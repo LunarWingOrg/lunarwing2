@@ -4,10 +4,6 @@ Items are grouped to respect the release cadence (`docs/ops/RELEASE_CADENCE.md`)
 
 | Feature | Target |
 |---------|--------|
-| Drop legacy `ironclaw-agent-v1` subprotocol offer from the daemon (delete the `SUBPROTOCOL_LEGACY` offer in `ic/src/orchestrator/external_worker.rs`) and `git rm` the 1.1.9-only repo-root compat symlinks `ironclaw_weechat_wss`, `darkirc_channel_for_ironclaw` (deployed tenants must have re-run mt-admin unit regen by then) | v2.0.0 |
-| LunarWing Web UI performance overhaul | v2.0.0 |
-| LunarWing Web MT admin setup integration (part 2 of earlier plan discussed) | v2.0.0 |
-| Several large proposals to ship | v2.0.0 |
 | XMPP file transfer — remaining polish (further hardening) | v2.0.1 |
 | Drop legacy `ironclaw-agent-v1` acceptance from external workers (pebble/lunarcode/opencode `LEGACY_SUBPROTOCOL` constants + negotiation fallback), one release after the daemon stops offering it | v2.0.1 |
 | Org/registry decisions deferred from 1.1.9 item #2: re-host registry WASM artifacts or make them source-build-only (nearai/ironclaw release URLs in `ic/registry/*.json` + `installer.rs` allowlist), fix or delete the `release-plz.yml` `repository_owner == 'nearai'` guard — fits alongside the Forgejo/CI migration. The Docker Hub image namespace was moved to `ggmethos/*` and the obsolete GCP VM bootstrap path was removed in 1.1.9 cleanup. | v2.0.1 |
@@ -19,7 +15,7 @@ Items are grouped to respect the release cadence (`docs/ops/RELEASE_CADENCE.md`)
 | Lorebook support / Agent Profile enhancements / Workspace Seeding improvements / Agent Profile switching / User Profile switching (further planning required) | v2.0.2 |
 | Self-Healing Capability Expansion - deferred from 1.1.8 | v2.0.2 |
 | Self-Healing Capabilities analysis of any missing pieces from all the new components. Implementation of missing pieces to follow | v2.0.2 |
-| Crate Updates | v2.0.2 |
+| More Crate Updates | v2.0.2 |
 | Per-tenant WeeChat health-glob gate (fix the flap /`render-units` footgun) | v2.0.3 |
 | Proprietary channel and code removal for Telegram | v2.0.3 |
 | Lunartica UI reskin continuation | v2.0.3 |

@@ -1,0 +1,89 @@
+"""Background job model bridging the blocking runners to the async WebSocket.
+
+Each job runs its (blocking) provisioning work on a daemon thread. The thread
+pushes structured event dicts onto a thread-safe ``queue.Queue``; the WebSocket
+handler drains that queue with ``asyncio.to_thread`` and forwards to the client.
+A ``None`` sentinel marks end-of-stream.
+"""
+
+from __future__ import annotations
+
+import queue
+import secrets
+import subprocess
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+Event = dict[str, Any]
+_SENTINEL: None = None
+
+
+@dataclass
+class Job:
+    id: str
+    mode: str
+    demo: bool
+    queue: "queue.Queue[Event | None]" = field(default_factory=queue.Queue)
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    proc: subprocess.Popen | None = None
+    status: str = "pending"  # pending | running | done | error | cancelled
+    ok: bool | None = None
+
+    def emit(self, **event: Any) -> None:
+        self.queue.put(event)
+
+    def cancelled(self) -> bool:
+        return self.stop_event.is_set()
+
+
+class JobManager:
+    """Creates, runs, tracks, and cancels jobs."""
+
+    def __init__(self, *, demo: bool = False, log_dir: str | None = None) -> None:
+        self.demo = demo
+        self.log_dir = log_dir
+        self._jobs: dict[str, Job] = {}
+        self._lock = threading.Lock()
+
+    def create(self, mode: str) -> Job:
+        job = Job(id=secrets.token_hex(6), mode=mode, demo=self.demo)
+        with self._lock:
+            self._jobs[job.id] = job
+        return job
+
+    def get(self, job_id: str) -> Job | None:
+        return self._jobs.get(job_id)
+
+    def start(self, job: Job, target: Callable[[Job], None]) -> None:
+        def run() -> None:
+            job.status = "running"
+            try:
+                target(job)
+            except Exception as exc:  # surface any unexpected error to the client
+                job.ok = False
+                job.status = "error"
+                job.emit(type="error", message=str(exc))
+            finally:
+                if job.status == "running":
+                    job.status = "done"
+                job.queue.put(_SENTINEL)
+
+        t = threading.Thread(target=run, name=f"job-{job.id}", daemon=True)
+        job.thread = t
+        t.start()
+
+    def cancel(self, job_id: str) -> bool:
+        job = self._jobs.get(job_id)
+        if not job:
+            return False
+        job.stop_event.set()
+        proc = job.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        return True

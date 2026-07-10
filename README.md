@@ -25,13 +25,11 @@ It's a hard fork of NearAI's IronClaw, diverging significantly since February 20
 ## Quick Links
 
 - Website: [lunarwing.org](https://lunarwing.org)
-- Source: [github.com/LunarWingOrg/lunarwing](https://github.com/LunarWingOrg/lunarwing)
+- Source: [LunarWing_v2](https://codeberg.org/LunarWing/LunarWing_v2)
 - IRC: `#lunarwing` on [irc.libera.chat](https://web.libera.chat/?channel=#lunarwing) (port 6697, TLS)
 - License: [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.en.html)
 
 [LunarWing](https://lunarwing.org/)
-
-[![zread](https://img.shields.io/badge/Ask_Zread-_.svg?style=for-the-badge&color=00b0aa&labelColor=000000&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTQuOTYxNTYgMS42MDAxSDIuMjQxNTZDMS44ODgxIDEuNjAwMSAxLjYwMTU2IDEuODg2NjQgMS42MDE1NiAyLjI0MDFWNC45NjAxQzEuNjAxNTYgNS4zMTM1NiAxLjg4ODEgNS42MDAxIDIuMjQxNTYgNS42MDAxSDQuOTYxNTZDNS4zMTUwMiA1LjYwMDEgNS42MDE1NiA1LjMxMzU2IDUuNjAxNTYgNC45NjAxVjIuMjQwMUM1LjYwMTU2IDEuODg2NjQgNS4zMTUwMiAxLjYwMDEgNC45NjE1NiAxLjYwMDFaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00Ljk2MTU2IDEwLjM5OTlIMi4yNDE1NkMxLjg4ODEgMTAuMzk5OSAxLjYwMTU2IDEwLjY4NjQgMS42MDE1NiAxMS4wMzk5VjEzLjc1OTlDMS42MDE1NiAxNC4xMTM0IDEuODg4MSAxNC4zOTk5IDIuMjQxNTYgMTQuMzk5OUg0Ljk2MTU2QzUuMzE1MDIgMTQuMzk5OSA1LjYwMTU2IDE0LjExMzQgNS42MDE1NiAxMy43NTk5VjExLjAzOTlDNS42MDE1NiAxMC42ODY0IDUuMzE1MDIgMTAuMzk5OSA0Ljk2MTU2IDEwLjM5OTlaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik0xMy43NTg0IDEuNjAwMUgxMS4wMzg0QzEwLjY4NSAxLjYwMDEgMTAuMzk4NCAxLjg4NjY0IDEwLjM5ODQgMi4yNDAxVjQuOTYwMUMxMC4zOTg0IDUuMzEzNTYgMTAuNjg1IDUuNjAwMSAxMS4wMzg0IDUuNjAwMUgxMy43NTg0QzE0LjExMTkgNS42MDAxIDE0LjM5ODQgNS4zMTM1NiAxNC4zOTg0IDQuOTYwMVYyLjI0MDFDMTQuMzk4NCAxLjg4NjY0IDE0LjExMTkgMS42MDAxIDEzLjc1ODQgMS42MDAxWiIgZmlsbD0iI2ZmZiIvPgo8cGF0aCBkPSJNNCAxMkwxMiA0TDQgMTJaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00IDEyTDEyIDQiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K&logoColor=ffffff)](https://zread.ai/LunarWingOrg/lunarwing)
 
 [![Chat on IRC](https://img.shields.io/badge/IRC-%23lunarwing-00b0aa?style=for-the-badge&labelColor=000000)](https://web.libera.chat/?channel=#lunarwing)
 
@@ -67,6 +65,7 @@ LunarWing adds real privacy-respecting tools and channels, with full secret supp
 * **LunarVision (Vision Service / OCR Sidecar)** -- Standalone Rust service for OCR (Tesseract) and vision-language analysis (Qwen3-VL), with smart routing, PaddleOCR fallback, disk-backed cache persistence, an API-versioned HTTP surface with an OpenAPI spec, and a self-reported `/health` endpoint. Runs rootless under Podman (`projects/ocr-sidecar/`)
 * **vision-analyze WASM Tool** -- Native WASM tool for image analysis via the LunarVision sidecar; rewritten from scratch in v1.1.7 and re-registered with the WASM toolset (`ic/tools-src/vision-analyze/`)
 * **Lunartica** -- Free Open Source Self Hostable Agent Coordination Platform (separate repo)
+* **SSH WASM Tool** -- Secure SSH access via WASM using Russh
 
 ### Worker Containers
 * **Nanocode Worker** -- Persistent NanoGPT community Nanocode worker container with optional ACP bridge, git/ssh key support, persistent storage, and development tools (`lunarcode4lunarwing/`)
@@ -77,16 +76,17 @@ LunarWing adds real privacy-respecting tools and channels, with full secret supp
 
 ### Infrastructure & Operations
 * **Agent SSH Harness** (introduced v1.1.7, tooling completed v1.1.8) -- A centralized, per-tenant SSH bridge that lets worker containers authenticate to a host over SSH **without the private key ever touching disk** inside the container (or on the host outside the encrypted secrets store). Key material lives AES-256-GCM-encrypted in the secrets store and is served to workers over a per-tenant `ssh-agent` Unix socket; the agent signs challenges in memory. Host-key verification is fail-closed. **v1.1.8 added the consuming tools:** a built-in in-process Rust `ssh` tool (delivery Option 2), a `ssh_git` tool for git-over-SSH through the harness, and a WASM `ssh` guest tool (delivery Option 3). `start-tenant` now uploads the staged key, bounces the daemon once to load it, and starts workers after the socket is real. Enabled by default for new tenants; configurable via `configure-ssh` and the `[ssh]` section of `config.toml`. Live-validated on systemd and OpenRC.
-* Specialized secret management wrapper scripts for both PostgreSQL and libSQL
-* Optional systemd, launchd, and OpenRC services for LunarWing, channel bridges, and healthcheck services
-* Improved scheduling system with native retry and exponential backoff for transient failures, stuck-run recovery, configurable lightweight execution timeouts, and automatic sweeping of orphaned routine runs
+* Specialized secret management wrapper scripts for both PostgreSQL and libSQL and interactive, easy to use, secure secret management where passwords, tokens, and other secrets are never shown in framebuffer
+* Optional systemd, launchd, and OpenRC services for LunarWing, channel bridges, and healthcheck services (with optional notifications!)
+* Improved scheduling system with native retry and exponential backoff for transient failures, stuck-run recovery, configurable lightweight execution timeouts, and automatic sweeping of orphaned routine runs. Most robust agentic routine system, unlike any other.
 * Self-healing healthchecks for channel bridge services, the daemon, and the routines system. Infrastructure health checks auto-detect init system (systemd, OpenRC, launchd)
 * Production multi-tenant deployment via `scripts/lunarwing-mt-admin.sh` with per-user OS isolation, port registry (v11 schema — dedicated per-tenant ports for workers, DarkIRC, and the LunarVision sidecar), and support for systemd, macOS (launchd), and OpenRC
 * TensorZero model routing support (the optional custom HTTP proxy was removed in v1.1.9; use a standalone TensorZero gateway)
 * Support for embedded memory search models
 * Reflex compiler for LLM-free fast-path execution of recurring prompts with exact, fuzzy (Jaro-Winkler), and semantic matching, auto-promotion, and stale pattern eviction
-* Supervised mode (`--supervised`) for human-gated tool execution — all tool actions require explicit approval regardless of tier
+* Supervised mode (`--supervised`) for human-gated tool execution — all tool actions require explicit approval regardless of tier (similar to Hermes Agent)
 * Response suppression and future cancellation with soft timeout and secondary hard-kill mechanism
+* Advanced MCP server features
 
 ### Development & Testing
 * Automated test suite with trace-replay E2E testing (no real LLM required)
@@ -324,7 +324,7 @@ Behavior depends on the detected service manager:
 
 The OpenRC default is intentionally conservative:
 - If `cronie`, `crond`, or `dcron` is already present, the installer keeps the cron-hourly path
-- If no cron daemon is present but `fcron` is available, the installer uses `fcron` automatically
+- If no cron daemon is present but `fcron` is available, the installer uses `fcron` automatically. `fcron` is the recommended and most tested cron implementation.
 
 Force a specific OpenRC mode:
 

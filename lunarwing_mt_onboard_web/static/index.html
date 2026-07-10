@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LunarWing · Multi-Tenant Onboarding</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link
+    href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body>
+  <canvas id="starfield" aria-hidden="true"></canvas>
+
+  <div id="token-error" class="token-error hidden">
+    <strong>Session token missing or invalid.</strong>
+    Re-open the URL printed by the launcher, including the <code>?token=…</code> part.
+  </div>
+
+  <header class="app-header">
+    <img class="logo" src="/assets/logo.jpg" alt="LunarWing logo" />
+    <div class="titles">
+      <h1>Lunar<span>Wing</span></h1>
+      <p class="subtitle">Multi-Tenant Onboarding</p>
+    </div>
+    <span id="mode-badge" class="badge badge-demo hidden"></span>
+  </header>
+
+  <div class="stage">
+  <div class="main-column">
+
+  <!-- Operation picker -->
+  <main id="view-picker" class="view">
+    <h2 class="view-title">Choose an operation</h2>
+    <div class="mode-grid">
+      <button class="mode-card" data-mode="provision">
+        <span class="mode-glyph">🌑</span>
+        <span class="mode-name">Provision</span>
+        <span class="mode-desc">Create &amp; build a fresh tenant end to end.</span>
+      </button>
+      <button class="mode-card" data-mode="secrets">
+        <span class="mode-glyph">🔐</span>
+        <span class="mode-name">Secrets</span>
+        <span class="mode-desc">Store an encrypted secret for a tenant.</span>
+      </button>
+      <button class="mode-card" data-mode="upgrade">
+        <span class="mode-glyph">🌗</span>
+        <span class="mode-name">Upgrade</span>
+        <span class="mode-desc">In-place version upgrade (dry-run by default).</span>
+      </button>
+      <button class="mode-card" data-mode="export">
+        <span class="mode-glyph">📦</span>
+        <span class="mode-name">Export</span>
+        <span class="mode-desc">Kawarimi migration bundle (dry-run by default).</span>
+      </button>
+    </div>
+  </main>
+
+  <!-- Wizard / form -->
+  <main id="view-wizard" class="view hidden">
+    <button class="back-link" data-action="to-picker">&larr; operations</button>
+    <div id="wizard-host"></div>
+  </main>
+
+  <!-- Live run -->
+  <main id="view-run" class="view hidden">
+    <section class="run-main glass">
+      <div id="run-title" class="run-title">Starting…</div>
+      <ol id="phase-stepper" class="phase-stepper"></ol>
+
+      <div class="progress-block">
+        <div class="progress-meta">
+          <span id="progress-activity" class="progress-activity">Preparing…</span>
+          <span id="progress-elapsed" class="progress-elapsed">0.0s</span>
+        </div>
+        <div class="progress-track">
+          <div id="progress-fill" class="progress-fill"></div>
+          <div id="progress-shimmer" class="progress-shimmer hidden"></div>
+        </div>
+      </div>
+
+      <div class="console-wrap">
+        <div class="console-head">
+          <span>activity log</span>
+          <label class="autoscroll"><input type="checkbox" id="autoscroll" checked /> follow</label>
+        </div>
+        <pre id="log-console" class="log-console" aria-live="polite"></pre>
+      </div>
+
+      <div id="masterkey-box" class="masterkey-box hidden"></div>
+      <div id="result-summary" class="result-summary hidden"></div>
+
+      <div class="run-actions">
+        <button id="btn-cancel" class="btn btn-danger">Cancel</button>
+        <button id="btn-new" class="btn btn-primary hidden" data-action="to-picker">Start another</button>
+      </div>
+    </section>
+  </main>
+
+  </div><!-- /main-column -->
+
+  <aside id="cosmos-dock" class="cosmos glass">
+    <div id="moon-host" class="moon-host"></div>
+    <div id="moon-label" class="moon-label">New moon</div>
+    <div id="bat-host" class="bat-host"></div>
+    <div id="bat-mood" class="bat-mood">content</div>
+  </aside>
+  </div><!-- /stage -->
+
+  <footer class="app-footer">
+    LunarWing · runs on 127.0.0.1 · every action is audit-logged
+  </footer>
+
+  <script src="/static/js/starfield.js"></script>
+  <script src="/static/js/moon.js"></script>
+  <script src="/static/js/bat.js"></script>
+  <script src="/static/js/progress.js"></script>
+  <script src="/static/js/wizard.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

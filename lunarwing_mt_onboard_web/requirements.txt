@@ -1,0 +1,12 @@
+# Web edition runtime dependencies.
+# Install into a venv (system Python is PEP-668 managed):
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+fastapi>=0.110
+uvicorn>=0.29
+websockets>=12.0
+# pydantic is pulled in transitively by fastapi (>=2).
+#
+# The parent `lunarwing_mt_onboard` package is imported directly and needs no
+# extra deps for the web backend. Real (non-demo) `secrets` mode additionally
+# needs `cryptography` and `psycopg2-binary`, which are installed on demand by
+# lunarwing_mt_onboard.secrets_ops.install_dependencies().
