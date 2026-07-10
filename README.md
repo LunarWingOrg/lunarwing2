@@ -19,7 +19,7 @@ It's a hard fork of NearAI's IronClaw, diverging significantly since February 20
 - **Lunarpunk values** — AGPLv3 forever. Free software, free infrastructure, no compromises.
 
 <p align="center">
-  <img src="./logo_new_black_bg.png" alt="LunarWing" width="400">
+  <img src="./crszsslw2412c09c1-8ea9-46bd-8063-084ccdd2f332.jpg" alt="LunarWing" width="400">
 </p>
 
 ## Quick Links
