@@ -12,6 +12,7 @@ import {
   type TaskResult,
   DEFAULT_TIMEOUT_MS,
 } from "./lunarwing_runtime"
+import { expandWorkspacePath } from "./workspace_path"
 
 const OPENCODE_HOST = process.env.OPENCODE_SERVE_HOST || "127.0.0.1"
 const OPENCODE_PORT = process.env.OPENCODE_SERVE_PORT || "4096"
@@ -249,6 +250,5 @@ export async function executeTask(
 }
 
 function resolveWorkDir(path: string): string {
-  if (path.startsWith("/")) return path
-  return `${WORKSPACE_ROOT}/${path}`
+  return expandWorkspacePath(path, WORKSPACE_ROOT)
 }
