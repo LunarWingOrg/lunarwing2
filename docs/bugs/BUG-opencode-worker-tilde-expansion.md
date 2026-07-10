@@ -2,7 +2,7 @@
 
 **Severity:** Low
 **Found:** 2026-07-03 during v1.1.8 live validation on tenant `orca` (Gentoo/OpenRC, rootless Podman)
-**Status:** Open
+**Status:** Fixed (opencode worker path expand; feat/opencode-tilde-expand)
 **Affects:** opencode worker (`opencode4lunarwing/`). Likely affects nanocode and pebble workers as well — all three share the same workspace-mount model (`/workspace` bind-mounted from the tenant's `*-workspace/` directory).
 
 ## Symptoms
@@ -44,3 +44,12 @@ This is not a bug in the opencode worker itself — it's an expectation mismatch
 
 - The same pattern likely affects nanocode and pebble workers — they use the same workspace-mount and non-root `USER` directive model
 - The `chmod 777` workaround for workspace file ownership (tracked separately in the release notes under "opencode workspace file ownership under rootless userns") is unrelated to this path-expansion issue
+
+## Resolution (2026-07-10)
+
+Bridge-level fix in `opencode4lunarwing/scripts`:
+- `expandWorkspacePath()` in `workspace_path.ts` maps `~` / `~/...` to `WORKSPACE_ROOT`
+- `resolveWorkDir()` in `opencode_task_executor.ts` uses the helper for structured `project_dir`
+- Self-check: `bun run opencode4lunarwing/scripts/path_expand_test.ts`
+
+Nanocode/pebble workers not changed in this pass.
