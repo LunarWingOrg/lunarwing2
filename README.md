@@ -365,7 +365,10 @@ Full documentation index: [docs/README.md](docs/README.md)
 
 [Blog](https://blog.lunarwing.org/)
 
+## Codeberg
+
+Actual development repo is on [Codeberg](https://codeberg.org/LunarWing/LunarWing_v2)
+
 ## Github
 
-Mirrored to [Github](https://github.com/LunarWingOrg/lunarwing2)
-
+Mirrored to [Github](https://github.com/LunarWingOrg/lunarwing2) on a 12 hour interval
