@@ -65,6 +65,14 @@ impl Drop for FileGuard {
     }
 }
 
+fn optional_git_ref(params: &serde_json::Value) -> Option<&str> {
+    params
+        .get("ref")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|git_ref| !git_ref.is_empty() && !git_ref.eq_ignore_ascii_case("null"))
+}
+
 #[async_trait]
 impl Tool for SshGitTool {
     fn name(&self) -> &str {
@@ -102,7 +110,7 @@ impl Tool for SshGitTool {
                 },
                 "ref": {
                     "type": "string",
-                    "description": "Optional branch/tag/refspec (clone --branch; fetch/pull/push refspec)."
+                    "description": "Optional branch/tag/refspec (clone --branch; fetch/pull/push refspec). Omit or pass null/empty to use Git's default ref behavior (remote HEAD for clone)."
                 },
                 "depth": {
                     "type": "integer",
@@ -129,7 +137,7 @@ impl Tool for SshGitTool {
         }
         let host = require_str(&params, "host")?;
         let path_str = require_str(&params, "path")?;
-        let git_ref = params.get("ref").and_then(|v| v.as_str());
+        let git_ref = optional_git_ref(&params);
         let repo = params.get("repo").and_then(|v| v.as_str());
         let depth = params.get("depth").and_then(|v| v.as_u64());
 
@@ -626,6 +634,30 @@ mod tests {
             known_hosts_line(&cfg("h", 22, HostKeyMode::Strict, None), None),
             None
         );
+    }
+
+    #[test]
+    fn test_optional_git_ref_treats_null_like_values_as_none() {
+        let cases = [
+            serde_json::json!({}),
+            serde_json::json!({"ref": null}),
+            serde_json::json!({"ref": "null"}),
+            serde_json::json!({"ref": "Null"}),
+            serde_json::json!({"ref": "NULL"}),
+            serde_json::json!({"ref": ""}),
+            serde_json::json!({"ref": "  "}),
+        ];
+
+        for params in cases {
+            assert_eq!(optional_git_ref(&params), None, "params: {params}");
+        }
+    }
+
+    #[test]
+    fn test_optional_git_ref_preserves_real_ref() {
+        let params = serde_json::json!({"ref": "main"});
+
+        assert_eq!(optional_git_ref(&params), Some("main"));
     }
 
     #[test]
