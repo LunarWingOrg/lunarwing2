@@ -28,14 +28,20 @@ LAST_MSG="${LOG_DIR}/${STAMP}.last-message.md"
 
 # Defaults tuned for unattended worker use. Override by exporting:
 #   CODEX_SANDBOX=workspace-write|danger-full-access|read-only
-#   CODEX_ASK=never|on-request|untrusted
+#   CODEX_APPROVAL=never|on-request|untrusted
 #   CODEX_MODEL=...
 #   CODEX_EXTRA_ARGS='...'
+#   CODEX_BYPASS_APPROVALS=1  # uses --dangerously-bypass-approvals-and-sandbox
 SANDBOX="${CODEX_SANDBOX:-workspace-write}"
-ASK="${CODEX_ASK:-never}"
+APPROVAL="${CODEX_APPROVAL:-never}"
 MODEL_ARGS=()
 if [[ -n "${CODEX_MODEL:-}" ]]; then
   MODEL_ARGS=(-m "$CODEX_MODEL")
+fi
+
+BYPASS_ARGS=()
+if [[ "${CODEX_BYPASS_APPROVALS:-0}" == "1" ]]; then
+  BYPASS_ARGS=(--dangerously-bypass-approvals-and-sandbox)
 fi
 
 # shellcheck disable=SC2206
@@ -45,7 +51,8 @@ EXTRA=(${CODEX_EXTRA_ARGS:-})
   echo "=== codex run $STAMP ==="
   echo "cwd=$WT"
   echo "sandbox=$SANDBOX"
-  echo "ask=$ASK"
+  echo "approval=$APPROVAL"
+  echo "bypass=${CODEX_BYPASS_APPROVALS:-0}"
   echo "codex=$(command -v codex)"
   echo "version=$(codex --version 2>/dev/null || true)"
   echo "prompt_file=$PROMPT_FILE"
@@ -55,18 +62,19 @@ EXTRA=(${CODEX_EXTRA_ARGS:-})
   echo "=== output ==="
 } | tee "$LOG"
 
-# Non-interactive: read prompt from file via stdin, pin cwd to worktree.
-# --json keeps a machine-readable trail on stdout (also teed to log).
+# Non-interactive: prompt via stdin, pin cwd to worktree.
+# approval_policy is set via -c because `codex exec` has no -a flag.
 set +e
 codex exec \
   -C "$WT" \
   -s "$SANDBOX" \
-  -a "$ASK" \
+  -c "approval_policy=\"${APPROVAL}\"" \
   --skip-git-repo-check \
   --ephemeral \
   --color never \
   --json \
   -o "$LAST_MSG" \
+  "${BYPASS_ARGS[@]}" \
   "${MODEL_ARGS[@]}" \
   "${EXTRA[@]}" \
   "$@" \

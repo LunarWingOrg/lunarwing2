@@ -104,8 +104,8 @@ Write `$WORKTREE/.codex-prompt.md`:
 ```
 
 Env overrides:
+- `CODEX_APPROVAL` (default `never`; passed as `-c approval_policy=...`)
 - `CODEX_SANDBOX` (default `workspace-write`)
-- `CODEX_ASK` (default `never`)
 - `CODEX_MODEL`
 - `CODEX_EXTRA_ARGS`
 

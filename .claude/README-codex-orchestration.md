@@ -48,10 +48,10 @@ feat-c: ... under pebble4lunarwing/**
 `run-codex.sh` uses:
 
 ```bash
-codex exec -C <worktree> -s workspace-write -a never --ephemeral --json -o <last-msg> - < prompt
+codex exec -C <worktree> -s workspace-write -c 'approval_policy="never"' --ephemeral --json -o <last-msg> - < prompt
 ```
 
-Overrides via env: `CODEX_SANDBOX`, `CODEX_ASK`, `CODEX_MODEL`, `CODEX_EXTRA_ARGS`.
+Overrides via env: `CODEX_SANDBOX`, `CODEX_APPROVAL`, `CODEX_MODEL`, `CODEX_EXTRA_ARGS`.
 
 ## Ignore rules
 
