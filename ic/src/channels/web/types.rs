@@ -1668,7 +1668,7 @@ mod tests {
             config.effective_transport(),
             EffectiveTransport::Stdio { command, args, env }
                 if command == "npx"
-                    && args == &["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+                    && args == ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
                     && env.get("NODE_ENV").map(String::as_str) == Some("production")
         ));
     }

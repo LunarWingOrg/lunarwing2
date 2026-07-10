@@ -5087,7 +5087,7 @@ mod tests {
             server.effective_transport(),
             EffectiveTransport::Stdio { command, args, .. }
                 if command == "npx"
-                    && args == &["-y", "@modelcontextprotocol/server-filesystem"]
+                    && args == ["-y", "@modelcontextprotocol/server-filesystem"]
         ));
 
         let auth = manager
