@@ -21,6 +21,7 @@ from lunarwing_mt_onboard.config import (
 )
 from lunarwing_mt_onboard.export_cli import ExportCliArgs, run_export_flow
 from lunarwing_mt_onboard.provisioner import ensure_mt_admin, provision
+from lunarwing_mt_onboard.secrets_cli import SecretsCliArgs, run_secrets_flow
 from lunarwing_mt_onboard.secrets import (
     generate_master_key,
     is_valid_master_key,
@@ -101,6 +102,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Export (Kawarimi migrate) a tenant for cross-host migration.",
     )
     _add_export_args(export)
+
+    secrets = subparsers.add_parser(
+        "secrets",
+        help="Insert secrets into a running tenant's encrypted secrets store.",
+    )
+    _add_secrets_args(secrets)
+
     return p
 
 
@@ -148,6 +156,28 @@ def _add_export_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--accept-defaults", action="store_true")
     parser.add_argument("--resume", metavar="FILE")
     parser.add_argument("--save", metavar="FILE")
+
+
+def _add_secrets_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--tenant", help="Tenant name (skip interactive picker).")
+    parser.add_argument(
+        "--secretname",
+        help="Secret name (requires --non-interactive).",
+    )
+    parser.add_argument(
+        "--secretvalue",
+        help="Secret value (requires --non-interactive).",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Run without prompts; requires --tenant, --secretname, --secretvalue.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip confirmation prompts.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +498,9 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "command", None) == "export":
         return run_export_flow(ExportCliArgs.from_namespace(args))
 
+    if getattr(args, "command", None) == "secrets":
+        return run_secrets_flow(SecretsCliArgs.from_namespace(args))
+
     config = TenantConfig()
     if args.resume:
         try:
@@ -515,6 +548,10 @@ def main(argv: list[str] | None = None) -> int:
         _display_results(result)
         if result.ok and not args.skip_start:
             _show_verify(config.name, host=config.gateway_host, port=config.gateway_port)
+            console.print(
+                "\n[bold]Tip:[/] Add more secrets (API keys, tokens) to this "
+                "tenant at any time:\n  [cyan]python3 -m lunarwing_mt_onboard secrets[/]"
+            )
         return 0 if result.ok else 2
     else:
         console.print("Aborted.")
