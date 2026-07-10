@@ -361,12 +361,11 @@ Full documentation index: [docs/README.md](docs/README.md)
 
 #### See: COMMUNITY.md for more information
 
-## Blog (Announcements for the LunarWing project, Philosophy, Discussion regarding Technology and Agorism)
+## Our Blog (Announcements for the LunarWing project, Philosophy, Discussion regarding Technology and Agorism)
 
-https://blog.lunarwing.org/
+[Blog](https://blog.lunarwing.org/)
 
 ## Github
 
-Mirrored to Github soon
+Mirrored to [Github](https://github.com/LunarWingOrg/lunarwing2)
 
-https://link.here
