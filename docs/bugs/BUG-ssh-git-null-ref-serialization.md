@@ -2,7 +2,7 @@
 
 **Severity:** Low
 **Found:** 2026-07-03 during v1.1.8 SSH tool validation on tenant `starforce`
-**Status:** Open
+**Status:** Fixed
 **Affects:** `ssh_git` built-in tool (`ic/src/tools/builtin/ssh_git.rs`)
 
 ## Symptoms
@@ -22,31 +22,24 @@ The agent omits `ref` (it's optional in the schema). The tool passes `null` as t
 
 ## Root Cause
 
-The Rust tool code (`ssh_git.rs:132`) handles absent/null `ref` correctly:
+Before the fix, the Rust tool parsed `ref` with:
 ```rust
 let git_ref = params.get("ref").and_then(|v| v.as_str());
 ```
-`as_str()` returns `None` for JSON null, and `build_argv` only adds `--branch` when `git_ref` is `Some`. So the Rust tool itself is correct.
-
-The issue is in the LLM serialization layer: when the agent omits `ref`, the tool-call JSON may serialize the absent value as the literal string `"null"` before it reaches the Rust tool's parameter parsing. Git then receives `--branch null` and fails with `fatal: Remote branch null not found`.
-
-The tool should either:
-1. Make `ref` required in the schema to force the agent to always pass an explicit value
-2. Or the serialization layer should omit absent fields entirely rather than converting them to string `"null"`
+This returned `None` for a missing field or JSON null, but accepted every JSON string
+verbatim. If the LLM serialization layer supplied the literal string `"null"`, an empty
+string, or whitespace, the value remained `Some` and flowed into Git's branch/refspec
+arguments.
 
 ## Impact
 
 - Clone/push may fail when `ref` is omitted or set to null
 - Agent must know to always pass an explicit `ref` value
 
-## Potential Fix
+## Resolution
 
-Either:
-1. Make `ref` required in the tool's `parameters_schema()` to eliminate the null/absent ambiguity entirely
-2. Trace the serialization layer to find where `None`/absent becomes the string `"null"` and fix it there
-
-Option 1 is simpler and avoids the agent guessing behavior.
-
-## Workaround
-
-Always pass `ref` explicitly in `ssh_git` calls (e.g. `ref: main`).
+Fixed 2026-07-10. `ssh_git` now normalizes missing fields, JSON null, blank strings,
+and case-insensitive string `"null"` values to no ref before validation and Git argv
+construction. Real refs such as `main` remain unchanged; with no ref, clone follows the
+remote HEAD and other operations retain Git's default ref behavior. Unit tests cover the
+regression cases.
