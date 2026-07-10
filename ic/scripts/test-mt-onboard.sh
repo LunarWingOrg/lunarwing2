@@ -16,12 +16,13 @@ export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 echo "── Python unit tests ──"
 PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
 import unittest
-from lunarwing_mt_onboard import tests, upgrade_runtime_tests, upgrade_tests
+from lunarwing_mt_onboard import tests, upgrade_runtime_tests, upgrade_tests, secrets_tests
 loader = unittest.TestLoader()
 suite = unittest.TestSuite([
     loader.loadTestsFromModule(tests),
     loader.loadTestsFromModule(upgrade_tests),
     loader.loadTestsFromModule(upgrade_runtime_tests),
+    loader.loadTestsFromModule(secrets_tests),
 ])
 runner = unittest.TextTestRunner(verbosity=2)
 result = runner.run(suite)
@@ -39,6 +40,11 @@ from lunarwing_mt_onboard.provisioner import (
     build_add_tenant_args, build_build_tenant_args,
 )
 from lunarwing_mt_onboard.upgrade import UpgradeConfig, build_upgrade_args
+from lunarwing_mt_onboard.secrets_ops import (
+    ensure_dependencies, list_tenants, parse_tenant_env,
+    validate_secret_name, insert_secret,
+)
+from lunarwing_mt_onboard.secrets_cli import SecretsCliArgs, run_secrets_flow
 print('All modules imported successfully')
 "
 
@@ -61,6 +67,20 @@ p = _build_parser()
 args = p.parse_args([
     'upgrade', '--tenant', 'alpha', '--target', 'v1.1.9',
     '--non-interactive', '--no-preflight'
+])
+print('Parsed:', args)
+"
+
+echo ""
+echo "── Secrets subcommand parser check ──"
+python3 -c "
+from lunarwing_mt_onboard.cli import _build_parser
+p = _build_parser()
+args = p.parse_args([
+    'secrets', '--tenant', 'alpha',
+    '--secretname', 'gotify_app_token',
+    '--secretvalue', 'testval',
+    '--non-interactive',
 ])
 print('Parsed:', args)
 "
