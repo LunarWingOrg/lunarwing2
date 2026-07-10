@@ -1,25 +1,33 @@
-/* Bat mascot — sprite swap. The four SVGs (content/excited/sleeping/angry)
-   are adapted from GLM's sprite set. Public API is unchanged so app.js keeps
-   driving moods via bat.set(mood); idle-cycles on the picker. */
+/* Mascot — "Lunar" the batpony (animated GIF sprites).
+   Mood -> file: content=walk, excited=jump, sleeping=sleep, angry=rage.
+   GIFs self-animate, so there are no CSS keyframes. The public API is
+   unchanged (set / startIdleCycle / stopIdle) so app.js is untouched. */
 (function () {
   const LW = (window.LW = window.LW || {});
-  const MOODS = ['content', 'excited', 'sleeping', 'angry'];
-  const IDLE_MOODS = ['content', 'excited', 'sleeping'];
-  const src = (m) => '/static/bat/' + m + '.svg';
 
-  // Preload all moods so swaps don't flicker.
-  MOODS.forEach((m) => {
+  const FILES = {
+    content: 'lunar_walk.gif',
+    excited: 'lunar_jump.gif',
+    sleeping: 'lunar_sleep.gif',
+    angry: 'lunar_rage.gif',
+  };
+  const IDLE_MOODS = ['content', 'excited', 'sleeping'];
+  const src = (m) => '/static/mascot/' + (FILES[m] || FILES.content);
+
+  // Preload so mood swaps are instant.
+  Object.keys(FILES).forEach((m) => {
     const img = new Image();
     img.src = src(m);
   });
 
   LW.Bat = function (host, moodLabel) {
-    host.innerHTML = '<img class="bat-sprite content" id="lw-bat-img" alt="LunarWing bat mascot" />';
+    host.innerHTML = '<img class="bat-sprite content" id="lw-bat-img" alt="Lunar the batpony" />';
     const img = host.querySelector('#lw-bat-img');
     let mood = 'content';
     let idleTimer = null;
 
     function apply(m) {
+      if (!FILES[m]) m = 'content';
       mood = m;
       img.src = src(m);
       img.className = 'bat-sprite ' + m;

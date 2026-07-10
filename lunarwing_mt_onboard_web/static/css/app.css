@@ -338,31 +338,22 @@ body {
 
 .app-footer { color: var(--text-dimmed); font-size: 12px; margin-top: auto; font-family: var(--font-mono); }
 
-/* Bat mascot (sprite-based; SVGs adapted from GLM's set) ------------------- */
+/* Mascot — "Lunar" the batpony (animated GIF sprites; self-animating) ------ */
 .bat-sprite {
-  width: 120px;
-  height: auto;
+  width: 128px;
+  height: 128px;
+  image-rendering: pixelated;
   filter: drop-shadow(0 6px 14px rgba(0, 0, 0, 0.5));
   transition: filter 0.3s ease;
-  animation: batFloat 3s ease-in-out infinite;
 }
-.bat-sprite.content { animation: batFloat 3s ease-in-out infinite; }
-.bat-sprite.excited { animation: batFlap 0.5s ease-in-out infinite; }
-.bat-sprite.sleeping { animation: batBreathe 4s ease-in-out infinite; opacity: 0.92; }
-.bat-sprite.angry {
-  animation: batShake 0.3s ease-in-out infinite;
-  filter: drop-shadow(0 0 10px rgba(230, 76, 76, 0.6));
-}
+.bat-sprite.angry { filter: drop-shadow(0 0 12px rgba(230, 76, 76, 0.7)); }
 
 /* Keyframes ---------------------------------------------------------------- */
 @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
 @keyframes fadeDown { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: none; } }
 @keyframes floaty { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
 @keyframes shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
-@keyframes batFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
-@keyframes batFlap { 0%, 100% { transform: rotate(-4deg) translateY(0); } 50% { transform: rotate(4deg) translateY(-4px); } }
-@keyframes batBreathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.04); } }
-@keyframes batShake { 0%, 100% { transform: translateX(0) rotate(0); } 25% { transform: translateX(-2px) rotate(-2deg); } 75% { transform: translateX(2px) rotate(2deg); } }
+/* (Lunar's GIFs self-animate; no mascot keyframes needed) */
 @keyframes moonGlow { 0%, 100% { filter: drop-shadow(0 0 12px rgba(147, 197, 253, 0.4)); } 50% { filter: drop-shadow(0 0 26px rgba(147, 197, 253, 0.7)); } }
 
 @media (prefers-reduced-motion: reduce) {
