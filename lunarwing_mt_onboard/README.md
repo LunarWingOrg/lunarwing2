@@ -153,6 +153,47 @@ Export flags:
 | `--apply` | Execute the export; omitted means dry-run |
 | `--no-quiesce` | Skip auto-stopping services (you must have already stopped them) |
 
+### Secrets insertion
+
+Insert encrypted secrets (API keys, tokens) into a running tenant's secrets
+store. Reads the tenant's `DATABASE_URL`, `SECRETS_MASTER_KEY`, and
+`LUNARWING_OWNER_ID` automatically from the tenant env file — no manual env
+exports needed. The crypto matches the Rust runtime exactly (AES-256-GCM with
+HKDF-SHA256 per-secret key derivation).
+
+Interactive:
+
+```bash
+sudo python3 -m lunarwing_mt_onboard secrets
+```
+
+This prompts to select a tenant, then loops for secret name + value entry.
+Secret values are hidden (no echo). After each insertion, asks if you want to
+add another.
+
+Non-interactive:
+
+```bash
+sudo python3 -m lunarwing_mt_onboard secrets \
+  --tenant ruffles \
+  --secretname gotify_app_token \
+  --secretvalue AdAKxxxxx \
+  --non-interactive
+```
+
+Secrets flags:
+
+| Flag | Description |
+|------|-------------|
+| `--tenant NAME` | Tenant name (skip interactive picker) |
+| `--secretname NAME` | Secret name (requires `--non-interactive`) |
+| `--secretvalue VALUE` | Secret value (requires `--non-interactive`) |
+| `--non-interactive` | Run without prompts |
+| `--yes` | Skip confirmation prompts |
+
+Note: `--secretvalue` on argv is visible in the process table. For interactive
+use, values are entered via hidden password prompts and never appear on argv.
+
 ## Module layout
 
 ```
@@ -167,8 +208,11 @@ lunarwing_mt_onboard/
 ├── export.py          # subprocess wrapper around export-tenant.sh
 ├── export_cli.py      # interactive export prompts + display
 ├── secrets.py         # master-key generation + validation
+├── secrets_ops.py     # crypto, DB insert, env parsing, dep checks
+├── secrets_cli.py     # interactive secrets subcommand
 ├── verify.py          # post-start health checks
 ├── tests.py           # unit tests (config, secrets, validation)
+├── secrets_tests.py   # unit tests for secrets_ops
 ├── upgrade_tests.py   # unit tests for in-place upgrades
 ├── export_tests.py    # unit tests for Kawarimi export
 └── requirements.txt   # rich, questionary
