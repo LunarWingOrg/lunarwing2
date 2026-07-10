@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="wingGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4FC3F7"/>
+      <stop offset="100%" stop-color="#1E88E5"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Left wing (relaxed) -->
+  <polygon points="28,44 10,42 6,48 12,52 18,50 24,54 28,52"
+           fill="#0D47A1" stroke="url(#wingGrad)" stroke-width="2" stroke-linejoin="round"/>
+  <!-- Right wing (relaxed) -->
+  <polygon points="72,44 90,42 94,48 88,52 82,50 76,54 72,52"
+           fill="#0D47A1" stroke="url(#wingGrad)" stroke-width="2" stroke-linejoin="round"/>
+
+  <!-- Ears -->
+  <polygon points="34,32 38,16 44,30" fill="#0D47A1"/>
+  <polygon points="56,30 62,16 66,32" fill="#0D47A1"/>
+  <polygon points="36,30 39,20 42,28" fill="#1565C0"/>
+  <polygon points="58,28 61,20 64,30" fill="#1565C0"/>
+
+  <!-- Body -->
+  <ellipse cx="50" cy="52" rx="22" ry="24" fill="#0D47A1"/>
+
+  <!-- Eyes (relaxed round) -->
+  <circle cx="42" cy="48" r="5" fill="#B3E5FC"/>
+  <circle cx="58" cy="48" r="5" fill="#B3E5FC"/>
+  <circle cx="42" cy="48" r="2.5" fill="#0D47A1"/>
+  <circle cx="58" cy="48" r="2.5" fill="#0D47A1"/>
+
+  <!-- Small smile -->
+  <path d="M44,60 Q50,64 56,60" fill="none" stroke="#B3E5FC" stroke-width="2" stroke-linecap="round"/>
+</svg>

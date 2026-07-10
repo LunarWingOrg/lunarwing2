@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="wingGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4FC3F7"/>
+      <stop offset="100%" stop-color="#1E88E5"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Drooped wings -->
+  <polygon points="28,50 8,56 4,62 12,62 18,60 24,64 28,60"
+           fill="#0D47A1" stroke="url(#wingGrad)" stroke-width="2" stroke-linejoin="round"/>
+  <polygon points="72,50 92,56 96,62 88,62 82,60 76,64 72,60"
+           fill="#0D47A1" stroke="url(#wingGrad)" stroke-width="2" stroke-linejoin="round"/>
+
+  <!-- Ears -->
+  <polygon points="34,32 38,16 44,30" fill="#0D47A1"/>
+  <polygon points="56,30 62,16 66,32" fill="#0D47A1"/>
+  <polygon points="36,30 39,20 42,28" fill="#1565C0"/>
+  <polygon points="58,28 61,20 64,30" fill="#1565C0"/>
+
+  <!-- Body -->
+  <ellipse cx="50" cy="52" rx="22" ry="24" fill="#0D47A1"/>
+
+  <!-- Closed eyes (downward arcs) -->
+  <path d="M38,49 Q42,53 46,49" fill="none" stroke="#B3E5FC" stroke-width="2" stroke-linecap="round"/>
+  <path d="M54,49 Q58,53 62,49" fill="none" stroke="#B3E5FC" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Relaxed mouth -->
+  <path d="M46,60 Q50,62 54,60" fill="none" stroke="#B3E5FC" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Zzz floating above -->
+  <text x="66" y="30" font-family="sans-serif" font-size="10" font-weight="bold" fill="#4FC3F7" opacity="0.9">z</text>
+  <text x="73" y="22" font-family="sans-serif" font-size="8" font-weight="bold" fill="#4FC3F7" opacity="0.6">z</text>
+  <text x="78" y="15" font-family="sans-serif" font-size="6" font-weight="bold" fill="#4FC3F7" opacity="0.3">z</text>
+</svg>

@@ -82,7 +82,7 @@ body {
   align-items: center;
   gap: 18px;
   width: 100%;
-  max-width: 960px;
+  max-width: 1200px;
   animation: fadeDown 0.6s var(--ease-out-expo) both;
 }
 .logo {
@@ -245,10 +245,16 @@ body {
 .btn-danger:hover { background: rgba(230, 76, 76, 0.25); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* Stage: main column + persistent mascot dock ------------------------------ */
+.stage { display: flex; gap: 20px; width: 100%; max-width: 1200px; align-items: flex-start; }
+.main-column { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 20px; }
+#cosmos-dock { flex: 0 0 220px; }
+
 /* Run view ----------------------------------------------------------------- */
-#view-run { display: grid; grid-template-columns: 280px 1fr; gap: 20px; align-items: start; }
-@media (max-width: 780px) {
-  #view-run { grid-template-columns: 1fr; }
+#view-run { display: block; }
+@media (max-width: 900px) {
+  .stage { flex-direction: column-reverse; align-items: center; }
+  #cosmos-dock { flex: none; width: 100%; max-width: 960px; position: static; }
   .mode-grid { grid-template-columns: 1fr; }
 }
 
@@ -327,56 +333,36 @@ body {
 
 .run-actions { display: flex; gap: 12px; margin-top: 20px; }
 
-.token-error { width: 100%; max-width: 960px; padding: 14px 18px; border-radius: var(--radius); background: var(--danger-soft); border: 1px solid rgba(230, 76, 76, 0.4); color: var(--text); font-size: 14px; }
+.token-error { width: 100%; max-width: 1200px; padding: 14px 18px; border-radius: var(--radius); background: var(--danger-soft); border: 1px solid rgba(230, 76, 76, 0.4); color: var(--text); font-size: 14px; }
 .token-error code { font-family: var(--font-mono); color: var(--accent); }
 
 .app-footer { color: var(--text-dimmed); font-size: 12px; margin-top: auto; font-family: var(--font-mono); }
 
-/* Bat mascot --------------------------------------------------------------- */
-.bat { width: 100%; height: 100%; transition: transform 0.3s var(--ease-spring); transform-origin: center bottom; }
-.bat .wing { transform-origin: center; animation: flap 0.9s ease-in-out infinite; }
-.bat .wing-r { animation-delay: 0.05s; }
-.bat .eye-open { display: inline; }
-.bat .eye-closed, .bat .eye-angry, .bat .fang, .bat .zzz, .bat .brow, .bat .mouth-grin { display: none; }
-.bat .pupil { transition: fill 0.3s; }
-
-/* content (default): calm */
-.bat.mood-content { animation: bob 3.6s ease-in-out infinite; }
-.bat.mood-content .wing { animation-duration: 1.6s; }
-
-/* excited: fast flap + bounce, sparkly */
-.bat.mood-excited { animation: bounce 0.6s var(--ease-spring) infinite; }
-.bat.mood-excited .wing { animation-duration: 0.45s; }
-.bat.mood-excited .mouth-grin { display: inline; }
-.bat.mood-excited .mouth-smile { display: none; }
-
-/* sleeping: eyes closed, Zzz, barely moving */
-.bat.mood-sleeping { animation: bob 5s ease-in-out infinite; }
-.bat.mood-sleeping .wing { animation-duration: 3s; opacity: 0.85; }
-.bat.mood-sleeping .eye-open { display: none; }
-.bat.mood-sleeping .eye-closed { display: inline; }
-.bat.mood-sleeping .zzz { display: inline; animation: floatZ 2.4s ease-in-out infinite; }
-.bat.mood-sleeping .mouth-smile { display: none; }
-
-/* angry: red glowing eyes, fangs, brows, shake */
-.bat.mood-angry { animation: shake 0.35s linear infinite; }
-.bat.mood-angry .wing { animation-duration: 0.35s; }
-.bat.mood-angry .eye-open { display: none; }
-.bat.mood-angry .eye-angry { display: inline; }
-.bat.mood-angry .brow { display: inline; }
-.bat.mood-angry .fang { display: inline; }
-.bat.mood-angry .mouth-smile, .bat.mood-angry .mouth-grin { display: none; }
+/* Bat mascot (sprite-based; SVGs adapted from GLM's set) ------------------- */
+.bat-sprite {
+  width: 120px;
+  height: auto;
+  filter: drop-shadow(0 6px 14px rgba(0, 0, 0, 0.5));
+  transition: filter 0.3s ease;
+  animation: batFloat 3s ease-in-out infinite;
+}
+.bat-sprite.content { animation: batFloat 3s ease-in-out infinite; }
+.bat-sprite.excited { animation: batFlap 0.5s ease-in-out infinite; }
+.bat-sprite.sleeping { animation: batBreathe 4s ease-in-out infinite; opacity: 0.92; }
+.bat-sprite.angry {
+  animation: batShake 0.3s ease-in-out infinite;
+  filter: drop-shadow(0 0 10px rgba(230, 76, 76, 0.6));
+}
 
 /* Keyframes ---------------------------------------------------------------- */
 @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
 @keyframes fadeDown { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: none; } }
 @keyframes floaty { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
 @keyframes shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
-@keyframes flap { 0%, 100% { transform: rotate(0deg) scaleX(1); } 50% { transform: rotate(-8deg) scaleX(0.82); } }
-@keyframes bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-7px); } }
-@keyframes bounce { 0%, 100% { transform: translateY(0) scale(1); } 40% { transform: translateY(-12px) scale(1.04); } }
-@keyframes shake { 0%, 100% { transform: translateX(0) rotate(0); } 25% { transform: translateX(-3px) rotate(-2deg); } 75% { transform: translateX(3px) rotate(2deg); } }
-@keyframes floatZ { 0% { opacity: 0; transform: translate(0, 0) scale(0.8); } 40% { opacity: 1; } 100% { opacity: 0; transform: translate(10px, -18px) scale(1.2); } }
+@keyframes batFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
+@keyframes batFlap { 0%, 100% { transform: rotate(-4deg) translateY(0); } 50% { transform: rotate(4deg) translateY(-4px); } }
+@keyframes batBreathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.04); } }
+@keyframes batShake { 0%, 100% { transform: translateX(0) rotate(0); } 25% { transform: translateX(-2px) rotate(-2deg); } 75% { transform: translateX(2px) rotate(2deg); } }
 @keyframes moonGlow { 0%, 100% { filter: drop-shadow(0 0 12px rgba(147, 197, 253, 0.4)); } 50% { filter: drop-shadow(0 0 26px rgba(147, 197, 253, 0.7)); } }
 
 @media (prefers-reduced-motion: reduce) {

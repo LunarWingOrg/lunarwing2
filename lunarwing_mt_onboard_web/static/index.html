@@ -29,6 +29,9 @@
     <span id="mode-badge" class="badge badge-demo hidden"></span>
   </header>
 
+  <div class="stage">
+  <div class="main-column">
+
   <!-- Operation picker -->
   <main id="view-picker" class="view">
     <h2 class="view-title">Choose an operation</h2>
@@ -64,13 +67,6 @@
 
   <!-- Live run -->
   <main id="view-run" class="view hidden">
-    <section class="cosmos glass">
-      <div id="moon-host" class="moon-host"></div>
-      <div id="moon-label" class="moon-label">New moon</div>
-      <div id="bat-host" class="bat-host"></div>
-      <div id="bat-mood" class="bat-mood">content</div>
-    </section>
-
     <section class="run-main glass">
       <div id="run-title" class="run-title">Starting…</div>
       <ol id="phase-stepper" class="phase-stepper"></ol>
@@ -103,6 +99,16 @@
       </div>
     </section>
   </main>
+
+  </div><!-- /main-column -->
+
+  <aside id="cosmos-dock" class="cosmos glass">
+    <div id="moon-host" class="moon-host"></div>
+    <div id="moon-label" class="moon-label">New moon</div>
+    <div id="bat-host" class="bat-host"></div>
+    <div id="bat-mood" class="bat-mood">content</div>
+  </aside>
+  </div><!-- /stage -->
 
   <footer class="app-footer">
     LunarWing · runs on 127.0.0.1 · every action is audit-logged
