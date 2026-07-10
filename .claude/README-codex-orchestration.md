@@ -2,6 +2,8 @@
 
 Pattern A: **Claude Code orchestrates**, **Codex implements** in isolated git worktrees.
 
+> **Full guide:** [`docs/guides/CLAUDE_CODEX_ORCHESTRATION.md`](../docs/guides/CLAUDE_CODEX_ORCHESTRATION.md)
+
 ## Layout
 
 ```text
@@ -17,13 +19,11 @@ Pattern A: **Claude Code orchestrates**, **Codex implements** in isolated git wo
 
 ## Prerequisites
 
-- `codex` on PATH (this machine: codex-cli 0.144.1)
+- `codex` on PATH (codex-cli 0.144.x+)
 - git repo (LunarWing root)
 - optional: `gh` for PRs
 
 ## Usage
-
-From the **LunarWing repo root** (or a Claude session whose cwd is that root):
 
 ```text
 /codex-impl my-slug: implement X only under ic/src/foo/**
@@ -32,32 +32,28 @@ From the **LunarWing repo root** (or a Claude session whose cwd is that root):
 ```text
 /features-parallel
 feat-a: ... under ic/src/a/**;
-feat-b: ... under opencode4lunarwing/**;
-feat-c: ... under pebble4lunarwing/**
+feat-b: ... under opencode4lunarwing/**
 ```
-
-## Safety notes for this branch
-
-- Main checkout is often pinned (e.g. `sloptegration/upgrade/v2.0.0.0`).
-- Setup and normal orchestration must **not** `git checkout` other branches on the main worktree.
-- Isolation branches live only under `.worktrees/` as `feat/<slug>`.
-- Creating those feature branches/worktrees is intentional for parallel work; ask first if the user forbade any new branches.
 
 ## Codex invocation defaults
 
 `run-codex.sh` uses:
 
 ```bash
-codex exec -C <worktree> -s workspace-write -c 'approval_policy="never"' --ephemeral --json -o <last-msg> - < prompt
+codex exec \
+  -C <worktree> \
+  -s workspace-write \
+  -c 'approval_policy="never"' \
+  --ephemeral --json -o <last-msg> \
+  - < prompt
 ```
 
-Overrides via env: `CODEX_SANDBOX`, `CODEX_APPROVAL`, `CODEX_MODEL`, `CODEX_EXTRA_ARGS`.
+Note: `codex exec` has no `-a` flag; approval is set via `-c approval_policy=...`.
 
-## Ignore rules
+Overrides via env: `CODEX_SANDBOX`, `CODEX_APPROVAL`, `CODEX_MODEL`, `CODEX_EXTRA_ARGS`, `CODEX_BYPASS_APPROVALS=1`.
 
-`.worktrees/` is already gitignored. Also ignore:
+## Branch policy
 
-```gitignore
-**/.codex-runs/
-**/.codex-prompt.md
-```
+- Feature work lives on `feat/<slug>` in `.worktrees/<slug>`
+- Integration branch (e.g. `sloptegration/upgrade/v2.0.0.0`) may receive orchestration tooling commits
+- Do not touch `master`/`main` for feature implementation
