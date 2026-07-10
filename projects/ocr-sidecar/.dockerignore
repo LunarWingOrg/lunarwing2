@@ -1,0 +1,7 @@
+target/
+*.md
+ic-ocr
+.env
+.env.example
+.git/
+.gitignore

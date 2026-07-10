@@ -1,0 +1,39 @@
+[
+  {
+    "id": "ollama",
+    "aliases": [],
+    "protocol": "ollama",
+    "default_base_url": "http://localhost:11434",
+    "base_url_env": "OLLAMA_BASE_URL",
+    "model_env": "OLLAMA_MODEL",
+    "default_model": "llama3",
+    "description": "Local Ollama instance (no API key needed)",
+    "setup": {
+      "kind": "ollama",
+      "display_name": "Ollama",
+      "can_list_models": true
+    }
+  },
+  {
+    "id": "openai_compatible",
+    "aliases": [
+      "openai-compatible",
+      "compatible"
+    ],
+    "protocol": "open_ai_completions",
+    "base_url_env": "LLM_BASE_URL",
+    "base_url_required": true,
+    "api_key_env": "LLM_API_KEY",
+    "api_key_required": false,
+    "model_env": "LLM_MODEL",
+    "default_model": "default",
+    "extra_headers_env": "LLM_EXTRA_HEADERS",
+    "description": "Custom OpenAI-compatible endpoint (vLLM, LiteLLM, etc.)",
+    "setup": {
+      "kind": "open_ai_compatible",
+      "secret_name": "llm_compatible_api_key",
+      "display_name": "OpenAI-compatible",
+      "can_list_models": false
+    }
+  }
+]

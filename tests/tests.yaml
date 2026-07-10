@@ -1,0 +1,100 @@
+# Worker Test Matrix
+# Each worker × scenario pair becomes a test case.
+version: "1.0"
+
+workers:
+  nanocode:
+    deploy: nanocode_worker
+    health_port: 8444
+    ws_port: 9090
+    auth_token: test-token
+    scenarios:
+      - name: health
+        type: http
+        method: GET
+        path: /health
+        expect:
+          status_code: 200
+      - name: ready
+        type: http
+        method: GET
+        path: /ready
+        expect:
+          status_code: 200
+      - name: ws_handshake
+        type: ws_handshake
+        expect:
+          first_message: ready
+          payload_has: [worker_id, version, mode]
+
+  opencode:
+    deploy: opencode_worker
+    health_port: 8445
+    ws_port: 9091
+    auth_token: test-token
+    scenarios:
+      - name: health
+        type: http
+        method: GET
+        path: /health
+        expect:
+          status_code: 200
+      - name: ready
+        type: http
+        method: GET
+        path: /ready
+        expect:
+          status_code: 200
+      - name: ws_handshake
+        type: ws_handshake
+        expect:
+          first_message: ready
+          payload_has: [worker_id, version, mode]
+
+  pebble:
+    deploy: pebble_worker
+    health_port: 8446
+    ws_port: 9092
+    auth_token: test-token
+    scenarios:
+      - name: health
+        type: http
+        method: GET
+        path: /health
+        expect:
+          status_code: 200
+      - name: ws_handshake
+        type: ws_handshake
+        expect:
+          first_message: ready
+          payload_has: [worker_id, version, mode]
+
+  builtin:
+    deploy: builtin_worker
+    health_port: 8080    # via orchestrator health
+    scenarios:
+      - name: orchestrator_health
+        type: http
+        method: GET
+        path: /health
+        expect:
+          status_code: 200
+          body_contains: status
+      - name: worker_config
+        type: http
+        method: GET
+        path: /worker/config
+        expect:
+          status_code: 200
+          body_contains: job_id
+
+  sandbox:
+    deploy: sandbox_worker
+    health_port: 8080
+    scenarios:
+      - name: orchestrator_health
+        type: http
+        method: GET
+        path: /health
+        expect:
+          status_code: 200

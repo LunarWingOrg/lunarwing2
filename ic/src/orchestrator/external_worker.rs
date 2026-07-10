@@ -1,0 +1,1642 @@
+//! WebSocket client for external workers speaking the `lunarwing-agent-v1`
+//! protocol (legacy alias `ironclaw-agent-v1` is still offered for workers
+//! built before the rename).
+//!
+//! External workers are persistent containers (nanocode, pebble, opencode, etc.) that the
+//! orchestrator connects to on demand rather than creating per-job.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use chrono::Utc;
+use futures::{SinkExt, StreamExt};
+use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
+use uuid::Uuid;
+
+use crate::channels::web::types::SseEvent;
+use crate::config::{ExternalWorkerConfig, LoadBalanceStrategy};
+use crate::context::{ContextManager, JobState};
+use crate::db::Database;
+use crate::error::OrchestratorError;
+
+// ── Protocol types ──────────────────────────────────────────────────
+
+/// Primary WebSocket subprotocol spoken by external workers.
+pub const SUBPROTOCOL: &str = "lunarwing-agent-v1";
+
+/// Legacy subprotocol alias, still offered so workers built before the
+/// ironclaw -> lunarwing rename keep negotiating successfully.
+pub const SUBPROTOCOL_LEGACY: &str = "ironclaw-agent-v1";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Envelope {
+    id: String,
+    #[serde(rename = "type")]
+    msg_type: String,
+    timestamp: String,
+    payload: serde_json::Value,
+}
+
+impl Envelope {
+    fn new(msg_type: &str, payload: serde_json::Value) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            msg_type: msg_type.to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            payload,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadyPayload {
+    worker_id: String,
+    #[allow(dead_code)]
+    version: String,
+    #[allow(dead_code)]
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskProgressPayload {
+    #[allow(dead_code)]
+    task_id: String,
+    delta: String,
+    #[allow(dead_code)]
+    done: bool,
+}
+
+/// A single message in conversation history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// Context passed to external workers with task requests.
+///
+/// All fields are optional with serde defaults for backward compatibility —
+/// older workers that don't understand these fields will still work.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TaskContext {
+    /// Workspace/project directory path.
+    pub project_dir: Option<String>,
+    /// Recent conversation messages for context.
+    pub conversation_history: Vec<ConversationMessage>,
+    /// Environment variables to inject into the worker process.
+    pub environment: HashMap<String, String>,
+    /// User ID who initiated the task.
+    pub user_id: String,
+    /// Arbitrary metadata key-value pairs.
+    pub metadata: HashMap<String, String>,
+}
+
+pub fn build_task_context(
+    user_id: &str,
+    project_dir: Option<&str>,
+    environment: HashMap<String, String>,
+    conversation_history: Vec<ConversationMessage>,
+    metadata: HashMap<String, String>,
+) -> TaskContext {
+    TaskContext {
+        user_id: user_id.to_string(),
+        project_dir: project_dir.map(String::from),
+        environment,
+        conversation_history,
+        metadata,
+    }
+}
+
+fn extract_host(url: &str) -> Option<String> {
+    let stripped = url
+        .strip_prefix("ws://")
+        .or_else(|| url.strip_prefix("wss://"))?;
+    let host_port = stripped.split('/').next()?;
+    let host = host_port
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host_port);
+    Some(host.to_string())
+}
+
+fn is_loopback(host: &str) -> bool {
+    host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "[::1]"
+        || host == "0.0.0.0"
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskResultPayload {
+    #[allow(dead_code)]
+    task_id: String,
+    status: String,
+    output: String,
+    error: Option<String>,
+    duration_ms: u64,
+}
+
+// ── External job handle ─────────────────────────────────────────────
+
+/// Handle to a running external worker task.
+pub struct ExternalJobHandle {
+    pub job_id: Uuid,
+    pub worker_name: String,
+    cancel_tx: Option<oneshot::Sender<()>>,
+}
+
+impl ExternalJobHandle {
+    pub fn cancel(mut self) {
+        if let Some(tx) = self.cancel_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+// ── Manager ─────────────────────────────────────────────────────────
+
+/// Manages connections to external worker endpoints.
+pub struct ExternalWorkerManager {
+    workers: HashMap<String, ExternalWorkerConfig>,
+    load_balancers: HashMap<String, LoadBalancer>,
+    pool: Arc<WorkerConnectionPool>,
+    job_event_tx: Option<broadcast::Sender<(Uuid, String, SseEvent)>>,
+    context_manager: Option<Arc<ContextManager>>,
+    store: Option<Arc<dyn Database>>,
+    active_handles: Arc<RwLock<HashMap<Uuid, Arc<Mutex<ExternalJobHandle>>>>>,
+}
+
+impl ExternalWorkerManager {
+    pub fn new(configs: Vec<ExternalWorkerConfig>) -> Self {
+        let mut load_balancers = HashMap::new();
+        for config in &configs {
+            for endpoint in config.endpoints() {
+                if let Some(host) = extract_host(&endpoint.url)
+                    && endpoint.url.starts_with("ws://")
+                    && !is_loopback(&host)
+                {
+                    tracing::warn!(
+                        "External worker '{}' endpoint uses cleartext ws:// for non-loopback host '{}'. \
+                         Credentials and task data will be sent unencrypted. Use wss:// for remote workers.",
+                        config.name,
+                        host
+                    );
+                }
+            }
+            let endpoints = config.endpoints();
+            load_balancers.insert(
+                config.name.clone(),
+                LoadBalancer::new(endpoints, config.load_balance.clone()),
+            );
+        }
+
+        let workers: HashMap<String, ExternalWorkerConfig> =
+            configs.into_iter().map(|c| (c.name.clone(), c)).collect();
+
+        if !workers.is_empty() {
+            tracing::info!(
+                "External workers configured: {}",
+                workers.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+
+        Self {
+            workers,
+            load_balancers,
+            pool: Arc::new(WorkerConnectionPool::new(2, Duration::from_secs(300))),
+            job_event_tx: None,
+            context_manager: None,
+            store: None,
+            active_handles: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn with_event_deps(
+        mut self,
+        event_tx: broadcast::Sender<(Uuid, String, SseEvent)>,
+        context_manager: Arc<ContextManager>,
+    ) -> Self {
+        self.job_event_tx = Some(event_tx);
+        self.context_manager = Some(context_manager);
+        self
+    }
+
+    pub fn with_store(mut self, store: Arc<dyn Database>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    pub fn get_worker(&self, name: &str) -> Option<&ExternalWorkerConfig> {
+        self.workers.get(name)
+    }
+
+    pub fn worker_names(&self) -> Vec<&str> {
+        self.workers.keys().map(|s| s.as_str()).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+
+    /// Execute a task on a named external worker.
+    ///
+    /// Connects via WebSocket, sends the task, streams progress as job events,
+    /// and returns the final result. If `wait` is true, blocks until completion.
+    /// If false, spawns a background task and returns immediately.
+    pub async fn execute_task(
+        &self,
+        job_id: Uuid,
+        worker_name: &str,
+        task: &str,
+        timeout_ms: Option<u64>,
+        wait: bool,
+        context: TaskContext,
+    ) -> Result<Option<ExternalTaskResult>, OrchestratorError> {
+        self.pool.evict_stale().await;
+
+        let config = self.workers.get(worker_name).ok_or_else(|| {
+            OrchestratorError::ExternalWorkerNotFound {
+                worker_name: worker_name.to_string(),
+            }
+        })?;
+
+        let timeout = timeout_ms.unwrap_or(config.timeout_ms);
+
+        // Use load balancer to select an endpoint and acquire an active-connection
+        // lease. The lease is held for the task's lifetime (moved into the spawned
+        // task on the fire-and-forget path) so LeastConnections reflects real load.
+        // With no LB configured (single legacy endpoint) there is nothing to
+        // balance and no active count to track.
+        let lease = self.load_balancers.get(worker_name).map(|lb| lb.acquire());
+        let url = lease
+            .as_ref()
+            .map(|l| l.url.clone())
+            .unwrap_or_else(|| config.url.clone());
+        let auth_token = lease
+            .as_ref()
+            .map(|l| l.auth_token.clone())
+            .unwrap_or_else(|| config.auth_token.clone());
+        let pool_key = format!("{worker_name}:{url}");
+        let worker_name_owned = worker_name.to_string();
+        let task_owned = task.to_string();
+        let event_tx = self.job_event_tx.clone();
+        let context_manager = self.context_manager.clone();
+        let store = self.store.clone();
+        let active_handles = Arc::clone(&self.active_handles);
+        let pool = Arc::clone(&self.pool);
+
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let handle = Arc::new(Mutex::new(ExternalJobHandle {
+            job_id,
+            worker_name: worker_name_owned.clone(),
+            cancel_tx: Some(cancel_tx),
+        }));
+        active_handles
+            .write()
+            .await
+            .insert(job_id, Arc::clone(&handle));
+
+        let mut maybe_cancel_rx = Some(cancel_rx);
+
+        if wait {
+            let lb = self.load_balancers.get(worker_name);
+            let max_attempts = if lb.is_some_and(|l| l.endpoint_count() > 1) {
+                lb.unwrap().endpoint_count()
+            } else {
+                1
+            };
+
+            let mut failed_urls: Vec<String> = Vec::new();
+
+            for attempt in 0..max_attempts {
+                let attempt_lease = lb.map(|lb| {
+                    if failed_urls.is_empty() {
+                        lb.acquire()
+                    } else {
+                        lb.acquire_excluding(&failed_urls)
+                    }
+                });
+                let attempt_url = attempt_lease
+                    .as_ref()
+                    .map(|l| l.url.clone())
+                    .unwrap_or_else(|| config.url.clone());
+                let attempt_auth_token = attempt_lease
+                    .as_ref()
+                    .map(|l| l.auth_token.clone())
+                    .unwrap_or_else(|| config.auth_token.clone());
+                let attempt_pool_key = format!("{worker_name_owned}:{attempt_url}");
+
+                let attempt_cancel_rx = maybe_cancel_rx.take().unwrap_or_else(|| {
+                    let (_, rx) = oneshot::channel();
+                    rx
+                });
+
+                let result = run_external_task(
+                    job_id,
+                    &attempt_url,
+                    attempt_auth_token.as_ref().map(|s| s.expose_secret()),
+                    &task_owned,
+                    timeout,
+                    &worker_name_owned,
+                    event_tx.as_ref(),
+                    context_manager.as_ref(),
+                    store.as_ref(),
+                    attempt_cancel_rx,
+                    context.clone(),
+                    &pool,
+                    &attempt_pool_key,
+                )
+                .await;
+
+                let is_connection_failure = matches!(
+                    &result,
+                    Err(OrchestratorError::ExternalWorkerConnectionFailed { .. })
+                );
+
+                if is_connection_failure && attempt + 1 < max_attempts {
+                    failed_urls.push(attempt_url.clone());
+                    if let Err(ref e) = result {
+                        tracing::warn!(
+                            "External worker '{}' endpoint {} unreachable ({e}), retrying {}/{}",
+                            worker_name_owned,
+                            attempt_url,
+                            attempt + 2,
+                            max_attempts
+                        );
+                    }
+                    continue;
+                }
+
+                active_handles.write().await.remove(&job_id);
+                return result.map(Some);
+            }
+
+            active_handles.write().await.remove(&job_id);
+            unreachable!("loop always returns when max_attempts > 0");
+        } else {
+            let spawn_cancel_rx = maybe_cancel_rx.take().unwrap_or_else(|| {
+                let (_, rx) = oneshot::channel();
+                rx
+            });
+            tokio::spawn(async move {
+                // Hold the endpoint lease for the task's lifetime so the active
+                // count (LeastConnections accounting) stays accurate until the
+                // task finishes; it decrements when _lease drops at block end.
+                let _lease = lease;
+                let result = run_external_task(
+                    job_id,
+                    &url,
+                    auth_token.as_ref().map(|s| s.expose_secret()),
+                    &task_owned,
+                    timeout,
+                    &worker_name_owned,
+                    event_tx.as_ref(),
+                    context_manager.as_ref(),
+                    store.as_ref(),
+                    spawn_cancel_rx,
+                    context,
+                    &pool,
+                    &pool_key,
+                )
+                .await;
+
+                active_handles.write().await.remove(&job_id);
+
+                match &result {
+                    Ok(r) => {
+                        tracing::info!(
+                            "External worker '{}' job {} completed: status={}",
+                            worker_name_owned,
+                            job_id,
+                            r.status
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "External worker '{}' job {} failed: {}",
+                            worker_name_owned,
+                            job_id,
+                            e
+                        );
+                    }
+                }
+            });
+
+            Ok(None)
+        }
+    }
+
+    /// Cancel an active external worker task.
+    pub async fn cancel_task(&self, job_id: Uuid) -> bool {
+        if let Some(handle) = self.active_handles.write().await.remove(&job_id) {
+            let mut h = handle.lock().await;
+            if let Some(tx) = h.cancel_tx.take() {
+                let _ = tx.send(());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Spawn a background task that periodically evicts stale idle connections.
+    /// Cancelled when the shutdown receiver fires.
+    pub fn spawn_eviction_task(&self, mut shutdown_rx: broadcast::Receiver<()>) {
+        let pool = Arc::clone(&self.pool);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await; // skip immediate first tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        pool.evict_stale().await;
+                    }
+                    _ = shutdown_rx.recv() => {
+                        tracing::debug!("pool eviction task shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Gracefully drain the pool (send WS Close frames, bounded per-connection).
+    pub async fn drain_pool(&self) {
+        self.pool.drain().await;
+    }
+}
+
+/// Status of an external worker task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalTaskStatus {
+    Success,
+    Failed,
+    Cancelled,
+    #[serde(rename = "timed_out")]
+    TimedOut,
+    Partial(String),
+}
+
+impl std::fmt::Display for ExternalTaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Success => write!(f, "success"),
+            Self::Failed => write!(f, "failed"),
+            Self::Cancelled => write!(f, "cancelled"),
+            Self::TimedOut => write!(f, "timed_out"),
+            Self::Partial(msg) => write!(f, "partial: {}", msg),
+        }
+    }
+}
+
+/// Result of an external worker task.
+#[derive(Debug, Clone)]
+pub struct ExternalTaskResult {
+    pub status: ExternalTaskStatus,
+    pub output: String,
+    pub error: Option<String>,
+    pub duration_ms: u64,
+}
+
+// ── Load balancer ──────────────────────────────────────────────────
+
+use crate::config::WorkerEndpoint;
+
+pub struct LoadBalancer {
+    inner: Arc<LbInner>,
+    strategy: LoadBalanceStrategy,
+    current_index: AtomicUsize,
+}
+
+struct LbInner {
+    endpoints: Vec<WorkerEndpoint>,
+    // In-flight task count per endpoint, parallel to `endpoints`. Bumped by
+    // `acquire()` and decremented when the returned `EndpointLease` drops, so
+    // LeastConnections can prefer the least-loaded endpoint.
+    active: Vec<AtomicUsize>,
+}
+
+/// A selected endpoint plus its active-connection accounting. Derefs to the
+/// chosen [`WorkerEndpoint`]; dropping the lease decrements that endpoint's
+/// in-flight count, so callers must hold it for the task's lifetime.
+pub struct EndpointLease {
+    index: usize,
+    inner: Arc<LbInner>,
+}
+
+impl std::ops::Deref for EndpointLease {
+    type Target = WorkerEndpoint;
+    fn deref(&self) -> &WorkerEndpoint {
+        &self.inner.endpoints[self.index]
+    }
+}
+
+impl Drop for EndpointLease {
+    fn drop(&mut self) {
+        self.inner.active[self.index].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl LoadBalancer {
+    pub fn new(endpoints: Vec<WorkerEndpoint>, strategy: LoadBalanceStrategy) -> Self {
+        assert!(
+            !endpoints.is_empty(),
+            "LoadBalancer requires at least one endpoint"
+        );
+        let active = (0..endpoints.len())
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>();
+        Self {
+            inner: Arc::new(LbInner { endpoints, active }),
+            strategy,
+            current_index: AtomicUsize::new(0),
+        }
+    }
+
+    /// Select the next endpoint and acquire an active-connection lease.
+    ///
+    /// - `RoundRobin`: cycles endpoints lock-free.
+    /// - `LeastConnections`: picks the endpoint with the fewest in-flight tasks
+    ///   (ties resolve to the lowest index).
+    ///
+    /// The returned lease must be held for the task's lifetime so the count
+    /// reflects actual load; it decrements on drop. For failover retries that
+    /// should skip a just-failed endpoint, use [`acquire_excluding`](Self::acquire_excluding).
+    pub fn acquire(&self) -> EndpointLease {
+        let len = self.inner.endpoints.len();
+        let idx = match self.strategy {
+            LoadBalanceStrategy::RoundRobin => {
+                self.current_index.fetch_add(1, Ordering::Relaxed) % len
+            }
+            LoadBalanceStrategy::LeastConnections => {
+                let mut best = 0usize;
+                let mut best_count = usize::MAX;
+                for (i, a) in self.inner.active.iter().enumerate() {
+                    let c = a.load(Ordering::Relaxed);
+                    if c < best_count {
+                        best_count = c;
+                        best = i;
+                    }
+                }
+                best
+            }
+        };
+        self.inner.active[idx].fetch_add(1, Ordering::Relaxed);
+        EndpointLease {
+            index: idx,
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Select an endpoint, skipping any whose URL is in `excluded_urls`. Used by
+    /// the failover retry loop to avoid re-trying an endpoint that just failed
+    /// (M9 circuit-breaker). If all endpoints are excluded, falls back to the
+    /// normal selection so we never deadlock.
+    pub fn acquire_excluding(&self, excluded_urls: &[String]) -> EndpointLease {
+        let len = self.inner.endpoints.len();
+        let idx = match self.strategy {
+            LoadBalanceStrategy::RoundRobin => {
+                self.current_index.fetch_add(1, Ordering::Relaxed) % len
+            }
+            LoadBalanceStrategy::LeastConnections => {
+                let mut best = 0usize;
+                let mut best_count = usize::MAX;
+                let mut found = false;
+                for (i, a) in self.inner.active.iter().enumerate() {
+                    if excluded_urls
+                        .iter()
+                        .any(|u| u == &self.inner.endpoints[i].url)
+                    {
+                        continue;
+                    }
+                    let c = a.load(Ordering::Relaxed);
+                    if c < best_count {
+                        best_count = c;
+                        best = i;
+                        found = true;
+                    }
+                }
+                if found {
+                    best
+                } else {
+                    self.current_index.fetch_add(1, Ordering::Relaxed) % len
+                }
+            }
+        };
+        self.inner.active[idx].fetch_add(1, Ordering::Relaxed);
+        EndpointLease {
+            index: idx,
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// In-flight task count for the endpoint currently at `index` (debug/observe).
+    pub fn active_for(&self, index: usize) -> usize {
+        self.inner
+            .active
+            .get(index)
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    pub fn endpoint_count(&self) -> usize {
+        self.inner.endpoints.len()
+    }
+
+    pub fn strategy(&self) -> LoadBalanceStrategy {
+        self.strategy.clone()
+    }
+}
+
+// ── Connection pool ────────────────────────────────────────────────
+
+use std::time::Instant;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+pub struct PooledConnection {
+    pub stream: WsStream,
+    pub worker_id: String,
+    last_used: Instant,
+}
+
+pub struct WorkerConnectionPool {
+    connections: Mutex<HashMap<String, Vec<PooledConnection>>>,
+    max_idle_per_endpoint: usize,
+    idle_timeout: Duration,
+}
+
+impl WorkerConnectionPool {
+    pub fn new(max_idle_per_endpoint: usize, idle_timeout: Duration) -> Self {
+        Self {
+            connections: Mutex::new(HashMap::new()),
+            max_idle_per_endpoint,
+            idle_timeout,
+        }
+    }
+
+    pub async fn try_acquire(&self, key: &str) -> Option<PooledConnection> {
+        let mut conns = self.connections.lock().await;
+        let pool = conns.get_mut(key)?;
+        pool.pop()
+    }
+
+    pub async fn release(&self, key: String, mut conn: PooledConnection) {
+        conn.last_used = Instant::now();
+        let mut conns = self.connections.lock().await;
+        let pool = conns.entry(key).or_default();
+        if pool.len() < self.max_idle_per_endpoint {
+            pool.push(conn);
+        }
+    }
+
+    pub async fn evict_stale(&self) {
+        let mut conns = self.connections.lock().await;
+        let cutoff = self.idle_timeout;
+        conns.retain(|_, pool| {
+            pool.retain(|c| c.last_used.elapsed() < cutoff);
+            !pool.is_empty()
+        });
+    }
+
+    pub async fn drain(&self) {
+        let mut conns = self.connections.lock().await;
+        for pool in conns.values_mut() {
+            for conn in pool.drain(..) {
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    let (mut sink, _read) = conn.stream.split();
+                    let _ = sink
+                        .send(tokio_tungstenite::tungstenite::Message::Close(None))
+                        .await;
+                })
+                .await;
+            }
+        }
+        conns.clear();
+    }
+
+    pub async fn pool_size(&self) -> usize {
+        let conns = self.connections.lock().await;
+        conns.values().map(|v| v.len()).sum()
+    }
+}
+
+// ── WebSocket task runner ───────────────────────────────────────────
+
+async fn connect_and_handshake(
+    url: &str,
+    auth_token: Option<&str>,
+    worker_name: &str,
+) -> Result<(WsStream, String), OrchestratorError> {
+    use tokio_tungstenite::tungstenite;
+
+    let uri = url.parse::<http::Uri>().map_err(|e| {
+        OrchestratorError::ExternalWorkerConnectionFailed {
+            worker_name: worker_name.to_string(),
+            reason: format!("invalid URL: {e}"),
+        }
+    })?;
+
+    // Offer both subprotocol names, preferred name first (RFC 6455 order).
+    // New workers echo `lunarwing-agent-v1`; pre-rename workers echo the
+    // legacy alias — tungstenite accepts either since both are in the offer.
+    let mut req_builder = http::Request::builder().uri(&uri).header(
+        "Sec-WebSocket-Protocol",
+        format!("{SUBPROTOCOL}, {SUBPROTOCOL_LEGACY}"),
+    );
+
+    if let Some(token) = auth_token {
+        req_builder = req_builder.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let host = uri.host().unwrap_or("localhost");
+    let port_suffix = uri.port_u16().map(|p| format!(":{p}")).unwrap_or_default();
+    req_builder = req_builder
+        .header("Host", format!("{host}{port_suffix}"))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header(
+            "Sec-WebSocket-Key",
+            tungstenite::handshake::client::generate_key(),
+        )
+        .header("Sec-WebSocket-Version", "13");
+
+    let ws_request =
+        req_builder
+            .body(())
+            .map_err(|e| OrchestratorError::ExternalWorkerConnectionFailed {
+                worker_name: worker_name.to_string(),
+                reason: format!("failed to build request: {e}"),
+            })?;
+
+    let connect_timeout = Duration::from_secs(15);
+    let (ws_stream, _response) = tokio::time::timeout(
+        connect_timeout,
+        tokio_tungstenite::connect_async(ws_request),
+    )
+    .await
+    .map_err(|_| OrchestratorError::ExternalWorkerConnectionFailed {
+        worker_name: worker_name.to_string(),
+        reason: "connection timed out (15s)".to_string(),
+    })?
+    .map_err(|e| OrchestratorError::ExternalWorkerConnectionFailed {
+        worker_name: worker_name.to_string(),
+        reason: e.to_string(),
+    })?;
+
+    let (write_half, mut read) = ws_stream.split();
+
+    let ready_timeout = Duration::from_secs(10);
+    let ready_msg = tokio::time::timeout(ready_timeout, read.next())
+        .await
+        .map_err(|_| OrchestratorError::ExternalWorkerProtocolError {
+            worker_name: worker_name.to_string(),
+            reason: "no ready message within 10s".to_string(),
+        })?
+        .ok_or_else(|| OrchestratorError::ExternalWorkerProtocolError {
+            worker_name: worker_name.to_string(),
+            reason: "connection closed before ready".to_string(),
+        })?
+        .map_err(|e| OrchestratorError::ExternalWorkerProtocolError {
+            worker_name: worker_name.to_string(),
+            reason: format!("WebSocket error: {e}"),
+        })?;
+
+    let ready_text =
+        ready_msg
+            .to_text()
+            .map_err(|e| OrchestratorError::ExternalWorkerProtocolError {
+                worker_name: worker_name.to_string(),
+                reason: format!("ready message not text: {e}"),
+            })?;
+
+    let ready_env: Envelope = serde_json::from_str(ready_text).map_err(|e| {
+        OrchestratorError::ExternalWorkerProtocolError {
+            worker_name: worker_name.to_string(),
+            reason: format!("invalid ready envelope: {e}"),
+        }
+    })?;
+
+    if ready_env.msg_type != "ready" {
+        return Err(OrchestratorError::ExternalWorkerProtocolError {
+            worker_name: worker_name.to_string(),
+            reason: format!("expected 'ready', got '{}'", ready_env.msg_type),
+        });
+    }
+
+    let ready: ReadyPayload = serde_json::from_value(ready_env.payload).map_err(|e| {
+        OrchestratorError::ExternalWorkerProtocolError {
+            worker_name: worker_name.to_string(),
+            reason: format!("invalid ready payload: {e}"),
+        }
+    })?;
+
+    let stream =
+        write_half
+            .reunite(read)
+            .map_err(|_| OrchestratorError::ExternalWorkerProtocolError {
+                worker_name: worker_name.to_string(),
+                reason: "failed to reunite WebSocket stream halves".to_string(),
+            })?;
+
+    Ok((stream, ready.worker_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_external_task(
+    job_id: Uuid,
+    url: &str,
+    auth_token: Option<&str>,
+    task: &str,
+    timeout_ms: u64,
+    worker_name: &str,
+    event_tx: Option<&broadcast::Sender<(Uuid, String, SseEvent)>>,
+    context_manager: Option<&Arc<ContextManager>>,
+    store: Option<&Arc<dyn Database>>,
+    cancel_rx: oneshot::Receiver<()>,
+    context: TaskContext,
+    pool: &WorkerConnectionPool,
+    pool_key: &str,
+) -> Result<ExternalTaskResult, OrchestratorError> {
+    use tokio_tungstenite::tungstenite;
+
+    // Try pooled connection first, fall back to fresh
+    let (mut write, mut read, worker_id, from_pool) =
+        if let Some(pooled) = pool.try_acquire(pool_key).await {
+            tracing::debug!("Reusing pooled connection for '{worker_name}'");
+            let wid = pooled.worker_id.clone();
+            let (w, r) = pooled.stream.split();
+            (w, r, wid, true)
+        } else {
+            let (stream, wid) = connect_and_handshake(url, auth_token, worker_name).await?;
+            let (w, r) = stream.split();
+            (w, r, wid, false)
+        };
+
+    let source = if from_pool { "pooled" } else { "new" };
+    tracing::info!(
+        "External worker '{}' ready (worker_id={}, connection={})",
+        worker_name,
+        worker_id,
+        source
+    );
+
+    // Emit job_started event
+    emit_event(
+        event_tx,
+        job_id,
+        SseEvent::JobStatus {
+            job_id: job_id.to_string(),
+            message: format!("Connected to external worker '{worker_name}'"),
+        },
+    );
+
+    // Send task_request
+    let task_request = Envelope::new(
+        "task_request",
+        serde_json::json!({
+            "task_id": job_id.to_string(),
+            "prompt": task,
+            "context": context,
+            "timeout_ms": timeout_ms,
+        }),
+    );
+
+    let msg = tungstenite::Message::Text(
+        serde_json::to_string(&task_request)
+            .map_err(|e| OrchestratorError::ExternalWorkerProtocolError {
+                worker_name: worker_name.to_string(),
+                reason: format!("failed to serialize task_request: {e}"),
+            })?
+            .into(),
+    );
+
+    write
+        .send(msg)
+        .await
+        .map_err(|e| OrchestratorError::ExternalWorkerProtocolError {
+            worker_name: worker_name.to_string(),
+            reason: format!("failed to send task_request: {e}"),
+        })?;
+
+    // Read messages until task_result or timeout
+    let task_timeout = Duration::from_millis(timeout_ms);
+    let mut accumulated_output = String::new();
+    let mut cancel_rx = cancel_rx;
+
+    let result = tokio::time::timeout(task_timeout, async {
+        loop {
+            tokio::select! {
+                msg = read.next() => {
+                    let Some(msg_result) = msg else {
+                        return Err(OrchestratorError::ExternalWorkerProtocolError {
+                            worker_name: worker_name.to_string(),
+                            reason: "connection closed unexpectedly".to_string(),
+                        });
+                    };
+
+                    let ws_msg = msg_result.map_err(|e| {
+                        OrchestratorError::ExternalWorkerProtocolError {
+                            worker_name: worker_name.to_string(),
+                            reason: format!("WebSocket error: {e}"),
+                        }
+                    })?;
+
+                    if ws_msg.is_close() {
+                        return Err(OrchestratorError::ExternalWorkerProtocolError {
+                            worker_name: worker_name.to_string(),
+                            reason: "connection closed by worker".to_string(),
+                        });
+                    }
+
+                    if ws_msg.is_ping() || ws_msg.is_pong() {
+                        continue;
+                    }
+
+                    let text = match ws_msg.to_text() {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+
+                    let env: Envelope = match serde_json::from_str(text) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!("Ignoring unparseable message from '{}': {}", worker_name, e);
+                            continue;
+                        }
+                    };
+
+                    match env.msg_type.as_str() {
+                        "task_progress" => {
+                            if let Ok(progress) = serde_json::from_value::<TaskProgressPayload>(env.payload) {
+                                accumulated_output.push_str(&progress.delta);
+
+                                emit_event(
+                                    event_tx,
+                                    job_id,
+                                    SseEvent::JobMessage {
+                                        job_id: job_id.to_string(),
+                                        content: progress.delta.clone(),
+                                        role: "assistant".to_string(),
+                                    },
+                                );
+
+                                // Persist as job event
+                                persist_event(store, job_id, "message", &progress.delta).await;
+                            }
+                        }
+                        "task_result" => {
+                            let result: TaskResultPayload =
+                                serde_json::from_value(env.payload).map_err(|e| {
+                                    OrchestratorError::ExternalWorkerProtocolError {
+                                        worker_name: worker_name.to_string(),
+                                        reason: format!("invalid task_result: {e}"),
+                                    }
+                                })?;
+
+                            let final_output = if result.output.is_empty() {
+                                accumulated_output.clone()
+                            } else {
+                                result.output.clone()
+                            };
+
+                            let status = match result.status.as_str() {
+                                "success" => ExternalTaskStatus::Success,
+                                "cancelled" => ExternalTaskStatus::Cancelled,
+                                _ => ExternalTaskStatus::Failed,
+                            };
+
+                            return Ok(ExternalTaskResult {
+                                status,
+                                output: final_output,
+                                error: result.error,
+                                duration_ms: result.duration_ms,
+                            });
+                        }
+                        "pong" => {}
+                        other => {
+                            tracing::debug!("Unknown message type '{}' from '{}'", other, worker_name);
+                        }
+                    }
+                }
+                _ = &mut cancel_rx => {
+                    // Send cancel envelope
+                    let cancel_env = Envelope::new(
+                        "cancel",
+                        serde_json::json!({ "task_id": job_id.to_string() }),
+                    );
+                    if let Ok(json) = serde_json::to_string(&cancel_env) {
+                        let _ = write.send(tungstenite::Message::Text(json.into())).await;
+                    }
+                    return Ok(ExternalTaskResult {
+                        status: ExternalTaskStatus::Cancelled,
+                        output: accumulated_output.clone(),
+                        error: None,
+                        duration_ms: 0,
+                    });
+                }
+            }
+        }
+    })
+    .await;
+
+    let task_result = match result {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(OrchestratorError::ExternalWorkerTimeout {
+                worker_name: worker_name.to_string(),
+                job_id,
+            });
+        }
+    };
+
+    // Update context manager state
+    let success = matches!(task_result.status, ExternalTaskStatus::Success);
+    let final_state = if success {
+        JobState::Completed
+    } else {
+        JobState::Failed
+    };
+
+    if let Some(cm) = context_manager {
+        let _ = cm
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(final_state, task_result.error.clone())
+            })
+            .await;
+    }
+
+    // Persist final event
+    let final_msg = if success {
+        format!("Completed: {}", task_result.output)
+    } else {
+        format!(
+            "Failed: {}",
+            task_result.error.as_deref().unwrap_or("unknown error")
+        )
+    };
+    persist_event(store, job_id, "result", &final_msg).await;
+
+    // Emit final SSE event
+    let status_str = if success { "completed" } else { "failed" };
+    emit_event(
+        event_tx,
+        job_id,
+        SseEvent::JobResult {
+            job_id: job_id.to_string(),
+            status: status_str.to_string(),
+            session_id: None,
+            fallback_deliverable: None,
+        },
+    );
+
+    // Update DB job record
+    if let Some(db) = store {
+        let status = if success { "completed" } else { "failed" };
+        let _ = db
+            .update_sandbox_job_status(
+                job_id,
+                status,
+                Some(success),
+                task_result.error.as_deref(),
+                None,
+                Some(Utc::now()),
+            )
+            .await;
+    }
+
+    // Return the connection to the pool for reuse on successful tasks.
+    // On failure/cancel/timeout paths the connection may be in an
+    // indeterminate state, so we drop it instead of risking corruption.
+    if success {
+        match write.reunite(read) {
+            Ok(stream) => {
+                tracing::debug!(
+                    "Returning connection to pool for '{worker_name}' (key={pool_key})"
+                );
+                pool.release(
+                    pool_key.to_string(),
+                    PooledConnection {
+                        stream,
+                        worker_id,
+                        last_used: std::time::Instant::now(),
+                    },
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to reunite WebSocket halves for '{worker_name}': {e}");
+            }
+        }
+    }
+
+    Ok(task_result)
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+fn emit_event(
+    tx: Option<&broadcast::Sender<(Uuid, String, SseEvent)>>,
+    job_id: Uuid,
+    event: SseEvent,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.send((job_id, "external".to_string(), event));
+    }
+}
+
+async fn persist_event(
+    store: Option<&Arc<dyn Database>>,
+    job_id: Uuid,
+    event_type: &str,
+    data: &str,
+) {
+    if let Some(db) = store {
+        let value = serde_json::json!({ "content": data });
+        let _ = db.save_job_event(job_id, event_type, &value).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LoadBalanceStrategy;
+
+    #[test]
+    fn envelope_serialization() {
+        let env = Envelope::new("task_request", serde_json::json!({"prompt": "hello"}));
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"task_request\""));
+        assert!(json.contains("\"prompt\":\"hello\""));
+    }
+
+    #[test]
+    fn envelope_deserialization() {
+        let json = r#"{"id":"abc","type":"ready","timestamp":"2026-01-01T00:00:00Z","payload":{"worker_id":"w1","version":"1.0","mode":"websocket"}}"#;
+        let env: Envelope = serde_json::from_str(json).unwrap();
+        assert_eq!(env.msg_type, "ready");
+        let ready: ReadyPayload = serde_json::from_value(env.payload).unwrap();
+        assert_eq!(ready.worker_id, "w1");
+    }
+
+    #[test]
+    fn task_result_deserialization() {
+        let json = r#"{"task_id":"abc","status":"success","output":"done","error":null,"duration_ms":1234}"#;
+        let result: TaskResultPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(result.status, "success");
+        assert_eq!(result.output, "done");
+        assert!(result.error.is_none());
+        assert_eq!(result.duration_ms, 1234);
+    }
+
+    #[test]
+    fn manager_new_empty() {
+        let mgr = ExternalWorkerManager::new(vec![]);
+        assert!(mgr.is_empty());
+        assert!(mgr.get_worker("nanocode").is_none());
+    }
+
+    #[test]
+    fn manager_new_with_workers() {
+        let mgr = ExternalWorkerManager::new(vec![
+            ExternalWorkerConfig {
+                name: "nanocode".to_string(),
+                url: "ws://localhost:9090/ws/agent".to_string(),
+                auth_token: Some(secrecy::SecretString::from("tok")),
+                timeout_ms: 300_000,
+                endpoints: vec![],
+                load_balance: LoadBalanceStrategy::default(),
+            },
+            ExternalWorkerConfig {
+                name: "pebble".to_string(),
+                url: "ws://localhost:8443".to_string(),
+                auth_token: None,
+                timeout_ms: 600_000,
+                endpoints: vec![],
+                load_balance: LoadBalanceStrategy::default(),
+            },
+        ]);
+        assert!(!mgr.is_empty());
+        assert!(mgr.get_worker("nanocode").is_some());
+        assert!(mgr.get_worker("pebble").is_some());
+        assert!(mgr.get_worker("unknown").is_none());
+        assert_eq!(mgr.worker_names().len(), 2);
+    }
+
+    #[test]
+    fn job_mode_db_roundtrip() {
+        use crate::orchestrator::job_manager::JobMode;
+        let ext = JobMode::External("nanocode".to_string());
+        assert_eq!(ext.db_value(), "external:nanocode");
+        assert_eq!(JobMode::from_db_value("external:nanocode"), ext);
+
+        let worker = JobMode::Worker;
+        assert_eq!(worker.db_value(), "worker");
+        assert_eq!(JobMode::from_db_value("worker"), worker);
+    }
+
+    #[test]
+    fn task_context_full_roundtrip() {
+        let ctx = TaskContext {
+            project_dir: Some("/workspace/myproject".to_string()),
+            conversation_history: vec![
+                ConversationMessage {
+                    role: "user".to_string(),
+                    content: "fix the bug".to_string(),
+                },
+                ConversationMessage {
+                    role: "assistant".to_string(),
+                    content: "working on it".to_string(),
+                },
+            ],
+            environment: [("API_KEY".to_string(), "secret123".to_string())]
+                .into_iter()
+                .collect(),
+            user_id: "user-42".to_string(),
+            metadata: [("priority".to_string(), "high".to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        let json = serde_json::to_string(&ctx).unwrap();
+        let deserialized: TaskContext = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            deserialized.project_dir,
+            Some("/workspace/myproject".to_string())
+        );
+        assert_eq!(deserialized.conversation_history.len(), 2);
+        assert_eq!(deserialized.conversation_history[0].role, "user");
+        assert_eq!(deserialized.conversation_history[0].content, "fix the bug");
+        assert_eq!(
+            deserialized.environment.get("API_KEY"),
+            Some(&"secret123".to_string())
+        );
+        assert_eq!(deserialized.user_id, "user-42");
+        assert_eq!(
+            deserialized.metadata.get("priority"),
+            Some(&"high".to_string())
+        );
+    }
+
+    #[test]
+    fn task_context_backward_compat() {
+        let json = r#"{}"#;
+        let ctx: TaskContext = serde_json::from_str(json).unwrap();
+
+        assert_eq!(ctx.project_dir, None);
+        assert!(ctx.conversation_history.is_empty());
+        assert!(ctx.environment.is_empty());
+        assert_eq!(ctx.user_id, "");
+        assert!(ctx.metadata.is_empty());
+    }
+
+    #[test]
+    fn task_status_enum_serde() {
+        assert_eq!(
+            serde_json::to_string(&ExternalTaskStatus::Success).unwrap(),
+            "\"success\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExternalTaskStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExternalTaskStatus::Cancelled).unwrap(),
+            "\"cancelled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExternalTaskStatus::TimedOut).unwrap(),
+            "\"timed_out\""
+        );
+        let partial_json =
+            serde_json::to_string(&ExternalTaskStatus::Partial("wip".to_string())).unwrap();
+        assert!(partial_json.contains("partial"));
+        assert!(partial_json.contains("wip"));
+
+        let success: ExternalTaskStatus = serde_json::from_str("\"success\"").unwrap();
+        assert_eq!(success, ExternalTaskStatus::Success);
+
+        let failed: ExternalTaskStatus = serde_json::from_str("\"failed\"").unwrap();
+        assert_eq!(failed, ExternalTaskStatus::Failed);
+        let cancelled: ExternalTaskStatus = serde_json::from_str("\"cancelled\"").unwrap();
+        assert_eq!(cancelled, ExternalTaskStatus::Cancelled);
+        let timed_out: ExternalTaskStatus = serde_json::from_str("\"timed_out\"").unwrap();
+        assert_eq!(timed_out, ExternalTaskStatus::TimedOut);
+    }
+
+    #[test]
+    fn task_status_enum_matching() {
+        let success = ExternalTaskStatus::Success;
+        let failed = ExternalTaskStatus::Failed;
+        let cancelled = ExternalTaskStatus::Cancelled;
+
+        assert!(matches!(success, ExternalTaskStatus::Success));
+        assert!(!matches!(failed, ExternalTaskStatus::Success));
+        assert!(!matches!(cancelled, ExternalTaskStatus::Success));
+    }
+
+    #[test]
+    fn load_balancer_round_robin() {
+        use crate::config::WorkerEndpoint;
+
+        let endpoints = vec![
+            WorkerEndpoint {
+                url: "ws://a:9090".to_string(),
+                auth_token: None,
+                weight: None,
+            },
+            WorkerEndpoint {
+                url: "ws://b:9090".to_string(),
+                auth_token: None,
+                weight: None,
+            },
+            WorkerEndpoint {
+                url: "ws://c:9090".to_string(),
+                auth_token: None,
+                weight: None,
+            },
+        ];
+        let lb = LoadBalancer::new(endpoints, LoadBalanceStrategy::RoundRobin);
+
+        assert_eq!(lb.acquire().url, "ws://a:9090");
+        assert_eq!(lb.acquire().url, "ws://b:9090");
+        assert_eq!(lb.acquire().url, "ws://c:9090");
+        assert_eq!(lb.acquire().url, "ws://a:9090");
+        assert_eq!(lb.acquire().url, "ws://b:9090");
+        assert_eq!(lb.acquire().url, "ws://c:9090");
+    }
+
+    #[test]
+    fn load_balancer_single_endpoint() {
+        use crate::config::WorkerEndpoint;
+
+        let endpoints = vec![WorkerEndpoint {
+            url: "ws://only:9090".to_string(),
+            auth_token: None,
+            weight: None,
+        }];
+        let lb = LoadBalancer::new(endpoints, LoadBalanceStrategy::RoundRobin);
+
+        for _ in 0..10 {
+            assert_eq!(lb.acquire().url, "ws://only:9090");
+        }
+    }
+
+    #[test]
+    fn load_balancer_least_connections_picks_least_loaded() {
+        // Regression for H3: LeastConnections must select by in-flight count,
+        // not silently round-robin.
+        // Noted in audit document for Jun 23 2026
+        use crate::config::WorkerEndpoint;
+
+        let endpoints = vec![
+            WorkerEndpoint {
+                url: "ws://a".to_string(),
+                auth_token: None,
+                weight: None,
+            },
+            WorkerEndpoint {
+                url: "ws://b".to_string(),
+                auth_token: None,
+                weight: None,
+            },
+            WorkerEndpoint {
+                url: "ws://c".to_string(),
+                auth_token: None,
+                weight: None,
+            },
+        ];
+        let lb = LoadBalancer::new(endpoints, LoadBalanceStrategy::LeastConnections);
+
+        // All zero: tie resolves to lowest index (a).
+        let l0 = lb.acquire();
+        assert_eq!(l0.url, "ws://a");
+        assert_eq!(lb.active_for(0), 1);
+
+        // a=1, b=0, c=0 -> pick b (lowest of the zeros).
+        let l1 = lb.acquire();
+        assert_eq!(l1.url, "ws://b");
+        assert_eq!(lb.active_for(1), 1);
+
+        // a=1, b=1, c=0 -> pick c.
+        let l2 = lb.acquire();
+        assert_eq!(l2.url, "ws://c");
+        assert_eq!(lb.active_for(2), 1);
+
+        // a=1, b=1, c=1 -> tie, lowest index a.
+        let l3 = lb.acquire();
+        assert_eq!(l3.url, "ws://a");
+        assert_eq!(lb.active_for(0), 2);
+        assert_eq!(lb.active_for(1), 1);
+        assert_eq!(lb.active_for(2), 1);
+    }
+
+    #[test]
+    fn load_balancer_lease_release_on_drop() {
+        // Holding a lease bumps the count; dropping it restores the count so the
+        // next LeastConnections pick returns to the released endpoint.
+        use crate::config::WorkerEndpoint;
+
+        let endpoints = vec![
+            WorkerEndpoint {
+                url: "ws://a".to_string(),
+                auth_token: None,
+                weight: None,
+            },
+            WorkerEndpoint {
+                url: "ws://b".to_string(),
+                auth_token: None,
+                weight: None,
+            },
+        ];
+        let lb = LoadBalancer::new(endpoints, LoadBalanceStrategy::LeastConnections);
+
+        // Pin a load on endpoint a.
+        let held = lb.acquire();
+        assert_eq!(held.url, "ws://a");
+        assert_eq!(lb.active_for(0), 1);
+
+        // While a is loaded, b is preferred.
+        let _b = lb.acquire();
+        assert_eq!(_b.url, "ws://b");
+        assert_eq!(lb.active_for(1), 1);
+
+        // Dropping the a-lease makes a least-loaded again.
+        drop(held);
+        assert_eq!(lb.active_for(0), 0);
+
+        let next = lb.acquire();
+        assert_eq!(next.url, "ws://a");
+        assert_eq!(lb.active_for(0), 1);
+    }
+
+    #[test]
+    fn load_balancer_strategies_diverge() {
+        // Concrete demonstration that H3 is fixed: the same acquire sequence
+        // yields different endpoints under the two strategies.
+        use crate::config::WorkerEndpoint;
+
+        let mk = || {
+            vec![
+                WorkerEndpoint {
+                    url: "ws://a".to_string(),
+                    auth_token: None,
+                    weight: None,
+                },
+                WorkerEndpoint {
+                    url: "ws://b".to_string(),
+                    auth_token: None,
+                    weight: None,
+                },
+            ]
+        };
+
+        // RoundRobin: a, b, a, b ...
+        let rr = LoadBalancer::new(mk(), LoadBalanceStrategy::RoundRobin);
+        assert_eq!(rr.acquire().url, "ws://a");
+        assert_eq!(rr.acquire().url, "ws://b");
+        assert_eq!(rr.acquire().url, "ws://a");
+
+        // LeastConnections with leases held: a, b, b, b ... (a stays loaded, so
+        // every subsequent pick prefers the least-loaded b).
+        let lc = LoadBalancer::new(mk(), LoadBalanceStrategy::LeastConnections);
+        let _hold_a = lc.acquire();
+        assert_eq!(_hold_a.url, "ws://a");
+        assert_eq!(lc.acquire().url, "ws://b");
+        assert_eq!(lc.acquire().url, "ws://b");
+    }
+
+    #[test]
+    fn endpoint_lease_is_send_sync() {
+        // EndpointLease must be Send+Sync so it can move into tokio::spawn on
+        // the fire-and-forget path and decrement across threads on drop.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<EndpointLease>();
+    }
+
+    #[test]
+    fn build_task_context_populates_fields() {
+        let env: HashMap<String, String> = [("API_KEY".to_string(), "secret".to_string())]
+            .into_iter()
+            .collect();
+        let history = vec![ConversationMessage {
+            role: "user".to_string(),
+            content: "do the thing".to_string(),
+        }];
+        let meta: HashMap<String, String> = [("priority".to_string(), "high".to_string())]
+            .into_iter()
+            .collect();
+
+        let ctx = build_task_context("user-1", Some("/workspace"), env, history, meta);
+
+        assert_eq!(ctx.user_id, "user-1");
+        assert_eq!(ctx.project_dir.as_deref(), Some("/workspace"));
+        assert_eq!(ctx.environment.get("API_KEY").unwrap(), "secret");
+        assert_eq!(ctx.conversation_history.len(), 1);
+        assert_eq!(ctx.conversation_history[0].content, "do the thing");
+        assert_eq!(ctx.metadata.get("priority").unwrap(), "high");
+    }
+
+    #[test]
+    fn build_task_context_defaults() {
+        let ctx = build_task_context("u", None, HashMap::new(), vec![], HashMap::new());
+
+        assert_eq!(ctx.user_id, "u");
+        assert!(ctx.project_dir.is_none());
+        assert!(ctx.environment.is_empty());
+        assert!(ctx.conversation_history.is_empty());
+        assert!(ctx.metadata.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pool_try_acquire_empty_returns_none() {
+        let pool = WorkerConnectionPool::new(2, Duration::from_secs(60));
+        assert!(
+            pool.try_acquire("nanocode:ws://localhost:9090")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_evict_stale_removes_old() {
+        let pool = WorkerConnectionPool::new(2, Duration::from_millis(1));
+        // Pool is empty, evict should be a no-op
+        pool.evict_stale().await;
+        assert_eq!(pool.pool_size().await, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_drain_empties_all() {
+        let pool = WorkerConnectionPool::new(2, Duration::from_secs(300));
+        pool.drain().await;
+        assert_eq!(pool.pool_size().await, 0);
+    }
+
+    #[test]
+    fn manager_initializes_load_balancers() {
+        use crate::config::WorkerEndpoint;
+
+        let mgr = ExternalWorkerManager::new(vec![ExternalWorkerConfig {
+            name: "multi".to_string(),
+            url: "ws://fallback:9090".to_string(),
+            auth_token: None,
+            timeout_ms: 300_000,
+            endpoints: vec![
+                WorkerEndpoint {
+                    url: "ws://a:9090".to_string(),
+                    auth_token: None,
+                    weight: None,
+                },
+                WorkerEndpoint {
+                    url: "ws://b:9090".to_string(),
+                    auth_token: None,
+                    weight: None,
+                },
+            ],
+            load_balance: LoadBalanceStrategy::default(),
+        }]);
+
+        let lb = mgr.load_balancers.get("multi").unwrap();
+        assert_eq!(lb.endpoint_count(), 2);
+        assert_eq!(lb.acquire().url, "ws://a:9090");
+        assert_eq!(lb.acquire().url, "ws://b:9090");
+        assert_eq!(lb.acquire().url, "ws://a:9090");
+    }
+
+    #[test]
+    fn extract_host_parses_ws_urls() {
+        assert_eq!(
+            extract_host("ws://127.0.0.1:9090/ws/agent"),
+            Some("127.0.0.1".to_string())
+        );
+        assert_eq!(
+            extract_host("wss://worker.example.com:443/ws"),
+            Some("worker.example.com".to_string())
+        );
+        assert_eq!(
+            extract_host("ws://localhost/path"),
+            Some("localhost".to_string())
+        );
+        assert!(extract_host("not-a-url").is_none());
+    }
+
+    #[test]
+    fn is_loopback_detects_local_hosts() {
+        assert!(is_loopback("127.0.0.1"));
+        assert!(is_loopback("localhost"));
+        assert!(is_loopback("::1"));
+        assert!(is_loopback("[::1]"));
+        assert!(!is_loopback("worker.example.com"));
+        assert!(!is_loopback("192.168.1.100"));
+    }
+}

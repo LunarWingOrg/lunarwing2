@@ -1,0 +1,23 @@
+# Local development only — do NOT use these credentials in production.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      # NOTE: existing dev pgdata volumes created before the ironclaw->lunarwing
+      # rename keep the old "ironclaw" DB/role. Either recreate the volume
+      # (docker compose down -v) or keep DATABASE_URL pointing at the old names.
+      POSTGRES_DB: lunarwing
+      POSTGRES_USER: lunarwing
+      POSTGRES_PASSWORD: lunarwing  # dev-only, change for any non-local deployment
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lunarwing"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:

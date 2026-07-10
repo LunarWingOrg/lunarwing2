@@ -1,0 +1,36 @@
+services:
+  ocr-sidecar:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lunarwing/vision-service
+    container_name: lunarwing-ocr-sidecar
+    ports:
+      - "8088:8088"
+      - "8089:8089"
+    environment:
+      - LUNARWING_AUTH_TOKEN=${LUNARWING_AUTH_TOKEN:?Set LUNARWING_AUTH_TOKEN}
+      - OCR_PORT=8088
+      - OCR_HEALTH_PORT=8089
+      - VL_URL=${VL_URL:-}
+      - VL_API_KEY=${VL_API_KEY:-}
+      - VL_MODEL=${VL_MODEL:-qwen3-vl}
+      - VL_TIMEOUT_SECS=${VL_TIMEOUT_SECS:-30}
+      - ENABLE_PADDLEOCR=${ENABLE_PADDLEOCR:-false}
+      - ENABLE_CACHE=${ENABLE_CACHE:-true}
+      - ENABLE_PROMETHEUS=${ENABLE_PROMETHEUS:-true}
+      - RATE_LIMIT_PER_SECOND=${RATE_LIMIT_PER_SECOND:-10}
+      - CACHE_PERSIST=${CACHE_PERSIST:-true}
+      - CACHE_DIR=${CACHE_DIR:-/app/cache}
+    volumes:
+      - ocr_cache:/app/cache
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8089/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  ocr_cache:
