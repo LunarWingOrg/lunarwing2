@@ -85,6 +85,10 @@
 #HEALTH_LUNARVISION_ENABLED=true
 
 # Sidecar base URL (where the OCR/VL service is listening).
+# Single-node override only. On multi-tenant hosts leave this UNSET so the
+# check discovers each tenant's vision_health port from the ports registry
+# (SELF_HEAL_TENANTS_FILE / /etc/lunarwing/ports.json). Default single-node
+# fallback is http://127.0.0.1:8088 when no registry ports exist.
 #HEALTH_LUNARVISION_URL="http://127.0.0.1:8088"
 
 # curl timeout in seconds for /health and /vision/metrics probes.
