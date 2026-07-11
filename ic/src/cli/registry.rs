@@ -55,6 +55,9 @@ pub enum RegistryCommand {
         #[arg(long)]
         build: bool,
     },
+
+    /// Validate all registry manifests for structural correctness
+    Validate,
 }
 
 /// Run a registry command.
@@ -85,6 +88,7 @@ pub async fn run_registry_command(cmd: RegistryCommand) -> anyhow::Result<()> {
         RegistryCommand::InstallDefaults { force, build } => {
             cmd_install(&catalog, &repo_root, "lunarwing", force, build).await
         }
+        RegistryCommand::Validate => cmd_validate(&catalog),
     }
 }
 
@@ -259,6 +263,23 @@ fn cmd_info(catalog: &RegistryCatalog, name: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn cmd_validate(catalog: &RegistryCatalog) -> anyhow::Result<()> {
+    let outcome = catalog.validate_all();
+    if outcome.is_clean() {
+        println!("Registry validation passed: 0 findings.");
+        return Ok(());
+    }
+    println!(
+        "Registry validation found {} finding(s) across {} manifest(s):\n",
+        outcome.findings.len(),
+        outcome.affected_count()
+    );
+    for finding in &outcome.findings {
+        println!("  [{}] {}", finding.manifest_key, finding.message);
+    }
+    anyhow::bail!("Registry validation failed with {} finding(s)", outcome.findings.len());
 }
 
 async fn cmd_install(

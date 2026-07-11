@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::registry::embedded;
-use crate::registry::manifest::{BundleDefinition, BundlesFile, ExtensionManifest, ManifestKind};
+use crate::registry::manifest::{
+    BundleDefinition, BundlesFile, ExtensionManifest, ManifestKind, McpManifestTransport,
+};
 
 /// Error type for registry operations.
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +87,37 @@ pub enum RegistryError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// A single registry validation finding.
+#[derive(Debug, Clone)]
+pub struct ValidationFinding {
+    /// Manifest key or bare name identifying the entry (e.g. "mcp-servers/foo").
+    pub manifest_key: String,
+    /// Human-readable description of the problem.
+    pub message: String,
+}
+
+/// Result of validating every manifest in the catalog.
+#[derive(Debug, Clone, Default)]
+pub struct ValidationOutcome {
+    /// All findings, grouped by manifest.
+    pub findings: Vec<ValidationFinding>,
+}
+
+impl ValidationOutcome {
+    /// Returns `true` when no findings were produced.
+    pub fn is_clean(&self) -> bool {
+        self.findings.is_empty()
+    }
+
+    /// Number of manifests with at least one finding.
+    pub fn affected_count(&self) -> usize {
+        let mut keys: Vec<&str> = self.findings.iter().map(|f| f.manifest_key.as_str()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.len()
+    }
 }
 
 /// Central catalog loaded from the `registry/` directory.
@@ -500,6 +533,126 @@ impl RegistryCatalog {
         let manifest = self.get_strict(name)?;
         Ok((vec![manifest], None))
     }
+
+    /// Validate every manifest in the catalog, returning findings for:
+    ///
+    /// - MCP manifests declaring both `url` and `transport`, or neither.
+    /// - Stdio manifests with empty commands, NUL bytes, or invalid env names.
+    /// - MCP manifests whose `auth` field contradicts the transport (e.g.
+    ///   stdio servers with `auth: dcr`).
+    /// - Duplicate bare names across different kind prefixes.
+    pub fn validate_all(&self) -> ValidationOutcome {
+        let mut findings = Vec::new();
+
+        for (key, manifest) in &self.manifests {
+            validate_single_manifest(key, manifest, &mut findings);
+        }
+
+        let mut seen_names: HashMap<String, Vec<&str>> = HashMap::new();
+        for (key, manifest) in &self.manifests {
+            let prefix = key.split('/').next().unwrap_or(key);
+            seen_names
+                .entry(manifest.name.clone())
+                .or_default()
+                .push(prefix);
+        }
+        for (name, prefixes) in &seen_names {
+            if prefixes.len() > 1 {
+                let mut sorted = prefixes.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                findings.push(ValidationFinding {
+                    manifest_key: name.clone(),
+                    message: format!(
+                        "Duplicate name '{}' appears under prefixes: {}",
+                        name,
+                        sorted.join(", ")
+                    ),
+                });
+            }
+        }
+
+        findings.sort_by(|a, b| a.manifest_key.cmp(&b.manifest_key).then(a.message.cmp(&b.message)));
+        ValidationOutcome { findings }
+    }
+}
+
+fn validate_single_manifest(
+    key: &str,
+    manifest: &ExtensionManifest,
+    findings: &mut Vec<ValidationFinding>,
+) {
+    if manifest.kind == ManifestKind::McpServer {
+        validate_mcp_manifest(key, manifest, findings);
+    }
+}
+
+fn validate_mcp_manifest(
+    key: &str,
+    manifest: &ExtensionManifest,
+    findings: &mut Vec<ValidationFinding>,
+) {
+    let has_url = manifest.url.is_some();
+    let has_transport = manifest.transport.is_some();
+
+    if has_url && has_transport {
+        findings.push(ValidationFinding {
+            manifest_key: key.to_string(),
+            message: "MCP manifest declares both 'url' and 'transport'; exactly one is required"
+                .to_string(),
+        });
+        return;
+    }
+    if !has_url && !has_transport {
+        findings.push(ValidationFinding {
+            manifest_key: key.to_string(),
+            message: "MCP manifest declares neither 'url' nor 'transport'; exactly one is required"
+                .to_string(),
+        });
+        return;
+    }
+
+    if let Some(McpManifestTransport::Stdio { command, args, env }) = &manifest.transport {
+        if command.is_empty() {
+            findings.push(ValidationFinding {
+                manifest_key: key.to_string(),
+                message: "stdio transport command cannot be empty".to_string(),
+            });
+        }
+        if command.contains('\0') || args.iter().any(|a| a.contains('\0')) {
+            findings.push(ValidationFinding {
+                manifest_key: key.to_string(),
+                message: "stdio command and arguments cannot contain NUL bytes".to_string(),
+            });
+        }
+        for (name, value) in env {
+            if name.is_empty() || name.contains(['=', '\0']) {
+                findings.push(ValidationFinding {
+                    manifest_key: key.to_string(),
+                    message: format!("invalid stdio environment variable name '{name}'"),
+                });
+            }
+            if value.contains('\0') {
+                findings.push(ValidationFinding {
+                    manifest_key: key.to_string(),
+                    message: format!(
+                        "stdio environment variable '{name}' contains a NUL byte"
+                    ),
+                });
+            }
+        }
+
+        if let Some(auth) = &manifest.auth {
+            if auth != "none" {
+                findings.push(ValidationFinding {
+                    manifest_key: key.to_string(),
+                    message: format!(
+                        "stdio MCP manifest should use auth 'none', got '{auth}'"
+                    ),
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -744,7 +897,6 @@ mod tests {
 
     #[test]
     fn test_bundle_entries_resolve_against_real_registry() {
-        // Load the actual registry/ directory (catches stale bundle refs after renames)
         let catalog = RegistryCatalog::load_or_embedded().unwrap();
 
         for bundle_name in catalog.bundle_names() {
@@ -762,5 +914,131 @@ mod tests {
                 bundle_name
             );
         }
+    }
+
+    fn write_mcp_manifest(dir: &Path, filename: &str, json: &str) {
+        let mcp_dir = dir.join("mcp-servers");
+        std::fs::create_dir_all(&mcp_dir).unwrap();
+        std::fs::write(mcp_dir.join(filename), json).unwrap();
+    }
+
+    #[test]
+    fn test_validate_clean_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_registry(tmp.path());
+
+        let catalog = RegistryCatalog::load(tmp.path()).unwrap();
+        let outcome = catalog.validate_all();
+        assert!(
+            outcome.is_clean(),
+            "expected no findings, got: {:?}",
+            outcome.findings
+        );
+    }
+
+    #[test]
+    fn test_validate_mcp_both_url_and_transport() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_mcp_manifest(
+            tmp.path(),
+            "bad.json",
+            r#"{"name":"bad","display_name":"Bad","kind":"mcp_server",
+            "description":"d","keywords":[],
+            "url":"https://example.com/mcp",
+            "transport":{"type":"stdio","command":"node","args":[],"env":{}}}"#,
+        );
+
+        let catalog = RegistryCatalog::load(tmp.path()).unwrap();
+        let outcome = catalog.validate_all();
+        assert_eq!(outcome.findings.len(), 1);
+        assert!(outcome.findings[0].message.contains("both"));
+    }
+
+    #[test]
+    fn test_validate_mcp_neither_url_nor_transport() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_mcp_manifest(
+            tmp.path(),
+            "bare.json",
+            r#"{"name":"bare","display_name":"Bare","kind":"mcp_server",
+            "description":"d","keywords":[]}"#,
+        );
+
+        let catalog = RegistryCatalog::load(tmp.path()).unwrap();
+        let outcome = catalog.validate_all();
+        assert_eq!(outcome.findings.len(), 1);
+        assert!(outcome.findings[0].message.contains("neither"));
+    }
+
+    #[test]
+    fn test_validate_stdio_empty_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_mcp_manifest(
+            tmp.path(),
+            "empty.json",
+            r#"{"name":"empty","display_name":"Empty","kind":"mcp_server",
+            "description":"d","keywords":[],
+            "transport":{"type":"stdio","command":"","args":[],"env":{}}}"#,
+        );
+
+        let catalog = RegistryCatalog::load(tmp.path()).unwrap();
+        let outcome = catalog.validate_all();
+        assert_eq!(outcome.findings.len(), 1);
+        assert!(outcome.findings[0].message.contains("empty"));
+    }
+
+    #[test]
+    fn test_validate_stdio_auth_not_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_mcp_manifest(
+            tmp.path(),
+            "authed.json",
+            r#"{"name":"authed","display_name":"Authed","kind":"mcp_server",
+            "description":"d","keywords":[],
+            "transport":{"type":"stdio","command":"node","args":[],"env":{}},
+            "auth":"dcr"}"#,
+        );
+
+        let catalog = RegistryCatalog::load(tmp.path()).unwrap();
+        let outcome = catalog.validate_all();
+        assert_eq!(outcome.findings.len(), 1);
+        assert!(outcome.findings[0].message.contains("auth 'none'"));
+    }
+
+    #[test]
+    fn test_validate_duplicate_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_registry(tmp.path());
+        write_mcp_manifest(
+            tmp.path(),
+            "gotify.json",
+            r#"{"name":"gotify","display_name":"Gotify MCP","kind":"mcp_server",
+            "description":"d","keywords":[],"url":"https://mcp.gotify.com","auth":"dcr"}"#,
+        );
+
+        let catalog = RegistryCatalog::load(tmp.path()).unwrap();
+        let outcome = catalog.validate_all();
+        let dup_findings: Vec<_> = outcome
+            .findings
+            .iter()
+            .filter(|f| f.message.contains("Duplicate"))
+            .collect();
+        assert_eq!(dup_findings.len(), 1);
+    }
+
+    #[test]
+    fn test_validate_real_embedded_catalog() {
+        let catalog = RegistryCatalog::load_or_embedded().unwrap();
+        let outcome = catalog.validate_all();
+        assert!(
+            outcome.is_clean(),
+            "embedded registry has validation findings:\n{}",
+            outcome
+                .findings
+                .iter()
+                .map(|f| format!("  [{}] {}", f.manifest_key, f.message))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 }
