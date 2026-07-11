@@ -225,5 +225,18 @@ class TestSecretsHelpers(unittest.TestCase):
         self.assertEqual(mask_secret(""), "")
 
 
+def load_tests(
+    loader: unittest.TestLoader,
+    standard_tests: unittest.TestSuite,
+    pattern: str | None,
+) -> unittest.TestSuite:
+    """Include focused feature modules in the package test entrypoint."""
+    _ = pattern
+    from lunarwing_mt_onboard import import_tenant_tests
+
+    standard_tests.addTests(loader.loadTestsFromModule(import_tenant_tests))
+    return standard_tests
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,11 +1,12 @@
-"""Mode runners: translate a request into reused provisioner/upgrade/export
+"""Mode runners: translate a request into reused provisioner/upgrade/export/import
 calls, streaming per-phase events to the job queue and auditing everything.
 
 These mirror the sequences in ``lunarwing_mt_onboard.provisioner.provision`` /
-``upgrade.run_upgrade`` / ``export.run_export`` but drive each phase explicitly
-so the UI gets accurate phase boundaries (for the moon + progress). All the
-real logic — argv construction, secret injection, DB crypto, verification —
-comes from the reused parent package; nothing is re-implemented here.
+``upgrade.run_upgrade`` / ``export.run_export`` / ``import_tenant.run_import``
+but drive each phase explicitly so the UI gets accurate phase boundaries (for
+the moon + progress). All the real logic — argv construction, secret injection,
+DB crypto, verification — comes from the reused parent package; nothing is
+re-implemented here.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import subprocess
 import time
 
 import lunarwing_mt_onboard.export as export
+import lunarwing_mt_onboard.import_tenant as tenant_import
 import lunarwing_mt_onboard.provisioner as provisioner
 import lunarwing_mt_onboard.upgrade as upgrade
 from lunarwing_mt_onboard import secrets as lw_secrets
@@ -24,8 +26,14 @@ from lunarwing_mt_onboard.verify import verify_tenant
 
 from . import demo as demo_mod
 from .audit import AuditLogger
-from .jobs import Job
-from .models import ExportRequest, ProvisionRequest, SecretRequest, UpgradeRequest
+from .jobs import Job, terminate_process_tree
+from .models import (
+    ExportRequest,
+    ImportRequest,
+    ProvisionRequest,
+    SecretRequest,
+    UpgradeRequest,
+)
 
 
 def list_tenants(demo: bool) -> list[str]:
@@ -52,16 +60,19 @@ def _run_phase(job: Job, argv: list[str], phase_name: str, audit: AuditLogger) -
         text=True,
         bufsize=1,
         env=os.environ.copy(),
+        start_new_session=os.name == "posix",
     ) as proc:
         job.proc = proc
         try:
+            if job.cancelled():
+                terminate_process_tree(proc)
             assert proc.stdout is not None
             for line in proc.stdout:
                 line = line.rstrip("\n")
                 audit.line(line)
                 job.emit(type="log", line=line)
                 if job.cancelled():
-                    proc.terminate()
+                    terminate_process_tree(proc)
                     break
             proc.wait()
         finally:
@@ -283,6 +294,47 @@ def run_export_job(job: Job, req: ExportRequest, *, log_dir: str | None = None) 
             return
         rc = _run_phase(job, args, "export", audit)
         summary.append({"name": "export", "ok": rc == 0, "code": rc})
+        return _finish(job, audit, summary)
+    finally:
+        audit.close()
+
+
+# --------------------------------------------------------------------------- #
+# Import
+# --------------------------------------------------------------------------- #
+
+
+def run_import_job(job: Job, req: ImportRequest, *, log_dir: str | None = None) -> None:
+    cfg = req.to_import_config()
+    err = cfg.validate()
+    if err:
+        job.emit(type="error", message=f"Invalid import config: {err}")
+        job.ok = False
+        return
+
+    audit_name = cfg.name or os.path.basename(cfg.bundle)
+    audit = AuditLogger("import", audit_name, job.id, log_dir=log_dir, demo=job.demo)
+    summary: list[dict] = []
+    try:
+        mode = "APPLY" if cfg.apply else "dry-run"
+        lifecycle = "start" if cfg.start else "stage-only"
+        rename = f" as '{cfg.name}'" if cfg.name else ""
+        job.emit(
+            type="phase",
+            name="import",
+            label=f"Importing '{cfg.bundle}'{rename} [{mode}; {lifecycle}]",
+            index=1,
+            total=1,
+        )
+        try:
+            args = tenant_import.build_import_args(cfg)
+        except FileNotFoundError as exc:
+            job.emit(type="error", message=str(exc))
+            job.ok = False
+            audit.finish(False)
+            return
+        rc = _run_phase(job, args, "import", audit)
+        summary.append({"name": "import", "ok": rc == 0, "code": rc})
         return _finish(job, audit, summary)
     finally:
         audit.close()
