@@ -65,7 +65,7 @@
   refactor, gateway integration, and automatic crash restart all increase the security or lifecycle surface materially.
   * I would implement deactivate/re-enable, diagnostics, registry validation, and integration tests as one contained follow-up. That
   provides a complete and inspectable host-local lifecycle before introducing another execution placement.
-4. [ ] bump crates version from 1.1.9 to 2.0.0
+4. [x] bump crates version from 1.1.9 to 2.0.0
 5. [ ] make sure you DIDNT MISS ANY CRATES. RELEVANT LUNARWING crates and things such as xmpp bridge and wasm channels must have 2.0.0 version, NOT 1.1.9 or 1.1.8
 6. [ ] Drop legacy `ironclaw-agent-v1` subprotocol offer from the daemon (delete the `SUBPROTOCOL_LEGACY` offer in `ic/src/orchestrator/external_worker.rs`) and `git rm` the 1.1.9-only repo-root compat symlinks `ironclaw_weechat_wss`, `darkirc_channel_for_ironclaw` (deployed tenants must have re-run mt-admin unit regen by then)
 7. [ ] LunarWing Web UI performance overhaul - lot of issues with UI - laggy, buttons dont animate, etc
