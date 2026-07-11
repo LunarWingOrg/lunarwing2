@@ -188,6 +188,7 @@ This is **not** a lowest-common-denominator product. Multi-tenant LunarWing runs
 - Assuming tenant units live on the **system** bus. They do not. On systemd hosts they are **`systemctl --user`** units under the tenant account (`XDG_RUNTIME_DIR=/run/user/<uid>`, linger enabled). On Gentoo they are OpenRC services.
 - "Works on my Fedora/Ubuntu box" shortcuts that ignore OpenRC or user-manager paths.
 - Reimplementing tenant lifecycle (add/build/start/stop/status/ports) outside `ic/scripts/lunarwing-mt-admin.sh`.
+- Hardcoding single-node host ports for multi-tenant health probes — especially LunarVision `http://127.0.0.1:8088`. On MT hosts each tenant publishes OCR health on registry `vision_health` (not 8088). Leave `HEALTH_LUNARVISION_URL` unset so `ic-infrastructure-health-check/health-lunarvision.sh` discovers ports from the registry.
 
 ### Required
 
@@ -196,6 +197,7 @@ This is **not** a lowest-common-denominator product. Multi-tenant LunarWing runs
 - If you must parse status text, handle **both** init shapes (e.g. systemd `lunarwing-<t>.service: active` and OpenRC `lunarwing-<t>: started`), or better: use mt-admin exit codes / structured contracts when available.
 - Init-specific code belongs **inside** `ic/scripts/lunarwing-mt-admin.sh` (and related infra-health tooling), behind helpers like `_systemctl_user` — not scattered through onboard/web/verify layers.
 - **Both systemd and OpenRC are first-class.** launchd is a distant third. Never treat OpenRC/Gentoo as an edge case.
+- Host health pipeline (`ic-infrastructure-health-check/`, installed via mt-admin) must stay ports-registry-aware; do not reintroduce sole-default 8088 lunarvision probes on MT fleets.
 
 ### Why this is non-negotiable
 
