@@ -6,7 +6,7 @@
 **NOTE: edit dev autonomous loop routine to use this file. ensure that checkbox is checked off in the corresponding branch before committing and pushing and opening PR**
 
 1. [x] Ensure references to 1.2.0 in the code and documentation are replaced by 2.0.0 (where applicable only of course)
-2. [ ] create ov dir ( cd {this repo} && mkdir -p docs/ov/ )
+2. [x] create ov dir ( cd {this repo} && mkdir -p docs/ov/ )
 3. [ ] MCP additions: 
 
 [DONE]:
