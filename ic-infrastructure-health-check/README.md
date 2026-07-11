@@ -144,7 +144,7 @@ checks can instead be **disabled** so they report `healthy` with
 | `RATELIMIT_DIR` | health-ratelimit.sh | `$BASE/ratelimit` | Rate-limit state directory |
 | `HEALTH_MODELS_ENABLED` | health-models.sh | `true` | Non-`true` disables (reports healthy/disabled) |
 | `HEALTH_LUNARVISION_ENABLED` | health-lunarvision.sh | `true` | Non-`true` disables (reports healthy/disabled) |
-| `HEALTH_LUNARVISION_URL` | health-lunarvision.sh | `http://127.0.0.1:8088` | OCR + VL sidecar base URL |
+| `HEALTH_LUNARVISION_URL` | health-lunarvision.sh | _(unset)_ → registry `vision_health` ports, else `http://127.0.0.1:8088` | Optional single-URL override. On multi-tenant hosts leave unset so every tenant `vision_health` port from the ports registry is probed. |
 | `HEALTH_LUNARVISION_TIMEOUT` | health-lunarvision.sh | `5` | curl timeout (seconds) for `/health` and `/vision/metrics` |
 | `HEALTH_LUNARVISION_FETCH_METRICS` | health-lunarvision.sh | `true` | Also probe `/vision/metrics` for request counts, cache stats, rate limiting |
 | `HEALTH_LUNARVISION_REQUIRE_VL` | health-lunarvision.sh | `false` | Degrade if the VL backend is not confirmed available |
@@ -178,6 +178,13 @@ HEALTH_MODELS_ENABLED=false  # skip the LLM-provider probe
 HEALTH_LUNARVISION_ENABLED=false  # skip the OCR/VL sidecar probe
 HEALTHCHECK_NOTIFY=false     # don't page on every per-run degrade (let self-heal escalations page instead)
 ```
+
+**Multi-tenant LunarVision:** do **not** hardcode `HEALTH_LUNARVISION_URL=http://127.0.0.1:8088`
+on MT hosts. That is the single-node default and will false-critical while
+per-tenant sidecars listen on registry `vision_health` ports (e.g. lunarium →
+`20006`). Leave the URL unset and set `SELF_HEAL_TENANTS_FILE` (mt-admin writes
+`/etc/lunarwing/ports.json`) so `health-lunarvision.sh` discovers every tenant.
+Only set `HEALTH_LUNARVISION_URL` when you intentionally force one override.
 
 Put these in a shared env file (e.g. `/etc/lunarwing/health.env`) loaded by the
 timer/cron unit so every run picks them up.
