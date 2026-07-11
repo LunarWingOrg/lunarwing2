@@ -174,8 +174,41 @@ cargo bench --all-features --no-run
 - Use `scripts/xmpp-rate-limit.sh` for live XMPP outbound rate-limit changes. It requires `XMPP_BRIDGE_TOKEN`; `status`, `set <n>`, `off`, and `reset` are the main commands.
 - Use `scripts/xmpp-configure.sh` for bridge room/configuration checks and configure calls when working with the existing XMPP bridge API.
 - The local service watchdog assets are `scripts/lunarwing-watchdog.sh` (systemd), `scripts/lunarwing-watchdog-openrc.sh` (OpenRC), `scripts/lunarwing-watchdog-launchd.sh` (macOS), `scripts/install-lunarwing-watchdog.sh`, `systemd/lunarwing-watchdog.service`, `systemd/lunarwing-watchdog.timer`, `systemd/lunarwing-watchdog.confd`, `systemd/lunarwing-watchdog.cron.hourly`, and `systemd/com.lunarwing.watchdog.plist` (launchd). The installer auto-detects `systemd` vs `OpenRC` vs `launchd`; on OpenRC it also auto-selects the scheduler. `auto` prefers an existing `cronie`/`crond`/`dcron` hourly setup and only falls back to a managed `fcron` entry when that avoids interfering.
-- Prefer read-only diagnostics first for service issues: `systemctl status`, `systemctl show`, `journalctl`, and bridge status endpoints. Only restart services after identifying the unit state or when the user explicitly asks.
+- Prefer read-only diagnostics first for **single-node / harness** service issues: `systemctl --user status` (or the matching OpenRC path), `journalctl --user`, and bridge status endpoints. For **multi-tenant** hosts always use `ic/scripts/lunarwing-mt-admin.sh status|…` — never bare system-bus `systemctl` against tenant units (see Multi-Tenant Ops below). Only restart services after identifying unit state or when the user explicitly asks.
 - If harness `verify` only fails the TensorZero proxy check, inspect the upstream `TENSORZERO_URL` before treating the local service install as broken. The local proxy can be bound and healthy while the upstream `/openai/v1/models` probe still returns `500`.
+
+## Multi-Tenant Ops and Init Agnosticism (HARD RULE)
+
+This is **not** a lowest-common-denominator product. Multi-tenant LunarWing runs on **real** init systems, including **systemd (user manager)** and **OpenRC (Gentoo)**. Agents must not write code that only works on "normal" system-bus systemd hosts.
+
+### Forbidden
+
+- Bare `systemctl is-active`, `systemctl status`, `systemctl show`, or `systemctl restart` against tenant units from Python/CLI/web wrappers (e.g. `lunarwing_mt_onboard*`, health helpers outside mt-admin).
+- Bare `rc-service` / OpenRC probes that reimplement what mt-admin already does.
+- Assuming tenant units live on the **system** bus. They do not. On systemd hosts they are **`systemctl --user`** units under the tenant account (`XDG_RUNTIME_DIR=/run/user/<uid>`, linger enabled). On Gentoo they are OpenRC services.
+- "Works on my Fedora/Ubuntu box" shortcuts that ignore OpenRC or user-manager paths.
+- Reimplementing tenant lifecycle (add/build/start/stop/status/ports) outside `ic/scripts/lunarwing-mt-admin.sh`.
+
+### Required
+
+- Tenant lifecycle, status, and health checks go through **`lunarwing-mt-admin.sh`** (override path with `LUNARWING_MT_ADMIN` if needed). Prefer `status <tenant>`, start/stop/build, etc.
+- Wrappers (`lunarwing_mt_onboard`, `lunarwing_mt_onboard_web`, other orchestration) are **thin drivers** of mt-admin. They must not invent parallel init logic.
+- If you must parse status text, handle **both** init shapes (e.g. systemd `lunarwing-<t>.service: active` and OpenRC `lunarwing-<t>: started`), or better: use mt-admin exit codes / structured contracts when available.
+- Init-specific code belongs **inside** `ic/scripts/lunarwing-mt-admin.sh` (and related infra-health tooling), behind helpers like `_systemctl_user` — not scattered through onboard/web/verify layers.
+- **Both systemd and OpenRC are first-class.** launchd is a distant third. Never treat OpenRC/Gentoo as an edge case.
+
+### Why this is non-negotiable
+
+A real provision of tenant `lunarium` was healthy (`mt-admin status` active, user unit running, HTTP agent status OK) while post-provision verify **false-failed** because it called bare `systemctl is-active` on the system bus. That class of bug must not reappear.
+
+### Quick greps before you ship
+
+```bash
+# These should not appear in onboard/web/verify wrappers:
+rg -n 'systemctl is-active|systemctl status|rc-service' lunarwing_mt_onboard lunarwing_mt_onboard_web
+```
+
+Exceptions: comments/docs forbidding the pattern; code inside `ic/scripts/lunarwing-mt-admin.sh` and dedicated infrastructure-health tooling that already abstracts init correctly.
 
 ## Docs, Parity, and Testing
 
