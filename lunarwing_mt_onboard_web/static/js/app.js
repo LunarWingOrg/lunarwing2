@@ -32,7 +32,7 @@
   let demo = false;
   let ws = null;
   let longTimer = null;
-  const LONG_PHASES = new Set(['build-tenant', 'build-darkirc', 'upgrade', 'export']);
+  const LONG_PHASES = new Set(['build-tenant', 'build-darkirc', 'upgrade', 'export', 'import']);
 
   const withToken = (path) => path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
 

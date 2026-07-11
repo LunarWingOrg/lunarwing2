@@ -2,7 +2,8 @@
 
 The web layer never re-implements provisioning logic — it only translates JSON
 request bodies into the same ``TenantConfig`` / ``UpgradeConfig`` /
-``ExportConfig`` objects the CLI builds, then hands them to the reused runners.
+``ExportConfig`` / ``ImportConfig`` objects the CLI builds, then hands them to
+the reused runners.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from lunarwing_mt_onboard.config import TenantConfig, WorkerType
 from lunarwing_mt_onboard.export import DEFAULT_OUT_DIR, ExportConfig
+from lunarwing_mt_onboard.import_tenant import ImportConfig
 from lunarwing_mt_onboard.upgrade import UpgradeConfig
 
 _VALID_WORKERS = {w.value for w in WorkerType}
@@ -103,6 +105,44 @@ class ExportRequest(BaseModel):
             out_dir=self.out_dir.strip() or DEFAULT_OUT_DIR,
             apply=self.apply,
             no_quiesce=self.no_quiesce,
+        )
+
+
+class ImportRequest(BaseModel):
+    """Kawarimi import form."""
+
+    bundle: str = ""
+    name: str = ""
+    start: bool = False
+    old_stopped: bool = False
+    with_nanocode: bool = False
+    with_pebble: bool = False
+    with_opencode: bool = False
+    with_toolchains: bool = False
+    with_vision: bool = False
+    docker_group: bool = False
+    tensorzero_url: str = ""
+    owner_scope: str = ""
+    apply: bool = False
+    force: bool = False
+
+    def to_import_config(self) -> ImportConfig:
+        return ImportConfig(
+            bundle=self.bundle.strip(),
+            name=self.name.strip(),
+            start=self.start,
+            old_stopped=self.old_stopped,
+            with_nanocode=self.with_nanocode,
+            with_pebble=self.with_pebble,
+            with_opencode=self.with_opencode,
+            with_toolchains=self.with_toolchains,
+            with_vision=self.with_vision,
+            docker_group=self.docker_group,
+            tensorzero_url=self.tensorzero_url.strip(),
+            owner_scope=self.owner_scope.strip(),
+            apply=self.apply,
+            force=self.force,
+            auto_yes=True,
         )
 
 

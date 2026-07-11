@@ -8,16 +8,73 @@ A ``None`` sentinel marks end-of-stream.
 
 from __future__ import annotations
 
+import os
 import queue
 import secrets
+import signal
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 Event = dict[str, Any]
 _SENTINEL: None = None
+_TERMINATE_GRACE_SECONDS = 1.0
+_TERMINATING_GROUPS: set[int] = set()
+_TERMINATING_LOCK = threading.Lock()
+
+
+def terminate_process_tree(proc: subprocess.Popen) -> None:
+    """Terminate a script and descendants started in its POSIX session."""
+    if os.name != "posix":
+        if proc.poll() is None:
+            proc.terminate()
+        return
+
+    process_group = proc.pid
+    with _TERMINATING_LOCK:
+        if process_group in _TERMINATING_GROUPS:
+            return
+        _TERMINATING_GROUPS.add(process_group)
+
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        _discard_terminating_group(process_group)
+        return
+    except OSError:
+        _discard_terminating_group(process_group)
+        if proc.poll() is None:
+            proc.terminate()
+        return
+
+    threading.Thread(
+        target=_kill_process_group_after_grace,
+        args=(process_group,),
+        name=f"kill-process-group-{process_group}",
+        daemon=True,
+    ).start()
+
+
+def _kill_process_group_after_grace(process_group: int) -> None:
+    try:
+        time.sleep(_TERMINATE_GRACE_SECONDS)
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return
+        os.killpg(process_group, signal.SIGKILL)
+    except OSError:
+        pass
+    finally:
+        _discard_terminating_group(process_group)
+
+
+def _discard_terminating_group(process_group: int) -> None:
+    with _TERMINATING_LOCK:
+        _TERMINATING_GROUPS.discard(process_group)
 
 
 @dataclass
@@ -81,9 +138,6 @@ class JobManager:
             return False
         job.stop_event.set()
         proc = job.proc
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-            except OSError:
-                pass
+        if proc is not None:
+            terminate_process_tree(proc)
         return True

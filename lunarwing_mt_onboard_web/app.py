@@ -13,7 +13,13 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__, runner
 from .jobs import JobManager
-from .models import ExportRequest, ProvisionRequest, SecretRequest, UpgradeRequest
+from .models import (
+    ExportRequest,
+    ImportRequest,
+    ProvisionRequest,
+    SecretRequest,
+    UpgradeRequest,
+)
 from .security import token_matches
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -29,7 +35,9 @@ def create_app(*, token: str, demo: bool, log_dir: str | None) -> FastAPI:
 
     def check(provided: str) -> None:
         if not token_matches(token, provided):
-            raise HTTPException(status_code=401, detail="invalid or missing session token")
+            raise HTTPException(
+                status_code=401, detail="invalid or missing session token"
+            )
 
     # -- static shell -------------------------------------------------------
     @app.get("/")
@@ -73,6 +81,13 @@ def create_app(*, token: str, demo: bool, log_dir: str | None) -> FastAPI:
         check(token)
         job = manager.create("export")
         manager.start(job, lambda j: runner.run_export_job(j, req, log_dir=log_dir))
+        return {"job_id": job.id}
+
+    @app.post("/api/import")
+    async def start_import(req: ImportRequest, token: str = Query("")) -> dict:
+        check(token)
+        job = manager.create("import")
+        manager.start(job, lambda j: runner.run_import_job(j, req, log_dir=log_dir))
         return {"job_id": job.id}
 
     @app.post("/api/secrets")

@@ -153,6 +153,11 @@ Export flags:
 | `--apply` | Execute the export; omitted means dry-run |
 | `--no-quiesce` | Skip auto-stopping services (you must have already stopped them) |
 
+The web GUI also wraps `ic/scripts/import-tenant.sh` through
+`import_tenant.py`. Import defaults to a non-interactive, stage-only dry-run;
+apply and start are separate choices, and unattended start requires the old
+host to be stopped.
+
 ### Secrets insertion
 
 Insert encrypted secrets (API keys, tokens) into a running tenant's secrets
@@ -207,6 +212,7 @@ lunarwing_mt_onboard/
 ├── upgrade_cli.py     # interactive upgrade prompts + display
 ├── export.py          # subprocess wrapper around export-tenant.sh
 ├── export_cli.py      # interactive export prompts + display
+├── import_tenant.py   # subprocess wrapper around import-tenant.sh
 ├── secrets.py         # master-key generation + validation
 ├── secrets_ops.py     # crypto, DB insert, env parsing, dep checks
 ├── secrets_cli.py     # interactive secrets subcommand
@@ -215,6 +221,7 @@ lunarwing_mt_onboard/
 ├── secrets_tests.py   # unit tests for secrets_ops
 ├── upgrade_tests.py   # unit tests for in-place upgrades
 ├── export_tests.py    # unit tests for Kawarimi export
+├── import_tenant_tests.py # unit tests for Kawarimi import
 └── requirements.txt   # rich, questionary
 ```
 
@@ -223,6 +230,9 @@ lunarwing_mt_onboard/
 ```bash
 # Unit tests (no root required)
 bash ic/scripts/test-mt-onboard.sh
+
+# Kawarimi import wrapper tests
+python3 -m unittest lunarwing_mt_onboard.import_tenant_tests
 
 # Or directly
 PYTHONPATH=. python3 -c "
