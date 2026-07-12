@@ -282,3 +282,52 @@ pub async fn skills_remove_handler(
         Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
     }
 }
+
+// ── B-1: self-improving skills — pending-patch approval API ──────────────
+//
+// These handlers surface the propose-then-approve loop to the operator. They
+// call the engine bridge (which reads the global engine store), so they work
+// only when the V2 engine is running. User scoping is enforced in the bridge.
+
+/// GET /api/skills/patches — list pending skill-patch proposals.
+pub async fn skill_patches_list_handler(
+    State(_state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let proposals = crate::bridge::list_pending_skill_patches(&user.user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let count = proposals.len();
+    Ok(Json(serde_json::json!({
+        "patches": proposals,
+        "count": count,
+    })))
+}
+
+/// POST /api/skills/patches/{doc_id}/approve — apply a pending patch.
+pub async fn skill_patch_approve_handler(
+    State(_state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Path(doc_id): Path<String>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    match crate::bridge::approve_skill_patch(&doc_id, &user.user_id).await {
+        Ok(_) => Ok(Json(ActionResponse::ok(format!(
+            "Skill patch approved and applied for {doc_id}"
+        )))),
+        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
+    }
+}
+
+/// POST /api/skills/patches/{doc_id}/reject — discard a pending patch.
+pub async fn skill_patch_reject_handler(
+    State(_state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Path(doc_id): Path<String>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    match crate::bridge::reject_skill_patch(&doc_id, &user.user_id).await {
+        Ok(_) => Ok(Json(ActionResponse::ok(format!(
+            "Skill patch rejected for {doc_id}"
+        )))),
+        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
+    }
+}

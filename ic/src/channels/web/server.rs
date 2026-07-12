@@ -44,6 +44,7 @@ use crate::channels::web::handlers::routines::{
     routines_summary_handler, routines_toggle_handler, routines_trigger_handler,
 };
 use crate::channels::web::handlers::skills::{
+    skill_patch_approve_handler, skill_patch_reject_handler, skill_patches_list_handler,
     skills_install_handler, skills_list_handler, skills_remove_handler, skills_search_handler,
 };
 use crate::channels::web::log_layer::LogBroadcaster;
@@ -493,6 +494,17 @@ pub async fn start_server(
         .route("/api/skills", get(skills_list_handler))
         .route("/api/skills/search", post(skills_search_handler))
         .route("/api/skills/install", post(skills_install_handler))
+        // B-1: self-improving skills — pending-patch approval surface.
+        // Static `patches` segment precedes the `{name}` delete route.
+        .route("/api/skills/patches", get(skill_patches_list_handler))
+        .route(
+            "/api/skills/patches/{doc_id}/approve",
+            post(skill_patch_approve_handler),
+        )
+        .route(
+            "/api/skills/patches/{doc_id}/reject",
+            post(skill_patch_reject_handler),
+        )
         .route(
             "/api/skills/{name}",
             axum::routing::delete(skills_remove_handler),
@@ -532,6 +544,18 @@ pub async fn start_server(
         .route("/favicon.ico", get(favicon_handler))
         .route("/favicon.svg", get(favicon_svg_handler))
         .route("/logo.svg", get(logo_svg_handler))
+        .route(
+            "/fonts/hanken-grotesk-latin-wght-normal.woff2",
+            get(font_hanken_normal_handler),
+        )
+        .route(
+            "/fonts/hanken-grotesk-latin-wght-italic.woff2",
+            get(font_hanken_italic_handler),
+        )
+        .route(
+            "/fonts/fira-code-latin-wght-normal.woff2",
+            get(font_fira_code_handler),
+        )
         .route("/i18n/index.js", get(i18n_index_handler))
         .route("/i18n/en.js", get(i18n_en_handler))
         .route("/i18n/zh-CN.js", get(i18n_zh_handler))
@@ -590,8 +614,8 @@ pub async fn start_server(
             header::HeaderValue::from_static(
                 "default-src 'self'; \
                  script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; \
-                 style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
-                 font-src https://fonts.gstatic.com; \
+                 style-src 'self' 'unsafe-inline'; \
+                 font-src 'self'; \
                  connect-src 'self'; \
                  img-src 'self' data:; \
                  object-src 'none'; \
@@ -710,6 +734,38 @@ async fn logo_svg_handler() -> impl IntoResponse {
             (header::CACHE_CONTROL, "public, max-age=86400"),
         ],
         include_str!("static/logo.svg"),
+    )
+}
+
+// Self-hosted fonts (embedded in the binary). woff2 is immutable content, so a
+// long cache lifetime is safe.
+async fn font_hanken_normal_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "font/woff2"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        include_bytes!("static/fonts/hanken-grotesk-latin-wght-normal.woff2").as_slice(),
+    )
+}
+
+async fn font_hanken_italic_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "font/woff2"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        include_bytes!("static/fonts/hanken-grotesk-latin-wght-italic.woff2").as_slice(),
+    )
+}
+
+async fn font_fira_code_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "font/woff2"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        include_bytes!("static/fonts/fira-code-latin-wght-normal.woff2").as_slice(),
     )
 }
 
@@ -2957,6 +3013,16 @@ mod tests {
         assert!(
             csp_str.contains("frame-ancestors 'none'"),
             "CSP must contain frame-ancestors 'none'"
+        );
+        // Fonts are self-hosted; the CSP must NOT reach out to Google's font
+        // CDNs and must allow same-origin fonts.
+        assert!(
+            csp_str.contains("font-src 'self'"),
+            "CSP must serve fonts from 'self' (self-hosted, no external CDN)"
+        );
+        assert!(
+            !csp_str.contains("fonts.googleapis.com") && !csp_str.contains("fonts.gstatic.com"),
+            "CSP must not reference Google Fonts CDNs"
         );
 
         if let Some(tx) = state.shutdown_tx.write().await.take() {

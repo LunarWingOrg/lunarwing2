@@ -111,6 +111,8 @@ fn v1_skill_to_memory_doc(skill: &LoadedSkill, project_id: ProjectId) -> MemoryD
         metrics: SkillMetrics::default(),
         parent_version: None,
         content_hash: skill.content_hash.clone(),
+        patch_history: vec![], // B-1: no patches on freshly-migrated skills
+        pending_patch: None,
     };
 
     let mut doc = MemoryDoc::new(

@@ -6,9 +6,7 @@
   <title>LunarWing</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="alternate icon" href="/favicon.ico" type="image/x-icon">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- Fonts are self-hosted via @font-face in style.css (no external font CDN). -->
   <link rel="stylesheet" href="/style.css">
 
   <!-- i18n Modules -->
@@ -389,6 +387,12 @@
                   <button id="skill-search-btn" data-i18n="skills.search">Search</button>
                 </div>
                 <div class="extensions-list" id="skill-search-results"></div>
+              </div>
+              <div class="extensions-section">
+                <h3 data-i18n="skills.patchesTitle">Skill Improvement Proposals</h3>
+                <div class="extensions-list" id="skill-patches-list">
+                  <div class="empty-state" data-i18n="skills.patchesLoading">Loading proposals...</div>
+                </div>
               </div>
               <div class="extensions-section">
                 <h3 data-i18n="skills.installed">Installed Skills</h3>

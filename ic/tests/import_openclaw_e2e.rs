@@ -222,7 +222,7 @@ mod e2e_import_tests {
         // Verify values
         assert_eq!(
             settings_map.get("llm.backend").and_then(|v| v.as_str()),
-            Some("openai")
+            Some("openai_compatible")
         );
     }
 

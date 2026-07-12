@@ -1,6 +1,30 @@
 /* LunarWing MT Onboard — Web edition
    Palette lifted from the gateway UI (ic/src/channels/web/static/style.css). */
 
+/* Self-hosted fonts (no external Google Fonts dependency). Variable woff2:
+   one file per family covers every weight. */
+@font-face {
+  font-family: 'Hanken Grotesk';
+  src: url('/static/fonts/hanken-grotesk-latin-wght-normal.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Hanken Grotesk';
+  src: url('/static/fonts/hanken-grotesk-latin-wght-italic.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Fira Code';
+  src: url('/static/fonts/fira-code-latin-wght-normal.woff2') format('woff2');
+  font-weight: 300 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --bg: #09090b;
   --bg-secondary: #0f0f11;
@@ -40,8 +64,8 @@
   --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
 
-  --font-ui: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-mono: 'IBM Plex Mono', 'SF Mono', 'Fira Code', Consolas, monospace;
+  --font-ui: 'Hanken Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'Fira Code', 'SF Mono', Consolas, monospace;
 }
 
 * { box-sizing: border-box; }

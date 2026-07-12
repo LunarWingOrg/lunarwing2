@@ -57,6 +57,24 @@ pub struct SkillMetrics {
     pub last_used: Option<DateTime<Utc>>,
 }
 
+/// Default confidence below which a skill becomes a patch candidate (B-1).
+pub const DEFAULT_PATCH_CONFIDENCE_THRESHOLD: f64 = 0.5;
+/// Default minimum usage before confidence is trusted enough to trigger a patch
+/// proposal — avoids reacting to a single early failure.
+pub const DEFAULT_PATCH_MIN_USAGE: u64 = 5;
+/// Cap on retained patch-history entries (bounded, newest kept).
+pub const MAX_PATCH_HISTORY: usize = 20;
+
+/// Compute the canonical content hash of a skill's body (B-1 optimistic
+/// concurrency). Stored as `content_hash` and re-checked before applying a
+/// pending patch so a patch cannot silently clobber an out-of-band edit.
+pub fn compute_content_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 impl SkillMetrics {
     /// Compute confidence as success ratio.
     ///
@@ -68,6 +86,63 @@ impl SkillMetrics {
         }
         self.success_count as f64 / total as f64
     }
+
+    /// Whether this skill is a patch candidate (B-1): enough recorded usage AND
+    /// confidence below the threshold. Requiring a minimum sample size prevents
+    /// one early failure from tripping the trigger.
+    pub fn is_patch_candidate(&self, threshold: f64, min_usage: u64) -> bool {
+        self.usage_count >= min_usage && self.confidence() < threshold
+    }
+}
+
+/// A single applied skill patch, recorded for auditability (B-1).
+///
+/// Captures the metrics as they stood *before* this patch reset them, so the
+/// full history (e.g. "v1 was 2/8 = 0.25, then patched") is never lost even
+/// though live metrics are epoch-reset on each patch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillPatch {
+    /// The version this patch produced.
+    pub version: u32,
+    /// When the patch was applied.
+    pub applied_at: DateTime<Utc>,
+    /// The thread whose failure motivated the patch (if any).
+    #[serde(default)]
+    pub source_thread_id: Option<String>,
+    /// Human-readable reason / diagnosis.
+    #[serde(default)]
+    pub reason: String,
+    /// Metrics snapshot immediately before this patch reset them (audit trail).
+    #[serde(default)]
+    pub metrics_before: SkillMetrics,
+}
+
+/// A proposed-but-not-yet-applied skill patch (B-1, propose-then-approve model).
+///
+/// Staged by the self-improvement mission; applied only on explicit user
+/// approval. The live skill is untouched while a proposal is pending.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingSkillPatch {
+    /// Proposed replacement content for the skill's prompt/body.
+    pub proposed_content: String,
+    /// Unified diff (current → proposed) for user review.
+    #[serde(default)]
+    pub diff: String,
+    /// Why the patch is proposed (diagnosis of the failure).
+    #[serde(default)]
+    pub reason: String,
+    /// The thread whose failure triggered the proposal.
+    #[serde(default)]
+    pub source_thread_id: Option<String>,
+    /// The skill confidence at proposal time (what tripped the threshold).
+    #[serde(default)]
+    pub confidence_at_proposal: f64,
+    /// Content hash of the skill when the proposal was made — used for
+    /// optimistic concurrency (refuse to apply if the skill changed since).
+    #[serde(default)]
+    pub base_content_hash: String,
+    /// When the proposal was staged.
+    pub proposed_at: DateTime<Utc>,
 }
 
 /// Full metadata for a v2 skill.
@@ -107,6 +182,14 @@ pub struct V2SkillMetadata {
     /// SHA-256 hash of the prompt content.
     #[serde(default)]
     pub content_hash: String,
+    /// Bounded history of applied patches (newest last, capped at
+    /// `MAX_PATCH_HISTORY`). B-1 auditability.
+    #[serde(default)]
+    pub patch_history: Vec<SkillPatch>,
+    /// A staged patch awaiting user approval, if any. Only one at a time; the
+    /// live skill is untouched while this is `Some`. B-1 propose-then-approve.
+    #[serde(default)]
+    pub pending_patch: Option<PendingSkillPatch>,
 }
 
 fn default_version() -> u32 {
@@ -182,6 +265,19 @@ mod tests {
             },
             parent_version: Some(2),
             content_hash: "sha256:abc".to_string(),
+            patch_history: vec![SkillPatch {
+                version: 3,
+                applied_at: Utc::now(),
+                source_thread_id: Some("thread-1".to_string()),
+                reason: "fixed bad command".to_string(),
+                metrics_before: SkillMetrics {
+                    usage_count: 8,
+                    success_count: 2,
+                    failure_count: 6,
+                    last_used: None,
+                },
+            }],
+            pending_patch: None,
         };
 
         let json = serde_json::to_string(&meta).expect("serialize");
@@ -193,6 +289,11 @@ mod tests {
         assert_eq!(parsed.code_snippets.len(), 1);
         assert_eq!(parsed.metrics.success_count, 4);
         assert_eq!(parsed.parent_version, Some(2));
+        assert_eq!(parsed.patch_history.len(), 1);
+        assert_eq!(parsed.patch_history[0].version, 3);
+        // Pre-patch metrics snapshot survives serialization (audit trail).
+        assert_eq!(parsed.patch_history[0].metrics_before.usage_count, 8);
+        assert_eq!(parsed.patch_history[0].metrics_before.failure_count, 6);
     }
 
     #[test]
@@ -205,5 +306,67 @@ mod tests {
         assert_eq!(parsed.trust, SkillTrust::Installed);
         assert!(parsed.code_snippets.is_empty());
         assert!((parsed.metrics.confidence() - 1.0).abs() < f64::EPSILON);
+        // B-1 fields default empty on old skills (forward compat).
+        assert!(parsed.patch_history.is_empty());
+        assert!(parsed.pending_patch.is_none());
+    }
+
+    #[test]
+    fn test_is_patch_candidate_requires_min_usage() {
+        // Below the confidence threshold but too few samples → NOT a candidate.
+        let m = SkillMetrics {
+            usage_count: 2,
+            success_count: 0,
+            failure_count: 2,
+            last_used: None,
+        };
+        assert!(!m.is_patch_candidate(DEFAULT_PATCH_CONFIDENCE_THRESHOLD, DEFAULT_PATCH_MIN_USAGE));
+    }
+
+    #[test]
+    fn test_is_patch_candidate_low_confidence_enough_usage() {
+        // 2/8 = 0.25 confidence, 8 uses → candidate.
+        let m = SkillMetrics {
+            usage_count: 8,
+            success_count: 2,
+            failure_count: 6,
+            last_used: None,
+        };
+        assert!(m.is_patch_candidate(DEFAULT_PATCH_CONFIDENCE_THRESHOLD, DEFAULT_PATCH_MIN_USAGE));
+    }
+
+    #[test]
+    fn test_is_patch_candidate_healthy_skill_excluded() {
+        // 7/8 = 0.875 confidence → healthy, not a candidate.
+        let m = SkillMetrics {
+            usage_count: 8,
+            success_count: 7,
+            failure_count: 1,
+            last_used: None,
+        };
+        assert!(!m.is_patch_candidate(DEFAULT_PATCH_CONFIDENCE_THRESHOLD, DEFAULT_PATCH_MIN_USAGE));
+    }
+
+    #[test]
+    fn test_pending_patch_serde_roundtrip() {
+        let meta = V2SkillMetadata {
+            name: "s".to_string(),
+            pending_patch: Some(PendingSkillPatch {
+                proposed_content: "new body".to_string(),
+                diff: "@@ -1 +1 @@".to_string(),
+                reason: "wrong tool name".to_string(),
+                source_thread_id: Some("t-9".to_string()),
+                confidence_at_proposal: 0.25,
+                base_content_hash: "sha256:old".to_string(),
+                proposed_at: Utc::now(),
+            }),
+            ..serde_json::from_str::<V2SkillMetadata>("{}").unwrap()
+        };
+        let json = serde_json::to_string(&meta).expect("serialize");
+        let parsed: V2SkillMetadata = serde_json::from_str(&json).expect("deserialize");
+        let p = parsed.pending_patch.expect("pending present");
+        assert_eq!(p.proposed_content, "new body");
+        assert_eq!(p.base_content_hash, "sha256:old");
+        assert!((p.confidence_at_proposal - 0.25).abs() < f64::EPSILON);
     }
 }

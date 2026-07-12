@@ -370,6 +370,52 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
         }
     }
 
+    // 11. Stuck-failure-loop detection (false-positive-averse).
+    //
+    // This does NOT flag high-volume repetition on its own: agents (especially
+    // smaller models on weak hardware) routinely repeat the same tool call many
+    // times and still succeed — that is inefficiency, not stuckness, and is
+    // explicitly allowed. We only flag when BOTH:
+    //   (a) the thread did NOT ultimately succeed, AND
+    //   (b) the same action *failed* identically many times.
+    // A thread that reached Completed/Done is never flagged here, regardless of
+    // how many times it repeated an action. We also key on FAILURES only, so a
+    // retry loop that eventually works produces no failure pile-up to flag.
+    let succeeded = matches!(thread.state, ThreadState::Completed | ThreadState::Done);
+    if !succeeded {
+        let mut fail_sig_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for event in &thread.events {
+            if let crate::types::event::EventKind::ActionFailed {
+                action_name,
+                params_summary,
+                ..
+            } = &event.kind
+            {
+                let sig = normalize_action_signature(action_name, params_summary.as_deref());
+                *fail_sig_counts.entry(sig).or_insert(0) += 1;
+            }
+        }
+        // Deterministic order: worst offender first.
+        let mut repeated: Vec<(&String, usize)> = fail_sig_counts
+            .iter()
+            .filter(|(_, c)| **c >= REPEATED_FAILURE_THRESHOLD)
+            .map(|(s, c)| (s, *c))
+            .collect();
+        repeated.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        for (sig, count) in repeated {
+            issues.push(TraceIssue {
+                severity: IssueSeverity::Warning,
+                category: "repeated_failure_loop".into(),
+                description: format!(
+                    "Action failed {count}x with the same signature '{}' on a thread that did not succeed — probable stuck loop",
+                    truncate(sig, 120)
+                ),
+                step: None,
+            });
+        }
+    }
+
     issues
 }
 
@@ -380,6 +426,84 @@ fn truncate(s: &str, max_chars: usize) -> String {
     } else {
         chars
     }
+}
+
+/// Threshold: how many times an identical *failing* action signature must
+/// repeat before we flag a probable stuck loop.
+///
+/// Deliberately high. Agents — especially smaller models on constrained
+/// hardware — legitimately repeat the same tool call many times (tens of
+/// times) and still succeed in the end. High-volume repetition that WORKS is
+/// inefficiency, not stuckness, and must not be flagged. So this threshold
+/// only ever applies to repeated *failures* on a thread that ultimately did
+/// NOT succeed (see the gating in `analyze_trace`). Set well clear of the
+/// "annoying but functional" range.
+const REPEATED_FAILURE_THRESHOLD: usize = 8;
+
+/// Normalize an `(action_name, params_summary)` pair into a stable signature so
+/// that repeated executions of "the same action with effectively the same
+/// arguments" collapse together, while genuinely different calls stay distinct.
+///
+/// Volatile tokens are masked: numbers → `N`, quoted strings → `""`, absolute
+/// paths → `/…`, and long hex/uuid-ish runs → `H`. This mirrors the intent of
+/// a command-signature normalizer: detect that the agent is *repeating itself*,
+/// not that two calls are byte-identical. A distinct file path or line range is
+/// NOT masked away entirely (the leading path segment is kept) so that reading
+/// two different files does not look like a loop, but re-reading one file with
+/// drifting line numbers does.
+pub fn normalize_action_signature(action_name: &str, params_summary: Option<&str>) -> String {
+    let raw = params_summary.unwrap_or("");
+    let mut s = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // Mask any run of digits (line numbers, offsets, counts) to `N`.
+            d if d.is_ascii_digit() => {
+                while chars.peek().is_some_and(|n| n.is_ascii_digit()) {
+                    chars.next();
+                }
+                s.push('N');
+            }
+            // Collapse quoted string contents.
+            '"' | '\'' => {
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n == c {
+                        break;
+                    }
+                }
+                s.push_str("\"\"");
+            }
+            other => s.push(other),
+        }
+    }
+    // Mask long hex/uuid-ish runs (commit-ish, ids) that survived digit masking.
+    let masked = mask_hexish(&s);
+    format!("{action_name}::{}", masked.trim())
+}
+
+/// Replace runs of >=8 hex/dash chars (uuids, hashes) with `H`.
+fn mask_hexish(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() >= 8 {
+            out.push('H');
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in s.chars() {
+        if c.is_ascii_hexdigit() || c == '-' {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 #[cfg(test)]
@@ -560,6 +684,122 @@ mod tests {
             empty_issues.len(),
             2,
             "should flag exactly the 2 empty call_ids"
+        );
+    }
+
+    // ── repeated-action (loop) detection ─────────────────────
+
+    fn exec_event(thread: &Thread, action: &str, params: Option<&str>) -> ThreadEvent {
+        ThreadEvent::new(
+            thread.id,
+            EventKind::ActionExecuted {
+                step_id: StepId::new(),
+                action_name: action.into(),
+                call_id: "c".into(),
+                duration_ms: 1,
+                params_summary: params.map(|s| s.to_string()),
+            },
+        )
+    }
+
+    #[test]
+    fn signature_masks_volatile_tokens() {
+        // Same file, drifting line numbers → same signature.
+        let a = normalize_action_signature("read_file", Some("src/main.rs:120-140"));
+        let b = normalize_action_signature("read_file", Some("src/main.rs:340-360"));
+        assert_eq!(a, b, "line-number drift should collapse to one signature");
+
+        // Different files → different signatures (not a loop).
+        let c = normalize_action_signature("read_file", Some("src/other.rs:1-10"));
+        assert_ne!(a, c, "different files must stay distinct");
+
+        // Quoted args collapse; different action names stay distinct.
+        let d = normalize_action_signature("shell", Some("grep \"foo\" x"));
+        let e = normalize_action_signature("shell", Some("grep \"bar\" x"));
+        assert_eq!(d, e, "quoted-arg drift should collapse");
+    }
+
+    fn fail_event(thread: &Thread, action: &str, params: Option<&str>) -> ThreadEvent {
+        ThreadEvent::new(
+            thread.id,
+            EventKind::ActionFailed {
+                step_id: StepId::new(),
+                action_name: action.into(),
+                call_id: "c".into(),
+                error: "boom".into(),
+                params_summary: params.map(|s| s.to_string()),
+            },
+        )
+    }
+
+    #[test]
+    fn detects_repeated_failure_loop_on_failed_thread() {
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::system("sys"));
+        thread.state = ThreadState::Failed;
+        // Same command FAILING 8x with drifting line ranges → stuck loop.
+        for i in 0..8 {
+            let p = format!("src/main.rs:{}-{}", i * 10, i * 10 + 5);
+            thread.events.push(fail_event(&thread, "read_file", Some(&p)));
+        }
+        let issues = analyze_trace(&thread);
+        let loops: Vec<_> = issues
+            .iter()
+            .filter(|i| i.category == "repeated_failure_loop")
+            .collect();
+        assert_eq!(loops.len(), 1, "should flag one repeated-failure signature");
+        assert!(loops[0].description.contains("8x"));
+        assert_eq!(loops[0].severity, IssueSeverity::Warning);
+    }
+
+    #[test]
+    fn high_volume_repetition_that_succeeds_is_not_flagged() {
+        // The key false-positive guard: an agent (e.g. a small model on weak
+        // hardware) hammers the SAME action 60x and the thread still succeeds.
+        // This is inefficiency, not stuckness — must NOT be flagged.
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::system("sys"));
+        thread.state = ThreadState::Done; // succeeded in the end
+        for _ in 0..60 {
+            thread.events.push(exec_event(&thread, "shell", Some("check status")));
+        }
+        let issues = analyze_trace(&thread);
+        assert!(
+            !issues.iter().any(|i| i.category == "repeated_failure_loop"),
+            "high-volume repetition that succeeds must not be flagged"
+        );
+    }
+
+    #[test]
+    fn repeated_failures_below_threshold_not_flagged() {
+        // A handful of identical failures on a failed thread is under threshold.
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::system("sys"));
+        thread.state = ThreadState::Failed;
+        for _ in 0..4 {
+            thread.events.push(fail_event(&thread, "shell", Some("cargo build")));
+        }
+        let issues = analyze_trace(&thread);
+        assert!(
+            !issues.iter().any(|i| i.category == "repeated_failure_loop"),
+            "below-threshold failure count must not be flagged"
+        );
+    }
+
+    #[test]
+    fn varied_failures_not_flagged_as_loop() {
+        // Many failures, but DIFFERENT targets → not a single stuck signature.
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::system("sys"));
+        thread.state = ThreadState::Failed;
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"] {
+            let p = format!("src/{name}.rs:1-10");
+            thread.events.push(fail_event(&thread, "read_file", Some(&p)));
+        }
+        let issues = analyze_trace(&thread);
+        assert!(
+            !issues.iter().any(|i| i.category == "repeated_failure_loop"),
+            "distinct failing targets must not collapse into one loop signature"
         );
     }
 

@@ -455,6 +455,11 @@ pub async fn execute_orchestrator(
                     // __record_skill_usage__(doc_id, success)
                     "__record_skill_usage__" => handle_record_skill_usage(args, store).await,
 
+                    // __propose_skill_patch__(doc_id, proposed_content, diff, reason)
+                    "__propose_skill_patch__" => {
+                        handle_propose_skill_patch(args, thread, store).await
+                    }
+
                     // Unknown — let Monty resolve it (user-defined functions, builtins)
                     other => ExtFunctionResult::NotFound(other.to_string()),
                 };
@@ -1772,6 +1777,56 @@ async fn handle_record_skill_usage(
     }
 
     ExtFunctionResult::Return(MontyObject::None)
+}
+
+/// Handle `__propose_skill_patch__(doc_id, proposed_content, diff, reason)`.
+///
+/// Stages a proposed skill patch for later user approval (B-1, propose-then-
+/// approve). Does NOT mutate the live skill — it only records a `pending_patch`
+/// on the skill's metadata. Called by the self-improvement mission when a
+/// below-confidence skill is implicated in a failed thread. Returns `True` on a
+/// successful stage, `False` otherwise (e.g. Installed/read-only skill), so the
+/// orchestrator Python can branch on the outcome.
+async fn handle_propose_skill_patch(
+    args: &[MontyObject],
+    thread: &Thread,
+    store: Option<&Arc<dyn Store>>,
+) -> ExtFunctionResult {
+    let Some(store) = store else {
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    };
+
+    let doc_id_str = args.first().map(monty_to_string).unwrap_or_default();
+    let proposed_content = args.get(1).map(monty_to_string).unwrap_or_default();
+    let diff = args.get(2).map(monty_to_string).unwrap_or_default();
+    let reason = args.get(3).map(monty_to_string).unwrap_or_default();
+
+    let Ok(uuid) = uuid::Uuid::parse_str(&doc_id_str) else {
+        debug!("__propose_skill_patch__: invalid doc_id: {doc_id_str}");
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    };
+    if proposed_content.trim().is_empty() {
+        debug!("__propose_skill_patch__: empty proposed_content, skipping");
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    }
+
+    let tracker = crate::memory::SkillTracker::new(Arc::clone(store));
+    match tracker
+        .propose_patch(
+            crate::types::memory::DocId(uuid),
+            proposed_content,
+            diff,
+            reason,
+            Some(thread.id.0.to_string()),
+        )
+        .await
+    {
+        Ok(()) => ExtFunctionResult::Return(MontyObject::Bool(true)),
+        Err(e) => {
+            debug!("__propose_skill_patch__: failed: {e}");
+            ExtFunctionResult::Return(MontyObject::Bool(false))
+        }
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────

@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
-use lunarwing_skills::v2::V2SkillMetadata;
+use lunarwing_skills::SkillTrust;
+use lunarwing_skills::v2::{
+    MAX_PATCH_HISTORY, PendingSkillPatch, SkillPatch, V2SkillMetadata, compute_content_hash,
+};
 
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
@@ -105,6 +108,177 @@ impl SkillTracker {
         self.store.save_memory_doc(&updated_doc).await
     }
 
+    /// Stage a proposed patch for later user approval (B-1, propose-then-approve).
+    ///
+    /// Does NOT change the skill's content or version — it only records a
+    /// `pending_patch` on the metadata. The live skill keeps working until the
+    /// user approves. Refuses to propose against `Installed` (external,
+    /// read-only) skills, and overwrites any prior pending proposal.
+    pub async fn propose_patch(
+        &self,
+        doc_id: DocId,
+        proposed_content: String,
+        diff: String,
+        reason: String,
+        source_thread_id: Option<String>,
+    ) -> Result<(), EngineError> {
+        let doc = self
+            .store
+            .load_memory_doc(doc_id)
+            .await?
+            .ok_or_else(|| EngineError::Skill {
+                reason: format!("skill doc not found: {}", doc_id.0),
+            })?;
+
+        if doc.doc_type != DocType::Skill {
+            return Err(EngineError::Skill {
+                reason: format!("doc {} is not a skill (type: {:?})", doc_id.0, doc.doc_type),
+            });
+        }
+
+        let mut meta: V2SkillMetadata =
+            serde_json::from_value(doc.metadata.clone()).map_err(|e| EngineError::Skill {
+                reason: format!("invalid skill metadata: {e}"),
+            })?;
+
+        // Never propose patches for externally-installed (read-only) skills.
+        if meta.trust == SkillTrust::Installed {
+            return Err(EngineError::Skill {
+                reason: format!(
+                    "refusing to propose a patch for Installed (read-only) skill {}",
+                    doc_id.0
+                ),
+            });
+        }
+
+        meta.pending_patch = Some(PendingSkillPatch {
+            proposed_content,
+            diff,
+            reason,
+            source_thread_id,
+            confidence_at_proposal: meta.metrics.confidence(),
+            base_content_hash: compute_content_hash(&doc.content),
+            proposed_at: chrono::Utc::now(),
+        });
+
+        let updated_doc = MemoryDoc {
+            metadata: serde_json::to_value(&meta).map_err(|e| EngineError::Skill {
+                reason: format!("failed to serialize skill metadata: {e}"),
+            })?,
+            updated_at: chrono::Utc::now(),
+            ..doc
+        };
+
+        self.store.save_memory_doc(&updated_doc).await
+    }
+
+    /// Apply a skill's pending patch on user approval (B-1).
+    ///
+    /// Bumps the version (with `parent_version` for rollback), swaps in the
+    /// proposed content, appends a bounded `patch_history` entry, and clears
+    /// the pending proposal. Optimistic concurrency: refuses if the skill's
+    /// current content no longer matches the hash captured at propose time.
+    pub async fn apply_pending_patch(&self, doc_id: DocId) -> Result<(), EngineError> {
+        let doc = self
+            .store
+            .load_memory_doc(doc_id)
+            .await?
+            .ok_or_else(|| EngineError::Skill {
+                reason: format!("skill doc not found: {}", doc_id.0),
+            })?;
+
+        let mut meta: V2SkillMetadata =
+            serde_json::from_value(doc.metadata.clone()).map_err(|e| EngineError::Skill {
+                reason: format!("invalid skill metadata: {e}"),
+            })?;
+
+        let pending = meta.pending_patch.take().ok_or_else(|| EngineError::Skill {
+            reason: format!("skill {} has no pending patch to apply", doc_id.0),
+        })?;
+
+        // Optimistic concurrency: the skill must not have changed since propose.
+        let current_hash = compute_content_hash(&doc.content);
+        if pending.base_content_hash != current_hash {
+            return Err(EngineError::Skill {
+                reason: format!(
+                    "skill {} changed since the patch was proposed; discard and re-propose",
+                    doc_id.0
+                ),
+            });
+        }
+
+        meta.parent_version = Some(meta.version);
+        meta.version += 1;
+        meta.content_hash = compute_content_hash(&pending.proposed_content);
+        meta.patch_history.push(SkillPatch {
+            version: meta.version,
+            applied_at: chrono::Utc::now(),
+            source_thread_id: pending.source_thread_id.clone(),
+            reason: pending.reason.clone(),
+            // Preserve the pre-patch metrics before the epoch reset below.
+            metrics_before: meta.metrics.clone(),
+        });
+        // Keep history bounded (newest kept).
+        if meta.patch_history.len() > MAX_PATCH_HISTORY {
+            let overflow = meta.patch_history.len() - MAX_PATCH_HISTORY;
+            meta.patch_history.drain(0..overflow);
+        }
+
+        // Epoch reset: a patched skill earns a fair fresh evaluation window.
+        // Without this, stale pre-patch failures would keep the cumulative
+        // ratio below threshold forever, immediately re-tripping the patch
+        // trigger and masking whether the patch actually helped. The old
+        // counts live on in `metrics_before` above (full audit trail).
+        meta.metrics.usage_count = 0;
+        meta.metrics.success_count = 0;
+        meta.metrics.failure_count = 0;
+        meta.metrics.last_used = None;
+
+        let updated_doc = MemoryDoc {
+            content: pending.proposed_content,
+            metadata: serde_json::to_value(&meta).map_err(|e| EngineError::Skill {
+                reason: format!("failed to serialize skill metadata: {e}"),
+            })?,
+            updated_at: chrono::Utc::now(),
+            ..doc
+        };
+
+        self.store.save_memory_doc(&updated_doc).await
+    }
+
+    /// Discard a skill's pending patch on user rejection (B-1). Leaves the
+    /// skill's content and version untouched.
+    pub async fn discard_pending_patch(&self, doc_id: DocId) -> Result<(), EngineError> {
+        let doc = self
+            .store
+            .load_memory_doc(doc_id)
+            .await?
+            .ok_or_else(|| EngineError::Skill {
+                reason: format!("skill doc not found: {}", doc_id.0),
+            })?;
+
+        let mut meta: V2SkillMetadata =
+            serde_json::from_value(doc.metadata.clone()).map_err(|e| EngineError::Skill {
+                reason: format!("invalid skill metadata: {e}"),
+            })?;
+
+        if meta.pending_patch.take().is_none() {
+            return Err(EngineError::Skill {
+                reason: format!("skill {} has no pending patch to discard", doc_id.0),
+            });
+        }
+
+        let updated_doc = MemoryDoc {
+            metadata: serde_json::to_value(&meta).map_err(|e| EngineError::Skill {
+                reason: format!("failed to serialize skill metadata: {e}"),
+            })?,
+            updated_at: chrono::Utc::now(),
+            ..doc
+        };
+
+        self.store.save_memory_doc(&updated_doc).await
+    }
+
     /// Rollback a skill to its previous version.
     ///
     /// Decrements the version to `parent_version` if available. This is a
@@ -167,6 +341,8 @@ mod tests {
             },
             parent_version: None,
             content_hash: String::new(),
+            patch_history: vec![],
+            pending_patch: None,
         };
 
         let mut doc = MemoryDoc::new(
@@ -176,6 +352,14 @@ mod tests {
             "skill:test",
             "Test skill prompt",
         );
+        doc.metadata = serde_json::to_value(&meta).unwrap();
+        doc
+    }
+
+    fn make_skill_doc_trust(project_id: ProjectId, trust: SkillTrust) -> MemoryDoc {
+        let mut doc = make_skill_doc(project_id);
+        let mut meta: V2SkillMetadata = serde_json::from_value(doc.metadata.clone()).unwrap();
+        meta.trust = trust;
         doc.metadata = serde_json::to_value(&meta).unwrap();
         doc
     }
@@ -286,5 +470,152 @@ mod tests {
 
         let result = tracker.record_usage(DocId::new(), true).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_propose_patch_stages_without_version_bump() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc_trust(project_id, SkillTrust::Trusted);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker
+            .propose_patch(
+                doc_id,
+                "patched body".to_string(),
+                "@@ diff @@".to_string(),
+                "wrong tool name".to_string(),
+                Some("thread-42".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        // Content + version UNCHANGED while pending.
+        assert_eq!(updated.content, "Test skill prompt");
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert_eq!(meta.version, 1);
+        let pending = meta.pending_patch.expect("pending staged");
+        assert_eq!(pending.proposed_content, "patched body");
+        assert_eq!(pending.source_thread_id.as_deref(), Some("thread-42"));
+    }
+
+    #[tokio::test]
+    async fn test_propose_patch_refused_for_installed_skill() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc_trust(project_id, SkillTrust::Installed);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store);
+
+        let result = tracker
+            .propose_patch(
+                doc_id,
+                "x".to_string(),
+                String::new(),
+                "r".to_string(),
+                None,
+            )
+            .await;
+        assert!(result.is_err(), "must refuse Installed skill");
+    }
+
+    #[tokio::test]
+    async fn test_apply_pending_patch_bumps_version_and_records_history() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc_trust(project_id, SkillTrust::Trusted);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker
+            .propose_patch(
+                doc_id,
+                "patched body".to_string(),
+                String::new(),
+                "fix".to_string(),
+                Some("t-1".to_string()),
+            )
+            .await
+            .unwrap();
+        tracker.apply_pending_patch(doc_id).await.unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        assert_eq!(updated.content, "patched body");
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert_eq!(meta.version, 2);
+        assert_eq!(meta.parent_version, Some(1));
+        assert!(meta.pending_patch.is_none());
+        assert_eq!(meta.patch_history.len(), 1);
+        assert_eq!(meta.patch_history[0].version, 2);
+        assert_eq!(meta.patch_history[0].reason, "fix");
+        // Epoch reset: live metrics zeroed so the patched skill gets a fresh
+        // evaluation window (confidence back to 1.0, benefit of the doubt).
+        assert_eq!(meta.metrics.usage_count, 0);
+        assert_eq!(meta.metrics.success_count, 0);
+        assert_eq!(meta.metrics.failure_count, 0);
+        assert!(meta.metrics.last_used.is_none());
+        assert!((meta.metrics.confidence() - 1.0).abs() < f64::EPSILON);
+        // ...but the pre-patch metrics are preserved in the history snapshot.
+        assert_eq!(meta.patch_history[0].metrics_before.usage_count, 5);
+        assert_eq!(meta.patch_history[0].metrics_before.success_count, 3);
+        assert_eq!(meta.patch_history[0].metrics_before.failure_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_apply_pending_patch_refuses_on_content_drift() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc_trust(project_id, SkillTrust::Trusted);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker
+            .propose_patch(
+                doc_id,
+                "patched body".to_string(),
+                String::new(),
+                "fix".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Simulate an out-of-band content change after the proposal.
+        let mut drifted = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        drifted.content = "changed underneath".to_string();
+        store.save_memory_doc(&drifted).await.unwrap();
+
+        let result = tracker.apply_pending_patch(doc_id).await;
+        assert!(result.is_err(), "must refuse to apply over a drifted skill");
+    }
+
+    #[tokio::test]
+    async fn test_discard_pending_patch_leaves_skill_untouched() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc_trust(project_id, SkillTrust::Trusted);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker
+            .propose_patch(
+                doc_id,
+                "patched body".to_string(),
+                String::new(),
+                "fix".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        tracker.discard_pending_patch(doc_id).await.unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        assert_eq!(updated.content, "Test skill prompt");
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert_eq!(meta.version, 1);
+        assert!(meta.pending_patch.is_none());
+        assert!(meta.patch_history.is_empty());
     }
 }

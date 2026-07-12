@@ -1,31 +1,9 @@
-# BUG: OMEMO MUC fallback-spam + stuck processing loop
+# Archived pointer: XMPP OMEMO fallback-spam
 
-> **STATUS: FIXED / not reproducing (as of 2026-06-07)** — reopen with logs if it recurs.
+> **Status: UNVERIFIED for fallback spam; processing-state recovery is fixed.**
 
-**Severity:** Medium (when active) — affected OMEMO group chat (MUC) only.
-
-## Symptoms
-
-Two symptoms that showed up together in OMEMO group chats:
-
-1. **Fallback-spam** — the agent repeatedly sent the plaintext fallback *"I sent you an OMEMO
-   encrypted message but your client doesn't seem to support that"* instead of decrypting,
-   typically right after a bridge/daemon restart.
-2. **Stuck processing loop** — the agent appeared wedged ("Message queued — will be processed
-   after the current turn") and stopped producing replies.
-
-## Status / resolution
-
-Neither symptom currently reproduces. They are consistent with two known, since-addressed
-behaviors rather than a distinct unfixed bug:
-
-- **OMEMO warmup after restart** is expected: encrypted MUC can take several messages after a
-  restart before decrypting reliably (see `CLAUDE.md` → "XMPP / OMEMO Known Behavior"). The
-  early fallback messages are the warmup window, not a loop.
-- **Stuck `Processing` threads** were addressed by the `handle_message` timeout/recovery work
-  and stuck-run recovery (see `docs/internal/history/architecture/HANDLE_MESSAGE_FIX.md` and the Routine System
-  notes in `CLAUDE.md`).
-
-This note was previously a placeholder ("document the OMEMO MUC bug + stuck loop"); it is kept
-as a thin Fixed record. If the spam or stuck loop returns, reopen with bridge `/v1/status`
-output and `RUST_LOG=lunarwing=debug` daemon logs around the affected messages.
+The current evidence, source checks, historical release symptom, and
+reproduction requirements are in
+[`../BUG-xmpp-omemo-warmup-and-processing.md`](../BUG-xmpp-omemo-warmup-and-processing.md).
+This pointer keeps the original history path valid without claiming that the
+MUC fallback behavior has been resolved.

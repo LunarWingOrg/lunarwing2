@@ -2,7 +2,7 @@
 
 **Severity:** High (4 bugs), Medium (2 bugs)
 **Found:** 2026-06-03 during v1.1.0 pre-release stress testing
-**Status:** Fixed
+**Status:** Fixed (current source verified 2026-07-12)
 **Affects:** `ic/src/workspace/`, `ic/src/db/` (both PostgreSQL and libSQL backends)
 **Found by:** Sunburst (test tenant, multi-tenant systemd deployment)
 **Testing environment:** PostgreSQL 16 (pgvector/pgvector:pg16)
@@ -112,7 +112,7 @@ zero chunks (after delete, before insert).
 
 ---
 
-## Bug 6: Persistence Lag at 16+ Concurrent Writes (MEDIUM, EXPECTED)
+## Bug 6: Persistence Lag at 16+ Concurrent Writes (NOT A BUG / EXPECTED POOLING)
 
 **Symptom:** At 16+ concurrent writes, write acknowledgment returned before
 all data was queryable by other connections.
@@ -362,3 +362,19 @@ connections).
 5. **Connection pool size is a concurrency ceiling.** With N connections and
    M connections per operation, the maximum safe concurrency is roughly N/M.
    Reducing M (connections per operation) is more effective than increasing N.
+
+## Current verification
+
+The current tree still contains the V21 migration and the atomic workspace
+operations described above:
+
+- `ic/migrations/V21__fix_null_agent_id_unique_constraint.sql:28-33` uses
+  `UNIQUE NULLS NOT DISTINCT`.
+- `ic/src/workspace/repository.rs:120-126,157-177,363-425` contains the atomic
+  get-or-create, append, and document/chunk replacement paths.
+- `ic/src/workspace/mod.rs:680-709,803-844` calls the atomic update/append APIs,
+  and the libSQL equivalents are in `ic/src/db/libsql/workspace.rs:421-455,765-870`.
+- The concurrency regression tests remain in `ic/src/workspace/mod.rs`.
+
+No Cargo command was run in this documentation pass. Bug 6 is retained as an
+operational expectation, not counted as an unresolved defect.

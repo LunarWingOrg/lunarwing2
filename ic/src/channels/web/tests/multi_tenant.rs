@@ -705,6 +705,9 @@ mod auth_enforcement {
             .route("/api/skills", get(authed_handler))
             .route("/api/skills/search", post(authed_handler))
             .route("/api/skills/install", post(authed_handler))
+            .route("/api/skills/patches", get(authed_handler))
+            .route("/api/skills/patches/{doc_id}/approve", post(authed_handler))
+            .route("/api/skills/patches/{doc_id}/reject", post(authed_handler))
             .route("/api/skills/{name}", delete(authed_handler))
             // Logs
             .route("/api/logs/events", get(authed_handler))
@@ -772,6 +775,10 @@ mod auth_enforcement {
         assert_requires_auth(&app, Method::POST, "/api/skills/search").await;
         assert_requires_auth(&app, Method::POST, "/api/skills/install").await;
         assert_requires_auth(&app, Method::DELETE, "/api/skills/test-skill").await;
+        // B-1: self-improving skills — patch approval surface is auth-gated too.
+        assert_requires_auth(&app, Method::GET, "/api/skills/patches").await;
+        assert_requires_auth(&app, Method::POST, "/api/skills/patches/abc/approve").await;
+        assert_requires_auth(&app, Method::POST, "/api/skills/patches/abc/reject").await;
     }
 
     #[tokio::test]
