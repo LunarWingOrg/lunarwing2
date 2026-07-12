@@ -1309,21 +1309,27 @@ impl Agent {
         // rerouted). With the flag off this is a no-op and behavior is identical
         // to the legacy path. The engine manages its own threads via
         // conversation_scope, so we branch BEFORE legacy session/thread resolution.
+        // Engine V2 routing is gated to the web gateway channel for now. The
+        // engine delivers replies ONLY over the gateway's SSE stream
+        // (await_thread_outcome → AppEvent::Response); it does not call a
+        // channel's respond(). XMPP / DarkIRC / weechat deliver via respond()
+        // (JID queue, WASM on_respond) and have no SSE, so routing them through
+        // the engine would compute a reply that never reaches the user. Until
+        // the engine learns channel-aware delivery, non-gateway channels stay
+        // on the legacy loop. The channel name "gateway" matches the web
+        // channel's Channel::name() and the IncomingMessage stamp in chat_send.
         if let Submission::UserInput { ref content } = submission {
-            if crate::bridge::is_engine_v2_enabled() {
+            if crate::bridge::is_engine_v2_enabled() && message.channel == "gateway" {
                 tracing::debug!(
                     message_id = %message.id,
                     user_id = %message.user_id,
-                    "ENGINE_V2 enabled — routing user input through engine v2"
+                    "ENGINE_V2 enabled — routing gateway user input through engine v2"
                 );
-                // The engine delivers its response to the channel itself (it
-                // streams thread events, including the final AppEvent::Response,
-                // over SSE keyed to the thread id). So we must NOT let the
-                // engine's returned text fall through to the caller's
-                // channels.respond() — that would double-send on the gateway
-                // (and previously errored with a missing routing target).
-                // Consume the result: log any error, and return an empty
-                // response which the outbound handler suppresses (never sent).
+                // The engine delivers its response over SSE itself, so we must
+                // NOT let the returned text fall through to channels.respond()
+                // — that would double-send on the gateway. Consume the result:
+                // log any error, and return an empty response which the
+                // outbound handler suppresses (never sent).
                 match crate::bridge::handle_with_engine(self, message, content).await {
                     Ok(_) => {}
                     Err(e) => {
