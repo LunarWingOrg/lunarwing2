@@ -32,6 +32,29 @@
 #        [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DARKIRC_MANIFEST_NAME="darkirc-contacts-v1.json"
+DARKIRC_SCOPE_RE='^[0-9a-f]{32}$'
+BUNDLE_HAS_DARKIRC_MANIFEST=false
+BUNDLE_DARKIRC_MANIFEST_MEMBER=""
+
+# These are the only values the exporter is allowed to carry into a live
+# tenant environment.  Import treats the bundle as untrusted input: an
+# arbitrary KEY=value line must never become a service setting.
+IMPORT_LUNARWING_KEYS=(
+  SECRETS_MASTER_KEY XMPP_JID XMPP_PASSWORD XMPP_DM_POLICY XMPP_ALLOW_FROM
+  XMPP_ALLOW_ROOMS XMPP_ENCRYPTED_ROOMS XMPP_ALLOW_PLAINTEXT_FALLBACK
+  XMPP_OMEMO_DEVICE_ID LLM_API_KEY LLM_MODEL OPENCODE_MODEL GOTIFY_URL
+  GATEWAY_HOST HTTP_HOST LLM_BASE_URL OPENCODE_BASE_URL
+)
+IMPORT_BRIDGE_KEYS=(
+  XMPP_JID XMPP_PASSWORD XMPP_DM_POLICY XMPP_ALLOW_FROM_JSON
+  XMPP_ALLOW_ROOMS_JSON XMPP_ENCRYPTED_ROOMS_JSON XMPP_DEVICE_ID
+  XMPP_ALLOW_PLAINTEXT_FALLBACK
+)
+IMPORT_VISION_KEYS=(VL_URL VL_MODEL LUNARWING_AUTH_TOKEN)
+INJECTED_MASTER_KEY_VERIFIED=false
+
 BUNDLE=""
 NAME_OVERRIDE=""
 DO_START=false
@@ -76,31 +99,300 @@ note()   { printf '  · %s\n' "$*"; }
 confirm() { $AUTO_YES && return 0; local a; read -r -p "$1 [y/N] " a; [[ "$a" == y || "$a" == Y ]]; }
 run()    { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; return 0; fi; printf '  + %s\n' "$*"; "$@"; }
 
-# Inject KEY=value lines from a manifest into a live env file, backslash-safe (awk
-# ENVIRON, not -v) and CR-tolerant; preserves the live file's inode/owner/mode. The
-# read loop's `|| [[ -n "$line" ]]` keeps a final line without a trailing newline.
-inject_keys() {  # <manifest> <live_env>
-  local man="$1" live="$2" line key tmp
-  [[ -f "$man" && -f "$live" ]] || return 0
+run_bundle_manifest_stdin() {  # <command> [args...]
+  if $DRY_RUN; then
+    printf '  [dry-run] %s < %s\n' "$*" "$DARKIRC_MANIFEST_NAME"
+    return 0
+  fi
+  printf '  + %s < %s\n' "$*" "$DARKIRC_MANIFEST_NAME"
+  tar -xOf "$BUNDLE" "$BUNDLE_DARKIRC_MANIFEST_MEMBER" | "$@"
+}
+
+path_components_no_symlink() {
+  local path="$1" rest component current="/"
+  [[ "$path" == /* ]] || return 1
+  rest="${path#/}"
+  while [[ -n "$rest" ]]; do
+    component="${rest%%/*}"
+    if [[ "$rest" == */* ]]; then
+      rest="${rest#*/}"
+    else
+      rest=""
+    fi
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+    current="${current%/}/$component"
+    [[ ! -L "$current" ]] || return 1
+    if [[ -n "$rest" ]]; then
+      [[ -d "$current" ]] || return 1
+    fi
+  done
+}
+
+validate_dotenv_manifest() {  # <manifest> <allowed-key> ...
+  local manifest="$1" manifest_name line key
+  shift
+  manifest_name="$(basename -- "$manifest")"
+  local -A allowed=() seen=()
+  for key in "$@"; do
+    allowed["$key"]=1
+  done
+  [[ -f "$manifest" && ! -L "$manifest" ]] \
+    || die "manifest is missing or not a regular file: $manifest"
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
-    [[ "$line" == *=* ]] || continue
-    key="${line%%=*}"
-    grep -qxF "$line" "$live" 2>/dev/null && continue
-    tmp="$(mktemp)"
-    if grep -q "^${key}=" "$live"; then
-      _ik_repl="$line" awk -v k="${key}=" 'index($0,k)==1{print ENVIRON["_ik_repl"];next}{print}' "$live" >"$tmp"
-    else
-      cp "$live" "$tmp"; printf '%s\n' "$line" >>"$tmp"
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=.*$ ]] \
+      || die "malformed dotenv line in $manifest_name"
+    key="${BASH_REMATCH[1]}"
+    [[ -n "${allowed[$key]+present}" ]] \
+      || die "unsupported dotenv key '$key' in $manifest_name"
+    [[ -z "${seen[$key]+present}" ]] \
+      || die "duplicate dotenv key '$key' in $manifest_name"
+    seen["$key"]=1
+  done <"$manifest"
+}
+
+validate_import_target_roots() {
+  local uid path owner mode links
+  uid="$(id -u "$TENANT" 2>/dev/null || true)"
+  [[ "$uid" =~ ^[0-9]+$ ]] || die "could not resolve target tenant UID"
+  for path in "$HOME_T" "$LWROOT" "$LWROOT/env" "$LWROOT/state"; do
+    path_components_no_symlink "$path" \
+      || die "unsafe target path component (symlink or missing directory): $path"
+    [[ -d "$path" && ! -L "$path" ]] \
+      || die "target path is not a regular directory: $path"
+    owner="$(stat -c '%u' "$path" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+    [[ "$owner" == "$uid" && "$mode" =~ ^[0-7]+$ ]] \
+      || die "target directory has unexpected ownership: $path"
+    (( (8#$mode & 022) == 0 )) \
+      || die "target directory is group/world writable: $path"
+  done
+  for path in "$ENVF" "$BRIDGE_ENVF"; do
+    [[ -f "$path" && ! -L "$path" ]] \
+      || die "target environment file is missing or unsafe: $path"
+    path_components_no_symlink "$path" \
+      || die "unsafe target environment path: $path"
+    owner="$(stat -c '%u' "$path" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+    links="$(stat -c '%h' "$path" 2>/dev/null || true)"
+    [[ "$owner" == "$uid" && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] \
+      || die "target environment file has unexpected ownership or link count: $path"
+    (( (8#$mode & 077) == 0 && (8#$mode & 0400) != 0 )) \
+      || die "target environment file has unsafe permissions: $path"
+  done
+  if [[ -e "$VISION_ENVF" ]]; then
+    [[ -f "$VISION_ENVF" && ! -L "$VISION_ENVF" ]] \
+      || die "target vision environment file is unsafe: $VISION_ENVF"
+    path_components_no_symlink "$VISION_ENVF" \
+      || die "unsafe target vision environment path: $VISION_ENVF"
+  fi
+}
+
+validate_bundle_members() {
+  local list_file="$1" member normalized first
+  tar -tf "$BUNDLE" >"$list_file" \
+    || die "failed to inspect bundle archive"
+  declare -A seen=()
+  while IFS= read -r member || [[ -n "$member" ]]; do
+    [[ -n "$member" ]] || continue
+    normalized="$member"
+    while [[ "$normalized" == ./* ]]; do
+      normalized="${normalized#./}"
+    done
+    while [[ "$normalized" == */ ]]; do
+      normalized="${normalized%/}"
+    done
+    [[ -n "$normalized" ]] || continue
+    [[ "$normalized" != /* && "$normalized" != ../* && "$normalized" != */../* \
+       && "$normalized" != '..' && "$normalized" != *'//'* \
+       && "$normalized" != */./* && "$normalized" != */. ]] \
+      || die "bundle contains unsafe path '$member'"
+    case "$normalized" in
+      "$DARKIRC_MANIFEST_NAME")
+        BUNDLE_HAS_DARKIRC_MANIFEST=true
+        BUNDLE_DARKIRC_MANIFEST_MEMBER="$member"
+        ;;
+      state/darkirc|state/darkirc/*)
+        die "bundle contains secret-bearing state/darkirc; use $DARKIRC_MANIFEST_NAME"
+        ;;
+    esac
+    [[ -z "${seen[$normalized]+present}" ]] \
+      || die "bundle contains duplicate path '$member'"
+    seen["$normalized"]=1
+  done <"$list_file"
+
+  # Generic migration bundles may contain only ordinary files/directories.
+  # Links, devices, FIFOs, and sockets are never meaningful migration payloads
+  # and can redirect or block privileged extraction.
+  while IFS= read -r first; do
+    case "$first" in
+      -*|d*) ;;
+      *) die "bundle contains a non-regular archive entry; refusing extraction" ;;
+    esac
+  done < <(tar -tvf "$BUNDLE" 2>/dev/null)
+}
+
+validate_state_archive() {  # <state.tar.gz> <list-file>
+  local archive="$1" list_file="$2" member normalized first
+  tar -tzf "$archive" >"$list_file" \
+    || die "bundle contains an unreadable state.tar.gz"
+  declare -A seen=()
+  while IFS= read -r member || [[ -n "$member" ]]; do
+    [[ -n "$member" ]] || continue
+    normalized="$member"
+    while [[ "$normalized" == ./* ]]; do
+      normalized="${normalized#./}"
+    done
+    while [[ "$normalized" == */ ]]; do
+      normalized="${normalized%/}"
+    done
+    [[ -n "$normalized" ]] || continue
+    [[ "$normalized" != /* && "$normalized" != ../* && "$normalized" != */../* \
+       && "$normalized" != '..' && "$normalized" != *'//'* \
+       && "$normalized" != */./* && "$normalized" != */. ]] \
+      || die "state archive contains unsafe path '$member'"
+    case "$normalized" in
+      state|state/*) ;;
+      *) die "state archive member is outside state/: '$member'" ;;
+    esac
+    case "$normalized" in
+      state/darkirc|state/darkirc/*)
+        die "generic state archive contains secret-bearing state/darkirc"
+        ;;
+    esac
+    [[ -z "${seen[$normalized]+present}" ]] \
+      || die "state archive contains duplicate path '$member'"
+    seen["$normalized"]=1
+  done <"$list_file"
+  while IFS= read -r first; do
+    case "$first" in
+      -*|d*) ;;
+      *) die "state archive contains a non-regular entry; refusing extraction" ;;
+    esac
+  done < <(tar -tvzf "$archive" 2>/dev/null)
+}
+
+valid_scope_id() {
+  local value="$1"
+  [[ "$value" =~ $DARKIRC_SCOPE_RE && ! "$value" =~ ^0+$ ]]
+}
+
+# Inject KEY=value lines from a manifest through a tenant-side atomic merge. Values
+# stay on stdin/a same-directory temporary file; they are never placed in argv or
+# an environment variable. The tenant child preserves the live file's mode/owner.
+inject_keys() {  # <manifest> <live_env> <allowed-key> ...
+  local man="$1" live="$2" verify_key=""
+  shift 2
+  validate_dotenv_manifest "$man" "$@"
+  path_components_no_symlink "$live" \
+    || die "unsafe target environment path: $live"
+  [[ -f "$live" && ! -L "$live" ]] \
+    || die "target environment file is missing or unsafe: $live"
+
+  # The manifest is secret-bearing, so feed it over stdin to a tenant-owned
+  # merge. The child never receives secret values in argv/environment and the
+  # root wrapper never reopens the mutable tenant pathname after the merge.
+  [[ "$live" == "$ENVF" ]] && verify_key="SECRETS_MASTER_KEY"
+  cat "$man" | sudo -u "$TENANT" env \
+    TARGET_PATH="$live" TARGET_VERIFY_KEY="$verify_key" bash -c '
+    set -euo pipefail
+    target="$TARGET_PATH"
+    parent="${target%/*}"
+    base="${target##*/}"
+    uid="$(id -u)"
+    [[ -d "$parent" && ! -L "$parent" ]] || exit 73
+    parent_owner="$(stat -c %u "$parent" 2>/dev/null || printf -1)"
+    parent_mode="$(stat -c %a "$parent" 2>/dev/null || true)"
+    [[ "$parent_owner" == "$uid" && "$parent_mode" =~ ^[0-7]+$ ]] || exit 73
+    (( (8#$parent_mode & 077) == 0 )) || exit 73
+    [[ -f "$target" && ! -L "$target" ]] || exit 73
+    owner="$(stat -c %u "$target" 2>/dev/null || printf -1)"
+    mode="$(stat -c %a "$target" 2>/dev/null || true)"
+    links="$(stat -c %h "$target" 2>/dev/null || printf 0)"
+    [[ "$owner" == "$uid" && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] || exit 73
+    (( (8#$mode & 077) == 0 && (8#$mode & 0400) != 0 )) || exit 73
+
+    umask 077
+    patch="$(mktemp "$parent/.${base}.import.XXXXXX")"
+    tmp="$(mktemp "$parent/.${base}.next.XXXXXX")"
+    trap '\''rm -f -- "$patch" "$tmp"'\'' EXIT
+    cat >"$patch"
+    if ! awk -v patch="$patch" '\''
+      BEGIN {
+        while ((getline line < patch) > 0) {
+          sub(/\r$/, "", line)
+          if (line == "" || line ~ /^#/) continue
+          if (line !~ /^[A-Za-z_][A-Za-z0-9_]*=.*$/) exit 74
+          key = line
+          sub(/=.*/, "", key)
+          if (key in replacement) exit 74
+          replacement[key] = line
+          order[++count] = key
+        }
+        close(patch)
+      }
+      {
+        key = $0
+        if (key ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+          sub(/=.*/, "", key)
+          if (key in replacement) {
+            if (seen[key]++) exit 74
+            print replacement[key]
+            next
+          }
+        }
+        print
+      }
+      END {
+        if (count < 0) exit 74
+        for (i = 1; i <= count; i++) {
+          key = order[i]
+          if (!(key in seen)) print replacement[key]
+        }
+      }
+    '\'' "$target" >"$tmp"; then
+      rm -f -- "$patch" "$tmp"
+      trap - EXIT
+      exit 74
     fi
-    cat "$tmp" >"$live"; rm -f "$tmp"
-    note "injected $key"
-  done < "$man"
+    chmod "$mode" "$tmp" || {
+      rm -f -- "$patch" "$tmp"
+      trap - EXIT
+      exit 74
+    }
+    if [[ -n "${TARGET_VERIFY_KEY:-}" ]]; then
+      if ! awk -v key="${TARGET_VERIFY_KEY}=" '\''
+        FNR == NR {
+          if (index($0, key) == 1) expected = $0
+          next
+        }
+        {
+          if (index($0, key) == 1) actual = $0
+        }
+        END {
+          if (expected == "" || actual != expected) exit 74
+        }
+      '\'' "$patch" "$tmp"; then
+        rm -f -- "$patch" "$tmp"
+        trap - EXIT
+        exit 74
+      fi
+    fi
+    mv -f -- "$tmp" "$target"
+    rm -f -- "$patch"
+    trap - EXIT
+    exit 0
+  ' >/dev/null || die "could not safely inject manifest into $live"
+  [[ "$live" == "$ENVF" ]] && INJECTED_MASTER_KEY_VERIFIED=true
+  note "validated and atomically injected manifest keys into $live"
 }
 
 non_target_owner_scopes() {  # <scope-summary> <target-scope>
-  local summary="$1" target="$2" line scope count
-  while IFS=$' \t' read -r scope count _; do
+  local summary="$1" target="$2" line scope _count
+  while IFS=$' \t' read -r scope _count _; do
     [[ -n "$scope" ]] || continue
     [[ "$scope" == "$target" ]] && continue
     printf '%s\n' "$scope"
@@ -118,7 +410,7 @@ show_owner_scope_summary() {  # <summary>
 }
 
 reconcile_owner_scope() {
-  banner "5/7  Owner scope"
+  banner "5/8  Owner scope"
 
   if $DRY_RUN; then
     if [[ -n "$OWNER_SCOPE" ]]; then
@@ -167,11 +459,12 @@ reconcile_owner_scope() {
 
 [[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.tar> [--name <t>] [--start] [--old-stopped] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-toolchains] [--with-vision] [--docker-group] [--tensorzero-url <url>] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
 [[ -f "$BUNDLE" ]] || die "bundle not found: $BUNDLE"
+[[ ! -L "$BUNDLE" ]] || die "bundle path must not be a symlink"
 [[ "$(id -u)" -eq 0 ]] || die "run as root (sudo) — mt-admin needs root"
 command -v jq  >/dev/null 2>&1 || die "jq required"
+command -v tar >/dev/null 2>&1 || die "tar required"
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-MT="$SCRIPT_DIR/lunarwing-mt-admin.sh"
+MT="${LUNARWING_MT_ADMIN:-$SCRIPT_DIR/lunarwing-mt-admin.sh}"
 WEECHAT_PREFLIGHT="$SCRIPT_DIR/lunarwing-weechat-preflight.sh"
 PORTS_REGISTRY="${LUNARWING_PORTS_REGISTRY:-/etc/lunarwing/ports.json}"
 [[ -x "$MT" ]] || die "mt-admin not found/executable at $MT"
@@ -181,8 +474,37 @@ grep -qE '^\s*owner-scopes\)' "$MT" || die "mt-admin at $MT predates owner-scope
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 chmod 0700 "$WORK"
-tar xf "$BUNDLE" -C "$WORK" || die "failed to unpack bundle $BUNDLE"
+# Pin the caller-supplied credential bundle before any validation.  Validation
+# and every later extraction then operate on the same private copy, so a
+# writable source directory cannot swap archive contents between the checks.
+BUNDLE_SOURCE="$BUNDLE"
+bundle_links="$(stat -c '%h' "$BUNDLE_SOURCE" 2>/dev/null || true)"
+[[ "$bundle_links" == 1 ]] || die "bundle must be a single-link regular file"
+BUNDLE="$WORK/input.bundle"
+( umask 077; cp --no-dereference -- "$BUNDLE_SOURCE" "$BUNDLE" ) \
+  || die "could not pin bundle contents for validation"
+[[ -f "$BUNDLE" && ! -L "$BUNDLE" ]] \
+  || die "bundle source changed to a non-regular file while being pinned"
+chmod 0600 "$BUNDLE"
+validate_bundle_members "$WORK/archive.list"
+tar xf "$BUNDLE" -C "$WORK" --no-same-owner --no-same-permissions \
+  --exclude="$DARKIRC_MANIFEST_NAME" --exclude="./$DARKIRC_MANIFEST_NAME" \
+  || die "failed to unpack bundle $BUNDLE"
+rm -f "$WORK/archive.list"
 [[ -f "$WORK/meta.txt" ]] || die "bundle missing meta.txt — not an export-tenant.sh bundle?"
+[[ ! -L "$WORK/meta.txt" ]] || die "bundle meta.txt is a symlink"
+validate_dotenv_manifest "$WORK/manifest-lunarwing.env" "${IMPORT_LUNARWING_KEYS[@]}"
+if [[ -f "$WORK/manifest-bridge.env" ]]; then
+  validate_dotenv_manifest "$WORK/manifest-bridge.env" "${IMPORT_BRIDGE_KEYS[@]}"
+fi
+if [[ -f "$WORK/manifest-vision.env" ]]; then
+  validate_dotenv_manifest "$WORK/manifest-vision.env" "${IMPORT_VISION_KEYS[@]}"
+fi
+if [[ -f "$WORK/state.tar.gz" ]]; then
+  [[ ! -L "$WORK/state.tar.gz" ]] || die "state.tar.gz is a symlink"
+  validate_state_archive "$WORK/state.tar.gz" "$WORK/state-archive.list"
+  rm -f "$WORK/state-archive.list"
+fi
 
 meta() { sed -n "s/^$1=//p" "$WORK/meta.txt" | head -1; }
 manifest_value() {
@@ -190,13 +512,106 @@ manifest_value() {
   value="$(sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -1)"
   printf '%s' "${value%$'\r'}"
 }
-# Sanitize the tenant name the same way mt-admin does ([a-z0-9-]), so our own
-# path/getent/chown use exactly the name mt-admin will use internally.
-RAW_NAME="${NAME_OVERRIDE:-$(meta tenant)}"
-TENANT="$(printf '%s' "$RAW_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
-[[ -n "$TENANT" ]] || die "could not determine a valid tenant name (got '$RAW_NAME'; pass --name)"
-[[ "$TENANT" == "$RAW_NAME" ]] || note "tenant name sanitized: '$RAW_NAME' -> '$TENANT'"
+SOURCE_TENANT="$(meta tenant)"
+[[ "$SOURCE_TENANT" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
+  || die "bundle has an unsafe source tenant name '$SOURCE_TENANT'"
+RAW_NAME="${NAME_OVERRIDE:-$SOURCE_TENANT}"
+[[ "$RAW_NAME" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
+  || die "unsafe target tenant name '$RAW_NAME' (use lowercase letters, digits, and hyphens)"
+TENANT="$RAW_NAME"
 SRC_VER="$(meta source_version)"; DB_BACKEND="$(meta db_backend)"; DB_BACKEND="${DB_BACKEND:-postgres}"
+
+DARKIRC_ENABLED_META="$(meta darkirc_enabled)"
+DARKIRC_ENABLED="$DARKIRC_ENABLED_META"
+DARKIRC_SCOPE_ID="$(meta darkirc_scope_id)"
+DARKIRC_MIGRATION_META="$(meta darkirc_migration)"
+DARKIRC_MIGRATION="$DARKIRC_MIGRATION_META"
+SOURCE_QUIESCED="$(meta source_quiesced)"
+SOURCE_QUIESCED="${SOURCE_QUIESCED:-false}"
+HAS_DARKIRC_MANIFEST="$BUNDLE_HAS_DARKIRC_MANIFEST"
+
+# Older structured bundles may predate the explicit metadata lines. Presence of
+# the fixed manifest is enough to opt into the strict DarkIRC path; explicit
+# false metadata remains an integrity error below.
+if $HAS_DARKIRC_MANIFEST; then
+  [[ -n "$DARKIRC_ENABLED" ]] || DARKIRC_ENABLED=true
+  [[ -n "$DARKIRC_MIGRATION" ]] || DARKIRC_MIGRATION=true
+fi
+DARKIRC_ENABLED="${DARKIRC_ENABLED:-false}"
+DARKIRC_MIGRATION="${DARKIRC_MIGRATION:-false}"
+
+[[ "$DARKIRC_ENABLED" == true || "$DARKIRC_ENABLED" == false ]] \
+  || die "bundle has invalid darkirc_enabled metadata"
+[[ "$DARKIRC_MIGRATION" == true || "$DARKIRC_MIGRATION" == false ]] \
+  || die "bundle has invalid darkirc_migration metadata"
+if $DARKIRC_MIGRATION && ! $HAS_DARKIRC_MANIFEST; then
+  die "bundle declares DarkIRC contact migration but lacks $DARKIRC_MANIFEST_NAME"
+fi
+if $HAS_DARKIRC_MANIFEST; then
+  $DARKIRC_ENABLED \
+    || die "$DARKIRC_MANIFEST_NAME is present but DarkIRC is not enabled in bundle metadata"
+  $DARKIRC_MIGRATION \
+    || die "$DARKIRC_MANIFEST_NAME is present without darkirc_migration=true metadata"
+  manifest_listing="$(tar -tvf "$BUNDLE" 2>/dev/null | awk -v name="$BUNDLE_DARKIRC_MANIFEST_MEMBER" '$NF == name { print; exit }')"
+  [[ "$manifest_listing" == -rw-------* ]] \
+    || die "$DARKIRC_MANIFEST_NAME must be a mode-0600 regular file"
+fi
+if $DARKIRC_ENABLED; then
+  valid_scope_id "$DARKIRC_SCOPE_ID" \
+    || die "bundle has no valid DarkIRC scope ID"
+  [[ "$TENANT" == "$SOURCE_TENANT" ]] \
+    || die "refusing to clone DarkIRC keys from '$SOURCE_TENANT' into '$TENANT'; verified rotation is required"
+  [[ "$SOURCE_QUIESCED" == true ]] \
+    || die "DarkIRC scope may be preserved only from a quiesced source export"
+  $OLD_STOPPED \
+    || die "DarkIRC scope preservation requires --old-stopped before target provisioning"
+  $FORCE && die "--force is not allowed for a DarkIRC migration; use a fresh target"
+
+  grep -qE 'darkirc-scope-id' "$MT" \
+    || die "target mt-admin lacks --darkirc-scope-id; refusing a late scope mismatch"
+  if $HAS_DARKIRC_MANIFEST; then
+    grep -qE 'stage-migration' "$MT" \
+      || die "target mt-admin lacks structured DarkIRC migration support"
+    grep -qE 'import-migration' "$MT" \
+      || die "target mt-admin lacks structured DarkIRC import support"
+    # The destination binary is not installed until after tenant provisioning;
+    # this preflight validates the manifest's frozen profile/key codec and
+    # checksums without accepting it into tenant state.  mt-admin revalidates
+    # the measured target binary immediately before stage/import.
+    if $DRY_RUN; then
+      note "[dry-run] would typed-validate $DARKIRC_MANIFEST_NAME without staging it"
+    else
+      manifest_validation="$(tar -xOf "$BUNDLE" "$BUNDLE_DARKIRC_MANIFEST_MEMBER" | \
+        "$MT" darkirc-contact validate-migration --in - --json --unbound)" \
+        || die "$DARKIRC_MANIFEST_NAME failed typed validation"
+      validated_scope="$(jq -r '.scope_id // empty' <<<"$manifest_validation")"
+      [[ "$validated_scope" == "$DARKIRC_SCOPE_ID" ]] \
+        || die "$DARKIRC_MANIFEST_NAME scope does not match bundle metadata"
+    fi
+  fi
+
+  if [[ -f "$PORTS_REGISTRY" ]]; then
+    jq -e '.tenants | type == "object"' "$PORTS_REGISTRY" >/dev/null 2>&1 \
+      || die "ports registry '$PORTS_REGISTRY' is invalid; refusing DarkIRC scope import"
+    SCOPE_OWNER="$(jq -r --arg scope "$DARKIRC_SCOPE_ID" \
+      '.tenants // {} | to_entries[] | select(.value.darkirc_scope_id == $scope) | .key' \
+      "$PORTS_REGISTRY" 2>/dev/null | head -1)"
+    [[ -z "$SCOPE_OWNER" ]] \
+      || die "DarkIRC scope ID is already registered to '$SCOPE_OWNER'; refusing clone/import"
+  else
+    # A pristine destination has no registry yet. add-tenant will initialize it
+    # and atomically reserve the validated source scope before any contact state
+    # is staged.
+    SCOPE_OWNER=""
+  fi
+fi
+
+if [[ -n "$OWNER_SCOPE" ]]; then
+  [[ "$OWNER_SCOPE" =~ ^[A-Za-z0-9_.:@-]+$ ]] \
+    || die "unsafe --owner-scope value '$OWNER_SCOPE'"
+  [[ "$OWNER_SCOPE" != "$TENANT" ]] \
+    || die "--owner-scope must not equal target tenant '$TENANT'"
+fi
 
 banner "Import tenant '$TENANT' (from source $SRC_VER, db $DB_BACKEND)"
 $DRY_RUN && say "*** DRY RUN — no changes will be made ***"
@@ -223,9 +638,10 @@ GOTIFY_URL="$(manifest_value GOTIFY_URL)"
 confirm "Stage tenant '$TENANT' on THIS host from the bundle?" || die "aborted by user"
 
 # ---- 1. provision fresh (no daemon, no health) -------------------------------
-banner "1/7  Provision (add-tenant --no-health)"
+banner "1/8  Provision (add-tenant --no-health)"
 add_args=(add-tenant "$TENANT" --no-health)
 $WITH_DOCKER_GROUP && add_args+=(--docker-group)
+$DARKIRC_ENABLED && add_args+=(--enable-darkirc --darkirc-scope-id "$DARKIRC_SCOPE_ID")
 [[ -n "$XMPP_JID" ]] && add_args+=(--xmpp-jid "$XMPP_JID")
 [[ -n "$XMPP_ALLOW_FROM" ]] && add_args+=(--xmpp-allow-from "$XMPP_ALLOW_FROM")
 [[ -n "$GATEWAY_HOST" ]] && add_args+=(--gateway-host "$GATEWAY_HOST")
@@ -252,7 +668,7 @@ BRIDGE_ENVF="$LWROOT/env/xmpp-bridge.env"
 VISION_ENVF="$LWROOT/env/vision.env"
 
 # ---- 2. build daemon + workers -----------------------------------------------
-banner "2/7  Build"
+banner "2/8  Build"
 build_args=(build-tenant "$TENANT" --with-wasm)
 $WITH_NANOCODE && build_args+=(--with-nanocode)
 $WITH_PEBBLE  && build_args+=(--with-pebble)
@@ -262,47 +678,61 @@ run "$MT" "${build_args[@]}"
 $WITH_VISION && run "$MT" build-vision-sidecar
 
 # ---- 3. inject carried secrets + config (CRITICAL: SECRETS_MASTER_KEY) -------
-banner "3/7  Inject carried secrets + config"
+banner "3/8  Inject carried secrets + config"
 if $DRY_RUN; then
   note "[dry-run] would inject manifest-lunarwing.env -> $ENVF and manifest-bridge.env -> $BRIDGE_ENVF (incl. SECRETS_MASTER_KEY, XMPP password, XMPP/LLM config)"
   [[ -s "$WORK/manifest-vision.env" ]] && note "[dry-run] would inject manifest-vision.env -> $VISION_ENVF (VL_URL, VL_MODEL, LUNARWING_AUTH_TOKEN)"
 else
-  inject_keys "$WORK/manifest-lunarwing.env" "$ENVF"
-  [[ -f "$WORK/manifest-bridge.env" ]] && inject_keys "$WORK/manifest-bridge.env" "$BRIDGE_ENVF"
+  validate_import_target_roots
+  inject_keys "$WORK/manifest-lunarwing.env" "$ENVF" "${IMPORT_LUNARWING_KEYS[@]}"
+  [[ -f "$WORK/manifest-bridge.env" ]] && \
+    inject_keys "$WORK/manifest-bridge.env" "$BRIDGE_ENVF" "${IMPORT_BRIDGE_KEYS[@]}"
   if [[ -s "$WORK/manifest-vision.env" ]]; then
     [[ -f "$VISION_ENVF" ]] || die "bundle carries vision config, but target mt-admin did not render $VISION_ENVF"
-    inject_keys "$WORK/manifest-vision.env" "$VISION_ENVF"
-    chown "$TENANT:$TENANT" "$VISION_ENVF" 2>/dev/null || true
+    inject_keys "$WORK/manifest-vision.env" "$VISION_ENVF" "${IMPORT_VISION_KEYS[@]}"
     note "vision.env carried config injected"
   fi
-  chown "$TENANT:$TENANT" "$ENVF" "$BRIDGE_ENVF" 2>/dev/null || true
-  # Verify the master key landed VERBATIM — without putting the value on argv
-  # (command substitution keeps it out of /proc/<pid>/cmdline) and without the
-  # grep -F "" empty-pattern false-PASS.
-  man_key="$(grep -m1 '^SECRETS_MASTER_KEY=' "$WORK/manifest-lunarwing.env" || true)"
-  live_key="$(grep -m1 '^SECRETS_MASTER_KEY=' "$ENVF" || true)"
-  [[ -n "$man_key" && "$live_key" == "$man_key" ]] \
+  # The tenant-side merge compares the master-key line internally and returns
+  # only a boolean, so the secret never enters a root shell variable.
+  [[ "$INJECTED_MASTER_KEY_VERIFIED" == true ]] \
     || die "SECRETS_MASTER_KEY did not land in $ENVF after injection — abort before restore (the DB's secrets would be undecryptable)"
   note "SECRETS_MASTER_KEY confirmed in place (verbatim)"
 fi
 
 # ---- 4. restore the database (PG up from step 1, daemon not started) ---------
-banner "4/7  Restore database"
+banner "4/8  Restore database"
 if $DRY_RUN; then note "[dry-run] would: $MT restore-tenant $TENANT <bundle db.dump> --yes"
 else "$MT" restore-tenant "$TENANT" "$WORK/db.dump" --yes; fi
 
 reconcile_owner_scope
 
-# ---- 6. restore on-disk state (OMEMO/workspace), then fresh WASM -------------
-banner "6/7  Restore state + install WASM"
+# ---- 6. structured DarkIRC contacts (never via generic state archive) --------
+if $HAS_DARKIRC_MANIFEST; then
+  banner "6/8  DarkIRC contacts"
+  run_bundle_manifest_stdin \
+    "$MT" darkirc-contact stage-migration "$TENANT" --in -
+  run "$MT" darkirc-contact import-migration "$TENANT"
+  note "DarkIRC contacts imported through the target baseline and scope contract"
+fi
+
+# ---- 7. restore on-disk state (OMEMO/workspace), then fresh WASM -------------
+banner "7/8  Restore state + install WASM"
 if [[ -f "$WORK/state.tar.gz" ]]; then
-  if $DRY_RUN; then note "[dry-run] would: tar xzf state.tar.gz into $LWROOT (OMEMO + workspace), chown to $TENANT"
+  if $DRY_RUN; then note "[dry-run] would: tar xzf state.tar.gz into $LWROOT (OMEMO + workspace; excluding state/darkirc), chown to $TENANT"
   else
     # Defensive excludes (export already strips these): never let a stale config.toml
-    # or old *.wasm overwrite the fresh host-specific ones.
-    tar xzf "$WORK/state.tar.gz" -C "$LWROOT" \
-      --exclude='state/config.toml' --exclude='state/tools/*.wasm' --exclude='state/channels/*.wasm'
-    chown -R "$TENANT:$TENANT" "$LWROOT/state"
+    # or old *.wasm overwrite the fresh host-specific ones. DarkIRC is always
+    # structured separately so stale ports or transactional secrets cannot land.
+    validate_import_target_roots
+    # Root opens the protected bundle member; tar itself runs unprivileged and
+    # receives archive bytes only over stdin.
+    # shellcheck disable=SC2024
+    sudo -u "$TENANT" tar xzf - -C "$LWROOT" \
+      --no-same-owner --no-same-permissions \
+      --keep-old-files \
+      --exclude='state/config.toml' --exclude='state/tools/*.wasm' \
+      --exclude='state/channels/*.wasm' --exclude='state/darkirc' \
+      --exclude='state/darkirc/**' <"$WORK/state.tar.gz"
     note "restored state dir$( [[ -d "$LWROOT/state/xmpp" ]] && echo ' (incl. OMEMO store)' )"
   fi
 else
@@ -313,8 +743,8 @@ run "$MT" install-wasm "$TENANT"   # lay down current v1.1.4 .wasm artifacts
 banner "WeeChat migration preflight"
 run "$WEECHAT_PREFLIGHT" "$TENANT"
 
-# ---- 7. cutover ---------------------------------------------------------------
-banner "7/7  Cutover"
+# ---- 8. cutover ---------------------------------------------------------------
+banner "8/8  Cutover"
 stage_msg() {
   say "Tenant '$TENANT' is STAGED (DB + secrets + state restored, units rendered) but NOT started."
   say ""
@@ -341,6 +771,10 @@ if ! $OLD_STOPPED; then
 fi
 run "$MT" start-tenant "$TENANT"
 if ! $DRY_RUN; then
+  if $DARKIRC_ENABLED; then
+    "$MT" darkirc-health "$TENANT" --strict --json \
+      || { "$MT" stop-tenant "$TENANT" >/dev/null 2>&1 || true; die "DarkIRC strict health failed after import; tenant was stopped"; }
+  fi
   run "$MT" status "$TENANT"
   note "Smoke-test: a message round-trips, history present, routines + channels load, OMEMO decrypts."
 fi
