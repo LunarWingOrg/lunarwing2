@@ -204,3 +204,49 @@ No full debug builds.
   visible via API), then wire a GUI review panel? Or block on the GUI?
 - **Notification:** reuse the existing Gotify/notification path to alert the
   user when a proposal is pending, or purely pull-based (user checks a list)?
+
+---
+
+## Implementation summary (2026-07-12) — DELIVERED
+
+B-1 is implemented end-to-end (API-first, then GUI), all layers verified with
+scoped `cargo test`/`check` and JS syntax checks. Not yet committed at time of
+writing (working-tree). Files:
+
+- **Data** (`ic/crates/lunarwing_skills/src/v2.rs`): `SkillPatch` (+
+  `metrics_before` snapshot), `PendingSkillPatch`, `patch_history` +
+  `pending_patch` on `V2SkillMetadata` (serde-default, back-compat),
+  `SkillMetrics::is_patch_candidate`, `compute_content_hash`, threshold consts.
+  10 tests.
+- **Storage** (`ic/crates/lunarwing_engine/src/memory/skill_tracker.rs`):
+  `propose_patch` (stage, no version bump, refuses `Installed`),
+  `apply_pending_patch` (version bump + parent + history + **epoch-reset of
+  metrics** + content-hash optimistic-concurrency guard), `discard_pending_patch`.
+  11 tests.
+- **Detection** (`ic/crates/lunarwing_engine/src/runtime/mission.rs`):
+  `collect_patch_candidate_skills` enriches the `thread_completed_with_issues`
+  payload with a confidence-gated, dedup'd `active_skills` list. 3 tests.
+- **Trigger** (`ic/crates/lunarwing_engine/src/executor/orchestrator.rs` +
+  `prompts/mission_self_improvement.md`): `__propose_skill_patch__` ext-function
+  and a propose-only skill-patching branch in the mission prompt.
+- **Bridge** (`ic/src/bridge/router.rs` + `mod.rs`):
+  `list_pending_skill_patches` / `approve_skill_patch` / `reject_skill_patch`
+  reading the global `ENGINE_STATE` store, with ownership checks.
+- **API** (`ic/src/channels/web/handlers/skills.rs` + `server.rs`):
+  `GET /api/skills/patches`, `POST /api/skills/patches/{doc_id}/approve`,
+  `POST /api/skills/patches/{doc_id}/reject`. Auth-gated (regression test in
+  `tests/multi_tenant.rs`).
+- **GUI** (`ic/src/channels/web/static/{index.html,app.js,style.css}` + i18n
+  en/zh-CN): "Skill Improvement Proposals" panel in Settings → Skills — diff
+  preview, confidence, reason, Approve/Reject.
+
+**Decisions honored:** propose+approve (no auto-apply), confidence-threshold
+trigger (not per-failure, no consecutive-failure logic), epoch-reset+snapshot on
+patch, guilt-by-association attribution mitigated by the human gate, never
+patches `Installed` skills.
+
+**Note:** gateway static assets are `include_bytes!`-compiled — the GUI (like
+prior font work) requires a release rebuild / next tenant build to appear.
+
+**Deferred to a separate plan** (`docs/plans/SELF_IMPROVING_SKILLS_B2_B3.md`):
+B-2 confidence-based demotion/pruning, B-3 cross-agent skill sharing.

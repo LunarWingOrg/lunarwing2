@@ -203,6 +203,15 @@ I18n.register('en', {
   'skills.confirmRemove': 'Remove skill "{name}"?',
   'skills.removeFailed': 'Remove failed: {message}',
   'skills.removed': 'Removed skill "{name}"',
+  'skills.patchesTitle': 'Skill Improvement Proposals',
+  'skills.patchesLoading': 'Loading proposals...',
+  'skills.patchesNone': 'No pending skill improvement proposals.',
+  'skills.patchesLoadFailed': 'Failed to load proposals: {message}',
+  'skills.patchConfidence': 'Flagged at {pct}% success confidence',
+  'skills.patchApprove': 'Approve',
+  'skills.patchReject': 'Reject',
+  'skills.patchActionOk': 'Done',
+  'skills.patchActionFailed': 'Action failed',
 
   // Jobs Summary
   'jobs.summary.total': 'Total',

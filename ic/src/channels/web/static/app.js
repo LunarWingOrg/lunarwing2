@@ -4759,6 +4759,106 @@ function renderSkillCard(skill) {
   return card;
 }
 
+// --- Skill improvement proposals (B-1: self-improving skills) ---
+// The self-improvement mission proposes patches to under-performing skills;
+// the operator reviews the diff here and approves (applies) or rejects.
+
+function loadSkillPatches() {
+  var list = document.getElementById('skill-patches-list');
+  if (!list) return;
+  list.innerHTML = renderCardsSkeleton(1);
+  apiFetch('/api/skills/patches').then(function(data) {
+    var patches = (data && data.patches) || [];
+    if (patches.length === 0) {
+      list.innerHTML = '<div class="empty-state">' + I18n.t('skills.patchesNone') + '</div>';
+      return;
+    }
+    list.innerHTML = '';
+    for (var i = 0; i < patches.length; i++) {
+      list.appendChild(renderSkillPatchCard(patches[i]));
+    }
+  }).catch(function(err) {
+    list.innerHTML = '<div class="empty-state">' + I18n.t('skills.patchesLoadFailed', {message: escapeHtml(err.message)}) + '</div>';
+  });
+}
+
+function renderSkillPatchCard(patch) {
+  var card = document.createElement('div');
+  card.className = 'ext-card state-active';
+
+  var header = document.createElement('div');
+  header.className = 'ext-header';
+
+  var name = document.createElement('span');
+  name.className = 'ext-name';
+  name.textContent = patch.skill_name;
+  header.appendChild(name);
+
+  var version = document.createElement('span');
+  version.className = 'skill-version';
+  version.textContent = 'v' + patch.current_version + ' → v' + (patch.current_version + 1);
+  header.appendChild(version);
+
+  card.appendChild(header);
+
+  // Confidence that triggered the proposal.
+  var meta = document.createElement('div');
+  meta.className = 'ext-keywords';
+  var confPct = Math.round((patch.confidence_at_proposal || 0) * 100);
+  meta.textContent = I18n.t('skills.patchConfidence', {pct: confPct});
+  card.appendChild(meta);
+
+  // Reason / diagnosis.
+  if (patch.reason) {
+    var reason = document.createElement('div');
+    reason.className = 'ext-desc';
+    reason.textContent = patch.reason;
+    card.appendChild(reason);
+  }
+
+  // Diff preview (monospace, escaped).
+  if (patch.diff) {
+    var diff = document.createElement('pre');
+    diff.className = 'skill-patch-diff';
+    diff.textContent = patch.diff;
+    card.appendChild(diff);
+  }
+
+  var actions = document.createElement('div');
+  actions.className = 'ext-actions';
+
+  var approveBtn = document.createElement('button');
+  approveBtn.className = 'btn-ext';
+  approveBtn.textContent = I18n.t('skills.patchApprove');
+  approveBtn.addEventListener('click', function() { resolveSkillPatch(patch.doc_id, 'approve'); });
+  actions.appendChild(approveBtn);
+
+  var rejectBtn = document.createElement('button');
+  rejectBtn.className = 'btn-ext remove';
+  rejectBtn.textContent = I18n.t('skills.patchReject');
+  rejectBtn.addEventListener('click', function() { resolveSkillPatch(patch.doc_id, 'reject'); });
+  actions.appendChild(rejectBtn);
+
+  card.appendChild(actions);
+  return card;
+}
+
+function resolveSkillPatch(docId, action) {
+  apiFetch('/api/skills/patches/' + encodeURIComponent(docId) + '/' + action, {
+    method: 'POST',
+  }).then(function(resp) {
+    if (resp && resp.ok === false) {
+      showToast(resp.message || I18n.t('skills.patchActionFailed'), 'error');
+    } else {
+      showToast(resp && resp.message ? resp.message : I18n.t('skills.patchActionOk'), 'success');
+    }
+    loadSkillPatches();
+    loadSkills();
+  }).catch(function(err) {
+    showToast(I18n.t('skills.patchActionFailed') + ': ' + err.message, 'error');
+  });
+}
+
 function searchClawHub() {
   var input = document.getElementById('skill-search-input');
   var query = input.value.trim();
@@ -5115,7 +5215,7 @@ function loadSettingsSubtab(subtab) {
   else if (subtab === 'networking') loadNetworkingSettings();
   else if (subtab === 'extensions') { loadExtensions(); startPairingPoll(); }
   else if (subtab === 'mcp') loadMcpServers();
-  else if (subtab === 'skills') loadSkills();
+  else if (subtab === 'skills') { loadSkills(); loadSkillPatches(); }
   if (subtab !== 'extensions' && subtab !== 'channels') stopPairingPoll();
 }
 

@@ -203,7 +203,16 @@ I18n.register('zh-CN', {
   'skills.confirmRemove': '确定要移除技能 "{name}" 吗？',
   'skills.removeFailed': '移除失败: {message}',
   'skills.removed': '已移除技能 "{name}"',
-  
+  'skills.patchesTitle': '技能改进建议',
+  'skills.patchesLoading': '正在加载建议...',
+  'skills.patchesNone': '暂无待处理的技能改进建议。',
+  'skills.patchesLoadFailed': '加载建议失败: {message}',
+  'skills.patchConfidence': '在 {pct}% 成功置信度时标记',
+  'skills.patchApprove': '批准',
+  'skills.patchReject': '拒绝',
+  'skills.patchActionOk': '完成',
+  'skills.patchActionFailed': '操作失败',
+
   // 任务摘要
   'jobs.summary.total': '总计',
   'jobs.summary.inProgress': '进行中',
