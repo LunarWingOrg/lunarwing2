@@ -43,6 +43,10 @@ pub struct ThreadManager {
     completed: Arc<RwLock<HashMap<ThreadId, ThreadOutcome>>>,
     /// Broadcast channel for thread events (for live status updates).
     event_tx: tokio::sync::broadcast::Sender<crate::types::event::ThreadEvent>,
+    /// Tenant identity/persona preamble (from workspace IDENTITY.md/SOUL.md/
+    /// AGENTS.md + MEMORY.md), supplied by the host and prepended to each
+    /// thread's system prompt so the agent keeps its own voice and memory.
+    identity_preamble: Option<String>,
 }
 
 impl ThreadManager {
@@ -67,7 +71,14 @@ impl ThreadManager {
             running: Arc::new(RwLock::new(HashMap::new())),
             completed: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
+            identity_preamble: None,
         }
+    }
+
+    /// Set the tenant identity/persona preamble applied to spawned threads.
+    /// Host-supplied (the engine crate has no workspace/filesystem access).
+    pub fn set_identity_preamble(&mut self, identity: Option<String>) {
+        self.identity_preamble = identity.filter(|s| !s.trim().is_empty());
     }
 
     /// Subscribe to thread events for live status updates.
@@ -259,11 +270,14 @@ impl ThreadManager {
         let store_for_retrieval = Arc::clone(&self.store);
         let retrieval = crate::memory::RetrievalEngine::new(store_for_retrieval);
 
-        let exec_loop = ExecutionLoop::new(thread, llm, effects, leases, policy, rx, user_id)
+        let mut exec_loop = ExecutionLoop::new(thread, llm, effects, leases, policy, rx, user_id)
             .with_capabilities(Arc::clone(&self.capabilities))
             .with_event_tx(self.event_tx.clone())
             .with_retrieval(retrieval)
             .with_store(Arc::clone(&self.store));
+        if let Some(identity) = &self.identity_preamble {
+            exec_loop = exec_loop.with_identity_preamble(identity.clone());
+        }
 
         // Spawn background task
         let store_for_task = Arc::clone(&self.store);

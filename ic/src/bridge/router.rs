@@ -864,14 +864,31 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
 
     let store_dyn: Arc<dyn Store> = store.clone();
 
-    let thread_manager = Arc::new(ThreadManager::new(
+    let mut thread_manager_inner = ThreadManager::new(
         llm_adapter,
         effect_adapter.clone(),
         store_dyn.clone(),
         Arc::new(capabilities),
         leases,
         policy,
-    ));
+    );
+
+    // Load the tenant's workspace identity/persona (+ MEMORY.md) so engine
+    // threads speak in the agent's own voice and see its memory — mirroring the
+    // legacy dispatcher's system_prompt loading. The engine crate is
+    // workspace-agnostic, so the bridge (which holds the workspace) supplies it.
+    if let Some(ws) = agent.workspace() {
+        match ws.system_prompt().await {
+            Ok(prompt) if !prompt.trim().is_empty() => {
+                thread_manager_inner.set_identity_preamble(Some(prompt));
+                debug!("engine v2: loaded workspace identity/persona into thread manager");
+            }
+            Ok(_) => debug!("engine v2: workspace system prompt empty; using generic persona"),
+            Err(e) => debug!("engine v2: could not load workspace system prompt: {e}"),
+        }
+    }
+
+    let thread_manager = Arc::new(thread_manager_inner);
 
     // Migrate legacy records: pre-existing engine records deserialize without a
     // user_id field and get the serde default "legacy". Stamp the owner's identity

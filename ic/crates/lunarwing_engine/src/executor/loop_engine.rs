@@ -51,6 +51,12 @@ pub struct ExecutionLoop {
     store: Option<Arc<dyn crate::traits::store::Store>>,
     /// Runtime platform metadata for self-awareness in system prompts.
     platform_info: Option<crate::executor::prompt::PlatformInfo>,
+    /// Optional tenant identity/persona text (IDENTITY.md, SOUL.md, AGENTS.md,
+    /// etc.) loaded by the host from the workspace and prepended to the system
+    /// prompt. The engine crate is storage/filesystem-agnostic, so the host
+    /// (bridge) reads these files and supplies the assembled text here. Without
+    /// it, the engine uses only the generic CodeAct persona.
+    identity_preamble: Option<String>,
 }
 
 impl ExecutionLoop {
@@ -76,7 +82,18 @@ impl ExecutionLoop {
             retrieval: None,
             store: None,
             platform_info: None,
+            identity_preamble: None,
         }
+    }
+
+    /// Set the tenant identity/persona preamble (prepended to the system
+    /// prompt). Supplied by the host, which reads the workspace identity files.
+    pub fn with_identity_preamble(mut self, identity: String) -> Self {
+        let trimmed = identity.trim();
+        if !trimmed.is_empty() {
+            self.identity_preamble = Some(trimmed.to_string());
+        }
+        self
     }
 
     /// Set the event broadcast sender for live status updates.
@@ -225,11 +242,20 @@ impl ExecutionLoop {
                 }
             };
             // Build prompt using pre-fetched docs (no extra Store query)
-            let system_prompt = crate::executor::prompt::build_codeact_system_prompt_with_docs(
+            let codeact_prompt = crate::executor::prompt::build_codeact_system_prompt_with_docs(
                 &actions,
                 &system_docs,
                 self.platform_info.as_ref(),
             );
+
+            // Prepend the tenant identity/persona (if the host supplied it) so
+            // the agent speaks in its own voice rather than the generic CodeAct
+            // persona. Identity comes first; the CodeAct operating instructions
+            // follow.
+            let system_prompt = match &self.identity_preamble {
+                Some(identity) => format!("{identity}\n\n---\n\n{codeact_prompt}"),
+                None => codeact_prompt,
+            };
 
             // Skill selection and injection happens in the Python orchestrator
             // via __list_skills__() host function — not here in Rust.
