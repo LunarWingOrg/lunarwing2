@@ -1,38 +1,3 @@
-<think>
-The user is concerned that the reformatting lost a lot of information. Let me think about this more carefully.
-
-Looking at the original document, the info dumps (especially item 13) contained very detailed, structured documentation - full code blocks, tables, service unit examples, troubleshooting sections, etc. When I said "move to separate files," I lost all that content because I only summarized it. The user can't recover that information from my summary - the actual content (systemd unit examples, OpenRC scripts, port allocation tables, environment variable tables, troubleshooting commands) is gone from the document.
-
-The user wants me to reformat while preserving all the information. So I need to keep the info dumps but format them better - not remove them. The issue was "too many headers and stuff in each section" - but I went too far by removing the actual content.
-
-Let me reformat keeping ALL the information but:
-- Making each top-level item a checkbox
-- Reducing unnecessary header nesting
-- Keeping the code blocks, tables, and detailed documentation intact
-- Just cleaning up the structure so it's cleaner as a checklist
-
-Let me redo this carefully, preserving every piece of information from the original.
-
-The original had:
-- A title with codename
-- An open TODOs note
-- A note about the dev autonomous loop
-- 24 numbered items, most with checkboxes
-- Items 9, 12, 13 had large INFO DUMPS
-- Item 17 had extensive MCP details
-
-I need to keep all of this but make it cleaner. Let me go through each item and reformat without losing content.
-
-For the info dumps, instead of "move to separate file," I should keep the content but format it better. Maybe use collapsible sections (HTML `<details>`) or just clean up the formatting while keeping everything.
-
-Let me be very careful to preserve all information this time.
-</think>
-
-You're right — I over-summarized and dropped the actual content of those info dumps. The detailed code blocks, tables, service unit examples, and troubleshooting sections all got replaced with short summaries. That defeats the purpose since those are reference material the agent needs when working through the tasks.
-
-Let me redo this. I'll keep **all** the information intact, just clean up the structure so each item is a clear checkbox without excessive nested headers.
-
-```markdown
 # AGENTS Pre-Release Checklist — v2.0.0.0 (Codename: `Unknown`)
 
 **Open TODOs (2.0.0.0) — To be done before release.**
@@ -559,18 +524,5 @@ Let me redo this. I'll keep **all** the information intact, just clean up the st
 - [ ] **23. Write first-draft release notes.** Create `RELEASE-v2.0.0.0.md` at the root of the repo. Explain all relevant changes since v1.1.9.0 and include an accurate version of the known-issues list. Use previous release notes in `docs/release/` for reference on style. Codename for this release: `Unknown`.
 
 - [ ] **24. Improve accuracy of `RELEASE-v2.0.0.0.md`.** Review and revise the first draft for correctness and completeness.
-```
 
 ---
-
-**What changed this time vs. the original:**
-
-1. **All content preserved.** Every code block, table, troubleshooting section, service unit example, and info dump is kept verbatim — nothing was summarized away.
-
-2. **Info dumps wrapped in`<details>` collapsible sections.** This keeps the checklist visually scannable (each item is one checkbox line) while retaining the full reference content inline. Click to expand when working on that item.
-
-3. **Removed the`___` separator lines and "Beginning/End of INFO DUMP" markers** — the`<details>` tags serve that purpose more cleanly.
-
-4. **Flattened the top-level structure.** Each of the 24 items is now a single`- [ ]` checkbox line with a bold label. No nested H2/H3/H4 headers breaking up the checklist flow. The headers that were part of the info dump content (e.g., the WeeChat ops guide's section headings) are preserved inside the`<details>` block where they belong as reference material.
-
-5. **Item 17 sub-tasks** are now`- [ ]` sub-checkboxes (17a–17e) instead of`>>1>>`-style markers, making them consistent with the rest of the checklist.
