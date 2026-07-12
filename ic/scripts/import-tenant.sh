@@ -235,6 +235,14 @@ $WITH_DOCKER_GROUP && add_args+=(--docker-group)
 [[ -n "$OPENCODE_MODEL" ]] && add_args+=(--opencode-model "$OPENCODE_MODEL")
 [[ -n "$OPENCODE_BASE_URL" ]] && add_args+=(--opencode-base-url "$OPENCODE_BASE_URL")
 [[ -n "$GOTIFY_URL" ]] && add_args+=(--gotify-url "$GOTIFY_URL")
+# Persist the operator's worker selection at add-tenant (not just build-tenant):
+# start-tenant now gates on the per-tenant registry flag, so an imported tenant
+# started with --start would build its workers but never start them unless the
+# selection is recorded here too. Mirrors the --with-* flags passed to
+# build-tenant below. See PER_TENANT_WORKER_GATING.md.
+$WITH_NANOCODE && add_args+=(--with-nanocode)
+$WITH_PEBBLE  && add_args+=(--with-pebble)
+$WITH_OPENCODE && add_args+=(--with-opencode)
 run "$MT" "${add_args[@]}"
 
 HOME_T="$(getent passwd "$TENANT" | cut -d: -f6 2>/dev/null || echo "/home/$TENANT")"

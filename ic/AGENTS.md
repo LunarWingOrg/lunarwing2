@@ -91,6 +91,7 @@ Start with these deeper docs as needed:
 - Use WASM tools or WASM channels for sandboxed extensions and plugin-style integrations.
 - Use MCP for external server integrations when the capability belongs outside the main binary.
 - Preserve extension lifecycle expectations: install, authenticate/configure, activate, remove.
+- For any library, framework, SDK, or crate documentation lookup, use Context7 MCP (`context7_resolve-library-id` → `context7_query-docs`) before relying on internal knowledge. Verify API signatures, feature flags, and version-specific behavior against the resolved docs. However, keep in mind that even libraries from context7 (especially for the LunarWing project) can also be woefully out of date. As such, it's best to always VERIFY any information obtained from context7.
 
 ## Local XMPP and Service Operations
 

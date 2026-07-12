@@ -146,6 +146,46 @@ assert_contains "builds vision sidecar when requested" "$output" "build-vision-s
 assert_contains "injects vision manifest" "$output" "manifest-vision.env ->"
 assert_contains "runs WeeChat preflight before start" "$output" "lunarwing-weechat-preflight.sh kawarimi"
 
+echo "=== import-tenant worker selection reaches BOTH add-tenant and build-tenant ==="
+# Regression guard for per-tenant worker gating: start-tenant now gates workers on
+# the registry flag persisted at add-tenant, so import must forward --with-* to
+# add-tenant too (not only build-tenant) — otherwise a --start import would build
+# workers but never start them. See docs/proposals/PER_TENANT_WORKER_GATING.md.
+worker_output="$(
+  PATH="$tmp/bin:$PATH" \
+  LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
+  KAWARIMI_TEST_WORK="$tmp" \
+  bash "$tmp/scripts/import-tenant.sh" "$tmp/kawarimi.tar" \
+    --dry-run --yes \
+    --with-nanocode --with-opencode \
+    2>&1
+)" || {
+  status=$?
+  printf '%s\n' "$worker_output"
+  fail "worker-selection import dry-run exited successfully"
+  exit "$status"
+}
+# Under --dry-run the import prints (does not exec) each planned command via
+# run()'s `[dry-run] <cmd>` line, so assert against stdout. Isolate the two
+# planned invocations so a flag on one can't satisfy an assertion on the other.
+add_line="$(printf '%s\n' "$worker_output" | grep -m1 '\[dry-run\].* add-tenant ' || true)"
+build_line="$(printf '%s\n' "$worker_output" | grep -m1 '\[dry-run\].* build-tenant ' || true)"
+assert_contains "add-tenant carries --with-nanocode" "$add_line" "--with-nanocode"
+assert_contains "add-tenant carries --with-opencode" "$add_line" "--with-opencode"
+assert_contains "build-tenant carries --with-nanocode" "$build_line" "--with-nanocode"
+assert_contains "build-tenant carries --with-opencode" "$build_line" "--with-opencode"
+# Unselected worker must NOT appear on either planned call.
+if [[ "$add_line" == *"--with-pebble"* ]]; then
+  fail "add-tenant leaked --with-pebble (not selected)"
+else
+  pass "add-tenant omits unselected --with-pebble"
+fi
+if [[ "$build_line" == *"--with-pebble"* ]]; then
+  fail "build-tenant leaked --with-pebble (not selected)"
+else
+  pass "build-tenant omits unselected --with-pebble"
+fi
+
 echo "=== import-tenant explicit owner-scope dry-run ==="
 explicit_output="$(
   PATH="$tmp/bin:$PATH" \

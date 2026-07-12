@@ -202,6 +202,13 @@ class DemoProvisionIntegrationTests(unittest.TestCase):
         phases = [e["name"] for e in events if e.get("type") == "phase"]
         self.assertIn("add-tenant", phases)
         self.assertIn("build-tenant", phases)
+        # credentials revealed during provision
+        self.assertTrue(any(e.get("type") == "master_key" for e in events), events)
+        gat = [e for e in events if e.get("type") == "gateway_auth_token"]
+        self.assertTrue(gat, events)
+        self.assertTrue(gat[0].get("token"), gat[0])
+        self.assertEqual(gat[0].get("host"), "127.0.0.1")
+        self.assertEqual(gat[0].get("port"), 10000)
         done = [e for e in events if e.get("type") == "done"]
         self.assertTrue(done and done[-1]["ok"], f"expected success, got {done}")
         self.assertTrue(job.ok)
@@ -220,7 +227,7 @@ class DemoProvisionIntegrationTests(unittest.TestCase):
         job = Job(id="test3", mode="secrets", demo=True)
         secret_value = "sup3r-s3cret-v4lue-xyz"
         self.runner.run_secret_job(
-            job, SecretRequest(tenant="sphinx", name="openai_api_key", value=secret_value), log_dir=self.tmp
+            job, SecretRequest(tenant="sphinx", name="gotify_app_token", value=secret_value), log_dir=self.tmp
         )
         events = _drain(job.queue)
         self.assertTrue(any(e.get("type") == "secret_stored" for e in events))
@@ -311,3 +318,48 @@ class ImportUiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SecretsUiTests(unittest.TestCase):
+    def test_secret_name_placeholder_is_gotify_app_token(self) -> None:
+        wizard = Path(__file__).resolve().parent / "static" / "js" / "wizard.js"
+        text = wizard.read_text()
+        self.assertIn("gotify_app_token", text)
+        self.assertNotIn("openai_api_key", text)
+
+
+class MascotSpriteTests(unittest.TestCase):
+    def test_all_mascot_gifs_present(self) -> None:
+        mascot = Path(__file__).resolve().parent / "static" / "mascot"
+        for name in (
+            "lunar_walk.gif",
+            "lunar_jump.gif",
+            "lunar_sleep.gif",
+            "lunar_rage.gif",
+            "lunar_greet.gif",
+            "lunar_sup.gif",
+            "lunar_fiery.gif",
+            "lunar_love.gif",
+        ):
+            self.assertTrue((mascot / name).is_file(), f"missing mascot sprite: {name}")
+
+    def test_bat_js_wires_greet_and_sup_moods(self) -> None:
+        bat = Path(__file__).resolve().parent / "static" / "js" / "bat.js"
+        text = bat.read_text()
+        # both new moods mapped to files
+        self.assertIn("greet: 'lunar_greet.gif'", text)
+        self.assertIn("sup: 'lunar_sup.gif'", text)
+        # one-shot API exported and event moods kept out of the idle rotation
+        self.assertIn("greet,", text)
+        self.assertIn("celebrate,", text)
+        # greet/sup stay out of the idle rotation; fiery + love are idle moods
+        self.assertIn("IDLE_MOODS = ['content', 'excited', 'sleeping', 'fiery', 'love']", text)
+        self.assertIn("fiery: 'lunar_fiery.gif'", text)
+        self.assertIn("love: 'lunar_love.gif'", text)
+
+    def test_app_js_triggers_greet_and_celebrate(self) -> None:
+        app = Path(__file__).resolve().parent / "static" / "js" / "app.js"
+        text = app.read_text()
+        self.assertIn("bat.greet()", text)
+        self.assertIn("bat.celebrate()", text)
+

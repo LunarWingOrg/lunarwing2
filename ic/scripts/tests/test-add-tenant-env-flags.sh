@@ -163,6 +163,55 @@ assert_eq "bridge json owner-only" "$(bridgeval XMPP_ALLOW_FROM_JSON)" '["fixtur
 out="$(run_bridge_writer "admin@xmpp.org,bob@xmpp.org")"
 assert_eq "bridge json owner+two" "$(bridgeval XMPP_ALLOW_FROM_JSON)" '["fixture-tenant@xmpp.localhost","admin@xmpp.org","bob@xmpp.org"]'
 
+echo "=== per-tenant worker gating (registry) tests ==="
+
+# Exercise the registry readers/writers that gate start_tenant_<worker>.
+# Point PORTS_REGISTRY at a fixture seeded with: an "old" tenant that predates
+# the workers map (key absent) and a tenant with an explicit selection.
+WORKERS_REG="$MT_FIXTURE/ports.json"
+PORTS_REGISTRY="$WORKERS_REG"
+cat > "$WORKERS_REG" <<JSON
+{"tenants":{
+  "oldt":{"base_port":10020},
+  "sel":{"base_port":10030,"workers":{"nanocode":true,"pebble":false,"opencode":false}}
+}}
+JSON
+
+# Capture a boolean helper's exit under `set -e` without aborting the run.
+worker_state() {  # <tenant> <worker> -> prints "on" | "off"
+  if tenant_worker_enabled "$1" "$2"; then echo on; else echo off; fi
+}
+
+# Absent workers key => every worker OFF (the bug this fixes: previously a
+# tenant started every worker whose shared image existed).
+assert_eq "old tenant nanocode OFF" "$(worker_state oldt nanocode)" "off"
+assert_eq "old tenant pebble OFF"   "$(worker_state oldt pebble)"   "off"
+assert_eq "old tenant opencode OFF" "$(worker_state oldt opencode)" "off"
+
+# Explicit selection honored.
+assert_eq "selected nanocode ON"  "$(worker_state sel nanocode)" "on"
+assert_eq "unselected pebble OFF" "$(worker_state sel pebble)"   "off"
+
+# Resume flip is one-directional (false->true), idempotent, and creates the
+# workers map on a tenant that lacked one — without leaking other workers ON.
+ports_enable_worker oldt opencode >/dev/null 2>&1
+assert_eq "resume enable opencode"   "$(worker_state oldt opencode)" "on"
+ports_enable_worker oldt opencode >/dev/null 2>&1   # idempotent
+assert_eq "resume enable idempotent" "$(worker_state oldt opencode)" "on"
+assert_eq "resume no leak nanocode"  "$(worker_state oldt nanocode)" "off"
+if jq -e . "$WORKERS_REG" >/dev/null 2>&1; then
+  echo "  PASS: registry remains valid JSON after enable"
+else
+  echo "  FAIL: registry corrupted"; failures=$((failures + 1))
+fi
+
+# Unknown worker name is rejected.
+if ( ports_enable_worker oldt bogus >/dev/null 2>&1 ); then
+  echo "  FAIL: ports_enable_worker accepted an unknown worker"; failures=$((failures + 1))
+else
+  echo "  PASS: ports_enable_worker rejects unknown worker"
+fi
+
 echo "=== CLI dispatch parsing smoke check ==="
 
 # Verify the dispatch block recognizes the new flags by invoking the script
@@ -174,13 +223,14 @@ err="$(bash "$ADMIN_SCRIPT" add-tenant \
   --llm-model glm-5-air \
   --gateway-host 0.0.0.0 \
   --xmpp-allow-from admin@xmpp.org \
+  --with-nanocode --with-pebble --with-opencode \
   2>&1 || true)"
 if echo "$err" | grep -q 'unknown flag'; then
   echo "  FAIL: a new flag was rejected as unknown"
   echo "        $err"
   failures=$((failures + 1))
 else
-  echo "  PASS: all three new flags parsed without 'unknown flag' error"
+  echo "  PASS: all new flags (incl. --with-nanocode/pebble/opencode) parsed"
 fi
 
 echo ""

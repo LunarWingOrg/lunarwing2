@@ -7,8 +7,10 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import re
+
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__, runner
@@ -40,9 +42,36 @@ def create_app(*, token: str, demo: bool, log_dir: str | None) -> FastAPI:
             )
 
     # -- static shell -------------------------------------------------------
-    @app.get("/")
-    async def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+    _ASSET_RE = re.compile(r'(href|src)="(/static/[^"?]+)"')
+
+    def _versioned_index() -> str:
+        """Return index.html with a ?v=<mtime> stamp on every /static asset.
+
+        The SPA's JS/CSS are served at fixed URLs, so a browser will happily
+        keep running a cached bundle after we ship a fix (the classic "my
+        change doesn't show up" trap). Stamping each asset with the file's
+        mtime makes the URL change whenever the file changes, so a reload
+        always pulls the current code without disabling caching wholesale.
+        """
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+        def stamp(m: "re.Match[str]") -> str:
+            attr, path = m.group(1), m.group(2)
+            fs_path = STATIC_DIR / path[len("/static/") :]
+            try:
+                ver = int(fs_path.stat().st_mtime)
+            except OSError:
+                return m.group(0)
+            return f'{attr}="{path}?v={ver}"'
+
+        return _ASSET_RE.sub(stamp, html)
+
+    @app.get("/", response_class=HTMLResponse)
+    async def index() -> HTMLResponse:
+        return HTMLResponse(
+            _versioned_index(),
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
 
     @app.get("/assets/logo.jpg")
     async def logo() -> FileResponse:

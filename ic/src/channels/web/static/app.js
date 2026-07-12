@@ -8,6 +8,16 @@ function getSystemTheme() {
 }
 
 const VALID_THEME_MODES = { dark: true, light: true, system: true };
+let _themeTransitionTimer = null;
+
+function beginThemeTransition() {
+  document.body.classList.add('theme-transition');
+  if (_themeTransitionTimer) clearTimeout(_themeTransitionTimer);
+  _themeTransitionTimer = setTimeout(() => {
+    document.body.classList.remove('theme-transition');
+    _themeTransitionTimer = null;
+  }, 350);
+}
 
 function getThemeMode() {
   const stored = localStorage.getItem('lunarwing-theme');
@@ -18,7 +28,8 @@ function resolveTheme(mode) {
   return mode === 'system' ? getSystemTheme() : mode;
 }
 
-function applyTheme(mode) {
+function applyTheme(mode, animate) {
+  if (animate) beginThemeTransition();
   const resolved = resolveTheme(mode);
   document.documentElement.setAttribute('data-theme', resolved);
   document.documentElement.setAttribute('data-theme-mode', mode);
@@ -34,25 +45,18 @@ function toggleTheme() {
   const current = getThemeMode();
   const next = cycle[current] || 'dark';
   localStorage.setItem('lunarwing-theme', next);
-  applyTheme(next);
+  applyTheme(next, true);
 }
 
 // Apply theme immediately (FOUC prevention is done via inline script in <head>,
 // but we call again here to ensure tooltip is set after DOM is ready).
 applyTheme(getThemeMode());
 
-// Delay enabling theme transition to avoid flash on initial load.
-requestAnimationFrame(function() {
-  requestAnimationFrame(function() {
-    document.body.classList.add('theme-transition');
-  });
-});
-
 // Listen for OS theme changes — only re-apply when in 'system' mode.
 const mql = window.matchMedia('(prefers-color-scheme: light)');
 const onSchemeChange = function() {
   if (getThemeMode() === 'system') {
-    applyTheme('system');
+    applyTheme('system', true);
   }
 };
 if (mql.addEventListener) {
@@ -88,6 +92,7 @@ let jobListRefreshTimer = null;
 let pairingPollInterval = null;
 let unreadThreads = new Map(); // thread_id -> unread count
 let _loadThreadsTimer = null;
+let _historyRequestSequence = 0;
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
 let stagedImages = [];
@@ -95,10 +100,14 @@ let authFlowPending = false;
 let _ghostSuggestion = '';
 let currentSettingsSubtab = 'inference';
 
-// --- Streaming Debounce State ---
+// --- Frame-coalesced rendering state ---
 let _streamBuffer = '';
-let _streamDebounceTimer = null;
-const STREAM_DEBOUNCE_MS = 50;
+let _streamRenderFrame = null;
+let _streamingMessage = null;
+let _streamingThreadId = null;
+let _chatScrollFrame = null;
+let _codeHighlightFrame = null;
+const _codeHighlightRoots = new Set();
 
 // --- Connection Status Banner State ---
 let _connectionLostTimer = null;
@@ -353,6 +362,7 @@ function updateRestartButtonVisibility() {
 
 function connectSSE() {
   if (eventSource) eventSource.close();
+  resetStreamingState();
 
   eventSource = new EventSource('/api/chat/events?token=' + encodeURIComponent(token));
 
@@ -425,30 +435,21 @@ function connectSSE() {
   eventSource.addEventListener('response', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) {
+      if (_streamingThreadId === data.thread_id) resetStreamingState();
       if (data.thread_id) {
         unreadThreads.set(data.thread_id, (unreadThreads.get(data.thread_id) || 0) + 1);
         debouncedLoadThreads();
       }
       return;
     }
-    // Flush any remaining streaming buffer
-    if (_streamDebounceTimer) {
-      clearInterval(_streamDebounceTimer);
-      _streamDebounceTimer = null;
-    }
-    if (_streamBuffer) {
-      appendToLastAssistant(_streamBuffer);
-      _streamBuffer = '';
-    }
-    // Remove streaming attribute from active assistant message
-    const streamingMsg = document.querySelector('.message.assistant[data-streaming="true"]');
-    if (streamingMsg) streamingMsg.removeAttribute('data-streaming');
 
     finalizeActivityGroup();
-    addMessage('assistant', data.content);
+    if (!finalizeStreamingMessage(data.thread_id, data.content)) {
+      addMessage('assistant', data.content);
+    }
     enableChatInput();
     // Refresh thread list so new titles appear after first message
-    loadThreads();
+    debouncedLoadThreads();
 
     // Show restart modal if the response indicates restart was initiated
     if (data.content && data.content.toLowerCase().includes('restart initiated')) {
@@ -501,31 +502,9 @@ function connectSSE() {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     finalizeActivityGroup();
-
-    // Mark the active assistant message as streaming
-    const container = document.getElementById('chat-messages');
-    let lastAssistant = container.querySelector('.message.assistant:last-of-type');
-    if (!lastAssistant) {
-      addMessage('assistant', '');
-      lastAssistant = container.querySelector('.message.assistant:last-of-type');
-    }
-    if (lastAssistant) lastAssistant.setAttribute('data-streaming', 'true');
-
-    // Accumulate chunks and debounce rendering at 50ms intervals
-    _streamBuffer += data.content;
-    // Force flush when buffer exceeds 10K chars to prevent memory buildup
-    if (_streamBuffer.length > 10000) {
-      appendToLastAssistant(_streamBuffer);
-      _streamBuffer = '';
-    }
-    if (!_streamDebounceTimer) {
-      _streamDebounceTimer = setInterval(() => {
-        if (_streamBuffer) {
-          appendToLastAssistant(_streamBuffer);
-          _streamBuffer = '';
-        }
-      }, STREAM_DEBOUNCE_MS);
-    }
+    getOrCreateStreamingMessage(data.thread_id);
+    _streamBuffer += data.content || '';
+    scheduleStreamRender();
   });
 
   eventSource.addEventListener('status', (e) => {
@@ -589,6 +568,7 @@ function connectSSE() {
     if (e.data) {
       const data = JSON.parse(e.data);
       if (!isCurrentThread(data.thread_id)) return;
+      resetStreamingState();
       finalizeActivityGroup();
       addMessage('system', 'Error: ' + data.message);
       enableChatInput();
@@ -885,7 +865,7 @@ function addGeneratedImage(dataUrl, path) {
   }
 
   container.appendChild(card);
-  container.scrollTop = container.scrollHeight;
+  scheduleChatScrollToBottom();
 }
 
 // --- Slash Autocomplete ---
@@ -1062,39 +1042,116 @@ function maybeInsertTimeSeparator(container, timestamp) {
   container.appendChild(sep);
 }
 
+function scheduleChatScrollToBottom() {
+  if (_chatScrollFrame !== null) return;
+  _chatScrollFrame = requestAnimationFrame(() => {
+    _chatScrollFrame = null;
+    const container = document.getElementById('chat-messages');
+    if (container) container.scrollTop = container.scrollHeight;
+  });
+}
+
+function scheduleCodeHighlight(root) {
+  if (typeof hljs === 'undefined') return;
+  _codeHighlightRoots.add(root);
+  if (_codeHighlightFrame !== null) return;
+  _codeHighlightFrame = requestAnimationFrame(() => {
+    _codeHighlightFrame = null;
+    for (const highlightRoot of _codeHighlightRoots) {
+      highlightRoot.querySelectorAll('pre code').forEach((block) => {
+        hljs.highlightElement(block);
+      });
+    }
+    _codeHighlightRoots.clear();
+  });
+}
+
 function addMessage(role, content) {
   const container = document.getElementById('chat-messages');
   maybeInsertTimeSeparator(container);
   const div = createMessageElement(role, content);
   container.appendChild(div);
-  container.scrollTop = container.scrollHeight;
+  scheduleChatScrollToBottom();
   return div;
 }
 
-function appendToLastAssistant(chunk) {
-  const container = document.getElementById('chat-messages');
-  const messages = container.querySelectorAll('.message.assistant');
-  if (messages.length > 0) {
-    const last = messages[messages.length - 1];
-    const raw = (last.getAttribute('data-raw') || '') + chunk;
-    last.setAttribute('data-raw', raw);
-    last.setAttribute('data-copy-text', raw);
-    const content = last.querySelector('.message-content');
-    if (content) {
-      content.innerHTML = renderMarkdown(raw);
-      // Syntax highlighting for code blocks
-      if (typeof hljs !== 'undefined') {
-        requestAnimationFrame(() => {
-          content.querySelectorAll('pre code').forEach(block => {
-            hljs.highlightElement(block);
-          });
-        });
-      }
-    }
-    container.scrollTop = container.scrollHeight;
-  } else {
-    addMessage('assistant', chunk);
+function resetStreamingState() {
+  if (_streamRenderFrame !== null) {
+    cancelAnimationFrame(_streamRenderFrame);
+    _streamRenderFrame = null;
   }
+  _streamBuffer = '';
+  if (_streamingMessage) _streamingMessage.removeAttribute('data-streaming');
+  _streamingMessage = null;
+  _streamingThreadId = null;
+}
+
+function getOrCreateStreamingMessage(threadId) {
+  if (_streamingMessage?.isConnected && _streamingThreadId === threadId) {
+    return _streamingMessage;
+  }
+
+  resetStreamingState();
+  const container = document.getElementById('chat-messages');
+  maybeInsertTimeSeparator(container);
+  const message = createMessageElement('assistant', '', { plainText: true });
+  message.setAttribute('data-streaming', 'true');
+  container.appendChild(message);
+  _streamingMessage = message;
+  _streamingThreadId = threadId;
+  scheduleChatScrollToBottom();
+  return message;
+}
+
+function flushStreamBuffer() {
+  if (!_streamBuffer || !_streamingMessage?.isConnected) return;
+  const chunk = _streamBuffer;
+  _streamBuffer = '';
+  const raw = (_streamingMessage.getAttribute('data-raw') || '') + chunk;
+  _streamingMessage.setAttribute('data-raw', raw);
+  _streamingMessage.setAttribute('data-copy-text', raw);
+  const content = _streamingMessage.querySelector('.message-content');
+  if (content?.firstChild) {
+    content.firstChild.appendData(chunk);
+  } else if (content) {
+    content.appendChild(document.createTextNode(chunk));
+  }
+  scheduleChatScrollToBottom();
+}
+
+function scheduleStreamRender() {
+  if (_streamRenderFrame !== null) return;
+  _streamRenderFrame = requestAnimationFrame(() => {
+    _streamRenderFrame = null;
+    flushStreamBuffer();
+  });
+}
+
+function finalizeStreamingMessage(threadId, content) {
+  if (!_streamingMessage?.isConnected || _streamingThreadId !== threadId) {
+    resetStreamingState();
+    return false;
+  }
+
+  if (_streamRenderFrame !== null) cancelAnimationFrame(_streamRenderFrame);
+  const message = _streamingMessage;
+  const streamedText = (message.getAttribute('data-raw') || '') + _streamBuffer;
+  const finalText = typeof content === 'string' ? content : streamedText;
+  _streamRenderFrame = null;
+  _streamBuffer = '';
+  _streamingMessage = null;
+  _streamingThreadId = null;
+
+  message.removeAttribute('data-streaming');
+  message.setAttribute('data-raw', finalText);
+  message.setAttribute('data-copy-text', finalText);
+  const contentElement = message.querySelector('.message-content');
+  if (contentElement) {
+    contentElement.innerHTML = renderMarkdown(finalText);
+    scheduleCodeHighlight(contentElement);
+  }
+  scheduleChatScrollToBottom();
+  return true;
 }
 
 // --- Inline Tool Activity Cards ---
@@ -1105,7 +1162,7 @@ function getOrCreateActivityGroup() {
   const group = document.createElement('div');
   group.className = 'activity-group';
   container.appendChild(group);
-  container.scrollTop = container.scrollHeight;
+  scheduleChatScrollToBottom();
   _activeGroup = group;
   _activeToolCards = {};
   return group;
@@ -1130,8 +1187,7 @@ function showActivityThinking(message) {
     group.appendChild(_activityThinking);
     _activityThinking.querySelector('.activity-thinking-text').textContent = message;
   }
-  const container = document.getElementById('chat-messages');
-  container.scrollTop = container.scrollHeight;
+  scheduleChatScrollToBottom();
 }
 
 function removeActivityThinking() {
@@ -1201,8 +1257,7 @@ function addToolCard(name) {
   if (!_activeToolCards[name]) _activeToolCards[name] = [];
   _activeToolCards[name].push({ card, startTime, timer: timerInterval, duration, icon, finalDuration: null });
 
-  const container = document.getElementById('chat-messages');
-  container.scrollTop = container.scrollHeight;
+  scheduleChatScrollToBottom();
 }
 
 function completeToolCard(name, success, error, parameters) {
@@ -1421,7 +1476,7 @@ function showApproval(data) {
   card.appendChild(actions);
 
   container.appendChild(card);
-  container.scrollTop = container.scrollHeight;
+  scheduleChatScrollToBottom();
 }
 
 function showJobCard(data) {
@@ -1468,7 +1523,7 @@ function showJobCard(data) {
   }
 
   container.appendChild(card);
-  container.scrollTop = container.scrollHeight;
+  scheduleChatScrollToBottom();
 }
 
 // --- Auth card ---
@@ -1711,6 +1766,8 @@ function setAuthFlowPending(pending, instructions) {
 
 function loadHistory(before) {
   clearSuggestionChips();
+  const requestedThreadId = currentThreadId;
+  const requestSequence = ++_historyRequestSequence;
   let historyUrl = '/api/chat/history?limit=50';
   if (currentThreadId) {
     historyUrl += '&thread_id=' + encodeURIComponent(currentThreadId);
@@ -1724,28 +1781,33 @@ function loadHistory(before) {
 
   // Show skeleton while loading (only for fresh loads)
   if (!isPaginating) {
+    resetStreamingState();
     const chatContainer = document.getElementById('chat-messages');
     chatContainer.innerHTML = '';
     chatContainer.appendChild(renderSkeleton('message', 3));
   }
 
   apiFetch(historyUrl).then((data) => {
+    if (requestSequence !== _historyRequestSequence || requestedThreadId !== currentThreadId) return;
     const container = document.getElementById('chat-messages');
 
     if (!isPaginating) {
-      // Fresh load: clear and render
-      container.innerHTML = '';
+      // Fresh load: build off-DOM, then replace the skeleton in one mutation.
+      const fragment = document.createDocumentFragment();
       for (const turn of data.turns) {
         if (turn.user_input) {
-          addMessage('user', turn.user_input);
+          maybeInsertTimeSeparator(fragment);
+          fragment.appendChild(createMessageElement('user', turn.user_input));
         }
         if (turn.tool_calls && turn.tool_calls.length > 0) {
-          addToolCallsSummary(turn.tool_calls);
+          fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
         }
         if (turn.response) {
-          addMessage('assistant', turn.response);
+          maybeInsertTimeSeparator(fragment);
+          fragment.appendChild(createMessageElement('assistant', turn.response));
         }
       }
+      container.replaceChildren(fragment);
       // Show welcome card when history is empty
       if (data.turns.length === 0) {
         showWelcomeCard();
@@ -1759,6 +1821,7 @@ function loadHistory(before) {
       if (data.pending_approval) {
         showApproval(data.pending_approval);
       }
+      scheduleChatScrollToBottom();
     } else {
       // Pagination: prepend older messages
       const savedHeight = container.scrollHeight;
@@ -1786,13 +1849,15 @@ function loadHistory(before) {
   }).catch(() => {
     // No history or no active thread
   }).finally(() => {
-    loadingOlder = false;
-    removeScrollSpinner();
+    if (requestSequence === _historyRequestSequence) {
+      loadingOlder = false;
+      removeScrollSpinner();
+    }
   });
 }
 
 // Create a message DOM element without appending it (for prepend operations)
-function createMessageElement(role, content) {
+function createMessageElement(role, content, options) {
   const div = document.createElement('div');
   div.className = 'message ' + role;
 
@@ -1808,14 +1873,11 @@ function createMessageElement(role, content) {
     contentEl.textContent = content;
   } else {
     div.setAttribute('data-raw', content);
-    contentEl.innerHTML = renderMarkdown(content);
-    // Syntax highlighting for code blocks
-    if (typeof hljs !== 'undefined') {
-      requestAnimationFrame(() => {
-        contentEl.querySelectorAll('pre code').forEach(block => {
-          hljs.highlightElement(block);
-        });
-      });
+    if (options?.plainText) {
+      contentEl.textContent = content;
+    } else {
+      contentEl.innerHTML = renderMarkdown(content);
+      scheduleCodeHighlight(contentEl);
     }
   }
   div.appendChild(contentEl);
@@ -1841,7 +1903,7 @@ function createMessageElement(role, content) {
 function addToolCallsSummary(toolCalls) {
   const container = document.getElementById('chat-messages');
   container.appendChild(createToolCallsSummaryElement(toolCalls));
-  container.scrollTop = container.scrollHeight;
+  scheduleChatScrollToBottom();
 }
 
 function createToolCallsSummaryElement(toolCalls) {
@@ -1931,6 +1993,90 @@ function debouncedLoadThreads() {
   _loadThreadsTimer = setTimeout(() => { _loadThreadsTimer = null; loadThreads(); }, 500);
 }
 
+function createThreadRow(thread) {
+  const item = document.createElement('div');
+  item.className = 'thread-item';
+  item.dataset.threadId = thread.id;
+
+  const label = document.createElement('span');
+  label.className = 'thread-label';
+  item.appendChild(label);
+
+  const meta = document.createElement('span');
+  meta.className = 'thread-meta';
+  item.appendChild(meta);
+
+  item.addEventListener('click', () => switchThread(item.dataset.threadId));
+  return item;
+}
+
+function updateThreadRow(item, thread) {
+  const isActive = thread.id === currentThreadId;
+  const className = 'thread-item' + (isActive ? ' active' : '');
+  if (item.className !== className) item.className = className;
+  item.dataset.threadId = thread.id;
+
+  const label = item.querySelector('.thread-label');
+  const title = threadTitle(thread);
+  const labelTitle = (thread.title || '') + ' (' + thread.id + ')';
+  if (label.textContent !== title) label.textContent = title;
+  if (label.title !== labelTitle) label.title = labelTitle;
+
+  const channel = thread.channel || 'gateway';
+  let badge = item.querySelector('.thread-badge');
+  if (channel === 'gateway') {
+    if (badge) badge.remove();
+  } else {
+    if (!badge) {
+      badge = document.createElement('span');
+      item.insertBefore(badge, label);
+    }
+    const badgeClass = 'thread-badge thread-badge-' + channel;
+    if (badge.className !== badgeClass) badge.className = badgeClass;
+    if (badge.textContent !== channel) badge.textContent = channel;
+  }
+
+  const meta = item.querySelector('.thread-meta');
+  const updatedAt = relativeTime(thread.updated_at);
+  if (meta.textContent !== updatedAt) meta.textContent = updatedAt;
+
+  const unread = unreadThreads.get(thread.id) || 0;
+  const unreadText = unread > 9 ? '9+' : String(unread);
+  let unreadElement = item.querySelector('.thread-unread');
+  if (unread > 0 && !isActive) {
+    if (!unreadElement) {
+      unreadElement = document.createElement('span');
+      unreadElement.className = 'thread-unread';
+      item.appendChild(unreadElement);
+    }
+    if (unreadElement.textContent !== unreadText) unreadElement.textContent = unreadText;
+  } else if (unreadElement) {
+    unreadElement.remove();
+  }
+}
+
+function reconcileThreadRows(list, threads) {
+  const existingRows = new Map();
+  for (const child of Array.from(list.children)) {
+    if (child.dataset.threadId) {
+      existingRows.set(child.dataset.threadId, child);
+    } else {
+      child.remove();
+    }
+  }
+
+  let cursor = list.firstElementChild;
+  for (const thread of threads) {
+    const item = existingRows.get(thread.id) || createThreadRow(thread);
+    updateThreadRow(item, thread);
+    if (item !== cursor) list.insertBefore(item, cursor);
+    cursor = item.nextElementSibling;
+    existingRows.delete(thread.id);
+  }
+
+  for (const staleRow of existingRows.values()) staleRow.remove();
+}
+
 function loadThreads() {
   // Show skeleton while loading
   const threadListEl = document.getElementById('thread-list');
@@ -1945,57 +2091,18 @@ function loadThreads() {
       assistantThreadId = data.assistant_thread.id;
       const el = document.getElementById('assistant-thread');
       const isActive = currentThreadId === assistantThreadId;
-      el.className = 'assistant-item' + (isActive ? ' active' : '');
+      el.classList.toggle('active', isActive);
       const labelEl = document.getElementById('assistant-label');
-      if (labelEl) {
-        const at = data.assistant_thread;
-        labelEl.textContent = 'Assistant';
-      }
+      if (labelEl && labelEl.textContent !== 'Assistant') labelEl.textContent = 'Assistant';
       const meta = document.getElementById('assistant-meta');
-      meta.textContent = relativeTime(data.assistant_thread.updated_at);
+      const updatedAt = relativeTime(data.assistant_thread.updated_at);
+      if (meta.textContent !== updatedAt) meta.textContent = updatedAt;
     }
 
     // Regular threads
     const list = document.getElementById('thread-list');
-    list.innerHTML = '';
     const threads = data.threads || [];
-    for (const thread of threads) {
-      const item = document.createElement('div');
-      const isActive = thread.id === currentThreadId;
-      item.className = 'thread-item' + (isActive ? ' active' : '');
-
-      // Channel badge for non-gateway threads
-      const ch = thread.channel || 'gateway';
-      if (ch !== 'gateway') {
-        const badge = document.createElement('span');
-        badge.className = 'thread-badge thread-badge-' + ch;
-        badge.textContent = ch;
-        item.appendChild(badge);
-      }
-
-      const label = document.createElement('span');
-      label.className = 'thread-label';
-      label.textContent = threadTitle(thread);
-      label.title = (thread.title || '') + ' (' + thread.id + ')';
-      item.appendChild(label);
-
-      const meta = document.createElement('span');
-      meta.className = 'thread-meta';
-      meta.textContent = relativeTime(thread.updated_at);
-      item.appendChild(meta);
-
-      // Unread dot
-      const unread = unreadThreads.get(thread.id) || 0;
-      if (unread > 0 && !isActive) {
-        const dot = document.createElement('span');
-        dot.className = 'thread-unread';
-        dot.textContent = unread > 9 ? '9+' : String(unread);
-        item.appendChild(dot);
-      }
-
-      item.addEventListener('click', () => switchThread(thread.id));
-      list.appendChild(item);
-    }
+    reconcileThreadRows(list, threads);
 
     // Default to assistant thread on first load if no thread selected
     if (!currentThreadId && assistantThreadId) {
@@ -2173,17 +2280,22 @@ document.getElementById('chat-messages').addEventListener('scroll', function () 
   }
 });
 
+const _textareaResizeFrames = new WeakMap();
+
 function autoResizeTextarea(el) {
-  const prev = el.offsetHeight;
-  el.style.height = 'auto';
-  const target = Math.min(el.scrollHeight, 120);
-  el.style.height = prev + 'px';
-  requestAnimationFrame(() => {
-    el.style.height = target + 'px';
+  if (_textareaResizeFrames.has(el)) return;
+  const frame = requestAnimationFrame(() => {
+    _textareaResizeFrames.delete(el);
+    if (!el.isConnected) return;
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 120) + 'px';
   });
+  _textareaResizeFrames.set(el, frame);
 }
 
 // --- Tabs ---
+
+let _tabIndicatorFrame = null;
 
 document.querySelectorAll('.tab-bar button[data-tab]').forEach((btn) => {
   btn.addEventListener('click', () => {
@@ -2205,13 +2317,21 @@ function switchTab(tab) {
   if (tab === 'memory') loadMemoryTree();
   if (tab === 'jobs') loadJobs();
   if (tab === 'routines') loadRoutines();
-  if (tab === 'logs') applyLogFilters();
+  if (tab === 'logs') scheduleLogFilters();
   if (tab === 'settings') {
     loadSettingsSubtab(currentSettingsSubtab);
   } else {
     stopPairingPoll();
   }
-  updateTabIndicator();
+  scheduleTabIndicatorUpdate();
+}
+
+function scheduleTabIndicatorUpdate() {
+  if (_tabIndicatorFrame !== null) return;
+  _tabIndicatorFrame = requestAnimationFrame(() => {
+    _tabIndicatorFrame = null;
+    updateTabIndicator();
+  });
 }
 
 function updateTabIndicator() {
@@ -2219,17 +2339,18 @@ function updateTabIndicator() {
   if (!indicator) return;
   const activeBtn = document.querySelector('.tab-bar button[data-tab].active');
   if (!activeBtn) {
-    indicator.style.width = '0';
+    indicator.style.opacity = '0';
     return;
   }
   const bar = activeBtn.closest('.tab-bar');
   const barRect = bar.getBoundingClientRect();
   const btnRect = activeBtn.getBoundingClientRect();
-  indicator.style.left = (btnRect.left - barRect.left) + 'px';
-  indicator.style.width = btnRect.width + 'px';
+  const offset = btnRect.left - barRect.left;
+  indicator.style.transform = 'translate3d(' + offset + 'px, 0, 0) scaleX(' + btnRect.width + ')';
+  indicator.style.opacity = '1';
 }
 
-window.addEventListener('resize', updateTabIndicator);
+window.addEventListener('resize', scheduleTabIndicatorUpdate);
 
 // --- Memory (filesystem tree) ---
 
@@ -2478,6 +2599,9 @@ function highlightQuery(text, query) {
 const LOG_MAX_ENTRIES = 2000;
 let logsPaused = false;
 let logBuffer = []; // buffer while paused
+let _pendingLogEntries = [];
+let _logRenderFrame = null;
+let _logFilterFrame = null;
 
 function connectLogSSE() {
   if (logEventSource) logEventSource.close();
@@ -2488,9 +2612,10 @@ function connectLogSSE() {
     const entry = JSON.parse(e.data);
     if (logsPaused) {
       logBuffer.push(entry);
+      if (logBuffer.length > LOG_MAX_ENTRIES) logBuffer.shift();
       return;
     }
-    prependLogEntry(entry);
+    queueLogEntry(entry);
   });
 
   logEventSource.onerror = () => {
@@ -2498,13 +2623,13 @@ function connectLogSSE() {
   };
 }
 
-function prependLogEntry(entry) {
-  const output = document.getElementById('logs-output');
-
-  // Level filter
+function currentLogFilters() {
   const levelFilter = document.getElementById('logs-level-filter').value;
   const targetFilter = document.getElementById('logs-target-filter').value.trim().toLowerCase();
+  return { levelFilter, targetFilter };
+}
 
+function createLogEntryElement(entry, filters) {
   const div = document.createElement('div');
   div.className = 'log-entry level-' + entry.level;
   div.setAttribute('data-level', entry.level);
@@ -2533,13 +2658,29 @@ function prependLogEntry(entry) {
   div.addEventListener('click', () => div.classList.toggle('expanded'));
 
   // Apply current filters as visibility
-  const matchesLevel = levelFilter === 'all' || entry.level === levelFilter;
-  const matchesTarget = !targetFilter || entry.target.toLowerCase().includes(targetFilter);
+  const matchesLevel = filters.levelFilter === 'all' || entry.level === filters.levelFilter;
+  const matchesTarget = !filters.targetFilter || entry.target.toLowerCase().includes(filters.targetFilter);
   if (!matchesLevel || !matchesTarget) {
     div.style.display = 'none';
   }
+  return div;
+}
 
-  output.prepend(div);
+function flushLogEntries() {
+  _logRenderFrame = null;
+  if (_pendingLogEntries.length === 0) return;
+
+  const output = document.getElementById('logs-output');
+  const entries = _pendingLogEntries;
+  _pendingLogEntries = [];
+  const filters = currentLogFilters();
+  const fragment = document.createDocumentFragment();
+
+  // Events arrive oldest-first; prepend newest-first to preserve current order.
+  for (let i = entries.length - 1; i >= 0; i--) {
+    fragment.appendChild(createLogEntryElement(entries[i], filters));
+  }
+  output.prepend(fragment);
 
   // Cap entries (remove oldest at the bottom)
   while (output.children.length > LOG_MAX_ENTRIES) {
@@ -2552,16 +2693,29 @@ function prependLogEntry(entry) {
   }
 }
 
+function queueLogEntry(entry) {
+  _pendingLogEntries.push(entry);
+  if (_pendingLogEntries.length > LOG_MAX_ENTRIES) _pendingLogEntries.shift();
+  if (_logRenderFrame !== null) return;
+  _logRenderFrame = requestAnimationFrame(flushLogEntries);
+}
+
+function queueLogEntries(entries) {
+  for (const entry of entries) queueLogEntry(entry);
+}
+
 function toggleLogsPause() {
+  if (!logsPaused && _logRenderFrame !== null) {
+    cancelAnimationFrame(_logRenderFrame);
+    _logRenderFrame = null;
+    flushLogEntries();
+  }
   logsPaused = !logsPaused;
   const btn = document.getElementById('logs-pause-btn');
   btn.textContent = logsPaused ? I18n.t('logs.resume') : I18n.t('logs.pause');
 
   if (!logsPaused) {
-    // Flush buffer: oldest-first + prepend naturally puts newest at top
-    for (const entry of logBuffer) {
-      prependLogEntry(entry);
-    }
+    queueLogEntries(logBuffer);
     logBuffer = [];
   }
 }
@@ -2570,15 +2724,25 @@ function clearLogs() {
   if (!confirm('Clear all logs?')) return;
   document.getElementById('logs-output').innerHTML = '';
   logBuffer = [];
+  _pendingLogEntries = [];
+  if (_logRenderFrame !== null) cancelAnimationFrame(_logRenderFrame);
+  _logRenderFrame = null;
 }
 
 // Re-apply filters when level or target changes
-document.getElementById('logs-level-filter').addEventListener('change', applyLogFilters);
-document.getElementById('logs-target-filter').addEventListener('input', applyLogFilters);
+document.getElementById('logs-level-filter').addEventListener('change', scheduleLogFilters);
+document.getElementById('logs-target-filter').addEventListener('input', scheduleLogFilters);
+
+function scheduleLogFilters() {
+  if (_logFilterFrame !== null) return;
+  _logFilterFrame = requestAnimationFrame(() => {
+    _logFilterFrame = null;
+    applyLogFilters();
+  });
+}
 
 function applyLogFilters() {
-  const levelFilter = document.getElementById('logs-level-filter').value;
-  const targetFilter = document.getElementById('logs-target-filter').value.trim().toLowerCase();
+  const { levelFilter, targetFilter } = currentLogFilters();
   const entries = document.querySelectorAll('#logs-output .log-entry');
   for (const el of entries) {
     const matchesLevel = levelFilter === 'all' || el.getAttribute('data-level') === levelFilter;

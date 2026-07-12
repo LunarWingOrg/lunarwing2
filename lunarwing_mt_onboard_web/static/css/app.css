@@ -313,11 +313,15 @@ body {
 .log-console .l-err { color: var(--danger); }
 .log-console .l-ok { color: var(--success); }
 
-/* Master key reveal */
+/* Credentials reveal (secrets master key + gateway Web UI token) */
 .masterkey-box { margin-top: 18px; padding: 16px; border-radius: var(--radius); border: 1px solid var(--warning); background: rgba(245, 166, 35, 0.08); }
 .masterkey-box h4 { margin: 0 0 8px; color: var(--warning); font-size: 14px; }
 .masterkey-box code { display: block; font-family: var(--font-mono); font-size: 13px; word-break: break-all; padding: 8px; background: var(--code-bg); border-radius: 6px; margin: 8px 0; color: var(--text); }
-.masterkey-box .warn { font-size: 12px; color: var(--text-secondary); }
+.masterkey-box .warn { font-size: 12px; color: var(--text-secondary); margin-top: 8px; }
+.masterkey-box .cred-list { display: flex; flex-direction: column; gap: 12px; }
+.masterkey-box .cred-row { }
+.masterkey-box .cred-title { font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
+.masterkey-box .cred-note { font-size: 12px; color: var(--text-secondary); font-family: var(--font-mono); word-break: break-all; }
 
 /* Result summary */
 .result-summary { margin-top: 18px; padding: 18px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-secondary); animation: fadeUp 0.5s var(--ease-out-expo) both; }
@@ -347,6 +351,10 @@ body {
   transition: filter 0.3s ease;
 }
 .bat-sprite.angry { filter: drop-shadow(0 0 12px rgba(230, 76, 76, 0.7)); }
+.bat-sprite.greet { filter: drop-shadow(0 0 12px rgba(122, 162, 247, 0.6)); }
+.bat-sprite.sup { filter: drop-shadow(0 0 12px rgba(52, 211, 153, 0.6)); }
+.bat-sprite.fiery { filter: drop-shadow(0 0 12px rgba(245, 130, 32, 0.7)); }
+.bat-sprite.love { filter: drop-shadow(0 0 12px rgba(236, 72, 153, 0.7)); }
 
 /* Keyframes ---------------------------------------------------------------- */
 @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
