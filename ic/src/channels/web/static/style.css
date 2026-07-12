@@ -372,11 +372,17 @@ body {
 /* Tab sliding indicator */
 .tab-indicator {
   position: absolute;
+  left: 0;
   bottom: 0;
+  width: 1px;
   height: 2px;
   background: var(--accent);
   border-radius: 1px;
-  transition: left 300ms var(--ease-spring), width 300ms var(--ease-spring);
+  opacity: 0;
+  transform: translate3d(0, 0, 0) scaleX(0);
+  transform-origin: left center;
+  transition: transform 300ms var(--ease-spring), opacity 150ms ease;
+  will-change: transform, opacity;
   z-index: 1;
   pointer-events: none;
 }
@@ -852,6 +858,10 @@ body {
   background: var(--accent);
   vertical-align: text-bottom;
   animation: cursorPulse 1.2s ease-in-out infinite;
+}
+
+.message.assistant[data-streaming="true"] .message-content {
+  white-space: pre-wrap;
 }
 
 @keyframes cursorPulse {
@@ -1630,7 +1640,6 @@ body {
   resize: none;
   min-height: 40px;
   max-height: 120px;
-  transition: height 100ms ease;
 }
 
 .ghost-text {
@@ -5359,11 +5368,11 @@ input[type="checkbox"]:focus-visible {
 }
 
 /* ============================================================
-   Theme transition (delayed via JS to avoid FOUC)
+   Temporary theme transition (enabled only while the theme changes)
    ============================================================ */
 
-body.theme-transition,
-body.theme-transition *:not(svg):not(path):not(line):not(circle):not(rect) {
+:where(body.theme-transition),
+:where(body.theme-transition *:not(svg):not(path):not(line):not(circle):not(rect)) {
   transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
 }
 
