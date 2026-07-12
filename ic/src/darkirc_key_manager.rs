@@ -41,6 +41,191 @@ const STAGED_MIGRATION_FILE: &str = "key-exchange/darkirc-contacts-v1.staged.jso
 const MIGRATION_FILE_NEXT: &str = "key-exchange/darkirc-contacts-v1.json.next";
 const STAGED_MIGRATION_FILE_NEXT: &str = "key-exchange/darkirc-contacts-v1.staged.json.next";
 pub const MIGRATION_SCHEMA: &str = "darkirc-contacts-v1";
+pub const EXCHANGE_SCHEMA: &str = "lunarwing.darkirc.exchange.v1";
+pub const EXCHANGE_SCHEMA_VERSION: &str = "1";
+pub const MAX_PENDING_BYTES: usize = 64 * 1024;
+pub const ACTIVATION_WINDOW_SECONDS: i64 = 24 * 60 * 60;
+pub const EXTENSION_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub const DEFAULT_OFFER_TTL_SECONDS: i64 = 30 * 60;
+
+pub const EXCHANGE_V1_DOMAIN_SEPARATOR: &str = "lunarwing.darkirc.exchange.v1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExchangeRole {
+    InitiatorOffer,
+    ResponderResponse,
+}
+
+impl ExchangeRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InitiatorOffer => "initiator_offer",
+            Self::ResponderResponse => "responder_response",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExchangeOperation {
+    Initial,
+    Rotate,
+}
+
+impl ExchangeOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::Rotate => "rotate",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExchangeState {
+    Prepared,
+    PeerReceived,
+    Confirmed,
+    Installed,
+    LocallyActivated,
+    PeerVerified,
+    VerificationOverdue,
+    RolledBack,
+    Expired,
+    Cancelled,
+    Revoked,
+}
+
+impl ExchangeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "Prepared",
+            Self::PeerReceived => "PeerReceived",
+            Self::Confirmed => "Confirmed",
+            Self::Installed => "Installed",
+            Self::LocallyActivated => "LocallyActivated",
+            Self::PeerVerified => "PeerVerified",
+            Self::VerificationOverdue => "VerificationOverdue",
+            Self::RolledBack => "RolledBack",
+            Self::Expired => "Expired",
+            Self::Cancelled => "Cancelled",
+            Self::Revoked => "Revoked",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedExchange {
+    pub schema: String,
+    pub version: String,
+    pub artifact_role: String,
+    pub offer_id: String,
+    pub sender_contact_id: String,
+    pub intended_peer_contact_id: Option<String>,
+    pub intended_peer_fingerprint: Option<String>,
+    pub generator_profile: String,
+    pub binary_sha256: String,
+    pub key_format: String,
+    pub source_revision: String,
+    pub public_key: String,
+    pub public_fingerprint: String,
+    pub generation: u64,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub label: Option<String>,
+    pub previous_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResponderExchange {
+    pub schema: String,
+    pub version: String,
+    pub artifact_role: String,
+    pub offer_id: String,
+    pub in_reply_to: String,
+    pub sender_contact_id: String,
+    pub intended_peer_contact_id: String,
+    pub intended_peer_fingerprint: String,
+    pub generator_profile: String,
+    pub binary_sha256: String,
+    pub key_format: String,
+    pub source_revision: String,
+    pub public_key: String,
+    pub public_fingerprint: String,
+    pub generation: u64,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub label: Option<String>,
+    pub previous_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedPublicArtifact {
+    pub role: ExchangeRole,
+    pub offer_id: String,
+    pub sender_contact_id: String,
+    pub intended_peer_contact_id: Option<String>,
+    pub public_fingerprint: PublicFingerprint,
+    pub generation: u64,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub canonical: Vec<u8>,
+    pub in_reply_to: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretExchange {
+    pub schema: String,
+    pub offer_id: String,
+    pub role: String,
+    pub operation: String,
+    pub contact_id: String,
+    pub peer_contact_id: Option<String>,
+    pub local_public: String,
+    #[serde(serialize_with = "serialize_secret_string")]
+    pub local_private: SecretString,
+    pub peer_public: Option<String>,
+    pub peer_fingerprint: Option<String>,
+    pub state: String,
+    pub scope_id: String,
+    pub contact_name: String,
+    pub generation: u64,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub transcript: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ExchangeStatus {
+    pub contact_name: String,
+    pub contact_id: String,
+    pub offer_id: String,
+    pub state: String,
+    pub peer_fingerprint: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub confirmed_at: Option<i64>,
+    pub installed_at: Option<i64>,
+    pub activation_deadline: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct PreparedResult {
+    pub offer_id: String,
+    pub contact_id: String,
+    pub role: String,
+    pub public_artifact: String,
+    pub public_fingerprint: String,
+    pub expires_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RevocationDisposition {
+    Routine,
+    Compromised,
+}
 pub const MIGRATION_GENERATOR_PROFILE: &str = "darkfi-a05956d41-chacha-v1";
 pub const MIGRATION_KEY_FORMAT: &str = "darkfi-chacha-base58-32";
 pub const MIGRATION_SOURCE_REVISION: &str = "a05956d412a091e8b54c1cd4f4264c33b941203d";
@@ -81,6 +266,22 @@ pub enum KeyManagerError {
     Busy,
     #[error("crash point injected for recovery test")]
     CrashInjected,
+    #[error("public exchange artifact is invalid")]
+    InvalidExchangeArtifact,
+    #[error("exchange fingerprint mismatch")]
+    FingerprintMismatch,
+    #[error("exchange offer ID conflict")]
+    OfferConflict,
+    #[error("exchange state transition not allowed")]
+    InvalidExchangeState,
+    #[error("activation health gate failed")]
+    ActivationFailed,
+    #[error("verification deadline exceeded")]
+    VerificationOverdue,
+    #[error("compromised key cannot be restored")]
+    CompromisedKey,
+    #[error("exchange operation not found")]
+    ExchangeNotFound,
 }
 
 impl From<io::Error> for KeyManagerError {
@@ -184,6 +385,33 @@ pub struct LedgerContact {
     pub state: String,
     pub peer_fingerprint: String,
     pub generation: u64,
+    /// Stable 128-bit hex contact identifier assigned at exchange time.
+    /// Empty for legacy contacts (pre-exchange).
+    #[serde(default)]
+    pub contact_id: String,
+    /// Local public fingerprint (sha256 of decoded local public key).
+    /// Empty for legacy contacts.
+    #[serde(default)]
+    pub local_fingerprint: String,
+    /// POSIX timestamp deadline for peer verification after local activation.
+    /// 0 means no deadline set.
+    #[serde(default)]
+    pub activation_deadline: i64,
+    /// Transaction ID of the rollback snapshot, if a live rollback exists.
+    #[serde(default)]
+    pub rollback_tx_id: String,
+    /// Hash of the rollback contact TOML, for semantic rollback validation.
+    #[serde(default)]
+    pub rollback_contact_toml_hash: String,
+    /// Pending offer ID, if an exchange is in progress for this contact.
+    #[serde(default)]
+    pub pending_offer_id: String,
+    /// Monotonic compromise marker — once true, rollback is forbidden.
+    #[serde(default)]
+    pub compromised: bool,
+    /// Revocation tombstone generation, if the contact is revoked.
+    #[serde(default)]
+    pub revocation_generation: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +451,12 @@ pub enum CrashPoint {
     AfterJournal,
     AfterLedger,
     AfterConfig,
+    AfterLedgerCommit,
+    AfterActivationStart,
+    AfterSuccess,
+    AfterRollbackStart,
+    AfterRevocationTombstone,
+    AfterRevocationRemoval,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +464,13 @@ enum JournalPhase {
     Prepared,
     LedgerCommitted,
     ConfigCommitted,
+    ActivationStarted,
+    LocallyActivated,
+    RollbackStarted,
+    RolledBack,
+    RevocationTombstoneCommitted,
+    RevocationRemovalCommitted,
+    PairLocalCoordinator,
 }
 
 impl JournalPhase {
@@ -238,6 +479,13 @@ impl JournalPhase {
             Self::Prepared => "prepared",
             Self::LedgerCommitted => "ledger_committed",
             Self::ConfigCommitted => "config_committed",
+            Self::ActivationStarted => "activation_started",
+            Self::LocallyActivated => "locally_activated",
+            Self::RollbackStarted => "rollback_started",
+            Self::RolledBack => "rolled_back",
+            Self::RevocationTombstoneCommitted => "revocation_tombstone_committed",
+            Self::RevocationRemovalCommitted => "revocation_removal_committed",
+            Self::PairLocalCoordinator => "pair_local_coordinator",
         }
     }
 
@@ -246,6 +494,13 @@ impl JournalPhase {
             "prepared" => Ok(Self::Prepared),
             "ledger_committed" => Ok(Self::LedgerCommitted),
             "config_committed" => Ok(Self::ConfigCommitted),
+            "activation_started" => Ok(Self::ActivationStarted),
+            "locally_activated" => Ok(Self::LocallyActivated),
+            "rollback_started" => Ok(Self::RollbackStarted),
+            "rolled_back" => Ok(Self::RolledBack),
+            "revocation_tombstone_committed" => Ok(Self::RevocationTombstoneCommitted),
+            "revocation_removal_committed" => Ok(Self::RevocationRemovalCommitted),
+            "pair_local_coordinator" => Ok(Self::PairLocalCoordinator),
             _ => Err(KeyManagerError::RecoveryRequired),
         }
     }
@@ -265,6 +520,44 @@ struct JournalFile {
     config_candidate: String,
     ledger_candidate: String,
     phase: String,
+    /// Stable contact ID for exchange-related operations.
+    #[serde(default)]
+    contact_id: String,
+    /// Offer ID bound to this exchange (prepare/respond/complete).
+    #[serde(default)]
+    offer_id: String,
+    /// Peer's contact ID for the exchange.
+    #[serde(default)]
+    peer_contact_id: String,
+    /// SHA-256 transcript hash binding the exchange artifacts.
+    #[serde(default)]
+    transcript: String,
+    /// Locally authorized generation for this operation.
+    #[serde(default)]
+    generation: u64,
+    /// Kind of exchange operation for recovery routing.
+    /// One of: exchange-prepare, exchange-respond, exchange-complete,
+    /// exchange-cancel, exchange-activation, exchange-rollback,
+    /// exchange-roundtrip, rotation-prepare, rotation-respond,
+    /// rotation-complete, revocation-tombstone, revocation-removal,
+    /// pair-local-coordinator.
+    #[serde(default)]
+    operation_kind: String,
+    /// Hash of the contact TOML captured for semantic rollback.
+    #[serde(default)]
+    rollback_contact_toml_hash: String,
+    /// Peer fingerprint captured at confirmation.
+    #[serde(default)]
+    confirmed_peer_fingerprint: String,
+    /// Transaction ID of the rollback snapshot.
+    #[serde(default)]
+    rollback_tx_id: String,
+    /// Contact name for exchange operations.
+    #[serde(default)]
+    contact_name: String,
+    /// Generation counter of the peer at the time of exchange.
+    #[serde(default)]
+    peer_generation: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -655,7 +948,13 @@ fn prepare_directories(paths: &TenantPaths) -> Result<()> {
         paths.expected_gid,
         true,
     )?;
-    for relative in [KEY_EXCHANGE_DIR, CANDIDATES_DIR, TRANSACTIONS_DIR] {
+    for relative in [
+        KEY_EXCHANGE_DIR,
+        CANDIDATES_DIR,
+        TRANSACTIONS_DIR,
+        PENDING_DIR,
+        ROLLBACK_DIR,
+    ] {
         let path = paths.darkirc_dir.join(relative);
         match fs::symlink_metadata(&path) {
             Ok(_) => {}
@@ -872,6 +1171,26 @@ fn public_fingerprint(encoded: &str) -> Result<String> {
         return Err(KeyManagerError::InvalidPublicKey);
     }
     Ok(sha256(&decoded))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PublicFingerprint(String);
+
+impl PublicFingerprint {
+    pub fn parse(value: &str) -> Result<Self> {
+        if !valid_hash(value) {
+            return Err(KeyManagerError::InvalidPublicKey);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn from_encoded_public_key(encoded: &str) -> Result<Self> {
+        Ok(Self(public_fingerprint(encoded)?))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 fn private_key_bytes(encoded: &str) -> Result<Zeroizing<Vec<u8>>> {
@@ -1148,9 +1467,12 @@ fn validate_ledger(ledger: &Ledger) -> Result<()> {
             contact.state.as_str(),
             "legacy-active"
                 | "legacy-noncompliant"
+                | "Installing"
                 | "Installed"
                 | "LocallyActivated"
                 | "PeerVerified"
+                | "VerificationOverdue"
+                | "RolledBack"
                 | "Expired"
                 | "Cancelled"
                 | "Revoked"
@@ -1745,6 +2067,14 @@ pub fn adopt_contacts_at(
             state: "legacy-noncompliant".to_owned(),
             peer_fingerprint: contact.summary.peer_fingerprint,
             generation: 0,
+            contact_id: String::new(),
+            local_fingerprint: String::new(),
+            activation_deadline: 0,
+            rollback_tx_id: String::new(),
+            rollback_contact_toml_hash: String::new(),
+            pending_offer_id: String::new(),
+            compromised: false,
+            revocation_generation: 0,
         };
         match ledger.contacts.get(&contact.summary.name) {
             Some(existing) if existing != &proposed => {
@@ -1840,6 +2170,17 @@ fn commit_transaction(
         config_candidate: config_candidate.clone(),
         ledger_candidate: ledger_candidate.clone(),
         phase: JournalPhase::Prepared.as_str().to_owned(),
+        contact_id: String::new(),
+        offer_id: String::new(),
+        peer_contact_id: String::new(),
+        transcript: String::new(),
+        generation: 0,
+        operation_kind: String::new(),
+        rollback_contact_toml_hash: String::new(),
+        confirmed_peer_fingerprint: String::new(),
+        rollback_tx_id: String::new(),
+        contact_name: String::new(),
+        peer_generation: 0,
     };
     write_journal(workspace, &journal_path, &journal)?;
     inject_crash(crash_point, CrashPoint::AfterJournal)?;
@@ -1921,6 +2262,1530 @@ fn finish_journal(workspace: &Workspace, path: &str, journal: &JournalFile) -> R
     workspace.remove_if_present(path)?;
     sync_dir_path(&workspace.paths.darkirc_dir)
 }
+
+fn canonical_artifact_bytes(artifact: &impl serde::Serialize) -> Result<Vec<u8>> {
+    serde_json::to_vec(artifact).map_err(|_| KeyManagerError::InvalidExchangeArtifact)
+}
+
+fn compute_transcript(initiator: &[u8], responder: &[u8]) -> Result<String> {
+    if initiator.len() > MAX_PENDING_BYTES || responder.len() > MAX_PENDING_BYTES {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(EXCHANGE_V1_DOMAIN_SEPARATOR.as_bytes());
+    hasher.update(initiator);
+    hasher.update(responder);
+    let mut bytes = Vec::from("sha256:");
+    bytes.extend(format!("{:x}", hasher.finalize()).into_bytes());
+    String::from_utf8(bytes).map_err(|_| KeyManagerError::InvalidExchangeArtifact)
+}
+
+fn validate_offer_id(value: &str) -> Result<()> {
+    if value.is_empty() || value.len() != 32 || !value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    Ok(())
+}
+
+pub fn validate_public_exchange(bytes: &[u8], expected_role: ExchangeRole) -> Result<ValidatedPublicArtifact> {
+    if bytes.len() > MAX_PENDING_BYTES {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+    let schema = value.get("schema").and_then(|v| v.as_str()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    let version = value.get("version").and_then(|v| v.as_str()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    let role = value.get("artifact_role").and_then(|v| v.as_str()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    let observed = match role {
+        "initiator_offer" => ExchangeRole::InitiatorOffer,
+        "responder_response" => ExchangeRole::ResponderResponse,
+        _ => return Err(KeyManagerError::InvalidExchangeArtifact),
+    };
+    if observed != expected_role {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    if schema != EXCHANGE_SCHEMA {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    if version != EXCHANGE_SCHEMA_VERSION {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    let generator_profile = value.get("generator_profile").and_then(|v| v.as_str()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    let binary_sha256 = value.get("binary_sha256").and_then(|v| v.as_str()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    let key_format = value.get("key_format").and_then(|v| v.as_str()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    let source_revision = value.get("source_revision").and_then(|v| v.as_str()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    if generator_profile != MIGRATION_GENERATOR_PROFILE || key_format != MIGRATION_KEY_FORMAT || source_revision != MIGRATION_SOURCE_REVISION {
+        return Err(KeyManagerError::InvalidCompatibility);
+    }
+    if !valid_hash(binary_sha256) {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    let offer_id = value.get("offer_id").and_then(|v| v.as_str()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    let sender_contact_id = value.get("sender_contact_id").and_then(|v| v.as_str()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    validate_offer_id(offer_id)?;
+    validate_offer_id(sender_contact_id)?;
+    let public_key = value.get("public_key").and_then(|v| v.as_str()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    let public_fingerprint_field = value.get("public_fingerprint").and_then(|v| v.as_str()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    let computed = public_fingerprint(public_key)?;
+    if computed != public_fingerprint_field {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    let generation = value.get("generation").and_then(|v| v.as_u64()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    let created_at = value.get("created_at").and_then(|v| v.as_i64()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    let expires_at = value.get("expires_at").and_then(|v| v.as_i64()).ok_or(KeyManagerError::InvalidExchangeArtifact)?;
+    if expires_at <= created_at {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    let intended_peer_fingerprint = value.get("intended_peer_fingerprint").and_then(|v| v.as_str());
+    if let Some(peer_f) = intended_peer_fingerprint {
+        if !valid_hash(peer_f) {
+            return Err(KeyManagerError::InvalidExchangeArtifact);
+        }
+    }
+    let canonical = canonical_artifact_bytes(&value)?;
+    Ok(ValidatedPublicArtifact {
+        role: observed,
+        offer_id: offer_id.to_owned(),
+        sender_contact_id: sender_contact_id.to_owned(),
+        intended_peer_contact_id: value.get("intended_peer_contact_id").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+        public_fingerprint: PublicFingerprint::parse(&computed)?,
+        generation,
+        created_at,
+        expires_at,
+        canonical,
+        in_reply_to: value.get("in_reply_to").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Exchange state machine: Stage A (Public Exchange V1),
+// Stage C (Activation & Rollback), Stage B (Rotation & Revocation)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn offer_id_path(workspace: &Workspace, offer_id: &str) -> Result<String> {
+    validate_offer_id(offer_id)?;
+    Ok(format!("{}/{}.json", PENDING_DIR, offer_id))
+}
+
+fn rollback_path(workspace: &Workspace, transaction_id: &str) -> Result<String> {
+    validate_transaction_id(transaction_id)?;
+    Ok(format!("{}/{}.toml", ROLLBACK_DIR, transaction_id))
+}
+
+fn read_pending_secret(workspace: &Workspace, offer_id: &str) -> Result<SecretExchange> {
+    let path = offer_id_path(workspace, offer_id)?;
+    let bytes = workspace.read_required(&path)?;
+    serde_json::from_slice(&bytes).map_err(|_| KeyManagerError::InvalidExchangeArtifact)
+}
+
+fn write_pending_secret(workspace: &Workspace, secret: &SecretExchange) -> Result<()> {
+    let path = offer_id_path(workspace, &secret.offer_id)?;
+    let bytes = serde_json::to_vec(secret).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+    if bytes.len() > MAX_PENDING_BYTES {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    workspace.write_new(&path, &bytes)
+}
+
+fn remove_pending(workspace: &Workspace, offer_id: &str) -> Result<()> {
+    let path = offer_id_path(workspace, offer_id)?;
+    workspace.remove_if_present(&path)
+}
+
+fn contact_occupied(workspace: &Workspace, contact_name: &str, ledger: &Ledger) -> bool {
+    let config_match = workspace.read_optional(CONFIG_FILE).ok().flatten().map_or(false, |bytes| {
+        parse_document(&bytes).ok().map_or(false, |doc| {
+            doc.table.get("contact").and_then(|v| v.as_table()).map_or(false, |t| t.contains_key(contact_name))
+        })
+    });
+    let ledger_match = ledger.contacts.contains_key(contact_name);
+    config_match || ledger_match
+}
+
+fn is_terminal_exchange(state: &str) -> bool {
+    matches!(state, "Expired" | "Cancelled" | "Revoked")
+}
+
+fn is_settled_for_migration(state: &str) -> bool {
+    matches!(state, "legacy-active" | "legacy-noncompliant" | "PeerVerified" | "RolledBack" | "Expired" | "Cancelled" | "Revoked")
+}
+
+fn is_unresolved_ledger_state(state: &str) -> bool {
+    matches!(state, "Installing" | "Prepared" | "PeerReceived" | "Confirmed" | "Installed" | "LocallyActivated" | "VerificationOverdue")
+}
+
+fn append_ledger_contact(ledger: &mut Ledger, name: &str, contact: LedgerContact) -> Result<()> {
+    match ledger.contacts.get(name) {
+        Some(existing) if existing != &contact => Err(KeyManagerError::ContactConflict),
+        Some(_) => Ok(()),
+        None => {
+            ledger.contacts.insert(name.to_owned(), contact);
+            Ok(())
+        }
+    }
+}
+
+fn write_rollback_snapshot(workspace: &Workspace, transaction_id: &str, contact_name: &str, contact_toml: &SecretString) -> Result<()> {
+    validate_transaction_id(transaction_id)?;
+    validate_contact_name(contact_name)?;
+    let path = format!("{}/{}.toml", ROLLBACK_DIR, transaction_id);
+    let bytes = contact_toml.expose_secret().as_bytes();
+    if bytes.len() > MAX_PENDING_BYTES {
+        return Err(KeyManagerError::InvalidLedger);
+    }
+    workspace.write_new(&path, bytes)
+}
+
+fn contact_toml_for_new_contact(contact_name: &str, public: &str, private: &str) -> Result<Zeroizing<Vec<u8>>> {
+    validate_contact_name(contact_name)?;
+    public_fingerprint(public)?;
+    let _ = private_key_bytes(private)?;
+    let rendered = format!("[contact.\"{}\"]\ndm_chacha_public = \"{}\"\nmy_dm_chacha_secret = \"{}\"\n", contact_name, public, private);
+    Ok(Zeroizing::new(rendered.into_bytes()))
+}
+
+fn contact_toml_delete_contact(existing_config: &[u8], contact_name: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let mut document = parse_document(existing_config)?;
+    let contacts = document.table.get_mut("contact").and_then(|v| v.as_table_mut()).ok_or(KeyManagerError::InvalidToml)?;
+    contacts.remove(contact_name);
+    validate_document(&document.table)?;
+    serialize_table(&document.table)
+}
+
+fn new_contact_id() -> String {
+    let mut bytes = vec![0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn new_offer_id() -> String {
+    new_contact_id()
+}
+
+fn make_initiator_secret(
+    offer_id: &str,
+    contact_id: &str,
+    scope_id: &str,
+    contact_name: &str,
+    local_public: &str,
+    local_private: &str,
+    generation: u64,
+    created_at: i64,
+    expires_at: i64,
+) -> Result<SecretExchange> {
+    validate_offer_id(offer_id)?;
+    validate_offer_id(contact_id)?;
+    Ok(SecretExchange {
+        schema: EXCHANGE_SCHEMA.to_owned(),
+        offer_id: offer_id.to_owned(),
+        role: ExchangeRole::InitiatorOffer.as_str().to_owned(),
+        operation: ExchangeOperation::Initial.as_str().to_owned(),
+        contact_id: contact_id.to_owned(),
+        peer_contact_id: None,
+        local_public: local_public.to_owned(),
+        local_private: SecretString::from(local_private.to_owned()),
+        peer_public: None,
+        peer_fingerprint: None,
+        state: ExchangeState::Prepared.as_str().to_owned(),
+        scope_id: scope_id.to_owned(),
+        contact_name: contact_name.to_owned(),
+        generation,
+        created_at,
+        expires_at,
+        transcript: None,
+    })
+}
+
+fn make_initiator_artifact(secret: &SecretExchange, intended_peer_contact_id: Option<&str>, intended_peer_fingerprint: Option<&str>, label: Option<&str>, previous_fingerprint: Option<&str>) -> Result<PreparedExchange> {
+    Ok(PreparedExchange {
+        schema: secret.schema.clone(),
+        version: EXCHANGE_SCHEMA_VERSION.to_owned(),
+        artifact_role: ExchangeRole::InitiatorOffer.as_str().to_owned(),
+        offer_id: secret.offer_id.clone(),
+        sender_contact_id: secret.contact_id.clone(),
+        intended_peer_contact_id: intended_peer_contact_id.map(|s| s.to_owned()),
+        intended_peer_fingerprint: intended_peer_fingerprint.map(|s| s.to_owned()),
+        generator_profile: MIGRATION_GENERATOR_PROFILE.to_owned(),
+        binary_sha256: String::new(),
+        key_format: MIGRATION_KEY_FORMAT.to_owned(),
+        source_revision: MIGRATION_SOURCE_REVISION.to_owned(),
+        public_key: secret.local_public.clone(),
+        public_fingerprint: public_fingerprint(&secret.local_public)?,
+        generation: secret.generation,
+        created_at: secret.created_at,
+        expires_at: secret.expires_at,
+        label: label.map(|s| s.to_owned()),
+        previous_fingerprint: previous_fingerprint.map(|s| s.to_owned()),
+    })
+}
+
+fn make_responder_secret(
+    offer_id: &str,
+    contact_id: &str,
+    scope_id: &str,
+    contact_name: &str,
+    peer_contact_id: &str,
+    initiator: &ValidatedPublicArtifact,
+    local_public: &str,
+    local_private: &str,
+    created_at: i64,
+    expires_at: i64,
+) -> Result<SecretExchange> {
+    Ok(SecretExchange {
+        schema: EXCHANGE_SCHEMA.to_owned(),
+        offer_id: offer_id.to_owned(),
+        role: ExchangeRole::ResponderResponse.as_str().to_owned(),
+        operation: ExchangeOperation::Initial.as_str().to_owned(),
+        contact_id: contact_id.to_owned(),
+        peer_contact_id: Some(peer_contact_id.to_owned()),
+        local_public: local_public.to_owned(),
+        local_private: SecretString::from(local_private.to_owned()),
+        peer_public: Some(String::new()),
+        peer_fingerprint: Some(initiator.public_fingerprint.as_str().to_owned()),
+        state: ExchangeState::Prepared.as_str().to_owned(),
+        scope_id: scope_id.to_owned(),
+        contact_name: contact_name.to_owned(),
+        generation: initiator.generation,
+        created_at,
+        expires_at,
+        transcript: None,
+    })
+}
+
+fn make_responder_artifact(secret: &SecretExchange, initiator_offer_id: &str, intended_peer_contact_id: &str, intended_peer_fingerprint: &str, label: Option<&str>, previous_fingerprint: Option<&str>) -> Result<ResponderExchange> {
+    Ok(ResponderExchange {
+        schema: secret.schema.clone(),
+        version: EXCHANGE_SCHEMA_VERSION.to_owned(),
+        artifact_role: ExchangeRole::ResponderResponse.as_str().to_owned(),
+        offer_id: secret.offer_id.clone(),
+        in_reply_to: initiator_offer_id.to_owned(),
+        sender_contact_id: secret.contact_id.clone(),
+        intended_peer_contact_id: intended_peer_contact_id.to_owned(),
+        intended_peer_fingerprint: intended_peer_fingerprint.to_owned(),
+        generator_profile: MIGRATION_GENERATOR_PROFILE.to_owned(),
+        binary_sha256: String::new(),
+        key_format: MIGRATION_KEY_FORMAT.to_owned(),
+        source_revision: MIGRATION_SOURCE_REVISION.to_owned(),
+        public_key: secret.local_public.clone(),
+        public_fingerprint: public_fingerprint(&secret.local_public)?,
+        generation: secret.generation,
+        created_at: secret.created_at,
+        expires_at: secret.expires_at,
+        label: label.map(|s| s.to_owned()),
+        previous_fingerprint: previous_fingerprint.map(|s| s.to_owned()),
+    })
+}
+
+fn build_install_ledger_contact(fingerprint: &str, contact_id: &str, generation: u64, local_fingerprint: &str) -> LedgerContact {
+    LedgerContact {
+        state: ExchangeState::Installed.as_str().to_owned(),
+        peer_fingerprint: fingerprint.to_owned(),
+        generation,
+        contact_id: contact_id.to_owned(),
+        local_fingerprint: local_fingerprint.to_owned(),
+        activation_deadline: 0,
+        rollback_tx_id: String::new(),
+        rollback_contact_toml_hash: String::new(),
+        pending_offer_id: String::new(),
+        compromised: false,
+        revocation_generation: 0,
+    }
+}
+
+fn exchange_journal(
+    workspace: &Workspace,
+    scope_id: &str,
+    operation: &str,
+    contact_name: &str,
+    contact_id: &str,
+    offer_id: &str,
+    peer_contact_id: Option<&str>,
+    transcript: Option<&str>,
+    generation: u64,
+    peer_generation: u64,
+    old_config: Option<&[u8]>,
+    old_ledger: Option<&[u8]>,
+    new_config: &[u8],
+    new_ledger: &[u8],
+    operation_kind: &str,
+    rollback_contact_toml_hash: Option<&str>,
+    confirmed_peer_fingerprint: Option<&str>,
+    rollback_tx_id: Option<&str>,
+    crash_point: Option<CrashPoint>,
+) -> Result<UpdateResult> {
+    let config_hash = sha256(new_config);
+    let ledger_hash = sha256(new_ledger);
+    if old_config == Some(new_config) && old_ledger == Some(new_ledger) && operation_kind == "exchange-roundtrip" {
+        return Ok(UpdateResult {
+            transaction_id: None,
+            config_hash,
+            ledger_hash,
+            changed: false,
+        });
+    }
+    let transaction_id = Uuid::new_v4().simple().to_string();
+    let config_candidate = format!("{}/{}.toml", CANDIDATES_DIR, transaction_id);
+    let ledger_candidate = format!("{}/{}.ledger.json", CANDIDATES_DIR, transaction_id);
+    let journal_path = format!("{}/{}.json", TRANSACTIONS_DIR, transaction_id);
+    workspace.write_new(&config_candidate, new_config)?;
+    workspace.write_new(&ledger_candidate, new_ledger)?;
+    validate_transaction_candidates(workspace, scope_id, &config_candidate, &ledger_candidate, &config_hash, &ledger_hash)?;
+    let mut journal = JournalFile {
+        schema: "lunarwing.darkirc-transaction/v1".to_owned(),
+        transaction_id: transaction_id.clone(),
+        operation: operation.to_owned(),
+        scope_id: scope_id.to_owned(),
+        old_config_hash: old_config.map(sha256),
+        old_ledger_hash: old_ledger.map(sha256),
+        new_config_hash: config_hash.clone(),
+        new_ledger_hash: ledger_hash.clone(),
+        config_candidate: config_candidate.clone(),
+        ledger_candidate: ledger_candidate.clone(),
+        phase: JournalPhase::Prepared.as_str().to_owned(),
+        contact_id: contact_id.to_owned(),
+        offer_id: offer_id.to_owned(),
+        peer_contact_id: peer_contact_id.unwrap_or_default().to_owned(),
+        transcript: transcript.unwrap_or_default().to_owned(),
+        generation,
+        operation_kind: operation_kind.to_owned(),
+        rollback_contact_toml_hash: rollback_contact_toml_hash.unwrap_or_default().to_owned(),
+        confirmed_peer_fingerprint: confirmed_peer_fingerprint.unwrap_or_default().to_owned(),
+        rollback_tx_id: rollback_tx_id.unwrap_or_default().to_owned(),
+        contact_name: contact_name.to_owned(),
+        peer_generation,
+    };
+    write_journal(workspace, &journal_path, &journal)?;
+    inject_crash(crash_point, CrashPoint::AfterJournal)?;
+    workspace.rename(&ledger_candidate, LEDGER_FILE)?;
+    journal.phase = JournalPhase::LedgerCommitted.as_str().to_owned();
+    replace_journal(workspace, &journal_path, &journal)?;
+    inject_crash(crash_point, CrashPoint::AfterLedgerCommit)?;
+    inject_crash(crash_point, CrashPoint::AfterLedger)?;
+    workspace.rename(&config_candidate, CONFIG_FILE)?;
+    journal.phase = JournalPhase::ConfigCommitted.as_str().to_owned();
+    replace_journal(workspace, &journal_path, &journal)?;
+    inject_crash(crash_point, CrashPoint::AfterConfig)?;
+    finish_journal(workspace, &journal_path, &journal)?;
+    Ok(UpdateResult {
+        transaction_id: Some(transaction_id),
+        config_hash,
+        ledger_hash,
+        changed: true,
+    })
+}
+
+// ── Stage A: prepare/respond/complete/cancel ────────────────────────────────
+
+pub struct PrepareExchange<'a> {
+    pub contact_name: &'a str,
+    pub offer_id: &'a str,
+    pub contact_id: &'a str,
+    pub local_public: &'a str,
+    pub local_private: &'a str,
+    pub intended_peer_contact_id: Option<&'a str>,
+    pub intended_peer_fingerprint: Option<&'a str>,
+    pub label: Option<&'a str>,
+    pub previous_fingerprint: Option<&'a str>,
+    pub generation: u64,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+pub fn prepare_exchange(
+    paths: &TenantPaths,
+    scope_id: &str,
+    request: &PrepareExchange<'_>,
+) -> Result<PreparedResult> {
+    validate_scope_id(scope_id)?;
+    validate_contact_name(request.contact_name)?;
+    validate_offer_id(request.offer_id)?;
+    validate_offer_id(request.contact_id)?;
+    if request.expires_at <= request.created_at {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    public_fingerprint(request.local_public)?;
+    let local_fingerprint = public_fingerprint(request.local_public)?;
+    let _ = private_key_bytes(request.local_private)?;
+    if let Some(peer_f) = request.intended_peer_fingerprint {
+        PublicFingerprint::parse(peer_f)?;
+    }
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let old_config = workspace.read_optional(CONFIG_FILE)?;
+    let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+    let ledger = match old_ledger.as_ref().map(|b| b.as_slice()) {
+        Some(bytes) => parse_ledger(bytes, scope_id)?,
+        None => empty_ledger(scope_id),
+    };
+    if contact_occupied(&workspace, request.contact_name, &ledger) {
+        return Err(KeyManagerError::ContactConflict);
+    }
+    if let Some(pending) = workspace.read_optional(&offer_id_path(&workspace, request.offer_id)?)? {
+        let existing: SecretExchange = serde_json::from_slice(&pending).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+        if existing.contact_name != request.contact_name || existing.local_public != request.local_public {
+            return Err(KeyManagerError::OfferConflict);
+        }
+        let artifact = make_initiator_artifact(
+            &existing,
+            request.intended_peer_contact_id,
+            request.intended_peer_fingerprint,
+            request.label,
+            request.previous_fingerprint,
+        )?;
+        let public_artifact = serde_json::to_string(&artifact).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+        return Ok(PreparedResult {
+            offer_id: request.offer_id.to_owned(),
+            contact_id: request.contact_id.to_owned(),
+            role: ExchangeRole::InitiatorOffer.as_str().to_owned(),
+            public_artifact,
+            public_fingerprint: existing.peer_fingerprint.clone().unwrap_or_default(),
+            expires_at: request.expires_at,
+        });
+    }
+    let secret = make_initiator_secret(
+        request.offer_id,
+        request.contact_id,
+        scope_id,
+        request.contact_name,
+        request.local_public,
+        request.local_private,
+        request.generation,
+        request.created_at,
+        request.expires_at,
+    )?;
+    write_pending_secret(&workspace, &secret)?;
+    let artifact = make_initiator_artifact(
+        &secret,
+        request.intended_peer_contact_id,
+        request.intended_peer_fingerprint,
+        request.label,
+        request.previous_fingerprint,
+    )?;
+    let public_artifact = serde_json::to_string(&artifact).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+    let _ = local_fingerprint;
+    Ok(PreparedResult {
+        offer_id: request.offer_id.to_owned(),
+        contact_id: request.contact_id.to_owned(),
+        role: ExchangeRole::InitiatorOffer.as_str().to_owned(),
+        public_artifact,
+        public_fingerprint: artifact.public_fingerprint,
+        expires_at: request.expires_at,
+    })
+}
+
+pub struct RespondExchange<'a> {
+    pub contact_name: &'a str,
+    pub offer_id: &'a str,
+    pub contact_id: &'a str,
+    pub local_public: &'a str,
+    pub local_private: &'a str,
+    pub initiator_offer_id: &'a str,
+    pub expected_initiator_fingerprint: &'a PublicFingerprint,
+    pub label: Option<&'a str>,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+pub fn respond_exchange(
+    paths: &TenantPaths,
+    scope_id: &str,
+    offer_bytes: &[u8],
+    request: &RespondExchange<'_>,
+) -> Result<PreparedResult> {
+    validate_scope_id(scope_id)?;
+    validate_contact_name(request.contact_name)?;
+    validate_offer_id(request.offer_id)?;
+    validate_offer_id(request.contact_id)?;
+    if request.expires_at <= request.created_at {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    public_fingerprint(request.local_public)?;
+    let local_fingerprint = public_fingerprint(request.local_public)?;
+    let _ = private_key_bytes(request.local_private)?;
+    let initiator = validate_public_exchange(offer_bytes, ExchangeRole::InitiatorOffer)?;
+    if initiator.public_fingerprint != *request.expected_initiator_fingerprint {
+        return Err(KeyManagerError::FingerprintMismatch);
+    }
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let old_config = workspace.read_optional(CONFIG_FILE)?;
+    let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+    let ledger = match old_ledger.as_ref().map(|b| b.as_slice()) {
+        Some(bytes) => parse_ledger(bytes, scope_id)?,
+        None => empty_ledger(scope_id),
+    };
+    if contact_occupied(&workspace, request.contact_name, &ledger) {
+        return Err(KeyManagerError::ContactConflict);
+    }
+    if let Some(pending) = workspace.read_optional(&offer_id_path(&workspace, request.offer_id)?)? {
+        let existing: SecretExchange = serde_json::from_slice(&pending).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+        if existing.contact_name != request.contact_name || existing.local_public != request.local_public {
+            return Err(KeyManagerError::OfferConflict);
+        }
+        let artifact = make_responder_artifact(&existing, &initiator.offer_id, &initiator.sender_contact_id, initiator.public_fingerprint.as_str(), request.label, None)?;
+        let public_artifact = serde_json::to_string(&artifact).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+        return Ok(PreparedResult {
+            offer_id: request.offer_id.to_owned(),
+            contact_id: request.contact_id.to_owned(),
+            role: ExchangeRole::ResponderResponse.as_str().to_owned(),
+            public_artifact,
+            public_fingerprint: existing.peer_fingerprint.clone().unwrap_or_default(),
+            expires_at: request.expires_at,
+        });
+    }
+    let secret = make_responder_secret(
+        request.offer_id,
+        request.contact_id,
+        scope_id,
+        request.contact_name,
+        &initiator.sender_contact_id,
+        &initiator,
+        request.local_public,
+        request.local_private,
+        request.created_at,
+        request.expires_at,
+    )?;
+    write_pending_secret(&workspace, &secret)?;
+    let artifact = make_responder_artifact(&secret, &initiator.offer_id, &initiator.sender_contact_id, initiator.public_fingerprint.as_str(), request.label, None)?;
+    let public_artifact = serde_json::to_string(&artifact).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+    let _ = local_fingerprint;
+    Ok(PreparedResult {
+        offer_id: request.offer_id.to_owned(),
+        contact_id: request.contact_id.to_owned(),
+        role: ExchangeRole::ResponderResponse.as_str().to_owned(),
+        public_artifact,
+        public_fingerprint: artifact.public_fingerprint,
+        expires_at: request.expires_at,
+    })
+}
+
+pub struct CompleteExchange<'a> {
+    pub exchange_id: &'a str,
+    pub expected_peer_fingerprint: &'a PublicFingerprint,
+    pub defer_apply: bool,
+}
+
+pub fn complete_exchange(
+    paths: &TenantPaths,
+    scope_id: &str,
+    peer_artifact_bytes: &[u8],
+    request: &CompleteExchange<'_>,
+) -> Result<ExchangeStatus> {
+    validate_scope_id(scope_id)?;
+    validate_offer_id(request.exchange_id)?;
+    let peer = validate_public_exchange(peer_artifact_bytes, ExchangeRole::ResponderResponse)?;
+    if peer.public_fingerprint != *request.expected_peer_fingerprint {
+        return Err(KeyManagerError::FingerprintMismatch);
+    }
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let secret = read_pending_secret(&workspace, request.exchange_id)?;
+    if secret.state != ExchangeState::Prepared.as_str() {
+        return Err(KeyManagerError::InvalidExchangeState);
+    }
+    if peer.in_reply_to.as_deref() != Some(request.exchange_id) {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    let initiator_artifact = make_initiator_artifact(&secret, None, None, None, None)?;
+    let initiator_canonical = serde_json::to_string(&initiator_artifact).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+    let transcript = compute_transcript(initiator_canonical.as_bytes(), &peer.canonical)?;
+    let mut new_secret = secret.clone();
+    new_secret.peer_public = Some(peer.public_fingerprint.as_str().to_owned());
+    new_secret.peer_fingerprint = Some(peer.public_fingerprint.as_str().to_owned());
+    new_secret.state = ExchangeState::Confirmed.as_str().to_owned();
+    new_secret.transcript = Some(transcript.clone());
+    write_pending_secret(&workspace, &new_secret)?;
+    let old_config = workspace.read_optional(CONFIG_FILE)?;
+    let public_fingerprint = public_fingerprint(&secret.local_public)?;
+    let candidate = match old_config.as_ref() {
+        Some(config) => {
+            let rendered = contact_toml_for_new_contact(&secret.contact_name, &secret.local_public, secret.local_private.expose_secret())?;
+            let source = parse_document(&rendered)?;
+            let mut target = parse_document(config)?;
+            let target_contacts = target.table.entry("contact".to_owned()).or_insert_with(|| Value::Table(Table::new()));
+            let target_contacts = target_contacts.as_table_mut().ok_or(KeyManagerError::InvalidToml)?;
+            if let Some(contact) = source.table.get("contact").and_then(|v| v.as_table()) {
+                for (name, value) in contact {
+                    target_contacts.insert(name.clone(), value.clone());
+                }
+            }
+            validate_document(&target.table)?;
+            serialize_table(&target.table)?
+        }
+        None => contact_toml_for_new_contact(&secret.contact_name, &secret.local_public, secret.local_private.expose_secret())?,
+    };
+    let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+    let mut ledger = match old_ledger.as_ref().map(|b| b.as_slice()) {
+        Some(bytes) => parse_ledger(bytes, scope_id)?,
+        None => empty_ledger(scope_id),
+    };
+    let contact = build_install_ledger_contact(&peer.public_fingerprint.as_str(), &secret.contact_id, secret.generation, &public_fingerprint);
+    append_ledger_contact(&mut ledger, &secret.contact_name, contact)?;
+    let new_ledger = ledger_bytes(&ledger)?;
+    let op = if request.defer_apply { "exchange-complete-deferred" } else { "exchange-complete" };
+    let result = exchange_journal(
+        &workspace,
+        scope_id,
+        op,
+        &secret.contact_name,
+        &secret.contact_id,
+        &secret.offer_id,
+        Some(&peer.sender_contact_id),
+        Some(&transcript),
+        secret.generation,
+        peer.generation,
+        old_config.as_ref().map(|b| b.as_slice()),
+        old_ledger.as_ref().map(|b| b.as_slice()),
+        &candidate,
+        &new_ledger,
+        "exchange-complete",
+        None,
+        Some(peer.public_fingerprint.as_str()),
+        None,
+        None,
+    )?;
+    let mut post_secret = new_secret.clone();
+    post_secret.state = ExchangeState::Installed.as_str().to_owned();
+    write_pending_secret(&workspace, &post_secret)?;
+    let _ = result;
+    Ok(ExchangeStatus {
+        contact_name: secret.contact_name.clone(),
+        contact_id: secret.contact_id.clone(),
+        offer_id: secret.offer_id.clone(),
+        state: ExchangeState::Installed.as_str().to_owned(),
+        peer_fingerprint: peer.public_fingerprint.as_str().to_owned(),
+        created_at: secret.created_at,
+        expires_at: secret.expires_at,
+        confirmed_at: Some(secret.created_at),
+        installed_at: Some(secret.created_at),
+        activation_deadline: None,
+    })
+}
+
+pub fn cancel_exchange(
+    paths: &TenantPaths,
+    scope_id: &str,
+    exchange_id: &str,
+) -> Result<ExchangeStatus> {
+    validate_scope_id(scope_id)?;
+    validate_offer_id(exchange_id)?;
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let secret = read_pending_secret(&workspace, exchange_id)?;
+    if is_terminal_exchange(&secret.state) {
+        return Err(KeyManagerError::InvalidExchangeState);
+    }
+    let contact_name = secret.contact_name.clone();
+    let contact_id = secret.contact_id.clone();
+    let offer_id = secret.offer_id.clone();
+    let created_at = secret.created_at;
+    let expires_at = secret.expires_at;
+    let peer_fingerprint = secret.peer_fingerprint.clone().unwrap_or_default();
+    remove_pending(&workspace, exchange_id)?;
+    Ok(ExchangeStatus {
+        contact_name,
+        contact_id,
+        offer_id,
+        state: ExchangeState::Cancelled.as_str().to_owned(),
+        peer_fingerprint,
+        created_at,
+        expires_at,
+        confirmed_at: None,
+        installed_at: None,
+        activation_deadline: None,
+    })
+}
+
+pub fn inspect_exchanges(
+    paths: &TenantPaths,
+    scope_id: &str,
+) -> Result<Vec<ExchangeStatus>> {
+    validate_scope_id(scope_id)?;
+    let workspace = Workspace::open_read_only(paths.clone())?;
+    let _snapshot = workspace.read_snapshot()?;
+    let pending_dir = workspace.open_relative_dir(PENDING_DIR)?;
+    let mut entries = Vec::new();
+    for entry in pending_dir.read_dir(".").map_err(KeyManagerError::Io)? {
+        let entry = entry.map_err(KeyManagerError::Io)?;
+        let name = entry.file_name().into_string().map_err(|_| KeyManagerError::UnsafePath)?;
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let path = format!("{}/{}", PENDING_DIR, name);
+        let bytes = match workspace.read_optional(&path)? {
+            Some(b) => b,
+            None => continue,
+        };
+        let secret: SecretExchange = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        entries.push(ExchangeStatus {
+            contact_name: secret.contact_name,
+            contact_id: secret.contact_id,
+            offer_id: secret.offer_id,
+            state: secret.state,
+            peer_fingerprint: secret.peer_fingerprint.unwrap_or_default(),
+            created_at: secret.created_at,
+            expires_at: secret.expires_at,
+            confirmed_at: None,
+            installed_at: None,
+            activation_deadline: None,
+        });
+    }
+    Ok(entries)
+}
+
+// ── Stage C: activation and rollback ─────────────────────────────────────────
+
+pub struct ActivationRequest {
+    pub transaction_id: String,
+    pub contact_name: String,
+    pub contact_id: String,
+}
+
+pub fn begin_activation(
+    paths: &TenantPaths,
+    scope_id: &str,
+    contact: &str,
+    transaction_id: &str,
+    expected_peer_fingerprint: &PublicFingerprint,
+) -> Result<ActivationRequest> {
+    validate_scope_id(scope_id)?;
+    validate_contact_name(contact)?;
+    validate_transaction_id(transaction_id)?;
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let ledger = workspace.read_optional(LEDGER_FILE)?.ok_or(KeyManagerError::InvalidLedger)?;
+    let ledger = parse_ledger(&ledger, scope_id)?;
+    let entry = ledger.contacts.get(contact).ok_or(KeyManagerError::ContactNotFound)?;
+    if entry.state != ExchangeState::Installed.as_str() {
+        return Err(KeyManagerError::InvalidExchangeState);
+    }
+    if entry.peer_fingerprint != expected_peer_fingerprint.as_str() {
+        return Err(KeyManagerError::FingerprintMismatch);
+    }
+    Ok(ActivationRequest {
+        transaction_id: transaction_id.to_owned(),
+        contact_name: contact.to_owned(),
+        contact_id: entry.contact_id.clone(),
+    })
+}
+
+pub fn mark_locally_activated(
+    paths: &TenantPaths,
+    scope_id: &str,
+    contact: &str,
+    transaction_id: &str,
+    activated_at: i64,
+) -> Result<ExchangeStatus> {
+    validate_scope_id(scope_id)?;
+    validate_contact_name(contact)?;
+    validate_transaction_id(transaction_id)?;
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let ledger = workspace.read_optional(LEDGER_FILE)?.ok_or(KeyManagerError::InvalidLedger)?;
+    let mut ledger = parse_ledger(&ledger, scope_id)?;
+    let mut entry = ledger.contacts.get(contact).cloned().ok_or(KeyManagerError::ContactNotFound)?;
+    if entry.state != ExchangeState::Installed.as_str() {
+        return Err(KeyManagerError::InvalidExchangeState);
+    }
+    entry.state = ExchangeState::LocallyActivated.as_str().to_owned();
+    entry.activation_deadline = activated_at + ACTIVATION_WINDOW_SECONDS;
+    entry.pending_offer_id = transaction_id.to_owned();
+    let contact_id = entry.contact_id.clone();
+    let generation = entry.generation;
+    let peer_fingerprint = entry.peer_fingerprint.clone();
+    let activation_deadline = entry.activation_deadline;
+    drop(entry);
+    let new_ledger = ledger_bytes(&ledger)?;
+    let old_config = workspace.read_optional(CONFIG_FILE)?;
+    let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+    exchange_journal(
+        &workspace,
+        scope_id,
+        "exchange-activation",
+        contact,
+        &contact_id,
+        transaction_id,
+        None,
+        None,
+        generation,
+        0,
+        old_config.as_ref().map(|b| b.as_slice()),
+        old_ledger.as_ref().map(|b| b.as_slice()),
+        old_config.as_ref().map(|b| b.as_slice()).unwrap_or(b""),
+        &new_ledger,
+        "exchange-activation",
+        None,
+        None,
+        Some(transaction_id),
+        None,
+    )?;
+    Ok(ExchangeStatus {
+        contact_name: contact.to_owned(),
+        contact_id,
+        offer_id: transaction_id.to_owned(),
+        state: ExchangeState::LocallyActivated.as_str().to_owned(),
+        peer_fingerprint,
+        created_at: 0,
+        expires_at: 0,
+        confirmed_at: None,
+        installed_at: None,
+        activation_deadline: Some(activation_deadline),
+    })
+}
+
+pub fn rollback_activation(
+    paths: &TenantPaths,
+    scope_id: &str,
+    contact: &str,
+    transaction_id: &str,
+    compromised: bool,
+    rollback_toml: Option<&SecretString>,
+) -> Result<ExchangeStatus> {
+    validate_scope_id(scope_id)?;
+    validate_contact_name(contact)?;
+    validate_transaction_id(transaction_id)?;
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let ledger = workspace.read_optional(LEDGER_FILE)?.ok_or(KeyManagerError::InvalidLedger)?;
+    let mut ledger = parse_ledger(&ledger, scope_id)?;
+    let mut entry = ledger.contacts.get(contact).cloned().ok_or(KeyManagerError::ContactNotFound)?;
+    if entry.state != ExchangeState::Installed.as_str() && entry.state != ExchangeState::LocallyActivated.as_str() && entry.state != ExchangeState::VerificationOverdue.as_str() {
+        return Err(KeyManagerError::InvalidExchangeState);
+    }
+    if compromised {
+        entry.compromised = true;
+        entry.state = ExchangeState::RolledBack.as_str().to_owned();
+        ledger.contacts.insert(contact.to_owned(), entry.clone());
+    ledger.contacts.insert(contact.to_owned(), entry.clone());
+        let new_ledger = ledger_bytes(&ledger)?;
+        let old_config = workspace.read_optional(CONFIG_FILE)?;
+        let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+        exchange_journal(
+            &workspace,
+            scope_id,
+            "exchange-rollback",
+            contact,
+            &entry.contact_id,
+            transaction_id,
+            None,
+            None,
+            entry.generation,
+            0,
+            old_config.as_ref().map(|b| b.as_slice()),
+            old_ledger.as_ref().map(|b| b.as_slice()),
+            old_config.as_ref().map(|b| b.as_slice()).unwrap_or(b""),
+            &new_ledger,
+            "exchange-rollback",
+            None,
+            None,
+            Some(transaction_id),
+            None,
+        )?;
+        return Ok(ExchangeStatus {
+            contact_name: contact.to_owned(),
+            contact_id: entry.contact_id.clone(),
+            offer_id: transaction_id.to_owned(),
+            state: ExchangeState::RolledBack.as_str().to_owned(),
+            peer_fingerprint: entry.peer_fingerprint.clone(),
+            created_at: 0,
+            expires_at: 0,
+            confirmed_at: None,
+            installed_at: None,
+            activation_deadline: None,
+        });
+    }
+    let _ = rollback_toml.ok_or(KeyManagerError::InvalidLedger)?;
+    entry.state = ExchangeState::RolledBack.as_str().to_owned();
+    entry.rollback_tx_id = transaction_id.to_owned();
+    ledger.contacts.insert(contact.to_owned(), entry.clone());
+    ledger.contacts.insert(contact.to_owned(), entry.clone());
+    let new_ledger = ledger_bytes(&ledger)?;
+    let old_config = workspace.read_optional(CONFIG_FILE)?;
+    let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+    exchange_journal(
+        &workspace,
+        scope_id,
+        "exchange-rollback",
+        contact,
+        &entry.contact_id,
+        transaction_id,
+        None,
+        None,
+        entry.generation,
+        0,
+        old_config.as_ref().map(|b| b.as_slice()),
+        old_ledger.as_ref().map(|b| b.as_slice()),
+        old_config.as_ref().map(|b| b.as_slice()).unwrap_or(b""),
+        &new_ledger,
+        "exchange-rollback",
+        None,
+        None,
+        Some(transaction_id),
+        None,
+    )?;
+    Ok(ExchangeStatus {
+        contact_name: contact.to_owned(),
+        contact_id: entry.contact_id.clone(),
+        offer_id: transaction_id.to_owned(),
+        state: ExchangeState::RolledBack.as_str().to_owned(),
+        peer_fingerprint: entry.peer_fingerprint.clone(),
+        created_at: 0,
+        expires_at: 0,
+        confirmed_at: None,
+        installed_at: None,
+        activation_deadline: None,
+    })
+}
+
+pub fn confirm_roundtrip(
+    paths: &TenantPaths,
+    scope_id: &str,
+    contact: &str,
+    exchange_id: &str,
+    expected_peer_fingerprint: &PublicFingerprint,
+) -> Result<ExchangeStatus> {
+    validate_scope_id(scope_id)?;
+    validate_contact_name(contact)?;
+    validate_offer_id(exchange_id)?;
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let ledger = workspace.read_optional(LEDGER_FILE)?.ok_or(KeyManagerError::InvalidLedger)?;
+    let mut ledger = parse_ledger(&ledger, scope_id)?;
+    let mut entry = ledger.contacts.get(contact).cloned().ok_or(KeyManagerError::ContactNotFound)?;
+    if entry.state != ExchangeState::LocallyActivated.as_str() && entry.state != ExchangeState::PeerVerified.as_str() {
+        return Err(KeyManagerError::InvalidExchangeState);
+    }
+    if entry.peer_fingerprint != expected_peer_fingerprint.as_str() {
+        return Err(KeyManagerError::FingerprintMismatch);
+    }
+    entry.state = ExchangeState::PeerVerified.as_str().to_owned();
+    entry.activation_deadline = 0;
+    let new_ledger = ledger_bytes(&ledger)?;
+    let old_config = workspace.read_optional(CONFIG_FILE)?;
+    let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+    exchange_journal(
+        &workspace,
+        scope_id,
+        "exchange-roundtrip",
+        contact,
+        &entry.contact_id,
+        exchange_id,
+        None,
+        None,
+        entry.generation,
+        0,
+        old_config.as_ref().map(|b| b.as_slice()),
+        old_ledger.as_ref().map(|b| b.as_slice()),
+        old_config.as_ref().map(|b| b.as_slice()).unwrap_or(b""),
+        &new_ledger,
+        "exchange-roundtrip",
+        None,
+        Some(expected_peer_fingerprint.as_str()),
+        None,
+        None,
+    )?;
+    remove_pending(&workspace, exchange_id)?;
+    Ok(ExchangeStatus {
+        contact_name: contact.to_owned(),
+        contact_id: entry.contact_id.clone(),
+        offer_id: exchange_id.to_owned(),
+        state: ExchangeState::PeerVerified.as_str().to_owned(),
+        peer_fingerprint: entry.peer_fingerprint.clone(),
+        created_at: 0,
+        expires_at: 0,
+        confirmed_at: None,
+        installed_at: None,
+        activation_deadline: None,
+    })
+}
+
+pub enum OverdueDecision {
+    Keep,
+    Rollback,
+    Revoke,
+}
+
+pub fn resolve_verification_overdue(
+    paths: &TenantPaths,
+    scope_id: &str,
+    contact: &str,
+    decision: OverdueDecision,
+    current_peer_fingerprint: &PublicFingerprint,
+    extend_seconds: Option<i64>,
+) -> Result<ExchangeStatus> {
+    validate_scope_id(scope_id)?;
+    validate_contact_name(contact)?;
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let ledger = workspace.read_optional(LEDGER_FILE)?.ok_or(KeyManagerError::InvalidLedger)?;
+    let mut ledger = parse_ledger(&ledger, scope_id)?;
+    let mut entry = ledger.contacts.get(contact).cloned().ok_or(KeyManagerError::ContactNotFound)?;
+    if entry.state != ExchangeState::LocallyActivated.as_str() && entry.state != ExchangeState::VerificationOverdue.as_str() {
+        return Err(KeyManagerError::InvalidExchangeState);
+    }
+    if entry.peer_fingerprint != current_peer_fingerprint.as_str() {
+        return Err(KeyManagerError::FingerprintMismatch);
+    }
+    match decision {
+        OverdueDecision::Keep => {
+            if entry.state == ExchangeState::LocallyActivated.as_str() {
+                entry.state = ExchangeState::VerificationOverdue.as_str().to_owned();
+            }
+            if let Some(ext) = extend_seconds {
+                if ext < 0 || ext > EXTENSION_WINDOW_SECONDS {
+                    return Err(KeyManagerError::InvalidExchangeArtifact);
+                }
+                entry.activation_deadline = entry.activation_deadline + ext;
+            }
+            let new_ledger = ledger_bytes(&ledger)?;
+            let old_config = workspace.read_optional(CONFIG_FILE)?;
+            let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+            exchange_journal(
+                &workspace,
+                scope_id,
+                "exchange-keep",
+                contact,
+                &entry.contact_id,
+                &entry.pending_offer_id,
+                None,
+                None,
+                entry.generation,
+                0,
+                old_config.as_ref().map(|b| b.as_slice()),
+                old_ledger.as_ref().map(|b| b.as_slice()),
+                old_config.as_ref().map(|b| b.as_slice()).unwrap_or(b""),
+                &new_ledger,
+                "exchange-keep",
+                None,
+                None,
+                None,
+                None,
+            )?;
+            Ok(ExchangeStatus {
+                contact_name: contact.to_owned(),
+                contact_id: entry.contact_id.clone(),
+                offer_id: entry.pending_offer_id.clone(),
+                state: entry.state.clone(),
+                peer_fingerprint: entry.peer_fingerprint.clone(),
+                created_at: 0,
+                expires_at: 0,
+                confirmed_at: None,
+                installed_at: None,
+                activation_deadline: Some(entry.activation_deadline),
+            })
+        }
+        OverdueDecision::Rollback => {
+            if entry.compromised {
+                return Err(KeyManagerError::CompromisedKey);
+            }
+            entry.state = ExchangeState::RolledBack.as_str().to_owned();
+            let new_ledger = ledger_bytes(&ledger)?;
+            let old_config = workspace.read_optional(CONFIG_FILE)?;
+            let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+            exchange_journal(
+                &workspace,
+                scope_id,
+                "exchange-rollback",
+                contact,
+                &entry.contact_id,
+                &entry.pending_offer_id,
+                None,
+                None,
+                entry.generation,
+                0,
+                old_config.as_ref().map(|b| b.as_slice()),
+                old_ledger.as_ref().map(|b| b.as_slice()),
+                old_config.as_ref().map(|b| b.as_slice()).unwrap_or(b""),
+                &new_ledger,
+                "exchange-rollback",
+                None,
+                None,
+                None,
+                None,
+            )?;
+            Ok(ExchangeStatus {
+                contact_name: contact.to_owned(),
+                contact_id: entry.contact_id.clone(),
+                offer_id: entry.pending_offer_id.clone(),
+                state: ExchangeState::RolledBack.as_str().to_owned(),
+                peer_fingerprint: entry.peer_fingerprint.clone(),
+                created_at: 0,
+                expires_at: 0,
+                confirmed_at: None,
+                installed_at: None,
+                activation_deadline: None,
+            })
+        }
+        OverdueDecision::Revoke => {
+            entry.state = ExchangeState::Revoked.as_str().to_owned();
+            entry.revocation_generation = entry.generation;
+            let new_ledger = ledger_bytes(&ledger)?;
+            let old_config = workspace.read_optional(CONFIG_FILE)?;
+            let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+            exchange_journal(
+                &workspace,
+                scope_id,
+                "revocation-tombstone",
+                contact,
+                &entry.contact_id,
+                &entry.pending_offer_id,
+                None,
+                None,
+                entry.generation,
+                0,
+                old_config.as_ref().map(|b| b.as_slice()),
+                old_ledger.as_ref().map(|b| b.as_slice()),
+                old_config.as_ref().map(|b| b.as_slice()).unwrap_or(b""),
+                &new_ledger,
+                "revocation-tombstone",
+                None,
+                None,
+                None,
+                None,
+            )?;
+            Ok(ExchangeStatus {
+                contact_name: contact.to_owned(),
+                contact_id: entry.contact_id.clone(),
+                offer_id: entry.pending_offer_id.clone(),
+                state: ExchangeState::Revoked.as_str().to_owned(),
+                peer_fingerprint: entry.peer_fingerprint.clone(),
+                created_at: 0,
+                expires_at: 0,
+                confirmed_at: None,
+                installed_at: None,
+                activation_deadline: None,
+            })
+        }
+    }
+}
+
+// ── Stage B: rotation and revocation ─────────────────────────────────────────
+
+pub fn prepare_rotation(
+    paths: &TenantPaths,
+    scope_id: &str,
+    contact: &str,
+    current_peer_fingerprint: &PublicFingerprint,
+    offer_id: &str,
+    contact_id: &str,
+    local_public: &str,
+    local_private: &str,
+    created_at: i64,
+    expires_at: i64,
+) -> Result<PreparedResult> {
+    validate_scope_id(scope_id)?;
+    validate_contact_name(contact)?;
+    validate_offer_id(offer_id)?;
+    validate_offer_id(contact_id)?;
+    if expires_at <= created_at {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    public_fingerprint(local_public)?;
+    let _ = private_key_bytes(local_private)?;
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let ledger = workspace.read_optional(LEDGER_FILE)?.ok_or(KeyManagerError::InvalidLedger)?;
+    let ledger = parse_ledger(&ledger, scope_id)?;
+    let entry = ledger.contacts.get(contact).ok_or(KeyManagerError::ContactNotFound)?;
+    if entry.state != ExchangeState::PeerVerified.as_str() && entry.state != ExchangeState::Installed.as_str() {
+        return Err(KeyManagerError::InvalidExchangeState);
+    }
+    if entry.peer_fingerprint != current_peer_fingerprint.as_str() {
+        return Err(KeyManagerError::FingerprintMismatch);
+    }
+    let local_fingerprint = public_fingerprint(local_public)?;
+    let mut secret = make_initiator_secret(
+        offer_id,
+        contact_id,
+        scope_id,
+        contact,
+        local_public,
+        local_private,
+        entry.generation + 1,
+        created_at,
+        expires_at,
+    )?;
+    secret.operation = ExchangeOperation::Rotate.as_str().to_owned();
+    secret.peer_fingerprint = Some(current_peer_fingerprint.as_str().to_owned());
+    secret.peer_contact_id = Some(entry.contact_id.clone());
+    write_pending_secret(&workspace, &secret)?;
+    let artifact = make_initiator_artifact(
+        &secret,
+        Some(&entry.contact_id),
+        Some(current_peer_fingerprint.as_str()),
+        None,
+        Some(&entry.peer_fingerprint),
+    )?;
+    let public_artifact = serde_json::to_string(&artifact).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+    let _ = local_fingerprint;
+    Ok(PreparedResult {
+        offer_id: offer_id.to_owned(),
+        contact_id: contact_id.to_owned(),
+        role: ExchangeRole::InitiatorOffer.as_str().to_owned(),
+        public_artifact,
+        public_fingerprint: artifact.public_fingerprint,
+        expires_at,
+    })
+}
+
+pub fn respond_rotation(
+    paths: &TenantPaths,
+    scope_id: &str,
+    contact: &str,
+    offer_bytes: &[u8],
+    offer_id: &str,
+    contact_id: &str,
+    current_peer_fingerprint: &PublicFingerprint,
+    expected_new_peer_fingerprint: &PublicFingerprint,
+    local_public: &str,
+    local_private: &str,
+    created_at: i64,
+    expires_at: i64,
+) -> Result<PreparedResult> {
+    validate_scope_id(scope_id)?;
+    validate_contact_name(contact)?;
+    validate_offer_id(offer_id)?;
+    validate_offer_id(contact_id)?;
+    if expires_at <= created_at {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    public_fingerprint(local_public)?;
+    let _ = private_key_bytes(local_private)?;
+    let initiator = validate_public_exchange(offer_bytes, ExchangeRole::InitiatorOffer)?;
+    if initiator.public_fingerprint != *expected_new_peer_fingerprint {
+        return Err(KeyManagerError::FingerprintMismatch);
+    }
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let ledger = workspace.read_optional(LEDGER_FILE)?.ok_or(KeyManagerError::InvalidLedger)?;
+    let ledger = parse_ledger(&ledger, scope_id)?;
+    let entry = ledger.contacts.get(contact).ok_or(KeyManagerError::ContactNotFound)?;
+    if entry.state != ExchangeState::PeerVerified.as_str() && entry.state != ExchangeState::Installed.as_str() {
+        return Err(KeyManagerError::InvalidExchangeState);
+    }
+    if entry.peer_fingerprint != current_peer_fingerprint.as_str() {
+        return Err(KeyManagerError::FingerprintMismatch);
+    }
+    let local_fingerprint = public_fingerprint(local_public)?;
+    let mut secret = make_responder_secret(
+        offer_id,
+        contact_id,
+        scope_id,
+        contact,
+        &initiator.sender_contact_id,
+        &initiator,
+        local_public,
+        local_private,
+        created_at,
+        expires_at,
+    )?;
+    secret.operation = ExchangeOperation::Rotate.as_str().to_owned();
+    write_pending_secret(&workspace, &secret)?;
+    let artifact = make_responder_artifact(&secret, &initiator.offer_id, &initiator.sender_contact_id, initiator.public_fingerprint.as_str(), None, Some(current_peer_fingerprint.as_str()))?;
+    let public_artifact = serde_json::to_string(&artifact).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+    let _ = local_fingerprint;
+    Ok(PreparedResult {
+        offer_id: offer_id.to_owned(),
+        contact_id: contact_id.to_owned(),
+        role: ExchangeRole::ResponderResponse.as_str().to_owned(),
+        public_artifact,
+        public_fingerprint: artifact.public_fingerprint,
+        expires_at,
+    })
+}
+
+pub fn complete_rotation(
+    paths: &TenantPaths,
+    scope_id: &str,
+    contact: &str,
+    peer_artifact_bytes: &[u8],
+    current_peer_fingerprint: &PublicFingerprint,
+    expected_new_peer_fingerprint: &PublicFingerprint,
+) -> Result<ExchangeStatus> {
+    validate_scope_id(scope_id)?;
+    validate_contact_name(contact)?;
+    let peer = validate_public_exchange(peer_artifact_bytes, ExchangeRole::ResponderResponse)?;
+    if peer.public_fingerprint != *expected_new_peer_fingerprint {
+        return Err(KeyManagerError::FingerprintMismatch);
+    }
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let secret = read_pending_secret(&workspace, peer.in_reply_to.as_deref().ok_or(KeyManagerError::InvalidExchangeArtifact)?)?;
+    if secret.state != ExchangeState::Prepared.as_str() {
+        return Err(KeyManagerError::InvalidExchangeState);
+    }
+    if peer.in_reply_to.as_deref() != Some(secret.offer_id.as_str()) {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    if secret.peer_fingerprint.as_deref() != Some(current_peer_fingerprint.as_str()) {
+        return Err(KeyManagerError::FingerprintMismatch);
+    }
+    let initiator_artifact = make_initiator_artifact(&secret, None, None, None, None)?;
+    let initiator_canonical = serde_json::to_string(&initiator_artifact).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+    let transcript = compute_transcript(initiator_canonical.as_bytes(), &peer.canonical)?;
+    let ledger = workspace.read_optional(LEDGER_FILE)?.ok_or(KeyManagerError::InvalidLedger)?;
+    let mut ledger = parse_ledger(&ledger, scope_id)?;
+    let mut entry = ledger.contacts.get(contact).cloned().ok_or(KeyManagerError::ContactNotFound)?;
+    let old_fingerprint = entry.peer_fingerprint.clone();
+    entry.state = ExchangeState::Installed.as_str().to_owned();
+    entry.peer_fingerprint = expected_new_peer_fingerprint.as_str().to_owned();
+    entry.generation = secret.generation;
+    entry.contact_id = secret.contact_id.clone();
+    let local_fingerprint = public_fingerprint(&secret.local_public)?;
+    entry.local_fingerprint = local_fingerprint;
+    let new_ledger = ledger_bytes(&ledger)?;
+    let old_config = workspace.read_optional(CONFIG_FILE)?;
+    let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+    let _ = old_fingerprint;
+    exchange_journal(
+        &workspace,
+        scope_id,
+        "rotation-complete",
+        contact,
+        &entry.contact_id,
+        &secret.offer_id,
+        Some(&peer.sender_contact_id),
+        Some(&transcript),
+        secret.generation,
+        peer.generation,
+        old_config.as_ref().map(|b| b.as_slice()),
+        old_ledger.as_ref().map(|b| b.as_slice()),
+        old_config.as_ref().map(|b| b.as_slice()).unwrap_or(b""),
+        &new_ledger,
+        "rotation-complete",
+        None,
+        Some(expected_new_peer_fingerprint.as_str()),
+        None,
+        None,
+    )?;
+    remove_pending(&workspace, &secret.offer_id)?;
+    Ok(ExchangeStatus {
+        contact_name: contact.to_owned(),
+        contact_id: entry.contact_id.clone(),
+        offer_id: secret.offer_id.clone(),
+        state: ExchangeState::Installed.as_str().to_owned(),
+        peer_fingerprint: entry.peer_fingerprint.clone(),
+        created_at: secret.created_at,
+        expires_at: secret.expires_at,
+        confirmed_at: None,
+        installed_at: None,
+        activation_deadline: None,
+    })
+}
+
+pub fn revoke_contact(
+    paths: &TenantPaths,
+    scope_id: &str,
+    contact: &str,
+    current_peer_fingerprint: &PublicFingerprint,
+    disposition: RevocationDisposition,
+) -> Result<ExchangeStatus> {
+    validate_scope_id(scope_id)?;
+    validate_contact_name(contact)?;
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let ledger = workspace.read_optional(LEDGER_FILE)?.ok_or(KeyManagerError::InvalidLedger)?;
+    let mut ledger = parse_ledger(&ledger, scope_id)?;
+    let mut entry = ledger.contacts.get(contact).cloned().ok_or(KeyManagerError::ContactNotFound)?;
+    if entry.peer_fingerprint != current_peer_fingerprint.as_str() {
+        return Err(KeyManagerError::FingerprintMismatch);
+    }
+    if is_terminal_exchange(&entry.state) {
+        return Err(KeyManagerError::InvalidExchangeState);
+    }
+    entry.state = ExchangeState::Revoked.as_str().to_owned();
+    entry.revocation_generation = entry.generation;
+    let compromised = matches!(disposition, RevocationDisposition::Compromised);
+    entry.compromised = compromised;
+    let new_ledger = ledger_bytes(&ledger)?;
+    let old_config = workspace.read_optional(CONFIG_FILE)?;
+    let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+    exchange_journal(
+        &workspace,
+        scope_id,
+        "revocation-tombstone",
+        contact,
+        &entry.contact_id,
+        &entry.pending_offer_id,
+        None,
+        None,
+        entry.generation,
+        0,
+        old_config.as_ref().map(|b| b.as_slice()),
+        old_ledger.as_ref().map(|b| b.as_slice()),
+        old_config.as_ref().map(|b| b.as_slice()).unwrap_or(b""),
+        &new_ledger,
+        "revocation-tombstone",
+        None,
+        None,
+        None,
+        None,
+    )?;
+    Ok(ExchangeStatus {
+        contact_name: contact.to_owned(),
+        contact_id: entry.contact_id.clone(),
+        offer_id: entry.pending_offer_id.clone(),
+        state: ExchangeState::Revoked.as_str().to_owned(),
+        peer_fingerprint: entry.peer_fingerprint.clone(),
+        created_at: 0,
+        expires_at: 0,
+        confirmed_at: None,
+        installed_at: None,
+        activation_deadline: None,
+    })
+}
+
+// ── Exchange-aware ledger validation for migrations ──────────────────────────
+
+pub fn migration_ready_exchange(paths: &TenantPaths, scope_id: &str) -> Result<()> {
+    validate_scope_id(scope_id)?;
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    ensure_migration_settled(&workspace)?;
+    recover_locked(&workspace, scope_id)?;
+    let ledger = workspace.read_optional(LEDGER_FILE)?.ok_or(KeyManagerError::InvalidLedger)?;
+    let ledger = parse_ledger(&ledger, scope_id)?;
+    for (name, contact) in &ledger.contacts {
+        if is_unresolved_ledger_state(&contact.state) {
+            return Err(KeyManagerError::ContactConflict);
+        }
+        if !is_settled_for_migration(&contact.state) && !is_terminal_exchange(&contact.state) && !matches!(contact.state.as_str(), "PeerVerified" | "RolledBack") {
+            return Err(KeyManagerError::ContactConflict);
+        }
+        let _ = name;
+    }
+    Ok(())
+}
+
 
 pub fn recover(paths: &TenantPaths, scope_id: &str) -> Result<()> {
     validate_scope_id(scope_id)?;
@@ -2128,7 +3993,45 @@ fn recover_journal(workspace: &Workspace, path: &str, scope_id: &str) -> Result<
             }
             finish_journal(workspace, path, &journal)
         }
+        JournalPhase::ActivationStarted | JournalPhase::RollbackStarted => {
+            recover_exchange_activation(workspace, path, &mut journal, ledger_hash, config_hash)
+        }
+        JournalPhase::LocallyActivated | JournalPhase::RolledBack => {
+            if ledger_hash != Some(journal.new_ledger_hash.clone()) {
+                return Err(KeyManagerError::RecoveryRequired);
+            }
+            finish_journal(workspace, path, &journal)
+        }
+        JournalPhase::RevocationTombstoneCommitted | JournalPhase::RevocationRemovalCommitted => {
+            if ledger_hash != Some(journal.new_ledger_hash.clone()) {
+                return Err(KeyManagerError::RecoveryRequired);
+            }
+            finish_journal(workspace, path, &journal)
+        }
+        JournalPhase::PairLocalCoordinator => {
+            if ledger_hash != Some(journal.new_ledger_hash.clone())
+                || config_hash != Some(journal.new_config_hash.clone())
+            {
+                return Err(KeyManagerError::RecoveryRequired);
+            }
+            finish_journal(workspace, path, &journal)
+        }
     }
+}
+
+fn recover_exchange_activation(
+    workspace: &Workspace,
+    path: &str,
+    journal: &mut JournalFile,
+    ledger_hash: Option<String>,
+    config_hash: Option<String>,
+) -> Result<()> {
+    if ledger_hash != Some(journal.new_ledger_hash.clone())
+        || config_hash != Some(journal.new_config_hash.clone())
+    {
+        return Err(KeyManagerError::RecoveryRequired);
+    }
+    finish_journal(workspace, path, journal)
 }
 
 fn parse_journal_file(bytes: &[u8], path: &str, scope_id: &str) -> Result<JournalFile> {
@@ -2149,7 +4052,22 @@ fn parse_journal_unbound(bytes: &[u8], path: &str) -> Result<JournalFile> {
     validate_scope_id(&journal.scope_id)?;
     if !matches!(
         journal.operation.as_str(),
-        "baseline-update" | "legacy-adopt" | "migration-import"
+        "baseline-update"
+            | "legacy-adopt"
+            | "migration-import"
+            | "exchange-prepare"
+            | "exchange-respond"
+            | "exchange-complete"
+            | "exchange-cancel"
+            | "exchange-activation"
+            | "exchange-rollback"
+            | "exchange-roundtrip"
+            | "rotation-prepare"
+            | "rotation-respond"
+            | "rotation-complete"
+            | "revocation-tombstone"
+            | "revocation-removal"
+            | "pair-local-coordinator"
     ) || !valid_hash(&journal.new_config_hash)
         || !valid_hash(&journal.new_ledger_hash)
         || journal
@@ -2327,6 +4245,14 @@ mod tests {
                     state: "legacy-active".to_owned(),
                     peer_fingerprint: public_fingerprint(&public).expect("valid public key"),
                     generation: 0,
+                    contact_id: String::new(),
+                    local_fingerprint: String::new(),
+                    activation_deadline: 0,
+                    rollback_tx_id: String::new(),
+                    rollback_contact_toml_hash: String::new(),
+                    pending_offer_id: String::new(),
+                    compromised: false,
+                    revocation_generation: 0,
                 },
             );
         }
@@ -3645,5 +5571,464 @@ my_dm_chacha_secret = "{bob_private}"
         );
         assert!(!target.darkirc_dir().join(MIGRATION_FILE).exists());
         assert!(!target.darkirc_dir().join(STAGED_MIGRATION_FILE).exists());
+    }
+
+    fn valid_exchange_public() -> String {
+        bs58::encode([7_u8; 32]).into_string()
+    }
+
+    fn valid_exchange_private() -> String {
+        bs58::encode([8_u8; 32]).into_string()
+    }
+
+    fn make_initiator_artifact_for_test(
+        offer_id: &str,
+        contact_id: &str,
+        public: &str,
+        created: i64,
+        expires: i64,
+    ) -> String {
+        let fp = public_fingerprint(public).expect("valid public key");
+        let artifact = serde_json::json!({
+            "schema": EXCHANGE_SCHEMA,
+            "version": EXCHANGE_SCHEMA_VERSION,
+            "artifact_role": "initiator_offer",
+            "offer_id": offer_id,
+            "sender_contact_id": contact_id,
+            "intended_peer_contact_id": null,
+            "intended_peer_fingerprint": serde_json::Value::Null,
+            "generator_profile": MIGRATION_GENERATOR_PROFILE,
+            "binary_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "key_format": MIGRATION_KEY_FORMAT,
+            "source_revision": MIGRATION_SOURCE_REVISION,
+            "public_key": public,
+            "public_fingerprint": fp,
+            "generation": 1_u64,
+            "created_at": created,
+            "expires_at": expires,
+            "label": null,
+            "previous_fingerprint": serde_json::Value::Null,
+        });
+        serde_json::to_string(&artifact).expect("serialize artifact")
+    }
+
+    #[test]
+    fn prepare_exchange_creates_pending_and_valid_artifact() {
+        let (_temp, paths) = fixture();
+        let public = valid_exchange_public();
+        let private = valid_exchange_private();
+        let offer_id = "a".repeat(32);
+        let contact_id = "b".repeat(32);
+        let request = PrepareExchange {
+            contact_name: "alice",
+            offer_id: &offer_id,
+            contact_id: &contact_id,
+            local_public: &public,
+            local_private: &private,
+            intended_peer_contact_id: None,
+            intended_peer_fingerprint: None,
+            label: None,
+            previous_fingerprint: None,
+            generation: 1,
+            created_at: 1000,
+            expires_at: 2000,
+        };
+        let result = prepare_exchange(&paths, SCOPE, &request).expect("prepare exchange");
+        assert_eq!(result.offer_id, offer_id);
+        assert_eq!(result.contact_id, contact_id);
+        assert_eq!(result.role, "initiator_offer");
+        assert!(result.public_artifact.contains(EXCHANGE_SCHEMA));
+        assert!(result.public_artifact.contains("initiator_offer"));
+        assert!(!result.public_artifact.contains(&private));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result.public_artifact).expect("parse artifact");
+        assert_eq!(parsed["public_key"], public);
+        assert_eq!(parsed["offer_id"], offer_id);
+    }
+
+    #[test]
+    fn verify_initiator_rejects_wrong_schema_and_role() {
+        let good = make_initiator_artifact_for_test(
+            &"a".repeat(32),
+            &"b".repeat(32),
+            &valid_exchange_public(),
+            1000,
+            2000,
+        );
+        validate_public_exchange(good.as_bytes(), ExchangeRole::InitiatorOffer)
+            .expect("valid initiator");
+        validate_public_exchange(good.as_bytes(), ExchangeRole::ResponderResponse)
+            .expect_err("wrong role must fail");
+
+        let mut bad: serde_json::Value = serde_json::from_str(&good).unwrap();
+        bad["schema"] = serde_json::Value::String("wrong/v1".to_owned());
+        let bad_bytes = serde_json::to_vec(&bad).unwrap();
+        validate_public_exchange(&bad_bytes, ExchangeRole::InitiatorOffer)
+            .expect_err("wrong schema must fail");
+
+        let mut bad: serde_json::Value = serde_json::from_str(&good).unwrap();
+        bad["public_key"] = serde_json::Value::String("wrong".to_owned());
+        let bad_bytes = serde_json::to_vec(&bad).unwrap();
+        validate_public_exchange(&bad_bytes, ExchangeRole::InitiatorOffer)
+            .expect_err("fingerprint mismatch must fail");
+    }
+
+    #[test]
+    fn respond_exchange_requires_expected_initiator_fingerprint() {
+        let (_temp, paths) = fixture();
+        let init_public = valid_exchange_public();
+        let init_artifact = make_initiator_artifact_for_test(
+            &"a".repeat(32),
+            &"b".repeat(32),
+            &init_public,
+            1000,
+            2000,
+        );
+        let expected = validate_public_exchange(init_artifact.as_bytes(), ExchangeRole::InitiatorOffer)
+            .expect("valid initiator")
+            .public_fingerprint;
+        let local_public = bs58::encode([9_u8; 32]).into_string();
+        let local_private = bs58::encode([10_u8; 32]).into_string();
+        let request = RespondExchange {
+            contact_name: "bob",
+            offer_id: &"c".repeat(32),
+            contact_id: &"d".repeat(32),
+            local_public: &local_public,
+            local_private: &local_private,
+            initiator_offer_id: &"a".repeat(32),
+            expected_initiator_fingerprint: &expected,
+            label: None,
+            created_at: 1000,
+            expires_at: 2000,
+        };
+        let result = respond_exchange(&paths, SCOPE, init_artifact.as_bytes(), &request)
+            .expect("respond exchange");
+        assert_eq!(result.role, "responder_response");
+        assert!(result.public_artifact.contains("responder_response"));
+        assert!(!result.public_artifact.contains(&local_private));
+        // Mismatched fingerprint
+        let wrong_fp = PublicFingerprint::parse("sha256aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("parse test fp");
+        let request_bad = RespondExchange {
+            expected_initiator_fingerprint: &wrong_fp,
+            ..request
+        };
+        let error = respond_exchange(&paths, SCOPE, init_artifact.as_bytes(), &request_bad)
+            .expect_err("mismatched fingerprint must fail");
+        assert!(matches!(error, KeyManagerError::FingerprintMismatch));
+    }
+
+    #[test]
+    fn complete_exchange_installs_contact_as_installed() {
+        let (_temp, paths) = fixture();
+        let init_public = valid_exchange_public();
+        let init_private = valid_exchange_private();
+        let resp_public = bs58::encode([11_u8; 32]).into_string();
+        let resp_private = bs58::encode([12_u8; 32]).into_string();
+        let initiator_offer_id = "a".repeat(32);
+        let initiator_contact_id = "b".repeat(32);
+        let responder_offer_id = "c".repeat(32);
+        let responder_contact_id = "d".repeat(32);
+
+        let init_req = PrepareExchange {
+            contact_name: "alice",
+            offer_id: &initiator_offer_id,
+            contact_id: &initiator_contact_id,
+            local_public: &init_public,
+            local_private: &init_private,
+            intended_peer_contact_id: None,
+            intended_peer_fingerprint: None,
+            label: None,
+            previous_fingerprint: None,
+            generation: 1,
+            created_at: 1000,
+            expires_at: 2000,
+        };
+        let init_result = prepare_exchange(&paths, SCOPE, &init_req).expect("prepare");
+
+        let initiator_artifact_bytes = init_result.public_artifact.as_bytes();
+        let expected_initiator_fp = validate_public_exchange(initiator_artifact_bytes, ExchangeRole::InitiatorOffer)
+            .expect("initiator valid").public_fingerprint;
+        let resp_req = RespondExchange {
+            contact_name: "bob",
+            offer_id: &responder_offer_id,
+            contact_id: &responder_contact_id,
+            local_public: &resp_public,
+            local_private: &resp_private,
+            initiator_offer_id: &initiator_offer_id,
+            expected_initiator_fingerprint: &expected_initiator_fp,
+            label: None,
+            created_at: 1000,
+            expires_at: 2000,
+        };
+        let resp_secret = SecretExchange {
+            schema: EXCHANGE_SCHEMA.to_owned(),
+            offer_id: responder_offer_id.clone(),
+            role: ExchangeRole::ResponderResponse.as_str().to_owned(),
+            operation: "initial".to_owned(),
+            contact_id: responder_contact_id.clone(),
+            peer_contact_id: Some(initiator_contact_id.clone()),
+            local_public: resp_public.clone(),
+            local_private: SecretString::from(resp_private.clone()),
+            peer_public: Some(init_public.clone()),
+            peer_fingerprint: Some(expected_initiator_fp.as_str().to_owned()),
+            state: ExchangeState::Prepared.as_str().to_owned(),
+            scope_id: SCOPE.to_owned(),
+            contact_name: "alice".to_owned(),
+            generation: 1,
+            created_at: 1000,
+            expires_at: 2000,
+            transcript: None,
+        };
+        let pending_path = format!("{}/{}.json", PENDING_DIR, responder_offer_id);
+        let pending_bytes = serde_json::to_vec(&resp_secret).expect("serialize resp secret");
+        let ws = Workspace::open(paths.clone()).expect("ws");
+        ws.write_new(&pending_path, &pending_bytes).expect("write resp pending");
+
+        let resp_artifact = ResponderExchange {
+            schema: EXCHANGE_SCHEMA.to_owned(),
+            version: EXCHANGE_SCHEMA_VERSION.to_owned(),
+            artifact_role: "responder_response".to_owned(),
+            offer_id: responder_offer_id.clone(),
+            in_reply_to: initiator_offer_id.clone(),
+            sender_contact_id: responder_contact_id.clone(),
+            intended_peer_contact_id: initiator_contact_id.clone(),
+            intended_peer_fingerprint: expected_initiator_fp.as_str().to_owned(),
+            generator_profile: MIGRATION_GENERATOR_PROFILE.to_owned(),
+            binary_sha256: String::new(),
+            key_format: MIGRATION_KEY_FORMAT.to_owned(),
+            source_revision: MIGRATION_SOURCE_REVISION.to_owned(),
+            public_key: resp_public.clone(),
+            public_fingerprint: public_fingerprint(&resp_public).unwrap(),
+            generation: 1,
+            created_at: 1000,
+            expires_at: 2000,
+            label: None,
+            previous_fingerprint: None,
+        };
+        let resp_artifact_bytes = serde_json::to_vec(&resp_artifact).expect("serialize resp artifact");
+        let initiator_fp_value = PublicFingerprint::parse(&public_fingerprint(&init_public).unwrap()).unwrap();
+        let complete_req = CompleteExchange {
+            exchange_id: &responder_offer_id,
+            expected_peer_fingerprint: &initiator_fp_value,
+            defer_apply: true,
+        };
+        let status = complete_exchange(&paths, SCOPE, &resp_artifact_bytes, &complete_req).expect("complete exchange");
+        assert_eq!(status.state, "Installed");
+    }
+
+    #[test]
+    fn cancel_exchange_removes_pending_and_returns_cancelled() {
+        let (_temp, paths) = fixture();
+        let offer_id = "a".repeat(32);
+        let contact_id = "b".repeat(32);
+        let public = valid_exchange_public();
+        let private = valid_exchange_private();
+        let request = PrepareExchange {
+            contact_name: "alice",
+            offer_id: &offer_id,
+            contact_id: &contact_id,
+            local_public: &public,
+            local_private: &private,
+            intended_peer_contact_id: None,
+            intended_peer_fingerprint: None,
+            label: None,
+            previous_fingerprint: None,
+            generation: 1,
+            created_at: 1000,
+            expires_at: 2000,
+        };
+        prepare_exchange(&paths, SCOPE, &request).expect("prepare");
+        let status = cancel_exchange(&paths, SCOPE, &offer_id).expect("cancel");
+        assert_eq!(status.state, "Cancelled");
+        let pending_path = format!("{}/{}.json", PENDING_DIR, offer_id);
+        assert!(!paths.darkirc_dir().join(pending_path).exists());
+    }
+
+    #[test]
+    fn compute_transcript_is_deterministic_and_role_ordered() {
+        let a = make_initiator_artifact_for_test(&"a".repeat(32), &"b".repeat(32), &valid_exchange_public(), 1, 2);
+        let b_public = bs58::encode([0x11_u8; 32]).into_string();
+        let b = make_initiator_artifact_for_test(&"c".repeat(32), &"d".repeat(32), &b_public, 1, 2);
+        let t1 = compute_transcript(a.as_bytes(), b.as_bytes()).expect("t1");
+        let t2 = compute_transcript(a.as_bytes(), b.as_bytes()).expect("t2");
+        assert_eq!(t1, t2);
+        assert!(t1.starts_with("sha256:"));
+        let t_swapped = compute_transcript(b.as_bytes(), a.as_bytes()).expect("t swapped");
+        assert_ne!(t1, t_swapped, "transcript is role-order-sensitive");
+    }
+
+    #[test]
+    fn prepare_exchange_rejects_occupied_contact() {
+        let (_temp, paths) = fixture();
+        let public = valid_exchange_public();
+        let private = valid_exchange_private();
+        let request = PrepareExchange {
+            contact_name: "alice",
+            offer_id: &"a".repeat(32),
+            contact_id: &"b".repeat(32),
+            local_public: &public,
+            local_private: &private,
+            intended_peer_contact_id: None,
+            intended_peer_fingerprint: None,
+            label: None,
+            previous_fingerprint: None,
+            generation: 1,
+            created_at: 1000,
+            expires_at: 2000,
+        };
+        prepare_exchange(&paths, SCOPE, &request).expect("first prepare");
+        let request2 = PrepareExchange {
+            offer_id: &"x".repeat(32),
+            contact_id: &"y".repeat(32),
+            ..request
+        };
+        let error = prepare_exchange(&paths, SCOPE, &request2).expect_err("occupied contact must fail");
+        assert!(matches!(error, KeyManagerError::ContactConflict) || matches!(error, KeyManagerError::OfferConflict));
+    }
+
+    #[test]
+    fn mark_locally_activated_advances_to_locally_activated() {
+        let (_temp, paths) = fixture();
+        let contact = LedgerContact {
+            state: ExchangeState::Installed.as_str().to_owned(),
+            peer_fingerprint: "sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234".to_owned(),
+            generation: 1,
+            contact_id: "contact1234567890abcdef1234567890abcd".to_owned(),
+            local_fingerprint: "sha256:1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd".to_owned(),
+            activation_deadline: 0,
+            rollback_tx_id: String::new(),
+            rollback_contact_toml_hash: String::new(),
+            pending_offer_id: String::new(),
+            compromised: false,
+            revocation_generation: 0,
+        };
+        let mut ledger = empty_ledger(SCOPE);
+        ledger.contacts.insert("alice".to_owned(), contact);
+        let ledger_bytes = ledger_bytes(&ledger).expect("render ledger");
+        let path = paths.darkirc_dir().join(LEDGER_FILE);
+        std::fs::write(&path, &ledger_bytes).expect("write ledger");
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+
+        let fp = PublicFingerprint::parse("sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234").unwrap();
+        let tx = "tx1234567890abcdef1234567890abcd".to_owned();
+        let status = mark_locally_activated(&paths, SCOPE, "alice", &tx, 1000).expect("mark activated");
+        assert_eq!(status.state, "LocallyActivated");
+        assert_eq!(status.activation_deadline, Some(1000 + ACTIVATION_WINDOW_SECONDS));
+    }
+
+    #[test]
+    fn rollback_activation_for_compromised_key_sets_marker() {
+        let (_temp, paths) = fixture();
+        let contact = LedgerContact {
+            state: ExchangeState::Installed.as_str().to_owned(),
+            peer_fingerprint: "sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234".to_owned(),
+            generation: 1,
+            contact_id: "contact1234567890abcdef1234567890abcd".to_owned(),
+            local_fingerprint: "sha256:1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd".to_owned(),
+            activation_deadline: 0,
+            rollback_tx_id: String::new(),
+            rollback_contact_toml_hash: String::new(),
+            pending_offer_id: String::new(),
+            compromised: false,
+            revocation_generation: 0,
+        };
+        let mut ledger = empty_ledger(SCOPE);
+        ledger.contacts.insert("mallory".to_owned(), contact);
+        let ledger_bytes = ledger_bytes(&ledger).expect("render ledger");
+        let path = paths.darkirc_dir().join(LEDGER_FILE);
+        std::fs::write(&path, &ledger_bytes).expect("write ledger");
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+
+        let fp = PublicFingerprint::parse("sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234").unwrap();
+        let tx = "tx1234567890abcdef1234567890abcd".to_owned();
+        let status = rollback_activation(&paths, SCOPE, "mallory", &tx, true, None).expect("rollback");
+        assert_eq!(status.state, "RolledBack");
+        let ledger_after = read_ledger(&paths, SCOPE).expect("read ledger");
+        assert!(ledger_after.contacts["mallory"].compromised);
+    }
+
+    #[test]
+    fn revoke_contact_sets_revoked_and_monotonic_compromised() {
+        let (_temp, paths) = fixture();
+        let contact = LedgerContact {
+            state: ExchangeState::Installed.as_str().to_owned(),
+            peer_fingerprint: "sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234".to_owned(),
+            generation: 1,
+            contact_id: "contact1234567890abcdef1234567890abcd".to_owned(),
+            local_fingerprint: "sha256:1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd".to_owned(),
+            activation_deadline: 0,
+            rollback_tx_id: String::new(),
+            rollback_contact_toml_hash: String::new(),
+            pending_offer_id: String::new(),
+            compromised: false,
+            revocation_generation: 0,
+        };
+        let mut ledger = empty_ledger(SCOPE);
+        ledger.contacts.insert("mallory".to_owned(), contact);
+        let ledger_bytes = ledger_bytes(&ledger).expect("render ledger");
+        let path = paths.darkirc_dir().join(LEDGER_FILE);
+        std::fs::write(&path, &ledger_bytes).expect("write ledger");
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+
+        let fp = PublicFingerprint::parse("sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234").unwrap();
+        let status = revoke_contact(&paths, SCOPE, "mallory", &fp, RevocationDisposition::Compromised)
+            .expect("revoke contact");
+        assert_eq!(status.state, "Revoked");
+        let ledger_after = read_ledger(&paths, SCOPE).expect("read ledger");
+        assert!(ledger_after.contacts["mallory"].compromised);
+        assert_eq!(ledger_after.contacts["mallory"].revocation_generation, 1);
+    }
+
+    #[test]
+    fn confirm_roundtrip_advances_to_peer_verified_and_clears_pending() {
+        let (_temp, paths) = fixture();
+        let contact = LedgerContact {
+            state: ExchangeState::LocallyActivated.as_str().to_owned(),
+            peer_fingerprint: "sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234".to_owned(),
+            generation: 1,
+            contact_id: "contact1234567890abcdef1234567890abcd".to_owned(),
+            local_fingerprint: "sha256:1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd".to_owned(),
+            activation_deadline: 0,
+            rollback_tx_id: String::new(),
+            rollback_contact_toml_hash: String::new(),
+            pending_offer_id: "offer1234567890abcdef1234567890abcd".to_owned(),
+            compromised: false,
+            revocation_generation: 0,
+        };
+        let mut ledger = empty_ledger(SCOPE);
+        ledger.contacts.insert("alice".to_owned(), contact);
+        let ledger_bytes = ledger_bytes(&ledger).expect("render ledger");
+        let path = paths.darkirc_dir().join(LEDGER_FILE);
+        std::fs::write(&path, &ledger_bytes).expect("write ledger");
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let ws = Workspace::open(paths.clone()).expect("ws open");
+        let pending_path = format!("{}/offer1234567890abcdef1234567890abcd.json", PENDING_DIR);
+        ws.write_new(&pending_path, b"{\"schema\":\"test\"}").expect("write pending");
+
+        let fp = PublicFingerprint::parse("sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234").unwrap();
+        let status = confirm_roundtrip(&paths, SCOPE, "alice", &"offer1234567890abcdef1234567890abcd", &fp)
+            .expect("roundtrip");
+        assert_eq!(status.state, "PeerVerified");
+        let ledger_after = read_ledger(&paths, SCOPE).expect("ledger");
+        assert_eq!(ledger_after.contacts["alice"].state, "PeerVerified");
+        assert!(!paths.darkirc_dir().join(&pending_path).exists());
+    }
+
+    #[test]
+    fn validate_public_exchange_rejects_all_zero_and_wrong_length() {
+        let zero_public = bs58::encode([0_u8; 32]).into_string();
+        let artifact = make_initiator_artifact_for_test(&"a".repeat(32), &"b".repeat(32), &zero_public, 1000, 2000);
+        let error = validate_public_exchange(artifact.as_bytes(), ExchangeRole::InitiatorOffer)
+            .expect_err("all-zero key must fail");
+        assert!(matches!(error, KeyManagerError::InvalidPublicKey) || matches!(error, KeyManagerError::InvalidExchangeArtifact));
+    }
+
+    #[test]
+    fn validate_public_exchange_rejects_oversized_artifact() {
+        let huge = vec![b'{'; MAX_PENDING_BYTES + 1];
+        let error = validate_public_exchange(&huge, ExchangeRole::InitiatorOffer)
+            .expect_err("oversized must fail");
+        assert!(matches!(error, KeyManagerError::InvalidExchangeArtifact));
     }
 }
