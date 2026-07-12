@@ -77,11 +77,7 @@
     <details>
     <summary><b>INFO DUMP — WeeChat Services for Multi-Tenant Deployments</b></summary>
     CLI pairing approve env var requirement in WeeChat ops guide. Adds troubleshooting section for the 'no pairing file' error caused by LUNARWING_BASE_DIR not being in the tenant user's shell environment. Includes three workarounds: inline env var, sourcing lunarwing.env, and gateway API. Ultraworked with Sisyphus (https://github.com/code-yeongyu/oh-my-openagent). Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
-WeeChat Services for Multi-Tenant Deployments
-    How WeeChat IRC access is managed as init services in LunarWing multi-tenant deployments. Each tenant runs a WeeChat instance in a tmux session plus a Python WebSocket adapter that bridges WeeChat's relay API to an HTTP endpoint polled by the LunarWing WASM channel.
-    For general multi-tenant setup, see MULTITENANCY-PRODUCTION.md.
-    Architecture:
-    WASM channel (poll) ──GET──► ws_adapter.py (port base+9)
+WeeChat Services for Multi-Tenant Deployments How WeeChat IRC access is managed as init services in LunarWing multi-tenant deployments. Each tenant runs a WeeChat instance in a tmux session plus a Python WebSocket adapter that bridges WeeChat's relay API to an HTTP endpoint polled by the LunarWing WASM channel. For general multi-tenant setup, see MULTITENANCY-PRODUCTION.md. Architecture: WASM channel (poll) ──GET──► ws_adapter.py (port base+9)
                                   │
                                   ▼
                               WebSocket
@@ -97,10 +93,7 @@ WeeChat Services for Multi-Tenant Deployments
     The adapter script lives at lunarwing_weechat_wss/weechat_relay/ws_adapter.py in the source repo.
 
     Service Dependency Chain:
-    
     weechat-<name> → lunarwing-weechat-adapter-<name> → lunarwing-<name>
-
-
     WeeChat must be running before the adapter starts. The adapter must be running before the main daemon starts. The MT admin script wires this automatically via Requires=/After= (systemd) or need/before (OpenRC).
 
     Port Allocation:
