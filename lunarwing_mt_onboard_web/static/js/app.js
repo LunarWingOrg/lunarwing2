@@ -11,7 +11,8 @@
   LW.startStarfield($('starfield'));
   const moon = LW.Moon($('moon-host'), $('moon-label'));
   const bat = LW.Bat($('bat-host'), $('bat-mood'));
-  bat.startIdleCycle();
+  // Wave hello on first load, then Lunar eases into the ambient idle cycle.
+  bat.greet();
 
   const panel = LW.RunPanel({
     title: $('run-title'),
@@ -88,8 +89,8 @@
   document.querySelectorAll('[data-action="to-picker"]').forEach((b) => {
     b.addEventListener('click', () => {
       closeWs();
-      bat.set('content');
-      bat.startIdleCycle();
+      // Back at the picker — wave hello again, then resume idle cycling.
+      bat.greet();
       moon.setPhase(0, 1);
       show('view-picker');
     });
@@ -155,6 +156,9 @@
       case 'master_key':
         panel.masterKey(ev.key);
         break;
+      case 'gateway_auth_token':
+        panel.gatewayAuthToken(ev);
+        break;
       case 'secret_stored':
         panel.log('secret stored: ' + ev.name);
         break;
@@ -163,7 +167,8 @@
         panel.done(ev);
         if (ev.ok) {
           moon.setPhase(1, 1);
-          bat.set('excited');
+          // Job finished OK — Lunar throws the success nod, then holds content.
+          bat.celebrate();
         } else {
           bat.set('angry');
         }

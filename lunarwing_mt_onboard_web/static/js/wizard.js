@@ -344,7 +344,7 @@
     simpleForm(host, 'Store a secret', 'encrypted into the tenant secrets store', (b, data) => {
       Object.assign(data, { tenant: '', name: '', value: '', confirm: '' });
       b.appendChild(textField(data, 'tenant', 'Tenant', { datalist: opts.tenants, placeholder: 'sphinx' }));
-      b.appendChild(textField(data, 'name', 'Secret name', { placeholder: 'openai_api_key', hint: 'letters, numbers, _ / -' }));
+      b.appendChild(textField(data, 'name', 'Secret name', { placeholder: 'gotify_app_token', hint: 'letters, numbers, _ / -' }));
       b.appendChild(textField(data, 'value', 'Secret value', { type: 'password' }));
       b.appendChild(textField(data, 'confirm', 'Confirm value', { type: 'password' }));
     }, 'Store secret', Object.assign(

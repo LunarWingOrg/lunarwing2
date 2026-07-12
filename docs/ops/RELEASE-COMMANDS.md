@@ -1,8 +1,13 @@
-# Release Commands
+# Release Commands (GitHub / `gh`)
 
 Step-by-step git/GitHub commands to cut a release. Replace `<version>` (e.g. `1.1.2`) and
 `<codename>` with the target release's values. The branching strategy (`staging` →
 `release/v<version>`) is documented in the root `CLAUDE.md`.
+
+> **Codeberg origin:** this monorepo’s `origin` is often
+> `https://codeberg.org/LunarWing/LunarWing_v2.git`. For that host use
+> [`RELEASE-COMMANDS-CODEBERG.md`](RELEASE-COMMANDS-CODEBERG.md) (Forgejo API /
+> curl; no `gh` required).
 
 ```bash
 # ── 0. Preflight: up-to-date staging with the release notes committed ──────────
