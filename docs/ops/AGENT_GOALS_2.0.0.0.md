@@ -65,11 +65,9 @@
 
     Issue: -relay-api is disabled (the API protocol needs cJSON). emerge needs cjson.
 
-    Fix:
-    ```bash
+    Fix: (commands)
     echo "net-irc/weechat relay-api" | sudo tee -a /etc/portage/package.use/weechat
     sudo emerge --oneshot --changed-use net-irc/weechat
-```
 
     Document the accuracy of this issue.
 
