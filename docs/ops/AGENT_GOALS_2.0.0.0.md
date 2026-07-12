@@ -7,84 +7,22 @@
 
 1. [x] Ensure references to 1.2.0 in the code and documentation are replaced by 2.0.0 (where applicable only of course)
 2. [x] create ov dir ( cd {this repo} && mkdir -p docs/ov/ )
-3. [ ] MCP additions: 
-[DONE]:
-• Implemented first-class host-local stdio MCP installation across LunarWing:
-  - Added typed stdio MCP registry manifests with command, structured args, and non-secret env.
-  - Added a shared validated ExtensionManager::install_mcp_config persistence path.
-  - Extended conversational tool_install and the web API to accept stdio configuration.
-  - Added HTTP/stdio controls to the web MCP settings UI.
-  - Added stdio support to lunarwing registry list/info/install, including --force handling.
-  - Exposed transport and command metadata when listing installed MCP servers.
-  - Treated stdio servers as requiring no OAuth authentication.
-  - Added validation for empty commands, NUL bytes, and invalid environment names/values.
-  - Ensured removal stops the managed child process before deleting its configuration.
-  - Preserved existing HTTP MCP and registry precedence behavior.
-  - Kept installation separate from execution: installation stores configuration; activation starts the process and discovers
-    tools.
-  - Updated the architecture proposal, historical supergateway note, and MCP documentation with neutral local-files examples.
-  Worker-local execution, automatic npm/pip installation, secret injection through stdio environment variables, and gateway
-  changes were intentionally excluded. All targeted tests, formatting, JavaScript syntax checks, and cargo check passed.
-  [RECOMMENDED FOR NEXT]:
-  • The safest next tranche is lifecycle and operational polish, because it extends the boundaries we just added without changing
-  the runtime architecture.
-  Recommended Next (Pick ONE, implement it, check off this box):
-  >>1>> MCP deactivate/re-enable
-      - Stop the child, unregister its tools, and preserve configuration.
-      - Persist enabled = false so restart does not relaunch it.
-      - Add tool_deactivate, API, and web controls.
-      - This completes the lifecycle without involving WASM or workers.
-  >>2>> Diagnostics and command preflight
-      - Extend doctor/status with transport, enabled state, and executable availability.
-      - Validate absolute commands or resolve commands through PATH.
-      - Report spawn and negotiation failures in the installed-extension response.
-      - Do not execute anything during installation.
-  >>3>> Registry validation
-      - Add a validation test or registry validate command covering:
-          - exactly one of url or transport
-          - valid stdio command/args/env
-          - auth: none for stdio
-          - duplicate names and unsupported transport types
-      - This is almost entirely isolated to registry code and CI.
-  >>4>> In-place configuration updates
-      - Let users edit command, args, env, or URL without remove/reinstall.
-      - If active, require explicit restart confirmation.
-      - Preserve existing registry precedence and approval rules.
-  >>5>> Focused integration coverage
-      - Exercise the real install API through the router.
-      - Verify install → list → activate failure reporting → deactivate → remove.
-      - Add a browser-level check for HTTP/stdio mode switching and mobile layout.
-  Useful, Slightly Larger
-  - Optional stdio working directory (cwd) with path validation.
-  - Per-server startup and request timeouts.
-  - A visible risk label explaining that host-local processes are unsandboxed.
-  - Better process cleanup when a spawn replaces an existing managed transport.
-  - Tenant/owner selection for mcp add and registry install; today the CLI persistence path still assumes the default owner.
-  Defer For Now:
-  * Worker-local MCP, automatic npm/pip installation, secret injection through process environment, a general runtime-adapter
-  refactor, gateway integration, and automatic crash restart all increase the security or lifecycle surface materially.
-  * I would implement deactivate/re-enable, diagnostics, registry validation, and integration tests as one contained follow-up. That
-  provides a complete and inspectable host-local lifecycle before introducing another execution placement.
-4. [x] bump crates version from 1.1.9 to 2.0.0
-5. [ ] make sure you DIDNT MISS ANY CRATES. RELEVANT LUNARWING crates and things such as xmpp bridge and wasm channels must have 2.0.0 version, NOT 1.1.9 or 1.1.8
-6. [ ] Drop legacy `ironclaw-agent-v1` subprotocol offer from the daemon (delete the `SUBPROTOCOL_LEGACY` offer in `ic/src/orchestrator/external_worker.rs`) and `git rm` the 1.1.9-only repo-root compat symlinks `ironclaw_weechat_wss`, `darkirc_channel_for_ironclaw` (deployed tenants must have re-run mt-admin unit regen by then)
-7. [ ] LunarWing Web UI performance overhaul - lot of issues with UI - laggy, buttons dont animate, etc
-8. [x] LunarWing Web MT admin setup integration (part 2 of an earlier plan discussed some time ago) - started - go see: lunarwing_mt_onboard_web/ - this is being worked on by another agent or human
-9. [ ] Write up a short doc with details of currently open PRs and Issues. Save it to docs/ops
-10. [ ] inspect status of cargo crates and create documented report of any crates that might still need to be updated. Verify if the following info is still correct:
-## ⚠️ One Major Version Behind (Not Urgent)                                                                                                    
-| Crate | Current | Available | Notes |                                   
-|-------|---------|-----------|-------|                                   
-2026-07-08 21:00:03     kageho  | `tower-http` | 0.6.10 | 0.7.0 | Available but not required. 0.6.11 patch is available.
-That's the **only** crate with a major version available. And it's just 0.7.0 — not a huge jump.
-## 🔍 Things You Might Have Missed                                        
+3. [x] bump crates version from 1.1.9 to 2.0.0
+4. [x] make sure you DIDNT MISS ANY CRATES. RELEVANT LUNARWING crates and things such as xmpp bridge and wasm channels must have 2.0.0 version, NOT 1.1.9 or 1.1.8
+5. [ ] Drop legacy `ironclaw-agent-v1` subprotocol offer from the daemon (delete the `SUBPROTOCOL_LEGACY` offer in `ic/src/orchestrator/external_worker.rs`) and `git rm` the 1.1.9-only repo-root compat symlinks `ironclaw_weechat_wss`, `darkirc_channel_for_ironclaw` (deployed tenants must have re-run mt-admin unit regen by then)
+6. [ ] LunarWing Web UI performance overhaul - lot of issues with UI - laggy, buttons dont animate, etc
+7. [x] LunarWing Web MT admin setup integration (part 2 of an earlier plan discussed some time ago) - started - go see: lunarwing_mt_onboard_web/ - this is being worked on by another agent or human
+8. [ ] Write up a short doc with details of currently open PRs and Issues. Save it to docs/ops
+9. [ ] inspect status of cargo crates and create documented report of any crates that might still need to be updated. Verify if the following below info is still correct:
+___
+Beginning of INFO DUMP:
+___
+`tower-http` | 0.6.10 | 0.7.0 | Available but not required. 0.6.11 patch is available. That's the **only** crate with a major version available. And it's just 0.7.0 — not a huge jump. Below are some 🔍 Things You Might Have Missed:
 2026-07-08 21:00:04     kageho  1. **`rand` 0.8.6** — You're still on 0.8.
  The dry-run shows 0.10.2 is available but it would be a **breaking change
-** (API redesign in 0.9+). If you've deliberately stayed on 0.8, that's fi
-ne. Just be aware it's two major versions behind.                         
+(API redesign in 0.9+). If you've deliberately stayed on 0.8, that's fine. Just be aware it's two major versions behind.                         
 **`base64` 0.21.7** — Still on 0.21. Version 0.22 is available. Minor A
-PI changes (`Engine` trait moved). Used in `ssh_hostkeys.rs` for fingerpri
-nt computation.
+PI changes (`Engine` trait moved). Used in `ssh_hostkeys.rs` for fingerprint computation.
 2026-07-08 21:00:05     kageho  3. **`wasmparser` 0.220.1** — This is bund
 led with wasmtime 36, so it's fine. The dry-run doesn't try to update it i
 ndependently.
@@ -110,16 +48,27 @@ This issue documents a crate audit. Current state:
 - `base64` 0.21.7 → 0.22: Still on 0.21 in `ic/Cargo.toml`. Minor breaking, deferred.
 - The `cargo update` (patch/minor bumps) recommendation may or may not have been run.
 **Verdict**: The deferred crates (`rand`, `base64`, `tower-http`) are intentionally held back for 2.0.0+. The patch-level `cargo update` should be verified. **Genuinely open** — deferred to 2.0.0+.
-11. [ ] Run all cargo tests — full `--all-features --no-fail-fast` run: lib 4087 passed/0 failed/4 ignored; all integration binaries + doctests pass except the 6 known-deferred (4 `multi_tenant_system_prompt` architectural, 2 `e2e_advanced_traces` bootstrap-greeting). See `docs/proposals/CARGO_TESTS_FIX.md`.
-12. [ ] Fix any remaining broken cargo tests and ensure updated documentation. Create (or rewrite) new tests if necessary. then re-run cargo tests to ensure — Fixed the 3 stale `lib` failures this cycle: `registry::embedded::tests::test_load_embedded_parses` (github→ssh sentinel), `cli::tests::test_help_output` + `test_long_help_output` (accepted rebranded insta snapshots). Lib re-run: 4087 passed/0 failed. The 6 remaining failures are documented known-deferred (architectural / harness), not regressions.
-13. [ ] Verify Gentoo Issue:
+___
+End of INFO DUMP:
+___
+Write up a document in docs/ops detailing the status of the information: is each piece verifiable? what outstanding issues remain? which points have already been addressed?
+10. [ ] Run all cargo tests — full `--all-features --no-fail-fast` run: lib 4087 passed/0 failed/4 ignored; all integration binaries + doctests pass except the 6 known-deferred (4 `multi_tenant_system_prompt` architectural, 2 `e2e_advanced_traces` bootstrap-greeting). See `docs/proposals/CARGO_TESTS_FIX.md`.
+11. [ ] Fix any remaining broken cargo tests and ensure updated documentation. Create (or rewrite) new tests if necessary. then re-run cargo tests to ensure — Fixed the 3 stale `lib` failures this cycle: `registry::embedded::tests::test_load_embedded_parses` (github→ssh sentinel), `cli::tests::test_help_output` + `test_long_help_output` (accepted rebranded insta snapshots). Lib re-run: 4087 passed/0 failed. The 6 remaining failures are documented known-deferred (architectural / harness), not regressions.
+12. [ ] Verify below Gentoo Issue:
+___
+Beginning of INFO DUMP:
+___
 issue is -relay-api is disabled (the api protocol needs cJSON)
 emerge needs cjson
 issue is -relay-api is disabled (the api protocol needs cJSON)
 echo "net-irc/weechat relay-api" | sudo tee -a /etc/portage/package.use/weechat
 sudo emerge --oneshot --changed-use net-irc/weechat
 Document the accuracy of this issue.
-14. [ ] Verify (only) if the following information is accurate:
+___
+End of INFO DUMP:
+___
+Write up a document in docs/ops detailing the status of the information: is each piece verifiable? what outstanding issues remain? which points have already been addressed?
+13. [ ] Verify (only) if the following information is accurate:
 __
 Document CLI pairing approve env var requirement in WeeChat ops guide
 Adds troubleshooting section for the 'no pairing file' error caused by LUNARWING_BASE_DIR not being in the tenant user's shell environment. Includes three workarounds: inline env var, sourcing lunarwing.env, and gateway API.
@@ -406,23 +355,84 @@ curl -sf -X POST http://127.0.0.1:<gateway_port>/api/pairing/weechat/approve \
   -H "Content-Type: application/json" \
   -d '{"code":"<CODE>"}'
 ```
-__
+
+___
+End of INFO DUMP:
+___
 **Write up doc with findings**
-15. [ ] dark irc key exchange
-16. [ ] memory_impl:
+Write up a document in docs/ops detailing the status of the information: is each piece verifiable? what outstanding issues remain? which points have already been addressed?
+14. [ ] dark irc key exchange. automate the process secruely. ** For this task I want you to help plan it out. Write up a doc in docs/proposals **
+15. [ ] memory_impl:
 implement third party memory cleaning, de-duping, correction routines into project
 I've created several advanced memory de-duplication routines on my own which are being used across three production agents (on 1.1.2). My goal is to either integrate these routines into LunarWing directly, or make it easy for new users to import them.
 I'll look into adding more to this idea in this issue at some point.
 kind of just a stub for the timebeing.
-** For this task I want you to help plan it out. Write up a doc **
-17. [ ] Work on integrated testing routing with Christopher as it will become very important for us (do not resume the routine without permission)
+** For this task I want you to help plan it out. Write up a doc in docs/proposals **
+16. [ ] Work on integrated testing routing with Christopher as it will become very important for us (do not resume the routine without permission)
+17. [ ] MCP additions: (please reference the following branch for a hint on getting started : faility/failed-partial-old-item-3-20260711-0601)
+[DONE]:
+• Implemented first-class host-local stdio MCP installation across LunarWing:
+  - Added typed stdio MCP registry manifests with command, structured args, and non-secret env.
+  - Added a shared validated ExtensionManager::install_mcp_config persistence path.
+  - Extended conversational tool_install and the web API to accept stdio configuration.
+  - Added HTTP/stdio controls to the web MCP settings UI.
+  - Added stdio support to lunarwing registry list/info/install, including --force handling.
+  - Exposed transport and command metadata when listing installed MCP servers.
+  - Treated stdio servers as requiring no OAuth authentication.
+  - Added validation for empty commands, NUL bytes, and invalid environment names/values.
+  - Ensured removal stops the managed child process before deleting its configuration.
+  - Preserved existing HTTP MCP and registry precedence behavior.
+  - Kept installation separate from execution: installation stores configuration; activation starts the process and discovers
+    tools.
+  - Updated the architecture proposal, historical supergateway note, and MCP documentation with neutral local-files examples.
+  Worker-local execution, automatic npm/pip installation, secret injection through stdio environment variables, and gateway
+  changes were intentionally excluded. All targeted tests, formatting, JavaScript syntax checks, and cargo check passed.
+  [RECOMMENDED FOR NEXT]:
+  • The safest next tranche is lifecycle and operational polish, because it extends the boundaries we just added without changing
+  the runtime architecture.
+  Recommended Next (Pick ONE, implement it, check off this box):
+  >>1>> MCP deactivate/re-enable
+      - Stop the child, unregister its tools, and preserve configuration.
+      - Persist enabled = false so restart does not relaunch it.
+      - Add tool_deactivate, API, and web controls.
+      - This completes the lifecycle without involving WASM or workers.
+  >>2>> Diagnostics and command preflight
+      - Extend doctor/status with transport, enabled state, and executable availability.
+      - Validate absolute commands or resolve commands through PATH.
+      - Report spawn and negotiation failures in the installed-extension response.
+      - Do not execute anything during installation.
+  >>3>> Registry validation
+      - Add a validation test or registry validate command covering:
+          - exactly one of url or transport
+          - valid stdio command/args/env
+          - auth: none for stdio
+          - duplicate names and unsupported transport types
+      - This is almost entirely isolated to registry code and CI.
+  >>4>> In-place configuration updates
+      - Let users edit command, args, env, or URL without remove/reinstall.
+      - If active, require explicit restart confirmation.
+      - Preserve existing registry precedence and approval rules.
+  >>5>> Focused integration coverage
+      - Exercise the real install API through the router.
+      - Verify install → list → activate failure reporting → deactivate → remove.
+      - Add a browser-level check for HTTP/stdio mode switching and mobile layout.
+  Useful, Slightly Larger
+  - Optional stdio working directory (cwd) with path validation.
+  - Per-server startup and request timeouts.
+  - A visible risk label explaining that host-local processes are unsandboxed.
+  - Better process cleanup when a spawn replaces an existing managed transport.
+  - Tenant/owner selection for mcp add and registry install; today the CLI persistence path still assumes the default owner.
+  Defer For Now:
+  * Worker-local MCP, automatic npm/pip installation, secret injection through process environment, a general runtime-adapter
+  refactor, gateway integration, and automatic crash restart all increase the security or lifecycle surface materially.
+  * I would implement deactivate/re-enable, diagnostics, registry validation, and integration tests as one contained follow-up. That
+  provides a complete and inspectable host-local lifecycle before introducing another execution placement.
 18. [ ] Finish going through all the documents under architecture directory in docs/ and update all outdated documentation. Then, consolidate documents if possible.
 19. [ ] Go through all documents under bugs directory in docs/ and update all outdated documentation. Then, consolidate documents.
 20. [ ] Go through all documents under proposals directory in docs/ and update all outdated documentation. Then, consolidate documents if deemed necessary. 
 21. [ ] Go through all documents under reviews directory in docs/ and update all outdated documentation. Then, consolidate documents.
 22. [ ] Go through all documents under guides directory in docs/ and update all outdated documentation. Then, consolidate documents.
-23. [ ] Write up FIRST DRAFT release notes (at root of repo) for v1.1.9.0 (note the version schema change) explaining all relevant changes since v1.1.8 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/release for reference as to how to write up this document. The codename for this release is: `Kiyome (きよめ/清め)` - The file you write will be RELEASE-v1.1.9.0.md and should be written to the ROOT of the repo.
-24. [ ] Improve accuracy of RELEASE-v1.1.9.0.md (from item #15)
+23. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.0.0 explaining all relevant changes since v1.1.9.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/release for reference as to how to write up this document. The codename for this release is: `Unknown` - The file you write will be RELEASE-v2.0.0.0.md and should be written to the ROOT of the repo.
+24. [ ] Improve accuracy of RELEASE-v2.0.0.0.md
 
 ---
-
