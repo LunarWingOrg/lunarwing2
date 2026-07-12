@@ -1,6 +1,5 @@
 //! WebSocket client for external workers speaking the `lunarwing-agent-v1`
-//! protocol (legacy alias `ironclaw-agent-v1` is still offered for workers
-//! built before the rename).
+//! protocol.
 //!
 //! External workers are persistent containers (nanocode, pebble, opencode, etc.) that the
 //! orchestrator connects to on demand rather than creating per-job.
@@ -27,10 +26,6 @@ use crate::error::OrchestratorError;
 
 /// Primary WebSocket subprotocol spoken by external workers.
 pub const SUBPROTOCOL: &str = "lunarwing-agent-v1";
-
-/// Legacy subprotocol alias, still offered so workers built before the
-/// ironclaw -> lunarwing rename keep negotiating successfully.
-pub const SUBPROTOCOL_LEGACY: &str = "ironclaw-agent-v1";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Envelope {
@@ -745,12 +740,10 @@ async fn connect_and_handshake(
         }
     })?;
 
-    // Offer both subprotocol names, preferred name first (RFC 6455 order).
-    // New workers echo `lunarwing-agent-v1`; pre-rename workers echo the
-    // legacy alias — tungstenite accepts either since both are in the offer.
+    // Offer the lunarwing-agent-v1 subprotocol (RFC 6455).
     let mut req_builder = http::Request::builder().uri(&uri).header(
         "Sec-WebSocket-Protocol",
-        format!("{SUBPROTOCOL}, {SUBPROTOCOL_LEGACY}"),
+        SUBPROTOCOL,
     );
 
     if let Some(token) = auth_token {

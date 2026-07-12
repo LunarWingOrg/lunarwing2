@@ -1,8 +1,7 @@
 //! Integration tests for the external-worker (EWE) WebSocket path.
 //!
 //! These tests stand up a mock worker speaking the `lunarwing-agent-v1`
-//! protocol (legacy alias `ironclaw-agent-v1`) on an ephemeral loopback port
-//! and drive the real
+//! protocol on an ephemeral loopback port and drive the real
 //! [`ExternalWorkerManager::execute_task`] against it. They close the largest
 //! pre-existing test gap (T1 in SESSION-AUDIT-MT-DARKIRC-EWE-2026-06-23.md):
 //! `connect_and_handshake`, `run_external_task`, and `execute_task` were
@@ -16,8 +15,7 @@
 //! - connection failure (unreachable endpoint) -> `ExternalWorkerConnectionFailed`
 //! - protocol error (connection closed before `ready`) -> `ExternalWorkerProtocolError`
 //! - connection-pool reuse across two sequential successful tasks
-//! - subprotocol negotiation with legacy-only (`ironclaw-agent-v1`) and
-//!   new-only (`lunarwing-agent-v1`) workers
+//! - subprotocol negotiation (`lunarwing-agent-v1`)
 //!
 //! No PostgreSQL / Docker / external services required; pure loopback WS.
 
@@ -37,7 +35,7 @@ use lunarwing::config::{ExternalWorkerConfig, LoadBalanceStrategy, WorkerEndpoin
 use lunarwing::error::OrchestratorError;
 use lunarwing::orchestrator::ExternalWorkerManager;
 use lunarwing::orchestrator::external_worker::{
-    ExternalTaskStatus, SUBPROTOCOL, SUBPROTOCOL_LEGACY, TaskContext,
+    ExternalTaskStatus, SUBPROTOCOL, TaskContext,
 };
 
 /// How long we wait for any single test assertion before declaring the test
@@ -65,15 +63,12 @@ enum MockBehavior {
     CloseBeforeReady,
 }
 
-/// Which subprotocol names the mock worker accepts, simulating worker
-/// generations on either side of the ironclaw -> lunarwing rename.
+/// Which subprotocol names the mock worker accepts.
 #[derive(Clone, Copy)]
 enum SubprotocolPolicy {
-    /// Current worker: accepts both names, prefers `lunarwing-agent-v1`.
+    /// Current worker: accepts `lunarwing-agent-v1`.
     PreferNew,
-    /// Pre-rename worker: only knows `ironclaw-agent-v1`.
-    LegacyOnly,
-    /// Future worker with the legacy alias dropped: only `lunarwing-agent-v1`.
+    /// Future worker: only `lunarwing-agent-v1`.
     NewOnly,
 }
 
@@ -81,8 +76,7 @@ impl SubprotocolPolicy {
     /// Accepted names in preference order.
     fn accepted(self) -> &'static [&'static str] {
         match self {
-            Self::PreferNew => &[SUBPROTOCOL, SUBPROTOCOL_LEGACY],
-            Self::LegacyOnly => &[SUBPROTOCOL_LEGACY],
+            Self::PreferNew => &[SUBPROTOCOL],
             Self::NewOnly => &[SUBPROTOCOL],
         }
     }
@@ -624,42 +618,6 @@ async fn connection_pool_reuse_across_sequential_tasks() {
         "expected pool reuse (1 connection), got {}",
         conn_count.load(Ordering::SeqCst)
     );
-}
-
-#[tokio::test]
-async fn legacy_only_worker_still_negotiates() {
-    // Regression test for the ironclaw -> lunarwing subprotocol rename: a
-    // worker built before the rename only knows `ironclaw-agent-v1`. Because
-    // the daemon offers both names (new first), the worker matches and echoes
-    // the legacy alias, and the handshake + task must still succeed.
-    let (url, _count) = spawn_mock_worker_with_subprotocol(
-        MockBehavior::Success {
-            progress: vec![],
-            output: "ok".to_string(),
-        },
-        SubprotocolPolicy::LegacyOnly,
-    )
-    .await;
-    let mgr = ExternalWorkerManager::new(vec![config_for(&url)]);
-
-    let res = timeout(
-        TEST_BOUND,
-        mgr.execute_task(
-            Uuid::new_v4(),
-            "mock",
-            "task",
-            Some(5_000),
-            true,
-            TaskContext::default(),
-        ),
-    )
-    .await
-    .expect("test timed out")
-    .expect("execute_task errored against legacy-only worker")
-    .expect("expected result");
-
-    assert_eq!(res.status, ExternalTaskStatus::Success);
-    assert_eq!(res.output, "ok");
 }
 
 #[tokio::test]
