@@ -80,6 +80,7 @@ Deployment, operations, multitenancy, and production guides.
 | [`PEBBLE-WORKER.md`](ops/PEBBLE-WORKER.md) | Pebble external worker operational guide |
 | [`NANOCODE-MULTITENANT.md`](ops/NANOCODE-MULTITENANT.md) | Nanocode external worker, multi-tenant setup |
 | [`WEECHAT-SERVICES.md`](ops/WEECHAT-SERVICES.md) | WeeChat services, ports, env vars, day-to-day ops |
+| [`WEECHAT_SERVICES_VERIFICATION.md`](ops/WEECHAT_SERVICES_VERIFICATION.md) | Verification report — audit of WEECHAT_SERVICES_FOR_MT_INFODUMP accuracy |
 | [`XMPP_KNOWN_ISSUES.md`](ops/XMPP_KNOWN_ISSUES.md) | XMPP/OMEMO known issues |
 | [`XMPP_TRANSFERS.md`](ops/XMPP_TRANSFERS.md) | XMPP file-transfer methods quick-reference |
 | [`RELEASE-COMMANDS.md`](ops/RELEASE-COMMANDS.md) | Release git/GitHub command template |
