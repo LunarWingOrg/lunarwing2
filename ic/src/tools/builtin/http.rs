@@ -458,6 +458,83 @@ impl Tool for HttpTool {
         let url = require_str(&params, "url")?;
         let mut parsed_url = validate_url(url)?;
 
+        if !matches!(
+            method_upper.as_str(),
+            "GET" | "POST" | "PUT" | "DELETE" | "PATCH"
+        ) {
+            return Err(ToolError::InvalidParameters(format!(
+                "unsupported method: {}",
+                method
+            )));
+        }
+
+        // Parse headers. Snapshot the caller-supplied values before credential
+        // injection so the recorder never sees injected secrets.
+        let mut headers_vec = parse_headers_param(params.get("headers"))?;
+        let caller_headers = headers_vec.clone();
+        let timeout_secs = parse_timeout_secs_param(params.get("timeout_secs"))?;
+        let save_to = parse_save_to_param(params.get("save_to"))?;
+        let effective_timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+
+        // Parse the body before the replay check so the recorded request still
+        // includes the caller-supplied payload without constructing a client.
+        let (body_bytes, body_json, body_text) = if let Some(body) = params.get("body") {
+            if let Some(body_str) = body.as_str() {
+                if body_str.is_empty() {
+                    (None, None, None)
+                } else if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body_str) {
+                    let bytes = serde_json::to_vec(&json_body).map_err(|e| {
+                        ToolError::InvalidParameters(format!("invalid body JSON: {}", e))
+                    })?;
+                    (Some(bytes), Some(json_body), None)
+                } else {
+                    let bytes = body_str.as_bytes().to_vec();
+                    (Some(bytes), None, Some(body_str.to_string()))
+                }
+            } else {
+                let bytes = serde_json::to_vec(body).map_err(|e| {
+                    ToolError::InvalidParameters(format!("invalid body JSON: {}", e))
+                })?;
+                (Some(bytes), Some(body.clone()), None)
+            }
+        } else {
+            (None, None, None)
+        };
+
+        // Leak detection still applies to replayed requests. No DNS lookup is
+        // needed when an interceptor supplies the response, because no network
+        // connection will be made. Literal private IPs were rejected by
+        // `validate_url` above; live requests retain the full DNS-pinning check.
+        let caller_url = parsed_url.clone();
+        let intercept_req = crate::llm::recording::HttpExchangeRequest {
+            method: method_upper.clone(),
+            url: caller_url.to_string(),
+            headers: caller_headers,
+            body: body_bytes
+                .as_ref()
+                .map(|b| crate::llm::recording::redact_body(&String::from_utf8_lossy(b))),
+        };
+        let detector = LeakDetector::new();
+        detector
+            .scan_http_request(parsed_url.as_str(), &headers_vec, body_bytes.as_deref())
+            .map_err(|e| ToolError::NotAuthorized(format!("{}", e)))?;
+
+        // Check HTTP interceptor before DNS resolution. Replayed traces must
+        // remain hermetic even when their recorded host is not resolvable.
+        if let Some(ref interceptor) = ctx.http_interceptor
+            && let Some(recorded) = interceptor.before_request(&intercept_req).await
+        {
+            let headers: HashMap<String, String> = recorded.headers.iter().cloned().collect();
+            let body: serde_json::Value = serde_json::from_str(&recorded.body)
+                .unwrap_or_else(|_| serde_json::Value::String(recorded.body.clone()));
+            let result = serde_json::json!({
+                "status": recorded.status,
+                "headers": headers,
+                "body": body
+            });
+            return Ok(ToolOutput::success(result, start.elapsed()).with_raw(recorded.body));
+        }
+
         // Resolve DNS once, validate against SSRF blocklist, then pin the
         // resolved addresses into the reqwest client so it cannot re-resolve
         // to a different (potentially private) IP.
@@ -473,63 +550,26 @@ impl Tool for HttpTool {
             reqwest::redirect::Policy::none(),
         )?;
 
-        // Parse headers. Snapshot the caller-supplied values before credential
-        // injection so the recorder never sees injected secrets.
-        let mut headers_vec = parse_headers_param(params.get("headers"))?;
-        let caller_headers = headers_vec.clone();
-        let caller_url = parsed_url.clone();
-        let timeout_secs = parse_timeout_secs_param(params.get("timeout_secs"))?;
-        let save_to = parse_save_to_param(params.get("save_to"))?;
-        let effective_timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
-
-        // Build request
-        let mut request = match method.to_uppercase().as_str() {
+        // Build request after DNS validation has succeeded.
+        let mut request = match method_upper.as_str() {
             "GET" => client.get(parsed_url.clone()),
             "POST" => client.post(parsed_url.clone()),
             "PUT" => client.put(parsed_url.clone()),
             "DELETE" => client.delete(parsed_url.clone()),
             "PATCH" => client.patch(parsed_url.clone()),
-            _ => {
-                return Err(ToolError::InvalidParameters(format!(
-                    "unsupported method: {}",
-                    method
-                )));
-            }
+            _ => unreachable!("method validated above"),
         };
 
         request = request.timeout(effective_timeout);
 
-        // Add headers
         for (key, value) in &headers_vec {
             request = request.header(key.as_str(), value.as_str());
         }
-
-        // Add body if present
-        let body_bytes = if let Some(body) = params.get("body") {
-            if let Some(body_str) = body.as_str() {
-                if body_str.is_empty() {
-                    None
-                } else if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body_str) {
-                    let bytes = serde_json::to_vec(&json_body).map_err(|e| {
-                        ToolError::InvalidParameters(format!("invalid body JSON: {}", e))
-                    })?;
-                    request = request.json(&json_body);
-                    Some(bytes)
-                } else {
-                    let bytes = body_str.as_bytes().to_vec();
-                    request = request.body(body_str.to_string());
-                    Some(bytes)
-                }
-            } else {
-                let bytes = serde_json::to_vec(body).map_err(|e| {
-                    ToolError::InvalidParameters(format!("invalid body JSON: {}", e))
-                })?;
-                request = request.json(body);
-                Some(bytes)
-            }
-        } else {
-            None
-        };
+        if let Some(json_body) = body_json {
+            request = request.json(&json_body);
+        } else if let Some(text_body) = body_text {
+            request = request.body(text_body);
+        }
 
         // Credential injection from shared registry
         if let (Some(registry), Some(store)) = (
@@ -566,36 +606,12 @@ impl Tool for HttpTool {
             }
         }
 
-        // Leak detection on outbound request (url/headers/body)
+        // Leak detection on outbound request (url/headers/body), including any
+        // credentials injected for a live request.
         let detector = LeakDetector::new();
         detector
             .scan_http_request(parsed_url.as_str(), &headers_vec, body_bytes.as_deref())
             .map_err(|e| ToolError::NotAuthorized(format!("{}", e)))?;
-
-        // Build the interceptor request descriptor for recording/replay
-        let intercept_req = crate::llm::recording::HttpExchangeRequest {
-            method: method_upper,
-            url: caller_url.to_string(),
-            headers: caller_headers,
-            body: body_bytes
-                .as_ref()
-                .map(|b| crate::llm::recording::redact_body(&String::from_utf8_lossy(b))),
-        };
-
-        // Check HTTP interceptor (replay mode returns pre-recorded response)
-        if let Some(ref interceptor) = ctx.http_interceptor
-            && let Some(recorded) = interceptor.before_request(&intercept_req).await
-        {
-            let headers: HashMap<String, String> = recorded.headers.iter().cloned().collect();
-            let body: serde_json::Value = serde_json::from_str(&recorded.body)
-                .unwrap_or_else(|_| serde_json::Value::String(recorded.body.clone()));
-            let result = serde_json::json!({
-                "status": recorded.status,
-                "headers": headers,
-                "body": body
-            });
-            return Ok(ToolOutput::success(result, start.elapsed()).with_raw(recorded.body));
-        }
 
         // Determine if this is a simple GET (eligible for redirect following).
         let is_simple_get =
