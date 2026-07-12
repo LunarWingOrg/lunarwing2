@@ -3,6 +3,7 @@
 **Open TODOs (2.0.0.0) — To be done before release**
 
 > **NOTE:** Edit the dev autonomous loop routine to use this file. Ensure each checkbox is checked off in the corresponding branch before committing, pushing, and opening a PR. Items are listed in rough recommended order but are not strictly sequential unless noted.
+> **NOTE:** Ensure that agent can still read file.
 
 ---
 
