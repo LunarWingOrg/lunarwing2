@@ -44,6 +44,7 @@ use crate::channels::web::handlers::routines::{
     routines_summary_handler, routines_toggle_handler, routines_trigger_handler,
 };
 use crate::channels::web::handlers::skills::{
+    skill_patch_approve_handler, skill_patch_reject_handler, skill_patches_list_handler,
     skills_install_handler, skills_list_handler, skills_remove_handler, skills_search_handler,
 };
 use crate::channels::web::log_layer::LogBroadcaster;
@@ -493,6 +494,17 @@ pub async fn start_server(
         .route("/api/skills", get(skills_list_handler))
         .route("/api/skills/search", post(skills_search_handler))
         .route("/api/skills/install", post(skills_install_handler))
+        // B-1: self-improving skills — pending-patch approval surface.
+        // Static `patches` segment precedes the `{name}` delete route.
+        .route("/api/skills/patches", get(skill_patches_list_handler))
+        .route(
+            "/api/skills/patches/{doc_id}/approve",
+            post(skill_patch_approve_handler),
+        )
+        .route(
+            "/api/skills/patches/{doc_id}/reject",
+            post(skill_patch_reject_handler),
+        )
         .route(
             "/api/skills/{name}",
             axum::routing::delete(skills_remove_handler),

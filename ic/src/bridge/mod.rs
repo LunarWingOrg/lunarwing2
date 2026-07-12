@@ -35,6 +35,7 @@ pub use router::{
     get_engine_project,
     get_engine_thread,
     // Action handlers
+    approve_skill_patch,
     handle_approval,
     handle_clear,
     handle_exec_approval,
@@ -46,12 +47,15 @@ pub use router::{
     // Initialization
     init_engine,
     is_engine_v2_enabled,
+    // B-1: self-improving skills — pending-patch approval surface
+    list_pending_skill_patches,
     list_engine_missions,
     list_engine_projects,
     list_engine_thread_events,
     list_engine_thread_steps,
     list_engine_threads,
     pause_engine_mission,
+    reject_skill_patch,
     resolve_engine_auth_callback,
     resolve_gate,
     resume_engine_mission,

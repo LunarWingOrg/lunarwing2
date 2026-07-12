@@ -1,0 +1,17 @@
+name: Push Mirror to GitHub
+on: [push, delete]
+
+jobs:
+  mirror:
+    runs-on: docker
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to GitHub Organization
+        run: |
+          git remote remove github 2>/dev/null || true
+          git remote add github https://chrismcfee:${{ secrets.GH_PAT }}@github.com/LunarWingOrg/lunarwing2.git
+          git push --prune --force --mirror github
