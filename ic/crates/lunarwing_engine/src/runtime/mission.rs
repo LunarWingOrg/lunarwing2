@@ -2936,4 +2936,125 @@ mod tests {
         let out = collect_patch_candidate_skills(&store, &thread).await;
         assert!(out.is_empty());
     }
+
+    // ── B-1 END-TO-END: detection → propose → list → approve/reject ──────
+    //
+    // Exercises the full propose→approve loop across the store + tracker seams
+    // (the layers unit-tested in isolation elsewhere), as one flow. No daemon,
+    // no LLM, no rebuild — just the Rust storage/detection/apply path.
+
+    #[tokio::test]
+    async fn b1_end_to_end_propose_then_approve() {
+        use crate::memory::SkillTracker;
+        use lunarwing_skills::v2::V2SkillMetadata;
+
+        let project_id = ProjectId::new();
+        let store = std::sync::Arc::new(TestStore::new());
+
+        // 1. A below-confidence Trusted skill (2/8 = 0.25) exists and was
+        //    active in a thread that failed.
+        let skill = seed_skill(
+            project_id,
+            "alice",
+            "flaky",
+            lunarwing_skills::SkillTrust::Trusted,
+            8,
+            2,
+            6,
+        );
+        let doc_id = skill.id;
+        store.save_memory_doc(&skill).await.unwrap();
+        let thread = failed_thread_activating(project_id, "alice", vec!["flaky".into()]);
+
+        // 2. DETECTION: the failure payload flags the skill as a patch candidate.
+        let candidates = collect_patch_candidate_skills(store.as_ref(), &thread).await;
+        assert_eq!(candidates.len(), 1, "flaky skill should be flagged");
+        assert_eq!(candidates[0]["name"], "flaky");
+        let cand_id = candidates[0]["doc_id"].as_str().unwrap();
+        assert_eq!(cand_id, doc_id.0.to_string());
+
+        // 3. PROPOSE (what the mission's __propose_skill_patch__ ext-fn does):
+        //    stage a patch — live skill untouched.
+        let tracker = SkillTracker::new(store.clone());
+        tracker
+            .propose_patch(
+                doc_id,
+                "patched skill body".into(),
+                "@@ -1 +1 @@".into(),
+                "flaky told the agent to call a nonexistent tool".into(),
+                Some(thread.id.0.to_string()),
+            )
+            .await
+            .unwrap();
+
+        // 4. LIST (what the GET /api/skills/patches bridge fn reads): the
+        //    proposal is pending, and the live skill has NOT changed yet.
+        let doc = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(doc.metadata.clone()).unwrap();
+        assert_eq!(meta.version, 1, "version unchanged while pending");
+        assert_eq!(doc.content, "skill body", "content unchanged while pending");
+        let pending = meta.pending_patch.expect("a patch is pending");
+        assert_eq!(pending.proposed_content, "patched skill body");
+        assert_eq!(pending.source_thread_id.as_deref(), Some(thread.id.0.to_string().as_str()));
+
+        // 5. APPROVE (what POST .../approve does): apply the patch.
+        tracker.apply_pending_patch(doc_id).await.unwrap();
+
+        // 6. VERIFY: version bumped, content swapped, history recorded with the
+        //    pre-patch metrics snapshot, and metrics EPOCH-RESET so the patched
+        //    skill gets a fair fresh evaluation window.
+        let doc2 = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        assert_eq!(doc2.content, "patched skill body");
+        let meta2: V2SkillMetadata = serde_json::from_value(doc2.metadata).unwrap();
+        assert_eq!(meta2.version, 2);
+        assert_eq!(meta2.parent_version, Some(1));
+        assert!(meta2.pending_patch.is_none(), "pending cleared after apply");
+        assert_eq!(meta2.patch_history.len(), 1);
+        assert_eq!(meta2.patch_history[0].metrics_before.failure_count, 6, "old metrics snapshotted");
+        assert_eq!(meta2.metrics.usage_count, 0, "metrics epoch-reset");
+        assert_eq!(meta2.metrics.failure_count, 0);
+        assert!((meta2.metrics.confidence() - 1.0).abs() < f64::EPSILON, "confidence reset to 1.0");
+
+        // 7. Post-approval: the skill is no longer a patch candidate (fresh slate).
+        let after = collect_patch_candidate_skills(store.as_ref(), &thread).await;
+        assert!(after.is_empty(), "patched skill should not immediately re-flag");
+    }
+
+    #[tokio::test]
+    async fn b1_end_to_end_reject_leaves_skill_untouched() {
+        use crate::memory::SkillTracker;
+        use lunarwing_skills::v2::V2SkillMetadata;
+
+        let project_id = ProjectId::new();
+        let store = std::sync::Arc::new(TestStore::new());
+        let skill = seed_skill(
+            project_id,
+            "alice",
+            "flaky",
+            lunarwing_skills::SkillTrust::Trusted,
+            8,
+            2,
+            6,
+        );
+        let doc_id = skill.id;
+        store.save_memory_doc(&skill).await.unwrap();
+
+        let tracker = SkillTracker::new(store.clone());
+        tracker
+            .propose_patch(doc_id, "new body".into(), String::new(), "reason".into(), None)
+            .await
+            .unwrap();
+
+        // REJECT (what POST .../reject does): discard the pending patch.
+        tracker.discard_pending_patch(doc_id).await.unwrap();
+
+        let doc = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(doc.metadata).unwrap();
+        assert_eq!(doc.content, "skill body", "content untouched on reject");
+        assert_eq!(meta.version, 1, "version untouched on reject");
+        assert!(meta.pending_patch.is_none(), "pending cleared on reject");
+        assert!(meta.patch_history.is_empty(), "no history entry on reject");
+        // Metrics NOT reset — the skill still carries its poor record.
+        assert_eq!(meta.metrics.failure_count, 6);
+    }
 }
