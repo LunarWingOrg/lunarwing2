@@ -80,16 +80,13 @@
 
     CLI pairing approve env var requirement in WeeChat ops guide. Adds troubleshooting section for the 'no pairing file' error caused by LUNARWING_BASE_DIR not being in the tenant user's shell environment. Includes three workarounds: inline env var, sourcing lunarwing.env, and gateway API. Ultraworked with Sisyphus (https://github.com/code-yeongyu/oh-my-openagent). Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
 
-    ---
-
-    WeeChat Services for Multi-Tenant Deployments
+WeeChat Services for Multi-Tenant Deployments
 
     How WeeChat IRC access is managed as init services in LunarWing multi-tenant deployments. Each tenant runs a WeeChat instance in a tmux session plus a Python WebSocket adapter that bridges WeeChat's relay API to an HTTP endpoint polled by the LunarWing WASM channel.
 
     For general multi-tenant setup, see MULTITENANCY-PRODUCTION.md.
 
     Architecture:
-    ```
     WASM channel (poll) ──GET──► ws_adapter.py (port base+9)
                                   │
                                   ▼
@@ -98,7 +95,6 @@
                                   ▼
                          WeeChat relay (port base+5, 127.0.0.1)
     WASM channel (send) ──POST──► WeeChat relay (direct)
-```
 
     Three components per tenant:
     - WeeChat: weechat in tmux — IRC client, runs relay API on 127.0.0.1:<base+5>
@@ -108,9 +104,9 @@
     The adapter script lives at lunarwing_weechat_wss/weechat_relay/ws_adapter.py in the source repo.
 
     Service Dependency Chain:
-    ```
+    
     weechat-<name> → lunarwing-weechat-adapter-<name> → lunarwing-<name>
-```
+
 
     WeeChat must be running before the adapter starts. The adapter must be running before the main daemon starts. The MT admin script wires this automatically via Requires=/After= (systemd) or need/before (OpenRC).
 
@@ -140,7 +136,6 @@
     Units are installed to ~/.config/systemd/user/ per tenant.
 
     weechat-<name>.service:
-    ```ini
     [Unit]
     Description=WeeChat IRC client (<name>)
     After=network.target
@@ -154,7 +149,6 @@
 
     [Install]
     WantedBy=default.target
-```
     Uses Type=forking because tmux daemonizes after creating the session.
 
     lunarwing-weechat-adapter-<name>.service:
@@ -176,14 +170,12 @@
 
     [Install]
     WantedBy=default.target
-```
     The PartOf=lunarwing-<name>.service means stopping the main daemon also stops the adapter.
 
     Main daemon unit (lunarwing-<name>.service) includes WeeChat services in its dependency list:
     ```ini
     After=... weechat-<name>.service lunarwing-weechat-adapter-<name>.service
     Wants=... weechat-<name>.service lunarwing-weechat-adapter-<name>.service
-```
 
     Generated Service Units — OpenRC (system-level):
 
@@ -192,46 +184,36 @@
     /etc/init.d/weechat-<name>: Runs WeeChat in a tmux session via start-stop-daemon. The start() function creates the tmux session; stop() kills it with tmux kill-session. Configurable via conf.d variables: weechat_user, weechat_group, weechat_home.
 
     Dependency wiring:
-    ```
     depend() {
         need net
         use dns
         after firewall
         before lunarwing-weechat-adapter-<name> lunarwing-<name>
     }
-```
 
     /etc/init.d/lunarwing-weechat-adapter-<name>: Uses supervise-daemon with automatic respawn (respawn_delay=5, respawn_max=5, respawn_period=60). Reads env from the tenant's lunarwing.env. Logs to <log_dir>/weechat-adapter.log and <log_dir>/weechat-adapter.err.
 
     Dependency wiring:
-    ```
     depend() {
         need net weechat-<name>
         use dns
         after firewall weechat-<name>
         before lunarwing-<name>
     }
-```
 
     Conf.d for the main daemon (/etc/conf.d/lunarwing-<name>) includes:
-    ```
     lunarwing_rc_need="xmpp-bridge-<name> lunarwing-proxy-<name> weechat-<name> lunarwing-weechat-adapter-<name>"
-```
 
     WeeChat Relay Setup:
 
     After starting the WeeChat service for the first time, the relay must be configured inside WeeChat. Attach to the tmux session and run these commands in WeeChat:
-    ```
     /relay add api <weechat_port>
     /set relay.network.password "<RELAY_PASSWORD>"
     /set relay.network.bind_address "127.0.0.1"
-```
     Replace <weechat_port> with the tenant's allocated relay port (base+5) and <RELAY_PASSWORD> with the value from lunarwing.env.
 
     Save the configuration so it persists across restarts:
-    ```
     /save
-```
 
     Manual Operations — Attach to WeeChat:
 
@@ -241,7 +223,6 @@
     tmux -L weechat-<name> attach -t weechat
     # As root
     sudo -u <name> tmux -L weechat-<name> attach -t weechat
-```
     Detach with Ctrl-b d (standard tmux detach).
 
     Manual Operations — Check service status:
@@ -255,13 +236,11 @@
     # As the tenant user
     systemctl --user status weechat-<name>.service
     systemctl --user status lunarwing-weechat-adapter-<name>.service
-```
 
     OpenRC:
     ```bash
     rc-service weechat-<name> status
     rc-service lunarwing-weechat-adapter-<name> status
-```
 
     Manual Operations — View logs:
 
@@ -271,13 +250,11 @@
       journalctl --user -u weechat-<name>.service -f
     sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
       journalctl --user -u lunarwing-weechat-adapter-<name>.service -f
-```
 
     OpenRC:
     ```bash
     tail -f /home/<name>/lunarwing/logs/weechat.log
     tail -f /home/<name>/lunarwing/logs/weechat-adapter.log
-```
 
     Manual Operations — Restart services:
 
@@ -287,20 +264,17 @@
     ```bash
     sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
       systemctl --user restart weechat-<name>.service
-```
 
     OpenRC:
     ```bash
     rc-service weechat-<name> restart
     rc-service lunarwing-weechat-adapter-<name> restart
-```
 
     Adding WeeChat to an Existing Tenant:
 
     If a tenant was created before WeeChat services were added, re-render units and add the environment variables manually.
 
     Add env vars to lunarwing.env:
-    ```bash
     # Get the tenant's WeeChat ports
     sudo ic/scripts/lunarwing-mt-admin.sh status <name>
     # Edit the env file (as the tenant user or root)
@@ -310,29 +284,23 @@
     ADAPTER_PORT=<weechat_adapter_port>
     WEECHAT_ADAPTER_PORT=<weechat_adapter_port>
     WS_ADAPTER_URL=http://127.0.0.1:<weechat_adapter_port>
-```
 
     RELAY_URL, WS_ADAPTER_URL, and RELAY_PASSWORD are what the in-process WASM channel reads — omitting WS_ADAPTER_URL makes the channel poll the hardcoded :6681 default. mt-admin patch-env <name> adds WS_ADAPTER_URL (and RELAY_URL if missing) idempotently.
 
     Generate a relay password:
-    ```bash
     openssl rand -hex 16
-```
 
     Create WeeChat config directory:
     ```bash
     sudo -u <name> mkdir -p /home/<name>/.config/weechat
-```
 
     Re-render service units:
-    ```bash
     # Stop the tenant first
     sudo ic/scripts/lunarwing-mt-admin.sh stop-tenant <name>
     # Re-render (regenerates all units including WeeChat)
     sudo ic/scripts/lunarwing-mt-admin.sh render-units <name>
     # Reload and start
     sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <name>
-```
 
     Configure the WeeChat relay: Attach to the tmux session and run the relay setup commands (see WeeChat Relay Setup above).
 
@@ -360,12 +328,10 @@
       systemctl --user restart weechat-<name>.service
     # OpenRC
     rc-service weechat-<name> restart
-```
 
     If the tmux socket file is stale (exists but no server), remove it first:
     ```bash
     rm -f /tmp/tmux-$(id -u <name>)/weechat-<name>
-```
 
     Troubleshooting — WASM channel reports no messages:
 
@@ -381,7 +347,6 @@
     The RELAY_PASSWORD in lunarwing.env must exactly match the value set inside WeeChat via /set relay.network.password. Attach to WeeChat and verify:
     ```
     /set relay.network.password
-```
     If they differ, update one to match the other and restart the adapter.
 
     Troubleshooting — CLI pairing approve fails with "no pairing file":
@@ -391,7 +356,6 @@
     The CLI resolves the pairing store from LUNARWING_BASE_DIR. In multi-tenant deployments this is set per-tenant in lunarwing.env (typically /home/<name>/lunarwing/state), but it is not exported into the tenant user's shell environment. Running sudo -u <name> lunarwing pairing approve ... without that variable causes the CLI to look in the wrong directory.
 
     Either source the env file first, or pass LUNARWING_BASE_DIR explicitly:
-    ```bash
     # Option A: pass the variable inline
     sudo -u <name> LUNARWING_BASE_DIR=/home/<name>/lunarwing/state \
       lunarwing pairing approve weechat <CODE>
@@ -401,16 +365,12 @@
       source /home/<name>/lunarwing/env/lunarwing.env
       set +a
       lunarwing pairing approve weechat <CODE>
-    '
-```
 
     Alternatively, use the gateway API (no env vars needed):
-    ```bash
     curl -sf -X POST http://127.0.0.1:<gateway_port>/api/pairing/weechat/approve \
       -H "Authorization: Bearer <GATEWAY_AUTH_TOKEN>" \
       -H "Content-Type: application/json" \
       -d '{"code":"<CODE>"}'
-```
 
     </details>
 
