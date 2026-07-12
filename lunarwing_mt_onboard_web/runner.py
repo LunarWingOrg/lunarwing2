@@ -11,6 +11,7 @@ re-implemented here.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -96,6 +97,60 @@ def _finish(job: Job, audit: AuditLogger, summary: list[dict]) -> None:
     audit.finish(ok)
 
 
+def _read_gateway_auth_token(tenant: str, *, demo: bool) -> str | None:
+    """Return GATEWAY_AUTH_TOKEN for *tenant* after add-tenant, or None.
+
+    Demo mode never writes a real env file, so a stable fake token is returned
+    so the UI can still exercise the credentials reveal path.
+    """
+    if demo:
+        return f"demo-gateway-token-{tenant}"
+    try:
+        env = secrets_ops.parse_tenant_env(tenant)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    token = (env.get("GATEWAY_AUTH_TOKEN") or "").strip()
+    return token or None
+
+
+def _read_gateway_port(tenant: str, *, demo: bool, fallback: int = 0) -> int:
+    """Resolve the tenant gateway port from ports.json (or a demo stand-in)."""
+    if demo:
+        return int(fallback) if fallback else 10000
+    if fallback:
+        return int(fallback)
+    try:
+        with open("/etc/lunarwing/ports.json", encoding="utf-8") as fh:
+            data = json.load(fh)
+        ports = (data.get("tenants") or {}).get(tenant, {}).get("ports") or {}
+        port = ports.get("gateway")
+        return int(port) if port else 0
+    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 0
+
+
+def _emit_gateway_auth_token(
+    job: Job, audit: AuditLogger, tenant: str, *, host: str, port: int
+) -> None:
+    """Surface the gateway Web UI bearer token once the env file exists."""
+    token = _read_gateway_auth_token(tenant, demo=job.demo)
+    if not token:
+        job.emit(
+            type="log",
+            line="gateway auth token unavailable (not found in tenant env)",
+        )
+        audit.note("gateway auth token unavailable after add-tenant")
+        return
+    resolved_port = _read_gateway_port(tenant, demo=job.demo, fallback=port)
+    job.emit(
+        type="gateway_auth_token",
+        token=token,
+        host=host or "127.0.0.1",
+        port=resolved_port,
+    )
+    audit.note("emitted gateway auth token to UI (value redacted)")
+
+
 # --------------------------------------------------------------------------- #
 # Provision
 # --------------------------------------------------------------------------- #
@@ -160,6 +215,16 @@ def run_provision_job(job: Job, req: ProvisionRequest, *, log_dir: str | None = 
             job.emit(type="log", line=f"inject-secrets error: {exc}")
             summary.append({"name": "inject-secrets", "ok": False, "code": 1})
             return _finish(job, audit, summary)
+
+        # GATEWAY_AUTH_TOKEN is minted by add-tenant into lunarwing.env — show it
+        # once the env is in place so operators can open the gateway Web UI.
+        _emit_gateway_auth_token(
+            job,
+            audit,
+            cfg.name,
+            host=cfg.gateway_host,
+            port=cfg.gateway_port,
+        )
 
         # build-tenant (+ darkirc)
         if not req.skip_build:

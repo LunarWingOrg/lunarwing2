@@ -202,6 +202,13 @@ class DemoProvisionIntegrationTests(unittest.TestCase):
         phases = [e["name"] for e in events if e.get("type") == "phase"]
         self.assertIn("add-tenant", phases)
         self.assertIn("build-tenant", phases)
+        # credentials revealed during provision
+        self.assertTrue(any(e.get("type") == "master_key" for e in events), events)
+        gat = [e for e in events if e.get("type") == "gateway_auth_token"]
+        self.assertTrue(gat, events)
+        self.assertTrue(gat[0].get("token"), gat[0])
+        self.assertEqual(gat[0].get("host"), "127.0.0.1")
+        self.assertEqual(gat[0].get("port"), 10000)
         done = [e for e in events if e.get("type") == "done"]
         self.assertTrue(done and done[-1]["ok"], f"expected success, got {done}")
         self.assertTrue(job.ok)
@@ -220,7 +227,7 @@ class DemoProvisionIntegrationTests(unittest.TestCase):
         job = Job(id="test3", mode="secrets", demo=True)
         secret_value = "sup3r-s3cret-v4lue-xyz"
         self.runner.run_secret_job(
-            job, SecretRequest(tenant="sphinx", name="openai_api_key", value=secret_value), log_dir=self.tmp
+            job, SecretRequest(tenant="sphinx", name="gotify_app_token", value=secret_value), log_dir=self.tmp
         )
         events = _drain(job.queue)
         self.assertTrue(any(e.get("type") == "secret_stored" for e in events))
@@ -311,3 +318,12 @@ class ImportUiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SecretsUiTests(unittest.TestCase):
+    def test_secret_name_placeholder_is_gotify_app_token(self) -> None:
+        wizard = Path(__file__).resolve().parent / "static" / "js" / "wizard.js"
+        text = wizard.read_text()
+        self.assertIn("gotify_app_token", text)
+        self.assertNotIn("openai_api_key", text)
+

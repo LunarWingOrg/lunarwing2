@@ -132,13 +132,48 @@
       }
     }
 
-    function masterKey(key) {
+    function ensureCredBox() {
       el.masterKeyBox.classList.remove('hidden');
-      el.masterKeyBox.innerHTML =
-        '<h4>⚠ Secrets master key — shown once</h4>' +
-        '<code></code>' +
-        '<div class="warn">Store this now. It decrypts this tenant\'s secrets and is not recoverable.</div>';
-      el.masterKeyBox.querySelector('code').textContent = key;
+      if (!el.masterKeyBox.querySelector('.cred-list')) {
+        el.masterKeyBox.innerHTML =
+          '<h4>⚠ Tenant credentials — shown once</h4>' +
+          '<div class="cred-list"></div>' +
+          '<div class="warn">Store these now. The secrets master key decrypts this tenant\'s vault and is not recoverable. The gateway Web UI token is the bearer used to open the tenant dashboard.</div>';
+      }
+      return el.masterKeyBox.querySelector('.cred-list');
+    }
+
+    function upsertCred(list, key, title, value, note) {
+      let row = list.querySelector('[data-cred="' + key + '"]');
+      if (!row) {
+        row = document.createElement('div');
+        row.className = 'cred-row';
+        row.dataset.cred = key;
+        row.innerHTML =
+          '<div class="cred-title"></div>' +
+          '<code></code>' +
+          (note ? '<div class="cred-note"></div>' : '');
+        list.appendChild(row);
+      }
+      row.querySelector('.cred-title').textContent = title;
+      row.querySelector('code').textContent = value;
+      const noteEl = row.querySelector('.cred-note');
+      if (noteEl) noteEl.textContent = note || '';
+    }
+
+    function masterKey(key) {
+      const list = ensureCredBox();
+      upsertCred(list, 'master_key', 'Secrets master key', key, '');
+    }
+
+    function gatewayAuthToken(ev) {
+      const list = ensureCredBox();
+      const host = (ev && ev.host) || '127.0.0.1';
+      const port = ev && ev.port ? Number(ev.port) : 0;
+      const note = port
+        ? 'Gateway Web UI: http://' + host + ':' + port + '/  (Authorization: Bearer <token>)'
+        : 'Gateway Web UI bearer token (port not yet known — check mt-admin tokens)';
+      upsertCred(list, 'gateway_auth_token', 'Gateway Web UI token', (ev && ev.token) || '', note);
     }
 
     function finalize(ok, phases, cancelled) {
@@ -201,6 +236,6 @@
       finalize(false, [], false);
     }
 
-    return { reset, phase, log, verify, masterKey, done, error };
+    return { reset, phase, log, verify, masterKey, gatewayAuthToken, done, error };
   };
 })();

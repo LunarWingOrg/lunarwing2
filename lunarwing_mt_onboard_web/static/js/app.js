@@ -155,6 +155,9 @@
       case 'master_key':
         panel.masterKey(ev.key);
         break;
+      case 'gateway_auth_token':
+        panel.gatewayAuthToken(ev);
+        break;
       case 'secret_stored':
         panel.log('secret stored: ' + ev.name);
         break;
