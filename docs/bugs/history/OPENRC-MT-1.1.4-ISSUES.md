@@ -3,8 +3,8 @@
 **Context.** The OpenRC/Gentoo multi-tenant path (rootless-podman + per-tenant OpenRC init
 scripts + host-global ICHC/self-heal via fcron) is the **experimental leg** (see
 `docs/ops/MULTITENANCY-PRODUCTION.md`; the systemd leg was hardened first in
-`docs/bugs/SYSTEMD-MT-1.1.4-ISSUES.md`). This doc records the 1.1.4 pre-release pass on the
-**Gentoo/OpenRC/podman** host `eris` (goals 6 & 8 in `docs/ops/GOALS_1.1.4.md`): a **full
+`docs/bugs/history/SYSTEMD-MT-1.1.4-ISSUES.md`). This doc records the 1.1.4 pre-release pass on the
+**Gentoo/OpenRC/podman** host `eris` (goals 6 & 8 in `docs/ops/history/GOALS_1.1.4.md`): a **full
 teardown to a clean slate** (all tenants + all images removed) followed by a **fresh
 provision** of tenant `snapfeather`.
 
@@ -14,6 +14,10 @@ Tenants `zeus`/`creamheart` (uids 1000/1001) torn down with `remove-tenant --pur
 tenant `snapfeather` provisioned — and **reused creamheart's uid 1001**, which surfaced O1.
 
 **Status legend:** 🔴 open · 🟡 workaround applied, code fix pending · 🟢 fixed (code)
+
+**Current-document note (2026-07-12):** the O1-O5 sections below preserve the
+original discovery narrative. Their "proposed fix" paragraphs are historical;
+the summary and current checks at the end are authoritative for this v2 tree.
 
 ---
 
@@ -237,7 +241,7 @@ installed). Matches systemd F7 (telegram unsupported).
 
 ---
 
-## Validation status — COMPLETE ✓ (goal #6: fresh OpenRC tenant, 8/8 all-green)
+## Validation status — COMPLETE (historical live pass; current source cross-check)
 
 - **Teardown → clean slate:** ✓ both tenants + all images removed; 22 GB reclaimed; health
   pipeline retired; **no F6 orphans**.
@@ -261,5 +265,18 @@ installed). Matches systemd F7 (telegram unsupported).
 **Minor note.** `logs/lunarwing.log` is 0 bytes under OpenRC `supervise-daemon` (daemon stdout
 is routed elsewhere); DB-connected + migrated is confirmed indirectly by the daemon serving
 authenticated `/api/gateway/status` with all channels healthy.
-</content>
-</invoke>
+
+### Current source cross-check (2026-07-12)
+
+- Stale UID cleanup remains in `ic/scripts/lunarwing-mt-admin.sh:1470-1520,1634-1685`.
+- Podman worker builds use `--network=host --format docker`
+  (`lunarwing-mt-admin.sh:1932-2001`).
+- OpenRC started-state gating is present in
+  `ic-infrastructure-health-check/health-openrc.sh:98-181`, with regression
+  coverage in `ic-infrastructure-health-check/tests/test-health-openrc.sh`.
+- The fully-qualified `PG_IMAGE` default is at
+  `ic/scripts/lunarwing-mt-admin.sh:81`.
+
+No live OpenRC provisioning or Cargo command was run for this documentation
+audit; status is source-verified, with the historical 8/8 run retained as
+provenance.
