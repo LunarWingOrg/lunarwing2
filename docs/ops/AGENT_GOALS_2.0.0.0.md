@@ -152,7 +152,6 @@ WeeChat Services for Multi-Tenant Deployments
     Uses Type=forking because tmux daemonizes after creating the session.
 
     lunarwing-weechat-adapter-<name>.service:
-    ```ini
     [Unit]
     Description=LunarWing WeeChat WS adapter (<name>)
     After=network.target weechat-<name>.service
@@ -173,7 +172,6 @@ WeeChat Services for Multi-Tenant Deployments
     The PartOf=lunarwing-<name>.service means stopping the main daemon also stops the adapter.
 
     Main daemon unit (lunarwing-<name>.service) includes WeeChat services in its dependency list:
-    ```ini
     After=... weechat-<name>.service lunarwing-weechat-adapter-<name>.service
     Wants=... weechat-<name>.service lunarwing-weechat-adapter-<name>.service
 
@@ -218,7 +216,6 @@ WeeChat Services for Multi-Tenant Deployments
     Manual Operations — Attach to WeeChat:
 
     Each tenant's WeeChat runs in a named tmux socket:
-    ```bash
     # As the tenant user
     tmux -L weechat-<name> attach -t weechat
     # As root
@@ -228,7 +225,6 @@ WeeChat Services for Multi-Tenant Deployments
     Manual Operations — Check service status:
 
     Systemd:
-    ```bash
     # As root (for any tenant)
     sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
       systemctl --user status weechat-<name>.service \
@@ -238,21 +234,18 @@ WeeChat Services for Multi-Tenant Deployments
     systemctl --user status lunarwing-weechat-adapter-<name>.service
 
     OpenRC:
-    ```bash
     rc-service weechat-<name> status
     rc-service lunarwing-weechat-adapter-<name> status
 
     Manual Operations — View logs:
 
     Systemd:
-    ```bash
     sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
       journalctl --user -u weechat-<name>.service -f
     sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
       journalctl --user -u lunarwing-weechat-adapter-<name>.service -f
 
     OpenRC:
-    ```bash
     tail -f /home/<name>/lunarwing/logs/weechat.log
     tail -f /home/<name>/lunarwing/logs/weechat-adapter.log
 
@@ -261,12 +254,10 @@ WeeChat Services for Multi-Tenant Deployments
     Restart WeeChat and the adapter together (the dependency chain handles ordering):
 
     Systemd:
-    ```bash
     sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
       systemctl --user restart weechat-<name>.service
 
     OpenRC:
-    ```bash
     rc-service weechat-<name> restart
     rc-service lunarwing-weechat-adapter-<name> restart
 
@@ -291,7 +282,6 @@ WeeChat Services for Multi-Tenant Deployments
     openssl rand -hex 16
 
     Create WeeChat config directory:
-    ```bash
     sudo -u <name> mkdir -p /home/<name>/.config/weechat
 
     Re-render service units:
@@ -322,7 +312,6 @@ WeeChat Services for Multi-Tenant Deployments
     Symptom: tmux -L weechat-<name> list-sessions returns "no server running" or "no sessions".
 
     Restart the WeeChat service:
-    ```bash
     # Systemd
     sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
       systemctl --user restart weechat-<name>.service
@@ -330,7 +319,6 @@ WeeChat Services for Multi-Tenant Deployments
     rc-service weechat-<name> restart
 
     If the tmux socket file is stale (exists but no server), remove it first:
-    ```bash
     rm -f /tmp/tmux-$(id -u <name>)/weechat-<name>
 
     Troubleshooting — WASM channel reports no messages:
@@ -345,7 +333,6 @@ WeeChat Services for Multi-Tenant Deployments
 
     Symptom: Adapter connects but authentication fails.
     The RELAY_PASSWORD in lunarwing.env must exactly match the value set inside WeeChat via /set relay.network.password. Attach to WeeChat and verify:
-    ```
     /set relay.network.password
     If they differ, update one to match the other and restart the adapter.
 
