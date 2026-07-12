@@ -75,7 +75,7 @@
     </details>
 
 14. [ ] Verify (only) if the information below is accurate, then write up a document in docs/ops detailing the status: is each piece verifiable? what outstanding issues remain? which points have already been addressed? Refer to infodump file located at: `docs/ops/WEECHAT_SERVICES_FOR_MT_INFODUMP.md`
-15. [ ] dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md
+15. [ ] dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branch already DONE: slopdarkirc1/codex/upgrade/v2.0.0.0 - stage 1 of the plan is already complete. you can continue to work on stages 2, 3, and 4. You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md
 16. [ ] memory_impl: implement third party memory cleaning, de-duping, correction routines into project. I've created several advanced memory de-duplication routines on my own which are being used across three production agents (on 1.1.2). My goal is to either integrate these routines into LunarWing directly, or make it easy for new users to import them. I'll look into adding more to this idea in this issue at some point. kind of just a stub for the timebeing. ** For this task I want you to help plan it out. Write up a doc in docs/proposals **
 17. [x] Work on integrated testing routing - checked this off because not giving auto-dev-loop permission for this
 18. [ ] MCP additions: (please reference the following branch for a hint on getting started, old failed implementations from previous opencode/codex workers: faility/failed-partial-old-item-3-20260711-0601 AND slopmcp1/codex/upgrade/v2.0.0.0) - There are two sections below. You must read BOTH of them (as well as reference the old failed implementation from previous failed opencode worker). Once you have, follow the following instructions: One of the sections is `Recommended List — Pick ONE, implement it, check off item 18` Pick ONE from the `Recommended List — Pick ONE, implement it, check off item 18` list below, implement it, check off this box. Two Informational Sections following this sentence:
@@ -105,19 +105,19 @@
 
     Recommended Next:
 
-    1. MCP deactivate/re-enable
+    MCP deactivate/re-enable
        - Stop the child, unregister its tools, and preserve configuration.
        - Persist enabled = false so restart does not relaunch it.
        - Add tool_deactivate, API, and web controls.
        - This completes the lifecycle without involving WASM or workers.
 
-    2. Diagnostics and command preflight
+       Diagnostics and command preflight
        - Extend doctor/status with transport, enabled state, and executable availability.
        - Validate absolute commands or resolve commands through PATH.
        - Report spawn and negotiation failures in the installed-extension response.
        - Do not execute anything during installation.
 
-    3. Registry validation
+       Registry validation
        - Add a validation test or registry validate command covering:
          - exactly one of url or transport
          - valid stdio command/args/env
@@ -125,12 +125,12 @@
          - duplicate names and unsupported transport types
        - This is almost entirely isolated to registry code and CI.
 
-    4. In-place configuration updates
+       In-place configuration updates
        - Let users edit command, args, env, or URL without remove/reinstall.
        - If active, require explicit restart confirmation.
        - Preserve existing registry precedence and approval rules.
 
-    5. Focused integration coverage
+       Focused integration coverage
        - Exercise the real install API through the router.
        - Verify install → list → activate failure reporting → deactivate → remove.
        - Add a browser-level check for HTTP/stdio mode switching and mobile layout.
