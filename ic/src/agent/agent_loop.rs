@@ -1301,6 +1301,25 @@ impl Agent {
             }
         }
 
+        // Engine V2 (parallel deployment, Strategy C): when ENGINE_V2=true, route
+        // plain user input through the v2 engine instead of the legacy loop.
+        // Gated to UserInput ONLY — commands, approvals, interrupts, and
+        // auth-token submissions stay on the legacy path (the engine handles its
+        // own approval/auth flows internally, and control submissions must not be
+        // rerouted). With the flag off this is a no-op and behavior is identical
+        // to the legacy path. The engine manages its own threads via
+        // conversation_scope, so we branch BEFORE legacy session/thread resolution.
+        if let Submission::UserInput { ref content } = submission {
+            if crate::bridge::is_engine_v2_enabled() {
+                tracing::debug!(
+                    message_id = %message.id,
+                    user_id = %message.user_id,
+                    "ENGINE_V2 enabled — routing user input through engine v2"
+                );
+                return crate::bridge::handle_with_engine(self, message, content).await;
+            }
+        }
+
         // Hydrate thread from DB if it's a historical thread not in memory
         if let Some(external_thread_id) = message.conversation_scope() {
             tracing::trace!(
