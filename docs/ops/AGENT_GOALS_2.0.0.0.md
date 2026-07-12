@@ -420,7 +420,7 @@
 
 15. [ ] dark irc key exchange. automate the process secruely. ** For this task I want you to help plan it out. Write up a doc in docs/proposals **
 16. [ ] memory_impl: implement third party memory cleaning, de-duping, correction routines into project. I've created several advanced memory de-duplication routines on my own which are being used across three production agents (on 1.1.2). My goal is to either integrate these routines into LunarWing directly, or make it easy for new users to import them. I'll look into adding more to this idea in this issue at some point. kind of just a stub for the timebeing. ** For this task I want you to help plan it out. Write up a doc in docs/proposals **
-17. [x] Work on integrated testing routing with Christopher as it will become very important for us (do not resume the routine without permission)
+17. [x] Work on integrated testing routing - checked this off because not giving auto-dev-loop permission for this
 18. [ ] MCP additions: (please reference the following branch for a hint on getting started, old failed implementation from previous opencode worker: faility/failed-partial-old-item-3-20260711-0601) Pick ONE from the recommended list below, implement it, check off this box.
 
     <details>
