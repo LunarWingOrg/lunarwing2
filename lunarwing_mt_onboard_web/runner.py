@@ -228,7 +228,7 @@ def run_provision_job(job: Job, req: ProvisionRequest, *, log_dir: str | None = 
 
         # build-tenant (+ darkirc)
         if not req.skip_build:
-            announce("build-tenant", "Building tenant — cargo + worker images (can take 20-40 min)")
+            announce("build-tenant", "Building tenant — cargo + worker images (can take 20-50 min or even longer on some low-end hardware)")
             rc = _run_phase(job, provisioner.build_build_tenant_args(cfg), "build-tenant", audit)
             summary.append({"name": "build-tenant", "ok": rc == 0, "code": rc})
             if _halt(job, rc):
@@ -242,7 +242,7 @@ def run_provision_job(job: Job, req: ProvisionRequest, *, log_dir: str | None = 
 
         # start-tenant + verify
         if not req.skip_start:
-            announce("start-tenant", f"Starting '{cfg.name}'")
+            announce("start-tenant", f"Starting '{cfg.name}' (this step can take exceptionally long on lower-end disk drives)")
             rc = _run_phase(job, provisioner.build_start_tenant_args(cfg), "start-tenant", audit)
             summary.append({"name": "start-tenant", "ok": rc == 0, "code": rc})
             if _halt(job, rc):

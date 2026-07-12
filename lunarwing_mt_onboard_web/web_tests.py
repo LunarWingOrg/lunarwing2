@@ -327,3 +327,34 @@ class SecretsUiTests(unittest.TestCase):
         self.assertIn("gotify_app_token", text)
         self.assertNotIn("openai_api_key", text)
 
+
+class MascotSpriteTests(unittest.TestCase):
+    def test_all_six_mascot_gifs_present(self) -> None:
+        mascot = Path(__file__).resolve().parent / "static" / "mascot"
+        for name in (
+            "lunar_walk.gif",
+            "lunar_jump.gif",
+            "lunar_sleep.gif",
+            "lunar_rage.gif",
+            "lunar_greet.gif",
+            "lunar_sup.gif",
+        ):
+            self.assertTrue((mascot / name).is_file(), f"missing mascot sprite: {name}")
+
+    def test_bat_js_wires_greet_and_sup_moods(self) -> None:
+        bat = Path(__file__).resolve().parent / "static" / "js" / "bat.js"
+        text = bat.read_text()
+        # both new moods mapped to files
+        self.assertIn("greet: 'lunar_greet.gif'", text)
+        self.assertIn("sup: 'lunar_sup.gif'", text)
+        # one-shot API exported and event moods kept out of the idle rotation
+        self.assertIn("greet,", text)
+        self.assertIn("celebrate,", text)
+        self.assertIn("IDLE_MOODS = ['content', 'excited', 'sleeping']", text)
+
+    def test_app_js_triggers_greet_and_celebrate(self) -> None:
+        app = Path(__file__).resolve().parent / "static" / "js" / "app.js"
+        text = app.read_text()
+        self.assertIn("bat.greet()", text)
+        self.assertIn("bat.celebrate()", text)
+
