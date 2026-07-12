@@ -1,9 +1,9 @@
 """Demo / simulation mode.
 
-Demo mode points the four ``LUNARWING_*_SCRIPT`` env vars at bundled fake
-shell scripts that emit realistic ``=== phase ===`` output with sleeps. This
-exercises the *real* provisioner/upgrade/export code paths end-to-end with no
-sudo and zero system impact.
+Demo mode points five ``LUNARWING_*`` script-path environment variables at
+bundled fake shell scripts that emit realistic ``=== phase ===`` output with
+sleeps. This exercises the *real* provisioner/upgrade/export/import code paths
+end-to-end with no sudo and zero system impact.
 
 Two things can't be faked purely by swapping scripts, so we patch them:
   * ``provisioner._inject_secrets`` writes to /home/<tenant>/... which doesn't
@@ -25,6 +25,7 @@ _DEMO_ENV = {
     "LUNARWING_UPGRADE_SCRIPT": SCRIPTS_DIR / "fake-upgrade.sh",
     "LUNARWING_PREFLIGHT_SCRIPT": SCRIPTS_DIR / "fake-preflight.sh",
     "LUNARWING_EXPORT_SCRIPT": SCRIPTS_DIR / "fake-export.sh",
+    "LUNARWING_IMPORT_SCRIPT": SCRIPTS_DIR / "fake-import.sh",
 }
 
 # Module globals in the parent package captured LUNARWING_*_SCRIPT at import
@@ -34,6 +35,7 @@ _PATCH_TARGETS = [
     ("lunarwing_mt_onboard.upgrade", "UPGRADE_SCRIPT", "LUNARWING_UPGRADE_SCRIPT"),
     ("lunarwing_mt_onboard.upgrade", "PREFLIGHT_SCRIPT", "LUNARWING_PREFLIGHT_SCRIPT"),
     ("lunarwing_mt_onboard.export", "EXPORT_SCRIPT", "LUNARWING_EXPORT_SCRIPT"),
+    ("lunarwing_mt_onboard.import_tenant", "IMPORT_SCRIPT", "LUNARWING_IMPORT_SCRIPT"),
 ]
 
 _DEMO_FLAG = "LUNARWING_ONBOARD_WEB_DEMO"

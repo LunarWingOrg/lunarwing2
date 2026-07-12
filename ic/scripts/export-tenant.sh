@@ -90,18 +90,41 @@ if [[ "$DBURL" == postgres://* ]]; then
 fi
 
 # Find which runtime actually owns the container (don't assume podman-first).
+# For rootless podman, containers live in the tenant user's storage — root
+# can't see them, so we must probe as the tenant user (matching mt-admin's
+# _ctr pattern).
 PG="lunarwing-pg-$TENANT"
+
+# Run a container command as the tenant user when rootless podman is in use.
+_ctr() {
+  local name="$TENANT"
+  local uid home
+  uid="$(id -u "$name")" || die "cannot resolve uid for tenant '$name'"
+  home="$(getent passwd "$name" | cut -d: -f6)"
+  ( cd / && exec sudo -u "$name" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" "$@" )
+}
+
 pick_runtime() {
   if [[ -n "${LUNARWING_CONTAINER_RUNTIME:-}" ]]; then echo "$LUNARWING_CONTAINER_RUNTIME"; return 0; fi
   local rt
+  # First try root-visible containers (rootful docker/podman)
   for rt in podman docker; do
     command -v "$rt" >/dev/null 2>&1 || continue
     "$rt" inspect "$PG" >/dev/null 2>&1 && { echo "$rt"; return 0; }
   done
+  # Fall back to rootless podman as the tenant user
+  if command -v podman >/dev/null 2>&1; then
+    _ctr podman inspect "$PG" >/dev/null 2>&1 && { echo "podman"; return 0; }
+  fi
   return 1
 }
 RUNTIME="$(pick_runtime || true)"
 [[ -n "$RUNTIME" ]] || die "could not find container '$PG' in podman or docker — is the tenant's PostgreSQL container present on this host? (set LUNARWING_CONTAINER_RUNTIME to force)"
+
+# Determine if the tenant's containers are rootless (need _ctr wrapper).
+_is_rootless() {
+  "$RUNTIME" inspect "$PG" >/dev/null 2>&1 && return 1 || return 0
+}
 
 SRC_VER="$(sudo -u "$TENANT" git -C "$LWROOT" describe --tags --always 2>/dev/null || echo unknown)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -141,10 +164,18 @@ banner "2/5  Database (pg_dump -Fc)"
 if $DRY_RUN; then
   note "[dry-run] would: $RUNTIME exec $PG pg_dump -U $PG_ROLE -Fc $PG_DB > db.dump (then verify PGDMP)"
 else
-  "$RUNTIME" inspect -f '{{.State.Running}}' "$PG" 2>/dev/null | grep -q true \
-    || die "DB container $PG is not running — start just the PG container so pg_dump can run, then re-export"
-  ( umask 077; "$RUNTIME" exec "$PG" pg_dump -U "$PG_ROLE" -Fc "$PG_DB" > "$WORK/db.dump" ) \
-    || die "pg_dump failed (role=$PG_ROLE db=$PG_DB) — check the names parsed from DATABASE_URL"
+  ROOTLESS="$(_is_rootless && echo true || echo false)"
+  if [[ "$ROOTLESS" == "true" ]]; then
+    _ctr podman inspect -f '{{.State.Running}}' "$PG" 2>/dev/null | grep -q true \
+      || die "DB container $PG is not running — start just the PG container so pg_dump can run, then re-export"
+    ( umask 077; _ctr podman exec "$PG" pg_dump -U "$PG_ROLE" -Fc "$PG_DB" > "$WORK/db.dump" ) \
+      || die "pg_dump failed (role=$PG_ROLE db=$PG_DB) — check the names parsed from DATABASE_URL"
+  else
+    "$RUNTIME" inspect -f '{{.State.Running}}' "$PG" 2>/dev/null | grep -q true \
+      || die "DB container $PG is not running — start just the PG container so pg_dump can run, then re-export"
+    ( umask 077; "$RUNTIME" exec "$PG" pg_dump -U "$PG_ROLE" -Fc "$PG_DB" > "$WORK/db.dump" ) \
+      || die "pg_dump failed (role=$PG_ROLE db=$PG_DB) — check the names parsed from DATABASE_URL"
+  fi
   [[ "$(head -c5 "$WORK/db.dump")" == "PGDMP" ]] || die "pg_dump output is not a valid PGDMP archive"
   [[ "$(stat -c%s "$WORK/db.dump")" -gt 0 ]] || die "pg_dump produced an empty file"
   say "  db.dump: $(du -h "$WORK/db.dump" | cut -f1) (verified PGDMP)"

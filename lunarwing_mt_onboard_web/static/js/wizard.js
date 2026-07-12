@@ -1,4 +1,4 @@
-/* Form builder for the four modes. Provision is a multi-step wizard; the
+/* Form builder for the five modes. Provision is a multi-step wizard; the
    others are single compact forms. Calls opts.onRun(mode, payload) to launch. */
 (function () {
   const LW = (window.LW = window.LW || {});
@@ -304,6 +304,42 @@
     ), 'export', opts);
   }
 
+  function mountImport(host, opts) {
+    simpleForm(host, 'Import a tenant', 'stage-only by default; start requires old host stopped', (b, data) => {
+      Object.assign(data, {
+        bundle: '', name: '', apply: false, start: false, old_stopped: false, force: false,
+        with_opencode: false, with_toolchains: false, with_nanocode: false,
+        with_pebble: false, with_vision: false, docker_group: false,
+        tensorzero_url: '', owner_scope: '',
+      });
+      b.appendChild(textField(data, 'bundle', 'Migration bundle path', { placeholder: '/var/lib/lunarwing-migrate/tenant.tar' }));
+      b.appendChild(textField(data, 'name', 'Tenant name override (optional)', { placeholder: 'sphinx-new' }));
+      b.appendChild(checkField(data, 'apply', 'Apply import (unchecked = dry-run)'));
+      b.appendChild(checkField(data, 'start', 'Start restored tenant (--start)'));
+      b.appendChild(checkField(data, 'old_stopped', 'Confirm old host stopped (--old-stopped)'));
+      b.appendChild(checkField(data, 'force', 'Force import (--force)'));
+      const workers = h('div', { class: 'subgroup' });
+      workers.appendChild(checkField(data, 'with_opencode', 'Build opencode worker'));
+      workers.appendChild(checkField(data, 'with_toolchains', 'Include worker toolchains'));
+      workers.appendChild(checkField(data, 'with_nanocode', 'Build nanocode worker'));
+      workers.appendChild(checkField(data, 'with_pebble', 'Build pebble worker'));
+      workers.appendChild(checkField(data, 'with_vision', 'Restore LunarVision'));
+      workers.appendChild(checkField(data, 'docker_group', 'Add tenant user to docker/podman group'));
+      b.appendChild(workers);
+      b.appendChild(textField(data, 'tensorzero_url', 'TensorZero upstream URL (optional)', {}));
+      b.appendChild(textField(data, 'owner_scope', 'Legacy owner scope (optional)', {}));
+    }, 'Run import', Object.assign(
+      (data) => ({
+        ...data,
+        bundle: data.bundle.trim(),
+        name: data.name.trim(),
+        tensorzero_url: data.tensorzero_url.trim(),
+        owner_scope: data.owner_scope.trim(),
+      }),
+      { validate: (d) => (!d.bundle.trim() ? 'bundle path is required' : d.name.trim() ? validateName(d.name.trim()) : null) }
+    ), 'import', opts);
+  }
+
   function mountSecrets(host, opts) {
     simpleForm(host, 'Store a secret', 'encrypted into the tenant secrets store', (b, data) => {
       Object.assign(data, { tenant: '', name: '', value: '', confirm: '' });
@@ -322,6 +358,7 @@
     if (mode === 'provision') mountProvision(host, opts);
     else if (mode === 'upgrade') mountUpgrade(host, opts);
     else if (mode === 'export') mountExport(host, opts);
+    else if (mode === 'import') mountImport(host, opts);
     else if (mode === 'secrets') mountSecrets(host, opts);
   };
 })();

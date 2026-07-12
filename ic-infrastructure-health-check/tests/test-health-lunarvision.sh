@@ -50,6 +50,10 @@ done
 if [[ "${MOCK_CURL_FAIL:-}" == "true" ]]; then
     exit 7  # CURLE_COULDNT_CONNECT
 fi
+# Fail only when URL contains a substring (multi-tenant per-port tests)
+if [[ -n "${MOCK_CURL_FAIL_URL_SUBSTR:-}" && "$url" == *"${MOCK_CURL_FAIL_URL_SUBSTR}"* ]]; then
+    exit 7
+fi
 
 # Simulate slow response
 if [[ -n "${MOCK_CURL_SLEEP:-}" ]]; then
@@ -329,6 +333,73 @@ ts=$(jq -r '.timestamp' <<<"$out_D")
 [[ "$ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
     && ok "P1: timestamp is ISO 8601 UTC" \
     || bad "P1: timestamp is ISO 8601 UTC" "got: $ts"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TEST Q: Multi-tenant ports-registry discovery (no HEALTH_LUNARVISION_URL)
+# ═════════════════════════════════════════════════════════════════════════════
+
+PORTS_Q="$ROOT/ports-q.json"
+cat > "$PORTS_Q" <<'JSON'
+{
+  "tenants": {
+    "alpha": {
+      "user": "alpha",
+      "extended_ports": { "vision_health": 20006, "vision_service": 20005 }
+    },
+    "beta": {
+      "user": "beta",
+      "extended_ports": { "vision_health": 21006 }
+    }
+  }
+}
+JSON
+
+# Both tenants healthy via mocked curl (URL contains port)
+# Unset HEALTH_LUNARVISION_URL so registry discovery is used (cannot use env with shell fn).
+unset HEALTH_LUNARVISION_URL || true
+out_Q=$(MOCK_HEALTH_BODY="$HEALTH_OK_WITH_VL" MOCK_HEALTH_CODE=200 \
+    MOCK_METRICS_BODY="$METRICS_OK" MOCK_METRICS_CODE=200 \
+    SELF_HEAL_TENANTS_FILE="$PORTS_Q" \
+    HEALTH_LUNARVISION_FETCH_METRICS=false \
+    run_check)
+ec_Q=$?
+assert_eq "$ec_Q" "0" "Q1: MT registry both up → exit 0"
+assert_eq "$(jq -r '.status' <<<"$out_Q")" "healthy" "Q2: MT registry both up → healthy"
+assert_eq "$(jq -r '.metrics.discovery' <<<"$out_Q")" "ports-registry" "Q3: discovery=ports-registry"
+assert_eq "$(jq -r '.metrics.target_count' <<<"$out_Q")" "2" "Q4: target_count=2"
+assert_eq "$(jq -r '.metrics.instances | length' <<<"$out_Q")" "2" "Q5: two instances"
+
+# One tenant unreachable → overall critical
+out_Q2=$(MOCK_HEALTH_BODY="$HEALTH_OK" MOCK_HEALTH_CODE=200 \
+    MOCK_CURL_FAIL_URL_SUBSTR="21006" \
+    SELF_HEAL_TENANTS_FILE="$PORTS_Q" \
+    HEALTH_LUNARVISION_FETCH_METRICS=false \
+    run_check)
+ec_Q2=$?
+assert_eq "$ec_Q2" "2" "Q2a: one tenant down → exit 2"
+assert_eq "$(jq -r '.status' <<<"$out_Q2")" "critical" "Q2b: one tenant down → critical"
+assert_contains "$(jq -r '.issues[]' <<<"$out_Q2")" "beta" "Q2c: issues mention beta"
+
+# Override URL still wins over registry
+out_Q3=$(MOCK_HEALTH_BODY="$HEALTH_OK" MOCK_HEALTH_CODE=200 \
+    HEALTH_LUNARVISION_URL="http://127.0.0.1:8088" \
+    SELF_HEAL_TENANTS_FILE="$PORTS_Q" \
+    HEALTH_LUNARVISION_FETCH_METRICS=false \
+    run_check)
+assert_eq "$(jq -r '.metrics.discovery' <<<"$out_Q3")" "override" "Q6: explicit URL → discovery=override"
+assert_eq "$(jq -r '.metrics.target_count' <<<"$out_Q3")" "1" "Q7: override → single target"
+assert_contains "$(jq -r '.metrics.url' <<<"$out_Q3")" "8088" "Q8: override URL preserved"
+
+# Empty registry → single-node default 8088
+PORTS_EMPTY="$ROOT/ports-empty.json"
+echo '{"tenants":{}}' > "$PORTS_EMPTY"
+unset HEALTH_LUNARVISION_URL || true
+out_Q4=$(MOCK_HEALTH_BODY="$HEALTH_OK" MOCK_HEALTH_CODE=200 \
+    SELF_HEAL_TENANTS_FILE="$PORTS_EMPTY" \
+    HEALTH_LUNARVISION_FETCH_METRICS=false \
+    run_check)
+assert_eq "$(jq -r '.metrics.discovery' <<<"$out_Q4")" "single" "Q9: empty registry → single discovery"
+assert_contains "$(jq -r '.metrics.url' <<<"$out_Q4")" "8088" "Q10: empty registry falls back to 8088"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Summary

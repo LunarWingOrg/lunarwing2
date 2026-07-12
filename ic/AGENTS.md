@@ -102,8 +102,50 @@ Start with these deeper docs as needed:
 - Use `scripts/xmpp-rate-limit.sh` for live XMPP outbound rate-limit changes. It requires `XMPP_BRIDGE_TOKEN`; `status`, `set <n>`, `off`, and `reset` are the main commands.
 - Use `scripts/xmpp-configure.sh` for bridge room/configuration checks and configure calls when working with the existing XMPP bridge API.
 - The local service watchdog assets are `scripts/lunarwing-watchdog.sh`, `scripts/lunarwing-watchdog-openrc.sh`, `scripts/install-lunarwing-watchdog.sh`, `systemd/lunarwing-watchdog.service`, `systemd/lunarwing-watchdog.timer`, `systemd/lunarwing-watchdog.confd`, and `systemd/lunarwing-watchdog.cron.hourly`. The installer auto-detects `systemd` vs `OpenRC`; on OpenRC it also auto-selects the scheduler. `auto` prefers an existing `cronie`/`crond`/`dcron` hourly setup and only falls back to a managed `fcron` entry when that avoids interfering.
-- Prefer read-only diagnostics first for service issues: `systemctl status`, `systemctl show`, `journalctl`, and bridge status endpoints. Only restart services after identifying the unit state or when the user explicitly asks.
+- Prefer read-only diagnostics first for **single-node / harness** service issues: `systemctl --user status` (or the matching OpenRC path), `journalctl --user`, and bridge status endpoints. For **multi-tenant** hosts always use `scripts/lunarwing-mt-admin.sh status|…` — never bare system-bus `systemctl` against tenant units (see Multi-Tenant Ops below). Only restart services after identifying unit state or when the user explicitly asks.
 - If harness `verify` only fails the TensorZero proxy check, inspect the upstream `TENSORZERO_URL` before treating the local service install as broken. The local proxy can be bound and healthy while the upstream `/openai/v1/models` probe still returns `500`.
+
+## Multi-Tenant Ops, Init Agnosticism, and Host Health (HARD RULE)
+
+This is **not** a lowest-common-denominator product. Multi-tenant LunarWing runs on **real** init systems — **systemd user managers** and **OpenRC (Gentoo)** — with per-tenant port blocks from `/etc/lunarwing/ports.json`. Agents must not write code that only works on a single-node system-bus systemd box.
+
+### Forbidden
+
+- Bare `systemctl is-active` / `systemctl status` / `systemctl restart` against **tenant** units from wrappers, verify helpers, or one-off scripts (system bus only — false-fails healthy tenants).
+- Bare `rc-service` probes that reimplement what `lunarwing-mt-admin.sh` already does.
+- Assuming tenant units live on the **system** bus. They do not. On systemd they are **`systemctl --user`** under the tenant (`XDG_RUNTIME_DIR=/run/user/<uid>`, linger). On Gentoo they are OpenRC services.
+- Hardcoding single-node host ports for multi-tenant health probes — especially LunarVision **`http://127.0.0.1:8088`**. On MT hosts each tenant publishes OCR health on registry **`vision_health`** (e.g. lunarium → `20006`), not 8088.
+- Setting `HEALTH_LUNARVISION_URL=http://127.0.0.1:8088` in `/etc/lunarwing/health.env` on multi-tenant fleets (forces false-critical overall health while tenant sidecars are fine).
+- Reimplementing tenant lifecycle (add/build/start/stop/status/ports) outside `scripts/lunarwing-mt-admin.sh`.
+
+### Required
+
+- Tenant lifecycle / status / operator health → **`scripts/lunarwing-mt-admin.sh`** (`status <tenant>`, start/stop/build, doctor, health pipeline install). Override path with `LUNARWING_MT_ADMIN` if needed.
+- Host-global pipeline lives under `../ic-infrastructure-health-check/` (installed to `/usr/local/lib/lunarwing-health/` via mt-admin). It must stay **init-agnostic** and **ports-registry-aware**.
+- `health-lunarvision.sh`: leave **`HEALTH_LUNARVISION_URL` unset** on MT hosts so it auto-discovers every tenant's `vision_health` (fallback `vision_service`) from `SELF_HEAL_TENANTS_FILE` / `/etc/lunarwing/ports.json`. Explicit URL is only for intentional single-target override; empty registry falls back to single-node `8088`.
+- Wrappers (`lunarwing_mt_onboard*`) are **thin drivers** of mt-admin — no parallel init or port logic.
+- Parse both init status shapes when reading mt-admin output (`….service: active` and OpenRC `…: started`), or use exit codes / structured contracts.
+- **Both systemd and OpenRC are first-class.** Never treat Gentoo/OpenRC as an edge case.
+
+### Why this is non-negotiable
+
+1. Tenant `lunarium` was healthy (`mt-admin status` active, user units running) while onboard **verify** false-failed on bare system-bus `systemctl is-active`.
+2. The same host's **health timer** reported overall **critical** because lunarvision still probed **8088** while the real sidecar answered on **`vision_health` 20006**. Units were fine; the probe was single-node-default wrong.
+
+That class of bug must not reappear.
+
+### Quick greps before you ship
+
+```bash
+# Must not appear in onboard/web/verify wrappers:
+rg -n 'systemctl is-active|systemctl status|rc-service' ../lunarwing_mt_onboard ../lunarwing_mt_onboard_web
+
+# LunarVision must not reintroduce hard-only 8088 without registry discovery:
+rg -n '127\.0\.0\.1:8088' ../ic-infrastructure-health-check/health-lunarvision.sh
+# (8088 as single-node *fallback after* ports-registry discovery is OK; sole/default-without-registry path must stay documented.)
+```
+
+Exceptions: comments/docs forbidding the pattern; init helpers **inside** `scripts/lunarwing-mt-admin.sh` (e.g. `_systemctl_user`); infrastructure-health tooling that already abstracts user units / OpenRC / ports.json correctly.
 
 ## Docs, Parity, and Testing
 

@@ -6,16 +6,20 @@ Run from the repo root with the venv interpreter:
 
 from __future__ import annotations
 
+import ast
 import os
 import queue
+import signal
 import tempfile
+import time
 import unittest
+from pathlib import Path
 
 from lunarwing_mt_onboard.config import WorkerType
 
 from . import audit, demo
-from .jobs import Job
-from .models import ExportRequest, ProvisionRequest, UpgradeRequest
+from .jobs import Job, JobManager
+from .models import ExportRequest, ImportRequest, ProvisionRequest, UpgradeRequest
 from .security import generate_token, token_matches
 
 
@@ -41,6 +45,40 @@ class ModelMappingTests(unittest.TestCase):
         e = ExportRequest(tenant="chimera").to_export_config()
         self.assertEqual(e.tenant, "chimera")
         self.assertEqual(e.out_dir, "/var/lib/lunarwing-migrate")
+
+    def test_import_mapper_trims_strings_and_forces_noninteractive(self) -> None:
+        cfg = ImportRequest(
+            bundle="  /tmp/chimera.tar  ",
+            name="  chimera-new  ",
+            start=True,
+            old_stopped=True,
+            with_opencode=True,
+            with_toolchains=True,
+            with_nanocode=True,
+            with_pebble=True,
+            with_vision=True,
+            docker_group=True,
+            tensorzero_url="  http://tensorzero.test/openai/v1  ",
+            owner_scope="  legacy-chimera  ",
+            apply=True,
+            force=True,
+        ).to_import_config()
+
+        self.assertEqual(cfg.bundle, "/tmp/chimera.tar")
+        self.assertEqual(cfg.name, "chimera-new")
+        self.assertEqual(cfg.tensorzero_url, "http://tensorzero.test/openai/v1")
+        self.assertEqual(cfg.owner_scope, "legacy-chimera")
+        self.assertTrue(cfg.start)
+        self.assertTrue(cfg.old_stopped)
+        self.assertTrue(cfg.with_opencode)
+        self.assertTrue(cfg.with_toolchains)
+        self.assertTrue(cfg.with_nanocode)
+        self.assertTrue(cfg.with_pebble)
+        self.assertTrue(cfg.with_vision)
+        self.assertTrue(cfg.docker_group)
+        self.assertTrue(cfg.apply)
+        self.assertTrue(cfg.force)
+        self.assertTrue(cfg.auto_yes)
 
 
 class RedactionTests(unittest.TestCase):
@@ -68,6 +106,72 @@ class TokenTests(unittest.TestCase):
         self.assertFalse(token_matches(t, "nope"))
         self.assertFalse(token_matches(t, None))
         self.assertTrue(token_matches("", "anything"))  # empty = disabled
+
+
+class CancellationTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
+    def test_cancel_terminates_wrapper_and_child_processes(self) -> None:
+        from . import runner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "spawn-child.sh"
+            child_pid_path = Path(tmp) / "child.pid"
+            script.write_text(
+                "#!/bin/sh\n"
+                "trap '' TERM\n"
+                "sleep 30 &\n"
+                "child=$!\n"
+                'printf \'%s\\n\' "$child" > "$1"\n'
+                'wait "$child"\n'
+            )
+            script.chmod(0o700)
+
+            manager = JobManager(demo=True, log_dir=tmp)
+            job = manager.create("cancel-test")
+
+            def run(job_to_run: Job) -> None:
+                audit_log = audit.AuditLogger(
+                    "cancel-test", "child", job_to_run.id, log_dir=tmp, demo=True
+                )
+                try:
+                    runner._run_phase(
+                        job_to_run,
+                        [str(script), str(child_pid_path)],
+                        "cancel-test",
+                        audit_log,
+                    )
+                finally:
+                    audit_log.close()
+
+            manager.start(job, run)
+            deadline = time.monotonic() + 3
+            while (
+                job.proc is None or not child_pid_path.exists()
+            ) and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            self.assertIsNotNone(job.proc)
+            self.assertTrue(child_pid_path.exists())
+            parent_pid = job.proc.pid if job.proc is not None else None
+            child_pid = int(child_pid_path.read_text().strip())
+            try:
+                self.assertTrue(manager.cancel(job.id))
+                self.assertIsNotNone(job.thread)
+                if job.thread is not None:
+                    job.thread.join(timeout=5)
+                    self.assertFalse(
+                        job.thread.is_alive(), "cancel left a child process running"
+                    )
+            finally:
+                for pid in (child_pid, parent_pid):
+                    if pid is None:
+                        continue
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                if job.thread is not None:
+                    job.thread.join(timeout=2)
 
 
 def _drain(q: "queue.Queue") -> list[dict]:
@@ -124,6 +228,85 @@ class DemoProvisionIntegrationTests(unittest.TestCase):
         for fn in os.listdir(self.tmp):
             with open(os.path.join(self.tmp, fn), encoding="utf-8") as f:
                 self.assertNotIn(secret_value, f.read())
+
+    def test_import_demo_is_noninteractive_dry_run_with_staged_output(self) -> None:
+        job = Job(id="test4", mode="import", demo=True)
+        req = ImportRequest(bundle="/tmp/chimera.tar")
+
+        self.runner.run_import_job(job, req, log_dir=self.tmp)
+
+        events = _drain(job.queue)
+        phases = [e["name"] for e in events if e.get("type") == "phase"]
+        log_text = "\n".join(e["line"] for e in events if e.get("type") == "log")
+        done = [e for e in events if e.get("type") == "done"]
+        self.assertEqual(phases, ["import"])
+        for stage in ("Provision", "Build", "Inject", "Restore", "Stage"):
+            self.assertIn(stage, log_text)
+        self.assertTrue(done and done[-1]["ok"], f"expected success, got {done}")
+        self.assertTrue(job.ok)
+
+        audit_text = "\n".join(
+            Path(self.tmp, name).read_text()
+            for name in os.listdir(self.tmp)
+            if "-import-" in name
+        )
+        self.assertIn("--dry-run", audit_text)
+        self.assertIn("--yes", audit_text)
+        self.assertNotIn("--start", audit_text)
+
+
+class AppRouteTests(unittest.TestCase):
+    def test_import_route_is_registered_as_post(self) -> None:
+        app_path = Path(__file__).resolve().parent / "app.py"
+        tree = ast.parse(app_path.read_text())
+        post_paths = {
+            decorator.args[0].value
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for decorator in node.decorator_list
+            if isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr == "post"
+            and decorator.args
+            and isinstance(decorator.args[0], ast.Constant)
+            and isinstance(decorator.args[0].value, str)
+        }
+
+        self.assertIn("/api/import", post_paths)
+
+
+class ImportUiTests(unittest.TestCase):
+    def test_import_card_and_form_are_wired(self) -> None:
+        static_dir = Path(__file__).resolve().parent / "static"
+        index = (static_dir / "index.html").read_text()
+        wizard = (static_dir / "js" / "wizard.js").read_text()
+
+        self.assertIn('data-mode="import"', index)
+        self.assertIn("function mountImport", wizard)
+        self.assertIn("mode === 'import'", wizard)
+
+        import_form = wizard.split("function mountImport", 1)[1].split(
+            "function mountSecrets", 1
+        )[0]
+        for field in (
+            "bundle",
+            "name",
+            "apply",
+            "start",
+            "old_stopped",
+            "force",
+            "with_opencode",
+            "with_toolchains",
+            "with_nanocode",
+            "with_pebble",
+            "with_vision",
+            "docker_group",
+            "tensorzero_url",
+            "owner_scope",
+        ):
+            self.assertIn(field, import_form)
+        self.assertIn("stage-only by default", import_form.lower())
+        self.assertIn("old host stopped", import_form.lower())
 
 
 if __name__ == "__main__":
