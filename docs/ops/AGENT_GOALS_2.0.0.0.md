@@ -24,24 +24,22 @@
 
     Things You Might Have Missed:
 
-    1. rand 0.8.6 — Still on 0.8. The dry-run shows 0.10.2 is available but it would be a breaking change (API redesign in 0.9+). If you've deliberately stayed on 0.8, that's fine. Just be aware it's two major versions behind.
+    1 rand 0.8.6 — Still on 0.8. The dry-run shows 0.10.2 is available but it would be a breaking change (API redesign in 0.9+). If you've deliberately stayed on 0.8, that's fine. Just be aware it's two major versions behind.
 
-    2. base64 0.21.7 — Still on 0.21. Version 0.22 is available. Minor API changes (Engine trait moved). Used in ssh_hostkeys.rs for fingerprint computation.
+    2 base64 0.21.7 — Still on 0.21. Version 0.22 is available. Minor API changes (Engine trait moved). Used in ssh_hostkeys.rs for fingerprint computation.
+ 
+    3 wasmparser 0.220.1 — Bundled with wasmtime 36, so it's fine. The dry-run doesn't try to update it independently.
 
-    3. wasmparser 0.220.1 — Bundled with wasmtime 36, so it's fine. The dry-run doesn't try to update it independently.
+    4 pathdiff being removed — The dry-run removes pathdiff v0.2.3 as unused. Good, less deps.
 
-    4. pathdiff being removed — The dry-run removes pathdiff v0.2.3 as unused. Good, less deps.
-
-    5. wasip3 being removed — Also cleaned up as unused. Good.
+    5 wasip3 being removed — Also cleaned up as unused. Good.
 
     My Recommendation:
-    ```bash
     # Safe to run right now — all patch/minor bumps
     cargo update
     # Then verify
     cargo check --lib
     cargo test --lib
-```
 
     NOTE: Crates to be deferred until 2.0.0+:
     - rand 0.8 → 0.10 — Breaking, but can be deferred
