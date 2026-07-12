@@ -329,7 +329,7 @@ class SecretsUiTests(unittest.TestCase):
 
 
 class MascotSpriteTests(unittest.TestCase):
-    def test_all_six_mascot_gifs_present(self) -> None:
+    def test_all_mascot_gifs_present(self) -> None:
         mascot = Path(__file__).resolve().parent / "static" / "mascot"
         for name in (
             "lunar_walk.gif",
@@ -338,6 +338,8 @@ class MascotSpriteTests(unittest.TestCase):
             "lunar_rage.gif",
             "lunar_greet.gif",
             "lunar_sup.gif",
+            "lunar_fiery.gif",
+            "lunar_love.gif",
         ):
             self.assertTrue((mascot / name).is_file(), f"missing mascot sprite: {name}")
 
@@ -350,7 +352,10 @@ class MascotSpriteTests(unittest.TestCase):
         # one-shot API exported and event moods kept out of the idle rotation
         self.assertIn("greet,", text)
         self.assertIn("celebrate,", text)
-        self.assertIn("IDLE_MOODS = ['content', 'excited', 'sleeping']", text)
+        # greet/sup stay out of the idle rotation; fiery + love are idle moods
+        self.assertIn("IDLE_MOODS = ['content', 'excited', 'sleeping', 'fiery', 'love']", text)
+        self.assertIn("fiery: 'lunar_fiery.gif'", text)
+        self.assertIn("love: 'lunar_love.gif'", text)
 
     def test_app_js_triggers_greet_and_celebrate(self) -> None:
         app = Path(__file__).resolve().parent / "static" / "js" / "app.js"

@@ -17,8 +17,12 @@
     angry: 'lunar_rage.gif',
     greet: 'lunar_greet.gif',
     sup: 'lunar_sup.gif',
+    fiery: 'lunar_fiery.gif',
+    love: 'lunar_love.gif',
   };
-  const IDLE_MOODS = ['content', 'excited', 'sleeping'];
+  // Ambient moods randomly cycled while idle on the picker. greet/sup stay out
+  // (they are one-shot event gestures); angry is reserved for failures.
+  const IDLE_MOODS = ['content', 'excited', 'sleeping', 'fiery', 'love'];
   // One GIF loop is 12 frames * 13cs ≈ 1.56s; let a one-shot gesture play ~1.5
   // loops before settling so it reads as a complete beat.
   const ONESHOT_MS = 2300;
