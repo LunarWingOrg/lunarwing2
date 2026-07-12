@@ -1316,7 +1316,25 @@ impl Agent {
                     user_id = %message.user_id,
                     "ENGINE_V2 enabled — routing user input through engine v2"
                 );
-                return crate::bridge::handle_with_engine(self, message, content).await;
+                // The engine delivers its response to the channel itself (it
+                // streams thread events, including the final AppEvent::Response,
+                // over SSE keyed to the thread id). So we must NOT let the
+                // engine's returned text fall through to the caller's
+                // channels.respond() — that would double-send on the gateway
+                // (and previously errored with a missing routing target).
+                // Consume the result: log any error, and return an empty
+                // response which the outbound handler suppresses (never sent).
+                match crate::bridge::handle_with_engine(self, message, content).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            message_id = %message.id,
+                            error = %e,
+                            "engine v2 message handling failed"
+                        );
+                    }
+                }
+                return Ok(Some(String::new()));
             }
         }
 

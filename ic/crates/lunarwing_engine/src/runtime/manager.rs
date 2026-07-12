@@ -112,6 +112,7 @@ impl ThreadManager {
             parent_id,
             user_id,
             Vec::new(),
+            None,
         )
         .await
     }
@@ -127,11 +128,19 @@ impl ThreadManager {
         parent_id: Option<ThreadId>,
         user_id: impl Into<String>,
         initial_messages: Vec<crate::types::message::ThreadMessage>,
+        preferred_thread_id: Option<ThreadId>,
     ) -> Result<ThreadId, EngineError> {
         let user_id = user_id.into();
         let mut thread = Thread::new(goal, thread_type, project_id, &user_id, config);
         if let Some(pid) = parent_id {
             thread = thread.with_parent(pid);
+        }
+        // Adopt a caller-supplied thread id (e.g. the gateway UI's thread_id) so
+        // downstream event/SSE routing lands on the thread the client is already
+        // subscribed to. Only honored for genuinely new threads — repeat messages
+        // on an existing thread never reach here (see handle_user_message).
+        if let Some(pid) = preferred_thread_id {
+            thread.id = pid;
         }
         let thread_id = thread.id;
 

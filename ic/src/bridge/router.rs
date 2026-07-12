@@ -2238,6 +2238,13 @@ async fn handle_with_engine_inner(
         config
     };
 
+    // Adopt the client's thread_id (from the message scope) as the engine
+    // thread identity for NEW threads, so the engine's SSE broadcasts land on
+    // the thread the gateway UI is already subscribed to. Only affects fresh
+    // threads — repeat messages on an existing thread inject into it and never
+    // hit the spawn path.
+    let preferred_thread_id = parse_engine_thread_id(message.conversation_scope());
+
     // Handle the message — spawns a new thread or injects into active one
     let thread_id = state
         .conversation_manager
@@ -2247,6 +2254,7 @@ async fn handle_with_engine_inner(
             project_id,
             &message.user_id,
             thread_config,
+            preferred_thread_id,
         )
         .await
         .map_err(|e| engine_err("thread error", e))?;
