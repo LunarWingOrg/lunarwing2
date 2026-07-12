@@ -154,6 +154,17 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
         args.extend(["--llm-model", config.llm_model])
     if config.enable_darkirc:
         args.append("--enable-darkirc")
+    # Persist the tenant's external-worker selection at add-tenant so
+    # start-tenant starts only what was chosen (start_tenant_<worker> gates on
+    # the per-tenant registry flag). build-tenant gets the same flags to build
+    # the shared images; add-tenant records the per-tenant choice. See
+    # build_build_tenant_args and docs/proposals/PER_TENANT_WORKER_GATING.md.
+    if WorkerType.NANOCODE in config.workers:
+        args.append("--with-nanocode")
+    if WorkerType.PEBBLE in config.workers:
+        args.append("--with-pebble")
+    if WorkerType.OPENCODE in config.workers:
+        args.append("--with-opencode")
     if config.no_ssh:
         args.append("--no-ssh")
     if config.no_health:

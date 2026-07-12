@@ -182,6 +182,20 @@ tenant_proxy_enabled() {
   [[ "$val" == "true" ]]
 }
 
+# Whether a given external worker (nanocode|pebble|opencode) is selected for this
+# tenant. The selection is persisted at add-tenant into
+# .tenants[<name>].workers.<worker> and gates start_tenant_<worker> — otherwise a
+# tenant would start every worker whose SHARED host image happens to exist,
+# regardless of what was chosen (see docs/proposals/PER_TENANT_WORKER_GATING.md).
+# Absent key = false (OFF): a tenant provisioned before this flag existed does not
+# auto-start workers until re-selected via `add-tenant <name> --with-<worker>`.
+tenant_worker_enabled() {
+  local name="$1" worker="$2"
+  local val
+  val="$(jq -r ".tenants[\"$name\"].workers[\"$worker\"] // false" "$PORTS_REGISTRY" 2>/dev/null)"
+  [[ "$val" == "true" ]]
+}
+
 # Per-tenant PostgreSQL password. The source of truth is a 0600, tenant-owned
 # secret file, generated once (hex → URL-safe inside DATABASE_URL) and reused so
 # it stays STABLE across restarts/reconfigures — POSTGRES_PASSWORD only
@@ -236,6 +250,12 @@ Commands:
     --no-ssh                       Don't provision SSH harness (key pair, config, agent)
     --enable-darkirc               Provision DarkIRC daemon + adapter for this tenant
                                    (disabled by default; darkirc services are NOT created)
+    --with-nanocode                Select the nanocode worker for this tenant (recorded
+                                   in the port registry; start-tenant only starts workers
+                                   the tenant selected — see --with-* on build-tenant to
+                                   also build the image). Off by default.
+    --with-pebble                  Select the pebble worker for this tenant (as above)
+    --with-opencode                Select the opencode worker for this tenant (as above)
     --nanocode-model <model>       Override the nanocode worker's LLM model
                                    (written to lunarwing.env as NANOCODE_MODEL)
     --nanocode-base-url <url>      Override the nanocode worker's TensorZero baseURL
@@ -1183,6 +1203,14 @@ ports_allocate() {
   local name="$1"
   local enable_darkirc="${2:-false}"
   local enable_proxy="${3:-false}"
+  # Selected external workers, as a JSON object literal
+  # (e.g. '{"nanocode":true,"pebble":false,"opencode":false}'). Persisted so
+  # start_tenant_<worker> can gate on the tenant's choice; see
+  # tenant_worker_enabled. NOTE: assign in two steps — `${4:-{}}` mis-parses
+  # (bash closes the ${...} at the first `}`, appending a stray `}` and
+  # corrupting the JSON), so default explicitly instead.
+  local workers_json="${4:-}"
+  [[ -n "$workers_json" ]] || workers_json='{}'
   require_cmd jq
 
   # Resumable (F4): if this tenant already has a block, reuse it (echo its
@@ -1202,6 +1230,15 @@ ports_allocate() {
     # manual teardown (see docs/ops/DARKIRC-MULTITENANT.md).
     [[ "$enable_darkirc" == "true" ]] && ports_enable_darkirc "$name"
     [[ "$enable_proxy" == "true" ]] && ports_enable_proxy "$name"
+    # Reconcile worker selection on resume, same one-directional false->true rule
+    # as darkirc/proxy: re-running `add-tenant <existing> --with-<worker>` turns a
+    # worker on; omitting the flag never turns one off (disabling is manual).
+    local _w
+    for _w in nanocode pebble opencode; do
+      if [[ "$(jq -r --arg w "$_w" '.[$w] // false' <<<"$workers_json" 2>/dev/null)" == "true" ]]; then
+        ports_enable_worker "$name" "$_w"
+      fi
+    done
     printf '%s' "$existing"
     return 0
   fi
@@ -1223,7 +1260,15 @@ ports_allocate() {
   [[ "$enable_darkirc" == "true" ]] && darkirc_json="true"
   local proxy_json="false"
   [[ "$enable_proxy" == "true" ]] && proxy_json="true"
-  jq --arg name "$name" --argjson base "$base" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson darkirc "$darkirc_json" --argjson proxy "$proxy_json" '
+  # Normalize the workers spec to a full {nanocode,pebble,opencode} bool map so
+  # every tenant object has a stable, explicit shape (missing/garbage -> all off).
+  local workers_norm
+  workers_norm="$(jq -c '{
+      nanocode: (.nanocode // false),
+      pebble:   (.pebble   // false),
+      opencode: (.opencode // false)
+    }' <<<"$workers_json" 2>/dev/null || echo '{"nanocode":false,"pebble":false,"opencode":false}')"
+  jq --arg name "$name" --argjson base "$base" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson darkirc "$darkirc_json" --argjson proxy "$proxy_json" --argjson workers "$workers_norm" '
     ( .range.start // 10000 ) as $rstart
     | ( .extended_range.start // 20000 ) as $estart
     | ( .extended_block_size // 10 ) as $ebs
@@ -1234,6 +1279,7 @@ ports_allocate() {
         created_at: $ts,
         enable_darkirc: $darkirc,
         enable_proxy: $proxy,
+        workers: $workers,
         ports: {
           gateway:          ($base + 0),
           http:             ($base + 1),
@@ -1312,6 +1358,35 @@ ports_enable_proxy() {
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
   say "proxy for tenant '$name': disabled -> enabled" >&2
+}
+
+# Mark a single external worker (nanocode|pebble|opencode) enabled for a tenant
+# (one-directional: false -> true). Idempotent. Used by ports_allocate()'s resume
+# path so `add-tenant <existing> --with-<worker>` flips the registry, mirroring
+# ports_enable_darkirc/proxy. Ensures a .workers object exists on older tenant
+# entries that predate the workers map.
+ports_enable_worker() {
+  local name="$1" worker="$2"
+  require_cmd jq
+  case "$worker" in
+    nanocode|pebble|opencode) ;;
+    *) die "ports_enable_worker: unknown worker '$worker'" ;;
+  esac
+  local current
+  current="$(jq -r ".tenants[\"$name\"].workers[\"$worker\"] // false" "$PORTS_REGISTRY" 2>/dev/null || true)"
+  [[ "$current" == "true" ]] && return 0
+
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  if ! jq --arg name "$name" --arg w "$worker" '
+      .tenants[$name].workers = ((.tenants[$name].workers // {}) + { ($w): true })
+    ' "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    die "failed to enable worker '$worker' for tenant '$name'"
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "worker '$worker' for tenant '$name': disabled -> enabled" >&2
 }
 
 ports_deallocate() {
@@ -5826,6 +5901,12 @@ add_tenant() {
   local xmpp_allow_from="${16:-}"
   local opencode_model="${17:-}"
   local opencode_base_url="${18:-}"
+  # External worker selection (default off). Persisted into the port registry so
+  # start_tenant_<worker> starts only what this tenant chose, not every worker
+  # whose shared host image happens to exist. See PER_TENANT_WORKER_GATING.md.
+  local with_nanocode="${19:-false}"
+  local with_pebble="${20:-false}"
+  local with_opencode="${21:-false}"
 
   name="$(sanitize_name "$name")"
   [[ -n "$name" ]] || die "invalid tenant name"
@@ -5845,8 +5926,10 @@ add_tenant() {
   say ""
 
   ports_registry_init
-  local base_port
-  base_port="$(ports_allocate "$name" "$enable_darkirc" "$enable_proxy")"
+  local base_port workers_json
+  workers_json="$(printf '{"nanocode":%s,"pebble":%s,"opencode":%s}' \
+    "$with_nanocode" "$with_pebble" "$with_opencode")"
+  base_port="$(ports_allocate "$name" "$enable_darkirc" "$enable_proxy" "$workers_json")"
   say ""
 
   create_tenant_user "$name" "$docker_group"
@@ -5926,6 +6009,7 @@ add_tenant() {
   say "  weechat_adapter:  $(ports_get "$name" weechat_adapter)"
   say "  darkirc:          $( [[ "$enable_darkirc" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-darkirc to enable)" )"
   say "  proxy:            $( [[ "$enable_proxy" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-proxy to enable)" )"
+  say "  workers:          $( _selected="$( [[ "$with_nanocode" == "true" ]] && printf 'nanocode '; [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-nanocode/--with-pebble/--with-opencode to select)" )"
   say "  ssh:              $( [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]] && echo "enabled (key upload + activation handled by start-tenant)" || echo "disabled (pass --no-ssh)" )"
   say ""
   say "Next steps:"
@@ -6132,9 +6216,20 @@ start_tenant() {
 
   # Workers start AFTER the daemon (and after any SSH-key bounce) so the SSH
   # agent socket is already a real, current Unix socket when podman bind-mounts it.
-  start_tenant_nanocode "$name"
-  start_tenant_pebble "$name"
-  start_tenant_opencode "$name"
+  #
+  # Gate each worker on the tenant's persisted selection (add-tenant --with-*).
+  # Without this, start_tenant_<worker> would start every worker whose SHARED
+  # host image happens to exist — regardless of what this tenant chose — because
+  # its only guards are "port allocated" (always true) and "image present"
+  # (host-wide). See tenant_worker_enabled / PER_TENANT_WORKER_GATING.md.
+  local _w
+  for _w in nanocode pebble opencode; do
+    if tenant_worker_enabled "$name" "$_w"; then
+      "start_tenant_${_w}" "$name"
+    else
+      say "$_w worker not selected for $name (skipping; enable with 'add-tenant $name --with-$_w')"
+    fi
+  done
   _ssh_ready_summary "$name" || true
 }
 
@@ -6544,7 +6639,7 @@ main() {
   case "$command_name" in
     add-tenant)
       require_root
-      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url=""
+      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" with_nanocode="false" with_pebble="false" with_opencode="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -6553,6 +6648,9 @@ main() {
           --no-ssh)          SSH_OPT_OUT=true; shift ;;
           --enable-darkirc)  enable_darkirc="true"; shift ;;
           --enable-proxy)    enable_proxy="true"; shift ;;
+          --with-nanocode)   with_nanocode="true"; shift ;;
+          --with-pebble)     with_pebble="true"; shift ;;
+          --with-opencode)   with_opencode="true"; shift ;;
           --xmpp-password)   xmpp_password="$2"; shift 2 ;;
           --llm-api-key)     llm_api_key="$2"; shift 2 ;;
           --llm-base-url)    llm_base_url="$2"; shift 2 ;;
@@ -6576,12 +6674,12 @@ main() {
       done
       [[ -n "$name" ]] || die "usage: add-tenant <name> [--docker-group] [--xmpp-jid <jid>]"
       [[ -n "$xmpp_jid" ]] || xmpp_jid="$(sanitize_name "$name")@xmpp.localhost"
-      add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url"
+      add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode"
       ;;
 
     add-tenants)
       require_root
-      local names_csv="" docker_group="false" xmpp_domain="xmpp.localhost" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url=""
+      local names_csv="" docker_group="false" xmpp_domain="xmpp.localhost" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" with_nanocode="false" with_pebble="false" with_opencode="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -6590,6 +6688,9 @@ main() {
           --no-ssh)          SSH_OPT_OUT=true; shift ;;
           --enable-darkirc)  enable_darkirc="true"; shift ;;
           --enable-proxy)    enable_proxy="true"; shift ;;
+          --with-nanocode)   with_nanocode="true"; shift ;;
+          --with-pebble)     with_pebble="true"; shift ;;
+          --with-opencode)   with_opencode="true"; shift ;;
           --llm-api-key)     llm_api_key="$2"; shift 2 ;;
           --llm-base-url)    llm_base_url="$2"; shift 2 ;;
           --tensorzero-url)  tz_url="$2"; shift 2 ;;
@@ -6620,7 +6721,7 @@ main() {
         sname="$(sanitize_name "$(echo "$raw_name" | xargs)")"
         [[ -n "$sname" ]] || continue
         say ""
-        add_tenant "$sname" "$docker_group" "${sname}@${xmpp_domain}" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url"
+        add_tenant "$sname" "$docker_group" "${sname}@${xmpp_domain}" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode"
       done
       ;;
 

@@ -194,6 +194,56 @@ class TestProvisionerArgs(unittest.TestCase):
         self.assertIn("--llm-model", args)
         self.assertIn("tensorzero::function_name::lunarwing", args)
 
+    def test_worker_selection_is_forwarded_to_add_tenant(self):
+        # start-tenant gates workers on the per-tenant registry flag persisted at
+        # add-tenant, so build_add_tenant_args must emit --with-* for selected
+        # workers (not only build_build_tenant_args). Unselected workers omitted.
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "lunarwing-mt-admin.sh")
+            with open(script, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(script, 0o700)
+
+            previous = provisioner.MT_ADMIN_SCRIPT
+            provisioner.MT_ADMIN_SCRIPT = script
+            try:
+                config = TenantConfig(
+                    name="alpha",
+                    workers=[WorkerType.NANOCODE, WorkerType.OPENCODE],
+                )
+                add_args = provisioner.build_add_tenant_args(config)
+                build_args = provisioner.build_build_tenant_args(config)
+            finally:
+                provisioner.MT_ADMIN_SCRIPT = previous
+
+        # Selected workers appear on add-tenant (the persisted selection).
+        self.assertIn("--with-nanocode", add_args)
+        self.assertIn("--with-opencode", add_args)
+        # Unselected worker is omitted from add-tenant.
+        self.assertNotIn("--with-pebble", add_args)
+        # build-tenant still gets the same selection (to build the images).
+        self.assertIn("--with-nanocode", build_args)
+        self.assertIn("--with-opencode", build_args)
+        self.assertNotIn("--with-pebble", build_args)
+
+    def test_no_workers_selected_emits_no_worker_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "lunarwing-mt-admin.sh")
+            with open(script, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(script, 0o700)
+
+            previous = provisioner.MT_ADMIN_SCRIPT
+            provisioner.MT_ADMIN_SCRIPT = script
+            try:
+                config = TenantConfig(name="alpha")  # no workers
+                add_args = provisioner.build_add_tenant_args(config)
+            finally:
+                provisioner.MT_ADMIN_SCRIPT = previous
+
+        for flag in ("--with-nanocode", "--with-pebble", "--with-opencode"):
+            self.assertNotIn(flag, add_args)
+
 
 class TestSecretsHelpers(unittest.TestCase):
     def test_generate_master_key_length(self):

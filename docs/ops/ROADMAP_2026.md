@@ -16,18 +16,20 @@ Items are grouped to respect the release cadence (`docs/ops/RELEASE_CADENCE.md`)
 | Self-Healing Capability Expansion - deferred from 1.1.8 | v2.0.2 |
 | Self-Healing Capabilities analysis of any missing pieces from all the new components. Implementation of missing pieces to follow | v2.0.2 |
 | More Crate Updates | v2.0.2 |
+| MCP Overhaul Part 1 | v2.0.2 |
 | Per-tenant WeeChat health-glob gate (fix the flap /`render-units` footgun) | v2.0.3 |
-| Proprietary channel and code removal for Telegram | v2.0.3 |
 | Lunartica UI reskin continuation | v2.0.3 |
 | Upgrade old testing harness | v2.0.3 |
 | Further external worker polishing | v2.0.3 |
-| Feature set of concepts adopted from Hermes Agent (Human Delay mode already landed in a prior release); comprehensive documentation to accompany each | v2.0.4 |
+| Feature set of subset of agent features adopted from Hermes Agent (Human Delay mode already landed in a prior release); comprehensive documentation to accompany each new feature | v2.0.4 |
 | Input-validation security improvements | v2.0.4 |
 | ONNX Runtime speech to text model support necessary for LunarVoice | v2.0.4 |
+| MCP Overhaul Part 2 | v2.0.4 |
 | Additional WASM Channel Polishing | v2.0.5 |
 | Additional Opencode/Paseo External Worker Polishing | v2.0.5 |
 | Reflex Compiler polishing and improvements | v2.0.5 |
 | LunarVoice Two Way Voice Communication | v2.0.6 |
+| MCP Overhaul Part 3 | v2.0.6 |
 | Additional LunarVoice polishing | v2.0.7 |
 | A surprise | v2.0.8 |
 
