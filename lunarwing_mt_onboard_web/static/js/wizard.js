@@ -278,6 +278,19 @@
   function mountUpgrade(host, opts) {
     simpleForm(host, 'Upgrade a tenant', 'dry-run by default', (b, data) => {
       Object.assign(data, { tenant: '', target: '', source_version_override: '', run_preflight: true, apply: false, force: false, auto_yes: false });
+      // Truthful warning: this form drives the v1-only version-tag upgrade
+      // script (upgrade-tenant-version.sh), which parses vX.Y.Z and defaults to
+      // v1.1.2. It CANNOT do a v2.0.0.0 -> v2.0.0.0 (or any v2) upgrade.
+      b.appendChild(h('div', { class: 'form-warn' }, [
+        h('strong', null, ['⚠ v1 upgrades only.']),
+        ' This drives ',
+        h('code', null, ['upgrade-tenant-version.sh']),
+        ' (v1 release tags; blank target = ',
+        h('code', null, ['v1.1.2']),
+        '). It does NOT support v2.0.0.0 → v2.0.0.0. For a v2 tenant, use the CLI instead: ',
+        h('code', null, ['sudo ic/scripts/lunarwing-mt-admin.sh upgrade-tenant <tenant> --target <ref>']),
+        '.',
+      ]));
       b.appendChild(textField(data, 'tenant', 'Tenant', { datalist: opts.tenants, placeholder: 'sphinx' }));
       b.appendChild(textField(data, 'target', 'Target release tag (blank = script default)', { placeholder: 'v1.1.9' }));
       b.appendChild(textField(data, 'source_version_override', 'Source version override (optional)', { placeholder: 'v1.1.7' }));
