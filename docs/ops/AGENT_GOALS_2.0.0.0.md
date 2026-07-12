@@ -74,18 +74,12 @@
     </details>
 
 14. [ ] Verify (only) if the information below is accurate, then write up a document in docs/ops detailing the status: is each piece verifiable? what outstanding issues remain? which points have already been addressed?
-
     <details>
     <summary><b>INFO DUMP — WeeChat Services for Multi-Tenant Deployments</b></summary>
-
     CLI pairing approve env var requirement in WeeChat ops guide. Adds troubleshooting section for the 'no pairing file' error caused by LUNARWING_BASE_DIR not being in the tenant user's shell environment. Includes three workarounds: inline env var, sourcing lunarwing.env, and gateway API. Ultraworked with Sisyphus (https://github.com/code-yeongyu/oh-my-openagent). Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
-
 WeeChat Services for Multi-Tenant Deployments
-
     How WeeChat IRC access is managed as init services in LunarWing multi-tenant deployments. Each tenant runs a WeeChat instance in a tmux session plus a Python WebSocket adapter that bridges WeeChat's relay API to an HTTP endpoint polled by the LunarWing WASM channel.
-
     For general multi-tenant setup, see MULTITENANCY-PRODUCTION.md.
-
     Architecture:
     WASM channel (poll) ──GET──► ws_adapter.py (port base+9)
                                   │
@@ -95,7 +89,6 @@ WeeChat Services for Multi-Tenant Deployments
                                   ▼
                          WeeChat relay (port base+5, 127.0.0.1)
     WASM channel (send) ──POST──► WeeChat relay (direct)
-
     Three components per tenant:
     - WeeChat: weechat in tmux — IRC client, runs relay API on 127.0.0.1:<base+5>
     - WS adapter: ws_adapter.py — Bridges WeeChat's WebSocket relay to a local HTTP API
