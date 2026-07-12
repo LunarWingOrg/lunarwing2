@@ -9,15 +9,15 @@ Items are grouped to respect the release cadence (`docs/ops/RELEASE_CADENCE.md`)
 | Org/registry decisions deferred from 1.1.9 item #2: re-host registry WASM artifacts or make them source-build-only (nearai/ironclaw release URLs in `ic/registry/*.json` + `installer.rs` allowlist), fix or delete the `release-plz.yml` `repository_owner == 'nearai'` guard — fits alongside the Forgejo/CI migration. The Docker Hub image namespace was moved to `ggmethos/*` and the obsolete GCP VM bootstrap path was removed in 1.1.9 cleanup. | v2.0.1 |
 | Further polishing of Lunarvision AND XMPP file sharing integration - see XMPP_LUNARVISION_INTEGRATION.md in docs/proposals for some information | v2.0.1 |
 | In-place Upgrade Harness v3/v4 to cover ALL version upgrades, rather than separate legacy and non-legacy upgrade scripts | v2.0.1 |
-| Migrate from Github to Forgejo. Multi-arch CI/CD pipeline for development. Dedicated Clean LW v2 repo | v2.0.1 |
+| Multi-arch CI/CD pipeline for development. Migrate to new dedicated LW v2 repo | v2.0.1 |
 | Better githooks for repo | v2.0.1 |
-| Deprecate Nanocode external Worker | v2.0.1 |
 | Lorebook support / Agent Profile enhancements / Workspace Seeding improvements / Agent Profile switching / User Profile switching (further planning required) | v2.0.2 |
 | Self-Healing Capability Expansion - deferred from 1.1.8 | v2.0.2 |
 | Self-Healing Capabilities analysis of any missing pieces from all the new components. Implementation of missing pieces to follow | v2.0.2 |
 | More Crate Updates | v2.0.2 |
 | MCP Overhaul Part 1 | v2.0.2 |
 | Per-tenant WeeChat health-glob gate (fix the flap /`render-units` footgun) | v2.0.3 |
+| Deprecate Nanocode external Worker | v2.0.3 |
 | Lunartica UI reskin continuation | v2.0.3 |
 | Upgrade old testing harness | v2.0.3 |
 | Further external worker polishing | v2.0.3 |
