@@ -148,8 +148,31 @@ user can see *why* a skill changed. Keep it bounded (e.g. last 20).
 - `ic/crates/lunarwing_engine/prompts/mission_self_improvement.md` — add the
   propose-only skill-patching branch.
 - **Approval surface** (API/UI): endpoints to list pending skill-patch
-  proposals, view the diff, and approve/reject. (Onboard/gateway wiring scoped
-  as a follow-up if the API lands first.)
+  proposals, view the diff, and approve/reject.
+
+### Approval-surface architecture (verified against the code)
+The web gateway does NOT hold the engine V2 `Store` directly — `GatewayState`
+only has the v1 `skill_registry` (marked for removal) and a sandbox `Database`.
+Engine V2 is parallel-deployment behind `ENGINE_V2=true` (Strategy C), and all
+engine↔web interaction goes through **bridge functions in
+`ic/src/bridge/router.rs`**, which read the engine store from the global
+`ENGINE_STATE: OnceLock<RwLock<Option<EngineState>>>` (`EngineState.store:
+Arc<dyn Store>`). `SkillTracker` is built on demand from that store (as the
+orchestrator already does: `SkillTracker::new(store)`).
+
+So the B-1 API mirrors the existing `get_engine_mission` / `handle_approval`
+pattern — NOT a raw SkillTracker handle on GatewayState:
+1. **Bridge fns** (`router.rs`): `list_pending_skill_patches(user)`,
+   `approve_skill_patch(doc_id, user)`, `reject_skill_patch(doc_id, user)` —
+   pull `store` from `ENGINE_STATE`, build a `SkillTracker`, call
+   `apply_pending_patch` / `discard_pending_patch`, return DTOs.
+2. **Gateway handlers + routes** (`channels/web/handlers/`, `server.rs`): thin
+   auth'd handlers that call the bridge fns. Routes e.g.
+   `GET /api/skills/patches` (list pending), `POST /api/skills/patches/{doc_id}/approve`,
+   `POST /api/skills/patches/{doc_id}/reject`. Auth via the existing
+   `AuthenticatedUser` extractor; user-scoped like other engine queries.
+3. **GUI** (separate follow-up pass): a review panel listing pending proposals
+   with the diff + confidence + failing thread, and approve/reject buttons.
 
 ## Tests
 - v2.rs: `patch_history` + `pending_patch` serde round-trip + bounded truncation.
