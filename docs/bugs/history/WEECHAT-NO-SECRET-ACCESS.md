@@ -1,7 +1,7 @@
 # BUG: WASM tools can't resolve secrets when triggered over WeeChat (IRC)
 
-> **STATUS: FIXED (verified 2026-06-07)** — channel-originated messages now execute under the
-> owner credential scope (`resolve_message_scope`, `ic/src/channels/wasm/wrapper.rs:768`), so
+> **STATUS: FIXED (current source verified 2026-07-12)** — channel-originated messages now execute under the
+> owner credential scope (`resolve_message_scope`, `ic/src/channels/wasm/wrapper.rs:760-772`), so
 > tools like `web_search` resolve secrets over WeeChat. Analysis retained for history.
 
 **Severity:** Medium — secret-backed WASM tools (e.g. `web_search` → `brave_api_key`) failed
@@ -50,7 +50,7 @@ and the tool failed with "credentials not configured."
 ## Fix
 
 Chosen approach (**Option A** — the cleaner of two): in `resolve_message_scope`
-(`ic/src/channels/wasm/wrapper.rs:768`), when no owner actor id is set, resolve to the instance
+(`ic/src/channels/wasm/wrapper.rs:760-772`), when no owner actor id is set, resolve to the instance
 **owner scope** rather than the raw sender id. Channel-originated messages now execute tools
 under the instance owner's credential scope; the raw `sender_id` is still preserved separately
 for audit/routing. The strict "no fallback to default" guard for per-user credential isolation
@@ -58,3 +58,10 @@ is left intact — this fixes the *scope resolution*, not the credential lookup.
 
 (The rejected Option B — adding a `"default"` fallback inside credential resolution — would have
 weakened the per-user isolation the test enforces.)
+
+## Current verification
+
+`resolve_message_scope` returns `owner_scope_id` when no owner actor is configured
+(`ic/src/channels/wasm/wrapper.rs:760-772`), and the downstream credential injector
+uses that scope (`wrapper.rs:3328-3356`). The old single-line `:768` reference is
+historical. No Cargo or live WeeChat run was performed.
