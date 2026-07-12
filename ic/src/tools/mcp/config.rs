@@ -702,6 +702,28 @@ mod tests {
         assert!(!file.remove("nonexistent"));
     }
 
+    #[test]
+    fn test_enabled_servers_excludes_disabled_and_includes_reenabled() {
+        let mut file = McpServersFile::default();
+        file.upsert(McpServerConfig::new("active", "https://active.example.com"));
+        let mut disabled = McpServerConfig::new("disabled", "https://disabled.example.com");
+        disabled.enabled = false;
+        file.upsert(disabled);
+
+        let enabled: Vec<&str> = file
+            .enabled_servers()
+            .map(|server| server.name.as_str())
+            .collect();
+        assert_eq!(enabled, ["active"]);
+
+        file.get_mut("disabled").expect("disabled server").enabled = true;
+        let enabled: Vec<&str> = file
+            .enabled_servers()
+            .map(|server| server.name.as_str())
+            .collect();
+        assert_eq!(enabled, ["active", "disabled"]);
+    }
+
     #[tokio::test]
     async fn test_load_save_config() {
         let dir = tempdir().unwrap();
@@ -763,6 +785,29 @@ mod tests {
             err.contains("bad-server"),
             "Error should name the offending server, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_load_rejects_path_like_server_name_before_startup() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp-servers.json");
+        let invalid = McpServersFile {
+            servers: vec![McpServerConfig::new_stdio(
+                "../escaped",
+                "cat",
+                Vec::new(),
+                HashMap::new(),
+            )],
+            schema_version: default_schema_version(),
+        };
+        tokio::fs::write(&path, serde_json::to_vec(&invalid).unwrap())
+            .await
+            .unwrap();
+
+        let error = load_mcp_servers_from(&path)
+            .await
+            .expect_err("path-like name must be rejected before startup");
+        assert!(error.to_string().contains("../escaped"));
     }
 
     #[test]

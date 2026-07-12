@@ -176,6 +176,8 @@ I18n.register('zh-CN', {
   'mcp.argsPlaceholder': '参数，每行一个',
   'mcp.envPlaceholder': '非机密环境变量，每行 KEY=VALUE',
   'mcp.envNonSecret': '环境变量值将以普通配置形式存储。请勿输入机密信息。',
+  'mcp.deactivated': '已停用 MCP 服务器 {name}',
+  'mcp.deactivateFailed': '停用失败: {message}',
 
 
   // 技能标签页

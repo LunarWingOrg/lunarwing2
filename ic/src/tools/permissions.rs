@@ -41,7 +41,7 @@ pub fn seeded_default_permission(tool_name: &str) -> Option<PermissionState> {
 
 fn seeded_default_permission_canonical(canonical_tool_name: &str) -> Option<PermissionState> {
     match canonical_tool_name {
-        // LunarWing keeps tool_activate and http as AskEachTime (conservative default).
+        // Lifecycle and HTTP actions keep conservative AskEachTime defaults.
         "echo" | "time" | "json" | "memory_search" | "memory_read" | "memory_write"
         | "memory_tree" | "tool_list" | "tool_info" | "tool_search" | "skill_list"
         | "skill_search" | "list_jobs" | "job_status" | "job_events" | "image_analyze"
@@ -63,6 +63,7 @@ fn seeded_default_permission_canonical(canonical_tool_name: &str) -> Option<Perm
         | "tool_install"
         | "tool_auth"
         | "tool_activate"
+        | "tool_deactivate"
         | "tool_remove"
         | "tool_upgrade"
         | "skill_install"
@@ -412,6 +413,12 @@ mod tests {
             effective_permission("tool_activate", &overrides),
             PermissionState::AskEachTime,
             "tool_activate should default to AskEachTime in LunarWing"
+        );
+
+        assert_eq!(
+            effective_permission("tool_deactivate", &overrides),
+            PermissionState::AskEachTime,
+            "tool_deactivate should default to AskEachTime in LunarWing"
         );
     }
 

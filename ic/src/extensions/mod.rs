@@ -510,6 +510,9 @@ pub struct InstalledExtension {
     pub command: Option<String>,
     pub authenticated: bool,
     pub active: bool,
+    /// Persisted desired state for MCP servers. Other extension kinds omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     /// Tool names if active.
     #[serde(default)]
     pub tools: Vec<String>,
@@ -957,6 +960,7 @@ mod tests {
         assert!(ext.url.is_none());
         assert!(ext.transport.is_none());
         assert!(ext.command.is_none());
+        assert!(ext.enabled.is_none());
         assert!(ext.activation_error.is_none());
     }
 
@@ -972,6 +976,7 @@ mod tests {
             command: None,
             authenticated: true,
             active: true,
+            enabled: None,
             tools: vec!["send_email".to_string(), "read_inbox".to_string()],
             needs_setup: true,
             has_auth: true,

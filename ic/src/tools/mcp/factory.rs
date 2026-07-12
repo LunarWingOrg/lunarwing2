@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use crate::secrets::SecretsStore;
+use crate::tools::ToolError;
 use crate::tools::mcp::config::{EffectiveTransport, McpServerConfig};
 use crate::tools::mcp::{McpClient, McpProcessManager, McpSessionManager, McpTransport};
 
@@ -109,6 +110,35 @@ pub async fn create_client_from_config(
     }
 }
 
+/// Shut down a live MCP client, its managed stdio process (when present), and session state.
+pub async fn shutdown_client_runtime(
+    server_name: &str,
+    client: Option<&McpClient>,
+    session_manager: &McpSessionManager,
+    process_manager: &McpProcessManager,
+) -> Result<(), ToolError> {
+    let client_error = if let Some(client) = client {
+        client.shutdown().await.err()
+    } else {
+        None
+    };
+    let process_error = process_manager.shutdown(server_name).await.err();
+    session_manager.terminate(server_name).await;
+
+    match (client_error, process_error) {
+        (None, None) => Ok(()),
+        (Some(client_error), None) => Err(ToolError::ExternalService(format!(
+            "Failed to stop MCP server '{server_name}' transport: {client_error}"
+        ))),
+        (None, Some(process_error)) => Err(ToolError::ExternalService(format!(
+            "Failed to stop MCP server '{server_name}' process: {process_error}"
+        ))),
+        (Some(client_error), Some(process_error)) => Err(ToolError::ExternalService(format!(
+            "Failed to stop MCP server '{server_name}' transport ({client_error}) and process ({process_error})"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +162,49 @@ mod tests {
         assert!(
             client.has_session_manager(),
             "non-OAuth HTTP clients must carry a session manager"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_client_runtime_stops_managed_stdio_process() {
+        let session_manager = Arc::new(McpSessionManager::new());
+        let process_manager = Arc::new(McpProcessManager::new());
+        let transport = process_manager
+            .spawn_stdio(
+                "shutdown-test",
+                "cat",
+                Vec::<String>::new(),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("spawn test process");
+        let client = McpClient::new_with_transport(
+            "shutdown-test",
+            transport,
+            Some(Arc::clone(&session_manager)),
+            None,
+            "test",
+            None,
+        );
+        session_manager
+            .get_or_create("shutdown-test", "stdio://shutdown-test")
+            .await;
+
+        shutdown_client_runtime(
+            "shutdown-test",
+            Some(&client),
+            &session_manager,
+            &process_manager,
+        )
+        .await
+        .expect("shutdown runtime");
+
+        assert!(process_manager.managed_servers().await.is_empty());
+        assert!(
+            !session_manager
+                .active_servers()
+                .await
+                .contains(&"shutdown-test".to_string())
         );
     }
 }

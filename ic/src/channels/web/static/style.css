@@ -3135,6 +3135,15 @@ body {
   background: var(--accent-subtle);
 }
 
+.btn-ext.deactivate {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.btn-ext.deactivate:hover {
+  background: var(--warning-subtle);
+}
+
 .btn-ext.remove {
   border-color: var(--danger);
   color: var(--danger);

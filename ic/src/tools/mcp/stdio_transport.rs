@@ -129,11 +129,22 @@ impl McpTransport for StdioMcpTransport {
     }
 
     async fn shutdown(&self) -> Result<(), ToolError> {
-        // Kill the child process.
-        {
+        let child_result = {
             let mut child = self.child.lock().await;
-            let _ = child.kill().await;
-        }
+            match child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => child.kill().await.map_err(|error| {
+                    ToolError::ExternalService(format!(
+                        "[{}] Failed to stop MCP server process: {}",
+                        self.server_name, error
+                    ))
+                }),
+                Err(error) => Err(ToolError::ExternalService(format!(
+                    "[{}] Failed to inspect MCP server process: {}",
+                    self.server_name, error
+                ))),
+            }
+        };
 
         // Abort the reader tasks.
         if let Some(handle) = self.reader_handle.lock().await.take() {
@@ -150,6 +161,7 @@ impl McpTransport for StdioMcpTransport {
             pending.clear(); // Dropping senders wakes receivers with Err
         }
 
+        child_result?;
         tracing::debug!("[{}] Stdio transport shut down", self.server_name);
         Ok(())
     }
@@ -192,6 +204,13 @@ mod tests {
 
         // Verify shutdown completes without error.
         transport.shutdown().await.expect("shutdown should succeed");
+        let status = transport
+            .child
+            .lock()
+            .await
+            .try_wait()
+            .expect("inspect child after shutdown");
+        assert!(status.is_some(), "shutdown must reap the child process");
     }
 
     #[tokio::test]

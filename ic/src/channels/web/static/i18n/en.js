@@ -176,6 +176,8 @@ I18n.register('en', {
   'mcp.argsPlaceholder': 'Arguments, one per line',
   'mcp.envPlaceholder': 'Non-secret environment, KEY=VALUE per line',
   'mcp.envNonSecret': 'Environment values are stored as plain configuration. Do not enter secrets.',
+  'mcp.deactivated': 'Deactivated MCP server {name}',
+  'mcp.deactivateFailed': 'Deactivate failed: {message}',
 
 
   // Skills Tab

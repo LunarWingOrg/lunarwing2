@@ -44,6 +44,7 @@ _MCP_ACTIVE = {
     "description": "An active MCP server",
     "url": "http://localhost:3000",
     "active": True,
+    "enabled": True,
     "authenticated": False,
     "has_auth": False,
     "needs_setup": False,
@@ -52,7 +53,13 @@ _MCP_ACTIVE = {
     "activation_error": None,
 }
 
-_MCP_INACTIVE = {**_MCP_ACTIVE, "name": "test-mcp-inactive", "display_name": "Inactive MCP", "active": False}
+_MCP_INACTIVE = {
+    **_MCP_ACTIVE,
+    "name": "test-mcp-inactive",
+    "display_name": "Inactive MCP",
+    "active": False,
+    "enabled": False,
+}
 
 _WASM_CHANNEL = {
     "name": "test-channel",
@@ -135,7 +142,7 @@ async def mock_ext_apis(page, *, installed=None, registry=None):
 
     Must be called BEFORE navigating to the extensions subtab.
     """
-    ext_body = json.dumps({"extensions": installed or []})
+    installed_state = installed or []
     registry_body = json.dumps({"entries": registry or []})
 
     # Playwright evaluates route handlers in LIFO order (last-registered fires
@@ -145,7 +152,11 @@ async def mock_ext_apis(page, *, installed=None, registry=None):
     async def handle_ext_list(route):
         path = route.request.url.split("?")[0]
         if path.endswith("/api/extensions"):
-            await route.fulfill(status=200, content_type="application/json", body=ext_body)
+            await route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"extensions": installed_state}),
+            )
         else:
             await route.continue_()
 
@@ -231,7 +242,7 @@ async def test_installed_wasm_tool_authed_shows_reconfigure_btn(page):
 # ─── Group C: MCP server cards ────────────────────────────────────────────────
 
 async def test_installed_mcp_server_active(page):
-    """Active MCP server shows 'Active' label and no Activate button."""
+    """Active MCP server shows its label and Deactivate control."""
     await mock_ext_apis(page, installed=[_MCP_ACTIVE])
     await go_to_mcp(page)
 
@@ -239,6 +250,7 @@ async def test_installed_mcp_server_active(page):
     await card.wait_for(state="visible", timeout=5000)
     assert await card.locator(SEL["ext_active_label"]).count() == 1
     assert await card.locator(SEL["ext_activate_btn"]).count() == 0
+    assert await card.locator(SEL["ext_deactivate_btn"]).count() == 1
     assert await card.locator(SEL["ext_remove_btn"]).count() == 1
 
 
@@ -277,6 +289,7 @@ async def test_mcp_server_installed_auth_dot(page):
     await card.wait_for(state="visible", timeout=5000)
     # Installed MCP in registry section should show auth dot
     assert await card.locator(SEL["ext_auth_dot_unauthed"]).count() == 1
+    assert await card.locator(SEL["ext_deactivate_btn"]).count() == 1
 
 
 # ─── Group D: WASM channel stepper states ─────────────────────────────────────
@@ -1019,6 +1032,39 @@ async def test_activate_mcp_server_success(page):
         await activate_btn.click()
 
     assert len(activate_called) >= 1, "Activate API was not called"
+
+
+async def test_deactivate_mcp_server_success(page):
+    """Deactivation refreshes an active MCP card into its persisted inactive state."""
+    deactivate_called = []
+    installed = [{**_MCP_ACTIVE}]
+
+    async def handle_deactivate(route):
+        deactivate_called.append(True)
+        installed[0] = {**installed[0], "active": False, "enabled": False}
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"success": True}),
+        )
+
+    await mock_ext_apis(page, installed=installed)
+    await page.route("**/api/extensions/test-mcp/deactivate", handle_deactivate)
+    await go_to_mcp(page)
+
+    deactivate_btn = page.locator(SEL["ext_card_mcp"]).first.locator(
+        SEL["ext_deactivate_btn"]
+    )
+    await deactivate_btn.wait_for(state="visible", timeout=5000)
+
+    async with page.expect_response("**/api/extensions/test-mcp/deactivate", timeout=5000):
+        await deactivate_btn.click()
+
+    assert len(deactivate_called) >= 1, "Deactivate API was not called"
+    card = page.locator(SEL["ext_card_mcp"]).first
+    await card.locator(SEL["ext_activate_btn"]).wait_for(state="visible", timeout=5000)
+    assert await card.locator(SEL["ext_deactivate_btn"]).count() == 0
+    assert "Inactive" in await card.locator(SEL["ext_active_label"]).text_content()
 
 
 async def test_activate_awaiting_token_opens_configure(page):

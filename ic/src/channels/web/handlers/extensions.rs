@@ -61,6 +61,7 @@ pub async fn extensions_list_handler(
                 command: ext.command,
                 authenticated: ext.authenticated,
                 active: ext.active,
+                enabled: ext.enabled,
                 tools: ext.tools,
                 needs_setup: ext.needs_setup,
                 has_auth: ext.has_auth,

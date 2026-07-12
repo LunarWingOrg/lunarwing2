@@ -235,6 +235,11 @@ impl McpClient {
         self.session_manager.is_some()
     }
 
+    /// Shut down the underlying transport and release its resources.
+    pub async fn shutdown(&self) -> Result<(), ToolError> {
+        self.transport.shutdown().await
+    }
+
     /// Get the next request ID.
     fn next_request_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
@@ -864,6 +869,7 @@ mod tests {
         supports_http: bool,
         responses: std::sync::Mutex<Vec<McpResponse>>,
         recorded_headers: std::sync::Mutex<Vec<HashMap<String, String>>>,
+        shutdown_called: std::sync::atomic::AtomicBool,
     }
 
     impl MockTransport {
@@ -872,10 +878,15 @@ mod tests {
                 supports_http,
                 responses: std::sync::Mutex::new(responses),
                 recorded_headers: std::sync::Mutex::new(Vec::new()),
+                shutdown_called: std::sync::atomic::AtomicBool::new(false),
             }
         }
         fn recorded_headers(&self) -> Vec<HashMap<String, String>> {
             self.recorded_headers.lock().unwrap().clone()
+        }
+
+        fn shutdown_called(&self) -> bool {
+            self.shutdown_called.load(Ordering::SeqCst)
         }
     }
 
@@ -896,6 +907,7 @@ mod tests {
             Ok(responses.remove(0))
         }
         async fn shutdown(&self) -> Result<(), ToolError> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
             Ok(())
         }
         fn supports_http_features(&self) -> bool {
@@ -1005,6 +1017,23 @@ mod tests {
         assert!(http_transport.supports_http_features());
         let mock_non_http = MockTransport::new(false, vec![]);
         assert!(!mock_non_http.supports_http_features());
+    }
+
+    #[tokio::test]
+    async fn test_client_shutdown_delegates_to_transport() {
+        let transport = Arc::new(MockTransport::new(false, Vec::new()));
+        let client = McpClient::new_with_transport(
+            "test-shutdown",
+            transport.clone(),
+            None,
+            None,
+            "default",
+            None,
+        );
+
+        client.shutdown().await.expect("client shutdown");
+
+        assert!(transport.shutdown_called());
     }
 
     /// Regression test for issue #890: stdio clients must auto-initialize

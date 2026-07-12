@@ -1,6 +1,6 @@
 //! Tool registry for managing available tools.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -22,8 +22,8 @@ use crate::tools::builtin::{
     JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool,
     MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool,
     ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool,
-    ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
-    ToolUpgradeTool, WriteFileTool,
+    ToolActivateTool, ToolAuthTool, ToolDeactivateTool, ToolInstallTool, ToolListTool,
+    ToolRemoveTool, ToolSearchTool, ToolUpgradeTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolDomain};
@@ -61,6 +61,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "tool_install",
     "tool_auth",
     "tool_activate",
+    "tool_deactivate",
     "tool_list",
     "tool_remove",
     "routine_create",
@@ -162,6 +163,23 @@ impl ToolRegistry {
         tracing::trace!("Registered tool: {}", name);
     }
 
+    /// Register a tool only when its exact name is currently vacant.
+    ///
+    /// Returns `true` only when this exact `Arc` was inserted. The vacancy
+    /// check and insertion happen under one write lock.
+    pub async fn register_if_vacant(&self, tool: Arc<dyn Tool>) -> bool {
+        let name = tool.name().to_string();
+        let mut tools = self.tools.write().await;
+        match tools.entry(name.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(tool);
+                tracing::trace!("Registered tool in vacant slot: {}", name);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
     /// Register a tool (sync version for startup, marks as built-in).
     pub fn register_sync(&self, tool: Arc<dyn Tool>) {
         let name = tool.name().to_string();
@@ -177,6 +195,20 @@ impl ToolRegistry {
     /// Unregister a tool.
     pub async fn unregister(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.write().await.remove(name)
+    }
+
+    /// Unregister a tool only when the current value is the expected `Arc`.
+    pub async fn unregister_if_same(&self, name: &str, expected: &Arc<dyn Tool>) -> bool {
+        let mut tools = self.tools.write().await;
+        let is_same = tools
+            .get(name)
+            .is_some_and(|registered| Arc::ptr_eq(registered, expected));
+        if !is_same {
+            return false;
+        }
+
+        tools.remove(name);
+        true
     }
 
     /// Resolve a tool name, accepting hyphenated legacy aliases.
@@ -525,7 +557,7 @@ impl ToolRegistry {
         tracing::debug!("Registered ssh_git tool");
     }
 
-    /// Register extension management tools (search, install, auth, activate, list, remove).
+    /// Register extension management tools.
     ///
     /// These allow the LLM to manage MCP servers and WASM tools through conversation.
     pub fn register_extension_tools(&self, manager: Arc<ExtensionManager>) {
@@ -533,11 +565,12 @@ impl ToolRegistry {
         self.register_sync(Arc::new(ToolInstallTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolAuthTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolActivateTool::new(Arc::clone(&manager))));
+        self.register_sync(Arc::new(ToolDeactivateTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolListTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolRemoveTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolUpgradeTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ExtensionInfoTool::new(manager)));
-        tracing::debug!("Registered 8 extension management tools");
+        tracing::debug!("Registered 9 extension management tools");
     }
 
     /// Register skill management tools (list, search, install, remove).
@@ -900,6 +933,110 @@ mod tests {
     use super::*;
     use crate::tools::registry::EchoTool;
     use crate::tools::tool::ToolDiscoverySummary;
+
+    struct NamedTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "ownership test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<crate::tools::tool::ToolOutput, crate::tools::tool::ToolError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_ownership_register_if_vacant_preserves_first_arc() {
+        let registry = ToolRegistry::new();
+        let first: Arc<dyn Tool> = Arc::new(NamedTool("shared"));
+        let second: Arc<dyn Tool> = Arc::new(NamedTool("shared"));
+
+        assert!(registry.register_if_vacant(Arc::clone(&first)).await);
+        assert!(!registry.register_if_vacant(Arc::clone(&second)).await);
+
+        let registered = registry.get("shared").await.expect("registered tool");
+        assert!(Arc::ptr_eq(&registered, &first));
+        assert!(!Arc::ptr_eq(&registered, &second));
+    }
+
+    #[tokio::test]
+    async fn registry_ownership_register_if_vacant_is_atomic() {
+        let registry = Arc::new(ToolRegistry::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let first: Arc<dyn Tool> = Arc::new(NamedTool("contended"));
+        let second: Arc<dyn Tool> = Arc::new(NamedTool("contended"));
+
+        let first_task = {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            let tool = Arc::clone(&first);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                registry.register_if_vacant(tool).await
+            })
+        };
+        let second_task = {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            let tool = Arc::clone(&second);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                registry.register_if_vacant(tool).await
+            })
+        };
+
+        barrier.wait().await;
+        let first_inserted = first_task.await.expect("first task");
+        let second_inserted = second_task.await.expect("second task");
+        assert_ne!(first_inserted, second_inserted);
+
+        let registered = registry.get("contended").await.expect("registered tool");
+        let winner = if first_inserted { &first } else { &second };
+        assert!(Arc::ptr_eq(&registered, winner));
+    }
+
+    #[tokio::test]
+    async fn registry_ownership_unregister_if_same_preserves_replacement() {
+        let registry = ToolRegistry::new();
+        let original: Arc<dyn Tool> = Arc::new(NamedTool("replaceable"));
+        let replacement: Arc<dyn Tool> = Arc::new(NamedTool("replaceable"));
+
+        assert!(registry.register_if_vacant(Arc::clone(&original)).await);
+        registry.register(Arc::clone(&replacement)).await;
+
+        assert!(!registry.unregister_if_same("replaceable", &original).await);
+        let registered = registry
+            .get("replaceable")
+            .await
+            .expect("replacement remains registered");
+        assert!(Arc::ptr_eq(&registered, &replacement));
+
+        assert!(
+            registry
+                .unregister_if_same("replaceable", &replacement)
+                .await
+        );
+        assert!(!registry.has("replaceable").await);
+        assert!(
+            !registry
+                .unregister_if_same("replaceable", &replacement)
+                .await
+        );
+    }
 
     #[tokio::test]
     async fn test_register_and_get() {

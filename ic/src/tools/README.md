@@ -154,6 +154,9 @@ negotiates MCP, and registers its tools. Treat the executable as trusted install
 code: stdio servers are not sandboxed. Values in `env` are plain configuration,
 not secret storage; use LunarWing's credential systems for secrets.
 
+Deactivation unloads the server's tools, stops a managed stdio child, and preserves
+the configuration with `enabled=false`; activating it again reconnects and restores its tools.
+
 **Decision guide:**
 
 | Scenario | Use |

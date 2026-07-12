@@ -48,17 +48,18 @@ impl McpProcessManager {
         let name = name.into();
         let command = command.into();
 
-        // Store config for potential restart
-        self.configs.write().await.insert(
-            name.clone(),
-            StdioSpawnConfig {
-                command: command.clone(),
-                args: args.clone(),
-                env: env.clone(),
-            },
-        );
-
+        let spawn_config = StdioSpawnConfig {
+            command: command.clone(),
+            args: args.clone(),
+            env: env.clone(),
+        };
         let transport = Arc::new(StdioMcpTransport::spawn(&name, &command, args, env).await?);
+
+        // Store config only after the child was spawned successfully.
+        self.configs
+            .write()
+            .await
+            .insert(name.clone(), spawn_config);
 
         self.transports
             .write()
@@ -76,27 +77,43 @@ impl McpProcessManager {
     /// Shut down all managed transports.
     pub async fn shutdown_all(&self) {
         let transports: Vec<(String, Arc<StdioMcpTransport>)> = {
-            let mut map = self.transports.write().await;
-            map.drain().collect()
+            let map = self.transports.read().await;
+            map.iter()
+                .map(|(name, transport)| (name.clone(), Arc::clone(transport)))
+                .collect()
         };
 
         for (name, transport) in transports {
             if let Err(e) = transport.shutdown().await {
                 tracing::warn!("Failed to shut down MCP stdio server '{}': {}", name, e);
+                continue;
             }
+            self.remove_if_same(&name, &transport).await;
+            self.configs.write().await.remove(&name);
         }
     }
 
     /// Shut down a specific transport by name.
     pub async fn shutdown(&self, name: &str) -> Result<(), ToolError> {
-        let transport = self.transports.write().await.remove(name);
+        let transport = self.transports.read().await.get(name).cloned();
 
-        if let Some(transport) = transport {
+        if let Some(ref transport) = transport {
             transport.shutdown().await?;
+            self.remove_if_same(name, transport).await;
         }
 
         self.configs.write().await.remove(name);
         Ok(())
+    }
+
+    async fn remove_if_same(&self, name: &str, expected: &Arc<StdioMcpTransport>) {
+        let mut transports = self.transports.write().await;
+        let is_same = transports
+            .get(name)
+            .is_some_and(|current| Arc::ptr_eq(current, expected));
+        if is_same {
+            transports.remove(name);
+        }
     }
 
     /// Attempt to restart a crashed transport with exponential backoff.
