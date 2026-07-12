@@ -113,6 +113,23 @@ user can see *why* a skill changed. Keep it bounded (e.g. last 20).
 - **Trigger: confidence-threshold.** Patching is considered when
   `SkillMetrics.confidence()` drops below `SKILL_PATCH_CONFIDENCE_THRESHOLD`
   (with a minimum `usage_count`), not on individual failures.
+- **Post-patch metrics: epoch reset + snapshot.** Applying a patch snapshots the
+  pre-patch `SkillMetrics` into the `SkillPatch` history entry
+  (`metrics_before`), then zeroes live usage/success/failure counts. This gives
+  a patched skill a fair fresh evaluation window (confidence → 1.0, needs
+  `min_usage` new outcomes before it can re-trip the trigger) instead of
+  carrying stale pre-patch failures forever. Full history is preserved in the
+  snapshot. Implemented + tested in `apply_pending_patch`.
+- **Credit assignment: keep simple, rely on the human gate.** Attribution stays
+  activation-based (every skill active in a failed thread shares the outcome —
+  guilt by association). We do NOT add snippet-invocation tracking. Rationale:
+  the ratio + `min_usage` floor dilutes single-thread noise, and propose-then-
+  approve means a falsely-blamed skill only yields a *proposal* the user can
+  reject. Revisit invocation-level attribution only if it proves noisy in
+  practice.
+  - Note: there is deliberately NO consecutive-failure logic (an earlier draft's
+    "3 failures in a row → auto-rollback" was dropped with the auto-apply model).
+    A skill flags only via cumulative ratio below threshold over ≥ min_usage uses.
 
 ## Files touched
 - `ic/crates/lunarwing_skills/src/v2.rs` — add `SkillPatch` + `patch_history`

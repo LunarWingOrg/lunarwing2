@@ -96,6 +96,10 @@ impl SkillMetrics {
 }
 
 /// A single applied skill patch, recorded for auditability (B-1).
+///
+/// Captures the metrics as they stood *before* this patch reset them, so the
+/// full history (e.g. "v1 was 2/8 = 0.25, then patched") is never lost even
+/// though live metrics are epoch-reset on each patch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillPatch {
     /// The version this patch produced.
@@ -108,6 +112,9 @@ pub struct SkillPatch {
     /// Human-readable reason / diagnosis.
     #[serde(default)]
     pub reason: String,
+    /// Metrics snapshot immediately before this patch reset them (audit trail).
+    #[serde(default)]
+    pub metrics_before: SkillMetrics,
 }
 
 /// A proposed-but-not-yet-applied skill patch (B-1, propose-then-approve model).
@@ -263,6 +270,12 @@ mod tests {
                 applied_at: Utc::now(),
                 source_thread_id: Some("thread-1".to_string()),
                 reason: "fixed bad command".to_string(),
+                metrics_before: SkillMetrics {
+                    usage_count: 8,
+                    success_count: 2,
+                    failure_count: 6,
+                    last_used: None,
+                },
             }],
             pending_patch: None,
         };
@@ -278,6 +291,9 @@ mod tests {
         assert_eq!(parsed.parent_version, Some(2));
         assert_eq!(parsed.patch_history.len(), 1);
         assert_eq!(parsed.patch_history[0].version, 3);
+        // Pre-patch metrics snapshot survives serialization (audit trail).
+        assert_eq!(parsed.patch_history[0].metrics_before.usage_count, 8);
+        assert_eq!(parsed.patch_history[0].metrics_before.failure_count, 6);
     }
 
     #[test]

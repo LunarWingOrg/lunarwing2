@@ -215,12 +215,24 @@ impl SkillTracker {
             applied_at: chrono::Utc::now(),
             source_thread_id: pending.source_thread_id.clone(),
             reason: pending.reason.clone(),
+            // Preserve the pre-patch metrics before the epoch reset below.
+            metrics_before: meta.metrics.clone(),
         });
         // Keep history bounded (newest kept).
         if meta.patch_history.len() > MAX_PATCH_HISTORY {
             let overflow = meta.patch_history.len() - MAX_PATCH_HISTORY;
             meta.patch_history.drain(0..overflow);
         }
+
+        // Epoch reset: a patched skill earns a fair fresh evaluation window.
+        // Without this, stale pre-patch failures would keep the cumulative
+        // ratio below threshold forever, immediately re-tripping the patch
+        // trigger and masking whether the patch actually helped. The old
+        // counts live on in `metrics_before` above (full audit trail).
+        meta.metrics.usage_count = 0;
+        meta.metrics.success_count = 0;
+        meta.metrics.failure_count = 0;
+        meta.metrics.last_used = None;
 
         let updated_doc = MemoryDoc {
             content: pending.proposed_content,
@@ -538,6 +550,17 @@ mod tests {
         assert_eq!(meta.patch_history.len(), 1);
         assert_eq!(meta.patch_history[0].version, 2);
         assert_eq!(meta.patch_history[0].reason, "fix");
+        // Epoch reset: live metrics zeroed so the patched skill gets a fresh
+        // evaluation window (confidence back to 1.0, benefit of the doubt).
+        assert_eq!(meta.metrics.usage_count, 0);
+        assert_eq!(meta.metrics.success_count, 0);
+        assert_eq!(meta.metrics.failure_count, 0);
+        assert!(meta.metrics.last_used.is_none());
+        assert!((meta.metrics.confidence() - 1.0).abs() < f64::EPSILON);
+        // ...but the pre-patch metrics are preserved in the history snapshot.
+        assert_eq!(meta.patch_history[0].metrics_before.usage_count, 5);
+        assert_eq!(meta.patch_history[0].metrics_before.success_count, 3);
+        assert_eq!(meta.patch_history[0].metrics_before.failure_count, 2);
     }
 
     #[tokio::test]

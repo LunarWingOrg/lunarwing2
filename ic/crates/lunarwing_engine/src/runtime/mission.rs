@@ -509,11 +509,20 @@ impl MissionManager {
                                 .take(10)
                                 .collect();
 
+                            // B-1: attribute the failure to any activated skills
+                            // that are ALSO below the patch-confidence threshold,
+                            // so the self-improvement mission can propose a patch.
+                            // Empty when no such skill was active — the mission
+                            // then only does its prompt/config/orchestrator work.
+                            let active_skills =
+                                collect_patch_candidate_skills(mgr.store.as_ref(), &thread).await;
+
                             let payload = serde_json::json!({
                                 "source_thread_id": event.thread_id.0.to_string(),
                                 "goal": thread.goal,
                                 "issues": issues,
                                 "error_messages": error_messages,
+                                "active_skills": active_skills,
                             });
 
                             if let Err(e) = mgr
@@ -938,6 +947,91 @@ impl MissionManager {
 }
 
 // ── Meta-prompt generation ───────────────────────────────────
+
+/// B-1: from a failed thread, collect the skills that were active AND are
+/// below the patch-confidence threshold, so the self-improvement mission can
+/// propose a patch for them.
+///
+/// Attribution is activation-based (guilt-by-association): any skill named in a
+/// `SkillActivated` event of the thread is a candidate, filtered to those that
+/// (a) are patchable (not `Installed`/read-only) and (b) trip
+/// `SkillMetrics::is_patch_candidate` (enough usage + confidence below
+/// threshold). Returns an empty vec if none qualify — the mission then does
+/// only its prompt/config/orchestrator work. Best-effort: store errors and
+/// unparseable skill metadata are skipped, never fatal to the listener.
+async fn collect_patch_candidate_skills(
+    store: &dyn Store,
+    thread: &crate::types::thread::Thread,
+) -> Vec<serde_json::Value> {
+    use lunarwing_skills::SkillTrust;
+    use lunarwing_skills::v2::{
+        DEFAULT_PATCH_CONFIDENCE_THRESHOLD, DEFAULT_PATCH_MIN_USAGE, V2SkillMetadata,
+    };
+
+    // Names activated during the thread (deduped).
+    let mut activated: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in &thread.events {
+        if let crate::types::event::EventKind::SkillActivated { skill_names } = &e.kind {
+            for n in skill_names {
+                activated.insert(n.clone());
+            }
+        }
+    }
+    if activated.is_empty() {
+        return Vec::new();
+    }
+
+    // Load the skills visible to this thread's user (own + shared).
+    let docs = match store
+        .list_memory_docs_with_shared(thread.project_id, &thread.user_id)
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            debug!("collect_patch_candidate_skills: store error: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    // Dedup by doc id: a skill can appear in both the user's own list and the
+    // shared list (own + shared are concatenated), and must be flagged once.
+    let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+    for doc in docs {
+        if doc.doc_type != crate::types::memory::DocType::Skill {
+            continue;
+        }
+        if !seen.insert(doc.id.0) {
+            continue;
+        }
+        let Ok(meta) = serde_json::from_value::<V2SkillMetadata>(doc.metadata.clone()) else {
+            continue;
+        };
+        // Must have been activated in this thread (match on the skill's name).
+        if !activated.contains(&meta.name) {
+            continue;
+        }
+        // Never propose patches for externally-installed (read-only) skills.
+        if meta.trust == SkillTrust::Installed {
+            continue;
+        }
+        // Confidence-threshold gate with a minimum-sample floor.
+        if !meta
+            .metrics
+            .is_patch_candidate(DEFAULT_PATCH_CONFIDENCE_THRESHOLD, DEFAULT_PATCH_MIN_USAGE)
+        {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "doc_id": doc.id.0.to_string(),
+            "name": meta.name,
+            "version": meta.version,
+            "confidence": meta.metrics.confidence(),
+            "usage_count": meta.metrics.usage_count,
+        }));
+    }
+    out
+}
 
 /// Build the meta-prompt for a mission thread.
 ///
@@ -2684,5 +2778,162 @@ mod tests {
             self_imp_count, 1,
             "should not duplicate self-improvement mission"
         );
+    }
+
+    // ── B-1: active-skill attribution for the failure payload ────────
+
+    fn seed_skill(
+        project_id: ProjectId,
+        user: &str,
+        name: &str,
+        trust: lunarwing_skills::SkillTrust,
+        usage: u64,
+        success: u64,
+        failure: u64,
+    ) -> MemoryDoc {
+        use lunarwing_skills::v2::{SkillMetrics, V2SkillMetadata};
+        let meta = V2SkillMetadata {
+            name: name.to_string(),
+            trust,
+            source: lunarwing_skills::v2::V2SkillSource::Extracted,
+            metrics: SkillMetrics {
+                usage_count: usage,
+                success_count: success,
+                failure_count: failure,
+                last_used: None,
+            },
+            ..serde_json::from_str::<V2SkillMetadata>("{}").unwrap()
+        };
+        let mut doc = MemoryDoc::new(
+            project_id,
+            user,
+            crate::types::memory::DocType::Skill,
+            format!("skill:{name}"),
+            "skill body",
+        );
+        doc.metadata = serde_json::to_value(&meta).unwrap();
+        doc
+    }
+
+    fn failed_thread_activating(
+        project_id: ProjectId,
+        user: &str,
+        skill_names: Vec<String>,
+    ) -> Thread {
+        let mut t = Thread::new(
+            "do a thing",
+            ThreadType::Foreground,
+            project_id,
+            user,
+            Default::default(),
+        );
+        t.events.push(ThreadEvent::new(
+            t.id,
+            crate::types::event::EventKind::SkillActivated { skill_names },
+        ));
+        t
+    }
+
+    #[tokio::test]
+    async fn test_collect_below_confidence_activated_skill() {
+        let project_id = ProjectId::new();
+        // 2/8 = 0.25 confidence, 8 uses, Trusted, activated → candidate.
+        let bad = seed_skill(
+            project_id,
+            "alice",
+            "flaky",
+            lunarwing_skills::SkillTrust::Trusted,
+            8,
+            2,
+            6,
+        );
+        let store = TestStore::new();
+        store.save_memory_doc(&bad).await.unwrap();
+        let thread = failed_thread_activating(project_id, "alice", vec!["flaky".to_string()]);
+
+        let out = collect_patch_candidate_skills(&store, &thread).await;
+        assert_eq!(out.len(), 1, "below-confidence activated skill should be flagged");
+        assert_eq!(out[0]["name"], "flaky");
+    }
+
+    #[tokio::test]
+    async fn test_collect_excludes_healthy_and_inactive_and_installed() {
+        let project_id = ProjectId::new();
+        let store = TestStore::new();
+        // Healthy, activated → excluded (confidence high).
+        store
+            .save_memory_doc(&seed_skill(
+                project_id,
+                "alice",
+                "good",
+                lunarwing_skills::SkillTrust::Trusted,
+                8,
+                7,
+                1,
+            ))
+            .await
+            .unwrap();
+        // Below-confidence but NOT activated → excluded.
+        store
+            .save_memory_doc(&seed_skill(
+                project_id,
+                "alice",
+                "notused",
+                lunarwing_skills::SkillTrust::Trusted,
+                8,
+                1,
+                7,
+            ))
+            .await
+            .unwrap();
+        // Below-confidence, activated, but Installed (read-only) → excluded.
+        store
+            .save_memory_doc(&seed_skill(
+                project_id,
+                "alice",
+                "vendor",
+                lunarwing_skills::SkillTrust::Installed,
+                8,
+                1,
+                7,
+            ))
+            .await
+            .unwrap();
+
+        let thread = failed_thread_activating(
+            project_id,
+            "alice",
+            vec!["good".to_string(), "vendor".to_string()],
+        );
+        let out = collect_patch_candidate_skills(&store, &thread).await;
+        assert!(out.is_empty(), "no skill should qualify, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn test_collect_empty_when_no_skills_activated() {
+        let project_id = ProjectId::new();
+        let store = TestStore::new();
+        store
+            .save_memory_doc(&seed_skill(
+                project_id,
+                "alice",
+                "flaky",
+                lunarwing_skills::SkillTrust::Trusted,
+                8,
+                2,
+                6,
+            ))
+            .await
+            .unwrap();
+        // Thread with NO SkillActivated events.
+        let thread = Thread::new(
+            "g",
+            ThreadType::Foreground,
+            project_id,
+            "alice",
+            Default::default(),
+        );
+        let out = collect_patch_candidate_skills(&store, &thread).await;
+        assert!(out.is_empty());
     }
 }
