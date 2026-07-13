@@ -2,7 +2,10 @@
 
 The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
 
-Enabled at runtime via the `ENGINE_V2=true` environment variable. When enabled, the bridge router (`src/bridge/router.rs`) delegates incoming messages to the engine instead of the legacy v1 agent loop.
+Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
+uses Engine V2 by default when enabled. The bridge router (`src/bridge/router.rs`)
+keeps other channels on the legacy path unless the exact eligible channel name
+is present in `ENGINE_V2_CHANNELS`.
 
 ## Five Primitives
 
@@ -265,6 +268,28 @@ Wraps `Database` + `Workspace` as the engine's `Store` trait:
 - In-memory HashMap cache backed by the database
 - Fallback to database on cache miss (never deletes LLM output)
 
+### Channel Routing And Delivery
+
+`should_route_to_engine_v2()` owns the rollout policy. `ENGINE_V2=false`
+disables every Engine V2 route. With Engine V2 enabled, the gateway is always
+eligible; `ENGINE_V2_CHANNELS` can additionally select the exact names `xmpp`,
+`darkirc`, and `weechat`. Values are comma-separated, trimmed, lowercased, and
+matched exactly. Empty and unknown values are ignored.
+
+Engine `ResponseDelta` events flow through
+`ChannelManager::send_status(StatusUpdate::StreamChunk)`. The gateway maps each
+chunk to SSE. WASM channels deliberately treat chunks as a no-op because the
+current WIT has no message-editing contract. Completed terminal text returns to
+the agent's outer outbound handler, which applies `BeforeOutbound`, suppresses
+empty responses, persists compatibility history, and calls
+`ChannelManager::respond()` once with the original incoming metadata.
+
+Approval, authentication, interrupt, clear, and new-thread controls use the
+same user and engine-conversation scope as ordinary input. This includes
+non-UUID DarkIRC and WeeChat scope keys. Approval and auth prompts are statuses;
+gate pauses, auth pauses, and stopped turns return an empty no-reply sentinel so
+the outer handler does not send or persist a duplicate terminal response.
+
 ## External Trait Boundaries
 
 The engine defines three traits that the host crate implements. This boundary ensures the engine has no dependency on the main daemon crate and is testable in isolation.
@@ -294,7 +319,10 @@ This enables:
 ## Configuration
 
 ```bash
-ENGINE_V2=true              # Enable the v2 engine (default: false)
+ENGINE_V2=true                 # Enable Engine V2 (default: false)
+ENGINE_V2_CHANNELS=            # Gateway only (default)
+ENGINE_V2_CHANNELS=xmpp        # Add XMPP
+ENGINE_V2_CHANNELS=xmpp,weechat # Add exact eligible channels
 ```
 
 The engine inherits most configuration from the host daemon (LLM provider settings, database config, tool registry, safety settings). Engine-specific behavior is controlled through `ThreadConfig` at thread spawn time.
