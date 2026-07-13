@@ -692,6 +692,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_drop_before_done_does_not_populate_cache() {
+        // The stream carries a terminal Done, but the consumer drops after the
+        // first delta. The cache must commit only when Done is actually
+        // consumed — a dropped stream leaves the cache empty.
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![StreamScript::Items(vec![
+                Ok(LlmStreamChunk::TextDelta("partial".to_string())),
+                Ok(LlmStreamChunk::Done {
+                    usage: Some(TokenUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_read_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                    }),
+                    finish_reason: "stop".to_string(),
+                }),
+            ])],
+            vec![],
+        ));
+        let cached = CachedProvider::new(provider, ResponseCacheConfig::default());
+
+        let mut stream = cached
+            .complete_stream(simple_request())
+            .await
+            .expect("stream should open");
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "partial"
+        ));
+        drop(stream);
+        assert!(cached.is_empty());
+    }
+
+    #[tokio::test]
     async fn blocking_completion_and_stream_share_cache_entry() {
         let provider = Arc::new(ScriptedStreamingProvider::new(
             "scripted",

@@ -182,7 +182,7 @@ This document tracks feature parity between LunarWing (Rust implementation) and 
 | Skill path compaction | ✅ | ❌ | ~ prefix to reduce prompt tokens |
 | Thinking modes (off/minimal/low/medium/high/xhigh/adaptive) | ✅ | 🚧 | thinkingConfig for Gemini models (thinkingBudget/thinkingLevel); no per-level control yet |
 | Per-model thinkingDefault override | ✅ | ❌ | Override thinking level per model; Anthropic Claude 4.6 defaults to adaptive |
-| Block-level streaming | ✅ | 🚧 | Engine V2 gateway: provider text deltas stream to the web UI via SSE `stream_chunk` (Phase 3). Non-gateway channels and tool-arg streaming deferred. |
+| Block-level streaming | ✅ | 🚧 | Engine V2 gateway: provider text deltas stream to the web UI via SSE `stream_chunk` (Phase 3). A gateway interrupt now cancels the in-flight provider stream and commits no terminal response/usage/cache/trace for the cancelled call (Phase 4). Non-gateway channels and tool-arg streaming deferred. |
 | Tool-level streaming | ✅ | ❌ | |
 | Z.AI tool_stream | ✅ | ❌ | Real-time tool call streaming |
 | Plugin tools | ✅ | ✅ | WASM tools |

@@ -192,9 +192,12 @@ impl SkillTracker {
                 reason: format!("invalid skill metadata: {e}"),
             })?;
 
-        let pending = meta.pending_patch.take().ok_or_else(|| EngineError::Skill {
-            reason: format!("skill {} has no pending patch to apply", doc_id.0),
-        })?;
+        let pending = meta
+            .pending_patch
+            .take()
+            .ok_or_else(|| EngineError::Skill {
+                reason: format!("skill {} has no pending patch to apply", doc_id.0),
+            })?;
 
         // Optimistic concurrency: the skill must not have changed since propose.
         let current_hash = compute_content_hash(&doc.content);

@@ -21,14 +21,23 @@ generation, and expose progress during long agentic runs.
   terminal `response`. The channel-neutral `StatusUpdate::StreamChunk` path is
   additionally wired for non-gateway channels (inert today; WASM channels ignore
   `StreamChunk`) to plumb the Phase 5 rollout.
-- **Interrupts and WASM channel delivery are still not covered.** Those remain
-  Phase 4 and Phase 5.
+- **Phase 4 is implemented on the implementation branch (automated gates
+  pass).** Each running thread owns a `tokio_util` `CancellationToken`; a stop
+  cancels it (in addition to the existing between-step `ThreadSignal::Stop`) so
+  an in-flight provider stream — whether still acquiring or mid-collection — is
+  dropped promptly. A cancelled LLM call is control flow, not an error: the
+  thread returns `ThreadOutcome::Stopped` and commits no terminal assistant
+  reply, no usage from the cancelled call, no cache entry, and no recording
+  trace. Cancellation is isolated by owner and conversation scope, resumed and
+  subsequent turns get fresh tokens, and the gateway `Submission::Interrupt` is
+  routed to Engine V2 (returning a single `Interrupted.` acknowledgement). The
+  live TensorZero `2026.3.2` cancellation gate on Brightdawn is still pending.
+- **WASM channel delivery is still not covered.** That remains Phase 5.
 - **TensorZero Gateway `2026.3.2` is the compatibility target.** LunarWing uses
   its OpenAI-compatible `/openai/v1/chat/completions` endpoint.
 
-The next work is interrupt-aware cancellation (Phase 4) and opt-in WASM channel
-delivery (Phase 5). Provider streaming and gateway delivery are no longer the
-blocker.
+The next work is opt-in WASM channel delivery (Phase 5). Provider streaming,
+gateway delivery, and interrupt-aware cancellation are no longer the blocker.
 
 ## Why this is foundational
 
@@ -216,7 +225,15 @@ gateway rather than exposing partial support.
   non-gateway `StatusUpdate::StreamChunk` path is wired (inert today) for the
   Phase 5 rollout. Gateway delta and status are emitted through a single path to
   avoid duplicating streamed text.
-- **Phase 4:** interrupt-aware engine consumption and cancellation tests.
+- **Phase 4 - implemented (live gate pending):** per-thread
+  `CancellationToken` ownership in `ThreadManager`, cancellation propagated
+  through `ExecutionLoop` into the orchestrator's LLM host call (wrapping stream
+  acquisition and collection in `run_until_cancelled`), a typed
+  `ThreadOutcome::Stopped` that resumes neither Monty nor failure/rollback
+  accounting, terminal-only decorator state preserved on stream drop, and a
+  scoped gateway interrupt route. The between-step `ThreadSignal::Stop` contract
+  is retained. Live TensorZero `2026.3.2` cancellation validation on Brightdawn
+  is still outstanding.
 - **Phase 5:** opt-in channel-neutral delivery for eligible WASM channels after
   the approved safety gates pass.
 

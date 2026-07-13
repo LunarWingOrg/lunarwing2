@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::capability::lease::LeaseManager;
@@ -57,6 +58,10 @@ pub struct ExecutionLoop {
     /// (bridge) reads these files and supplies the assembled text here. Without
     /// it, the engine uses only the generic CodeAct persona.
     identity_preamble: Option<String>,
+    /// Cancels an in-flight provider stream when the thread is stopped. The
+    /// manager supplies the running thread's token; direct unit-test
+    /// construction gets a fresh, never-cancelled token.
+    cancellation: CancellationToken,
 }
 
 impl ExecutionLoop {
@@ -83,7 +88,15 @@ impl ExecutionLoop {
             store: None,
             platform_info: None,
             identity_preamble: None,
+            cancellation: CancellationToken::new(),
         }
+    }
+
+    /// Set the cancellation token used to drop an in-flight provider stream
+    /// when the thread is stopped.
+    pub fn with_cancellation_token(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     /// Set the tenant identity/persona preamble (prepended to the system
@@ -302,6 +315,7 @@ impl ExecutionLoop {
             &self.leases,
             &self.policy,
             &mut self.signal_rx,
+            &self.cancellation,
             self.event_tx.as_ref(),
             self.retrieval.as_ref(),
             self.store.as_ref(),
@@ -312,8 +326,12 @@ impl ExecutionLoop {
         // Post-cleanup: persist final state, track failures for auto-rollback
         match result {
             Ok(orch_result) => {
-                // Reset failure counter on success
-                if let Some(store) = self.store.as_ref() {
+                // Reset the failure counter on a normal finish. A user stop
+                // (`Stopped`) is control flow, not a successful run, so it must
+                // not clear orchestrator failure/rollback history.
+                if !matches!(&orch_result.outcome, ThreadOutcome::Stopped)
+                    && let Some(store) = self.store.as_ref()
+                {
                     crate::executor::orchestrator::reset_orchestrator_failures(
                         store,
                         self.thread.project_id,
@@ -1600,5 +1618,125 @@ mod tests {
             empty_id_issues.is_empty(),
             "clean execution should have no empty_call_id issues, got: {empty_id_issues:?}"
         );
+    }
+
+    // ── Streaming cancellation preserves failure history ────
+
+    /// Backend whose stream emits one delta then stays pending, so only
+    /// cancellation ends it.
+    struct PendingStreamLlm;
+
+    #[async_trait::async_trait]
+    impl LlmBackend for PendingStreamLlm {
+        async fn complete(
+            &self,
+            _messages: &[ThreadMessage],
+            _actions: &[ActionDef],
+            _config: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            Err(EngineError::Llm {
+                reason: "blocking completion must not be called".into(),
+            })
+        }
+
+        async fn complete_stream<'a>(
+            &'a self,
+            _messages: &[ThreadMessage],
+            _actions: &[ActionDef],
+            _config: &LlmCallConfig,
+        ) -> Result<LlmStream<'a>, EngineError> {
+            use futures::StreamExt;
+            Ok(
+                futures::stream::iter([Ok(LlmStreamChunk::TextDelta("before-cancel".into()))])
+                    .chain(futures::stream::pending())
+                    .boxed(),
+            )
+        }
+
+        fn model_name(&self) -> &str {
+            "pending-stream"
+        }
+    }
+
+    async fn failure_count(
+        store: &Arc<dyn crate::traits::store::Store>,
+        project_id: ProjectId,
+    ) -> u64 {
+        store
+            .list_shared_memory_docs(project_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .find(|doc| doc.title == "orchestrator:failures")
+            .and_then(|doc| serde_json::from_str::<serde_json::Value>(&doc.content).ok())
+            .and_then(|value| value.get("count").and_then(|count| count.as_u64()))
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn stopped_outcome_does_not_reset_orchestrator_failures() {
+        let project_id = ProjectId::new();
+        let store: Arc<dyn crate::traits::store::Store> =
+            Arc::new(crate::tests::InMemoryStore::new());
+
+        // Seed a nonzero failure tracker for the compiled-in orchestrator (v0).
+        crate::executor::orchestrator::record_orchestrator_failure(&store, project_id, 0).await;
+        crate::executor::orchestrator::record_orchestrator_failure(&store, project_id, 0).await;
+        assert_eq!(failure_count(&store, project_id).await, 2);
+
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            project_id,
+            "user",
+            ThreadConfig::default(),
+        );
+        let tid = thread.id;
+        let effects = Arc::new(MockEffects::new(vec![test_action()], Vec::new()));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        leases
+            .grant(tid, "test_cap", GrantedActions::All, None, None)
+            .await
+            .unwrap();
+
+        let (_tx, rx) = crate::runtime::messaging::signal_channel(16);
+        let token = CancellationToken::new();
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(32);
+        let llm: Arc<dyn LlmBackend> = Arc::new(PendingStreamLlm);
+
+        let mut exec = ExecutionLoop::new(thread, llm, effects, leases, policy, rx, "user".into())
+            .with_store(Arc::clone(&store))
+            .with_event_tx(event_tx)
+            .with_cancellation_token(token.clone());
+
+        let canceller = {
+            let token = token.clone();
+            async move {
+                while let Ok(event) = event_rx.recv().await {
+                    if let EventKind::ResponseDelta { content } = &event.kind
+                        && content == "before-cancel"
+                    {
+                        break;
+                    }
+                }
+                token.cancel();
+            }
+        };
+
+        let run = async move { exec.run().await };
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(run, canceller)
+        })
+        .await
+        .expect("stopped loop should finish promptly");
+
+        assert!(matches!(
+            outcome.expect("loop should return Ok"),
+            ThreadOutcome::Stopped
+        ));
+
+        // A user stop must not clear orchestrator failure history.
+        assert_eq!(failure_count(&store, project_id).await, 2);
     }
 }

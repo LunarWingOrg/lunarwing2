@@ -13,7 +13,7 @@
 3. [x] CREATE DETAILED PLAN OF PHASE 4 OF BIG STREAM Phase 4 is interruption/cancellation; Phase 5 is opt-in WASM delivery.
 4. [x] CREATE DETAILED PLAN OF PHASE 5 OF BIG STREAM Phase 4 is interruption/cancellation; Phase 5 is opt-in WASM delivery.
 5. [ ] PHASE 3 OF 5 NOW COMPLETE FOR v2 engine overhaul. ensure compatibility with all tools, mcp, skills, channels. ensure streaming. ensure gateway ui functionality. ensure tool compatibility in tensorzero. multiple phases. record progress. lot of tests needed
-6. [ ] Drop legacy `ironclaw-agent-v1` subprotocol offer from the daemon (delete the `SUBPROTOCOL_LEGACY` offer in `ic/src/orchestrator/external_worker.rs`) and `git rm` the 1.1.9-only repo-root compat symlinks `ironclaw_weechat_wss`, `darkirc_channel_for_ironclaw` (deployed tenants must have re-run mt-admin unit regen by then) (open pr)
+6. [ ] Drop legacy `ironclaw-agent-v1` subprotocol offer from the daemon (delete the `SUBPROTOCOL_LEGACY` offer in `ic/src/orchestrator/external_worker.rs`) and `git rm` the 1.1.9-only repo-root compat symlinks `ironclaw_weechat_wss`, `darkirc_channel_for_ironclaw` (deployed tenants must have re-run mt-admin unit regen by then) See: rarity/item-6-20260712-1200
 7. [x] LunarWing Web UI performance overhaul - lot of issues with UI - laggy, buttons dont animate, etc
 8. [x] LunarWing Web MT admin setup integration (part 2 of an earlier plan discussed some time ago) - started - go see: lunarwing_mt_onboard_web/ - this is being worked on by another agent or human
 9. [ ] Refine lunarwing web mt admin setup with more user options or build options. Other ideas: more sprites, splash screen, optional mascot, show tips on side panel instead of mascot? there is old closed pr with some other stuff w branch rarity/item-11-20260712-1936
@@ -115,7 +115,7 @@
     Defer For Now:
     Worker-local MCP, automatic npm/pip installation, secret injection through process environment, a general runtime-adapter refactor, gateway integration, and automatic crash restart all increase the security or lifecycle surface materially. Recommended: implement deactivate/re-enable, diagnostics, registry validation, and integration tests as one contained follow-up. That provides a complete and inspectable host-local lifecycle before introducing another execution placement.
     </details>
-20. [ ] Finish going through all the documents under architecture directory in docs/ and update all outdated documentation. Then, consolidate documents if possible.
+20. [ ] Finish going through all the documents under architecture directory in docs/ and update all outdated documentation. Then, consolidate documents if possible. see rarity/item-19-20260713-0300
 21. [ ] Go through all documents under bugs directory in docs/ and update all outdated documentation. Then, consolidate documents.
 22. [ ] Go through all documents under proposals directory in docs/ and update all outdated documentation. Then, consolidate documents if deemed necessary.
 23. [ ] Go through all documents under reviews directory in docs/ and update all outdated documentation. Then, consolidate documents.
