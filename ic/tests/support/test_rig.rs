@@ -98,6 +98,11 @@ impl TestRig {
         self.channel.wait_for_responses(n, timeout).await
     }
 
+    /// Return a snapshot of all captured responses.
+    pub fn captured_responses(&self) -> Vec<OutgoingResponse> {
+        self.channel.captured_responses()
+    }
+
     /// Return the names of all `ToolStarted` events captured so far.
     pub fn tool_calls_started(&self) -> Vec<String> {
         self.channel.tool_calls_started()
@@ -372,6 +377,7 @@ pub struct TestRigBuilder {
     extra_tools: Vec<Arc<dyn Tool>>,
     wasm_tools: Vec<WasmToolSpec>,
     keep_bootstrap: bool,
+    channel_name: String,
 }
 
 impl TestRigBuilder {
@@ -389,6 +395,7 @@ impl TestRigBuilder {
             extra_tools: Vec::new(),
             wasm_tools: Vec::new(),
             keep_bootstrap: false,
+            channel_name: "test".to_string(),
         }
     }
 
@@ -424,6 +431,12 @@ impl TestRigBuilder {
     /// Override the LLM provider directly (takes precedence over trace).
     pub fn with_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
         self.llm = Some(llm);
+        self
+    }
+
+    /// Override the in-process channel name.
+    pub fn with_channel_name(mut self, channel_name: impl Into<String>) -> Self {
+        self.channel_name = channel_name.into();
         self
     }
 
@@ -508,6 +521,7 @@ impl TestRigBuilder {
             extra_tools,
             wasm_tools,
             keep_bootstrap,
+            channel_name,
         } = self;
 
         // 1. Create temp dir + libSQL database + run migrations.
@@ -769,11 +783,12 @@ impl TestRigBuilder {
         // 7. Create TestChannel and ChannelManager.
         // When testing bootstrap, the channel must be named "gateway" because
         // the bootstrap greeting targets only the gateway channel.
-        let test_channel = if self.keep_bootstrap {
-            Arc::new(TestChannel::new().with_name("gateway"))
+        let channel_name = if keep_bootstrap {
+            "gateway".to_string()
         } else {
-            Arc::new(TestChannel::new())
+            channel_name
         };
+        let test_channel = Arc::new(TestChannel::new().with_name(channel_name));
         let handle = TestChannelHandle::new(Arc::clone(&test_channel));
         let channel_manager = ChannelManager::new();
         channel_manager.add(Box::new(handle)).await;
