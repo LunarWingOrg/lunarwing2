@@ -8,7 +8,7 @@
 
 ---
 
-1. [ ] Work on docs/ops/WEECHAT_SERVICES_VERIFICATION.md
+1. [x] Work on docs/ops/WEECHAT_SERVICES_VERIFICATION.md
 2. [x] CREATE DETAILED PLAN OF PHASE 4 OF BIG STREAM Phase 4 is interruption/cancellation; Phase 5 is opt-in WASM delivery.
 3. [x] CREATE DETAILED PLAN OF PHASE 5 OF BIG STREAM Phase 4 is interruption/cancellation; Phase 5 is opt-in WASM delivery.
 4. [ ] Refine lunarwing web mt admin setup with more user options or build options. We want: GUI splash screen basic black LunarWing text on startup, a toggle for the mascot to enable/disable, toggle for enable/disable show tips on side panel instead of mascot. There is old closed pr with some other stuff w branch rarity/item-11-20260712-1936 not sure if this is even worth checking out or not for this purpose.
