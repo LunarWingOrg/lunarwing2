@@ -1318,30 +1318,31 @@ impl Agent {
         // the engine learns channel-aware delivery, non-gateway channels stay
         // on the legacy loop. The channel name "gateway" matches the web
         // channel's Channel::name() and the IncomingMessage stamp in chat_send.
-        if let Submission::UserInput { ref content } = submission {
-            if crate::bridge::is_engine_v2_enabled() && message.channel == "gateway" {
-                tracing::debug!(
-                    message_id = %message.id,
-                    user_id = %message.user_id,
-                    "ENGINE_V2 enabled — routing gateway user input through engine v2"
-                );
-                // The engine delivers its response over SSE itself, so we must
-                // NOT let the returned text fall through to channels.respond()
-                // — that would double-send on the gateway. Consume the result:
-                // log any error, and return an empty response which the
-                // outbound handler suppresses (never sent).
-                match crate::bridge::handle_with_engine(self, message, content).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::error!(
-                            message_id = %message.id,
-                            error = %e,
-                            "engine v2 message handling failed"
-                        );
-                    }
+        if let Submission::UserInput { ref content } = submission
+            && crate::bridge::is_engine_v2_enabled()
+            && message.channel == "gateway"
+        {
+            tracing::debug!(
+                message_id = %message.id,
+                user_id = %message.user_id,
+                "ENGINE_V2 enabled — routing gateway user input through engine v2"
+            );
+            // The engine delivers its response over SSE itself, so we must
+            // NOT let the returned text fall through to channels.respond()
+            // — that would double-send on the gateway. Consume the result:
+            // log any error, and return an empty response which the
+            // outbound handler suppresses (never sent).
+            match crate::bridge::handle_with_engine(self, message, content).await {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(
+                        message_id = %message.id,
+                        error = %e,
+                        "engine v2 message handling failed"
+                    );
                 }
-                return Ok(Some(String::new()));
             }
+            return Ok(Some(String::new()));
         }
 
         // Hydrate thread from DB if it's a historical thread not in memory
