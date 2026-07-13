@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented.
+Implementation in progress.
 
 This design follows the completed Phase 2 work in
 `docs/proposals/ENGINE_LLM_STREAMING.md` and the approved channel-neutral
@@ -46,6 +46,27 @@ Translate `EventKind::ResponseDelta` at the bridge boundary in
 2. `forward_event_to_channel` (channel-neutral `StatusUpdate` path) gains a
    `ResponseDelta` arm that sends `StatusUpdate::StreamChunk(content)` — but only
    for **non-gateway** channels.
+3. Subscribe to the engine event broadcaster before any operation that can
+   spawn or resume thread execution, then pass that receiver into
+   `await_thread_outcome`. When execution finishes, drain events already queued
+   on that receiver before emitting the authoritative terminal response.
+
+## Event capture ordering
+
+Tokio broadcast receivers observe only events sent after subscription. Engine
+threads start in a background task before `handle_user_message` returns, so
+subscribing inside `await_thread_outcome` can miss the first provider deltas.
+The same race exists when approval or authentication resumes a paused thread.
+
+The bridge therefore establishes the receiver before calling any spawn/resume
+operation. `await_thread_outcome` consumes that existing receiver rather than
+creating a new one. Once the thread is no longer running, all engine sends have
+completed, but some events can still be queued locally; those matching the
+thread are drained and delivered before terminal response reconciliation.
+
+Receiver lag remains best-effort: it is logged, and the final response still
+replaces the partial browser bubble. Phase 3 does not make transient deltas
+durable or replayable.
 
 ## The double-emission constraint
 
@@ -108,6 +129,12 @@ JS change.
   `forward_event_to_channel` sends no status to a `"gateway"` channel for a
   `ResponseDelta` but sends one `StatusUpdate::StreamChunk` to a non-gateway
   channel.
+- `message_execution_subscribes_before_immediate_deltas`: an immediate engine
+  backend cannot emit its first response delta before the bridge receiver is
+  established.
+- `pending_thread_events_are_drained_in_order`: deltas already queued when a
+  thread completes are retained in order while events for other threads are
+  ignored.
 
 ## Verification
 
@@ -123,4 +150,6 @@ git diff --check
 
 End-to-end: run the gateway, send a prompt in the web UI, confirm assistant text
 appears incrementally then is replaced once by the final markdown-rendered
-answer — including on a brand-new thread's first message.
+answer — including on a brand-new thread's first message. Capture the SSE event
+sequence to verify at least two ordered `stream_chunk` events precede exactly
+one terminal `response` event for the same thread.
