@@ -453,6 +453,41 @@ pub trait LlmProvider: Send + Sync {
         request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError>;
 
+    /// Complete with tool use support as an incremental stream.
+    ///
+    /// Providers that do not support native tool streaming inherit a safe
+    /// fallback that performs the existing blocking completion and emits the
+    /// complete text/tool calls followed by terminal metadata.
+    async fn complete_with_tools_stream(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<LlmStream<'_>, LlmError> {
+        let response = self.complete_with_tools(request).await?;
+        let usage = TokenUsage {
+            input_tokens: response.input_tokens,
+            output_tokens: response.output_tokens,
+            cache_read_input_tokens: response.cache_read_input_tokens,
+            cache_creation_input_tokens: response.cache_creation_input_tokens,
+        };
+        let mut chunks = Vec::new();
+        if let Some(content) = response.content.filter(|content| !content.is_empty()) {
+            chunks.push(Ok(LlmStreamChunk::TextDelta(content)));
+        }
+        for (index, call) in response.tool_calls.into_iter().enumerate() {
+            chunks.push(Ok(LlmStreamChunk::ToolCallDelta {
+                index,
+                id: Some(call.id),
+                name: Some(call.name),
+                args_delta: call.arguments.to_string(),
+            }));
+        }
+        chunks.push(Ok(LlmStreamChunk::Done {
+            usage: Some(usage),
+            finish_reason: response.finish_reason.as_str().to_string(),
+        }));
+        Ok(stream::iter(chunks).boxed())
+    }
+
     /// List available models from the provider.
     /// Default implementation returns empty list.
     async fn list_models(&self) -> Result<Vec<String>, LlmError> {
@@ -644,6 +679,53 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    struct ToolFallbackProvider;
+
+    #[async_trait]
+    impl LlmProvider for ToolFallbackProvider {
+        fn model_name(&self) -> &str {
+            "tool-fallback"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Ok(CompletionResponse {
+                content: "plain".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            Ok(ToolCompletionResponse {
+                content: Some("I will search.".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "search".to_string(),
+                    arguments: serde_json::json!({"q": "rust"}),
+                    reasoning: None,
+                }],
+                input_tokens: 8,
+                output_tokens: 4,
+                finish_reason: FinishReason::ToolUse,
+                cache_read_input_tokens: 2,
+                cache_creation_input_tokens: 1,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn non_streaming_provider_falls_back_to_single_text_delta() {
         let provider: Arc<dyn LlmProvider> = Arc::new(crate::testing::StubLlm::new("hello"));
@@ -669,6 +751,53 @@ mod tests {
             }
             other => panic!("expected terminal chunk, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_provider_falls_back_for_tool_stream() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(ToolFallbackProvider);
+        let request = ToolCompletionRequest::new(
+            vec![ChatMessage::user("search")],
+            vec![ToolDefinition {
+                name: "search".to_string(),
+                description: "Search".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+        );
+
+        let chunks = provider
+            .complete_with_tools_stream(request)
+            .await
+            .expect("tool fallback stream should be created")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(chunks.len(), 3);
+        assert!(matches!(
+            &chunks[0],
+            Ok(LlmStreamChunk::TextDelta(text)) if text == "I will search."
+        ));
+        assert!(matches!(
+            &chunks[1],
+            Ok(LlmStreamChunk::ToolCallDelta {
+                index: 0,
+                id: Some(id),
+                name: Some(name),
+                args_delta,
+            }) if id == "call_1" && name == "search" && args_delta == "{\"q\":\"rust\"}"
+        ));
+        assert!(matches!(
+            &chunks[2],
+            Ok(LlmStreamChunk::Done {
+                usage: Some(TokenUsage {
+                    input_tokens: 8,
+                    output_tokens: 4,
+                    cache_read_input_tokens: 2,
+                    cache_creation_input_tokens: 1,
+                }),
+                finish_reason,
+            }) if finish_reason == "tool_calls"
+        ));
     }
 
     #[test]

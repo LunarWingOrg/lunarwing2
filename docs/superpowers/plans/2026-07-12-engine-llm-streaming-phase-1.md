@@ -89,6 +89,25 @@ Rig 0.40 changes relevant to this plan:
 - raw provider streams also contain internal metadata events, but those are
   consumed by Rig and are not exposed as typed assistant content.
 
+## Production Provider Contract - TensorZero 2026.3.2
+
+The deployed production provider is TensorZero Gateway 2026.3.2 through its
+OpenAI-compatible `/openai/v1/chat/completions` endpoint. Task 2 must cover its
+actual wire contract in addition to synthetic Rig events:
+
+- JSON SSE data frames terminate with `data: [DONE]`;
+- tool calls retain one numeric index while the ID is present only in the first
+  chunk and name/argument fragments arrive incrementally;
+- usage is present only when `stream_options.include_usage=true`; Rig 0.40's
+  OpenAI streaming client adds that option;
+- mid-stream failures are OpenAI-shaped JSON SSE events with a non-empty
+  `error` object; Rig 0.40 recognizes them and terminates the stream instead of
+  silently skipping them;
+- `delta.tensorzero_extra_content` carries thought and unknown blocks that
+  Rig's generic OpenAI parser does not expose. Phase 1 continues to omit
+  reasoning, so preserving those blocks remains a later TensorZero-specific
+  adapter decision.
+
 ## Scope And Locked Decisions
 
 This plan is the provider-layer Phase 1 milestone. It does not implement the
@@ -299,7 +318,7 @@ async fn complete_with_tools_stream(
 }
 ```
 
-- [ ] **Step 4: Add shared first-item and request helpers**
+- [x] **Step 4: Add shared first-item and request helpers**
 
 Create `ic/src/llm/streaming.rs` with exact typed request dispatch and replay
 semantics:
@@ -366,7 +385,7 @@ Use explicit named lifetimes if the inferred `'_` return lifetimes do not
 compile; the input stream and returned `FirstStreamItem`/`LlmStream` must share
 one lifetime.
 
-- [ ] **Step 5: Add deterministic stream test support**
+- [x] **Step 5: Add deterministic stream test support**
 
 Create `ic/src/llm/streaming_test_support.rs` behind `#[cfg(test)]` in
 `llm/mod.rs`. Define `StreamScript::{SetupError, Items, DelayedItems}` and a
@@ -398,7 +417,7 @@ stream methods pop from the corresponding queue. Expose `plain_calls()` and
 `tool_calls()` so decorator tests can prove that retries/failovers did or did
 not occur.
 
-- [ ] **Step 6: Run the contract tests**
+- [x] **Step 6: Run the contract tests**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::provider::tests:: -- --nocapture
@@ -406,7 +425,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::provider::tests:: -- --nocapture
 
 Expected: all provider fallback tests pass.
 
-- [ ] **Step 7: Commit the contract correction**
+- [x] **Step 7: Commit the contract correction**
 
 ```bash
 git add ic/src/llm/provider.rs ic/src/llm/streaming.rs ic/src/llm/streaming_test_support.rs ic/src/llm/mod.rs
@@ -652,10 +671,17 @@ Add these exact tests:
 - `complete_with_tools_stream_suppresses_duplicate_full_arguments`
 - `complete_with_tools_stream_synthesizes_full_tool_call`
 - `complete_stream_surfaces_mid_stream_error_and_stops`
+- `tensorzero_2026_3_2_stream_maps_text_usage_and_done`
+- `tensorzero_2026_3_2_tool_stream_preserves_fragment_order`
+- `tensorzero_2026_3_2_midstream_error_is_not_silently_dropped`
 
 The duplicate test must emit Rig name/argument deltas followed by Rig's full
 `ToolCall` and assert argument fragments appear once. The full-call test must
-emit only `ToolCall` and assert LunarWing receives one complete delta.
+emit only `ToolCall` and assert LunarWing receives one complete delta. The
+TensorZero tests must use a local mock HTTP/SSE endpoint with captured
+2026.3.2-compatible frames and exercise Rig's OpenAI completions client through
+`RigAdapter`; they must not depend on a live TensorZero service or the external
+TensorZero checkout.
 
 - [ ] **Step 6: Run Rig adapter coverage**
 
@@ -1371,6 +1397,8 @@ Update `docs/proposals/ENGINE_LLM_STREAMING.md` to record:
 - Host Phase 1 includes `complete_with_tools_stream` because engine action calls
   require it; user-visible partial tool rendering remains deferred.
 - Rig 0.40 finish-reason limitation and LunarWing's inference policy.
+- TensorZero Gateway 2026.3.2 SSE compatibility and its deferred
+  `tensorzero_extra_content` limitation.
 - Strict EOF-before-final behavior.
 - Retry/failover first-successful-chunk commit point.
 - SmartRouting's buffered moderate cascade.
