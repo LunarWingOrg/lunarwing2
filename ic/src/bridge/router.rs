@@ -303,14 +303,6 @@ async fn insert_and_notify_pending_gate(
     }
 }
 
-fn approval_thread_scope_hint(message: &IncomingMessage) -> Option<&str> {
-    if message.channel == "gateway" {
-        message.conversation_scope()
-    } else {
-        None
-    }
-}
-
 fn is_valid_tool_permission_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -1273,6 +1265,136 @@ pub async fn resolve_engine_auth_callback(
     Ok(true)
 }
 
+/// True when `responding_channel` may resolve `pending` — the same channel that
+/// created it, or a trusted gateway channel. Mirrors the authorization that
+/// `PendingGateStore::take_verified` enforces atomically at resolution time.
+fn gate_channel_matches(pending: &PendingGate, responding_channel: &str) -> bool {
+    pending.source_channel == responding_channel
+        || crate::gate::store::TRUSTED_GATE_CHANNELS.contains(&responding_channel)
+}
+
+/// Read-only lookup of the engine conversation for a message's scoped key.
+///
+/// Uses [`engine_conversation_key`] and `list_conversations`, so it never
+/// creates state (unlike `get_or_create_conversation`). Required for DarkIRC and
+/// WeeChat whose scopes (`darkirc:dm:...`, `weechat:group:...`) are not UUIDs
+/// and therefore cannot be matched by `parse_scope_uuid`.
+async fn find_engine_conversation_for_message(
+    state: &EngineState,
+    message: &IncomingMessage,
+) -> Option<lunarwing_engine::ConversationSurface> {
+    let key = engine_conversation_key(message);
+    state
+        .conversation_manager
+        .list_conversations(&message.user_id)
+        .await
+        .into_iter()
+        .find(|conversation| conversation.channel == key)
+}
+
+/// Find the single pending approval gate for the message's scoped conversation.
+///
+/// Returns `None` for zero or ambiguous (2+) matches so callers fall back to the
+/// legacy path rather than resolving a gate from another conversation. A trusted
+/// gateway channel supplying an explicit `request_id` plus an engine `ThreadId`
+/// scope may resolve that exact gate cross-channel; otherwise matching is scoped
+/// to the message's own conversation. Resolution still goes through
+/// `take_verified`, which re-checks request id, channel, and expiry atomically.
+async fn matching_engine_approval_gate(
+    state: &EngineState,
+    message: &IncomingMessage,
+    request_id: Option<uuid::Uuid>,
+) -> Option<PendingGate> {
+    // Trusted-gateway explicit-scope path: the gateway approval UI resolves a
+    // gate that originated on another channel by exact (thread_id, request_id).
+    if let Some(request_id) = request_id
+        && crate::gate::store::TRUSTED_GATE_CHANNELS.contains(&message.channel.as_str())
+        && let Some(thread_id) = parse_engine_thread_id(message.conversation_scope())
+    {
+        let scoped = state
+            .pending_gates
+            .list_for_user(&message.user_id)
+            .await
+            .into_iter()
+            .find(|gate| {
+                gate.thread_id == thread_id
+                    && gate.request_id == request_id
+                    && matches!(
+                        gate.resume_kind,
+                        lunarwing_engine::ResumeKind::Approval { .. }
+                    )
+            });
+        if scoped.is_some() {
+            return scoped;
+        }
+    }
+
+    let conversation = find_engine_conversation_for_message(state, message).await?;
+    let mut matches: Vec<PendingGate> = state
+        .pending_gates
+        .list_for_user(&message.user_id)
+        .await
+        .into_iter()
+        .filter(|gate| {
+            gate.conversation_id == conversation.id
+                && matches!(
+                    gate.resume_kind,
+                    lunarwing_engine::ResumeKind::Approval { .. }
+                )
+                && request_id.is_none_or(|rid| gate.request_id == rid)
+                && gate_channel_matches(gate, &message.channel)
+        })
+        .collect();
+
+    // Exactly one match, or None for zero/ambiguous.
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    }
+}
+
+/// Read-only predicate: does the user's scoped engine conversation have a
+/// pending approval gate (optionally matching `request_id`)? Never initializes
+/// or mutates engine state, so the legacy approval path stays reachable when no
+/// engine match exists.
+pub async fn has_matching_engine_approval(
+    message: &IncomingMessage,
+    request_id: Option<uuid::Uuid>,
+) -> bool {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return false;
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return false;
+    };
+    matching_engine_approval_gate(state, message, request_id)
+        .await
+        .is_some()
+}
+
+/// Read-only predicate: is at least one thread in the message's scoped engine
+/// conversation currently running? Never creates a conversation.
+pub async fn has_active_engine_thread(message: &IncomingMessage) -> bool {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return false;
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return false;
+    };
+    let Some(conversation) = find_engine_conversation_for_message(state, message).await else {
+        return false;
+    };
+    for tid in &conversation.active_threads {
+        if state.thread_manager.is_running(*tid).await {
+            return true;
+        }
+    }
+    false
+}
+
 /// Handle an approval response (yes/no/always) for engine v2.
 ///
 /// Called from `handle_message` when the user responds to an approval request.
@@ -1292,33 +1414,17 @@ pub async fn handle_approval(
         .as_ref()
         .ok_or_else(|| engine_err("init", "engine state is empty"))?;
 
-    let pending = match resolve_pending_gate_for_user(
-        &state.pending_gates,
-        &message.user_id,
-        approval_thread_scope_hint(message),
-    )
-    .await
-    {
-        PendingGateResolution::Resolved(p) => p,
-        PendingGateResolution::None => {
-            debug!(user_id = %message.user_id, "engine v2: no pending approval for user, ignoring");
+    // Conversation-scoped matcher: only an approval gate in this exact
+    // user/channel/scope conversation is eligible. `None` (zero or ambiguous)
+    // returns a generic message rather than resolving another conversation's
+    // gate. The matcher only returns Approval-kind gates.
+    let pending = match matching_engine_approval_gate(state, message, None).await {
+        Some(pending) => pending,
+        None => {
+            debug!(user_id = %message.user_id, "engine v2: no matching pending approval for user, ignoring");
             return Ok(Some("No pending approval for this thread.".into()));
         }
-        PendingGateResolution::Ambiguous => {
-            return Ok(Some(
-                "Multiple pending gates are waiting. Resolve from the original thread or retry with that thread selected.".into(),
-            ));
-        }
     };
-
-    if !matches!(
-        pending.resume_kind,
-        lunarwing_engine::ResumeKind::Approval { .. }
-    ) {
-        return Ok(Some(
-            "The selected pending gate is not an approval request.".into(),
-        ));
-    }
 
     let request_id = pending.request_id;
     let thread_id = pending.thread_id;
@@ -1355,46 +1461,10 @@ pub async fn handle_exec_approval(
         .as_ref()
         .ok_or_else(|| engine_err("init", "engine state is empty"))?;
 
-    if let Some(thread_id) = parse_engine_thread_id(message.conversation_scope())
-        && let Some(gate) = state
-            .pending_gates
-            .peek(&crate::gate::pending::PendingGateKey {
-                user_id: message.user_id.clone(),
-                thread_id,
-            })
-            .await
-        && gate.request_id == request_id.to_string()
-        && matches!(
-            gate.resume_kind,
-            lunarwing_engine::ResumeKind::Approval { .. }
-        )
-    {
-        drop(guard);
-        return resolve_gate(
-            agent,
-            message,
-            thread_id,
-            request_id,
-            if approved {
-                lunarwing_engine::GateResolution::Approved { always }
-            } else {
-                lunarwing_engine::GateResolution::Denied { reason: None }
-            },
-        )
-        .await;
-    }
-
-    let pending = state
-        .pending_gates
-        .list_for_user(&message.user_id)
-        .await
-        .into_iter()
-        .find(|gate| {
-            matches!(
-                gate.resume_kind,
-                lunarwing_engine::ResumeKind::Approval { .. }
-            ) && gate.request_id == request_id
-        });
+    // Conversation-scoped matcher with the explicit request id (also honors the
+    // trusted-gateway cross-channel approval path). Resolution stays atomic via
+    // `resolve_gate` -> `take_verified`.
+    let pending = matching_engine_approval_gate(state, message, Some(request_id)).await;
     drop(guard);
 
     if let Some(pending) = pending {
@@ -4631,6 +4701,169 @@ mod tests {
         let captured = statuses.lock().expect("poisoned");
         assert_eq!(captured.len(), 1);
         assert!(matches!(captured[0], StatusUpdate::ApprovalNeeded { .. }));
+    }
+
+    // ── Phase 5: scoped control routing ──────────────────────────
+
+    fn gate_in_conversation(
+        user_id: &str,
+        source_channel: &str,
+        conversation_id: lunarwing_engine::ConversationId,
+        resume_kind: lunarwing_engine::ResumeKind,
+    ) -> PendingGate {
+        let thread_id = lunarwing_engine::ThreadId::new();
+        PendingGate {
+            request_id: uuid::Uuid::new_v4(),
+            gate_name: resume_kind.kind_name().to_string(),
+            user_id: user_id.into(),
+            thread_id,
+            conversation_id,
+            source_channel: source_channel.into(),
+            action_name: "shell".into(),
+            call_id: format!("call-{thread_id}"),
+            parameters: serde_json::json!({}),
+            display_parameters: None,
+            description: "gate".into(),
+            resume_kind,
+            created_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            original_message: None,
+            resume_output: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_matcher_is_conversation_scoped() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        let conv_b = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-b", "alice")
+            .await
+            .unwrap();
+
+        let gate_a = gate_in_conversation(
+            "alice",
+            "gateway",
+            conv_a,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let gate_b = gate_in_conversation(
+            "alice",
+            "gateway",
+            conv_b,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let tid_a = gate_a.thread_id;
+        state.pending_gates.insert(gate_a).await.unwrap();
+        state.pending_gates.insert(gate_b).await.unwrap();
+
+        // A "yes" scoped to thread-a resolves only thread-a's gate, never B's.
+        let msg =
+            IncomingMessage::new("gateway", "alice", "yes").with_conversation_scope("thread-a");
+        let matched = matching_engine_approval_gate(&state, &msg, None).await;
+        assert_eq!(matched.map(|gate| gate.thread_id), Some(tid_a));
+    }
+
+    #[tokio::test]
+    async fn approval_matcher_ignores_authentication_gates() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+        let conv = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        state
+            .pending_gates
+            .insert(gate_in_conversation(
+                "alice",
+                "gateway",
+                conv,
+                lunarwing_engine::ResumeKind::Authentication {
+                    credential_name: "github".into(),
+                    instructions: "paste token".into(),
+                    auth_url: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let msg =
+            IncomingMessage::new("gateway", "alice", "yes").with_conversation_scope("thread-a");
+        assert!(
+            matching_engine_approval_gate(&state, &msg, None)
+                .await
+                .is_none(),
+            "authentication gates must not be classified as approvals"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_active_engine_thread_is_scoped() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let project_id = state.default_project_id;
+        let mut events = state.thread_manager.subscribe_events();
+
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        let tid_a = state
+            .conversation_manager
+            .handle_user_message(
+                conv_a,
+                "hi",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let wait = async {
+            while let Ok(evt) = events.recv().await {
+                if matches!(evt.kind, lunarwing_engine::EventKind::ResponseDelta { .. }) {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait)
+            .await
+            .expect("stream should start");
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let scoped_a =
+            IncomingMessage::new("gateway", "alice", "/stop").with_conversation_scope("thread-a");
+        let scoped_b =
+            IncomingMessage::new("gateway", "alice", "/stop").with_conversation_scope("thread-b");
+        assert!(has_active_engine_thread(&scoped_a).await);
+        assert!(!has_active_engine_thread(&scoped_b).await);
+
+        // Clean up the running thread and clear global engine state.
+        {
+            let guard = lock.read().await;
+            let state = guard.as_ref().unwrap();
+            let _ = state.thread_manager.stop_thread(tid_a, "alice").await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.thread_manager.join_thread(tid_a),
+            )
+            .await;
+        }
+        *lock.write().await = None;
     }
 
     // ── Phase 4: scoped interrupt + outcome mapping ──────────────
