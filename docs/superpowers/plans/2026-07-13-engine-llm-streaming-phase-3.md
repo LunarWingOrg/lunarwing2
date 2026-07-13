@@ -278,10 +278,24 @@ taskset -c 0-5 cargo fmt --all -- --check   # changed regions clean; pre-existin
 git diff --check
 ```
 
-- [ ] **Step 4: End-to-end UI check** — run the gateway, send a prompt, confirm
-  at least two ordered `stream_chunk` events followed by one terminal response
-  and a single markdown-rendered final replacement, including on a new thread's
-  first message.
+- [x] **Step 4: End-to-end SSE and persistence check** — on the `brightdawn`
+  tenant, capture at least two ordered `stream_chunk` events followed by exactly
+  one terminal `response` on the same thread. Confirm DB-backed gateway history
+  matches the terminal content, including on a new thread's first message and an
+  existing-thread continuation.
+
+- [ ] **Step 5: Browser UI check** — confirm partial text appears incrementally
+  in one streaming bubble, then is replaced once by the markdown-rendered final
+  response without a duplicate or orphan bubble.
+
+Live verification on TensorZero Gateway `2026.3.2`:
+
+- New-thread first message: 3 ordered chunks, 1 terminal response, no paired
+  duplicate emission, persisted history matched.
+- Existing-thread continuation: 93 ordered chunks, 1 terminal response, no
+  paired duplicate emission, persisted history matched.
+- The daemon logged no engine receiver lag or engine delivery error for either
+  case.
 
 ## Notes / boundaries
 

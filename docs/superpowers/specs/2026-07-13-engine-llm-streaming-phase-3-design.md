@@ -2,7 +2,8 @@
 
 ## Status
 
-Implemented locally; live tenant verification is pending.
+Implemented and live SSE/persistence verified; browser visual verification is
+pending.
 
 This design follows the completed Phase 2 work in
 `docs/proposals/ENGINE_LLM_STREAMING.md` and the approved channel-neutral
@@ -161,3 +162,10 @@ appears incrementally then is replaced once by the final markdown-rendered
 answer — including on a brand-new thread's first message. Capture the SSE event
 sequence to verify at least two ordered `stream_chunk` events precede exactly
 one terminal `response` event for the same thread.
+
+Live protocol verification against the `brightdawn` tenant and TensorZero
+Gateway `2026.3.2` passed for both a new-thread first message (3 chunks) and an
+existing-thread continuation (93 chunks). Each case produced exactly one later
+terminal response on the same thread, showed no paired duplicate emission, and
+matched DB-backed persisted history. No receiver-lag warning or engine delivery
+error was logged. Browser visual verification remains pending.
