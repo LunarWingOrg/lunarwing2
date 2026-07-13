@@ -526,7 +526,7 @@ impl StreamTraceAccumulator {
                 .into_values()
                 .map(|tool_call| {
                     let arguments = serde_json::from_str(&tool_call.arguments)
-                        .unwrap_or_else(|_| serde_json::Value::String(tool_call.arguments));
+                        .unwrap_or(serde_json::Value::String(tool_call.arguments));
                     TraceToolCall {
                         id: tool_call.id.unwrap_or_default(),
                         name: tool_call.name.unwrap_or_default(),
@@ -763,10 +763,7 @@ impl RecordingLlm {
                         provider: self.inner.model_name().to_string(),
                         reason: "plain recording stream produced a tool call".to_string(),
                     };
-                    return Some((
-                        Err(error),
-                        (inner, accumulator, hint, tool_results, true),
-                    ));
+                    return Some((Err(error), (inner, accumulator, hint, tool_results, true)));
                 }
 
                 match &item {
@@ -783,10 +780,7 @@ impl RecordingLlm {
                 }
 
                 let finished = matches!(&item, Ok(LlmStreamChunk::Done { .. }) | Err(_));
-                Some((
-                    item,
-                    (inner, accumulator, hint, tool_results, finished),
-                ))
+                Some((item, (inner, accumulator, hint, tool_results, finished)))
             },
         )
         .boxed()
