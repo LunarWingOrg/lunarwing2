@@ -438,7 +438,7 @@ git commit -m "feat: add tool-capable llm stream contract"
 - Modify: `ic/src/llm/rig_adapter.rs:1-35, 474-552, 601-760`
 - Test: `ic/src/llm/rig_adapter.rs`
 
-- [ ] **Step 1: Write failing native text and truncation tests**
+- [x] **Step 1: Write failing native text and truncation tests**
 
 Add a private `ScriptedCompletionModel` implementing Rig's `CompletionModel`
 with a raw final response that implements `GetTokenUsage`. Add these tests:
@@ -493,7 +493,7 @@ async fn complete_stream_rejects_eof_without_final_event() {
 }
 ```
 
-- [ ] **Step 2: Run the text test and verify it fails**
+- [x] **Step 2: Run the text test and verify it fails**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::rig_adapter::tests::complete_stream_emits_text_deltas_and_terminal_usage -- --exact --nocapture
@@ -501,7 +501,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::rig_adapter::tests::complete_stream_emi
 
 Expected: failure because `RigAdapter` still inherits the blocking fallback.
 
-- [ ] **Step 3: Add the Rig stream state and mapper**
+- [x] **Step 3: Add the Rig stream state and mapper**
 
 Import `GetTokenUsage`, `StreamedAssistantContent`, and
 `ToolCallDeltaContent`. Add an owned state used by `futures::stream::unfold`:
@@ -511,7 +511,7 @@ struct RigStreamState<R>
 where
     R: Clone + Unpin + GetTokenUsage,
 {
-    upstream: rig::streaming::StreamingCompletionResponse<R>,
+    upstream: rig_core::streaming::StreamingCompletionResponse<R>,
     provider: String,
     indexes: std::collections::HashMap<String, usize>,
     seen_deltas: HashSet<String>,
@@ -590,11 +590,14 @@ match state.upstream.next().await {
     }
     Some(Ok(StreamedAssistantContent::Final(raw))) => {
         state.terminal = true;
-        let usage = raw.token_usage().map(|usage| TokenUsage {
-            input_tokens: saturate_u32(usage.input_tokens),
-            output_tokens: saturate_u32(usage.output_tokens),
-            cache_read_input_tokens: saturate_u32(usage.cached_input_tokens),
-            cache_creation_input_tokens: extract_cache_creation(&raw),
+        let raw_usage = raw.token_usage();
+        let usage = raw_usage.has_values().then(|| TokenUsage {
+            input_tokens: saturate_u32(raw_usage.input_tokens),
+            output_tokens: saturate_u32(raw_usage.output_tokens),
+            cache_read_input_tokens: saturate_u32(raw_usage.cached_input_tokens),
+            cache_creation_input_tokens: saturate_u32(
+                raw_usage.cache_creation_input_tokens,
+            ),
         });
         let finish_reason = if state.saw_tool { "tool_calls" } else { "stop" };
         Some((Ok(LlmStreamChunk::Done {
@@ -624,7 +627,7 @@ Do not actually emit empty text for skipped reasoning/empty events. Structure
 the `unfold` helper to loop internally until it has a real LunarWing item or
 reaches terminal state.
 
-- [ ] **Step 4: Implement both native request methods**
+- [x] **Step 4: Implement both native request methods**
 
 Extract request preparation helpers so blocking and streaming paths share
 model-override warnings, unsupported-parameter stripping, message sanitation,
@@ -649,7 +652,7 @@ async fn complete_with_tools_stream(
     &self,
     request: ToolCompletionRequest,
 ) -> Result<LlmStream<'_>, LlmError> {
-    let rig_request = self.build_tool_request(request)?;
+    let (rig_request, _known_tool_names) = self.build_tool_request(request)?;
     let upstream = self.model.stream(rig_request).await.map_err(|error| {
         LlmError::RequestFailed {
             provider: self.model_name.clone(),
@@ -663,7 +666,7 @@ async fn complete_with_tools_stream(
 Add the explicit associated response bounds required for boxing the owned Rig
 stream. Keep `M::Response` and `M::StreamingResponse` bounds separate.
 
-- [ ] **Step 5: Add tool, duplicate, and mid-stream error tests**
+- [x] **Step 5: Add tool, duplicate, and mid-stream error tests**
 
 Add these exact tests:
 
@@ -683,7 +686,7 @@ TensorZero tests must use a local mock HTTP/SSE endpoint with captured
 `RigAdapter`; they must not depend on a live TensorZero service or the external
 TensorZero checkout.
 
-- [ ] **Step 6: Run Rig adapter coverage**
+- [x] **Step 6: Run Rig adapter coverage**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::rig_adapter::tests:: -- --nocapture
@@ -692,7 +695,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::rig_adapter::tests:: -- --nocapture
 Expected: all adapter conversion and native stream tests pass without network
 access.
 
-- [ ] **Step 7: Commit native Rig streaming**
+- [x] **Step 7: Commit native Rig streaming**
 
 ```bash
 git add ic/src/llm/rig_adapter.rs
