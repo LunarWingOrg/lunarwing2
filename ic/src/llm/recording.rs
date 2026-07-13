@@ -13,19 +13,20 @@
 //! Enable by setting `LUNARWING_RECORD_TRACE=1` at runtime
 //! (legacy alias `IRONCLAW_RECORD_TRACE` still accepted).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
-    ChatMessage, CompletionRequest, CompletionResponse, LlmProvider, ModelMetadata, Role,
-    ToolCompletionRequest, ToolCompletionResponse,
+    ChatMessage, CompletionRequest, CompletionResponse, LlmProvider, LlmStream, LlmStreamChunk,
+    ModelMetadata, Role, TokenUsage, ToolCompletionRequest, ToolCompletionResponse,
 };
 
 // ── Trace format types ─────────────────────────────────────────────
@@ -471,6 +472,83 @@ pub struct RecordingLlm {
     http_interceptor: Arc<RecordingHttpInterceptor>,
 }
 
+#[derive(Default)]
+struct StreamTraceAccumulator {
+    content: String,
+    tool_calls: BTreeMap<usize, StreamTraceToolCall>,
+}
+
+#[derive(Default)]
+struct StreamTraceToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl StreamTraceAccumulator {
+    fn record(&mut self, chunk: &LlmStreamChunk) {
+        match chunk {
+            LlmStreamChunk::TextDelta(delta) => self.content.push_str(delta),
+            LlmStreamChunk::ToolCallDelta {
+                index,
+                id,
+                name,
+                args_delta,
+            } => {
+                let tool_call = self.tool_calls.entry(*index).or_default();
+                if let Some(id) = id.as_ref().filter(|id| !id.is_empty()) {
+                    tool_call.id = Some(id.clone());
+                }
+                if let Some(name) = name.as_ref().filter(|name| !name.is_empty()) {
+                    tool_call.name = Some(name.clone());
+                }
+                tool_call.arguments.push_str(args_delta);
+            }
+            LlmStreamChunk::Done { .. } => {}
+        }
+    }
+
+    fn into_step(
+        self,
+        hint: Option<RequestHint>,
+        tool_results: Vec<ExpectedToolResult>,
+        usage: TokenUsage,
+    ) -> TraceStep {
+        let response = if self.tool_calls.is_empty() {
+            TraceResponse::Text {
+                content: self.content,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }
+        } else {
+            let tool_calls = self
+                .tool_calls
+                .into_values()
+                .map(|tool_call| {
+                    let arguments = serde_json::from_str(&tool_call.arguments)
+                        .unwrap_or_else(|_| serde_json::Value::String(tool_call.arguments));
+                    TraceToolCall {
+                        id: tool_call.id.unwrap_or_default(),
+                        name: tool_call.name.unwrap_or_default(),
+                        arguments,
+                    }
+                })
+                .collect();
+            TraceResponse::ToolCalls {
+                tool_calls,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }
+        };
+
+        TraceStep {
+            request_hint: hint,
+            response,
+            expected_tool_results: tool_results,
+        }
+    }
+}
+
 impl RecordingLlm {
     /// Wrap a provider for recording.
     pub fn new(inner: Arc<dyn LlmProvider>, output_path: PathBuf, model_name: String) -> Self {
@@ -658,6 +736,61 @@ impl RecordingLlm {
 
         (hint, tool_results)
     }
+
+    fn trace_stream<'a>(
+        &'a self,
+        inner: LlmStream<'a>,
+        hint: Option<RequestHint>,
+        tool_results: Vec<ExpectedToolResult>,
+        allow_tools: bool,
+    ) -> LlmStream<'a> {
+        futures::stream::unfold(
+            (
+                inner,
+                StreamTraceAccumulator::default(),
+                hint,
+                tool_results,
+                false,
+            ),
+            move |(mut inner, mut accumulator, mut hint, mut tool_results, finished)| async move {
+                if finished {
+                    return None;
+                }
+
+                let item = inner.next().await?;
+                if !allow_tools && matches!(&item, Ok(LlmStreamChunk::ToolCallDelta { .. })) {
+                    let error = LlmError::InvalidResponse {
+                        provider: self.inner.model_name().to_string(),
+                        reason: "plain recording stream produced a tool call".to_string(),
+                    };
+                    return Some((
+                        Err(error),
+                        (inner, accumulator, hint, tool_results, true),
+                    ));
+                }
+
+                match &item {
+                    Ok(LlmStreamChunk::Done { usage, .. }) => {
+                        let step = std::mem::take(&mut accumulator).into_step(
+                            hint.take(),
+                            std::mem::take(&mut tool_results),
+                            usage.unwrap_or_default(),
+                        );
+                        self.steps.lock().await.push(step);
+                    }
+                    Ok(chunk) => accumulator.record(chunk),
+                    Err(_) => {}
+                }
+
+                let finished = matches!(&item, Ok(LlmStreamChunk::Done { .. }) | Err(_));
+                Some((
+                    item,
+                    (inner, accumulator, hint, tool_results, finished),
+                ))
+            },
+        )
+        .boxed()
+    }
 }
 
 #[async_trait]
@@ -693,6 +826,12 @@ impl LlmProvider for RecordingLlm {
         });
 
         Ok(response)
+    }
+
+    async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
+        let (hint, tool_results) = self.capture_new_messages(&request.messages).await;
+        let stream = self.inner.complete_stream(request).await?;
+        Ok(self.trace_stream(stream, hint, tool_results, false))
     }
 
     async fn complete_with_tools(
@@ -736,6 +875,15 @@ impl LlmProvider for RecordingLlm {
         Ok(response)
     }
 
+    async fn complete_with_tools_stream(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<LlmStream<'_>, LlmError> {
+        let (hint, tool_results) = self.capture_new_messages(&request.messages).await;
+        let stream = self.inner.complete_with_tools_stream(request).await?;
+        Ok(self.trace_stream(stream, hint, tool_results, true))
+    }
+
     async fn list_models(&self) -> Result<Vec<String>, LlmError> {
         self.inner.list_models().await
     }
@@ -764,6 +912,11 @@ impl LlmProvider for RecordingLlm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use futures::StreamExt;
+
+    use crate::llm::provider::{LlmStreamChunk, TokenUsage};
+    use crate::llm::streaming_test_support::{ScriptedStreamingProvider, StreamScript};
     use crate::testing::StubLlm;
 
     fn make_recorder(stub: Arc<StubLlm>) -> RecordingLlm {
@@ -773,6 +926,225 @@ mod tests {
             dir.path().join("test_recording.json"),
             "test-recording".to_string(),
         )
+    }
+
+    fn make_stream_recorder(inner: Arc<dyn LlmProvider>) -> RecordingLlm {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        RecordingLlm::new(
+            inner,
+            dir.path().join("test_stream_recording.json"),
+            "test-stream-recording".to_string(),
+        )
+    }
+
+    fn stream_request() -> CompletionRequest {
+        CompletionRequest::new(vec![ChatMessage::user("stream this")])
+    }
+
+    fn tool_stream_request() -> ToolCompletionRequest {
+        ToolCompletionRequest::new(vec![ChatMessage::user("use tools")], vec![])
+    }
+
+    #[tokio::test]
+    async fn stream_records_reassembled_text_and_usage() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![StreamScript::Items(vec![
+                Ok(LlmStreamChunk::TextDelta("hel".to_string())),
+                Ok(LlmStreamChunk::TextDelta("lo".to_string())),
+                Ok(LlmStreamChunk::Done {
+                    usage: Some(TokenUsage {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                        cache_read_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                    }),
+                    finish_reason: "stop".to_string(),
+                }),
+            ])],
+            vec![],
+        ));
+        let recorder = make_stream_recorder(provider);
+
+        let chunks = recorder
+            .complete_stream(stream_request())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream should complete");
+
+        assert_eq!(chunks.len(), 3);
+        let steps = recorder.steps.lock().await;
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(
+            &steps[1].response,
+            TraceResponse::Text {
+                content,
+                input_tokens: 7,
+                output_tokens: 3,
+            } if content == "hello"
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_stream_records_reassembled_tool_calls() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![],
+            vec![StreamScript::Items(vec![
+                Ok(LlmStreamChunk::TextDelta("I will search.".to_string())),
+                Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".to_string()),
+                    name: Some("search".to_string()),
+                    args_delta: "{\"q\":\"".to_string(),
+                }),
+                Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    args_delta: "rust\"}".to_string(),
+                }),
+                Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 1,
+                    id: Some("call_2".to_string()),
+                    name: Some("raw".to_string()),
+                    args_delta: "not-json".to_string(),
+                }),
+                Ok(LlmStreamChunk::Done {
+                    usage: Some(TokenUsage {
+                        input_tokens: 8,
+                        output_tokens: 4,
+                        cache_read_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                    }),
+                    finish_reason: "tool_calls".to_string(),
+                }),
+            ])],
+        ));
+        let recorder = make_stream_recorder(provider);
+
+        recorder
+            .complete_with_tools_stream(tool_stream_request())
+            .await
+            .expect("tool stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("tool stream should complete");
+
+        let steps = recorder.steps.lock().await;
+        assert_eq!(steps.len(), 2);
+        match &steps[1].response {
+            TraceResponse::ToolCalls {
+                tool_calls,
+                input_tokens,
+                output_tokens,
+            } => {
+                assert_eq!((*input_tokens, *output_tokens), (8, 4));
+                assert_eq!(tool_calls.len(), 2);
+                assert_eq!(tool_calls[0].id, "call_1");
+                assert_eq!(tool_calls[0].name, "search");
+                assert_eq!(tool_calls[0].arguments, serde_json::json!({"q": "rust"}));
+                assert_eq!(tool_calls[1].arguments, serde_json::json!("not-json"));
+            }
+            other => panic!("expected tool calls, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_error_does_not_record_partial_response() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![StreamScript::Items(vec![
+                Ok(LlmStreamChunk::TextDelta("partial".to_string())),
+                Err(LlmError::RequestFailed {
+                    provider: "scripted".to_string(),
+                    reason: "stream failed".to_string(),
+                }),
+            ])],
+            vec![],
+        ));
+        let recorder = make_stream_recorder(provider);
+
+        let chunks = recorder
+            .complete_stream(stream_request())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            chunks.last(),
+            Some(Err(LlmError::RequestFailed { .. }))
+        ));
+        let steps = recorder.steps.lock().await;
+        assert_eq!(steps.len(), 1);
+        assert!(matches!(steps[0].response, TraceResponse::UserInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn stream_eof_without_done_does_not_record_response() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![StreamScript::Items(vec![Ok(LlmStreamChunk::TextDelta(
+                "partial".to_string(),
+            ))])],
+            vec![],
+        ));
+        let recorder = make_stream_recorder(provider);
+
+        let chunks = recorder
+            .complete_stream(stream_request())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(chunks.len(), 1);
+        let steps = recorder.steps.lock().await;
+        assert_eq!(steps.len(), 1);
+        assert!(matches!(steps[0].response, TraceResponse::UserInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn plain_stream_rejects_tool_delta_without_recording() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![StreamScript::Items(vec![
+                Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".to_string()),
+                    name: Some("search".to_string()),
+                    args_delta: "{}".to_string(),
+                }),
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "tool_calls".to_string(),
+                }),
+            ])],
+            vec![],
+        ));
+        let recorder = make_stream_recorder(provider);
+
+        let chunks = recorder
+            .complete_stream(stream_request())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [Err(LlmError::InvalidResponse { .. })]
+        ));
+        let steps = recorder.steps.lock().await;
+        assert_eq!(steps.len(), 1);
+        assert!(matches!(steps[0].response, TraceResponse::UserInput { .. }));
     }
 
     #[tokio::test]
