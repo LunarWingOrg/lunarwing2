@@ -170,6 +170,13 @@ pub enum EventKind {
         role: String,
         content_preview: String,
     },
+    /// A live, provider-neutral assistant text fragment.
+    ///
+    /// This event is broadcast for delivery but is not persisted in the
+    /// thread's event history.
+    ResponseDelta {
+        content: String,
+    },
 
     // ── Thread tree ─────────────────────────────────────────
     ChildSpawned {
@@ -221,4 +228,30 @@ pub enum EventKind {
         to_version: u64,
         reason: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EventKind, ThreadEvent};
+    use crate::types::thread::ThreadId;
+
+    #[test]
+    fn response_delta_round_trips_through_serde() {
+        let event = ThreadEvent::new(
+            ThreadId::new(),
+            EventKind::ResponseDelta {
+                content: "partial response".to_string(),
+            },
+        );
+
+        let json = serde_json::to_value(&event).expect("response delta should serialize");
+        let decoded: ThreadEvent =
+            serde_json::from_value(json).expect("response delta should deserialize");
+
+        assert_eq!(decoded.thread_id, event.thread_id);
+        assert!(matches!(
+            decoded.kind,
+            EventKind::ResponseDelta { content } if content == "partial response"
+        ));
+    }
 }
