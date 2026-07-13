@@ -1302,47 +1302,49 @@ impl Agent {
         }
 
         // Engine V2 (parallel deployment, Strategy C): when ENGINE_V2=true, route
-        // plain user input through the v2 engine instead of the legacy loop.
-        // Gated to UserInput ONLY — commands, approvals, interrupts, and
-        // auth-token submissions stay on the legacy path (the engine handles its
-        // own approval/auth flows internally, and control submissions must not be
-        // rerouted). With the flag off this is a no-op and behavior is identical
-        // to the legacy path. The engine manages its own threads via
-        // conversation_scope, so we branch BEFORE legacy session/thread resolution.
-        // Engine V2 routing is gated to the web gateway channel for now. The
-        // engine delivers replies ONLY over the gateway's SSE stream
-        // (await_thread_outcome → AppEvent::Response); it does not call a
-        // channel's respond(). XMPP / DarkIRC / weechat deliver via respond()
-        // (JID queue, WASM on_respond) and have no SSE, so routing them through
-        // the engine would compute a reply that never reaches the user. Until
-        // the engine learns channel-aware delivery, non-gateway channels stay
-        // on the legacy loop. The channel name "gateway" matches the web
-        // channel's Channel::name() and the IncomingMessage stamp in chat_send.
-        if let Submission::UserInput { ref content } = submission
-            && crate::bridge::is_engine_v2_enabled()
-            && message.channel == "gateway"
-        {
-            tracing::debug!(
-                message_id = %message.id,
-                user_id = %message.user_id,
-                "ENGINE_V2 enabled — routing gateway user input through engine v2"
-            );
-            // The engine delivers its response over SSE itself, so we must
-            // NOT let the returned text fall through to channels.respond()
-            // — that would double-send on the gateway. Consume the result:
-            // log any error, and return an empty response which the
-            // outbound handler suppresses (never sent).
-            match crate::bridge::handle_with_engine(self, message, content).await {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!(
+        // gateway user input and interrupts through the v2 engine instead of the
+        // legacy loop. Gated to the web gateway channel for now; Phase 5
+        // generalizes control routing to opt-in non-gateway channels. We branch
+        // BEFORE legacy session/thread resolution because the engine manages its
+        // own threads via conversation_scope. The channel name "gateway" matches
+        // the web channel's Channel::name() and the IncomingMessage stamp in
+        // chat_send.
+        //
+        // User input: the engine delivers its reply over the gateway SSE stream
+        // itself (await_thread_outcome), so the returned text is swallowed here
+        // to avoid a double-send via channels.respond(). Phase 5 removes the
+        // direct terminal SSE and returns the reply through the normal outbound
+        // handler instead.
+        //
+        // Interrupt: routed to the engine so a stop cancels the in-flight stream
+        // in the correct scoped conversation; the single "Interrupted." ack is
+        // returned through the normal response path. Approvals, auth tokens,
+        // clear, and new-thread controls stay on the legacy path until Phase 5.
+        if crate::bridge::is_engine_v2_enabled() && message.channel == "gateway" {
+            match &submission {
+                Submission::UserInput { content } => {
+                    tracing::debug!(
                         message_id = %message.id,
-                        error = %e,
-                        "engine v2 message handling failed"
+                        user_id = %message.user_id,
+                        "ENGINE_V2 enabled — routing gateway user input through engine v2"
                     );
+                    match crate::bridge::handle_with_engine(self, message, content).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!(
+                                message_id = %message.id,
+                                error = %e,
+                                "engine v2 message handling failed"
+                            );
+                        }
+                    }
+                    return Ok(Some(String::new()));
                 }
+                Submission::Interrupt => {
+                    return crate::bridge::handle_interrupt(self, message).await;
+                }
+                _ => {}
             }
-            return Ok(Some(String::new()));
         }
 
         // Hydrate thread from DB if it's a historical thread not in memory

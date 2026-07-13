@@ -36,6 +36,37 @@ pub fn is_engine_v2_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Build the scoped engine conversation key for a message.
+///
+/// When the message carries a conversation scope (e.g. the gateway thread id),
+/// the key is `channel:scope` so each scope maps to a distinct engine
+/// conversation. Ordinary input, interrupts, clears, and `/expected` must all
+/// use this single key or they will address different conversations.
+fn engine_conversation_key(message: &IncomingMessage) -> String {
+    match message.conversation_scope() {
+        Some(scope) => format!("{}:{scope}", message.channel),
+        None => message.channel.clone(),
+    }
+}
+
+/// Map a thread outcome to the terminal channel response.
+///
+/// `Stopped` (and any future no-reply outcome) uses the empty-string sentinel,
+/// which the outbound handler suppresses and which is never written to v1
+/// compatibility history. `GatePaused` returns `None` because the caller drives
+/// its channel status side effects separately.
+fn thread_outcome_response(outcome: &ThreadOutcome) -> Option<String> {
+    match outcome {
+        ThreadOutcome::Completed { response } => response.clone(),
+        ThreadOutcome::Stopped => Some(String::new()),
+        ThreadOutcome::MaxIterations => {
+            Some("Reached maximum iterations without completing.".into())
+        }
+        ThreadOutcome::Failed { error } => Some(format!("Error: {error}")),
+        ThreadOutcome::GatePaused { .. } => None,
+    }
+}
+
 /// Shorthand for building an `Error` from an engine-related failure.
 fn engine_err(context: &str, e: impl std::fmt::Display) -> Error {
     Error::from(crate::error::JobError::ContextError {
@@ -1712,9 +1743,21 @@ pub async fn handle_interrupt(
         .as_ref()
         .ok_or_else(|| engine_err("init", "engine state is empty"))?;
 
+    interrupt_engine_conversation(state, message).await
+}
+
+/// Stop every running thread in the message's scoped engine conversation.
+///
+/// Uses [`engine_conversation_key`] so an interrupt only targets threads in the
+/// same `channel:scope` conversation the user is interacting with; threads in
+/// other scopes (or other users) are untouched.
+async fn interrupt_engine_conversation(
+    state: &EngineState,
+    message: &IncomingMessage,
+) -> Result<Option<String>, Error> {
     let conv_id = state
         .conversation_manager
-        .get_or_create_conversation(&message.channel, &message.user_id)
+        .get_or_create_conversation(&engine_conversation_key(message), &message.user_id)
         .await
         .map_err(|e| engine_err("conversation error", e))?;
 
@@ -1787,11 +1830,7 @@ pub async fn handle_expected(
         .ok_or_else(|| engine_err("init", "engine state is empty"))?;
 
     // Find the conversation for this channel+user
-    let scope = message.conversation_scope();
-    let channel_key = match scope {
-        Some(tid) => format!("{}:{}", message.channel, tid),
-        None => message.channel.clone(),
-    };
+    let channel_key = engine_conversation_key(message);
 
     let conv_id = state
         .conversation_manager
@@ -1940,7 +1979,7 @@ async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> 
 
     let conv_id = state
         .conversation_manager
-        .get_or_create_conversation(&message.channel, &message.user_id)
+        .get_or_create_conversation(&engine_conversation_key(message), &message.user_id)
         .await
         .map_err(|e| engine_err("conversation error", e))?;
 
@@ -2207,16 +2246,11 @@ async fn handle_with_engine_inner(
     // Reset the per-step call counter so each thread starts fresh
     state.effect_adapter.reset_call_count();
 
-    // Scope the engine conversation by (channel, user, thread).
-    // When the frontend sends a thread_id (user created a new conversation),
-    // use it as part of the channel key so each v1 thread maps to a distinct
-    // engine conversation. Without this, all threads share one conversation
-    // and messages appear in the wrong place.
-    let scope = message.conversation_scope();
-    let channel_key = match scope {
-        Some(tid) => format!("{}:{}", message.channel, tid),
-        None => message.channel.clone(),
-    };
+    // Scope the engine conversation by (channel, user, thread). When the
+    // frontend sends a thread_id (user created a new conversation), the scoped
+    // key maps each v1 thread to a distinct engine conversation. Interrupt and
+    // clear use the same key so they address this exact conversation.
+    let channel_key = engine_conversation_key(message);
 
     // Get or create conversation for this scoped channel+user
     let conv_id = state
@@ -2410,114 +2444,110 @@ async fn await_thread_outcome(
         );
     }
 
-    let result = match outcome {
-        ThreadOutcome::Completed { response } => {
-            debug!(thread_id = %thread_id, "engine v2: completed");
+    // A Completed response that requests authentication enters auth mode via a
+    // side-effectful early return; the prompt itself is not persisted to v1
+    // history. This is a defense-in-depth safety net — the pre-flight auth gate
+    // should catch most cases before execution.
+    if let ThreadOutcome::Completed {
+        response: Some(ref text),
+    } = outcome
+        && text.contains("authentication_required")
+    {
+        debug!(
+            thread_id = %thread_id,
+            "text-based auth fallback triggered — pre-flight gate did not catch this"
+        );
 
-            // Text-based auth fallback: detect authentication_required in the
-            // response and enter auth mode. This is a defense-in-depth safety net
-            // — the pre-flight auth gate should catch most cases before execution.
-            if let Some(ref text) = response
-                && text.contains("authentication_required")
-            {
-                debug!(
-                    thread_id = %thread_id,
-                    "text-based auth fallback triggered — pre-flight gate did not catch this"
-                );
+        // Extract credential name from the response text and validate
+        // it against the expected pattern (alphanumeric + underscores).
+        let cred_name = text
+            .split("credential_name")
+            .nth(1)
+            .and_then(|s| {
+                // Handle both JSON ("credential_name":"foo") and prose
+                s.split(&['"', '\'', '`'][..])
+                    .find(|seg| !seg.is_empty() && !seg.contains(':') && !seg.contains(' '))
+            })
+            .filter(|name| {
+                // Reject names that don't look like valid credential identifiers
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            .unwrap_or("unknown")
+            .to_string();
 
-                // Extract credential name from the response text and validate
-                // it against the expected pattern (alphanumeric + underscores).
-                let cred_name = text
-                    .split("credential_name")
-                    .nth(1)
-                    .and_then(|s| {
-                        // Handle both JSON ("credential_name":"foo") and prose
-                        s.split(&['"', '\'', '`'][..])
-                            .find(|seg| !seg.is_empty() && !seg.contains(':') && !seg.contains(' '))
-                    })
-                    .filter(|name| {
-                        // Reject names that don't look like valid credential identifiers
-                        !name.is_empty()
-                            && name.len() <= 64
-                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    })
-                    .unwrap_or("unknown")
-                    .to_string();
+        // Look up setup instructions via AuthManager (or fall back to inline lookup)
+        let setup_hint = state
+            .auth_manager
+            .as_ref()
+            .and_then(|mgr| mgr.get_setup_instructions(&cred_name))
+            .unwrap_or_else(|| format!("Provide your {} token", cred_name));
 
-                // Look up setup instructions via AuthManager (or fall back to inline lookup)
-                let setup_hint = state
-                    .auth_manager
-                    .as_ref()
-                    .and_then(|mgr| mgr.get_setup_instructions(&cred_name))
-                    .unwrap_or_else(|| format!("Provide your {} token", cred_name));
-
-                let pending = PendingGate {
-                    request_id: uuid::Uuid::new_v4(),
-                    gate_name: "authentication".into(),
-                    user_id: message.user_id.clone(),
-                    thread_id,
-                    conversation_id: conv_id,
-                    source_channel: message.channel.clone(),
-                    action_name: "authentication_fallback".into(),
-                    call_id: format!("fallback-auth-{thread_id}"),
-                    parameters: serde_json::json!({ "credential_name": cred_name }),
-                    display_parameters: None,
-                    description: format!("Authentication required for '{}'.", cred_name),
-                    resume_kind: lunarwing_engine::ResumeKind::Authentication {
-                        credential_name: cred_name.clone(),
-                        instructions: setup_hint.clone(),
-                        auth_url: None,
-                    },
-                    created_at: chrono::Utc::now(),
-                    expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
-                    original_message: Some(message.content.clone()),
-                    resume_output: None,
-                };
-                if let Err(e) = state.pending_gates.insert(pending).await {
-                    tracing::debug!(error = %e, "failed to store fallback auth gate");
-                }
-
-                // Show auth prompt via channel
-                let _ = agent
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::AuthRequired {
-                            extension_name: cred_name.clone(),
-                            instructions: Some(setup_hint.clone()),
-                            auth_url: None,
-                            setup_url: None,
-                        },
-                        &message.metadata,
-                    )
-                    .await;
-
-                if let Some(ref sse) = state.sse {
-                    sse.broadcast_for_user(
-                        &message.user_id,
-                        AppEvent::AuthRequired {
-                            extension_name: cred_name.clone(),
-                            instructions: Some(setup_hint.clone()),
-                            auth_url: None,
-                            setup_url: None,
-                            thread_id: Some(thread_id.to_string()),
-                        },
-                    );
-                }
-
-                return Ok(Some(format!(
-                    "Authentication required for '{}'. Paste your token below (or type 'cancel'):",
-                    cred_name
-                )));
-            }
-
-            Ok(response)
+        let pending = PendingGate {
+            request_id: uuid::Uuid::new_v4(),
+            gate_name: "authentication".into(),
+            user_id: message.user_id.clone(),
+            thread_id,
+            conversation_id: conv_id,
+            source_channel: message.channel.clone(),
+            action_name: "authentication_fallback".into(),
+            call_id: format!("fallback-auth-{thread_id}"),
+            parameters: serde_json::json!({ "credential_name": cred_name }),
+            display_parameters: None,
+            description: format!("Authentication required for '{}'.", cred_name),
+            resume_kind: lunarwing_engine::ResumeKind::Authentication {
+                credential_name: cred_name.clone(),
+                instructions: setup_hint.clone(),
+                auth_url: None,
+            },
+            created_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            original_message: Some(message.content.clone()),
+            resume_output: None,
+        };
+        if let Err(e) = state.pending_gates.insert(pending).await {
+            tracing::debug!(error = %e, "failed to store fallback auth gate");
         }
-        ThreadOutcome::Stopped => Ok(Some("Thread was stopped.".into())),
-        ThreadOutcome::MaxIterations => Ok(Some(
-            "Reached maximum iterations without completing.".into(),
-        )),
-        ThreadOutcome::Failed { error } => Ok(Some(format!("Error: {error}"))),
+
+        // Show auth prompt via channel
+        let _ = agent
+            .channels
+            .send_status(
+                &message.channel,
+                StatusUpdate::AuthRequired {
+                    extension_name: cred_name.clone(),
+                    instructions: Some(setup_hint.clone()),
+                    auth_url: None,
+                    setup_url: None,
+                },
+                &message.metadata,
+            )
+            .await;
+
+        if let Some(ref sse) = state.sse {
+            sse.broadcast_for_user(
+                &message.user_id,
+                AppEvent::AuthRequired {
+                    extension_name: cred_name.clone(),
+                    instructions: Some(setup_hint.clone()),
+                    auth_url: None,
+                    setup_url: None,
+                    thread_id: Some(thread_id.to_string()),
+                },
+            );
+        }
+
+        return Ok(Some(format!(
+            "Authentication required for '{}'. Paste your token below (or type 'cancel'):",
+            cred_name
+        )));
+    }
+
+    // Completed (non-auth), Stopped, MaxIterations, and Failed map to their
+    // terminal response via `thread_outcome_response`. Stopped yields the empty
+    // sentinel so no terminal reply or history row is committed for a user stop.
+    let result = match outcome {
         ThreadOutcome::GatePaused {
             gate_name,
             action_name,
@@ -2640,11 +2670,14 @@ async fn await_thread_outcome(
                 }
             }
         }
+        other => Ok(thread_outcome_response(&other)),
     };
 
-    // Write the response to the v1 DB for all outcomes so the history
-    // endpoint shows the correct state (not just for Completed).
+    // Write the response to the v1 DB for all outcomes that produce a
+    // non-empty response so the history endpoint shows the correct state. The
+    // empty sentinel (e.g. a stopped turn) writes no assistant row.
     if let Ok(Some(ref text)) = result
+        && !text.is_empty()
         && let Some(ref db) = state.db
     {
         write_v1_response(db, text).await;
@@ -3531,9 +3564,7 @@ pub struct SkillPatchProposal {
 
 /// List all skills that currently have a pending patch proposal, visible to
 /// `user_id` (own + shared). Empty when the engine isn't running.
-pub async fn list_pending_skill_patches(
-    user_id: &str,
-) -> Result<Vec<SkillPatchProposal>, Error> {
+pub async fn list_pending_skill_patches(user_id: &str) -> Result<Vec<SkillPatchProposal>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
     };
@@ -4569,5 +4600,226 @@ mod tests {
             "expected StreamChunk(\"hi\"), got {:?}",
             captured[0]
         );
+    }
+
+    // ── Phase 4: scoped interrupt + outcome mapping ──────────────
+
+    #[test]
+    fn engine_conversation_key_includes_non_gateway_scope() {
+        let msg =
+            IncomingMessage::new("xmpp", "alice", "hi").with_conversation_scope("room@example.org");
+        assert_eq!(engine_conversation_key(&msg), "xmpp:room@example.org");
+    }
+
+    #[test]
+    fn engine_conversation_key_without_scope_is_channel() {
+        let msg = IncomingMessage::new("gateway", "alice", "hi");
+        assert_eq!(engine_conversation_key(&msg), "gateway");
+    }
+
+    #[test]
+    fn stopped_outcome_uses_empty_response_sentinel() {
+        assert_eq!(
+            thread_outcome_response(&ThreadOutcome::Stopped),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn completed_outcome_returns_its_text() {
+        assert_eq!(
+            thread_outcome_response(&ThreadOutcome::Completed {
+                response: Some("final".into()),
+            }),
+            Some("final".into())
+        );
+    }
+
+    /// Backend whose stream emits one delta then stays pending, so only a stop
+    /// ends it.
+    struct InterruptTestLlm;
+
+    #[async_trait::async_trait]
+    impl lunarwing_engine::LlmBackend for InterruptTestLlm {
+        async fn complete(
+            &self,
+            _: &[lunarwing_engine::ThreadMessage],
+            _: &[lunarwing_engine::ActionDef],
+            _: &lunarwing_engine::LlmCallConfig,
+        ) -> Result<lunarwing_engine::LlmOutput, lunarwing_engine::EngineError> {
+            Err(lunarwing_engine::EngineError::Llm {
+                reason: "blocking completion must not be called".into(),
+            })
+        }
+
+        async fn complete_stream<'a>(
+            &'a self,
+            _: &[lunarwing_engine::ThreadMessage],
+            _: &[lunarwing_engine::ActionDef],
+            _: &lunarwing_engine::LlmCallConfig,
+        ) -> Result<lunarwing_engine::LlmStream<'a>, lunarwing_engine::EngineError> {
+            use futures::StreamExt;
+            Ok(
+                futures::stream::iter([Ok(lunarwing_engine::LlmStreamChunk::TextDelta(
+                    "before-cancel".into(),
+                ))])
+                .chain(futures::stream::pending())
+                .boxed(),
+            )
+        }
+
+        fn model_name(&self) -> &str {
+            "interrupt-pending"
+        }
+    }
+
+    struct InterruptTestEffects;
+
+    #[async_trait::async_trait]
+    impl lunarwing_engine::EffectExecutor for InterruptTestEffects {
+        async fn execute_action(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: &lunarwing_engine::CapabilityLease,
+            _: &lunarwing_engine::ThreadExecutionContext,
+        ) -> Result<lunarwing_engine::ActionResult, lunarwing_engine::EngineError> {
+            unreachable!("pending stream never reaches action execution")
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[lunarwing_engine::CapabilityLease],
+        ) -> Result<Vec<lunarwing_engine::ActionDef>, lunarwing_engine::EngineError> {
+            Ok(vec![])
+        }
+    }
+
+    fn make_interrupt_test_state(store: Arc<TestStore>) -> EngineState {
+        let store_dyn: Arc<dyn Store> = store;
+        let effect_adapter = Arc::new(EffectBridgeAdapter::new(
+            Arc::new(crate::tools::ToolRegistry::new()),
+            Arc::new(lunarwing_safety::SafetyLayer::new(
+                &lunarwing_safety::SafetyConfig {
+                    max_output_length: 10_000,
+                    injection_check_enabled: false,
+                },
+            )),
+            Arc::new(crate::hooks::HookRegistry::default()),
+        ));
+
+        let tm = Arc::new(ThreadManager::new(
+            Arc::new(InterruptTestLlm),
+            Arc::new(InterruptTestEffects),
+            store_dyn.clone(),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+
+        let cm = ConversationManager::new(Arc::clone(&tm), store_dyn.clone());
+
+        EngineState {
+            thread_manager: tm,
+            conversation_manager: cm,
+            effect_adapter,
+            store: store_dyn,
+            default_project_id: lunarwing_engine::ProjectId::new(),
+            pending_gates: Arc::new(crate::gate::store::PendingGateStore::in_memory()),
+            sse: None,
+            db: None,
+            secrets_store: None,
+            auth_manager: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_only_stops_the_scoped_conversation() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let project_id = state.default_project_id;
+
+        let mut events = state.thread_manager.subscribe_events();
+
+        // Two scoped gateway conversations for the same user.
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        let conv_b = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-b", "alice")
+            .await
+            .unwrap();
+
+        let tid_a = state
+            .conversation_manager
+            .handle_user_message(
+                conv_a,
+                "hi a",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let tid_b = state
+            .conversation_manager
+            .handle_user_message(
+                conv_b,
+                "hi b",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Wait until both threads' streams are active.
+        let wait_two = async {
+            let mut seen = 0;
+            while let Ok(evt) = events.recv().await {
+                if matches!(evt.kind, lunarwing_engine::EventKind::ResponseDelta { .. }) {
+                    seen += 1;
+                    if seen >= 2 {
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait_two)
+            .await
+            .expect("both streams should start");
+
+        // Interrupt only thread-a's scope.
+        let msg = IncomingMessage::new("gateway", "alice", "/interrupt")
+            .with_conversation_scope("thread-a");
+        let result = interrupt_engine_conversation(&state, &msg)
+            .await
+            .expect("interrupt should succeed");
+        assert_eq!(result, Some("Interrupted.".to_string()));
+
+        // Thread A stops; thread B is untouched.
+        let outcome_a = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.thread_manager.join_thread(tid_a),
+        )
+        .await
+        .expect("thread A should stop promptly")
+        .expect("thread A should join");
+        assert!(matches!(outcome_a, ThreadOutcome::Stopped));
+        assert!(state.thread_manager.is_running(tid_b).await);
+
+        // Clean up thread B.
+        let _ = state.thread_manager.stop_thread(tid_b, "alice").await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.thread_manager.join_thread(tid_b),
+        )
+        .await;
     }
 }
