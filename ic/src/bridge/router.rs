@@ -206,7 +206,7 @@ fn resumed_action_result_message(
 }
 
 async fn insert_and_notify_pending_gate(
-    agent: &Agent,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
     state: &EngineState,
     message: &IncomingMessage,
     pending: PendingGate,
@@ -219,6 +219,8 @@ async fn insert_and_notify_pending_gate(
         .await
         .map_err(|e| engine_err("pending gate insert", e))?;
 
+    // GateRequired is a structural engine-gate event with no `StatusUpdate`
+    // equivalent, so it stays on the direct SSE path.
     if let Some(ref sse) = state.sse {
         sse.broadcast_for_user(
             &message.user_id,
@@ -235,10 +237,13 @@ async fn insert_and_notify_pending_gate(
         );
     }
 
+    // The channel status carries the human-readable prompt (WASM channels build
+    // it from ApprovalNeeded/AuthRequired). The bridge returns the empty
+    // sentinel so the outer outbound handler does not also send a prompt as a
+    // terminal message — that would double-prompt on WASM channels.
     match &pending.resume_kind {
         lunarwing_engine::ResumeKind::Approval { allow_always } => {
-            let _ = agent
-                .channels
+            let _ = channels
                 .send_status(
                     &message.channel,
                     StatusUpdate::ApprovalNeeded {
@@ -252,18 +257,14 @@ async fn insert_and_notify_pending_gate(
                 )
                 .await;
 
-            Ok(Some(format!(
-                "Tool '{}' requires approval. Reply 'yes' to approve, 'no' to deny.",
-                pending.action_name
-            )))
+            Ok(Some(String::new()))
         }
         lunarwing_engine::ResumeKind::Authentication {
             credential_name,
             instructions,
             auth_url,
         } => {
-            let _ = agent
-                .channels
+            let _ = channels
                 .send_status(
                     &message.channel,
                     StatusUpdate::AuthRequired {
@@ -276,10 +277,7 @@ async fn insert_and_notify_pending_gate(
                 )
                 .await;
 
-            Ok(Some(format!(
-                "Authentication required for '{}'. Paste your token below (or type 'cancel'):",
-                credential_name
-            )))
+            Ok(Some(String::new()))
         }
         lunarwing_engine::ResumeKind::External { callback_id } => {
             tracing::debug!(
@@ -287,10 +285,20 @@ async fn insert_and_notify_pending_gate(
                 callback = %callback_id,
                 "GatePaused(External)"
             );
-            Ok(Some(format!(
-                "Waiting for external confirmation (gate: {})...",
-                pending.gate_name
-            )))
+            // External gates emit no Approval/Auth status; send one best-effort
+            // waiting indication so non-gateway users are not left without any.
+            let _ = channels
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::Status(format!(
+                        "Waiting for external confirmation (gate: {})...",
+                        pending.gate_name
+                    )),
+                    &message.metadata,
+                )
+                .await;
+
+            Ok(Some(String::new()))
         }
     }
 }
@@ -518,7 +526,7 @@ async fn execute_pending_gate_action(
                 original_message: None,
                 resume_output: resume_output.map(|value| *value),
             };
-            insert_and_notify_pending_gate(agent, state, message, pending_gate).await
+            insert_and_notify_pending_gate(&agent.channels, state, message, pending_gate).await
         }
         Err(e) => Err(engine_err("execute pending gate action", e)),
     }
@@ -2561,23 +2569,10 @@ async fn await_thread_outcome(
             )
             .await;
 
-        if let Some(ref sse) = state.sse {
-            sse.broadcast_for_user(
-                &message.user_id,
-                AppEvent::AuthRequired {
-                    extension_name: cred_name.clone(),
-                    instructions: Some(setup_hint.clone()),
-                    auth_url: None,
-                    setup_url: None,
-                    thread_id: Some(thread_id.to_string()),
-                },
-            );
-        }
-
-        return Ok(Some(format!(
-            "Authentication required for '{}'. Paste your token below (or type 'cancel'):",
-            cred_name
-        )));
+        // `GatewayChannel::send_status(AuthRequired)` is now the single gateway
+        // mapping for auth prompts, so there is no direct SSE broadcast here.
+        // The empty sentinel avoids a duplicate terminal prompt on any channel.
+        return Ok(Some(String::new()));
     }
 
     // Completed (non-auth), Stopped, MaxIterations, and Failed map to their
@@ -2652,10 +2647,9 @@ async fn await_thread_outcome(
                         )
                         .await;
 
-                    Ok(Some(format!(
-                        "Tool '{}' requires approval. Reply 'yes' to approve, 'no' to deny.",
-                        action_name
-                    )))
+                    // Status carries the prompt; return empty to avoid a
+                    // duplicate terminal message.
+                    Ok(Some(String::new()))
                 }
                 lunarwing_engine::ResumeKind::Authentication {
                     credential_name,
@@ -2676,23 +2670,9 @@ async fn await_thread_outcome(
                         )
                         .await;
 
-                    if let Some(ref sse) = state.sse {
-                        sse.broadcast_for_user(
-                            &message.user_id,
-                            AppEvent::AuthRequired {
-                                extension_name: credential_name.clone(),
-                                instructions: Some(instructions.clone()),
-                                auth_url: auth_url.clone(),
-                                setup_url: None,
-                                thread_id: Some(thread_id.to_string()),
-                            },
-                        );
-                    }
-
-                    Ok(Some(format!(
-                        "Authentication required for '{}'. Paste your token below (or type 'cancel'):",
-                        credential_name
-                    )))
+                    // `send_status(AuthRequired)` is the single gateway mapping
+                    // now; no direct SSE broadcast, and empty sentinel return.
+                    Ok(Some(String::new()))
                 }
                 lunarwing_engine::ResumeKind::External { callback_id } => {
                     tracing::debug!(
@@ -2700,9 +2680,20 @@ async fn await_thread_outcome(
                         callback = %callback_id,
                         "GatePaused(External)"
                     );
-                    Ok(Some(format!(
-                        "Waiting for external confirmation (gate: {gate_name})..."
-                    )))
+                    // External gates emit no Approval/Auth status; send one
+                    // best-effort waiting indication before the empty sentinel.
+                    let _ = agent
+                        .channels
+                        .send_status(
+                            &message.channel,
+                            StatusUpdate::Status(format!(
+                                "Waiting for external confirmation (gate: {gate_name})..."
+                            )),
+                            &message.metadata,
+                        )
+                        .await;
+
+                    Ok(Some(String::new()))
                 }
             }
         }
@@ -4608,6 +4599,38 @@ mod tests {
             metadata,
             serde_json::json!({"xmpp_room": "room@example.org"})
         );
+    }
+
+    #[tokio::test]
+    async fn pending_gate_approval_returns_empty_and_sends_one_status() {
+        use crate::testing::StubChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (stub, _tx) = StubChannel::new("xmpp");
+        let statuses = stub.captured_statuses_handle();
+        manager.add(Box::new(stub)).await;
+
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+        let message = IncomingMessage::new("xmpp", "alice", "run a tool");
+        let gate = sample_pending_gate(
+            "alice",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+
+        let result = insert_and_notify_pending_gate(&manager, &state, &message, gate)
+            .await
+            .expect("gate notify should succeed");
+
+        // The status carries the prompt; the bridge returns the empty sentinel
+        // so no duplicate terminal message is sent (would double-prompt WASM).
+        assert_eq!(result, Some(String::new()));
+
+        // Exactly one ApprovalNeeded status reached the channel.
+        let captured = statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 1);
+        assert!(matches!(captured[0], StatusUpdate::ApprovalNeeded { .. }));
     }
 
     // ── Phase 4: scoped interrupt + outcome mapping ──────────────
