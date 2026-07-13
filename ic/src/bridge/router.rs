@@ -36,6 +36,51 @@ pub fn is_engine_v2_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Non-gateway channels that may opt in to Engine V2 via `ENGINE_V2_CHANNELS`.
+const ENGINE_V2_OPT_IN_CHANNELS: [&str; 3] = ["xmpp", "darkirc", "weechat"];
+
+/// Pure Engine V2 channel routing policy.
+///
+/// - `ENGINE_V2=false` disables every channel.
+/// - With Engine V2 enabled, `gateway` is always routed.
+/// - Only the eligible channels `xmpp`, `darkirc`, `weechat` may opt in, and
+///   only when named as an exact (trimmed, case-insensitive) comma-separated
+///   entry in `ENGINE_V2_CHANNELS`. Empty and unknown entries are ignored;
+///   substring matches never qualify.
+fn engine_v2_channel_allowed(
+    engine_enabled: bool,
+    configured_channels: Option<&str>,
+    channel: &str,
+) -> bool {
+    if !engine_enabled {
+        return false;
+    }
+
+    let channel = channel.trim().to_ascii_lowercase();
+    if channel == "gateway" {
+        return true;
+    }
+    if !ENGINE_V2_OPT_IN_CHANNELS.contains(&channel.as_str()) {
+        return false;
+    }
+
+    configured_channels.is_some_and(|configured| {
+        configured
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .any(|entry| entry.eq_ignore_ascii_case(&channel))
+    })
+}
+
+/// Whether a message on `channel` should be routed through Engine V2, reading
+/// the live `ENGINE_V2` and `ENGINE_V2_CHANNELS` environment. The parameterized
+/// [`engine_v2_channel_allowed`] stays private for deterministic tests.
+pub fn should_route_to_engine_v2(channel: &str) -> bool {
+    let configured = std::env::var("ENGINE_V2_CHANNELS").ok();
+    engine_v2_channel_allowed(is_engine_v2_enabled(), configured.as_deref(), channel)
+}
+
 /// Build the scoped engine conversation key for a message.
 ///
 /// When the message carries a conversation scope (e.g. the gateway thread id),
@@ -4633,6 +4678,33 @@ mod tests {
             }),
             Some("final".into())
         );
+    }
+
+    #[test]
+    fn engine_v2_channel_policy_is_gateway_default_and_exact_opt_in() {
+        let cases = [
+            (false, None, "gateway", false),
+            (false, Some("xmpp"), "xmpp", false),
+            (true, None, "gateway", true),
+            (true, None, "xmpp", false),
+            (true, Some(""), "gateway", true),
+            (true, Some(""), "darkirc", false),
+            (true, Some(" xmpp, DARKIRC ,weechat "), "xmpp", true),
+            (true, Some(" xmpp, DARKIRC ,weechat "), "darkirc", true),
+            (true, Some(" xmpp, DARKIRC ,weechat "), "weechat", true),
+            (true, Some("notxmpp"), "xmpp", false),
+            (true, Some("xmpp-extra"), "xmpp", false),
+            (true, Some("telegram"), "telegram", false),
+            (true, Some(",,xmpp,,"), "xmpp", true),
+        ];
+
+        for (engine_enabled, configured, channel, expected) in cases {
+            assert_eq!(
+                engine_v2_channel_allowed(engine_enabled, configured, channel),
+                expected,
+                "enabled={engine_enabled}, configured={configured:?}, channel={channel}",
+            );
+        }
     }
 
     /// Backend whose stream emits one delta then stays pending, so only a stop

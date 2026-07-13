@@ -50,6 +50,7 @@ pub use router::{
     resolve_engine_auth_callback,
     resolve_gate,
     resume_engine_mission,
+    should_route_to_engine_v2,
 };
 
 #[cfg(feature = "libsql")]
