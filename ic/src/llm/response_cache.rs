@@ -220,7 +220,7 @@ impl CachedProvider {
                                 content: content.clone(),
                                 input_tokens: usage.input_tokens,
                                 output_tokens: usage.output_tokens,
-                                finish_reason: finish_reason_from_stream(finish_reason),
+                                finish_reason: FinishReason::from_stream_reason(finish_reason),
                                 cache_read_input_tokens: usage.cache_read_input_tokens,
                                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
                             },
@@ -237,16 +237,6 @@ impl CachedProvider {
             },
         )
         .boxed()
-    }
-}
-
-fn finish_reason_from_stream(reason: &str) -> FinishReason {
-    match reason {
-        "stop" => FinishReason::Stop,
-        "length" => FinishReason::Length,
-        "tool_calls" => FinishReason::ToolUse,
-        "content_filter" => FinishReason::ContentFilter,
-        _ => FinishReason::Unknown,
     }
 }
 

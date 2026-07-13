@@ -252,6 +252,17 @@ impl FinishReason {
             Self::Unknown => "unknown",
         }
     }
+
+    /// Parse terminal metadata emitted by an LLM stream.
+    pub(crate) fn from_stream_reason(reason: &str) -> Self {
+        match reason {
+            "stop" => Self::Stop,
+            "length" => Self::Length,
+            "tool_calls" => Self::ToolUse,
+            "content_filter" => Self::ContentFilter,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// Definition of a tool for the LLM.
@@ -798,6 +809,27 @@ mod tests {
                 finish_reason,
             }) if finish_reason == "tool_calls"
         ));
+    }
+
+    #[test]
+    fn finish_reason_from_stream_maps_protocol_values() {
+        assert_eq!(FinishReason::from_stream_reason("stop"), FinishReason::Stop);
+        assert_eq!(
+            FinishReason::from_stream_reason("length"),
+            FinishReason::Length
+        );
+        assert_eq!(
+            FinishReason::from_stream_reason("tool_calls"),
+            FinishReason::ToolUse
+        );
+        assert_eq!(
+            FinishReason::from_stream_reason("content_filter"),
+            FinishReason::ContentFilter
+        );
+        assert_eq!(
+            FinishReason::from_stream_reason("vendor_specific"),
+            FinishReason::Unknown
+        );
     }
 
     #[test]
