@@ -115,7 +115,7 @@
     Defer For Now:
     Worker-local MCP, automatic npm/pip installation, secret injection through process environment, a general runtime-adapter refactor, gateway integration, and automatic crash restart all increase the security or lifecycle surface materially. Recommended: implement deactivate/re-enable, diagnostics, registry validation, and integration tests as one contained follow-up. That provides a complete and inspectable host-local lifecycle before introducing another execution placement.
     </details>
-20. [ ] Finish going through all the documents under architecture directory in docs/ and update all outdated documentation. Then, consolidate documents if possible.
+20. [ ] Finish going through all the documents under architecture directory in docs/ and update all outdated documentation. Then, consolidate documents if possible. see rarity/item-19-20260713-0300
 21. [ ] Go through all documents under bugs directory in docs/ and update all outdated documentation. Then, consolidate documents.
 22. [ ] Go through all documents under proposals directory in docs/ and update all outdated documentation. Then, consolidate documents if deemed necessary.
 23. [ ] Go through all documents under reviews directory in docs/ and update all outdated documentation. Then, consolidate documents.
