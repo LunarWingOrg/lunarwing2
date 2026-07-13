@@ -39,7 +39,7 @@
 - Create: `ic/tests/engine_v2_interrupt_ingress.rs`
 - Modify: `ic/Cargo.toml`
 
-- [ ] **Step 1: Extend `TestRig` without changing existing callers**
+- [x] **Step 1: Extend `TestRig` without changing existing callers**
 
 Add `channel_name: String` to `TestRigBuilder`, default it to `"test"`, add:
 
@@ -69,7 +69,7 @@ pub fn captured_responses(&self) -> Vec<OutgoingResponse> {
 }
 ```
 
-- [ ] **Step 2: Register the isolated integration target**
+- [x] **Step 2: Register the isolated integration target**
 
 Add after the existing `e2e_thread_scheduling` target in `ic/Cargo.toml`:
 
@@ -79,7 +79,7 @@ name = "engine_v2_interrupt_ingress"
 required-features = ["libsql", "integration"]
 ```
 
-- [ ] **Step 3: Create a pending-provider regression test**
+- [x] **Step 3: Create a pending-provider regression test**
 
 Create `ic/tests/engine_v2_interrupt_ingress.rs` with one serialized Tokio test. Use this provider shape so cancellation must drop an in-flight acquisition future:
 
@@ -93,7 +93,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 use lunarwing::channels::IncomingMessage;
@@ -104,6 +104,8 @@ use lunarwing::llm::{
 };
 
 use support::test_rig::TestRigBuilder;
+
+static ENGINE_V2_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 struct DropProbe(Arc<AtomicUsize>);
 
@@ -165,8 +167,8 @@ struct EngineV2EnvGuard {
 impl EngineV2EnvGuard {
     fn enable() -> Self {
         let original = std::env::var("ENGINE_V2").ok();
-        // SAFETY: this dedicated integration binary contains one test, so no
-        // concurrent code reads or mutates ENGINE_V2.
+        // SAFETY: every test in this dedicated binary holds ENGINE_V2_ENV_LOCK
+        // until its background agent is stopped.
         unsafe { std::env::set_var("ENGINE_V2", "true") };
         Self { original }
     }
@@ -174,7 +176,8 @@ impl EngineV2EnvGuard {
 
 impl Drop for EngineV2EnvGuard {
     fn drop(&mut self) {
-        // SAFETY: this dedicated integration binary contains one test.
+        // SAFETY: the caller still holds ENGINE_V2_ENV_LOCK and has stopped its
+        // background agent before this guard is dropped.
         unsafe {
             match &self.original {
                 Some(value) => std::env::set_var("ENGINE_V2", value),
@@ -195,6 +198,7 @@ fn gateway_message(thread_id: Uuid, content: &str) -> IncomingMessage {
 
 #[tokio::test]
 async fn gateway_interrupt_is_dispatched_while_llm_acquisition_is_pending() {
+    let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
     let _env = EngineV2EnvGuard::enable();
     lunarwing::bridge::reset_engine_state().await;
 
@@ -230,12 +234,12 @@ async fn gateway_interrupt_is_dispatched_while_llm_acquisition_is_pending() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(rig.captured_responses().len(), 1);
 
-    rig.shutdown();
+    rig.shutdown_and_wait().await;
     lunarwing::bridge::reset_engine_state().await;
 }
 ```
 
-- [ ] **Step 4: Run the regression and confirm RED**
+- [x] **Step 4: Run the regression and confirm RED**
 
 From `ic/`:
 
@@ -248,7 +252,7 @@ taskset -c 0-5 cargo test -j6 --no-default-features \
 
 Expected: FAIL after two seconds because the old run loop does not dequeue the interrupt; `responses.len()` is `0` and the pending LLM future has not been dropped.
 
-- [ ] **Step 5: Commit the RED regression**
+- [x] **Step 5: Commit the RED regression**
 
 ```bash
 git add ic/Cargo.toml ic/tests/support/test_rig.rs \
@@ -262,7 +266,7 @@ git commit -m "test(agent): reproduce blocked streaming interrupt"
 - Create: `ic/src/agent/dispatch.rs`
 - Modify: `ic/src/agent/mod.rs`
 
-- [ ] **Step 1: Write pure dispatcher tests**
+- [x] **Step 1: Write pure dispatcher tests**
 
 Create tests in `dispatch.rs` first:
 
@@ -287,9 +291,9 @@ mod tests {
     #[test]
     fn deferred_messages_are_fifo_and_bounded() {
         let mut queue = DeferredMessages::with_capacity_for_test(2);
-        assert!(queue.defer(message("first")).is_ok());
-        assert!(queue.defer(message("second")).is_ok());
-        let rejected = queue.defer(message("third")).expect_err("queue is full");
+        assert!(queue.defer(message("first")).is_none());
+        assert!(queue.defer(message("second")).is_none());
+        let rejected = queue.defer(message("third")).expect("queue is full");
         assert_eq!(rejected.content, "third");
         assert_eq!(queue.pop_front().map(|m| m.content), Some("first".into()));
         assert_eq!(queue.pop_front().map(|m| m.content), Some("second".into()));
@@ -297,7 +301,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the unit tests and confirm RED**
+- [x] **Step 2: Run the unit tests and confirm RED**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib agent::dispatch::tests -- --nocapture
@@ -305,7 +309,7 @@ taskset -c 0-5 cargo test -j6 --lib agent::dispatch::tests -- --nocapture
 
 Expected: compilation fails because the module and helpers do not exist.
 
-- [ ] **Step 3: Implement the minimal dispatcher helper**
+- [x] **Step 3: Implement the minimal dispatcher helper**
 
 Create `ic/src/agent/dispatch.rs`:
 
@@ -344,15 +348,12 @@ impl DeferredMessages {
         }
     }
 
-    pub(super) fn defer(
-        &mut self,
-        message: IncomingMessage,
-    ) -> Result<(), IncomingMessage> {
+    pub(super) fn defer(&mut self, message: IncomingMessage) -> Option<IncomingMessage> {
         if self.queue.len() >= self.capacity {
-            return Err(message);
+            return Some(message);
         }
         self.queue.push_back(message);
-        Ok(())
+        None
     }
 
     pub(super) fn pop_front(&mut self) -> Option<IncomingMessage> {
@@ -367,7 +368,7 @@ impl DeferredMessages {
 
 Add `mod dispatch;` to `ic/src/agent/mod.rs`.
 
-- [ ] **Step 4: Run the unit tests and commit**
+- [x] **Step 4: Run the unit tests and commit**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib agent::dispatch::tests -- --nocapture
@@ -382,7 +383,7 @@ Expected: both dispatcher tests pass.
 **Files:**
 - Modify: `ic/src/agent/agent_loop.rs`
 
-- [ ] **Step 1: Extract common outbound result delivery**
+- [x] **Step 1: Extract common outbound result delivery**
 
 Move the existing normal-completion branches into:
 
@@ -441,7 +442,7 @@ Extract the current `BeforeOutbound` block without changing its behavior:
 async fn deliver_outbound_with_hooks(&self, message: &IncomingMessage, response: String)
 ```
 
-- [ ] **Step 2: Add message preparation and priority execution helpers**
+- [x] **Step 2: Add message preparation and priority execution helpers**
 
 Extract the current transcription/document/indexing block into:
 
@@ -468,7 +469,7 @@ async fn handle_priority_interrupt(&self, message: IncomingMessage) {
 }
 ```
 
-- [ ] **Step 3: Replace the blocking timeout with an interrupt-aware select loop**
+- [x] **Step 3: Replace the blocking timeout with an interrupt-aware select loop**
 
 At the start of the main message loop, create:
 
@@ -514,7 +515,7 @@ let active_result = loop {
                     self.handle_priority_interrupt(incoming).await;
                 }
                 Some(incoming) => {
-                    if let Err(rejected) = deferred_messages.defer(incoming) {
+                    if let Some(rejected) = deferred_messages.defer(incoming) {
                         let result = Ok(Some(
                             crate::agent::dispatch::DEFERRED_QUEUE_FULL_RESPONSE.to_string(),
                         ));
@@ -557,7 +558,7 @@ ActiveMessageResult::Shutdown(signal) => {
 Add a small `recv_sigterm` helper under `#[cfg(unix)]` plus a non-Unix pending
 implementation so Ctrl+C/SIGTERM remain selectable during active work.
 
-- [ ] **Step 4: Run the real regression and confirm GREEN**
+- [x] **Step 4: Run the real regression and confirm GREEN**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --no-default-features \
@@ -569,7 +570,7 @@ taskset -c 0-5 cargo test -j6 --no-default-features \
 Expected: PASS; one `Interrupted.` response arrives, the acquisition future is
 dropped, and no cancelled terminal response follows.
 
-- [ ] **Step 5: Run existing agent/bridge cancellation tests**
+- [x] **Step 5: Run existing agent/bridge cancellation tests**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib agent::agent_loop::tests -- --nocapture
@@ -580,7 +581,7 @@ taskset -c 0-5 cargo test -j6 -p lunarwing_engine runtime::manager::tests \
 
 Expected: all pass with no duplicate response, scope, or cancellation regression.
 
-- [ ] **Step 6: Commit the dispatcher integration**
+- [x] **Step 6: Commit the dispatcher integration**
 
 ```bash
 git add ic/src/agent/agent_loop.rs
@@ -595,7 +596,7 @@ git commit -m "fix(agent): dispatch interrupts during active turns"
 - Modify: `ic/tests/support/test_rig.rs`
 - Modify: `ic/tests/engine_v2_interrupt_ingress.rs`
 
-- [ ] **Step 1: Complete exact command-classification coverage**
+- [x] **Step 1: Complete exact command-classification coverage**
 
 Add these assertions to `only_exact_interrupt_submissions_are_priority` before
 changing production code:
@@ -609,7 +610,7 @@ assert!(!is_priority_interrupt(&message("/stop now")));
 This locks classification to `SubmissionParser` rather than a substring or
 prefix check.
 
-- [ ] **Step 2: Add a controllable provider for lifecycle tests**
+- [x] **Step 2: Add a controllable provider for lifecycle tests**
 
 In `ic/tests/engine_v2_interrupt_ingress.rs`, import `FinishReason` and add this
 provider below `PendingLlm`:
@@ -689,7 +690,7 @@ impl LlmProvider for FirstPendingThenReplyLlm {
 }
 ```
 
-- [ ] **Step 3: Prove an interrupt overtakes FIFO without making ordinary input concurrent**
+- [x] **Step 3: Prove an interrupt overtakes FIFO without making ordinary input concurrent**
 
 Add this integration test. It observes the response snapshot at the instant the
 second provider call starts, so a scheduler that starts `second` before sending
@@ -698,6 +699,7 @@ the acknowledgement fails deterministically:
 ```rust
 #[tokio::test]
 async fn queued_ordinary_message_starts_after_interrupt_acknowledgement() {
+    let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
     let _env = EngineV2EnvGuard::enable();
     lunarwing::bridge::reset_engine_state().await;
 
@@ -738,12 +740,12 @@ async fn queued_ordinary_message_starts_after_interrupt_acknowledgement() {
     assert_eq!(responses[1].content, "response-1");
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 
-    rig.shutdown();
+    rig.shutdown_and_wait().await;
     lunarwing::bridge::reset_engine_state().await;
 }
 ```
 
-- [ ] **Step 4: Exercise overflow at the real 256-message limit**
+- [x] **Step 4: Exercise overflow at the real 256-message limit**
 
 Do not add a test-only production capacity. Add this integration test using the
 real configured bound:
@@ -751,6 +753,7 @@ real configured bound:
 ```rust
 #[tokio::test]
 async fn deferred_queue_overflow_gets_one_explicit_busy_response() {
+    let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
     let _env = EngineV2EnvGuard::enable();
     lunarwing::bridge::reset_engine_state().await;
 
@@ -769,12 +772,9 @@ async fn deferred_queue_overflow_gets_one_explicit_busy_response() {
         .await
         .expect("active provider call should start");
     tokio::time::timeout(Duration::from_secs(2), async {
-        for index in 0..=256 {
-            rig.send_incoming(gateway_message(
-                thread_id,
-                &format!("deferred-{index}"),
-            ))
-            .await;
+        for _ in 0..=256 {
+            rig.send_incoming(gateway_message(thread_id, "/clear"))
+                .await;
         }
     })
     .await
@@ -792,12 +792,15 @@ async fn deferred_queue_overflow_gets_one_explicit_busy_response() {
     let responses = rig.wait_for_responses(2, Duration::from_secs(2)).await;
     assert_eq!(responses[1].content, "Interrupted.");
 
-    rig.shutdown();
+    let responses = rig.wait_for_responses(258, Duration::from_secs(10)).await;
+    assert_eq!(responses.len(), 258);
+
+    rig.shutdown_and_wait().await;
     lunarwing::bridge::reset_engine_state().await;
 }
 ```
 
-- [ ] **Step 5: Preserve the soft-timeout detach contract**
+- [x] **Step 5: Preserve the soft-timeout detach contract**
 
 Add `handle_message_timeout: Option<Duration>` to `TestRigBuilder`, default it
 to `None`, destructure it in `build()`, and add:
@@ -806,6 +809,18 @@ to `None`, destructure it in `build()`, and add:
 pub fn with_handle_message_timeout(mut self, timeout: Duration) -> Self {
     self.handle_message_timeout = Some(timeout);
     self
+}
+```
+
+Add an awaited teardown alongside the existing synchronous test helper:
+
+```rust
+pub async fn shutdown_and_wait(mut self) {
+    self.channel.signal_shutdown();
+    if let Some(handle) = self.agent_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
 }
 ```
 
@@ -824,6 +839,7 @@ turn can run while the timed-out first handler remains detached:
 ```rust
 #[tokio::test]
 async fn soft_timeout_detaches_and_suppresses_the_original_handler() {
+    let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
     let _env = EngineV2EnvGuard::enable();
     lunarwing::bridge::reset_engine_state().await;
 
@@ -832,7 +848,7 @@ async fn soft_timeout_detaches_and_suppresses_the_original_handler() {
     let llm: Arc<dyn LlmProvider> = provider.clone();
     let rig = TestRigBuilder::new()
         .with_channel_name("gateway")
-        .with_handle_message_timeout(Duration::from_millis(50))
+        .with_handle_message_timeout(Duration::from_secs(2))
         .with_llm(llm)
         .build()
         .await;
@@ -844,21 +860,21 @@ async fn soft_timeout_detaches_and_suppresses_the_original_handler() {
     rig.send_incoming(gateway_message(Uuid::new_v4(), "second"))
         .await;
 
-    let responses = rig.wait_for_responses(2, Duration::from_secs(2)).await;
+    let responses = rig.wait_for_responses(2, Duration::from_secs(6)).await;
     assert_eq!(responses[0].content, "Sorry, your request timed out. Please try again.");
     assert_eq!(responses[1].content, "response-1");
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
 
     provider.release_first.notify_one();
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(rig.captured_responses().len(), 2);
 
-    rig.shutdown();
+    rig.shutdown_and_wait().await;
     lunarwing::bridge::reset_engine_state().await;
 }
 ```
 
-- [ ] **Step 6: Prove active shutdown waits for task cancellation**
+- [x] **Step 6: Prove active shutdown waits for task cancellation**
 
 Extract the shutdown operation used by both signal branches:
 
@@ -905,7 +921,7 @@ async fn abort_and_wait_drops_the_active_handler_before_returning() {
 }
 ```
 
-- [ ] **Step 7: Run the new cases and confirm the intended RED/characterization split**
+- [x] **Step 7: Run the new cases and confirm the intended RED/characterization split**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib agent::dispatch::tests -- --nocapture
@@ -919,13 +935,13 @@ test passes, the current run loop fails the interrupt/FIFO and overflow cases,
 and the existing soft-timeout behavior passes. The active-shutdown unit test
 fails to compile until `abort_and_wait` is introduced.
 
-- [ ] **Step 8: Make only the minimal lifecycle adjustments required by RED**
+- [x] **Step 8: Make only the minimal lifecycle adjustments required by RED**
 
 Keep queue capacity, FIFO, timeout detachment, hard-kill abort, and process
 shutdown in their owning helpers. Do not add general message concurrency or
 priority for any other submission.
 
-- [ ] **Step 9: Run, format, and commit lifecycle coverage**
+- [x] **Step 9: Run, format, and commit lifecycle coverage**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib agent::dispatch::tests -- --nocapture
@@ -947,7 +963,7 @@ git commit -m "test(agent): cover interrupt dispatcher lifecycle"
 - Check: `docs/architecture/ENGINE-V2.md`
 - Check: `CHANGELOG.md`
 
-- [ ] **Step 1: Run the scoped verification matrix**
+- [x] **Step 1: Run the scoped verification matrix**
 
 From `ic/`, one Cargo process at a time:
 
@@ -973,7 +989,7 @@ rg -n 'systemctl is-active|systemctl status|rc-service' \
   lunarwing_mt_onboard lunarwing_mt_onboard_web
 ```
 
-- [ ] **Step 2: Update status with verified facts only**
+- [x] **Step 2: Update status with verified facts only**
 
 Record the RED/green integration test, exact local commands, and the fact that
 Phase 4 remains live-pending until Brightdawn passes. Append a corrective task to
@@ -981,7 +997,7 @@ the Phase 4 plan rather than rewriting its historical completed tasks. Update
 `FEATURE_PARITY.md`, architecture docs, or changelog only if their current text
 would otherwise make a false behavior claim.
 
-- [ ] **Step 3: Commit local verification documentation**
+- [x] **Step 3: Commit local verification documentation**
 
 ```bash
 git add docs/proposals/ENGINE_LLM_STREAMING.md \

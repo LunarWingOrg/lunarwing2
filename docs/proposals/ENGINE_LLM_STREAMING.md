@@ -21,8 +21,8 @@ generation, and expose progress during long agentic runs.
   terminal `response`. The channel-neutral `StatusUpdate::StreamChunk` path is
   additionally wired for non-gateway channels (inert today; WASM channels ignore
   `StreamChunk`) to plumb the Phase 5 rollout.
-- **Phase 4 engine cancellation is implemented on the implementation branch
-  (automated engine/bridge gates pass), but the live ingress gate failed.** Each
+- **Phase 4 engine cancellation and interrupt-aware ingress are implemented on
+  the integration branch; the corrected Brightdawn live gate is pending.** Each
   running thread owns a `tokio_util` `CancellationToken`; a stop
   cancels it (in addition to the existing between-step `ThreadSignal::Stop`) so
   an in-flight provider stream — whether still acquiring or mid-collection — is
@@ -31,18 +31,22 @@ generation, and expose progress during long agentic runs.
   reply, no usage from the cancelled call, no cache entry, and no recording
   trace. Cancellation is isolated by owner and conversation scope, resumed and
   subsequent turns get fresh tokens, and the gateway `Submission::Interrupt` is
-  routed to Engine V2 (returning a single `Interrupted.` acknowledgement).
-  Brightdawn exposed that `Agent::run()` awaits the active message handler before
-  polling channel input again, so a live `/interrupt` remains queued until the
-  target has completed. Phase 4 now requires the approved interrupt-aware
-  serialized dispatcher before its live TensorZero `2026.3.2` gate can pass.
+  routed to Engine V2 (returning a single `Interrupted.` acknowledgement). The
+  host dispatcher now continues polling channel input while one ordinary handler
+  is active: exact `/interrupt` and `/stop` controls use the normal scoped route,
+  while every other message remains FIFO in a 256-entry bounded queue with an
+  explicit busy response on overflow. The original agent-level regression first
+  failed with zero responses after two seconds, then passed with the dispatcher;
+  five ingress lifecycle tests now cover acquisition cancellation, FIFO priority,
+  overflow, legacy fallback, and soft-timeout preservation. Phase 4 remains open
+  until Brightdawn repeats the TensorZero `2026.3.2` live gate successfully.
 - **WASM channel delivery is still not covered.** That remains Phase 5.
 - **TensorZero Gateway `2026.3.2` is the compatibility target.** LunarWing uses
   its OpenAI-compatible `/openai/v1/chat/completions` endpoint.
 
-The next work is closing the Phase 4 channel-ingress cancellation blocker, then
-finishing opt-in WASM channel delivery (Phase 5). Provider and engine streaming
-are no longer the blocker.
+The next work is repeating the corrected Phase 4 Brightdawn live gate, then
+finishing opt-in WASM channel delivery (Phase 5). Provider, engine, and host
+dispatcher plumbing are no longer the blocker.
 
 ## Why this is foundational
 
@@ -230,17 +234,19 @@ gateway rather than exposing partial support.
   non-gateway `StatusUpdate::StreamChunk` path is wired (inert today) for the
   Phase 5 rollout. Gateway delta and status are emitted through a single path to
   avoid duplicating streamed text.
-- **Phase 4 - engine layer implemented; live ingress gate failed:** per-thread
+- **Phase 4 - implementation locally verified; corrected live gate pending:** per-thread
   `CancellationToken` ownership in `ThreadManager`, cancellation propagated
   through `ExecutionLoop` into the orchestrator's LLM host call (wrapping stream
   acquisition and collection in `run_until_cancelled`), a typed
   `ThreadOutcome::Stopped` that resumes neither Monty nor failure/rollback
   accounting, terminal-only decorator state preserved on stream drop, and a
   scoped gateway interrupt route. The between-step `ThreadSignal::Stop` contract
-  is retained. The 2026-07-13 Brightdawn gate proved that the serialized agent
-  loop does not dequeue `/interrupt` while an ordinary handler is active; the
-  approved interrupt-aware serialized dispatcher must land before live
-  TensorZero `2026.3.2` cancellation validation is repeated.
+  is retained. The 2026-07-13 Brightdawn gate proved that the old serialized
+  agent loop did not dequeue `/interrupt` while an ordinary handler was active.
+  The corrective dispatcher is now implemented and locally verified: exact
+  interrupts overtake a bounded FIFO of ordinary messages without introducing
+  ordinary-message concurrency, and active shutdown aborts and awaits its task.
+  Brightdawn must still repeat the live TensorZero `2026.3.2` cancellation gate.
 - **Phase 5:** opt-in channel-neutral delivery for eligible WASM channels after
   the approved safety gates pass.
 
@@ -270,6 +276,17 @@ tool reconstruction, complete-only fallback compatibility, response-delta
 Serde coverage, and real orchestrator text/code/tool/error/no-receiver streams.
 The integration tests also prove ordered live delta broadcast, non-persistence
 of provider chunks, and terminal-only usage commitment.
+
+Phase 4 ingress coverage adds an agent-level pending-acquisition regression. It
+was observed RED against the old loop (`0` responses after the two-second
+deadline) and GREEN after the dispatcher. The final isolated target passes five
+tests covering one acknowledgement with no cancelled terminal response, FIFO
+priority across scopes, the real 256-message overflow response, unmatched-scope
+legacy fallback without cross-thread cancellation, and soft-timeout detachment.
+The full Engine crate passes 322 tests; focused agent-loop, dispatcher, and bridge
+suites pass 17, 2, and 30 tests respectively. Default, PostgreSQL-only, and
+libSQL-only checks, formatting, and zero-warning Clippy also pass under the
+six-thread constraint. These are local gates, not a substitute for Brightdawn.
 
 `FEATURE_PARITY.md` is intentionally unchanged in Phase 2 because no
 user-facing channel consumes native provider deltas yet.

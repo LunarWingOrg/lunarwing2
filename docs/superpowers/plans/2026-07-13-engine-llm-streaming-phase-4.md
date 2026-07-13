@@ -879,6 +879,30 @@ the next turn remains cancelled. Roll back the tenant binary/source to the last
 known-good Phase 3 commit and restart with `lunarwing-mt-admin.sh`; do not alter
 `env/` or `state/`.
 
+### Task 8: Correct The Live Ingress Scheduling Blocker
+
+The first Brightdawn live gate failed before cancellation routing was reached.
+The target thread started at `20:24:08Z`, completed normally at `20:25:39Z`, and
+the queued `/interrupt` was not parsed until `20:25:58Z`. `Agent::run()` awaited
+the ordinary `handle_message()` task before polling channel input again.
+
+- [x] Add an agent-level pending-acquisition regression and observe RED: the old
+  loop returned zero responses at the two-second deadline.
+- [x] Add parser-based priority classification plus a bounded 256-message FIFO.
+- [x] Keep one ordinary handler active while exact `/interrupt` and `/stop`
+  controls use the existing `handle_message()` and outbound-hook path.
+- [x] Preserve soft-timeout detachment and the independent hard-kill
+  `AbortHandle`; abort and await the active task for process shutdown.
+- [x] Cover FIFO priority, real-capacity overflow, unmatched scoped fallback,
+  timeout suppression, and single-acknowledgement cancellation in the isolated
+  `engine_v2_interrupt_ingress` target (`5 passed; 0 failed`).
+- [x] Run local gates: Engine `322/322`, agent loop `17/17`, dispatcher `2/2`,
+  bridge/router `30/30`, default/PostgreSQL/libSQL checks, formatting, and
+  zero-warning Clippy.
+- [ ] Push the corrected integration branch, rebuild Brightdawn without touching
+  tenant `env/`, `state/`, or installed WASM artifacts, and repeat the measured
+  TensorZero `2026.3.2` live gate.
+
 ## Phase 4 Completion Gate
 
 Phase 4 is complete only when every item below is true:
