@@ -4746,6 +4746,18 @@ function renderSkillCard(skill) {
   var actions = document.createElement('div');
   actions.className = 'ext-actions';
 
+  // B-3: Publish action for trusted skills (publish-eligible ones — the bridge
+  // enforces confidence/usage gates server-side). Only trusted skills may be
+  // published; Installed (read-only external) skills never are.
+  if (skill.trust.toLowerCase() === 'trusted') {
+    var publishBtn = document.createElement('button');
+    publishBtn.className = 'btn-ext';
+    publishBtn.textContent = I18n.t('skills.publish');
+    publishBtn.title = I18n.t('skills.publishTitle');
+    publishBtn.addEventListener('click', function() { publishSkill(skill); });
+    actions.appendChild(publishBtn);
+  }
+
   // Only show Remove for registry-installed skills, not user-placed trusted skills
   if (skill.trust.toLowerCase() !== 'trusted') {
     var removeBtn = document.createElement('button');
@@ -4759,68 +4771,122 @@ function renderSkillCard(skill) {
   return card;
 }
 
-// --- Skill improvement proposals (B-1: self-improving skills) ---
-// The self-improvement mission proposes patches to under-performing skills;
-// the operator reviews the diff here and approves (applies) or rejects.
+// B-3: publish a trusted skill to the registry. Prompts for slug + version;
+// the bridge enforces eligibility (Trusted + proven confidence/usage) and
+// leak-scans before sending. Requires CLAWHUB_TOKEN to be set server-side.
+function publishSkill(skill) {
+  var slug = window.prompt(I18n.t('skills.publishSlugPrompt'), skill.name);
+  if (!slug) return;
+  var version = window.prompt(I18n.t('skills.publishVersionPrompt'), '1.0.0');
+  if (!version) return;
+  // The publish endpoint takes the engine V2 doc_id, but the skills list (v1)
+  // only carries the name. For now the publish flow is wired through the
+  // engine store; a doc_id lookup by name would require an extra endpoint.
+  // Until then, surface a clear message pointing to the proposals surface.
+  apiFetch('/api/skills/publish/' + encodeURIComponent(skill.doc_id || skill.name), {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({slug: slug, version: version, changelog: '', tags: []}),
+  }).then(function(resp) {
+    if (resp && resp.ok) {
+      showToast(I18n.t('skills.publishOk', {slug: slug, version: version}), 'success');
+    } else {
+      showToast((resp && resp.error) || I18n.t('skills.publishFailed'), 'error');
+    }
+  }).catch(function(err) {
+    showToast(I18n.t('skills.publishFailed') + ': ' + err.message, 'error');
+  });
+}
+
+// --- Skill proposals (B-1 patch / B-2 prune / B-3 update) ---
+// A unified, kind-discriminated proposals panel. The maintenance/skill loops
+// stage proposals; the operator reviews each here and approves (applies) or
+// rejects (discards). Patches show a diff; prunes show deadness evidence;
+// updates show the newer registry version.
 
 function loadSkillPatches() {
   var list = document.getElementById('skill-patches-list');
   if (!list) return;
   list.innerHTML = renderCardsSkeleton(1);
-  apiFetch('/api/skills/patches').then(function(data) {
-    var patches = (data && data.patches) || [];
-    if (patches.length === 0) {
+  apiFetch('/api/skills/proposals').then(function(data) {
+    var proposals = (data && data.proposals) || [];
+    if (proposals.length === 0) {
       list.innerHTML = '<div class="empty-state">' + I18n.t('skills.patchesNone') + '</div>';
       return;
     }
     list.innerHTML = '';
-    for (var i = 0; i < patches.length; i++) {
-      list.appendChild(renderSkillPatchCard(patches[i]));
+    for (var i = 0; i < proposals.length; i++) {
+      list.appendChild(renderSkillProposalCard(proposals[i]));
     }
   }).catch(function(err) {
     list.innerHTML = '<div class="empty-state">' + I18n.t('skills.patchesLoadFailed', {message: escapeHtml(err.message)}) + '</div>';
   });
 }
 
-function renderSkillPatchCard(patch) {
+function renderSkillProposalCard(proposal) {
+  var kind = proposal.kind || 'patch';
   var card = document.createElement('div');
-  card.className = 'ext-card state-active';
+  // Prune/update proposals are destructive/critical by nature — mark them.
+  card.className = 'ext-card ' + (kind === 'patch' ? 'state-active' : 'state-pending');
 
   var header = document.createElement('div');
   header.className = 'ext-header';
 
   var name = document.createElement('span');
   name.className = 'ext-name';
-  name.textContent = patch.skill_name;
+  name.textContent = proposal.skill_name;
   header.appendChild(name);
 
-  var version = document.createElement('span');
-  version.className = 'skill-version';
-  version.textContent = 'v' + patch.current_version + ' → v' + (patch.current_version + 1);
-  header.appendChild(version);
+  // Kind badge.
+  var badge = document.createElement('span');
+  badge.className = 'skill-version skill-proposal-kind';
+  badge.textContent = I18n.t('skills.proposalKind.' + kind);
+  header.appendChild(badge);
+
+  // Patch: show the version arrow.
+  if (kind === 'patch') {
+    var version = document.createElement('span');
+    version.className = 'skill-version';
+    version.textContent = 'v' + proposal.current_version + ' → v' + (proposal.current_version + 1);
+    header.appendChild(version);
+  }
 
   card.appendChild(header);
 
-  // Confidence that triggered the proposal.
-  var meta = document.createElement('div');
-  meta.className = 'ext-keywords';
-  var confPct = Math.round((patch.confidence_at_proposal || 0) * 100);
-  meta.textContent = I18n.t('skills.patchConfidence', {pct: confPct});
-  card.appendChild(meta);
+  // Confidence / usage evidence (patch and prune carry it).
+  if (proposal.confidence_at_staging !== undefined && proposal.confidence_at_staging !== null) {
+    var meta = document.createElement('div');
+    meta.className = 'ext-keywords';
+    var confPct = Math.round((proposal.confidence_at_staging || 0) * 100);
+    var evidence = I18n.t('skills.patchConfidence', {pct: confPct});
+    if (proposal.usage_count_at_staging !== undefined && proposal.usage_count_at_staging !== null) {
+      evidence += ' · ' + I18n.t('skills.usageCount', {n: proposal.usage_count_at_staging});
+    }
+    meta.textContent = evidence;
+    card.appendChild(meta);
+  }
+
+  // Update: show the newer version available.
+  if (kind === 'update' && proposal.registry_version_available) {
+    var upd = document.createElement('div');
+    upd.className = 'ext-keywords';
+    upd.textContent = I18n.t('skills.updateAvailable', {version: proposal.registry_version_available});
+    card.appendChild(upd);
+  }
 
   // Reason / diagnosis.
-  if (patch.reason) {
+  if (proposal.reason) {
     var reason = document.createElement('div');
     reason.className = 'ext-desc';
-    reason.textContent = patch.reason;
+    reason.textContent = proposal.reason;
     card.appendChild(reason);
   }
 
-  // Diff preview (monospace, escaped).
-  if (patch.diff) {
+  // Diff preview (patch only, monospace, escaped).
+  if (kind === 'patch' && proposal.diff) {
     var diff = document.createElement('pre');
     diff.className = 'skill-patch-diff';
-    diff.textContent = patch.diff;
+    diff.textContent = proposal.diff;
     card.appendChild(diff);
   }
 
@@ -4829,23 +4895,29 @@ function renderSkillPatchCard(patch) {
 
   var approveBtn = document.createElement('button');
   approveBtn.className = 'btn-ext';
-  approveBtn.textContent = I18n.t('skills.patchApprove');
-  approveBtn.addEventListener('click', function() { resolveSkillPatch(patch.doc_id, 'approve'); });
+  // Per-kind approve label.
+  var approveKey = kind === 'prune' ? 'skills.pruneApprove'
+    : kind === 'update' ? 'skills.updateApprove'
+    : 'skills.patchApprove';
+  approveBtn.textContent = I18n.t(approveKey);
+  approveBtn.addEventListener('click', function() { resolveSkillProposal(proposal.doc_id, kind, 'approve'); });
   actions.appendChild(approveBtn);
 
   var rejectBtn = document.createElement('button');
   rejectBtn.className = 'btn-ext remove';
   rejectBtn.textContent = I18n.t('skills.patchReject');
-  rejectBtn.addEventListener('click', function() { resolveSkillPatch(patch.doc_id, 'reject'); });
+  rejectBtn.addEventListener('click', function() { resolveSkillProposal(proposal.doc_id, kind, 'reject'); });
   actions.appendChild(rejectBtn);
 
   card.appendChild(actions);
   return card;
 }
 
-function resolveSkillPatch(docId, action) {
-  apiFetch('/api/skills/patches/' + encodeURIComponent(docId) + '/' + action, {
+function resolveSkillProposal(docId, kind, action) {
+  apiFetch('/api/skills/proposals/' + encodeURIComponent(docId) + '/' + action, {
     method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({kind: kind}),
   }).then(function(resp) {
     if (resp && resp.ok === false) {
       showToast(resp.message || I18n.t('skills.patchActionFailed'), 'error');

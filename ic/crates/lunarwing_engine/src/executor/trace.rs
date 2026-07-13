@@ -740,7 +740,9 @@ mod tests {
         // Same command FAILING 8x with drifting line ranges → stuck loop.
         for i in 0..8 {
             let p = format!("src/main.rs:{}-{}", i * 10, i * 10 + 5);
-            thread.events.push(fail_event(&thread, "read_file", Some(&p)));
+            thread
+                .events
+                .push(fail_event(&thread, "read_file", Some(&p)));
         }
         let issues = analyze_trace(&thread);
         let loops: Vec<_> = issues
@@ -761,7 +763,9 @@ mod tests {
         thread.add_message(ThreadMessage::system("sys"));
         thread.state = ThreadState::Done; // succeeded in the end
         for _ in 0..60 {
-            thread.events.push(exec_event(&thread, "shell", Some("check status")));
+            thread
+                .events
+                .push(exec_event(&thread, "shell", Some("check status")));
         }
         let issues = analyze_trace(&thread);
         assert!(
@@ -777,7 +781,9 @@ mod tests {
         thread.add_message(ThreadMessage::system("sys"));
         thread.state = ThreadState::Failed;
         for _ in 0..4 {
-            thread.events.push(fail_event(&thread, "shell", Some("cargo build")));
+            thread
+                .events
+                .push(fail_event(&thread, "shell", Some("cargo build")));
         }
         let issues = analyze_trace(&thread);
         assert!(
@@ -794,7 +800,9 @@ mod tests {
         thread.state = ThreadState::Failed;
         for name in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"] {
             let p = format!("src/{name}.rs:1-10");
-            thread.events.push(fail_event(&thread, "read_file", Some(&p)));
+            thread
+                .events
+                .push(fail_event(&thread, "read_file", Some(&p)));
         }
         let issues = analyze_trace(&thread);
         assert!(

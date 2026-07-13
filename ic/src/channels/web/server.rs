@@ -45,7 +45,9 @@ use crate::channels::web::handlers::routines::{
 };
 use crate::channels::web::handlers::skills::{
     skill_patch_approve_handler, skill_patch_reject_handler, skill_patches_list_handler,
-    skills_install_handler, skills_list_handler, skills_remove_handler, skills_search_handler,
+    skill_proposal_approve_handler, skill_proposal_reject_handler, skill_proposals_list_handler,
+    skill_publish_handler, skills_install_handler, skills_list_handler, skills_remove_handler,
+    skills_search_handler,
 };
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
@@ -505,6 +507,20 @@ pub async fn start_server(
             "/api/skills/patches/{doc_id}/reject",
             post(skill_patch_reject_handler),
         )
+        // B-1/B-2/B-3: unified skill proposals surface (kind-discriminated).
+        // The patch routes above remain as back-compat aliases.
+        .route("/api/skills/proposals", get(skill_proposals_list_handler))
+        .route(
+            "/api/skills/proposals/{doc_id}/approve",
+            post(skill_proposal_approve_handler),
+        )
+        .route(
+            "/api/skills/proposals/{doc_id}/reject",
+            post(skill_proposal_reject_handler),
+        )
+        // B-3: cross-agent skill sharing — publish to the registry.
+        // Static `publish` segment precedes the `{name}` delete route.
+        .route("/api/skills/publish/{doc_id}", post(skill_publish_handler))
         .route(
             "/api/skills/{name}",
             axum::routing::delete(skills_remove_handler),
