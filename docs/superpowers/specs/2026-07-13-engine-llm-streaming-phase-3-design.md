@@ -2,7 +2,7 @@
 
 ## Status
 
-Implementation in progress.
+Implemented locally; live tenant verification is pending.
 
 This design follows the completed Phase 2 work in
 `docs/proposals/ENGINE_LLM_STREAMING.md` and the approved channel-neutral
@@ -46,23 +46,26 @@ Translate `EventKind::ResponseDelta` at the bridge boundary in
 2. `forward_event_to_channel` (channel-neutral `StatusUpdate` path) gains a
    `ResponseDelta` arm that sends `StatusUpdate::StreamChunk(content)` — but only
    for **non-gateway** channels.
-3. Subscribe to the engine event broadcaster before any operation that can
-   spawn or resume thread execution, then pass that receiver into
-   `await_thread_outcome`. When execution finishes, drain events already queued
-   on that receiver before emitting the authoritative terminal response.
+3. Subscribe to the engine event broadcaster before each new-message or
+   interactive gate-resolution operation whose result is delivered through
+   `await_thread_outcome`, then pass that receiver into the outcome handler.
+   When execution finishes, drain events already queued on that receiver before
+   emitting the authoritative terminal response.
 
 ## Event capture ordering
 
 Tokio broadcast receivers observe only events sent after subscription. Engine
 threads start in a background task before `handle_user_message` returns, so
 subscribing inside `await_thread_outcome` can miss the first provider deltas.
-The same race exists when approval or authentication resumes a paused thread.
+The same race exists when an approval or authentication resume continues into
+`await_thread_outcome`.
 
-The bridge therefore establishes the receiver before calling any spawn/resume
-operation. `await_thread_outcome` consumes that existing receiver rather than
-creating a new one. Once the thread is no longer running, all engine sends have
-completed, but some events can still be queued locally; those matching the
-thread are drained and delivered before terminal response reconciliation.
+The bridge therefore establishes the receiver before each spawn/resume
+operation routed into `await_thread_outcome`. The outcome handler consumes that
+existing receiver rather than creating a new one. Once the thread is no longer
+running, all engine sends have completed, but some events can still be queued
+locally; those matching the thread are drained and delivered before terminal
+response reconciliation.
 
 Receiver lag remains best-effort: it is logged, and the final response still
 replaces the partial browser bubble. Phase 3 does not make transient deltas
@@ -108,6 +111,9 @@ JS change.
 - Enabling Engine V2 for WASM channels (Phase 5). The non-gateway
   `StatusUpdate::StreamChunk` wiring is inert today (WASM channels ignore
   `StreamChunk`) but plumbs that rollout.
+- Adding event and terminal-response delivery to the standalone OAuth callback
+  resume. That callback has no `Agent` / `IncomingMessage` delivery context and
+  requires its own lifecycle design.
 - Collapsing the two gateway dispatch paths. Any pre-existing duplication for
   non-delta events is out of scope; the channel-neutral delivery migration owns
   it.
@@ -116,7 +122,8 @@ JS change.
 ## Files Changed
 
 - `ic/src/bridge/router.rs`: `ResponseDelta` arms in `thread_event_to_app_events`
-  and `forward_event_to_channel`, plus unit tests.
+  and `forward_event_to_channel`; pre-execution event subscription and
+  completion draining; unit tests.
 - `docs/proposals/ENGINE_LLM_STREAMING.md`: Phase 3 status.
 - `ic/FEATURE_PARITY.md`: gateway incremental streaming is now user-visible.
 
@@ -142,9 +149,10 @@ From `ic/` (six-thread constraint; prefix with the environment proxy for
 network fetches, and `taskset -c 0-5` on Linux hosts):
 
 ```bash
-cargo test -j6 --lib bridge::router::tests::response_delta -- --nocapture
-cargo clippy -j6 --lib -- -D warnings
-cargo fmt --all -- --check
+taskset -c 0-5 cargo test -j6 --lib bridge::router::tests:: -- --nocapture
+taskset -c 0-5 cargo test -j6 -p lunarwing_engine -- --nocapture
+taskset -c 0-5 cargo clippy -j6 --lib -- -D warnings
+taskset -c 0-5 cargo fmt --all -- --check
 git diff --check
 ```
 

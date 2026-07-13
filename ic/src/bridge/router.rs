@@ -381,6 +381,7 @@ async fn execute_pending_gate_action(
         .await
     {
         Ok(result) => {
+            let event_rx = state.thread_manager.subscribe_events();
             state
                 .thread_manager
                 .resume_thread(
@@ -401,6 +402,7 @@ async fn execute_pending_gate_action(
                 message,
                 pending.conversation_id,
                 pending.thread_id,
+                event_rx,
             )
             .await
         }
@@ -1404,7 +1406,7 @@ pub async fn resolve_gate(
             }
         })?;
 
-    match resolution {
+    let event_rx = match resolution {
         lunarwing_engine::GateResolution::Approved { always: raw_always } => {
             let always = clamp_always_to_resume_kind(raw_always, &pending.resume_kind);
             if let Some(ref sse) = state.sse {
@@ -1496,6 +1498,7 @@ pub async fn resolve_gate(
             ));
 
             state.effect_adapter.reset_call_count();
+            let event_rx = state.thread_manager.subscribe_events();
             state
                 .thread_manager
                 .resume_thread(
@@ -1507,6 +1510,7 @@ pub async fn resolve_gate(
                 )
                 .await
                 .map_err(|e| engine_err("resume error", e))?;
+            event_rx
         }
 
         lunarwing_engine::GateResolution::Cancelled => {
@@ -1614,6 +1618,7 @@ pub async fn resolve_gate(
                 }
 
                 if let Some(resume_output) = pending.resume_output.clone() {
+                    let event_rx = state.thread_manager.subscribe_events();
                     state
                         .thread_manager
                         .resume_thread(
@@ -1628,6 +1633,7 @@ pub async fn resolve_gate(
                         )
                         .await
                         .map_err(|e| engine_err("resume error", e))?;
+                    event_rx
                 } else {
                     return execute_pending_gate_action(
                         agent, state, message, &pending, false, None,
@@ -1657,6 +1663,7 @@ pub async fn resolve_gate(
                 );
             }
             if let Some(resume_output) = pending.resume_output.clone() {
+                let event_rx = state.thread_manager.subscribe_events();
                 state
                     .thread_manager
                     .resume_thread(
@@ -1671,12 +1678,13 @@ pub async fn resolve_gate(
                     )
                     .await
                     .map_err(|e| engine_err("resume error", e))?;
+                event_rx
             } else {
                 return execute_pending_gate_action(agent, state, message, &pending, false, None)
                     .await;
             }
         }
-    }
+    };
 
     await_thread_outcome(
         agent,
@@ -1684,6 +1692,7 @@ pub async fn resolve_gate(
         message,
         pending.conversation_id,
         pending.thread_id,
+        event_rx,
     )
     .await
 }
@@ -2245,19 +2254,18 @@ async fn handle_with_engine_inner(
     // hit the spawn path.
     let preferred_thread_id = parse_engine_thread_id(message.conversation_scope());
 
-    // Handle the message — spawns a new thread or injects into active one
-    let thread_id = state
-        .conversation_manager
-        .handle_user_message(
-            conv_id,
-            content,
-            project_id,
-            &message.user_id,
-            thread_config,
-            preferred_thread_id,
-        )
-        .await
-        .map_err(|e| engine_err("thread error", e))?;
+    // Subscribe before execution starts: broadcast receivers do not replay
+    // deltas that were sent before they were created.
+    let (thread_id, event_rx) = handle_user_message_with_event_receiver(
+        state,
+        conv_id,
+        content,
+        project_id,
+        &message.user_id,
+        thread_config,
+        preferred_thread_id,
+    )
+    .await?;
 
     // Dual-write to v1 database so the gateway history API shows messages.
     if let Some(ref db) = state.db
@@ -2267,7 +2275,38 @@ async fn handle_with_engine_inner(
     }
 
     debug!(thread_id = %thread_id, "engine v2: thread spawned");
-    await_thread_outcome(agent, state, message, conv_id, thread_id).await
+    await_thread_outcome(agent, state, message, conv_id, thread_id, event_rx).await
+}
+
+async fn handle_user_message_with_event_receiver(
+    state: &EngineState,
+    conversation_id: lunarwing_engine::ConversationId,
+    content: &str,
+    project_id: lunarwing_engine::ProjectId,
+    user_id: &str,
+    thread_config: ThreadConfig,
+    preferred_thread_id: Option<lunarwing_engine::ThreadId>,
+) -> Result<
+    (
+        lunarwing_engine::ThreadId,
+        tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
+    ),
+    Error,
+> {
+    let event_rx = state.thread_manager.subscribe_events();
+    let thread_id = state
+        .conversation_manager
+        .handle_user_message(
+            conversation_id,
+            content,
+            project_id,
+            user_id,
+            thread_config,
+            preferred_thread_id,
+        )
+        .await
+        .map_err(|error| engine_err("thread error", error))?;
+    Ok((thread_id, event_rx))
 }
 
 async fn await_thread_outcome(
@@ -2276,12 +2315,8 @@ async fn await_thread_outcome(
     message: &IncomingMessage,
     conv_id: lunarwing_engine::ConversationId,
     thread_id: lunarwing_engine::ThreadId,
+    mut event_rx: tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
 ) -> Result<Option<String>, Error> {
-    let mut event_rx = state.thread_manager.subscribe_events();
-    let channels = &agent.channels;
-    let channel_name = &message.channel;
-    let metadata = &message.metadata;
-    let sse = state.sse.as_ref();
     let tid_str = thread_id.to_string();
 
     // Safety timeout: if the thread doesn't finish within 5 minutes,
@@ -2294,19 +2329,24 @@ async fn await_thread_outcome(
             event = event_rx.recv() => {
                 match event {
                     Ok(ref evt) if evt.thread_id == thread_id => {
-                        forward_event_to_channel(evt, channels, channel_name, metadata).await;
-                        if let Some(sse) = sse {
-                            for app_event in thread_event_to_app_events(evt, &tid_str) {
-                                sse.broadcast_for_user(&message.user_id, app_event);
-                            }
-                        }
+                        deliver_thread_event(agent, state, message, &tid_str, evt).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            thread_id = %thread_id,
+                            skipped,
+                            "engine event receiver lagged"
+                        );
+                    }
                     _ => {}
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                 if !state.thread_manager.is_running(thread_id).await {
+                    for event in drain_pending_thread_events(&mut event_rx, thread_id) {
+                        deliver_thread_event(agent, state, message, &tid_str, &event).await;
+                    }
                     break;
                 }
                 if tokio::time::Instant::now() >= deadline {
@@ -2611,6 +2651,46 @@ async fn await_thread_outcome(
     }
 
     result
+}
+
+async fn deliver_thread_event(
+    agent: &Agent,
+    state: &EngineState,
+    message: &IncomingMessage,
+    thread_id: &str,
+    event: &lunarwing_engine::ThreadEvent,
+) {
+    forward_event_to_channel(event, &agent.channels, &message.channel, &message.metadata).await;
+    if let Some(sse) = state.sse.as_ref() {
+        for app_event in thread_event_to_app_events(event, thread_id) {
+            sse.broadcast_for_user(&message.user_id, app_event);
+        }
+    }
+}
+
+fn drain_pending_thread_events(
+    event_rx: &mut tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
+    thread_id: lunarwing_engine::ThreadId,
+) -> Vec<lunarwing_engine::ThreadEvent> {
+    let mut events = Vec::new();
+    loop {
+        match event_rx.try_recv() {
+            Ok(event) if event.thread_id == thread_id => events.push(event),
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    skipped,
+                    "engine event receiver lagged while draining"
+                );
+            }
+            Err(
+                tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed,
+            ) => break,
+        }
+    }
+    events
 }
 
 // ── Shared event display helpers ────────────────────────────
@@ -4352,6 +4432,81 @@ mod tests {
                 callback_id: "abc".to_string()
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn message_execution_subscribes_before_immediate_deltas() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+        let conversation_id = state
+            .conversation_manager
+            .get_or_create_conversation("gateway", "alice")
+            .await
+            .expect("conversation should be created");
+
+        let (thread_id, mut event_rx) = handle_user_message_with_event_receiver(
+            &state,
+            conversation_id,
+            "reply immediately",
+            state.default_project_id,
+            "alice",
+            lunarwing_engine::ThreadConfig::default(),
+            None,
+        )
+        .await
+        .expect("thread should start");
+
+        let first_delta = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = event_rx
+                    .recv()
+                    .await
+                    .expect("event sender should remain open");
+                if event.thread_id == thread_id
+                    && let lunarwing_engine::EventKind::ResponseDelta { content } = event.kind
+                {
+                    break content;
+                }
+            }
+        })
+        .await
+        .expect("first delta should not be missed");
+
+        assert_eq!(first_delta, "done");
+        let _ = state.thread_manager.join_thread(thread_id).await;
+    }
+
+    #[test]
+    fn pending_thread_events_are_drained_in_order() {
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let other_thread_id = lunarwing_engine::ThreadId::new();
+
+        for (id, content) in [
+            (thread_id, "one"),
+            (other_thread_id, "ignore"),
+            (thread_id, "two"),
+        ] {
+            event_tx
+                .send(lunarwing_engine::ThreadEvent::new(
+                    id,
+                    lunarwing_engine::EventKind::ResponseDelta {
+                        content: content.to_string(),
+                    },
+                ))
+                .expect("receiver should be active");
+        }
+
+        let drained = drain_pending_thread_events(&mut event_rx, thread_id);
+        let contents: Vec<_> = drained
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                lunarwing_engine::EventKind::ResponseDelta { content } => Some(content),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(contents, ["one", "two"]);
     }
 
     #[test]

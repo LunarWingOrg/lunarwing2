@@ -27,7 +27,7 @@ support `StreamChunk`.
 - Modify: `ic/src/bridge/router.rs` (`handle_with_engine_inner`, gate resume
   paths, `await_thread_outcome`)
 
-- [ ] **Step 1: Add failing lifecycle tests**
+- [x] **Step 1: Add failing lifecycle tests**
 
 Add these tests to `bridge::router::tests`. The first exercises the real
 conversation/thread managers with the existing immediate `NoopLlm`; the second
@@ -122,11 +122,11 @@ Expected: compilation fails because
 `handle_user_message_with_event_receiver` and `drain_pending_thread_events` do
 not exist.
 
-- [ ] **Step 2: Subscribe before spawn/resume**
+- [x] **Step 2: Subscribe before spawn/resume**
 
-Create the broadcast receiver before every operation that can start engine
-execution. Pass it into `await_thread_outcome`; do not create a replacement
-receiver there.
+Create the broadcast receiver before each new-message or interactive
+gate-resolution operation whose result enters `await_thread_outcome`. Pass it
+into the outcome handler; do not create a replacement receiver there.
 
 Add this focused helper and use it from `handle_with_engine_inner`:
 
@@ -160,11 +160,11 @@ async fn handle_user_message_with_event_receiver(
 }
 ```
 
-For approval/authentication resumes, call `subscribe_events()` immediately
-before `resume_thread()`. Extend `await_thread_outcome` with an `event_rx`
-argument and remove its internal subscription.
+For approval/authentication resumes that continue into `await_thread_outcome`,
+call `subscribe_events()` immediately before `resume_thread()`. Extend the
+outcome handler with an `event_rx` argument and remove its internal subscription.
 
-- [ ] **Step 3: Drain completion-time events**
+- [x] **Step 3: Drain completion-time events**
 
 When the thread is no longer running, drain matching events already queued on
 the receiver and deliver them before joining and emitting the terminal response.
@@ -252,7 +252,8 @@ channels ignore `StreamChunk` today; this plumbs Phase 5.
 - [x] **Step 3: Run focused tests**
 
 ```bash
-cargo test -j6 --lib bridge::router::tests::response_delta -- --nocapture
+taskset -c 0-5 cargo test -j6 --lib \
+  bridge::router::tests::response_delta -- --nocapture
 ```
 
 Expected: both tests pass.
@@ -272,8 +273,8 @@ Expected: both tests pass.
 - [x] **Step 3: Static checks**
 
 ```bash
-cargo clippy -j6 --lib -- -D warnings
-cargo fmt --all -- --check   # my regions clean; pre-existing skill-patch fmt noise is unrelated
+taskset -c 0-5 cargo clippy -j6 --lib -- -D warnings
+taskset -c 0-5 cargo fmt --all -- --check   # changed regions clean; pre-existing fmt noise is unrelated
 git diff --check
 ```
 
@@ -285,5 +286,8 @@ git diff --check
 ## Notes / boundaries
 
 - Interrupt-aware cancellation is Phase 4; WASM channel enablement is Phase 5.
+- The standalone OAuth callback resumes without an `Agent` / `IncomingMessage`
+  outcome-delivery context. Giving that callback its own event consumer and
+  terminal-response delivery contract is separate follow-up work, not Phase 3.
 - Pre-existing dual-path emission for non-delta events (tool cards, thinking) is
   out of scope; the channel-neutral delivery migration owns collapsing it.
