@@ -9,7 +9,7 @@
 ---
 
 1. [x] Ensure references to 1.2.0 in the code and documentation are replaced by 2.0.0.0 (or 2.0.0)
-2. [x] Create ov dir ( cd {this repo} && mkdir -p docs/ov/ )
+2. [ ] Work on docs/ops/WEECHAT_SERVICES_VERIFICATION.md
 3. [x] Bump crates version from 1.1.9 to 2.0.0 (crate version schema remains unchanged from v1 days)
 4. [x] Make sure you DIDNT MISS ANY CRATES. RELEVANT LUNARWING crates and things such as xmpp bridge and wasm channels must have 2.0.0 version, NOT 1.1.9 or 1.1.8
 5. [x] Multiple steps here for this one: First, read the blog post: https://blog.lunarwing.org/2026/07/12/lunarwingv2-the-next-frontier-of-private-self-hosted-ai-agents/ — THEN: Analyze the features not yet included in this AGENT_GOALS_2.0.0.0.md or in docs/ops/ROADMAP_2026.md and document all of them into a new document under docs/proposals please. (open pr)
