@@ -650,7 +650,14 @@ mod tests {
         let project = ProjectId::new();
 
         let tid = cm
-            .handle_user_message(conv_id, "Hello", project, "user1", ThreadConfig::default(), None)
+            .handle_user_message(
+                conv_id,
+                "Hello",
+                project,
+                "user1",
+                ThreadConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -818,7 +825,14 @@ mod tests {
 
         // Spawn a thread so the conversation has entries and active threads
         let tid = cm
-            .handle_user_message(conv_id, "Hello", project, "user1", ThreadConfig::default(), None)
+            .handle_user_message(
+                conv_id,
+                "Hello",
+                project,
+                "user1",
+                ThreadConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 
