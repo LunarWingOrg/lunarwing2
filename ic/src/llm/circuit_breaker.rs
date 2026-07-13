@@ -16,13 +16,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
-    CompletionRequest, CompletionResponse, LlmProvider, ModelMetadata, ToolCompletionRequest,
-    ToolCompletionResponse,
+    CompletionRequest, CompletionResponse, LlmProvider, LlmStream, LlmStreamChunk, ModelMetadata,
+    ToolCompletionRequest, ToolCompletionResponse,
 };
 
 /// Configuration for the circuit breaker.
@@ -213,6 +214,20 @@ impl CircuitBreakerProvider {
             CircuitState::Open => {}
         }
     }
+
+    fn account_stream<'a>(&'a self, stream: LlmStream<'a>) -> LlmStream<'a> {
+        stream
+            .then(move |item| async move {
+                match &item {
+                    Ok(LlmStreamChunk::Done { .. }) => self.record_success().await,
+                    Err(error) => self.record_failure(error).await,
+                    Ok(LlmStreamChunk::TextDelta(_)) | Ok(LlmStreamChunk::ToolCallDelta { .. }) => {
+                    }
+                }
+                item
+            })
+            .boxed()
+    }
 }
 
 /// Returns `true` for errors that indicate the provider is degraded
@@ -273,6 +288,17 @@ impl LlmProvider for CircuitBreakerProvider {
         }
     }
 
+    async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
+        self.check_allowed().await?;
+        match self.inner.complete_stream(request).await {
+            Ok(stream) => Ok(self.account_stream(stream)),
+            Err(error) => {
+                self.record_failure(&error).await;
+                Err(error)
+            }
+        }
+    }
+
     async fn complete_with_tools(
         &self,
         request: ToolCompletionRequest,
@@ -286,6 +312,20 @@ impl LlmProvider for CircuitBreakerProvider {
             Err(err) => {
                 self.record_failure(&err).await;
                 Err(err)
+            }
+        }
+    }
+
+    async fn complete_with_tools_stream(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<LlmStream<'_>, LlmError> {
+        self.check_allowed().await?;
+        match self.inner.complete_with_tools_stream(request).await {
+            Ok(stream) => Ok(self.account_stream(stream)),
+            Err(error) => {
+                self.record_failure(&error).await;
+                Err(error)
             }
         }
     }
@@ -319,6 +359,10 @@ impl LlmProvider for CircuitBreakerProvider {
 mod tests {
     use super::*;
 
+    use futures::StreamExt;
+
+    use crate::llm::provider::LlmStreamChunk;
+    use crate::llm::streaming_test_support::{ScriptedStreamingProvider, StreamScript};
     use crate::testing::StubLlm;
 
     fn make_request() -> CompletionRequest {
@@ -335,6 +379,161 @@ mod tests {
             recovery_timeout: Duration::from_millis(50),
             half_open_successes_needed: 1,
         }
+    }
+
+    fn transient_stream_error() -> LlmError {
+        LlmError::RequestFailed {
+            provider: "scripted".to_string(),
+            reason: "stream failed".to_string(),
+        }
+    }
+
+    fn successful_stream() -> StreamScript {
+        StreamScript::Items(vec![
+            Ok(LlmStreamChunk::TextDelta("delta".to_string())),
+            Ok(LlmStreamChunk::Done {
+                usage: None,
+                finish_reason: "stop".to_string(),
+            }),
+        ])
+    }
+
+    #[tokio::test]
+    async fn stream_setup_failure_counts_toward_breaker() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![StreamScript::SetupError(transient_stream_error())],
+            vec![],
+        ));
+        let breaker = CircuitBreakerProvider::new(provider.clone(), fast_config(1));
+
+        let result = breaker.complete_stream(make_request()).await;
+
+        assert!(matches!(result, Err(LlmError::RequestFailed { .. })));
+        assert_eq!(breaker.consecutive_failures().await, 1);
+        assert_eq!(breaker.circuit_state().await, CircuitState::Open);
+        assert_eq!(provider.plain_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_midstream_failure_counts_toward_breaker() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![StreamScript::Items(vec![
+                Ok(LlmStreamChunk::TextDelta("delta".to_string())),
+                Err(transient_stream_error()),
+            ])],
+            vec![],
+        ));
+        let breaker = CircuitBreakerProvider::new(provider.clone(), fast_config(1));
+
+        let chunks = breaker
+            .complete_stream(make_request())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(
+            &chunks[0],
+            Ok(LlmStreamChunk::TextDelta(text)) if text == "delta"
+        ));
+        assert!(matches!(
+            &chunks[1],
+            Err(LlmError::RequestFailed { provider, reason })
+                if provider == "scripted" && reason == "stream failed"
+        ));
+        assert_eq!(breaker.consecutive_failures().await, 1);
+        assert_eq!(breaker.circuit_state().await, CircuitState::Open);
+        assert_eq!(provider.plain_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_done_marks_success() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![successful_stream()],
+            vec![],
+        ));
+        let breaker = CircuitBreakerProvider::new(provider, fast_config(2));
+        breaker.record_failure(&transient_stream_error()).await;
+        assert_eq!(breaker.consecutive_failures().await, 1);
+
+        let mut stream = breaker
+            .complete_stream(make_request())
+            .await
+            .expect("stream should open");
+
+        assert_eq!(breaker.consecutive_failures().await, 1);
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "delta"
+        ));
+        assert_eq!(breaker.consecutive_failures().await, 1);
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LlmStreamChunk::Done { .. }))
+        ));
+        assert_eq!(breaker.consecutive_failures().await, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_drop_before_done_does_not_mark_success() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![successful_stream()],
+            vec![],
+        ));
+        let breaker = CircuitBreakerProvider::new(provider, fast_config(2));
+        breaker.record_failure(&transient_stream_error()).await;
+
+        let mut stream = breaker
+            .complete_stream(make_request())
+            .await
+            .expect("stream should open");
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "delta"
+        ));
+        drop(stream);
+
+        assert_eq!(breaker.consecutive_failures().await, 1);
+        assert_eq!(breaker.circuit_state().await, CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn tool_stream_uses_same_breaker_accounting() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![],
+            vec![StreamScript::Items(vec![
+                Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".to_string()),
+                    name: Some("search".to_string()),
+                    args_delta: "{}".to_string(),
+                }),
+                Err(transient_stream_error()),
+            ])],
+        ));
+        let breaker = CircuitBreakerProvider::new(provider.clone(), fast_config(1));
+
+        let chunks = breaker
+            .complete_with_tools_stream(make_tool_request())
+            .await
+            .expect("tool stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            chunks.last(),
+            Some(Err(LlmError::RequestFailed { .. }))
+        ));
+        assert_eq!(breaker.consecutive_failures().await, 1);
+        assert_eq!(breaker.circuit_state().await, CircuitState::Open);
+        assert_eq!(provider.plain_calls(), 0);
+        assert_eq!(provider.tool_calls(), 1);
     }
 
     // -- State machine tests --

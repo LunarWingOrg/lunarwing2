@@ -56,5 +56,5 @@
   <circle cx="140" cy="78" r="1.5" fill="#B3E5FC" opacity="0.5"/>
 
   <!-- LunarWing text -->
-  <text x="100" y="210" text-anchor="middle" font-family="'DM Sans', system-ui, sans-serif" font-size="20" font-weight="700" fill="#4FC3F7" letter-spacing="1">LunarWing</text>
+  <text x="100" y="210" text-anchor="middle" font-family="'Hanken Grotesk', system-ui, sans-serif" font-size="20" font-weight="700" fill="#4FC3F7" letter-spacing="1">LunarWing</text>
 </svg>

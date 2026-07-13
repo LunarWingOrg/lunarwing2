@@ -5,15 +5,20 @@
 
 use crate::llm::config::CacheRetention;
 use async_trait::async_trait;
-use rig::OneOrMany;
-use rig::completion::{
-    AssistantContent, CompletionModel, CompletionRequest as RigRequest,
+use futures::StreamExt;
+use rig_core::OneOrMany;
+use rig_core::completion::{
+    AssistantContent, CompletionModel, CompletionRequest as RigRequest, GetTokenUsage,
     ToolDefinition as RigToolDefinition, Usage as RigUsage,
 };
-use rig::message::{
+use rig_core::message::{
     DocumentSourceKind, Image, ImageMediaType, Message as RigMessage, MimeType,
     ToolChoice as RigToolChoice, ToolFunction, ToolResult as RigToolResult, ToolResultContent,
     UserContent,
+};
+use rig_core::streaming::{
+    StreamedAssistantContent, StreamingCompletionResponse as RigStreamingCompletionResponse,
+    ToolCallDeltaContent,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -22,15 +27,15 @@ use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::llm::costs;
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
-    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider,
-    ToolCall as IronToolCall, ToolCompletionRequest, ToolCompletionResponse,
-    ToolDefinition as IronToolDefinition, strip_unsupported_completion_params,
-    strip_unsupported_tool_params,
+    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, LlmStream,
+    LlmStreamChunk, TokenUsage, ToolCall as IronToolCall, ToolCompletionRequest,
+    ToolCompletionResponse, ToolDefinition as IronToolDefinition,
+    strip_unsupported_completion_params, strip_unsupported_tool_params,
 };
 
 /// Adapter that wraps a rig-core `CompletionModel` and implements `LlmProvider`.
@@ -108,6 +113,61 @@ impl<M: CompletionModel> RigAdapter<M> {
     /// Strip unsupported fields from a `ToolCompletionRequest` in place.
     fn strip_unsupported_tool_params(&self, req: &mut ToolCompletionRequest) {
         strip_unsupported_tool_params(&self.unsupported_params, req);
+    }
+
+    fn warn_model_override(&self, requested_model: Option<&str>) {
+        if let Some(requested_model) = requested_model
+            && requested_model != self.model_name.as_str()
+        {
+            tracing::warn!(
+                requested_model,
+                active_model = %self.model_name,
+                "Per-request model override is not supported for this provider; using configured model"
+            );
+        }
+    }
+
+    fn build_plain_request(&self, mut request: CompletionRequest) -> Result<RigRequest, LlmError> {
+        self.warn_model_override(request.model.as_deref());
+        self.strip_unsupported_completion_params(&mut request);
+
+        let mut messages = request.messages;
+        crate::llm::provider::sanitize_tool_messages(&mut messages);
+        let (preamble, history) = convert_messages(&messages);
+        build_rig_request(
+            preamble,
+            history,
+            Vec::new(),
+            None,
+            request.temperature,
+            request.max_tokens,
+            self.cache_retention,
+        )
+    }
+
+    fn build_tool_request(
+        &self,
+        mut request: ToolCompletionRequest,
+    ) -> Result<(RigRequest, HashSet<String>), LlmError> {
+        self.warn_model_override(request.model.as_deref());
+        self.strip_unsupported_tool_params(&mut request);
+
+        let known_tool_names = request.tools.iter().map(|tool| tool.name.clone()).collect();
+        let mut messages = request.messages;
+        crate::llm::provider::sanitize_tool_messages(&mut messages);
+        let (preamble, history) = convert_messages(&messages);
+        let tools = convert_tools(&request.tools);
+        let tool_choice = convert_tool_choice(request.tool_choice.as_deref());
+        let rig_request = build_rig_request(
+            preamble,
+            history,
+            tools,
+            tool_choice,
+            request.temperature,
+            request.max_tokens,
+            self.cache_retention,
+        )?;
+        Ok((rig_request, known_tool_names))
     }
 }
 
@@ -347,7 +407,7 @@ fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<RigMessage
                         let tool_call_id =
                             normalized_tool_call_id(Some(tc.id.as_str()), history.len() + idx);
                         contents.push(AssistantContent::ToolCall(
-                            rig::message::ToolCall::new(
+                            rig_core::message::ToolCall::new(
                                 tool_call_id.clone(),
                                 ToolFunction::new(tc.name.clone(), tc.arguments.clone()),
                             )
@@ -587,6 +647,7 @@ fn build_rig_request(
     };
 
     Ok(RigRequest {
+        model: None,
         preamble,
         chat_history,
         documents: Vec::new(),
@@ -595,7 +656,169 @@ fn build_rig_request(
         max_tokens: max_tokens.map(|t| t as u64),
         tool_choice,
         additional_params,
+        output_schema: None,
     })
+}
+
+struct RigStreamState<R>
+where
+    R: Clone + Unpin + GetTokenUsage,
+{
+    upstream: RigStreamingCompletionResponse<R>,
+    provider: String,
+    indexes: HashMap<String, usize>,
+    seen_deltas: HashSet<String>,
+    next_index: usize,
+    saw_tool: bool,
+    terminal: bool,
+}
+
+impl<R> RigStreamState<R>
+where
+    R: Clone + Unpin + GetTokenUsage,
+{
+    fn new(upstream: RigStreamingCompletionResponse<R>, provider: String) -> Self {
+        Self {
+            upstream,
+            provider,
+            indexes: HashMap::new(),
+            seen_deltas: HashSet::new(),
+            next_index: 0,
+            saw_tool: false,
+            terminal: false,
+        }
+    }
+
+    fn index_for(&mut self, internal_call_id: &str) -> usize {
+        if let Some(index) = self.indexes.get(internal_call_id) {
+            return *index;
+        }
+        let index = self.next_index;
+        self.next_index += 1;
+        self.indexes.insert(internal_call_id.to_string(), index);
+        index
+    }
+
+    fn tool_delta(
+        &mut self,
+        id: String,
+        internal_call_id: String,
+        content: ToolCallDeltaContent,
+    ) -> LlmStreamChunk {
+        let index = self.index_for(&internal_call_id);
+        self.saw_tool = true;
+        self.seen_deltas.insert(internal_call_id);
+        let (name, args_delta) = match content {
+            ToolCallDeltaContent::Name(name) => (Some(name), String::new()),
+            ToolCallDeltaContent::Delta(delta) => (None, delta),
+        };
+        LlmStreamChunk::ToolCallDelta {
+            index,
+            id: (!id.is_empty()).then_some(id),
+            name,
+            args_delta,
+        }
+    }
+
+    fn full_tool_call(
+        &mut self,
+        tool_call: rig_core::message::ToolCall,
+        internal_call_id: String,
+    ) -> LlmStreamChunk {
+        self.saw_tool = true;
+        let index = self.index_for(&internal_call_id);
+        if self.seen_deltas.contains(&internal_call_id) {
+            return LlmStreamChunk::ToolCallDelta {
+                index,
+                id: (!tool_call.id.is_empty()).then_some(tool_call.id),
+                name: None,
+                args_delta: String::new(),
+            };
+        }
+        LlmStreamChunk::ToolCallDelta {
+            index,
+            id: (!tool_call.id.is_empty()).then_some(tool_call.id),
+            name: Some(tool_call.function.name),
+            args_delta: tool_call.function.arguments.to_string(),
+        }
+    }
+
+    fn done(&mut self, raw: R) -> LlmStreamChunk {
+        self.terminal = true;
+        let raw_usage = raw.token_usage();
+        let usage = raw_usage.has_values().then(|| TokenUsage {
+            input_tokens: saturate_u32(raw_usage.input_tokens),
+            output_tokens: saturate_u32(raw_usage.output_tokens),
+            cache_read_input_tokens: saturate_u32(raw_usage.cached_input_tokens),
+            cache_creation_input_tokens: saturate_u32(raw_usage.cache_creation_input_tokens),
+        });
+        let finish_reason = if self.saw_tool { "tool_calls" } else { "stop" };
+        LlmStreamChunk::Done {
+            usage,
+            finish_reason: finish_reason.to_string(),
+        }
+    }
+}
+
+async fn next_rig_stream_item<R>(
+    mut state: RigStreamState<R>,
+) -> Option<(Result<LlmStreamChunk, LlmError>, RigStreamState<R>)>
+where
+    R: Clone + Unpin + GetTokenUsage,
+{
+    loop {
+        if state.terminal {
+            return None;
+        }
+        let item = match state.upstream.next().await {
+            Some(Ok(StreamedAssistantContent::Text(text))) if !text.text.is_empty() => {
+                Ok(LlmStreamChunk::TextDelta(text.text))
+            }
+            Some(Ok(StreamedAssistantContent::Text(_)))
+            | Some(Ok(StreamedAssistantContent::Reasoning(_)))
+            | Some(Ok(StreamedAssistantContent::ReasoningDelta { .. }))
+            | Some(Ok(StreamedAssistantContent::Unknown(_))) => continue,
+            Some(Ok(StreamedAssistantContent::ToolCallDelta {
+                id,
+                internal_call_id,
+                content,
+            })) => Ok(state.tool_delta(id, internal_call_id, content)),
+            Some(Ok(StreamedAssistantContent::ToolCall {
+                tool_call,
+                internal_call_id,
+            })) => Ok(state.full_tool_call(tool_call, internal_call_id)),
+            Some(Ok(StreamedAssistantContent::Final(raw))) => Ok(state.done(raw)),
+            Some(Err(error)) => {
+                state.terminal = true;
+                Err(LlmError::RequestFailed {
+                    provider: state.provider.clone(),
+                    reason: error.to_string(),
+                })
+            }
+            None => {
+                state.terminal = true;
+                Err(LlmError::InvalidResponse {
+                    provider: state.provider.clone(),
+                    reason: "stream ended before Rig emitted a final response".to_string(),
+                })
+            }
+        };
+        return Some((item, state));
+    }
+}
+
+fn map_rig_stream<R>(
+    upstream: RigStreamingCompletionResponse<R>,
+    provider: String,
+) -> LlmStream<'static>
+where
+    R: Clone + Unpin + GetTokenUsage + Send + 'static,
+{
+    futures::stream::unfold(
+        RigStreamState::new(upstream, provider),
+        next_rig_stream_item,
+    )
+    .boxed()
 }
 
 #[async_trait]
@@ -603,6 +826,7 @@ impl<M> LlmProvider for RigAdapter<M>
 where
     M: CompletionModel + Send + Sync + 'static,
     M::Response: Send + Sync + Serialize + DeserializeOwned,
+    M::StreamingResponse: Send + 'static,
 {
     fn model_name(&self) -> &str {
         &self.model_name
@@ -628,35 +852,8 @@ where
         }
     }
 
-    async fn complete(
-        &self,
-        mut request: CompletionRequest,
-    ) -> Result<CompletionResponse, LlmError> {
-        if let Some(requested_model) = request.model.as_deref()
-            && requested_model != self.model_name.as_str()
-        {
-            tracing::warn!(
-                requested_model = requested_model,
-                active_model = %self.model_name,
-                "Per-request model override is not supported for this provider; using configured model"
-            );
-        }
-
-        self.strip_unsupported_completion_params(&mut request);
-
-        let mut messages = request.messages;
-        crate::llm::provider::sanitize_tool_messages(&mut messages);
-        let (preamble, history) = convert_messages(&messages);
-
-        let rig_req = build_rig_request(
-            preamble,
-            history,
-            Vec::new(),
-            None,
-            request.temperature,
-            request.max_tokens,
-            self.cache_retention,
-        )?;
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        let rig_req = self.build_plain_request(request)?;
 
         let response =
             self.model
@@ -691,40 +888,24 @@ where
         Ok(resp)
     }
 
+    async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
+        let rig_request = self.build_plain_request(request)?;
+        let upstream =
+            self.model
+                .stream(rig_request)
+                .await
+                .map_err(|error| LlmError::RequestFailed {
+                    provider: self.model_name.clone(),
+                    reason: error.to_string(),
+                })?;
+        Ok(map_rig_stream(upstream, self.model_name.clone()))
+    }
+
     async fn complete_with_tools(
         &self,
-        mut request: ToolCompletionRequest,
+        request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
-        if let Some(requested_model) = request.model.as_deref()
-            && requested_model != self.model_name.as_str()
-        {
-            tracing::warn!(
-                requested_model = requested_model,
-                active_model = %self.model_name,
-                "Per-request model override is not supported for this provider; using configured model"
-            );
-        }
-
-        self.strip_unsupported_tool_params(&mut request);
-
-        let known_tool_names: HashSet<String> =
-            request.tools.iter().map(|t| t.name.clone()).collect();
-
-        let mut messages = request.messages;
-        crate::llm::provider::sanitize_tool_messages(&mut messages);
-        let (preamble, history) = convert_messages(&messages);
-        let tools = convert_tools(&request.tools);
-        let tool_choice = convert_tool_choice(request.tool_choice.as_deref());
-
-        let rig_req = build_rig_request(
-            preamble,
-            history,
-            tools,
-            tool_choice,
-            request.temperature,
-            request.max_tokens,
-            self.cache_retention,
-        )?;
+        let (rig_req, known_tool_names) = self.build_tool_request(request)?;
 
         let response =
             self.model
@@ -773,6 +954,22 @@ where
         Ok(resp)
     }
 
+    async fn complete_with_tools_stream(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<LlmStream<'_>, LlmError> {
+        let (rig_request, _known_tool_names) = self.build_tool_request(request)?;
+        let upstream =
+            self.model
+                .stream(rig_request)
+                .await
+                .map_err(|error| LlmError::RequestFailed {
+                    provider: self.model_name.clone(),
+                    reason: error.to_string(),
+                })?;
+        Ok(map_rig_stream(upstream, self.model_name.clone()))
+    }
+
     fn active_model_name(&self) -> String {
         self.model_name.clone()
     }
@@ -815,6 +1012,606 @@ fn normalize_tool_name(name: &str, known_tools: &HashSet<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
+    use std::sync::{Arc, Mutex};
+
+    use crate::llm::LlmStreamChunk;
+    use axum::extract::State;
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use futures::StreamExt;
+    use rig_core::client::CompletionClient;
+    use rig_core::completion::{CompletionError, GetTokenUsage};
+    use rig_core::providers::openai;
+    use rig_core::streaming::{
+        RawStreamingChoice, RawStreamingToolCall,
+        StreamingCompletionResponse as RigStreamingCompletionResponse, ToolCallDeltaContent,
+    };
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct TestStreamingResponse {
+        usage: RigUsage,
+    }
+
+    impl TestStreamingResponse {
+        fn new(input_tokens: u64, output_tokens: u64, cached_input_tokens: u64) -> Self {
+            Self {
+                usage: RigUsage {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens: input_tokens.saturating_add(output_tokens),
+                    cached_input_tokens,
+                    cache_creation_input_tokens: 0,
+                    tool_use_prompt_tokens: 0,
+                    reasoning_tokens: 0,
+                },
+            }
+        }
+    }
+
+    impl GetTokenUsage for TestStreamingResponse {
+        fn token_usage(&self) -> RigUsage {
+            self.usage
+        }
+    }
+
+    type ScriptedStreamItem = Result<RawStreamingChoice<TestStreamingResponse>, CompletionError>;
+
+    #[derive(Clone)]
+    struct ScriptedCompletionModel {
+        stream_items: Arc<Mutex<Option<Vec<ScriptedStreamItem>>>>,
+    }
+
+    impl ScriptedCompletionModel {
+        fn new(items: Vec<ScriptedStreamItem>) -> Self {
+            Self {
+                stream_items: Arc::new(Mutex::new(Some(items))),
+            }
+        }
+    }
+
+    impl CompletionModel for ScriptedCompletionModel {
+        type Response = serde_json::Value;
+        type StreamingResponse = TestStreamingResponse;
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self::new(Vec::new())
+        }
+
+        async fn completion(
+            &self,
+            _request: RigRequest,
+        ) -> Result<rig_core::completion::CompletionResponse<Self::Response>, CompletionError>
+        {
+            Err(CompletionError::ProviderError(
+                "blocking completion is not configured".to_string(),
+            ))
+        }
+
+        fn stream(
+            &self,
+            _request: RigRequest,
+        ) -> impl std::future::Future<
+            Output = Result<
+                RigStreamingCompletionResponse<Self::StreamingResponse>,
+                CompletionError,
+            >,
+        > + Send {
+            let items = self
+                .stream_items
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+                .unwrap_or_default();
+            async move {
+                Ok(RigStreamingCompletionResponse::stream(Box::pin(
+                    futures::stream::iter(items),
+                )))
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct TensorZeroSseState {
+        events: Arc<Vec<String>>,
+        request: Arc<Mutex<Option<JsonValue>>>,
+    }
+
+    struct TensorZeroSseFixture {
+        base_url: String,
+        request: Arc<Mutex<Option<JsonValue>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl TensorZeroSseFixture {
+        async fn start(events: Vec<String>) -> Self {
+            let request = Arc::new(Mutex::new(None));
+            let state = TensorZeroSseState {
+                events: Arc::new(events),
+                request: Arc::clone(&request),
+            };
+            let app = Router::new()
+                .route("/openai/v1/chat/completions", post(tensorzero_sse_handler))
+                .with_state(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("TensorZero fixture should bind");
+            let address = listener
+                .local_addr()
+                .expect("TensorZero fixture should have an address");
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("TensorZero fixture should serve requests");
+            });
+            Self {
+                base_url: format!("http://{address}/openai/v1"),
+                request,
+                server,
+            }
+        }
+
+        fn provider(&self) -> Arc<dyn LlmProvider> {
+            let client = openai::Client::builder()
+                .api_key("test-key")
+                .base_url(&self.base_url)
+                .build()
+                .expect("TensorZero fixture client should build")
+                .completions_api();
+            Arc::new(RigAdapter::new(
+                client.completion_model("tensorzero::function_name::lunarwing"),
+                "tensorzero::function_name::lunarwing",
+            ))
+        }
+
+        fn captured_request(&self) -> JsonValue {
+            self.request
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+                .expect("TensorZero fixture should capture a request")
+        }
+    }
+
+    impl Drop for TensorZeroSseFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn tensorzero_sse_handler(
+        State(state): State<TensorZeroSseState>,
+        Json(request): Json<JsonValue>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        *state
+            .request
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(request);
+        let events = state.events.as_ref().clone();
+        let stream = futures::stream::iter(
+            events
+                .into_iter()
+                .map(|data| Ok(Event::default().data(data))),
+        );
+        Sse::new(stream)
+    }
+
+    fn tool_stream_request() -> ToolCompletionRequest {
+        ToolCompletionRequest::new(
+            vec![ChatMessage::user("search")],
+            vec![IronToolDefinition {
+                name: "search".to_string(),
+                description: "Search".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+        )
+    }
+
+    #[tokio::test]
+    async fn complete_stream_emits_text_deltas_and_terminal_usage() {
+        let model = ScriptedCompletionModel::new(vec![
+            Ok(RawStreamingChoice::Message("hel".to_string())),
+            Ok(RawStreamingChoice::Message("lo".to_string())),
+            Ok(RawStreamingChoice::FinalResponse(
+                TestStreamingResponse::new(7, 3, 2),
+            )),
+        ]);
+        let adapter = RigAdapter::new(model, "test-model");
+
+        let chunks = adapter
+            .complete_stream(CompletionRequest::new(vec![ChatMessage::user("hi")]))
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "hel"
+        ));
+        assert!(matches!(
+            chunks.get(1),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "lo"
+        ));
+        assert!(matches!(
+            chunks.get(2),
+            Some(Ok(LlmStreamChunk::Done {
+                usage: Some(crate::llm::TokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    cache_read_input_tokens: 2,
+                    cache_creation_input_tokens: 0,
+                }),
+                finish_reason,
+            })) if finish_reason == "stop"
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_stream_rejects_eof_without_final_event() {
+        let model = ScriptedCompletionModel::new(vec![Ok(RawStreamingChoice::Message(
+            "partial".to_string(),
+        ))]);
+        let adapter = RigAdapter::new(model, "test-model");
+
+        let chunks = adapter
+            .complete_stream(CompletionRequest::new(vec![ChatMessage::user("hi")]))
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            chunks.last(),
+            Some(Err(LlmError::InvalidResponse { provider, reason }))
+                if provider == "test-model" && reason.contains("final response")
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_stream_assigns_stable_indexes() {
+        let model = ScriptedCompletionModel::new(vec![
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: "call_a".to_string(),
+                internal_call_id: "internal_a".to_string(),
+                content: ToolCallDeltaContent::Name("search".to_string()),
+            }),
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: "call_b".to_string(),
+                internal_call_id: "internal_b".to_string(),
+                content: ToolCallDeltaContent::Name("search".to_string()),
+            }),
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: String::new(),
+                internal_call_id: "internal_a".to_string(),
+                content: ToolCallDeltaContent::Delta("{}".to_string()),
+            }),
+            Ok(RawStreamingChoice::FinalResponse(
+                TestStreamingResponse::new(8, 4, 0),
+            )),
+        ]);
+        let adapter = RigAdapter::new(model, "test-model");
+
+        let chunks = adapter
+            .complete_with_tools_stream(tool_stream_request())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+        let indexes = chunks
+            .iter()
+            .filter_map(|item| match item {
+                Ok(LlmStreamChunk::ToolCallDelta { index, .. }) => Some(*index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(indexes, vec![0, 1, 0]);
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_stream_suppresses_duplicate_full_arguments() {
+        let model = ScriptedCompletionModel::new(vec![
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: "call_1".to_string(),
+                internal_call_id: "internal_1".to_string(),
+                content: ToolCallDeltaContent::Name("search".to_string()),
+            }),
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: String::new(),
+                internal_call_id: "internal_1".to_string(),
+                content: ToolCallDeltaContent::Delta("{\"q\":\"rust\"}".to_string()),
+            }),
+            Ok(RawStreamingChoice::ToolCall(
+                RawStreamingToolCall::new(
+                    "call_1".to_string(),
+                    "search".to_string(),
+                    serde_json::json!({"q": "rust"}),
+                )
+                .with_internal_call_id("internal_1".to_string()),
+            )),
+            Ok(RawStreamingChoice::FinalResponse(
+                TestStreamingResponse::new(8, 4, 0),
+            )),
+        ]);
+        let adapter = RigAdapter::new(model, "test-model");
+
+        let chunks = adapter
+            .complete_with_tools_stream(tool_stream_request())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+        let arguments = chunks
+            .iter()
+            .filter_map(|item| match item {
+                Ok(LlmStreamChunk::ToolCallDelta { args_delta, .. }) => Some(args_delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+
+        assert_eq!(arguments, "{\"q\":\"rust\"}");
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_stream_synthesizes_full_tool_call() {
+        let model = ScriptedCompletionModel::new(vec![
+            Ok(RawStreamingChoice::ToolCall(
+                RawStreamingToolCall::new(
+                    "call_1".to_string(),
+                    "search".to_string(),
+                    serde_json::json!({"q": "rust"}),
+                )
+                .with_internal_call_id("internal_1".to_string()),
+            )),
+            Ok(RawStreamingChoice::FinalResponse(
+                TestStreamingResponse::new(8, 4, 0),
+            )),
+        ]);
+        let adapter = RigAdapter::new(model, "test-model");
+
+        let chunks = adapter
+            .complete_with_tools_stream(tool_stream_request())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::ToolCallDelta {
+                index: 0,
+                id: Some(id),
+                name: Some(name),
+                args_delta,
+            })) if id == "call_1" && name == "search" && args_delta == "{\"q\":\"rust\"}"
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_stream_surfaces_mid_stream_error_and_stops() {
+        let model = ScriptedCompletionModel::new(vec![
+            Ok(RawStreamingChoice::Message("partial".to_string())),
+            Err(CompletionError::ProviderError("stream failed".to_string())),
+            Ok(RawStreamingChoice::Message("ignored".to_string())),
+        ]);
+        let adapter = RigAdapter::new(model, "test-model");
+
+        let chunks = adapter
+            .complete_stream(CompletionRequest::new(vec![ChatMessage::user("hi")]))
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "partial"
+        ));
+        assert!(matches!(
+            chunks.get(1),
+            Some(Err(LlmError::RequestFailed { provider, reason }))
+                if provider == "test-model" && reason.contains("stream failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn tensorzero_2026_3_2_stream_maps_text_usage_and_done() {
+        let fixture = TensorZeroSseFixture::start(vec![
+            serde_json::json!({
+                "id": "inference-1",
+                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": null,
+                    "delta": {"role": "assistant", "content": "hel"}
+                }],
+                "usage": null
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": "inference-1",
+                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "delta": {"content": "lo"}
+                }],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "total_tokens": 10
+                }
+            })
+            .to_string(),
+            "[DONE]".to_string(),
+        ])
+        .await;
+
+        let chunks = fixture
+            .provider()
+            .complete_stream(CompletionRequest::new(vec![ChatMessage::user("hi")]))
+            .await
+            .expect("TensorZero stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "hel"
+        ));
+        assert!(matches!(
+            chunks.get(1),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "lo"
+        ));
+        assert!(matches!(
+            chunks.get(2),
+            Some(Ok(LlmStreamChunk::Done {
+                usage: Some(crate::llm::TokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    ..
+                }),
+                finish_reason,
+            })) if finish_reason == "stop"
+        ));
+        assert_eq!(
+            fixture
+                .captured_request()
+                .pointer("/stream_options/include_usage"),
+            Some(&JsonValue::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn tensorzero_2026_3_2_tool_stream_preserves_fragment_order() {
+        let fixture = TensorZeroSseFixture::start(vec![
+            serde_json::json!({
+                "id": "inference-1",
+                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": null,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "search", "arguments": ""}
+                        }]
+                    }
+                }],
+                "usage": null
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": "inference-1",
+                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": null,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": null,
+                            "type": "function",
+                            "function": {"name": "", "arguments": "{\"q\":\"rust\"}"}
+                        }]
+                    }
+                }],
+                "usage": null
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": "inference-1",
+                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "delta": {}
+                }],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 4,
+                    "total_tokens": 12
+                }
+            })
+            .to_string(),
+            "[DONE]".to_string(),
+        ])
+        .await;
+
+        let chunks = fixture
+            .provider()
+            .complete_with_tools_stream(tool_stream_request())
+            .await
+            .expect("TensorZero tool stream should open")
+            .collect::<Vec<_>>()
+            .await;
+        let arguments = chunks
+            .iter()
+            .filter_map(|item| match item {
+                Ok(LlmStreamChunk::ToolCallDelta { args_delta, .. }) => Some(args_delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+
+        assert_eq!(arguments, "{\"q\":\"rust\"}");
+        assert!(matches!(
+            chunks.last(),
+            Some(Ok(LlmStreamChunk::Done { finish_reason, .. }))
+                if finish_reason == "tool_calls"
+        ));
+    }
+
+    #[tokio::test]
+    async fn tensorzero_2026_3_2_midstream_error_is_not_silently_dropped() {
+        let fixture = TensorZeroSseFixture::start(vec![
+            serde_json::json!({
+                "id": "inference-1",
+                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": null,
+                    "delta": {"role": "assistant", "content": "partial"}
+                }],
+                "usage": null
+            })
+            .to_string(),
+            serde_json::json!({
+                "error": {
+                    "message": "TensorZero provider failed mid-stream",
+                    "type": "inference_error"
+                }
+            })
+            .to_string(),
+            "[DONE]".to_string(),
+        ])
+        .await;
+
+        let chunks = fixture
+            .provider()
+            .complete_stream(CompletionRequest::new(vec![ChatMessage::user("hi")]))
+            .await
+            .expect("TensorZero stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "partial"
+        ));
+        assert!(matches!(
+            chunks.get(1),
+            Some(Err(LlmError::RequestFailed { reason, .. }))
+                if reason.contains("TensorZero provider failed mid-stream")
+        ));
+    }
 
     #[test]
     fn test_round_f32_to_f64_no_precision_artifacts() {
@@ -1284,8 +2081,8 @@ mod tests {
 
     #[test]
     fn test_with_unsupported_params_populates_set() {
-        use rig::client::CompletionClient;
-        use rig::providers::openai;
+        use rig_core::client::CompletionClient;
+        use rig_core::providers::openai;
 
         let client: openai::Client = openai::Client::builder()
             .api_key("test-key")
@@ -1303,8 +2100,8 @@ mod tests {
 
     #[test]
     fn test_strip_unsupported_completion_params() {
-        use rig::client::CompletionClient;
-        use rig::providers::openai;
+        use rig_core::client::CompletionClient;
+        use rig_core::providers::openai;
 
         let client: openai::Client = openai::Client::builder()
             .api_key("test-key")
@@ -1335,8 +2132,8 @@ mod tests {
 
     #[test]
     fn test_strip_unsupported_tool_params() {
-        use rig::client::CompletionClient;
-        use rig::providers::openai;
+        use rig_core::client::CompletionClient;
+        use rig_core::providers::openai;
 
         let client: openai::Client = openai::Client::builder()
             .api_key("test-key")
@@ -1360,8 +2157,8 @@ mod tests {
 
     #[test]
     fn test_unsupported_params_empty_by_default() {
-        use rig::client::CompletionClient;
-        use rig::providers::openai;
+        use rig_core::client::CompletionClient;
+        use rig_core::providers::openai;
 
         let client: openai::Client = openai::Client::builder()
             .api_key("test-key")

@@ -3,7 +3,7 @@
 **Context.** The systemd multi-tenant path (rootless-podman Quadlets + per-tenant user
 units + host-global ICHC/self-heal) has **not** been exercised as thoroughly as the
 Gentoo/OpenRC path. This doc records issues found during the 1.1.4 pre-release pass on the
-**Arch Linux** MT test VM (goals 5–8 in `docs/ops/GOALS_1.1.4.md`) and proposes fixes.
+**Arch Linux** MT test VM (goals 5-8 in `docs/ops/history/GOALS_1.1.4.md`) and proposes fixes.
 
 **Test VM facts.** systemd; rootless podman; tenants `summer`/`autumn`/`winter` (created on a
 `1.1.4`-named branch but crate version still `1.1.3`, provisioned with
@@ -12,6 +12,11 @@ systemd units). New tenant `springfeather` provisioned with
 `LUNARWING_CONTAINER_RUNTIME=podman` to exercise the **new** Quadlet systemd-unit path.
 
 **Status legend:** 🔴 open · 🟡 workaround applied, code fix pending · 🟢 fixed (code)
+
+**Current-document note (2026-07-12):** F1-F10 and F12 are historical resolved
+findings. F11 remains an active capacity issue and is tracked in
+[`../BUG-mt-nanocode-image-size.md`](../BUG-mt-nanocode-image-size.md); the
+discovery detail stays here for provenance.
 
 **Fix status (2026-06-17):** all six fixed in code on `1.1.4-staging-goals`, then a
 6-agent adversarial review (see below) returned NO-GO and a second hardening pass
@@ -36,7 +41,7 @@ crash-loop chaos case + `SubState` mock, and a new `tests/test-health-systemd.sh
 | F8 | Medium | nanocode/pebble worker image build fails under podman — the build-RUN container's `apt` can't reach the internet (host has no IPv6 route; the default build network can't route IPv4 out) | 🟢 fixed — `--network=host` on the podman worker builds; both images now build (apt reaches the net via the host netns) |
 | F9 | — | ~~`build-tenant` exits 0 on a worker-build failure~~ — **NOT a bug**: `build-tenant` `die`s (exit 1) and propagates correctly. The observed "exit 0" was a test-harness artifact (a trailing `echo "...$?"` in the background wrapper masked the real exit). | 🟢 invalid |
 | F10 | Medium | `_ctr` runs `sudo -u <tenant>` without a tenant-traversable CWD → "cannot chdir" → the rootless pg readiness gate **always** times out (spurious 120s WARNING) | 🟢 fixed — `cd /` in `_ctr` (gate now ~3s, "ready via quadlet") |
-| F11 | Low | nanocode worker image is **~6 GB**; per-tenant `save\|load` distribution into the rootless store is slow + disk-heavy and can fail under disk pressure (succeeded on retry) | 🟡 mitigated (retry); follow-up: trim the image / shared additionalimagestore |
+| F11 | Low | nanocode worker image is **~6 GB**; per-tenant `save\|load` distribution into the rootless store is slow + disk-heavy and can fail under disk pressure (succeeded on retry) | 🔴 open follow-up; see [`BUG-mt-nanocode-image-size.md`](../BUG-mt-nanocode-image-size.md) |
 | F12 | Medium | worker Quadlet emitted `KillMode=process` in `[Service]` → the Quadlet generator **rejected** the `.container` ("invalid KillMode") → no `.service` generated → workers never started (pg's quadlet has no `KillMode`, so it worked) | 🟢 fixed — removed `KillMode=process` from `render_worker_quadlet` |
 
 ---
@@ -298,7 +303,7 @@ tenant is all-green: 8/8 units healthy** — `pg`, `proxy`, daemon, `weechat`,
 `weechat-adapter`, `xmpp-bridge`, **nanocode**, **pebble**. F7 (telegram) is now moot — the
 telegram tool source was removed. Only the F11 image-size follow-up remains.
 
-## Validation plan for the fixes
+## Historical validation plan (completed for the 1.1.4 pass)
 
 1. Implement F1 (FQ image) + F2 (robust gate) + F3 (enabled-state gating) + F4 (resumable add) +
    F5 (settle-window verify) + F6 (honest purge).
@@ -308,3 +313,20 @@ telegram tool source was removed. Only the F11 image-size follow-up remains.
 3. `build-tenant springfeather --with-wasm --with-nanocode --with-pebble` → `start-tenant`.
 4. Re-run ICHC: expect all springfeather units `healthy`, overall `healthy`.
 5. Confirm F3: between add and start, the new tenant no longer flips the report to `critical`.
+
+## Current source cross-check (2026-07-12)
+
+- `PG_IMAGE` is fully qualified and used by both imperative and Quadlet paths
+  (`ic/scripts/lunarwing-mt-admin.sh:81,4313,4546`).
+- Worker builds use host networking and Docker image format
+  (`lunarwing-mt-admin.sh:1932-2001`).
+- Systemd health classification and tests are present in
+  `ic-infrastructure-health-check/health-systemd.sh` and
+  `ic-infrastructure-health-check/tests/test-health-systemd.sh`.
+- Tenant purge/resume logic is present in
+  `lunarwing-mt-admin.sh:1470-1685,5925-5957`.
+- The large-image `save|load` path remains at `lunarwing-mt-admin.sh:585-629`,
+  which is why F11 is not archived as fixed.
+
+No live systemd provisioning, image build, or Cargo command was run in this
+documentation audit.

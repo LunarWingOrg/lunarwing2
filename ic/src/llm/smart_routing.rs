@@ -21,13 +21,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use regex::Regex;
 use rust_decimal::Decimal;
 
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
-    CompletionRequest, CompletionResponse, LlmProvider, ModelMetadata, Role, ToolCompletionRequest,
-    ToolCompletionResponse,
+    CompletionRequest, CompletionResponse, FinishReason, LlmProvider, LlmStream, LlmStreamChunk,
+    ModelMetadata, Role, ToolCompletionRequest, ToolCompletionResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -688,6 +689,54 @@ pub struct SmartRoutingSnapshot {
     pub cascade_escalations: u64,
 }
 
+struct BufferedCompletion {
+    chunks: Vec<LlmStreamChunk>,
+    response: CompletionResponse,
+}
+
+async fn buffer_completion_stream(
+    provider_name: &str,
+    mut stream: LlmStream<'_>,
+) -> Result<BufferedCompletion, LlmError> {
+    let mut chunks = Vec::new();
+    let mut content = String::new();
+
+    while let Some(item) = stream.next().await {
+        let chunk = item?;
+        match &chunk {
+            LlmStreamChunk::TextDelta(delta) => content.push_str(delta),
+            LlmStreamChunk::ToolCallDelta { .. } => {
+                return Err(LlmError::InvalidResponse {
+                    provider: provider_name.to_string(),
+                    reason: "plain smart-routing stream produced a tool call".to_string(),
+                });
+            }
+            LlmStreamChunk::Done {
+                usage,
+                finish_reason,
+            } => {
+                let usage = usage.unwrap_or_default();
+                let response = CompletionResponse {
+                    content,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    finish_reason: FinishReason::from_stream_reason(finish_reason),
+                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                };
+                chunks.push(chunk);
+                return Ok(BufferedCompletion { chunks, response });
+            }
+        }
+        chunks.push(chunk);
+    }
+
+    Err(LlmError::InvalidResponse {
+        provider: provider_name.to_string(),
+        reason: "smart-routing stream ended before Done".to_string(),
+    })
+}
+
 /// Smart routing provider that classifies task complexity and routes to the appropriate model.
 ///
 /// - `complete()` — scores complexity across 13 dimensions, checks pattern overrides, then
@@ -925,6 +974,62 @@ impl LlmProvider for SmartRoutingProvider {
         }
     }
 
+    async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
+        self.stats.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        match self.classify(&request) {
+            TaskComplexity::Simple => {
+                tracing::trace!(
+                    model = %self.cheap.model_name(),
+                    "Smart routing: Simple stream -> cheap model"
+                );
+                self.stats.cheap_requests.fetch_add(1, Ordering::Relaxed);
+                self.cheap.complete_stream(request).await
+            }
+            TaskComplexity::Complex => {
+                tracing::trace!(
+                    model = %self.primary.model_name(),
+                    "Smart routing: Complex stream -> primary model"
+                );
+                self.stats.primary_requests.fetch_add(1, Ordering::Relaxed);
+                self.primary.complete_stream(request).await
+            }
+            TaskComplexity::Moderate if !self.config.cascade_enabled => {
+                tracing::trace!(
+                    model = %self.cheap.model_name(),
+                    "Smart routing: Moderate stream -> cheap model (cascade disabled)"
+                );
+                self.stats.cheap_requests.fetch_add(1, Ordering::Relaxed);
+                self.cheap.complete_stream(request).await
+            }
+            TaskComplexity::Moderate => {
+                tracing::trace!(
+                    model = %self.cheap.model_name(),
+                    "Smart routing: Moderate stream -> cheap model (cascade enabled)"
+                );
+                self.stats.cheap_requests.fetch_add(1, Ordering::Relaxed);
+                let cheap_stream = self.cheap.complete_stream(request.clone()).await?;
+                let buffered =
+                    buffer_completion_stream(self.cheap.model_name(), cheap_stream).await?;
+
+                if Self::response_is_uncertain(&buffered.response) {
+                    tracing::info!(
+                        cheap_model = %self.cheap.model_name(),
+                        primary_model = %self.primary.model_name(),
+                        "Smart routing: Escalating stream to primary"
+                    );
+                    self.stats
+                        .cascade_escalations
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.stats.primary_requests.fetch_add(1, Ordering::Relaxed);
+                    self.primary.complete_stream(request).await
+                } else {
+                    Ok(futures::stream::iter(buffered.chunks.into_iter().map(Ok)).boxed())
+                }
+            }
+        }
+    }
+
     /// Tool use always goes to the primary model for reliable structured output.
     async fn complete_with_tools(
         &self,
@@ -937,6 +1042,19 @@ impl LlmProvider for SmartRoutingProvider {
             "Smart routing: Tool use -> primary model (always)"
         );
         self.primary.complete_with_tools(request).await
+    }
+
+    async fn complete_with_tools_stream(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<LlmStream<'_>, LlmError> {
+        self.stats.total_requests.fetch_add(1, Ordering::Relaxed);
+        self.stats.primary_requests.fetch_add(1, Ordering::Relaxed);
+        tracing::trace!(
+            model = %self.primary.model_name(),
+            "Smart routing: Tool stream -> primary model (always)"
+        );
+        self.primary.complete_with_tools_stream(request).await
     }
 
     async fn list_models(&self) -> Result<Vec<String>, LlmError> {
@@ -967,7 +1085,12 @@ impl LlmProvider for SmartRoutingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use futures::StreamExt;
+
     use crate::llm::ChatMessage;
+    use crate::llm::provider::LlmStreamChunk;
+    use crate::llm::streaming_test_support::{ScriptedStreamingProvider, StreamScript};
     use crate::testing::StubLlm;
 
     fn default_config() -> SmartRoutingConfig {
@@ -1540,6 +1663,221 @@ mod tests {
 
     fn make_tool_request() -> ToolCompletionRequest {
         ToolCompletionRequest::new(vec![ChatMessage::user("implement a search")], vec![])
+    }
+
+    fn text_stream(parts: &[&str]) -> StreamScript {
+        let mut items = parts
+            .iter()
+            .map(|part| Ok(LlmStreamChunk::TextDelta((*part).to_string())))
+            .collect::<Vec<_>>();
+        items.push(Ok(LlmStreamChunk::Done {
+            usage: None,
+            finish_reason: "stop".to_string(),
+        }));
+        StreamScript::Items(items)
+    }
+
+    fn tool_stream() -> StreamScript {
+        StreamScript::Items(vec![
+            Ok(LlmStreamChunk::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("search".to_string()),
+                args_delta: "{}".to_string(),
+            }),
+            Ok(LlmStreamChunk::Done {
+                usage: None,
+                finish_reason: "tool_calls".to_string(),
+            }),
+        ])
+    }
+
+    #[tokio::test]
+    async fn simple_stream_routes_to_cheap_provider() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![text_stream(&["primary"])],
+            vec![],
+        ));
+        let cheap = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![text_stream(&["cheap-", "stream"])],
+            vec![],
+        ));
+        let router = SmartRoutingProvider::new(primary.clone(), cheap.clone(), default_config());
+
+        let chunks = router
+            .complete_stream(make_request("hello"))
+            .await
+            .expect("cheap stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            chunks,
+            vec![
+                LlmStreamChunk::TextDelta("cheap-".to_string()),
+                LlmStreamChunk::TextDelta("stream".to_string()),
+                LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                },
+            ]
+        );
+        assert_eq!(cheap.plain_calls(), 1);
+        assert_eq!(primary.plain_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn complex_stream_routes_to_primary_provider() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![text_stream(&["primary-", "stream"])],
+            vec![],
+        ));
+        let cheap = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![text_stream(&["cheap"])],
+            vec![],
+        ));
+        let router = SmartRoutingProvider::new(primary.clone(), cheap.clone(), default_config());
+
+        let chunks = router
+            .complete_stream(make_request("security audit review"))
+            .await
+            .expect("primary stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [LlmStreamChunk::TextDelta(first), LlmStreamChunk::TextDelta(second), LlmStreamChunk::Done { .. }]
+                if first == "primary-" && second == "stream"
+        ));
+        assert_eq!(primary.plain_calls(), 1);
+        assert_eq!(cheap.plain_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn moderate_cascade_replays_confident_cheap_stream() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![text_stream(&["primary"])],
+            vec![],
+        ));
+        let cheap = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![text_stream(&["Deployed successfully ", "to production."])],
+            vec![],
+        ));
+        let router = SmartRoutingProvider::new(primary.clone(), cheap.clone(), default_config());
+
+        let chunks = router
+            .complete_stream(make_request("Deploy this to production"))
+            .await
+            .expect("buffered cheap stream should replay")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            chunks,
+            vec![
+                LlmStreamChunk::TextDelta("Deployed successfully ".to_string()),
+                LlmStreamChunk::TextDelta("to production.".to_string()),
+                LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                },
+            ]
+        );
+        assert_eq!(cheap.plain_calls(), 1);
+        assert_eq!(primary.plain_calls(), 0);
+        assert_eq!(router.stats().cascade_escalations, 0);
+    }
+
+    #[tokio::test]
+    async fn moderate_cascade_discards_uncertain_cheap_before_primary_stream() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![text_stream(&["primary-", "answer"])],
+            vec![],
+        ));
+        let cheap = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![text_stream(&["I'm not ", "sure."])],
+            vec![],
+        ));
+        let router = SmartRoutingProvider::new(primary.clone(), cheap.clone(), default_config());
+
+        let chunks = router
+            .complete_stream(make_request("Deploy this to production"))
+            .await
+            .expect("primary stream should open after escalation")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [LlmStreamChunk::TextDelta(first), LlmStreamChunk::TextDelta(second), LlmStreamChunk::Done { .. }]
+                if first == "primary-" && second == "answer"
+        ));
+        assert!(!chunks.iter().any(|chunk| {
+            matches!(chunk, LlmStreamChunk::TextDelta(text) if text.contains("not") || text.contains("sure"))
+        }));
+        assert_eq!(cheap.plain_calls(), 1);
+        assert_eq!(primary.plain_calls(), 1);
+        let stats = router.stats();
+        assert_eq!(stats.cheap_requests, 1);
+        assert_eq!(stats.primary_requests, 1);
+        assert_eq!(stats.cascade_escalations, 1);
+    }
+
+    #[tokio::test]
+    async fn tool_stream_always_routes_to_primary_provider() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![],
+            vec![tool_stream()],
+        ));
+        let cheap = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![],
+            vec![tool_stream()],
+        ));
+        let router = SmartRoutingProvider::new(primary.clone(), cheap.clone(), default_config());
+
+        let chunks = router
+            .complete_with_tools_stream(make_tool_request())
+            .await
+            .expect("primary tool stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [
+                LlmStreamChunk::ToolCallDelta { .. },
+                LlmStreamChunk::Done { .. }
+            ]
+        ));
+        assert_eq!(primary.tool_calls(), 1);
+        assert_eq!(cheap.tool_calls(), 0);
+        assert_eq!(router.stats().primary_requests, 1);
     }
 
     #[tokio::test]

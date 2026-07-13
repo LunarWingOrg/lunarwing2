@@ -864,14 +864,31 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
 
     let store_dyn: Arc<dyn Store> = store.clone();
 
-    let thread_manager = Arc::new(ThreadManager::new(
+    let mut thread_manager_inner = ThreadManager::new(
         llm_adapter,
         effect_adapter.clone(),
         store_dyn.clone(),
         Arc::new(capabilities),
         leases,
         policy,
-    ));
+    );
+
+    // Load the tenant's workspace identity/persona (+ MEMORY.md) so engine
+    // threads speak in the agent's own voice and see its memory — mirroring the
+    // legacy dispatcher's system_prompt loading. The engine crate is
+    // workspace-agnostic, so the bridge (which holds the workspace) supplies it.
+    if let Some(ws) = agent.workspace() {
+        match ws.system_prompt().await {
+            Ok(prompt) if !prompt.trim().is_empty() => {
+                thread_manager_inner.set_identity_preamble(Some(prompt));
+                debug!("engine v2: loaded workspace identity/persona into thread manager");
+            }
+            Ok(_) => debug!("engine v2: workspace system prompt empty; using generic persona"),
+            Err(e) => debug!("engine v2: could not load workspace system prompt: {e}"),
+        }
+    }
+
+    let thread_manager = Arc::new(thread_manager_inner);
 
     // Migrate legacy records: pre-existing engine records deserialize without a
     // user_id field and get the serde default "legacy". Stamp the owner's identity
@@ -2221,6 +2238,13 @@ async fn handle_with_engine_inner(
         config
     };
 
+    // Adopt the client's thread_id (from the message scope) as the engine
+    // thread identity for NEW threads, so the engine's SSE broadcasts land on
+    // the thread the gateway UI is already subscribed to. Only affects fresh
+    // threads — repeat messages on an existing thread inject into it and never
+    // hit the spawn path.
+    let preferred_thread_id = parse_engine_thread_id(message.conversation_scope());
+
     // Handle the message — spawns a new thread or injects into active one
     let thread_id = state
         .conversation_manager
@@ -2230,6 +2254,7 @@ async fn handle_with_engine_inner(
             project_id,
             &message.user_id,
             thread_config,
+            preferred_thread_id,
         )
         .await
         .map_err(|e| engine_err("thread error", e))?;
@@ -3378,6 +3403,144 @@ pub async fn fire_engine_mission(mission_id: &str, user_id: &str) -> Result<Opti
         .map_err(|e| engine_err("fire mission", e))?;
 
     Ok(result.map(|tid| tid.to_string()))
+}
+
+// ── B-1: self-improving skills — pending-patch approval surface ──────────
+
+/// A staged, awaiting-approval skill patch proposal (B-1).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillPatchProposal {
+    pub doc_id: String,
+    pub skill_name: String,
+    pub current_version: u32,
+    /// Current live skill body (for side-by-side review).
+    pub current_content: String,
+    /// Proposed replacement body.
+    pub proposed_content: String,
+    /// Unified diff (current → proposed).
+    pub diff: String,
+    /// Why the patch was proposed.
+    pub reason: String,
+    /// Skill confidence at proposal time (what tripped the threshold).
+    pub confidence_at_proposal: f64,
+    /// The failing thread that motivated the proposal, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_thread_id: Option<String>,
+    pub proposed_at: String,
+}
+
+/// List all skills that currently have a pending patch proposal, visible to
+/// `user_id` (own + shared). Empty when the engine isn't running.
+pub async fn list_pending_skill_patches(
+    user_id: &str,
+) -> Result<Vec<SkillPatchProposal>, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Ok(Vec::new());
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Ok(Vec::new());
+    };
+
+    let docs = state
+        .store
+        .list_memory_docs_with_shared(state.default_project_id, user_id)
+        .await
+        .map_err(|e| engine_err("list skill docs", e))?;
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for doc in docs {
+        if doc.doc_type != lunarwing_engine::DocType::Skill {
+            continue;
+        }
+        if !seen.insert(doc.id.0) {
+            continue;
+        }
+        let Ok(meta) =
+            serde_json::from_value::<lunarwing_skills::v2::V2SkillMetadata>(doc.metadata.clone())
+        else {
+            continue;
+        };
+        let Some(pending) = meta.pending_patch else {
+            continue;
+        };
+        out.push(SkillPatchProposal {
+            doc_id: doc.id.0.to_string(),
+            skill_name: meta.name,
+            current_version: meta.version,
+            current_content: doc.content,
+            proposed_content: pending.proposed_content,
+            diff: pending.diff,
+            reason: pending.reason,
+            confidence_at_proposal: pending.confidence_at_proposal,
+            source_thread_id: pending.source_thread_id,
+            proposed_at: pending.proposed_at.to_rfc3339(),
+        });
+    }
+    Ok(out)
+}
+
+/// Resolve + ownership-check a skill doc for a patch action. Returns the
+/// verified DocId, or an error the caller maps to a 4xx.
+async fn resolve_owned_skill(
+    state: &EngineState,
+    doc_id: &str,
+    user_id: &str,
+) -> Result<lunarwing_engine::DocId, Error> {
+    let uuid = uuid::Uuid::parse_str(doc_id).map_err(|e| engine_err("parse doc_id", e))?;
+    let did = lunarwing_engine::DocId(uuid);
+    let doc = state
+        .store
+        .load_memory_doc(did)
+        .await
+        .map_err(|e| engine_err("load skill", e))?
+        .ok_or_else(|| engine_err("skill", "skill not found"))?;
+    if doc.doc_type != lunarwing_engine::DocType::Skill {
+        return Err(engine_err("skill", "doc is not a skill"));
+    }
+    // Only the owner (or shared skills) may act on the proposal.
+    if doc.user_id != user_id && !is_shared_owner(&doc.user_id) {
+        return Err(engine_err("skill", "not authorized for this skill"));
+    }
+    Ok(did)
+}
+
+/// Approve (apply) a skill's pending patch. Bumps version, records history,
+/// epoch-resets metrics. Returns `true` on success.
+pub async fn approve_skill_patch(doc_id: &str, user_id: &str) -> Result<bool, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Err(engine_err("not initialized", "engine v2 is not running"));
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Err(engine_err("not initialized", "engine v2 is not running"));
+    };
+    let did = resolve_owned_skill(state, doc_id, user_id).await?;
+    let tracker = lunarwing_engine::memory::SkillTracker::new(Arc::clone(&state.store));
+    tracker
+        .apply_pending_patch(did)
+        .await
+        .map_err(|e| engine_err("apply skill patch", e))?;
+    Ok(true)
+}
+
+/// Reject (discard) a skill's pending patch. Leaves the skill untouched.
+pub async fn reject_skill_patch(doc_id: &str, user_id: &str) -> Result<bool, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Err(engine_err("not initialized", "engine v2 is not running"));
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Err(engine_err("not initialized", "engine v2 is not running"));
+    };
+    let did = resolve_owned_skill(state, doc_id, user_id).await?;
+    let tracker = lunarwing_engine::memory::SkillTracker::new(Arc::clone(&state.store));
+    tracker
+        .discard_pending_patch(did)
+        .await
+        .map_err(|e| engine_err("discard skill patch", e))?;
+    Ok(true)
 }
 
 /// Pause a mission.

@@ -105,6 +105,64 @@ pub enum LlmResponse {
     },
 }
 
+impl LlmResponse {
+    /// Classify provider text as plain assistant output or executable CodeAct.
+    pub fn from_text(text: String) -> Self {
+        match extract_code_block(&text) {
+            Some(code) => Self::Code {
+                code,
+                content: Some(text),
+            },
+            None => Self::Text(text),
+        }
+    }
+}
+
+/// Extract Python code from fenced code blocks in an LLM response.
+fn extract_code_block(text: &str) -> Option<String> {
+    let mut all_code = Vec::new();
+
+    for marker in ["```repl", "```python", "```py", "```"] {
+        let mut search_from = 0;
+        while let Some(start) = text[search_from..].find(marker) {
+            let abs_start = search_from + start;
+            let after_marker = abs_start + marker.len();
+
+            if marker == "```" && text[after_marker..].starts_with(|c: char| c.is_alphabetic()) {
+                let lang: String = text[after_marker..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                    .collect();
+                if !["repl", "python", "py"].contains(&lang.as_str()) {
+                    search_from = after_marker;
+                    continue;
+                }
+            }
+
+            let code_start = text[after_marker..]
+                .find('\n')
+                .map(|offset| after_marker + offset + 1)
+                .unwrap_or(after_marker);
+
+            if let Some(end) = text[code_start..].find("```") {
+                let code = text[code_start..code_start + end].trim();
+                if !code.is_empty() {
+                    all_code.push(code.to_string());
+                }
+                search_from = code_start + end + 3;
+            } else {
+                break;
+            }
+        }
+
+        if !all_code.is_empty() {
+            break;
+        }
+    }
+
+    (!all_code.is_empty()).then(|| all_code.join("\n\n"))
+}
+
 /// A request from the LLM to execute a capability action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionCall {
@@ -133,7 +191,7 @@ pub struct ActionResult {
 }
 
 /// Token usage for a single LLM call.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -162,5 +220,75 @@ mod duration_millis {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         let millis = u64::deserialize(d)?;
         Ok(Duration::from_millis(millis))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LlmResponse;
+
+    fn extracted_code(text: &str) -> Option<String> {
+        match LlmResponse::from_text(text.to_string()) {
+            LlmResponse::Code { code, content } => {
+                assert_eq!(content.as_deref(), Some(text));
+                Some(code)
+            }
+            LlmResponse::Text(_) => None,
+            LlmResponse::ActionCalls { .. } => {
+                panic!("text classification cannot create actions")
+            }
+        }
+    }
+
+    #[test]
+    fn from_text_preserves_plain_text() {
+        let response = LlmResponse::from_text("plain response".to_string());
+        assert!(matches!(
+            response,
+            LlmResponse::Text(text) if text == "plain response"
+        ));
+    }
+
+    #[test]
+    fn from_text_extracts_supported_python_fences() {
+        let cases = [
+            ("```repl\nx = 1\n```", "x = 1"),
+            ("```python\nprint('hello')\n```", "print('hello')"),
+            ("```py\nvalue = 42\n```", "value = 42"),
+            ("```\nFINAL('done')\n```", "FINAL('done')"),
+        ];
+
+        for (text, expected) in cases {
+            assert_eq!(extracted_code(text).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn from_text_ignores_invalid_fences() {
+        for text in [
+            "```json\n{\"key\": \"value\"}\n```",
+            "```python\n\n```",
+            "```python\nprint('unclosed')",
+        ] {
+            assert!(matches!(
+                LlmResponse::from_text(text.to_string()),
+                LlmResponse::Text(content) if content == text
+            ));
+        }
+    }
+
+    #[test]
+    fn from_text_concatenates_multiple_specific_blocks() {
+        let text = "```repl\nfirst = 1\n```\ntext\n```repl\nFINAL(first)\n```";
+        assert_eq!(
+            extracted_code(text).as_deref(),
+            Some("first = 1\n\nFINAL(first)")
+        );
+    }
+
+    #[test]
+    fn from_text_prefers_specific_marker_over_bare_block() {
+        let text = "```\nignored\n```\n```repl\nused = True\n```";
+        assert_eq!(extracted_code(text).as_deref(), Some("used = True"));
     }
 }

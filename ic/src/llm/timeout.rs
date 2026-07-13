@@ -19,12 +19,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use rust_decimal::Decimal;
 
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
-    CompletionRequest, CompletionResponse, LlmProvider, ModelMetadata, ToolCompletionRequest,
-    ToolCompletionResponse,
+    CompletionRequest, CompletionResponse, LlmProvider, LlmStream, LlmStreamChunk, ModelMetadata,
+    ToolCompletionRequest, ToolCompletionResponse,
 };
 
 /// Bounds each `complete` / `complete_with_tools` call (with all of its internal
@@ -49,6 +50,28 @@ impl TimeoutProvider {
                 self.budget.as_secs()
             ),
         }
+    }
+
+    fn deadline_stream<'a>(
+        &'a self,
+        inner: LlmStream<'a>,
+        deadline: tokio::time::Instant,
+    ) -> LlmStream<'a> {
+        futures::stream::unfold((inner, false), move |(mut inner, finished)| async move {
+            if finished {
+                return None;
+            }
+
+            match tokio::time::timeout_at(deadline, inner.next()).await {
+                Ok(Some(item)) => {
+                    let terminal = matches!(&item, Ok(LlmStreamChunk::Done { .. }) | Err(_));
+                    Some((item, (inner, terminal)))
+                }
+                Ok(None) => None,
+                Err(_) => Some((Err(self.elapsed_error()), (inner, true))),
+            }
+        })
+        .boxed()
     }
 }
 
@@ -84,6 +107,22 @@ impl LlmProvider for TimeoutProvider {
         }
     }
 
+    async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
+        let deadline = tokio::time::Instant::now() + self.budget;
+        match tokio::time::timeout_at(deadline, self.inner.complete_stream(request)).await {
+            Ok(Ok(stream)) => Ok(self.deadline_stream(stream, deadline)),
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                tracing::warn!(
+                    provider = self.inner.model_name(),
+                    budget_secs = self.budget.as_secs(),
+                    "LLM complete_stream() exceeded turn budget - failing gracefully"
+                );
+                Err(self.elapsed_error())
+            }
+        }
+    }
+
     async fn complete_with_tools(
         &self,
         request: ToolCompletionRequest,
@@ -95,6 +134,27 @@ impl LlmProvider for TimeoutProvider {
                     provider = self.inner.model_name(),
                     budget_secs = self.budget.as_secs(),
                     "LLM complete_with_tools() exceeded turn budget — failing gracefully"
+                );
+                Err(self.elapsed_error())
+            }
+        }
+    }
+
+    async fn complete_with_tools_stream(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<LlmStream<'_>, LlmError> {
+        let deadline = tokio::time::Instant::now() + self.budget;
+        match tokio::time::timeout_at(deadline, self.inner.complete_with_tools_stream(request))
+            .await
+        {
+            Ok(Ok(stream)) => Ok(self.deadline_stream(stream, deadline)),
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                tracing::warn!(
+                    provider = self.inner.model_name(),
+                    budget_secs = self.budget.as_secs(),
+                    "LLM complete_with_tools_stream() exceeded turn budget - failing gracefully"
                 );
                 Err(self.elapsed_error())
             }
@@ -130,9 +190,106 @@ impl LlmProvider for TimeoutProvider {
 mod tests {
     use super::*;
 
+    use futures::StreamExt;
+
+    use crate::llm::provider::{FinishReason, LlmStream, LlmStreamChunk};
     use crate::llm::retry::is_retryable;
     use crate::testing::StubLlm;
     use crate::testing::fault_injection::{FaultAction, FaultInjector};
+
+    struct TimedStreamingProvider {
+        first_delay: Duration,
+        terminal_delay: Duration,
+    }
+
+    impl TimedStreamingProvider {
+        fn new(first_delay: Duration, terminal_delay: Duration) -> Self {
+            Self {
+                first_delay,
+                terminal_delay,
+            }
+        }
+
+        fn timed_stream(&self, first: LlmStreamChunk, finish_reason: &str) -> LlmStream<'static> {
+            let first_delay = self.first_delay;
+            let terminal_delay = self.terminal_delay;
+            let finish_reason = finish_reason.to_string();
+            let first = futures::stream::once(async move {
+                tokio::time::sleep(first_delay).await;
+                Ok(first)
+            });
+            let terminal = futures::stream::once(async move {
+                tokio::time::sleep(terminal_delay).await;
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason,
+                })
+            });
+            first.chain(terminal).boxed()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for TimedStreamingProvider {
+        fn model_name(&self) -> &str {
+            "timed"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Ok(CompletionResponse {
+                content: "blocking response".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<LlmStream<'_>, LlmError> {
+            Ok(self.timed_stream(LlmStreamChunk::TextDelta("visible".to_string()), "stop"))
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            Ok(ToolCompletionResponse {
+                content: None,
+                tool_calls: Vec::new(),
+                input_tokens: 1,
+                output_tokens: 1,
+                finish_reason: FinishReason::ToolUse,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+
+        async fn complete_with_tools_stream(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<LlmStream<'_>, LlmError> {
+            Ok(self.timed_stream(
+                LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".to_string()),
+                    name: Some("search".to_string()),
+                    args_delta: "{}".to_string(),
+                },
+                "tool_calls",
+            ))
+        }
+    }
 
     fn make_request() -> CompletionRequest {
         CompletionRequest::new(vec![crate::llm::ChatMessage::user("hello")])
@@ -140,6 +297,115 @@ mod tests {
 
     fn make_tool_request() -> ToolCompletionRequest {
         ToolCompletionRequest::new(vec![crate::llm::ChatMessage::user("hello")], vec![])
+    }
+
+    #[tokio::test]
+    async fn complete_stream_times_out_before_first_chunk() {
+        let provider = Arc::new(TimedStreamingProvider::new(
+            Duration::from_millis(100),
+            Duration::ZERO,
+        ));
+        let timeout = TimeoutProvider::new(provider, Duration::from_millis(20));
+
+        let chunks = timeout
+            .complete_stream(make_request())
+            .await
+            .expect("stream acquisition should succeed")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(
+            chunks.first(),
+            Some(Err(LlmError::RequestFailed { reason, .. })) if reason.contains("turn budget")
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_stream_times_out_after_visible_chunk() {
+        let provider = Arc::new(TimedStreamingProvider::new(
+            Duration::ZERO,
+            Duration::from_millis(100),
+        ));
+        let timeout = TimeoutProvider::new(provider, Duration::from_millis(20));
+
+        let chunks = timeout
+            .complete_stream(make_request())
+            .await
+            .expect("stream acquisition should succeed")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(
+            &chunks[0],
+            Ok(LlmStreamChunk::TextDelta(text)) if text == "visible"
+        ));
+        assert!(matches!(
+            &chunks[1],
+            Err(LlmError::RequestFailed { reason, .. }) if reason.contains("turn budget")
+        ));
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, Ok(LlmStreamChunk::Done { .. })))
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_stream_finishes_within_total_budget() {
+        let provider = Arc::new(TimedStreamingProvider::new(
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        ));
+        let timeout = TimeoutProvider::new(provider, Duration::from_millis(100));
+
+        let chunks = timeout
+            .complete_stream(make_request())
+            .await
+            .expect("stream acquisition should succeed")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream should finish within budget");
+
+        assert_eq!(
+            chunks,
+            vec![
+                LlmStreamChunk::TextDelta("visible".to_string()),
+                LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_stream_uses_same_total_budget() {
+        let provider = Arc::new(TimedStreamingProvider::new(
+            Duration::ZERO,
+            Duration::from_millis(100),
+        ));
+        let timeout = TimeoutProvider::new(provider, Duration::from_millis(20));
+
+        let chunks = timeout
+            .complete_with_tools_stream(make_tool_request())
+            .await
+            .expect("tool stream acquisition should succeed")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(
+            &chunks[0],
+            Ok(LlmStreamChunk::ToolCallDelta { index: 0, .. })
+        ));
+        assert!(matches!(
+            &chunks[1],
+            Err(LlmError::RequestFailed { reason, .. }) if reason.contains("turn budget")
+        ));
     }
 
     /// A provider that hangs longer than the budget must be aborted with a

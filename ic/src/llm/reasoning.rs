@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::llm::error::LlmError;
 
 use crate::llm::{
-    ChatMessage, CompletionRequest, LlmProvider, Role, ToolCall, ToolCompletionRequest,
+    ChatMessage, CompletionRequest, LlmProvider, Role, TokenUsage, ToolCall, ToolCompletionRequest,
     ToolDefinition,
 };
 
@@ -351,23 +351,6 @@ pub struct ToolSelection {
     /// be echoed back in the corresponding tool result message. Without this,
     /// the provider cannot match results to their originating calls.
     pub tool_call_id: String,
-}
-
-/// Token usage from a single LLM call.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TokenUsage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    /// Tokens served from the provider's server-side prompt cache (Anthropic).
-    pub cache_read_input_tokens: u32,
-    /// Tokens written to the provider's prompt cache (Anthropic).
-    pub cache_creation_input_tokens: u32,
-}
-
-impl TokenUsage {
-    pub fn total(&self) -> u32 {
-        self.input_tokens + self.output_tokens
-    }
 }
 
 /// Result of a response with potential tool calls.

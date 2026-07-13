@@ -2,12 +2,16 @@
 
 use std::sync::Arc;
 
+use futures::StreamExt;
 use lunarwing_engine::{
     ActionDef, EngineError, LlmBackend, LlmCallConfig, LlmOutput, LlmResponse, ThreadMessage,
     TokenUsage,
 };
 
-use crate::llm::{ChatMessage, LlmProvider, Role, ToolCall, ToolCompletionRequest, ToolDefinition};
+use crate::llm::{
+    ChatMessage, CompletionRequest, CompletionResponse, LlmError, LlmProvider, Role, ToolCall,
+    ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
+};
 
 /// Wraps an existing `LlmProvider` to implement the engine's `LlmBackend` trait.
 pub struct LlmBridgeAdapter {
@@ -36,6 +40,142 @@ impl LlmBridgeAdapter {
     }
 }
 
+enum BridgeRequest {
+    Plain(CompletionRequest),
+    Tools(ToolCompletionRequest),
+}
+
+fn build_request(
+    messages: &[ThreadMessage],
+    actions: &[ActionDef],
+    config: &LlmCallConfig,
+) -> BridgeRequest {
+    let chat_messages = messages.iter().map(thread_msg_to_chat).collect();
+    let tools: Vec<ToolDefinition> = if config.force_text {
+        Vec::new()
+    } else {
+        actions.iter().map(action_def_to_tool_def).collect()
+    };
+    let max_tokens = config.max_tokens.unwrap_or(4096);
+
+    if tools.is_empty() {
+        let mut request = CompletionRequest::new(chat_messages).with_max_tokens(max_tokens);
+        if let Some(temperature) = config.temperature {
+            request = request.with_temperature(temperature);
+        }
+        request.metadata = config.metadata.clone();
+        BridgeRequest::Plain(request)
+    } else {
+        let mut request = ToolCompletionRequest::new(chat_messages, tools)
+            .with_max_tokens(max_tokens)
+            .with_tool_choice("auto");
+        if let Some(temperature) = config.temperature {
+            request = request.with_temperature(temperature);
+        }
+        request.metadata = config.metadata.clone();
+        BridgeRequest::Tools(request)
+    }
+}
+
+fn map_provider_error(error: LlmError) -> EngineError {
+    EngineError::Llm {
+        reason: error.to_string(),
+    }
+}
+
+fn map_usage(usage: crate::llm::TokenUsage) -> TokenUsage {
+    map_usage_fields(
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+    )
+}
+
+fn map_usage_fields(
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
+) -> TokenUsage {
+    TokenUsage {
+        input_tokens: u64::from(input_tokens),
+        output_tokens: u64::from(output_tokens),
+        cache_read_tokens: u64::from(cache_read_tokens),
+        cache_write_tokens: u64::from(cache_write_tokens),
+        cost_usd: 0.0,
+    }
+}
+
+fn map_stream_chunk(chunk: crate::llm::LlmStreamChunk) -> lunarwing_engine::LlmStreamChunk {
+    match chunk {
+        crate::llm::LlmStreamChunk::TextDelta(text) => {
+            lunarwing_engine::LlmStreamChunk::TextDelta(text)
+        }
+        crate::llm::LlmStreamChunk::ToolCallDelta {
+            index,
+            id,
+            name,
+            args_delta,
+        } => lunarwing_engine::LlmStreamChunk::ToolCallDelta {
+            index,
+            id,
+            name,
+            args_delta,
+        },
+        crate::llm::LlmStreamChunk::Done {
+            usage,
+            finish_reason,
+        } => lunarwing_engine::LlmStreamChunk::Done {
+            usage: usage.map(map_usage),
+            finish_reason,
+        },
+    }
+}
+
+fn map_completion_response(response: CompletionResponse) -> LlmOutput {
+    LlmOutput {
+        response: LlmResponse::from_text(response.content),
+        usage: map_usage_fields(
+            response.input_tokens,
+            response.output_tokens,
+            response.cache_read_input_tokens,
+            response.cache_creation_input_tokens,
+        ),
+    }
+}
+
+fn map_tool_response(response: ToolCompletionResponse) -> LlmOutput {
+    let usage = map_usage_fields(
+        response.input_tokens,
+        response.output_tokens,
+        response.cache_read_input_tokens,
+        response.cache_creation_input_tokens,
+    );
+
+    let llm_response = if response.tool_calls.is_empty() {
+        LlmResponse::from_text(response.content.unwrap_or_default())
+    } else {
+        LlmResponse::ActionCalls {
+            calls: response
+                .tool_calls
+                .into_iter()
+                .map(|call| lunarwing_engine::ActionCall {
+                    id: call.id,
+                    action_name: call.name,
+                    parameters: call.arguments,
+                })
+                .collect(),
+            content: response.content,
+        }
+    };
+
+    LlmOutput {
+        response: llm_response,
+        usage,
+    }
+}
+
 #[async_trait::async_trait]
 impl LlmBackend for LlmBridgeAdapter {
     async fn complete(
@@ -46,107 +186,36 @@ impl LlmBackend for LlmBridgeAdapter {
     ) -> Result<LlmOutput, EngineError> {
         let provider = self.provider_for_depth(config.depth);
 
-        // Convert messages
-        let chat_messages: Vec<ChatMessage> = messages.iter().map(thread_msg_to_chat).collect();
-
-        // Convert actions to tool definitions
-        let tools: Vec<ToolDefinition> = if config.force_text {
-            vec![] // No tools when forcing text
-        } else {
-            actions.iter().map(action_def_to_tool_def).collect()
-        };
-
-        // Build request — match the existing Reasoning.respond_with_tools() defaults
-        let max_tokens = config.max_tokens.unwrap_or(4096);
-        let temperature = config.temperature.unwrap_or(0.7);
-
-        if tools.is_empty() {
-            // No tools: use plain completion (matches existing no-tools path)
-            let mut request = crate::llm::CompletionRequest::new(chat_messages)
-                .with_max_tokens(max_tokens)
-                .with_temperature(temperature);
-            request.metadata = config.metadata.clone();
-
-            let response = provider
+        match build_request(messages, actions, config) {
+            BridgeRequest::Plain(request) => provider
                 .complete(request)
                 .await
-                .map_err(|e| EngineError::Llm {
-                    reason: e.to_string(),
-                })?;
-
-            // Check for code blocks in the response (CodeAct/RLM pattern)
-            let llm_response = match extract_code_block(&response.content) {
-                Some(code) => LlmResponse::Code {
-                    code,
-                    content: Some(response.content),
-                },
-                None => LlmResponse::Text(response.content),
-            };
-
-            return Ok(LlmOutput {
-                response: llm_response,
-                usage: TokenUsage {
-                    input_tokens: u64::from(response.input_tokens),
-                    output_tokens: u64::from(response.output_tokens),
-                    cache_read_tokens: u64::from(response.cache_read_input_tokens),
-                    cache_write_tokens: u64::from(response.cache_creation_input_tokens),
-                    cost_usd: 0.0,
-                },
-            });
-        }
-
-        // With tools: use tool completion (matches existing tools path)
-        let mut request = ToolCompletionRequest::new(chat_messages, tools)
-            .with_max_tokens(max_tokens)
-            .with_temperature(temperature)
-            .with_tool_choice("auto");
-        request.metadata = config.metadata.clone();
-
-        // Call provider
-        let response =
-            provider
+                .map(map_completion_response)
+                .map_err(map_provider_error),
+            BridgeRequest::Tools(request) => provider
                 .complete_with_tools(request)
                 .await
-                .map_err(|e| EngineError::Llm {
-                    reason: e.to_string(),
-                })?;
+                .map(map_tool_response)
+                .map_err(map_provider_error),
+        }
+    }
 
-        // Convert response — check for code blocks (CodeAct/RLM pattern)
-        let llm_response = if !response.tool_calls.is_empty() {
-            LlmResponse::ActionCalls {
-                calls: response
-                    .tool_calls
-                    .iter()
-                    .map(|tc| lunarwing_engine::ActionCall {
-                        id: tc.id.clone(),
-                        action_name: tc.name.clone(),
-                        parameters: tc.arguments.clone(),
-                    })
-                    .collect(),
-                content: response.content.clone(),
-            }
-        } else {
-            let text = response.content.unwrap_or_default();
-            // Detect ```repl or ```python fenced code blocks
-            match extract_code_block(&text) {
-                Some(code) => LlmResponse::Code {
-                    code,
-                    content: Some(text),
-                },
-                None => LlmResponse::Text(text),
-            }
-        };
+    async fn complete_stream<'a>(
+        &'a self,
+        messages: &[ThreadMessage],
+        actions: &[ActionDef],
+        config: &LlmCallConfig,
+    ) -> Result<lunarwing_engine::LlmStream<'a>, EngineError> {
+        let provider = self.provider_for_depth(config.depth);
+        let stream = match build_request(messages, actions, config) {
+            BridgeRequest::Plain(request) => provider.complete_stream(request).await,
+            BridgeRequest::Tools(request) => provider.complete_with_tools_stream(request).await,
+        }
+        .map_err(map_provider_error)?;
 
-        Ok(LlmOutput {
-            response: llm_response,
-            usage: TokenUsage {
-                input_tokens: u64::from(response.input_tokens),
-                output_tokens: u64::from(response.output_tokens),
-                cache_read_tokens: u64::from(response.cache_read_input_tokens),
-                cache_write_tokens: u64::from(response.cache_creation_input_tokens),
-                cost_usd: 0.0, // TODO: populate from provider cost data when available
-            },
-        })
+        Ok(stream
+            .map(|item| item.map(map_stream_chunk).map_err(map_provider_error))
+            .boxed())
     }
 
     fn model_name(&self) -> &str {
@@ -201,161 +270,352 @@ fn action_def_to_tool_def(action: &ActionDef) -> ToolDefinition {
     }
 }
 
-/// Extract Python code from fenced code blocks in the LLM response.
-///
-/// Tries these markers in order: ```repl, ```python, ```py, then bare ```
-/// (if the content looks like Python). Collects ALL code blocks in the
-/// response and concatenates them (models sometimes split code across
-/// multiple blocks with explanation text between them).
-fn extract_code_block(text: &str) -> Option<String> {
-    let mut all_code = Vec::new();
-
-    // Try specific markers first, then bare backticks
-    for marker in ["```repl", "```python", "```py", "```"] {
-        let mut search_from = 0;
-        while let Some(start) = text[search_from..].find(marker) {
-            let abs_start = search_from + start;
-            let after_marker = abs_start + marker.len();
-
-            // For bare ```, skip if it's actually ```someotherlang
-            if marker == "```" && text[after_marker..].starts_with(|c: char| c.is_alphabetic()) {
-                let lang: String = text[after_marker..]
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-                    .collect();
-                if !["repl", "python", "py"].contains(&lang.as_str()) {
-                    search_from = after_marker;
-                    continue;
-                }
-            }
-
-            // Skip to next line after the marker
-            let code_start = text[after_marker..]
-                .find('\n')
-                .map(|i| after_marker + i + 1)
-                .unwrap_or(after_marker);
-
-            // Find closing ```
-            if let Some(end) = text[code_start..].find("```") {
-                let code = text[code_start..code_start + end].trim();
-                if !code.is_empty() {
-                    all_code.push(code.to_string());
-                }
-                search_from = code_start + end + 3;
-            } else {
-                break;
-            }
-        }
-
-        // If we found code with a specific marker, use it (don't fall through to bare)
-        if !all_code.is_empty() {
-            break;
-        }
-    }
-
-    if all_code.is_empty() {
-        return None;
-    }
-
-    Some(all_code.join("\n\n"))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use futures::StreamExt;
+    use lunarwing_engine::LlmStreamChunk as EngineChunk;
+    use rust_decimal::Decimal;
+
     use super::*;
+    use crate::llm::streaming_test_support::{ScriptedStreamingProvider, StreamScript};
+    use crate::llm::{
+        CompletionRequest, CompletionResponse, FinishReason, LlmError, LlmStreamChunk as HostChunk,
+        TokenUsage as HostUsage, ToolCompletionResponse,
+    };
 
-    // ── extract_code_block tests ────────────────────────────
-
-    #[test]
-    fn extract_repl_block() {
-        let text = "Some explanation\n```repl\nx = 1 + 2\nprint(x)\n```\nMore text";
-        let code = extract_code_block(text).unwrap();
-        assert_eq!(code, "x = 1 + 2\nprint(x)");
+    fn search_action() -> ActionDef {
+        ActionDef {
+            name: "search".to_string(),
+            description: "Search".to_string(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            effects: Vec::new(),
+            requires_approval: false,
+        }
     }
 
-    #[test]
-    fn extract_python_block() {
-        let text = "Let me compute:\n```python\nresult = sum([1,2,3])\n```";
-        let code = extract_code_block(text).unwrap();
-        assert_eq!(code, "result = sum([1,2,3])");
+    #[tokio::test]
+    async fn complete_stream_maps_plain_host_chunks_and_usage() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![StreamScript::Items(vec![
+                Ok(HostChunk::TextDelta("hel".into())),
+                Ok(HostChunk::TextDelta("lo".into())),
+                Ok(HostChunk::Done {
+                    usage: Some(HostUsage {
+                        input_tokens: 8,
+                        output_tokens: 3,
+                        cache_read_input_tokens: 2,
+                        cache_creation_input_tokens: 1,
+                    }),
+                    finish_reason: "stop".into(),
+                }),
+            ])],
+            vec![],
+        ));
+        let adapter = LlmBridgeAdapter::new(provider.clone(), None);
+
+        let chunks = adapter
+            .complete_stream(&[], &[], &LlmCallConfig::default())
+            .await
+            .expect("plain stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(provider.plain_calls(), 1);
+        assert!(matches!(&chunks[0], Ok(EngineChunk::TextDelta(text)) if text == "hel"));
+        assert!(matches!(&chunks[1], Ok(EngineChunk::TextDelta(text)) if text == "lo"));
+        match &chunks[2] {
+            Ok(EngineChunk::Done {
+                usage: Some(usage),
+                finish_reason,
+            }) => {
+                assert_eq!(usage.input_tokens, 8);
+                assert_eq!(usage.output_tokens, 3);
+                assert_eq!(usage.cache_read_tokens, 2);
+                assert_eq!(usage.cache_write_tokens, 1);
+                assert_eq!(usage.cost_usd, 0.0);
+                assert_eq!(finish_reason, "stop");
+            }
+            other => panic!("expected mapped terminal usage, got {other:?}"),
+        }
     }
 
-    #[test]
-    fn extract_py_block() {
-        let text = "```py\nprint('hello')\n```";
-        let code = extract_code_block(text).unwrap();
-        assert_eq!(code, "print('hello')");
+    #[tokio::test]
+    async fn complete_stream_maps_fragmented_tool_chunks() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![],
+            vec![StreamScript::Items(vec![
+                Ok(HostChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("search".into()),
+                    args_delta: "{\"q\":\"".into(),
+                }),
+                Ok(HostChunk::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    args_delta: "rust\"}".into(),
+                }),
+                Ok(HostChunk::Done {
+                    usage: None,
+                    finish_reason: "tool_calls".into(),
+                }),
+            ])],
+        ));
+        let adapter = LlmBridgeAdapter::new(provider.clone(), None);
+
+        let chunks = adapter
+            .complete_stream(&[], &[search_action()], &LlmCallConfig::default())
+            .await
+            .expect("tool stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(provider.tool_calls(), 1);
+        assert!(matches!(
+            &chunks[0],
+            Ok(EngineChunk::ToolCallDelta {
+                index: 0,
+                id: Some(id),
+                name: Some(name),
+                args_delta,
+            }) if id == "call-1" && name == "search" && args_delta == "{\"q\":\""
+        ));
+        assert!(matches!(
+            &chunks[1],
+            Ok(EngineChunk::ToolCallDelta { args_delta, .. }) if args_delta == "rust\"}"
+        ));
     }
 
-    #[test]
-    fn extract_bare_backtick_block() {
-        let text = "Here's the code:\n```\nx = 42\nFINAL(x)\n```";
-        let code = extract_code_block(text).unwrap();
-        assert_eq!(code, "x = 42\nFINAL(x)");
+    #[tokio::test]
+    async fn complete_stream_uses_cheap_provider_at_nonzero_depth() {
+        let primary = Arc::new(ScriptedStreamingProvider::new("primary", vec![], vec![]));
+        let cheap = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![StreamScript::Items(vec![
+                Ok(HostChunk::TextDelta("cheap".into())),
+                Ok(HostChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".into(),
+                }),
+            ])],
+            vec![],
+        ));
+        let adapter = LlmBridgeAdapter::new(primary.clone(), Some(cheap.clone()));
+        let config = LlmCallConfig {
+            depth: 1,
+            ..LlmCallConfig::default()
+        };
+
+        let chunks = adapter
+            .complete_stream(&[], &[], &config)
+            .await
+            .expect("cheap stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(primary.plain_calls(), 0);
+        assert_eq!(cheap.plain_calls(), 1);
+        assert!(matches!(&chunks[0], Ok(EngineChunk::TextDelta(text)) if text == "cheap"));
     }
 
-    #[test]
-    fn skip_non_python_language() {
-        let text = "```json\n{\"key\": \"value\"}\n```\nThat's the config.";
-        assert!(extract_code_block(text).is_none());
+    #[tokio::test]
+    async fn complete_stream_maps_setup_error() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![StreamScript::SetupError(LlmError::RequestFailed {
+                provider: "primary".into(),
+                reason: "setup failed".into(),
+            })],
+            vec![],
+        ));
+        let adapter = LlmBridgeAdapter::new(provider, None);
+
+        let error = match adapter
+            .complete_stream(&[], &[], &LlmCallConfig::default())
+            .await
+        {
+            Ok(_) => panic!("setup error should cross the bridge"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, EngineError::Llm { reason } if reason.contains("setup failed")));
     }
 
-    #[test]
-    fn no_code_blocks_returns_none() {
-        let text = "Just a plain text response with no code.";
-        assert!(extract_code_block(text).is_none());
+    #[tokio::test]
+    async fn complete_stream_maps_item_error() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![StreamScript::Items(vec![Err(LlmError::RequestFailed {
+                provider: "primary".into(),
+                reason: "item failed".into(),
+            })])],
+            vec![],
+        ));
+        let adapter = LlmBridgeAdapter::new(provider, None);
+        let items = adapter
+            .complete_stream(&[], &[], &LlmCallConfig::default())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            items.first(),
+            Some(Err(EngineError::Llm { reason })) if reason.contains("item failed")
+        ));
     }
 
-    #[test]
-    fn multiple_code_blocks_concatenated() {
-        let text = "\
-Let me search first:\n\
-```repl\nresult = web_search(query=\"test\")\nprint(result)\n```\n\
-Now let's process:\n\
-```repl\nFINAL(result['title'])\n```";
-        let code = extract_code_block(text).unwrap();
-        assert!(code.contains("web_search"));
-        assert!(code.contains("FINAL"));
-        // Two blocks joined by double newline
-        assert!(code.contains("\n\n"));
+    #[derive(Default)]
+    struct CapturingProvider {
+        plain_requests: Mutex<Vec<CompletionRequest>>,
+        tool_requests: Mutex<Vec<ToolCompletionRequest>>,
     }
 
-    #[test]
-    fn mixed_thinking_and_code() {
-        // Simulates a model that outputs explanation + code (the Hyperliquid case)
-        let text = "\
-Let me help you explore the relationship between Hyperliquid's price and revenue.\n\
-\n\
-First, let's gather some data:\n\
-\n\
-```python\nsearch_results = web_search(\n    query=\"Hyperliquid revenue\",\n    count=5\n)\nprint(search_results)\n```\n\
-\n\
-And also check the token price:\n\
-\n\
-```python\ntoken_data = web_search(\n    query=\"Hyperliquid token price\",\n    count=3\n)\nprint(token_data)\n```";
-        let code = extract_code_block(text).unwrap();
-        assert!(code.contains("web_search"));
-        assert!(code.contains("Hyperliquid revenue"));
-        assert!(code.contains("Hyperliquid token price"));
+    #[async_trait::async_trait]
+    impl LlmProvider for CapturingProvider {
+        fn model_name(&self) -> &str {
+            "capturing"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            self.plain_requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(request);
+            Ok(CompletionResponse {
+                content: "plain".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            self.tool_requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(request);
+            Ok(ToolCompletionResponse {
+                content: Some("tools".to_string()),
+                tool_calls: Vec::new(),
+                input_tokens: 1,
+                output_tokens: 1,
+                finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
     }
 
-    #[test]
-    fn repl_preferred_over_bare() {
-        // If both ```repl and bare ``` exist, prefer ```repl
-        let text = "```\nignored\n```\n```repl\nused = True\n```";
-        let code = extract_code_block(text).unwrap();
-        assert_eq!(code, "used = True");
+    #[tokio::test]
+    async fn stream_request_preserves_plain_config_and_metadata() {
+        let provider = Arc::new(CapturingProvider::default());
+        let adapter = LlmBridgeAdapter::new(provider.clone(), None);
+        let config = LlmCallConfig {
+            max_tokens: Some(1234),
+            temperature: Some(0.25),
+            force_text: true,
+            depth: 0,
+            metadata: [("thread_id".to_string(), "thread-1".to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        adapter
+            .complete_stream(&[ThreadMessage::user("hello")], &[search_action()], &config)
+            .await
+            .expect("plain stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        let requests = provider.plain_requests.lock().expect("plain request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].max_tokens, Some(1234));
+        assert_eq!(requests[0].temperature, Some(0.25));
+        assert_eq!(
+            requests[0].metadata.get("thread_id").map(String::as_str),
+            Some("thread-1")
+        );
+        assert!(
+            provider
+                .tool_requests
+                .lock()
+                .expect("tool request lock")
+                .is_empty()
+        );
     }
 
-    #[test]
-    fn empty_code_block_skipped() {
-        let text = "```python\n\n```\nThat was empty.";
-        assert!(extract_code_block(text).is_none());
+    #[tokio::test]
+    async fn stream_request_preserves_tool_config_and_choice() {
+        let provider = Arc::new(CapturingProvider::default());
+        let adapter = LlmBridgeAdapter::new(provider.clone(), None);
+        let config = LlmCallConfig {
+            max_tokens: Some(2048),
+            temperature: Some(0.5),
+            metadata: [("trace".to_string(), "abc".to_string())]
+                .into_iter()
+                .collect(),
+            ..LlmCallConfig::default()
+        };
+
+        adapter
+            .complete_stream(
+                &[ThreadMessage::user("search")],
+                &[search_action()],
+                &config,
+            )
+            .await
+            .expect("tool stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        let requests = provider.tool_requests.lock().expect("tool request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].max_tokens, Some(2048));
+        assert_eq!(requests[0].temperature, Some(0.5));
+        assert_eq!(requests[0].tool_choice.as_deref(), Some("auto"));
+        assert_eq!(
+            requests[0].metadata.get("trace").map(String::as_str),
+            Some("abc")
+        );
     }
 
-    #[test]
-    fn unclosed_block_returns_none() {
-        let text = "```python\nprint('no closing fence')";
-        assert!(extract_code_block(text).is_none());
+    #[tokio::test]
+    async fn stream_request_uses_blocking_defaults() {
+        let provider = Arc::new(CapturingProvider::default());
+        let adapter = LlmBridgeAdapter::new(provider.clone(), None);
+
+        adapter
+            .complete_stream(
+                &[ThreadMessage::user("hello")],
+                &[],
+                &LlmCallConfig::default(),
+            )
+            .await
+            .expect("default plain stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        let requests = provider.plain_requests.lock().expect("plain request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].max_tokens, Some(4096));
+        assert_eq!(requests[0].temperature, None);
     }
 }

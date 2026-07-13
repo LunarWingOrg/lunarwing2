@@ -51,6 +51,12 @@ pub struct ExecutionLoop {
     store: Option<Arc<dyn crate::traits::store::Store>>,
     /// Runtime platform metadata for self-awareness in system prompts.
     platform_info: Option<crate::executor::prompt::PlatformInfo>,
+    /// Optional tenant identity/persona text (IDENTITY.md, SOUL.md, AGENTS.md,
+    /// etc.) loaded by the host from the workspace and prepended to the system
+    /// prompt. The engine crate is storage/filesystem-agnostic, so the host
+    /// (bridge) reads these files and supplies the assembled text here. Without
+    /// it, the engine uses only the generic CodeAct persona.
+    identity_preamble: Option<String>,
 }
 
 impl ExecutionLoop {
@@ -76,7 +82,18 @@ impl ExecutionLoop {
             retrieval: None,
             store: None,
             platform_info: None,
+            identity_preamble: None,
         }
+    }
+
+    /// Set the tenant identity/persona preamble (prepended to the system
+    /// prompt). Supplied by the host, which reads the workspace identity files.
+    pub fn with_identity_preamble(mut self, identity: String) -> Self {
+        let trimmed = identity.trim();
+        if !trimmed.is_empty() {
+            self.identity_preamble = Some(trimmed.to_string());
+        }
+        self
     }
 
     /// Set the event broadcast sender for live status updates.
@@ -225,11 +242,20 @@ impl ExecutionLoop {
                 }
             };
             // Build prompt using pre-fetched docs (no extra Store query)
-            let system_prompt = crate::executor::prompt::build_codeact_system_prompt_with_docs(
+            let codeact_prompt = crate::executor::prompt::build_codeact_system_prompt_with_docs(
                 &actions,
                 &system_docs,
                 self.platform_info.as_ref(),
             );
+
+            // Prepend the tenant identity/persona (if the host supplied it) so
+            // the agent speaks in its own voice rather than the generic CodeAct
+            // persona. Identity comes first; the CodeAct operating instructions
+            // follow.
+            let system_prompt = match &self.identity_preamble {
+                Some(identity) => format!("{identity}\n\n---\n\n{codeact_prompt}"),
+                None => codeact_prompt,
+            };
 
             // Skill selection and injection happens in the Python orchestrator
             // via __list_skills__() host function — not here in Rust.
@@ -410,14 +436,16 @@ mod tests {
     use super::*;
     use crate::runtime::messaging::ThreadSignal;
     use crate::traits::effect::ThreadExecutionContext;
-    use crate::traits::llm::{LlmCallConfig, LlmOutput};
+    use crate::traits::llm::{LlmCallConfig, LlmOutput, LlmStream, LlmStreamChunk};
     use crate::types::capability::{ActionDef, CapabilityLease, EffectType, GrantedActions};
     use crate::types::project::ProjectId;
     use crate::types::step::LlmResponse;
     use crate::types::step::{ActionResult, TokenUsage};
     use crate::types::thread::{ThreadConfig, ThreadType};
 
+    use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     // ── Mock LLM ────────────────────────────────────────────
@@ -455,6 +483,61 @@ mod tests {
 
         fn model_name(&self) -> &str {
             "mock"
+        }
+    }
+
+    struct StreamingMockLlm {
+        streams: Mutex<VecDeque<Vec<Result<LlmStreamChunk, EngineError>>>>,
+        blocking_calls: AtomicUsize,
+        streaming_calls: AtomicUsize,
+    }
+
+    impl StreamingMockLlm {
+        fn new(streams: Vec<Vec<Result<LlmStreamChunk, EngineError>>>) -> Self {
+            Self {
+                streams: Mutex::new(streams.into()),
+                blocking_calls: AtomicUsize::new(0),
+                streaming_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for StreamingMockLlm {
+        async fn complete(
+            &self,
+            _messages: &[ThreadMessage],
+            _actions: &[ActionDef],
+            _config: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            self.blocking_calls.fetch_add(1, Ordering::Relaxed);
+            Err(EngineError::Llm {
+                reason: "blocking completion must not be called".to_string(),
+            })
+        }
+
+        async fn complete_stream<'a>(
+            &'a self,
+            _messages: &[ThreadMessage],
+            _actions: &[ActionDef],
+            _config: &LlmCallConfig,
+        ) -> Result<LlmStream<'a>, EngineError> {
+            use futures::StreamExt;
+
+            self.streaming_calls.fetch_add(1, Ordering::Relaxed);
+            let items = self
+                .streams
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
+                .ok_or_else(|| EngineError::Llm {
+                    reason: "no scripted engine stream remains".to_string(),
+                })?;
+            Ok(futures::stream::iter(items).boxed())
+        }
+
+        fn model_name(&self) -> &str {
+            "streaming-mock"
         }
     }
 
@@ -546,8 +629,8 @@ mod tests {
         }
     }
 
-    async fn make_loop(
-        llm_responses: Vec<LlmOutput>,
+    async fn make_loop_with_llm(
+        llm: Arc<dyn LlmBackend>,
         effect_results: Vec<Result<ActionResult, EngineError>>,
         config: ThreadConfig,
     ) -> (ExecutionLoop, crate::runtime::messaging::SignalSender) {
@@ -561,7 +644,6 @@ mod tests {
         );
         let tid = thread.id;
 
-        let llm = Arc::new(MockLlm::new(llm_responses));
         let effects = Arc::new(MockEffects::new(vec![test_action()], effect_results));
         let leases = Arc::new(LeaseManager::new());
         let policy = Arc::new(PolicyEngine::new());
@@ -578,7 +660,216 @@ mod tests {
         (exec, tx)
     }
 
+    async fn make_loop(
+        llm_responses: Vec<LlmOutput>,
+        effect_results: Vec<Result<ActionResult, EngineError>>,
+        config: ThreadConfig,
+    ) -> (ExecutionLoop, crate::runtime::messaging::SignalSender) {
+        make_loop_with_llm(
+            Arc::new(MockLlm::new(llm_responses)),
+            effect_results,
+            config,
+        )
+        .await
+    }
+
     // ── Tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn orchestrator_uses_native_text_stream_and_broadcasts_deltas() {
+        let usage = TokenUsage {
+            input_tokens: 8,
+            output_tokens: 3,
+            ..TokenUsage::default()
+        };
+        let llm = Arc::new(StreamingMockLlm::new(vec![vec![
+            Ok(LlmStreamChunk::TextDelta("hel".to_string())),
+            Ok(LlmStreamChunk::TextDelta("lo".to_string())),
+            Ok(LlmStreamChunk::Done {
+                usage: Some(usage),
+                finish_reason: "stop".to_string(),
+            }),
+        ]]));
+        let (exec, _signal_tx) =
+            make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(32);
+        let mut exec = exec.with_event_tx(event_tx);
+
+        let outcome = exec.run().await.expect("streamed orchestrator should run");
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "hello"
+        ));
+        assert_eq!(llm.blocking_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(llm.streaming_calls.load(Ordering::Relaxed), 1);
+
+        let mut deltas = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let EventKind::ResponseDelta { content } = event.kind {
+                deltas.push(content);
+            }
+        }
+        assert_eq!(deltas, vec!["hel", "lo"]);
+        assert!(
+            !exec
+                .thread
+                .events
+                .iter()
+                .any(|event| matches!(&event.kind, EventKind::ResponseDelta { .. }))
+        );
+        assert_eq!(exec.thread.total_tokens_used, usage.total());
+    }
+
+    #[tokio::test]
+    async fn orchestrator_reconstructs_native_code_stream() {
+        let code_text = "```repl\nFINAL('streamed code')\n```";
+        let llm = Arc::new(StreamingMockLlm::new(vec![vec![
+            Ok(LlmStreamChunk::TextDelta(code_text.to_string())),
+            Ok(LlmStreamChunk::Done {
+                usage: Some(TokenUsage::default()),
+                finish_reason: "stop".to_string(),
+            }),
+        ]]));
+        let (execution, _signal_tx) =
+            make_loop_with_llm(llm, Vec::new(), ThreadConfig::default()).await;
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(32);
+        let mut execution = execution.with_event_tx(event_tx);
+
+        let outcome = execution
+            .run()
+            .await
+            .expect("native code stream should run");
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "streamed code"
+        ));
+        let mut code_deltas = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let EventKind::ResponseDelta { content } = event.kind {
+                code_deltas.push(content);
+            }
+        }
+        assert_eq!(code_deltas, vec![code_text.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_reconstructs_native_tool_stream() {
+        let llm = Arc::new(StreamingMockLlm::new(vec![
+            vec![
+                Ok(LlmStreamChunk::TextDelta("I will run it.".to_string())),
+                Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".to_string()),
+                    name: Some("test_tool".to_string()),
+                    args_delta: "{".to_string(),
+                }),
+                Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    args_delta: "}".to_string(),
+                }),
+                Ok(LlmStreamChunk::Done {
+                    usage: Some(TokenUsage {
+                        input_tokens: 4,
+                        output_tokens: 2,
+                        ..TokenUsage::default()
+                    }),
+                    finish_reason: "tool_calls".to_string(),
+                }),
+            ],
+            vec![
+                Ok(LlmStreamChunk::TextDelta("Done!".to_string())),
+                Ok(LlmStreamChunk::Done {
+                    usage: Some(TokenUsage {
+                        input_tokens: 5,
+                        output_tokens: 1,
+                        ..TokenUsage::default()
+                    }),
+                    finish_reason: "stop".to_string(),
+                }),
+            ],
+        ]));
+        let effect = ActionResult {
+            call_id: "call-1".to_string(),
+            action_name: "test_tool".to_string(),
+            output: serde_json::json!({"ok": true}),
+            is_error: false,
+            duration: Duration::from_millis(1),
+        };
+        let (mut execution, _signal_tx) =
+            make_loop_with_llm(llm.clone(), vec![Ok(effect)], ThreadConfig::default()).await;
+
+        let outcome = execution
+            .run()
+            .await
+            .expect("native tool stream should run");
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "Done!"
+        ));
+        assert_eq!(llm.streaming_calls.load(Ordering::Relaxed), 2);
+        assert!(execution.thread.internal_messages.iter().any(|message| {
+            message.role == crate::types::message::MessageRole::ActionResult
+                && message.action_call_id.as_deref() == Some("call-1")
+        }));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_stream_failure_does_not_commit_usage() {
+        let llm = Arc::new(StreamingMockLlm::new(vec![vec![
+            Ok(LlmStreamChunk::TextDelta("partial".to_string())),
+            Err(EngineError::Llm {
+                reason: "mid-stream failure".to_string(),
+            }),
+        ]]));
+        let (execution, _signal_tx) =
+            make_loop_with_llm(llm, Vec::new(), ThreadConfig::default()).await;
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(32);
+        let mut execution = execution.with_event_tx(event_tx);
+
+        let outcome = execution
+            .run()
+            .await
+            .expect("engine loop should convert orchestrator error to failed outcome");
+
+        assert!(matches!(outcome, ThreadOutcome::Failed { .. }));
+        assert_eq!(execution.thread.total_tokens_used, 0);
+        let mut deltas = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let EventKind::ResponseDelta { content } = event.kind {
+                deltas.push(content);
+            }
+        }
+        assert_eq!(deltas, vec!["partial"]);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_streams_without_event_sender() {
+        let llm = Arc::new(StreamingMockLlm::new(vec![vec![
+            Ok(LlmStreamChunk::TextDelta("no receiver".to_string())),
+            Ok(LlmStreamChunk::Done {
+                usage: None,
+                finish_reason: "stop".to_string(),
+            }),
+        ]]));
+        let (mut execution, _signal_tx) =
+            make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+
+        let outcome = execution
+            .run()
+            .await
+            .expect("stream should not require an event sender");
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "no receiver"
+        ));
+        assert_eq!(llm.streaming_calls.load(Ordering::Relaxed), 1);
+    }
 
     #[tokio::test]
     async fn text_response_completes() {

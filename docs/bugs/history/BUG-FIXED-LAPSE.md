@@ -1,9 +1,10 @@
 # BUG: Agent "lapse" — recurring "I'm not sure how to respond to that."
 
-> **STATUS: FIXED (v1.1.2, 2026-06-07)** — tool calls emitted in the
-> `<function=NAME>…</function>` XML dialect are now recovered into structured calls before
+> **STATUS: FIXED (current source verified 2026-07-12; originally fixed in v1.1.2)** — tool calls emitted in the
+> `<function=NAME>...</function>` XML dialect are now recovered into structured calls before
 > response cleaning, so they no longer clean to empty and trip the empty-response fallback.
-> Fix in `ic/src/llm/reasoning.rs` (commit `7a9aca2c`). Report retained for history.
+> The historical fix was recorded as commit `7a9aca2c`; that pre-v2 commit is
+> not separately reachable from this snapshot. Report retained for history.
 
 **Severity:** High — user-visible; the agent appears to "lapse" and stop doing work.
 **Found:** v1.1.2 cycle, on models that speak the GLM/Qwen tool-call dialect.
@@ -48,10 +49,11 @@ user as the fallback — every turn the model used the dialect.
 
 ## Fix
 
-`ic/src/llm/reasoning.rs` (commit `7a9aca2c`, +8 regression tests):
+`ic/src/llm/reasoning.rs` (the old commit reference is not separately reachable
+in this v2 snapshot):
 
 1. **`recover_function_xml_calls()`** — before cleaning, scan the raw content for
-   `<function=NAME>…</function>` blocks (with or without the `<tool_call>` wrapper) and turn
+   `<function=NAME>...</function>` blocks (with or without the `<tool_call>` wrapper) and turn
    them into structured `ToolCall`s. Only known tool names are recovered; each
    `<parameter=KEY>VALUE</parameter>` becomes an argument, with `VALUE` parsed as JSON when
    valid (so `true`/numbers keep their type) and kept as a trimmed string otherwise. IDs
@@ -64,12 +66,19 @@ user as the fallback — every turn the model used the dialect.
 With recovery in place, the dialect produces real tool calls, the loop executes the tool, and
 the empty-response fallback is no longer triggered.
 
+## Current verification
+
+The recovery and cleanup functions remain at
+`ic/src/llm/reasoning.rs:1486-1685`, with regression tests at
+`:2564-2626` and `:3348`. The old `:776`/`:823` references are historical.
+No Cargo command was run.
+
 ## Affected code
 
 | File | Relevance |
 |------|-----------|
-| `ic/src/llm/reasoning.rs` | `recover_function_xml_calls()` (recovery), `strip_function_xml_tags()` (cleanup), empty-response retry + fallback (`MAX_EMPTY_RESPONSE_RETRIES`, `:776`/`:823`) |
-| `ic/src/llm/CLAUDE.md` | Documents the empty-response retry mechanism |
+| `ic/src/llm/reasoning.rs` | `recover_function_xml_calls()` (recovery), `strip_function_xml_tags()` (cleanup), empty-response retry + fallback (the old `:776`/`:823` references are historical) |
+| `ic/src/llm/CLAUDE.md` | Historical path; this file is absent from the current v2 tree |
 
 ## Regression tests (`ic/src/llm/reasoning.rs`)
 

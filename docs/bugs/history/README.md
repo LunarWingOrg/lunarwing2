@@ -1,23 +1,23 @@
-# Archived Bug Docs
+# Archived bug docs
 
-Resolved and historical bug reports kept for provenance. These are **not** active bugs — the
-active bug tracker index is at [`../README.md`](../README.md).
+Resolved reports and compatibility pointers kept for provenance. The active index is
+[`../README.md`](../README.md); unresolved current work should have a canonical
+document directly under `docs/bugs/`. The two pointer rows marked below remain
+here only so old paths continue to resolve.
 
-| Doc | Resolution |
-|-----|------------|
-| [BUG-FIXED-LAPSE.md](BUG-FIXED-LAPSE.md) | `<function=NAME>` tool-call dialect recovered before response cleaning (`reasoning.rs`, commit `7a9aca2c`) |
-| [BUG-FIXED-wasm-tools-not-found-on-build.md](BUG-FIXED-wasm-tools-not-found-on-build.md) | MT `build-tenant --with-wasm` now resolves the tenant's `~/.cargo/bin/wasm-tools` instead of root's PATH |
-| [BUG-FIXED-WEECHAT-WARNINGS.md](BUG-FIXED-WEECHAT-WARNINGS.md) | Unused import fixed; `rand_check` stub (Low) still open |
-| [BUG-FIXED-workspace-concurrency-fixes-v1.1.0.md](BUG-FIXED-workspace-concurrency-fixes-v1.1.0.md) | Fixed in v1.1.0 (migration V21 + atomic workspace ops) |
-| [WEECHAT-NO-SECRET-ACCESS.md](WEECHAT-NO-SECRET-ACCESS.md) | Channel messages resolve under the owner credential scope (`resolve_message_scope`, `wrapper.rs:768`) |
-| [XMPP-OMEMO-BUG-TO-DO.md](XMPP-OMEMO-BUG-TO-DO.md) | OMEMO MUC fallback-spam / stuck-loop appear resolved; reopen if they recur |
+| Document | Current status / resolution |
+|---|---|
+| [BUG-FIXED-LAPSE.md](BUG-FIXED-LAPSE.md) | FIXED: XML tool-call dialect recovery |
+| [BUG-FIXED-engine-and-test-harness.md](BUG-FIXED-engine-and-test-harness.md) | FIXED: engine assertions and `Arc<Agent>::run` harness ownership |
+| [BUG-FIXED-kawarimi-import-opencode.md](BUG-FIXED-kawarimi-import-opencode.md) | FIXED named `--with-opencode` import/build forwarding; separate parity bug is active |
+| [BUG-FIXED-subagent-worker-hang.md](BUG-FIXED-subagent-worker-hang.md) | FIXED: fire-and-forget completion state transition |
+| [BUG-FIXED-WEECHAT-WARNINGS.md](BUG-FIXED-WEECHAT-WARNINGS.md) | COMPATIBILITY POINTER: PARTIAL; `rand_check` is active in `../BUG-weechat-relay-rand-check.md` |
+| [BUG-FIXED-wasm-tools-not-found-on-build.md](BUG-FIXED-wasm-tools-not-found-on-build.md) | FIXED: tenant-local `wasm-tools` lookup and raw-component fallback wording |
+| [BUG-FIXED-workspace-concurrency-fixes-v1.1.0.md](BUG-FIXED-workspace-concurrency-fixes-v1.1.0.md) | FIXED: atomic workspace writes and indexing; expected pool lag retained as not-a-bug |
+| [OPENRC-MT-1.1.4-ISSUES.md](OPENRC-MT-1.1.4-ISSUES.md) | Historical OpenRC pass; O1/O2/O4/O5 fixed and O3 documented |
+| [SYSTEMD-MT-1.1.4-ISSUES.md](SYSTEMD-MT-1.1.4-ISSUES.md) | Historical systemd pass; F11 was promoted to active `BUG-mt-nanocode-image-size.md` |
+| [WEECHAT-NO-SECRET-ACCESS.md](WEECHAT-NO-SECRET-ACCESS.md) | FIXED: owner credential scope for WASM channel messages |
+| [XMPP-OMEMO-BUG-TO-DO.md](XMPP-OMEMO-BUG-TO-DO.md) | COMPATIBILITY POINTER: UNVERIFIED fallback-spam; active report is `../BUG-xmpp-omemo-warmup-and-processing.md` |
 
-## 1.1.4 MT pre-release issue logs
-
-Multi-issue logs from the 1.1.4 multi-tenant pre-release passes. Each issue carries its own
-status in the doc (🟢 fixed · 🟡 workaround · 🔴 open).
-
-| Doc | Scope | Open items remaining |
-|-----|-------|----------------------|
-| [SYSTEMD-MT-1.1.4-ISSUES.md](SYSTEMD-MT-1.1.4-ISSUES.md) | Arch / systemd rootless-podman Quadlet MT pass (F1–F12) | none (F7 telegram tool removed → moot; all others fixed/documented) |
-| [OPENRC-MT-1.1.4-ISSUES.md](OPENRC-MT-1.1.4-ISSUES.md) | Gentoo / OpenRC rootless-podman MT fresh-machine pass (O1–O5) | none (all fixed / documented) |
+The pointer files above are intentionally not counted as resolved reports in
+the active index; their primary dispositions appear in its original-file table.

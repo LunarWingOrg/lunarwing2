@@ -33,16 +33,17 @@ use crate::capability::policy::PolicyEngine;
 use crate::memory::RetrievalEngine;
 use crate::runtime::messaging::{SignalReceiver, ThreadOutcome, ThreadSignal};
 use crate::traits::effect::{EffectExecutor, ThreadExecutionContext};
-use crate::traits::llm::{LlmBackend, LlmCallConfig};
+use crate::traits::llm::{LlmBackend, LlmCallConfig, LlmOutput};
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
 use crate::types::event::{EventKind, ThreadEvent, summarize_params};
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
 use crate::types::shared_owner_id;
-use crate::types::step::{StepId, TokenUsage};
+use crate::types::step::{LlmResponse, StepId, TokenUsage};
 use crate::types::thread::{Thread, ThreadState};
 
+use super::llm_stream::collect_llm_stream;
 use super::scripting::{execute_code, json_to_monty, monty_to_json, monty_to_string};
 
 /// The compiled-in default orchestrator (v0).
@@ -392,12 +393,12 @@ pub async fn execute_orchestrator(
                     "__llm_complete__" => {
                         handle_llm_complete(
                             args,
-                            kwargs,
                             thread,
                             llm,
                             effects,
                             leases,
                             &mut total_tokens,
+                            event_tx,
                         )
                         .await
                     }
@@ -454,6 +455,11 @@ pub async fn execute_orchestrator(
 
                     // __record_skill_usage__(doc_id, success)
                     "__record_skill_usage__" => handle_record_skill_usage(args, store).await,
+
+                    // __propose_skill_patch__(doc_id, proposed_content, diff, reason)
+                    "__propose_skill_patch__" => {
+                        handle_propose_skill_patch(args, thread, store).await
+                    }
 
                     // Unknown — let Monty resolve it (user-defined functions, builtins)
                     other => ExtFunctionResult::NotFound(other.to_string()),
@@ -530,15 +536,13 @@ pub async fn execute_orchestrator(
 ///
 async fn handle_llm_complete(
     args: &[MontyObject],
-    _kwargs: &[(MontyObject, MontyObject)],
     thread: &mut Thread,
     llm: &Arc<dyn LlmBackend>,
     effects: &Arc<dyn EffectExecutor>,
     leases: &Arc<LeaseManager>,
     total_tokens: &mut TokenUsage,
+    event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
 ) -> ExtFunctionResult {
-    use crate::types::step::LlmResponse;
-
     let explicit_messages = args.first().map(monty_to_json).filter(|v| !v.is_null());
     let explicit_config = args.get(2).map(monty_to_json).filter(|v| !v.is_null());
     let messages = explicit_messages
@@ -572,52 +576,75 @@ async fn handle_llm_complete(
         metadata: HashMap::new(),
     };
 
-    match llm.complete(&messages, &actions, &config).await {
-        Ok(output) => {
-            total_tokens.input_tokens += output.usage.input_tokens;
-            total_tokens.output_tokens += output.usage.output_tokens;
-            total_tokens.cost_usd += output.usage.cost_usd;
+    let stream = match llm.complete_stream(&messages, &actions, &config).await {
+        Ok(stream) => stream,
+        Err(error) => return llm_error_result(error),
+    };
+    let thread_id = thread.id;
+    let output = collect_llm_stream(stream, |content| {
+        let Some(tx) = event_tx else {
+            return;
+        };
+        let event = ThreadEvent::new(
+            thread_id,
+            EventKind::ResponseDelta {
+                content: content.to_string(),
+            },
+        );
+        let _ = tx.send(event);
+    })
+    .await;
 
-            let usage = serde_json::json!({
-                "input_tokens": output.usage.input_tokens,
-                "output_tokens": output.usage.output_tokens,
-                "cost_usd": output.usage.cost_usd,
-            });
-
-            let result = match output.response {
-                LlmResponse::Text(text) => {
-                    serde_json::json!({"type": "text", "content": text, "usage": usage})
-                }
-                LlmResponse::Code { code, .. } => {
-                    serde_json::json!({"type": "code", "code": code, "usage": usage})
-                }
-                LlmResponse::ActionCalls { calls, content } => {
-                    let calls_json: Vec<serde_json::Value> = calls
-                        .iter()
-                        .map(|c| {
-                            serde_json::json!({
-                                "name": c.action_name,
-                                "call_id": c.id,
-                                "params": c.parameters,
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({
-                        "type": "actions",
-                        "content": content,
-                        "calls": calls_json,
-                        "usage": usage
-                    })
-                }
-            };
-
-            ExtFunctionResult::Return(json_to_monty(&result))
-        }
-        Err(e) => ExtFunctionResult::Error(monty::MontyException::new(
-            monty::ExcType::RuntimeError,
-            Some(format!("LLM call failed: {e}")),
-        )),
+    match output {
+        Ok(output) => llm_output_result(output, total_tokens),
+        Err(error) => llm_error_result(error),
     }
+}
+
+fn llm_output_result(output: LlmOutput, total_tokens: &mut TokenUsage) -> ExtFunctionResult {
+    total_tokens.input_tokens += output.usage.input_tokens;
+    total_tokens.output_tokens += output.usage.output_tokens;
+    total_tokens.cost_usd += output.usage.cost_usd;
+
+    let usage = serde_json::json!({
+        "input_tokens": output.usage.input_tokens,
+        "output_tokens": output.usage.output_tokens,
+        "cost_usd": output.usage.cost_usd,
+    });
+    let result = match output.response {
+        LlmResponse::Text(text) => {
+            serde_json::json!({"type": "text", "content": text, "usage": usage})
+        }
+        LlmResponse::Code { code, .. } => {
+            serde_json::json!({"type": "code", "code": code, "usage": usage})
+        }
+        LlmResponse::ActionCalls { calls, content } => {
+            let calls: Vec<serde_json::Value> = calls
+                .into_iter()
+                .map(|call| {
+                    serde_json::json!({
+                        "name": call.action_name,
+                        "call_id": call.id,
+                        "params": call.parameters,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "type": "actions",
+                "content": content,
+                "calls": calls,
+                "usage": usage,
+            })
+        }
+    };
+    ExtFunctionResult::Return(json_to_monty(&result))
+}
+
+fn llm_error_result(error: EngineError) -> ExtFunctionResult {
+    ExtFunctionResult::Error(monty::MontyException::new(
+        monty::ExcType::RuntimeError,
+        Some(format!("LLM call failed: {error}")),
+    ))
 }
 
 /// Handle `__execute_code_step__(code, state)`.
@@ -1772,6 +1799,56 @@ async fn handle_record_skill_usage(
     }
 
     ExtFunctionResult::Return(MontyObject::None)
+}
+
+/// Handle `__propose_skill_patch__(doc_id, proposed_content, diff, reason)`.
+///
+/// Stages a proposed skill patch for later user approval (B-1, propose-then-
+/// approve). Does NOT mutate the live skill — it only records a `pending_patch`
+/// on the skill's metadata. Called by the self-improvement mission when a
+/// below-confidence skill is implicated in a failed thread. Returns `True` on a
+/// successful stage, `False` otherwise (e.g. Installed/read-only skill), so the
+/// orchestrator Python can branch on the outcome.
+async fn handle_propose_skill_patch(
+    args: &[MontyObject],
+    thread: &Thread,
+    store: Option<&Arc<dyn Store>>,
+) -> ExtFunctionResult {
+    let Some(store) = store else {
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    };
+
+    let doc_id_str = args.first().map(monty_to_string).unwrap_or_default();
+    let proposed_content = args.get(1).map(monty_to_string).unwrap_or_default();
+    let diff = args.get(2).map(monty_to_string).unwrap_or_default();
+    let reason = args.get(3).map(monty_to_string).unwrap_or_default();
+
+    let Ok(uuid) = uuid::Uuid::parse_str(&doc_id_str) else {
+        debug!("__propose_skill_patch__: invalid doc_id: {doc_id_str}");
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    };
+    if proposed_content.trim().is_empty() {
+        debug!("__propose_skill_patch__: empty proposed_content, skipping");
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    }
+
+    let tracker = crate::memory::SkillTracker::new(Arc::clone(store));
+    match tracker
+        .propose_patch(
+            crate::types::memory::DocId(uuid),
+            proposed_content,
+            diff,
+            reason,
+            Some(thread.id.0.to_string()),
+        )
+        .await
+    {
+        Ok(()) => ExtFunctionResult::Return(MontyObject::Bool(true)),
+        Err(e) => {
+            debug!("__propose_skill_patch__: failed: {e}");
+            ExtFunctionResult::Return(MontyObject::Bool(false))
+        }
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────

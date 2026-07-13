@@ -7,6 +7,7 @@
 
 pub mod compaction;
 pub mod context;
+mod llm_stream;
 pub mod loop_engine;
 pub mod orchestrator;
 pub mod prompt;

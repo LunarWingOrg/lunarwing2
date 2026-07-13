@@ -125,6 +125,7 @@ impl ConversationManager {
         project_id: ProjectId,
         user_id: &str,
         thread_config: ThreadConfig,
+        preferred_thread_id: Option<ThreadId>,
     ) -> Result<ThreadId, EngineError> {
         let mut convs = self.conversations.write().await;
         let conv = convs.get_mut(&conversation_id).ok_or(EngineError::Store {
@@ -195,6 +196,7 @@ impl ConversationManager {
                         None,
                         user_id,
                         history,
+                        preferred_thread_id,
                     )
                     .await?;
 
@@ -648,7 +650,7 @@ mod tests {
         let project = ProjectId::new();
 
         let tid = cm
-            .handle_user_message(conv_id, "Hello", project, "user1", ThreadConfig::default())
+            .handle_user_message(conv_id, "Hello", project, "user1", ThreadConfig::default(), None)
             .await
             .unwrap();
 
@@ -719,6 +721,7 @@ mod tests {
                 project,
                 "user1",
                 ThreadConfig::default(),
+                None,
             )
             .await
             .unwrap();
@@ -815,7 +818,7 @@ mod tests {
 
         // Spawn a thread so the conversation has entries and active threads
         let tid = cm
-            .handle_user_message(conv_id, "Hello", project, "user1", ThreadConfig::default())
+            .handle_user_message(conv_id, "Hello", project, "user1", ThreadConfig::default(), None)
             .await
             .unwrap();
 
