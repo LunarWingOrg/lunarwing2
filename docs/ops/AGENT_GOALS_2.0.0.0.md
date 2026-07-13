@@ -1,8 +1,11 @@
-# AGENT PRE-RELEASE CHECKLIST for 2.0.0.0 Codename `?` (Unknown at this time)
+# AGENT PRE-RELEASE CHECKLIST for LunarWing v2.0.0.0 Codename `Kosoku (光速)`
 
-**Open TODOs (2.0.0.0) — To be done before release**
+## Release Codename:  光速
+## English Context:   Kōsoku / Kosoku
+## Pronunciation:     こうそく (kō-soku)
 
-> **NOTE:** Edit the dev autonomous loop routine to use this file. Ensure each checkbox is checked off in the corresponding branch before committing, pushing, and opening a PR. Items are listed in rough recommended order but are not strictly sequential unless noted.
+**Open TODOs (v2.0.0.0) — To be done before release**
+
 ---
 
 1. [x] Ensure references to 1.2.0 in the code and documentation are replaced by 2.0.0 (where applicable only of course)
@@ -145,11 +148,11 @@
 
     </details>
 
-19. [ ] Finish going through all the documents under architecture directory in docs/ and update all outdated documentation. Then, consolidate documents if possible.
-20. [ ] Go through all documents under bugs directory in docs/ and update all outdated documentation. Then, consolidate documents.
-21. [ ] Go through all documents under proposals directory in docs/ and update all outdated documentation. Then, consolidate documents if deemed necessary.
-22. [ ] Go through all documents under reviews directory in docs/ and update all outdated documentation. Then, consolidate documents.
-23. [ ] Go through all documents under guides directory in docs/ and update all outdated documentation. Then, consolidate documents.
+19. [x] Finish going through all the documents under architecture directory in docs/ and update all outdated documentation. Then, consolidate documents if possible.
+20. [x] Go through all documents under bugs directory in docs/ and update all outdated documentation. Then, consolidate documents.
+21. [x] Go through all documents under proposals directory in docs/ and update all outdated documentation. Then, consolidate documents if deemed necessary.
+22. [x] Go through all documents under reviews directory in docs/ and update all outdated documentation. Then, consolidate documents.
+23. [x] Go through all documents under guides directory in docs/ and update all outdated documentation. Then, consolidate documents.
 24. [x] Write up FIRST DRAFT release notes (at root of repo) for v2.0.0.0 explaining all relevant changes since v1.1.9.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/release for reference as to how to write up this document. The codename for this release is: `Unknown` — The file you write will be RELEASE-v2.0.0.0.md and should be written to the ROOT of the repo.(SKIPPINGITONPURPOSE)
 25. [x] Improve accuracy of RELEASE-v2.0.0.0.md(SKIPPINGITONPURPOSE)
 
