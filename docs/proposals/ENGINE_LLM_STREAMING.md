@@ -14,14 +14,21 @@ generation, and expose progress during long agentic runs.
 - **Phase 2 is complete on the implementation branch**: the host bridge maps
   native streams, the primary Engine V2 orchestrator consumes them strictly,
   and engine text deltas are broadcast as transient provider-neutral events.
-- **Phase 2 is intentionally not user-visible.** The gateway SSE consumer,
-  frontend, interrupts, and WASM channel delivery do not consume native
-  provider deltas yet.
+- **Phase 3 is complete on the implementation branch and is user-visible.** The
+  bridge translates engine `ResponseDelta` events into the gateway SSE
+  `stream_chunk` event (via the direct SSE path in `await_thread_outcome`), and
+  the existing web frontend renders deltas incrementally, finalizing on the
+  terminal `response`. The channel-neutral `StatusUpdate::StreamChunk` path is
+  additionally wired for non-gateway channels (inert today; WASM channels ignore
+  `StreamChunk`) to plumb the Phase 5 rollout.
+- **Interrupts and WASM channel delivery are still not covered.** Those remain
+  Phase 4 and Phase 5.
 - **TensorZero Gateway `2026.3.2` is the compatibility target.** LunarWing uses
   its OpenAI-compatible `/openai/v1/chat/completions` endpoint.
 
-The next work starts at the engine consumer. Provider streaming is no longer
-the blocker.
+The next work is interrupt-aware cancellation (Phase 4) and opt-in WASM channel
+delivery (Phase 5). Provider streaming and gateway delivery are no longer the
+blocker.
 
 ## Why this is foundational
 
@@ -203,8 +210,12 @@ gateway rather than exposing partial support.
 - **Phase 2 - implemented:** the host bridge maps native streams, the primary
   Engine V2 orchestrator consumes them strictly, and engine text deltas are
   broadcast as transient provider-neutral events.
-- **Phase 3:** gateway SSE and frontend append deltas and finalize on the
-  existing terminal response.
+- **Phase 3 - implemented:** the bridge maps engine `ResponseDelta` to the
+  gateway SSE `stream_chunk` event via the direct SSE path; the existing web
+  frontend appends deltas and finalizes on the terminal `response`. The
+  non-gateway `StatusUpdate::StreamChunk` path is wired (inert today) for the
+  Phase 5 rollout. Gateway delta and status are emitted through a single path to
+  avoid duplicating streamed text.
 - **Phase 4:** interrupt-aware engine consumption and cancellation tests.
 - **Phase 5:** opt-in channel-neutral delivery for eligible WASM channels after
   the approved safety gates pass.

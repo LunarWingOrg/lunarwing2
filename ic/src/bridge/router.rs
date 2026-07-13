@@ -2831,6 +2831,22 @@ async fn forward_event_to_channel(
                 )
                 .await;
         }
+        // The gateway receives streamed deltas via the direct SSE path in
+        // `await_thread_outcome` (see `thread_event_to_app_events`), which
+        // carries the real engine thread id and scopes by `message.user_id`.
+        // Emitting here as well would double the streamed text because the
+        // frontend appends chunks additively. Wire the channel-neutral status
+        // path for other channels only; WASM channels currently ignore
+        // `StreamChunk`, but this plumbs Phase 5 delivery.
+        EventKind::ResponseDelta { content } if channel_name != "gateway" => {
+            let _ = channels
+                .send_status(
+                    channel_name,
+                    StatusUpdate::StreamChunk(content.clone()),
+                    metadata,
+                )
+                .await;
+        }
         _ => {}
     }
 }
@@ -2924,6 +2940,10 @@ fn thread_event_to_app_events(
         }],
         EventKind::SkillActivated { skill_names } => vec![AppEvent::SkillActivated {
             skill_names: skill_names.clone(),
+            thread_id: Some(thread_id.into()),
+        }],
+        EventKind::ResponseDelta { content } => vec![AppEvent::StreamChunk {
+            content: content.clone(),
             thread_id: Some(thread_id.into()),
         }],
         _ => vec![],
@@ -4332,5 +4352,67 @@ mod tests {
                 callback_id: "abc".to_string()
             }
         ));
+    }
+
+    #[test]
+    fn response_delta_maps_to_stream_chunk_app_event() {
+        let evt = lunarwing_engine::ThreadEvent::new(
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::EventKind::ResponseDelta {
+                content: "hi".to_string(),
+            },
+        );
+
+        let events = thread_event_to_app_events(&evt, "tid-1");
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AppEvent::StreamChunk { content, thread_id } => {
+                assert_eq!(content, "hi");
+                assert_eq!(thread_id.as_deref(), Some("tid-1"));
+            }
+            other => panic!("expected StreamChunk, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_delta_skips_gateway_but_forwards_to_other_channels() {
+        use crate::testing::StubChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+
+        let (gateway_stub, _gw_tx) = StubChannel::new("gateway");
+        let gateway_statuses = gateway_stub.captured_statuses_handle();
+        manager.add(Box::new(gateway_stub)).await;
+
+        let (xmpp_stub, _xmpp_tx) = StubChannel::new("xmpp");
+        let xmpp_statuses = xmpp_stub.captured_statuses_handle();
+        manager.add(Box::new(xmpp_stub)).await;
+
+        let evt = lunarwing_engine::ThreadEvent::new(
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::EventKind::ResponseDelta {
+                content: "hi".to_string(),
+            },
+        );
+        let metadata = serde_json::json!({});
+
+        // Gateway is served by the direct SSE path; forwarding here too would
+        // double the streamed text, so no status is sent to it.
+        forward_event_to_channel(&evt, &manager, "gateway", &metadata).await;
+        assert!(
+            gateway_statuses.lock().expect("poisoned").is_empty(),
+            "gateway must not receive ResponseDelta via send_status"
+        );
+
+        // Non-gateway channels get the channel-neutral StreamChunk status.
+        forward_event_to_channel(&evt, &manager, "xmpp", &metadata).await;
+        let captured = xmpp_statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 1);
+        assert!(
+            matches!(&captured[0], StatusUpdate::StreamChunk(c) if c == "hi"),
+            "expected StreamChunk(\"hi\"), got {:?}",
+            captured[0]
+        );
     }
 }
