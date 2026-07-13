@@ -11,9 +11,12 @@ generation, and expose progress during long agentic runs.
 - **Host Phase 1 is complete on the implementation branch**: Rig 0.40 streams
   plain and tool-capable requests, and the complete production decorator chain
   preserves those streams.
-- **Phase 1 is intentionally not user-visible.** The engine executor, bridge
-  event path, gateway SSE consumer, interrupts, and WASM channel delivery do
-  not consume native provider deltas yet.
+- **Phase 2 is complete on the implementation branch**: the host bridge maps
+  native streams, the primary Engine V2 orchestrator consumes them strictly,
+  and engine text deltas are broadcast as transient provider-neutral events.
+- **Phase 2 is intentionally not user-visible.** The gateway SSE consumer,
+  frontend, interrupts, and WASM channel delivery do not consume native
+  provider deltas yet.
 - **TensorZero Gateway `2026.3.2` is the compatibility target.** LunarWing uses
   its OpenAI-compatible `/openai/v1/chat/completions` endpoint.
 
@@ -172,17 +175,17 @@ assistant response.
 
 ## Remaining delivery path
 
-The engine and gateway still use the blocking outcome path:
+The bridge and primary Engine V2 executor now consume native provider streams,
+strictly reconstruct the existing text/code/action result, and broadcast
+transient provider-neutral `ResponseDelta` thread events. Provider streaming is
+still not user-visible because the bridge/router does not translate those
+events into channel statuses yet.
 
-1. `LlmBridgeAdapter` must map host chunks to the engine stream type.
-2. The Engine V2 executor must consume chunks while accumulating the same final
-   step result used by tool parsing and thread state.
-3. The executor must emit provider-neutral response-delta thread events.
-4. The bridge/router must convert those events to channel-neutral application
+1. The bridge/router must convert those events to channel-neutral application
    events.
-5. Gateway SSE can map those events to the existing `stream_chunk` wire shape;
+2. Gateway SSE can map those events to the existing `stream_chunk` wire shape;
    the terminal response remains the finalization signal.
-6. Interrupt handling must drop the active stream without emitting a spurious
+3. Interrupt handling must drop the active stream without emitting a spurious
    successful terminal response.
 
 The gateway UI remains the first supported consumer. WASM channels stay on the
@@ -197,8 +200,9 @@ gateway rather than exposing partial support.
   fallbacks, no behavior change.
 - **Phase 1 - implemented:** Rig 0.40 native plain/tool streams, TensorZero
   `2026.3.2` fixtures, strict terminal handling, and decorator preservation.
-- **Phase 2:** bridge and Engine V2 consume provider streams and emit
-  provider-neutral deltas behind a gateway-scoped flag.
+- **Phase 2 - implemented:** the host bridge maps native streams, the primary
+  Engine V2 orchestrator consumes them strictly, and engine text deltas are
+  broadcast as transient provider-neutral events.
 - **Phase 3:** gateway SSE and frontend append deltas and finalize on the
   existing terminal response.
 - **Phase 4:** interrupt-aware engine consumption and cancellation tests.
@@ -225,8 +229,15 @@ Phase 1 verification uses scoped tests plus `cargo check`, Clippy with warnings
 denied, formatting checks, and `git diff --check`, all under the repository's
 six-thread build constraint.
 
-`FEATURE_PARITY.md` is intentionally unchanged in Phase 1 because neither the
-engine nor any user-facing channel consumes native provider deltas yet.
+Phase 2 coverage adds host-to-engine plain/tool chunk mapping, request/default
+parity, depth routing, setup and item error mapping, strict engine terminal and
+tool reconstruction, complete-only fallback compatibility, response-delta
+Serde coverage, and real orchestrator text/code/tool/error/no-receiver streams.
+The integration tests also prove ordered live delta broadcast, non-persistence
+of provider chunks, and terminal-only usage commitment.
+
+`FEATURE_PARITY.md` is intentionally unchanged in Phase 2 because no
+user-facing channel consumes native provider deltas yet.
 
 ## Non-goals and risks
 
