@@ -1,5 +1,7 @@
 # WeeChat Channel Architecture
 
+> **Status:** As-built. End-to-end validated against live WeeChat relay. Last reviewed for 2.0.0.
+
 How LunarWing connects to IRC through WeeChat: the components, the end-to-end message
 flow, the ingestion/latency model, the configuration-precedence rules (and the trap they
 create), and the known issues with their fix status.
@@ -340,7 +342,8 @@ The adapter and WASM must update **together** (the WASM probes `/api/health` for
 
 - `docs/ops/WEECHAT-SERVICES.md` — services, ports, env vars, day-to-day ops.
 - `WEECHAT-MULTITENANT-PORT-BUG.md` — the per-tenant port/password fix and the
-  env-sourced-fields mechanism (archived to `docs/internal/history/archive/ops/`).
+  env-sourced-fields mechanism (archived to `docs/internal/history/archive/ops/`). *This
+  document may not exist at this path in newer checkouts.*
 - `docs/proposals/WEECHAT_WS_ADAPTER_SYNC_PROTOCOL.md`,
    `docs/proposals/WEECHAT_WS_ADAPTER_MISSING_DEPENDENCY_AND_AUTOMATION.md` — the adapter sync protocol,
    dependency + automation.

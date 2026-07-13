@@ -1,5 +1,7 @@
 # XMPP File Transfer Support
 
+> **Status:** As-built. Implemented and unit-tested (`cargo test channels::xmpp`); the standalone `xmpp-bridge` builds in release. Last reviewed for 2.0.0.
+
 ## Overview
 
 LunarWing supports file transfers over XMPP in both directions, in DMs and group chats (including OMEMO-encrypted):

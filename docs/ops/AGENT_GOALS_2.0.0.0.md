@@ -145,7 +145,7 @@
 
     </details>
 
-19. [ ] Finish going through all the documents under architecture directory in docs/ and update all outdated documentation. Then, consolidate documents if possible.
+19. [x] Finish going through all the documents under architecture directory in docs/ and update all outdated documentation. Then, consolidate documents if possible.
 20. [ ] Go through all documents under bugs directory in docs/ and update all outdated documentation. Then, consolidate documents.
 21. [ ] Go through all documents under proposals directory in docs/ and update all outdated documentation. Then, consolidate documents if deemed necessary.
 22. [ ] Go through all documents under reviews directory in docs/ and update all outdated documentation. Then, consolidate documents.

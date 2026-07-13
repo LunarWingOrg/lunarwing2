@@ -1,5 +1,7 @@
 # Engine V2 Architecture
 
+> **Status:** As-built. Reviewed for 2.0.0.
+
 The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. When enabled, the bridge router (`src/bridge/router.rs`) delegates incoming messages to the engine instead of the legacy v1 agent loop.
@@ -36,16 +38,20 @@ ic/crates/lunarwing_engine/src/
     store.rs              Store trait (20 CRUD methods)
     effect.rs             EffectExecutor trait
   capability/             Capability management
+    mod.rs                CapabilityModule (register/get/list capabilities)
     registry.rs           CapabilityRegistry (register/get/list capabilities)
     lease.rs              LeaseManager (grant/check/consume/revoke/expire leases)
     policy.rs             PolicyEngine (deterministic allow/deny/approve + provenance taint)
+    planner.rs            Capability planning (capability composition/planning)
   runtime/                Thread lifecycle management
+    mod.rs                RuntimeModule entry
     manager.rs            ThreadManager (spawn, stop, inject messages, join threads)
     conversation.rs       ConversationManager (routes UI messages to threads)
     mission.rs            MissionManager (long-running goals that spawn threads on cadence)
     tree.rs               ThreadTree (parent-child relationships)
     messaging.rs          ThreadSignal, ThreadOutcome, signal channels
   executor/               Step execution
+    mod.rs                Executor module entry
     loop_engine.rs        ExecutionLoop (core loop replacing run_agentic_loop)
     structured.rs         Tier 0: structured tool call execution
     scripting.rs          Tier 1: embedded Python via Monty (CodeAct/RLM)
@@ -53,10 +59,17 @@ ic/crates/lunarwing_engine/src/
     compaction.rs         Context compaction when approaching model context limit
     prompt.rs             System prompt construction (CodeAct preamble/postamble)
     trace.rs              Execution trace recording and retrospective analysis
+    orchestrator.rs       Python orchestrator host/runtime
   memory/                 Memory document system
+    mod.rs                Memory module entry
     store.rs              MemoryStore (project-scoped doc CRUD)
     retrieval.rs          RetrievalEngine (keyword-based context retrieval from project docs)
     skill_tracker.rs      SkillTracker (confidence tracking, versioned updates, rollback)
+  gate/                   Execution gates
+    mod.rs                Gate module entry
+    pipeline.rs           GatePipeline (composes multiple gates in sequence)
+    lease.rs              Lease gating
+    tool_tier.rs          Tool tier gating
   reliability.rs          ReliabilityTracker (per-action success rate and latency via EMA)
 ```
 

@@ -147,9 +147,9 @@ If/when you do revisit, **Option C (Channel-Layer Token)** is probably the clean
 
 - `ic/src/channels/mod.rs` — turn token management
 - `ic/src/channels/web/sse.rs` — SSE event filtering
-- `ic/src/agent/dispatcher.rs` — pass turn token through agentic loop
+- `ic/src/agent/dispatcher.rs` — pass turn token through agentic loop (contains `ChatDelegate`)
 - `ic/src/tools/mod.rs` — tool execution context
-- `ic/src/llm/delegate.rs` — ChatDelegate emission
+- `ic/src/agent/agentic_loop.rs` — `LoopDelegate` trait (ChatDelegate impl lives in `dispatcher.rs`)
 
 ## Decision Log
 

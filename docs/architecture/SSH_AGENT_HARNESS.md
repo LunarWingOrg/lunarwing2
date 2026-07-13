@@ -1,6 +1,6 @@
 # SSH Agent Harness
 
-**Status:** As-built (verified against source 2026-07-01; reviewed for 1.1.9)
+**Status:** As-built (verified against source 2026-07-01; reviewed for 2.0.0)
 **Code:** `ic/src/bridge/ssh*.rs`, `ic/src/config/ssh.rs`
 **Operator guide:** [`docs/ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 **Delivery mechanisms** (how the agent actually runs SSH work — worker mode, the `ssh`/`ssh_git` built-in tools, the WASM `ssh` tool): [`SSH_DELIVERY_MECHANISMS.md`](SSH_DELIVERY_MECHANISMS.md)
@@ -17,7 +17,7 @@ verification, see the operator guide linked above.
 ## 1. What it is
 
 The SSH Agent harness gives LunarWing worker containers (nanocode, pebble,
-opencode; codex removed in v1.1.9), routines, and git operations the ability to authenticate to remote SSH
+opencode; codex removed in v1.1.9, legacy subprotocol dropped in 2.0.0), routines, and git operations the ability to authenticate to remote SSH
 hosts **without ever exposing raw private-key bytes to those consumers**.
 
 It does this by splitting SSH state into two halves:

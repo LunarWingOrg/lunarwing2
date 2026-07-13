@@ -1,6 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Date:** 2026-06-13 (updated 2026-07-09)
+**Date:** 2026-06-13 (updated 2026-07-13 for 2.0.0)
 **Status:** Reference (as-is) — documents current behavior, not a proposal
 **Related:** `ic-infrastructure-health-check/README.md`, `docs/ops/MULTITENANCY-PRODUCTION.md`, `docs/internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md`
 
@@ -8,7 +8,7 @@
 
 The infrastructure health-check + self-heal pipeline (`ic-infrastructure-health-check/`)
 is a **host-level** facility that covers all tenants automatically (registry /
-init-scan discovery). As of v1.1.9, `lunarwing-mt-admin.sh add-tenant` calls
+init-scan discovery). As of v2.0.0, `lunarwing-mt-admin.sh add-tenant` calls
 `ensure_health_pipeline()` which installs the pipeline scripts, writes a config
 env file, and schedules the pipeline (systemd timer or OpenRC cron) in one step.
 It can be opted out with `--no-health`.
@@ -53,7 +53,7 @@ There are two installation paths:
 ### Path 1: `mt-admin.sh add-tenant` (primary, automatic)
 
 `lunarwing-mt-admin.sh add-tenant <name>` calls `ensure_health_pipeline()` as part
-of tenant provisioning (unless `--no-health` is passed). This function:
+of tenant provisioning (unless `--no-health` is passed). This function (unchanged since v1.1.9):
 
 1. Copies the pipeline scripts from `ic-infrastructure-health-check/` to a stable
    lib dir (`$HEALTH_LIB_DIR`) that survives repo/worktree moves.
@@ -139,7 +139,7 @@ that is handled by `add-tenant`. On hosts that have not run `add-tenant` (e.g.
 single-instance setups), the operator must schedule the pipeline manually per
 `ic-infrastructure-health-check/README.md`.
 
-## Historical gaps (resolved in v1.1.9)
+## Historical gaps (resolved in v1.1.9; carried forward into 2.0.0)
 
 The following gaps were documented before `ensure_health_pipeline()` was added
 to `add-tenant`:

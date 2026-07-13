@@ -1,5 +1,7 @@
 # Semantic Memory Search
 
+> **Status:** As-built. Reviewed for 2.0.0 (migrations now extend through V22).
+
 LunarWing provides persistent memory for agents with hybrid search combining full-text search (BM25-style keyword matching) and vector search (cosine similarity on embeddings). Results are fused using Reciprocal Rank Fusion (RRF) to produce a single ranked list.
 
 The system lives in `ic/src/workspace/` and is exposed to agents via the `memory_search`, `memory_write`, `memory_read`, and `memory_tree` tools in `ic/src/tools/builtin/memory.rs`.
@@ -211,6 +213,8 @@ Search results include:
 Key migrations:
 - `V1__initial.sql`: base schema with documents, chunks, tsvector, pgvector
 - `V9__flexible_embedding_dimension.sql`: dropped HNSW index, changed to unbounded `vector` type
+- `V10-V22` (2026): additional schema additions (wasm versioning, conversation indexes, reflex patterns, etc.)
+- `V22__rename_leak_pattern.sql`: latest migration (leak pattern rename)
 
 ### libSQL
 
