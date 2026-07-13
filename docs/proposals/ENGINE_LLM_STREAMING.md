@@ -67,15 +67,21 @@ path**; the SSE event type and frontend rendering are largely present.
 
 ### The streaming primitive
 Add a streaming completion to both trait layers, returning an async stream of
-typed chunks rather than a single result. Proposed chunk type (shared, in
-`ic/src/llm/`):
+typed chunks rather than a single result. Define mirrored chunk types in
+`ic/src/llm/` and `ic/crates/lunarwing_engine/src/traits/llm.rs`; the bridge maps
+between them. Keep their variant schemas aligned:
 
 ```rust
 pub enum LlmStreamChunk {
     /// Incremental assistant text (the common case).
     TextDelta(String),
-    /// Incremental tool/action call (name + partial args), for CodeAct/tool use.
-    ToolCallDelta { index: usize, name: Option<String>, args_delta: String },
+    /// Incremental tool/action call (id/name + partial args), for CodeAct/tool use.
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        args_delta: String,
+    },
     /// Terminal: usage/stop reason; stream ends after this.
     Done { usage: Option<TokenUsage>, finish_reason: String },
 }
@@ -88,16 +94,18 @@ pub enum LlmStreamChunk {
   existing provider/decorator compiles and works unchanged; only providers that
   *natively* stream override it.
 - **`LlmBackend`** (engine) gains the analogous `complete_stream`, also with a
-  `complete()`-backed default.
+  `complete()`-backed default. Because the current `LlmOutput` does not retain a
+  finish reason, its text/code fallback reports `"unknown"`; the structured
+  action-call variant can safely report `"tool_calls"`.
 
 ### Layer-by-layer changes
 
-1. **OpenAI-compatible provider** (the one that hits `LLM_BASE_URL` /
-   TensorZero): implement real `complete_stream` — send `"stream": true`, parse
-   the SSE `data:` lines into `TextDelta`/`ToolCallDelta`, terminate on
-   `[DONE]`. Reference the existing SSE-parse shapes already in
-   `openai_compat.rs` (`OpenAiDelta`, the streaming response types at
-   `:123-138`).
+1. **OpenAI-compatible provider path** (the `RigAdapter` registry path created in
+   `ic/src/llm/mod.rs`, which hits `LLM_BASE_URL` / TensorZero): implement real
+   `complete_stream` at that outbound boundary. The similarly named
+   `ic/src/channels/web/openai_compat.rs` is LunarWing's inbound server endpoint,
+   not the provider implementation; its SSE shapes are useful protocol
+   references but are not the code path to extend.
 2. **Decorators** (`Retry`, `Failover`, `CircuitBreaker`, `Timeout`,
    `SmartRouting`, `Cached`, `Recording`): forward `complete_stream` to the
    inner provider, preserving each decorator's semantics. These need care —
@@ -146,11 +154,13 @@ streaming changes some decorators' contracts:
 
 - **Phase 0 — traits + default fallback (no behavior change).** Add
   `LlmStreamChunk`, `complete_stream` to both traits with `complete()`-backed
-  defaults; decorators forward. Everything compiles; nothing streams yet.
-  Verifies the abstraction with zero risk. `cargo check`.
+  defaults; decorators inherit that fallback so their existing blocking
+  semantics remain unchanged. Everything compiles; nothing streams yet. Verifies
+  the abstraction with zero risk. `cargo check`.
 - **Phase 1 — native provider streaming.** Implement `complete_stream` on the
-  OpenAI-compatible provider (`stream:true` + delta parse). Add decorator
-  forwarding with the semantics above. Unit-test the SSE parse + fallback.
+  outbound OpenAI-compatible `RigAdapter` path (`stream:true` + delta parse).
+  Add decorator forwarding with the semantics above. Unit-test the SSE parse +
+  fallback.
 - **Phase 2 — engine consumes the stream.** Engine `__llm_complete__` consumes
   chunks, emits `EventKind::ResponseDelta`; accumulate full text for step
   result. Gate behind a flag (`ENGINE_STREAMING=true`) initially.
@@ -198,4 +208,3 @@ release rebuild / tenant upgrade to take effect (same as prior gateway work).
 - Should `ENGINE_STREAMING` be its own flag or implied by `ENGINE_V2`? Proposed:
   separate flag through Phase 2-3, fold into default once proven.
 - Tool-call streaming (partial args) — defer to Phase 5; text streaming first.
-

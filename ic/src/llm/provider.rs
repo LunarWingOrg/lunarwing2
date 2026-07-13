@@ -1,6 +1,8 @@
 //! LLM provider trait and types.
 
 use async_trait::async_trait;
+use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -207,6 +209,28 @@ pub struct CompletionResponse {
     pub cache_creation_input_tokens: u32,
 }
 
+/// Incremental output from an LLM completion stream.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LlmStreamChunk {
+    /// Incremental assistant text.
+    TextDelta(String),
+    /// Incremental tool/action call data.
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        args_delta: String,
+    },
+    /// Terminal stream metadata. The stream ends after this chunk.
+    Done {
+        usage: Option<TokenUsage>,
+        finish_reason: String,
+    },
+}
+
+/// A boxed provider stream that can be consumed across async task boundaries.
+pub type LlmStream<'a> = BoxStream<'a, Result<LlmStreamChunk, LlmError>>;
+
 /// Why the completion finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
@@ -215,6 +239,19 @@ pub enum FinishReason {
     ToolUse,
     ContentFilter,
     Unknown,
+}
+
+impl FinishReason {
+    /// Return the protocol spelling used in streamed terminal metadata.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+            Self::ToolUse => "tool_calls",
+            Self::ContentFilter => "content_filter",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// Definition of a tool for the LLM.
@@ -358,6 +395,23 @@ pub struct ModelMetadata {
     pub context_length: Option<u32>,
 }
 
+/// Token usage from a single LLM call.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    /// Tokens served from the provider's server-side prompt cache (Anthropic).
+    pub cache_read_input_tokens: u32,
+    /// Tokens written to the provider's prompt cache (Anthropic).
+    pub cache_creation_input_tokens: u32,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u32 {
+        self.input_tokens + self.output_tokens
+    }
+}
+
 /// Trait for LLM providers.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -369,6 +423,29 @@ pub trait LlmProvider: Send + Sync {
 
     /// Complete a chat conversation.
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError>;
+
+    /// Complete a chat conversation as an incremental stream.
+    ///
+    /// Providers that do not support native streaming inherit a safe fallback
+    /// that performs the existing blocking completion and emits one text delta
+    /// followed by terminal metadata.
+    async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
+        let response = self.complete(request).await?;
+        let usage = TokenUsage {
+            input_tokens: response.input_tokens,
+            output_tokens: response.output_tokens,
+            cache_read_input_tokens: response.cache_read_input_tokens,
+            cache_creation_input_tokens: response.cache_creation_input_tokens,
+        };
+        let chunks = vec![
+            Ok(LlmStreamChunk::TextDelta(response.content)),
+            Ok(LlmStreamChunk::Done {
+                usage: Some(usage),
+                finish_reason: response.finish_reason.as_str().to_string(),
+            }),
+        ];
+        Ok(stream::iter(chunks).boxed())
+    }
 
     /// Complete with tool use support.
     async fn complete_with_tools(
@@ -563,7 +640,36 @@ pub fn strip_unsupported_tool_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use std::collections::HashSet;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn non_streaming_provider_falls_back_to_single_text_delta() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(crate::testing::StubLlm::new("hello"));
+        let request = CompletionRequest::new(vec![ChatMessage::user("say hello")]);
+
+        let chunks = provider
+            .complete_stream(request)
+            .await
+            .expect("fallback stream should be created")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(&chunks[0], Ok(LlmStreamChunk::TextDelta(text)) if text == "hello"));
+        match &chunks[1] {
+            Ok(LlmStreamChunk::Done {
+                usage: Some(usage),
+                finish_reason,
+            }) => {
+                assert_eq!(usage.input_tokens, 10);
+                assert_eq!(usage.output_tokens, 5);
+                assert_eq!(finish_reason, "stop");
+            }
+            other => panic!("expected terminal chunk, got {other:?}"),
+        }
+    }
 
     #[test]
     fn generate_tool_call_id_has_valid_format() {

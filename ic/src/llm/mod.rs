@@ -38,12 +38,13 @@ pub use lunarwing_cloud_chat::{
 };
 pub use provider::{
     ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, ImageUrl,
-    LlmProvider, ModelMetadata, Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
-    ToolDefinition, ToolResult, generate_tool_call_id,
+    LlmProvider, LlmStream, LlmStreamChunk, ModelMetadata, Role, TokenUsage, ToolCall,
+    ToolCompletionRequest, ToolCompletionResponse, ToolDefinition, ToolResult,
+    generate_tool_call_id,
 };
 pub use reasoning::{
     ActionPlan, Reasoning, ReasoningContext, RespondOutput, RespondResult, SILENT_REPLY_TOKEN,
-    TOOL_INTENT_NUDGE, TokenUsage, ToolSelection, is_silent_reply, llm_signals_tool_intent,
+    TOOL_INTENT_NUDGE, ToolSelection, is_silent_reply, llm_signals_tool_intent,
     user_signals_execution_intent,
 };
 pub use recording::RecordingLlm;
