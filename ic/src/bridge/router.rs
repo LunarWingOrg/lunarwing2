@@ -1354,6 +1354,42 @@ async fn matching_engine_approval_gate(
     }
 }
 
+/// Find a pending authentication gate for the message's scoped conversation.
+///
+/// Non-UUID channel scopes must resolve through the engine conversation key;
+/// treating them as an absent thread hint can consume a credential from another
+/// conversation owned by the same user.
+async fn matching_engine_auth_gate(
+    state: &EngineState,
+    message: &IncomingMessage,
+) -> PendingGateResolution {
+    let Some(conversation) = find_engine_conversation_for_message(state, message).await else {
+        return PendingGateResolution::None;
+    };
+    let mut matches: Vec<PendingGate> = state
+        .pending_gates
+        .list_for_user(&message.user_id)
+        .await
+        .into_iter()
+        .filter(|gate| {
+            gate.conversation_id == conversation.id
+                && matches!(
+                    gate.resume_kind,
+                    lunarwing_engine::ResumeKind::Authentication { .. }
+                )
+                && gate_channel_matches(gate, &message.channel)
+        })
+        .collect();
+
+    match matches.len() {
+        0 => PendingGateResolution::None,
+        1 => matches.pop().map_or(PendingGateResolution::None, |gate| {
+            PendingGateResolution::Resolved(Box::new(gate))
+        }),
+        _ => PendingGateResolution::Ambiguous,
+    }
+}
+
 /// Read-only predicate: does the user's scoped engine conversation have a
 /// pending approval gate (optionally matching `request_id`)? Never initializes
 /// or mutates engine state, so the legacy approval path stays reachable when no
@@ -2289,33 +2325,27 @@ async fn handle_with_engine_inner(
     let thread_scope = message.conversation_scope();
     let scoped_thread_id = parse_engine_thread_id(thread_scope);
 
-    if let PendingGateResolution::Resolved(gate) =
-        resolve_pending_gate_for_user(&state.pending_gates, &message.user_id, thread_scope).await
-        && matches!(
-            gate.resume_kind,
-            lunarwing_engine::ResumeKind::Authentication { .. }
-        )
-    {
-        let request_id = gate.request_id;
-        let resolution =
-            if content.trim().is_empty() || content.trim().eq_ignore_ascii_case("cancel") {
-                lunarwing_engine::GateResolution::Cancelled
-            } else {
-                lunarwing_engine::GateResolution::CredentialProvided {
-                    token: content.trim().to_string(),
-                }
-            };
-        drop(guard);
-        return resolve_gate(agent, message, gate.thread_id, request_id, resolution).await;
-    }
-
-    if matches!(
-        resolve_pending_gate_for_user(&state.pending_gates, &message.user_id, thread_scope).await,
-        PendingGateResolution::Ambiguous
-    ) {
-        return Ok(Some(
-            "Multiple authentication prompts are waiting. Reply from the original thread.".into(),
-        ));
+    match matching_engine_auth_gate(state, message).await {
+        PendingGateResolution::Resolved(gate) => {
+            let request_id = gate.request_id;
+            let resolution =
+                if content.trim().is_empty() || content.trim().eq_ignore_ascii_case("cancel") {
+                    lunarwing_engine::GateResolution::Cancelled
+                } else {
+                    lunarwing_engine::GateResolution::CredentialProvided {
+                        token: content.trim().to_string(),
+                    }
+                };
+            drop(guard);
+            return resolve_gate(agent, message, gate.thread_id, request_id, resolution).await;
+        }
+        PendingGateResolution::Ambiguous => {
+            return Ok(Some(
+                "Multiple authentication prompts are waiting. Reply from the original thread."
+                    .into(),
+            ));
+        }
+        PendingGateResolution::None => {}
     }
 
     if let Some(thread_id) = scoped_thread_id

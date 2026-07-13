@@ -533,13 +533,18 @@ impl EffectBridgeAdapter {
             let requirement = tool.requires_approval(&parameters);
             match requirement {
                 ApprovalRequirement::Always => {
-                    return Err(EngineError::LeaseDenied {
-                        reason: format!(
-                            "Tool '{}' requires explicit approval for this operation. \
-                             This action cannot be auto-approved.",
-                            action_name
-                        ),
-                    });
+                    if !approval_already_granted {
+                        return Err(Self::gate_paused(
+                            "approval",
+                            action_name,
+                            context.current_call_id.as_deref(),
+                            parameters,
+                            lunarwing_engine::ResumeKind::Approval {
+                                allow_always: false,
+                            },
+                            None,
+                        ));
+                    }
                 }
                 ApprovalRequirement::UnlessAutoApproved => {
                     let is_approved = self
@@ -1028,7 +1033,8 @@ mod tests {
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "value": { "type": "string" }
+                    "value": { "type": "string" },
+                    "always": { "type": "boolean" }
                 }
             })
         }
@@ -1044,8 +1050,16 @@ mod tests {
             ))
         }
 
-        fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-            ApprovalRequirement::UnlessAutoApproved
+        fn requires_approval(&self, params: &serde_json::Value) -> ApprovalRequirement {
+            if params
+                .get("always")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                ApprovalRequirement::Always
+            } else {
+                ApprovalRequirement::UnlessAutoApproved
+            }
         }
     }
 
@@ -1166,6 +1180,72 @@ mod tests {
             )
             .await;
         assert!(matches!(third, Err(EngineError::GatePaused { .. })));
+    }
+
+    #[tokio::test]
+    async fn always_approval_pauses_and_bypasses_only_resolved_action() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalTestTool)).await;
+
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let parameters = serde_json::json!({"value": "x", "always": true});
+
+        let first = adapter
+            .execute_action(
+                "approval_test",
+                parameters.clone(),
+                &lease(),
+                &exec_ctx(thread_id, Some("call_always_1")),
+            )
+            .await;
+        match first {
+            Err(EngineError::GatePaused {
+                call_id,
+                resume_kind,
+                ..
+            }) => {
+                assert_eq!(call_id, "call_always_1");
+                assert!(matches!(
+                    *resume_kind,
+                    lunarwing_engine::ResumeKind::Approval {
+                        allow_always: false
+                    }
+                ));
+            }
+            other => panic!("expected GatePaused, got {other:?}"),
+        }
+
+        let resolved = adapter
+            .execute_resolved_pending_action(
+                "approval_test",
+                parameters.clone(),
+                &lease(),
+                &exec_ctx(thread_id, Some("call_always_1")),
+                true,
+            )
+            .await
+            .expect("resolved Always action should execute once");
+        assert!(!resolved.is_error);
+
+        let next = adapter
+            .execute_action(
+                "approval_test",
+                parameters,
+                &lease(),
+                &exec_ctx(thread_id, Some("call_always_2")),
+            )
+            .await;
+        assert!(matches!(next, Err(EngineError::GatePaused { .. })));
     }
 
     #[derive(Default)]

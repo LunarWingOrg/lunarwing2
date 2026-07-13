@@ -24,6 +24,15 @@ use lunarwing::error::ChannelError;
 // TestChannel
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
+pub enum CapturedDelivery {
+    Status(StatusUpdate),
+    Response {
+        message: Box<IncomingMessage>,
+        response: OutgoingResponse,
+    },
+}
+
 /// A `Channel` implementation for injecting messages and capturing responses
 /// in integration tests.
 pub struct TestChannel {
@@ -37,6 +46,8 @@ pub struct TestChannel {
     pub responses: Arc<Mutex<Vec<OutgoingResponse>>>,
     /// Captured status events.
     status_events: Arc<Mutex<Vec<StatusUpdate>>>,
+    /// Statuses and responses in the exact order delivered through the channel.
+    deliveries: Arc<Mutex<Vec<CapturedDelivery>>>,
     /// Tracks when each tool started (by name). Supports nested/overlapping tools
     /// by using a Vec of start times per tool name.
     tool_start_times: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
@@ -68,6 +79,7 @@ impl TestChannel {
             rx: Mutex::new(Some(rx)),
             responses: Arc::new(Mutex::new(Vec::new())),
             status_events: Arc::new(Mutex::new(Vec::new())),
+            deliveries: Arc::new(Mutex::new(Vec::new())),
             tool_start_times: Arc::new(Mutex::new(HashMap::new())),
             tool_timings: Arc::new(Mutex::new(Vec::new())),
             user_id: user_id.into(),
@@ -158,6 +170,14 @@ impl TestChannel {
             .clone()
     }
 
+    /// Return a snapshot of status and response deliveries in call order.
+    pub fn captured_deliveries(&self) -> Vec<CapturedDelivery> {
+        self.deliveries
+            .try_lock()
+            .expect("captured_deliveries lock contention")
+            .clone()
+    }
+
     /// Return the names of all `ToolStarted` events captured so far.
     pub fn tool_calls_started(&self) -> Vec<String> {
         self.captured_status_events()
@@ -205,6 +225,7 @@ impl TestChannel {
     pub async fn clear(&self) {
         self.responses.lock().await.clear();
         self.status_events.lock().await.clear();
+        self.deliveries.lock().await.clear();
         self.tool_start_times.lock().await.clear();
         self.tool_timings.lock().await.clear();
     }
@@ -319,9 +340,16 @@ impl Channel for TestChannel {
 
     async fn respond(
         &self,
-        _msg: &IncomingMessage,
+        msg: &IncomingMessage,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
+        self.deliveries
+            .lock()
+            .await
+            .push(CapturedDelivery::Response {
+                message: Box::new(msg.clone()),
+                response: response.clone(),
+            });
         self.responses.lock().await.push(response);
         Ok(())
     }
@@ -331,6 +359,10 @@ impl Channel for TestChannel {
         status: StatusUpdate,
         _metadata: &serde_json::Value,
     ) -> Result<(), ChannelError> {
+        self.deliveries
+            .lock()
+            .await
+            .push(CapturedDelivery::Status(status.clone()));
         // Capture timing before pushing to events.
         match &status {
             StatusUpdate::ToolStarted { name } => {

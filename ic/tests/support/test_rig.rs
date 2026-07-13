@@ -15,12 +15,13 @@ use lunarwing::channels::web::log_layer::LogBroadcaster;
 use lunarwing::channels::{OutgoingResponse, StatusUpdate};
 use lunarwing::config::Config;
 use lunarwing::db::Database;
+use lunarwing::hooks::Hook;
 use lunarwing::llm::{LlmProvider, SessionConfig, SessionManager};
 use lunarwing::tools::Tool;
 
 use crate::support::instrumented_llm::InstrumentedLlm;
 use crate::support::metrics::{ToolInvocation, TraceMetrics};
-use crate::support::test_channel::{TestChannel, TestChannelHandle};
+use crate::support::test_channel::{CapturedDelivery, TestChannel, TestChannelHandle};
 use crate::support::trace_llm::{LlmTrace, TraceLlm};
 
 use lunarwing::llm::recording::{HttpExchange, HttpInterceptor, ReplayingHttpInterceptor};
@@ -126,6 +127,11 @@ impl TestRig {
     /// Return a snapshot of all captured status events.
     pub fn captured_status_events(&self) -> Vec<StatusUpdate> {
         self.channel.captured_status_events()
+    }
+
+    /// Return status and response deliveries in exact channel call order.
+    pub fn captured_deliveries(&self) -> Vec<CapturedDelivery> {
+        self.channel.captured_deliveries()
     }
 
     /// Clear all captured responses and status events.
@@ -384,6 +390,7 @@ pub struct TestRigBuilder {
     enable_routines: bool,
     http_exchanges: Vec<HttpExchange>,
     extra_tools: Vec<Arc<dyn Tool>>,
+    extra_hooks: Vec<Arc<dyn Hook>>,
     wasm_tools: Vec<WasmToolSpec>,
     keep_bootstrap: bool,
     channel_name: String,
@@ -403,6 +410,7 @@ impl TestRigBuilder {
             enable_routines: false,
             http_exchanges: Vec::new(),
             extra_tools: Vec::new(),
+            extra_hooks: Vec::new(),
             wasm_tools: Vec::new(),
             keep_bootstrap: false,
             channel_name: "test".to_string(),
@@ -448,6 +456,12 @@ impl TestRigBuilder {
     /// Override the in-process channel name.
     pub fn with_channel_name(mut self, channel_name: impl Into<String>) -> Self {
         self.channel_name = channel_name.into();
+        self
+    }
+
+    /// Register an additional lifecycle hook in the test agent.
+    pub fn with_hook(mut self, hook: Arc<dyn Hook>) -> Self {
+        self.extra_hooks.push(hook);
         self
     }
 
@@ -536,6 +550,7 @@ impl TestRigBuilder {
             enable_routines,
             http_exchanges: explicit_http_exchanges,
             extra_tools,
+            extra_hooks,
             wasm_tools,
             keep_bootstrap,
             channel_name,
@@ -632,6 +647,9 @@ impl TestRigBuilder {
         components.config.agent.allow_local_tools = true;
         if let Some(timeout) = handle_message_timeout {
             components.config.agent.handle_message_timeout = timeout;
+        }
+        for hook in extra_hooks {
+            components.hooks.register(hook).await;
         }
 
         let scheduler_slot: lunarwing::tools::builtin::SchedulerSlot =
