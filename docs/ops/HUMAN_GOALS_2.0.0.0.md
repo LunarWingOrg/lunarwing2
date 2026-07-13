@@ -16,7 +16,7 @@
 6. [ ] Drop legacy `ironclaw-agent-v1` subprotocol offer from the daemon (delete the `SUBPROTOCOL_LEGACY` offer in `ic/src/orchestrator/external_worker.rs`) and `git rm` the 1.1.9-only repo-root compat symlinks `ironclaw_weechat_wss`, `darkirc_channel_for_ironclaw` (deployed tenants must have re-run mt-admin unit regen by then) (open pr)
 7. [x] LunarWing Web UI performance overhaul - lot of issues with UI - laggy, buttons dont animate, etc
 8. [x] LunarWing Web MT admin setup integration (part 2 of an earlier plan discussed some time ago) - started - go see: lunarwing_mt_onboard_web/ - this is being worked on by another agent or human
-9. [x] Refine lunarwing web mt admin setup with more user options or build options. Other ideas: more sprites, splash screen, optional mascot, show tips on side panel instead of mascot?
+9. [ ] Refine lunarwing web mt admin setup with more user options or build options. Other ideas: more sprites, splash screen, optional mascot, show tips on side panel instead of mascot? there is old closed pr with some other stuff w branch rarity/item-11-20260712-1936
 10. [ ] PRs/branch review
 11. [ ] Inspect status of cargo crates and create documented report of any crates that might still need to be updated. Verify if the info dump below is still correct, then write up a document in docs/ops detailing the status: is each piece verifiable? what outstanding issues remain? which points have already been addressed? (open pr)
     <details>
