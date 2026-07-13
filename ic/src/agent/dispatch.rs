@@ -34,12 +34,12 @@ impl DeferredMessages {
         }
     }
 
-    pub(super) fn defer(&mut self, message: IncomingMessage) -> Result<(), IncomingMessage> {
+    pub(super) fn defer(&mut self, message: IncomingMessage) -> Option<IncomingMessage> {
         if self.queue.len() >= self.capacity {
-            return Err(message);
+            return Some(message);
         }
         self.queue.push_back(message);
-        Ok(())
+        None
     }
 
     pub(super) fn pop_front(&mut self) -> Option<IncomingMessage> {
@@ -65,17 +65,20 @@ mod tests {
     fn only_exact_interrupt_submissions_are_priority() {
         assert!(is_priority_interrupt(&message("/interrupt")));
         assert!(is_priority_interrupt(&message("/stop")));
+        assert!(is_priority_interrupt(&message(" /STOP ")));
         assert!(!is_priority_interrupt(&message("please interrupt this")));
+        assert!(!is_priority_interrupt(&message("please /stop after this")));
         assert!(!is_priority_interrupt(&message("/interrupt later")));
+        assert!(!is_priority_interrupt(&message("/stop now")));
         assert!(!is_priority_interrupt(&message("/clear")));
     }
 
     #[test]
     fn deferred_messages_are_fifo_and_bounded() {
         let mut queue = DeferredMessages::with_capacity_for_test(2);
-        assert!(queue.defer(message("first")).is_ok());
-        assert!(queue.defer(message("second")).is_ok());
-        let rejected = queue.defer(message("third")).expect_err("queue is full");
+        assert!(queue.defer(message("first")).is_none());
+        assert!(queue.defer(message("second")).is_none());
+        let rejected = queue.defer(message("third")).expect("queue is full");
         assert_eq!(rejected.content, "third");
         assert_eq!(
             queue.pop_front().map(|message| message.content),

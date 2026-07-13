@@ -15,6 +15,9 @@ use futures::StreamExt;
 use uuid::Uuid;
 
 use crate::agent::context_monitor::ContextMonitor;
+use crate::agent::dispatch::{
+    DEFERRED_QUEUE_FULL_RESPONSE, DeferredMessages, is_priority_interrupt,
+};
 use crate::agent::heartbeat::spawn_heartbeat;
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
@@ -44,6 +47,63 @@ use crate::workspace::Workspace;
 /// margin, so the `TimeoutProvider` is guaranteed to fire before this grace
 /// elapses. Keeping one constant prevents the two files from drifting.
 pub(crate) const HARD_KILL_GRACE_SECS: u64 = 30;
+
+enum MessageLoopControl {
+    Continue,
+    Shutdown,
+}
+
+enum ActiveMessageResult {
+    Completed(Result<Result<Option<String>, Error>, tokio::task::JoinError>),
+    TimedOut,
+    Shutdown(ShutdownSignal),
+}
+
+enum ShutdownSignal {
+    CtrlC,
+    Sigterm,
+}
+
+#[cfg(unix)]
+type SigtermReceiver = Option<tokio::signal::unix::Signal>;
+
+#[cfg(not(unix))]
+type SigtermReceiver = ();
+
+#[cfg(unix)]
+fn register_sigterm() -> SigtermReceiver {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    match signal(SignalKind::terminate()) {
+        Ok(signal) => Some(signal),
+        Err(error) => {
+            tracing::warn!("Failed to register SIGTERM handler: {error}");
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn register_sigterm() -> SigtermReceiver {}
+
+#[cfg(unix)]
+async fn recv_sigterm(receiver: &mut SigtermReceiver) {
+    if let Some(signal) = receiver {
+        signal.recv().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn recv_sigterm(_receiver: &mut SigtermReceiver) {
+    std::future::pending::<()>().await;
+}
+
+async fn abort_and_wait<T>(handle: &mut tokio::task::JoinHandle<T>) {
+    handle.abort();
+    let _ = handle.await;
+}
 
 /// Static greeting persisted to DB and broadcast on first launch.
 ///
@@ -874,275 +934,115 @@ impl Agent {
         // Main message loop
         tracing::info!("Agent {} ready and listening", self.config.name);
 
-        #[cfg(unix)]
-        let mut sigterm = {
-            use tokio::signal::unix::{SignalKind, signal};
-            match signal(SignalKind::terminate()) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    tracing::warn!("Failed to register SIGTERM handler: {}", e);
-                    None
-                }
-            }
-        };
+        let mut sigterm = register_sigterm();
+        let mut deferred_messages = DeferredMessages::new();
+        let mut channels_open = true;
 
-        loop {
-            let message = tokio::select! {
-                biased;
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Ctrl+C received, shutting down...");
-                    break;
-                }
-                _ = async {
-                    #[cfg(unix)]
-                    if let Some(ref mut s) = sigterm {
-                        s.recv().await;
-                    } else {
-                        std::future::pending::<()>().await;
+        'message_loop: loop {
+            if !channels_open && deferred_messages.is_empty() {
+                tracing::warn!("All channel streams ended, shutting down...");
+                break;
+            }
+
+            let message = if let Some(message) = deferred_messages.pop_front() {
+                message
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::info!("Ctrl+C received, shutting down...");
+                        break 'message_loop;
                     }
-                    #[cfg(not(unix))]
-                    std::future::pending::<()>().await;
-                } => {
-                    tracing::warn!("SIGTERM received, shutting down gracefully...");
-                    break;
-                }
-                msg = message_stream.next() => {
-                    match msg {
-                        Some(m) => m,
-                        None => {
-                            tracing::warn!("All channel streams ended, shutting down...");
-                            break;
+                    _ = recv_sigterm(&mut sigterm) => {
+                        tracing::warn!("SIGTERM received, shutting down gracefully...");
+                        break 'message_loop;
+                    }
+                    incoming = message_stream.next() => {
+                        match incoming {
+                            Some(message) => message,
+                            None => {
+                                channels_open = false;
+                                continue 'message_loop;
+                            }
                         }
                     }
                 }
             };
 
-            // Apply transcription middleware to audio attachments
-            let mut message = message;
-            if let Some(ref transcription) = self.deps.transcription {
-                transcription.process(&mut message).await;
-            }
-
-            // Apply document extraction middleware to document attachments
-            if let Some(ref doc_extraction) = self.deps.document_extraction {
-                doc_extraction.process(&mut message).await;
-            }
-
-            // Store successfully extracted document text in workspace for indexing
-            self.store_extracted_documents(&message).await;
-
-            // Spawn handle_message as a background task so it can complete
-            // naturally (calling complete_turn/fail_turn) even if the soft
-            // timeout fires. This prevents the thread from getting stuck in
-            // Processing state forever.
+            let message = self.prepare_message(message).await;
             let suppressed = Arc::new(AtomicBool::new(false));
             let agent = Arc::clone(&self);
-            let msg = message.clone();
-            let suppressed_task = Arc::clone(&suppressed);
-            let handle =
-                tokio::spawn(async move { agent.handle_message(&msg, &suppressed_task).await });
+            let task_message = message.clone();
+            let task_suppressed = Arc::clone(&suppressed);
+            let mut handle =
+                tokio::spawn(
+                    async move { agent.handle_message(&task_message, &task_suppressed).await },
+                );
             let abort_handle = handle.abort_handle();
-
             let soft_timeout = self.config.handle_message_timeout;
-            match tokio::time::timeout(soft_timeout, handle).await {
-                // ── Soft timeout: task keeps running, user gets immediate feedback ──
-                Err(_elapsed) => {
-                    suppressed.store(true, Ordering::SeqCst);
-                    tracing::error!(
-                        timeout_secs = soft_timeout.as_secs(),
-                        channel = %message.channel,
-                        user = %message.user_id,
-                        "handle_message soft timeout — response suppressed, task continues"
-                    );
-                    // Log thread state at soft timeout for debugging follow-up-message issues
-                    {
-                        let (session, thread_id) = self
-                            .session_manager
-                            .resolve_thread(
-                                &message.user_id,
-                                &message.channel,
-                                message.conversation_scope(),
-                            )
-                            .await;
-                        let sess = session.lock().await;
-                        if let Some(thread) = sess.threads.get(&thread_id) {
-                            tracing::warn!(
-                                %thread_id,
-                                state = ?thread.state,
-                                pending_messages = thread.pending_messages.len(),
-                                "SOFT TIMEOUT: thread state snapshot"
-                            );
-                        }
+            let deadline = tokio::time::sleep(soft_timeout);
+            tokio::pin!(deadline);
+
+            let active_result = loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::signal::ctrl_c() => {
+                        break ActiveMessageResult::Shutdown(ShutdownSignal::CtrlC);
                     }
-
-                    let _ = self
-                        .channels
-                        .respond(
-                            &message,
-                            OutgoingResponse::text(
-                                "Sorry, your request timed out. Please try again.".to_string(),
-                            ),
-                        )
-                        .await;
-
-                    // Hard-kill timer: after a short grace period, abort the
-                    // orphaned task and force-reset thread state + pending queue.
-                    let hard_agent = Arc::clone(&self);
-                    let hard_user = message.user_id.clone();
-                    let hard_channel = message.channel.clone();
-                    let hard_scope = message.conversation_scope().map(String::from);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(HARD_KILL_GRACE_SECS)).await;
-
-                        abort_handle.abort();
-
-                        let (session, thread_id) = hard_agent
-                            .session_manager
-                            .resolve_thread(&hard_user, &hard_channel, hard_scope.as_deref())
-                            .await;
-                        let mut sess = session.lock().await;
-                        if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                            let pre_state = thread.state;
-                            if thread.state == ThreadState::Processing {
-                                // Preserve the pending queue. The `abort()` above
-                                // guarantees the orphaned task can no longer emit a
-                                // response, so the "confusing concurrent response"
-                                // risk that originally justified clearing no longer
-                                // applies at the hard-kill. `fail_turn` (unlike the
-                                // removed `fail_turn_hard`) leaves `pending_messages`
-                                // intact, so the user's queued follow-up is drained by
-                                // their next turn instead of being silently dropped.
-                                let preserved = thread.pending_messages.len();
-                                thread.fail_turn("handle_message hard timeout");
-                                tracing::warn!(
-                                    thread_id = %thread_id,
-                                    ?pre_state,
-                                    new_state = ?thread.state,
-                                    preserved_pending = preserved,
-                                    "HARD TIMEOUT: aborted task, reset thread, preserved pending messages for next turn"
-                                );
-                            } else {
-                                tracing::debug!(
-                                    thread_id = %thread_id,
-                                    ?pre_state,
-                                    pending_messages = thread.pending_messages.len(),
-                                    "HARD TIMEOUT: thread not in Processing, no action taken"
-                                );
-                            }
-                        }
-                    });
-
-                    continue;
-                }
-                // ── Task panicked ──
-                Ok(Err(join_error)) => {
-                    tracing::error!(
-                        channel = %message.channel,
-                        user = %message.user_id,
-                        error = %join_error,
-                        "handle_message task panicked"
-                    );
-
-                    // Safety net: reset thread state after panic
-                    let (session, thread_id) = self
-                        .session_manager
-                        .resolve_thread(
-                            &message.user_id,
-                            &message.channel,
-                            message.conversation_scope(),
-                        )
-                        .await;
-                    {
-                        let mut sess = session.lock().await;
-                        if let Some(thread) = sess.threads.get_mut(&thread_id)
-                            && thread.state == ThreadState::Processing
-                        {
-                            thread.fail_turn("handle_message panicked");
-                            tracing::warn!(
-                                thread_id = %thread_id,
-                                "Reset stuck thread after panic"
-                            );
-                        }
+                    _ = recv_sigterm(&mut sigterm) => {
+                        break ActiveMessageResult::Shutdown(ShutdownSignal::Sigterm);
                     }
-
-                    let _ = self
-                        .channels
-                        .respond(
-                            &message,
-                            OutgoingResponse::text(
-                                "Sorry, something went wrong. Please try again.".to_string(),
-                            ),
-                        )
-                        .await;
-                }
-                // ── Normal completion ──
-                Ok(Ok(Ok(Some(response)))) if !response.is_empty() => {
-                    // Hook: BeforeOutbound — allow hooks to modify or suppress outbound
-                    let event = crate::hooks::HookEvent::Outbound {
-                        user_id: message.user_id.clone(),
-                        channel: message.channel.clone(),
-                        content: response.clone(),
-                        thread_id: message.thread_id.clone(),
-                    };
-                    match self.hooks().run(&event).await {
-                        Err(err) => {
-                            tracing::warn!("BeforeOutbound hook blocked response: {}", err);
-                        }
-                        Ok(crate::hooks::HookOutcome::Continue {
-                            modified: Some(new_content),
-                        }) => {
-                            if let Err(e) = self
-                                .channels
-                                .respond(&message, OutgoingResponse::text(new_content))
-                                .await
-                            {
-                                tracing::error!(
-                                    channel = %message.channel,
-                                    error = %e,
-                                    "Failed to send response to channel"
-                                );
+                    result = &mut handle => {
+                        break ActiveMessageResult::Completed(result);
+                    }
+                    _ = &mut deadline => {
+                        break ActiveMessageResult::TimedOut;
+                    }
+                    incoming = message_stream.next(), if channels_open => {
+                        match incoming {
+                            Some(incoming) if is_priority_interrupt(&incoming) => {
+                                self.handle_priority_interrupt(incoming).await;
                             }
-                        }
-                        _ => {
-                            if let Err(e) = self
-                                .channels
-                                .respond(&message, OutgoingResponse::text(response))
-                                .await
-                            {
-                                tracing::error!(
-                                    channel = %message.channel,
-                                    error = %e,
-                                    "Failed to send response to channel"
-                                );
+                            Some(incoming) => {
+                                if let Some(rejected) = deferred_messages.defer(incoming) {
+                                    let result = Ok(Some(DEFERRED_QUEUE_FULL_RESPONSE.to_string()));
+                                    let _ = self.deliver_message_result(&rejected, result).await;
+                                }
                             }
+                            None => channels_open = false,
                         }
                     }
                 }
-                Ok(Ok(Ok(Some(empty)))) => {
-                    tracing::debug!(
-                        channel = %message.channel,
-                        user = %message.user_id,
-                        empty_len = empty.len(),
-                        "Suppressed empty response (not sent to channel)"
-                    );
+            };
+
+            match active_result {
+                ActiveMessageResult::Completed(Ok(result)) => {
+                    if matches!(
+                        self.deliver_message_result(&message, result).await,
+                        MessageLoopControl::Shutdown
+                    ) {
+                        tracing::info!("Shutdown command received, exiting...");
+                        break;
+                    }
                 }
-                Ok(Ok(Ok(None))) => {
-                    tracing::info!("Shutdown command received, exiting...");
+                ActiveMessageResult::Completed(Err(join_error)) => {
+                    self.handle_message_panic(&message, &join_error).await;
+                }
+                ActiveMessageResult::TimedOut => {
+                    self.handle_soft_timeout(&message, &suppressed, soft_timeout, abort_handle)
+                        .await;
+                }
+                ActiveMessageResult::Shutdown(signal) => {
+                    abort_and_wait(&mut handle).await;
+                    match signal {
+                        ShutdownSignal::CtrlC => {
+                            tracing::info!("Ctrl+C received, shutting down...");
+                        }
+                        ShutdownSignal::Sigterm => {
+                            tracing::warn!("SIGTERM received, shutting down gracefully...");
+                        }
+                    }
                     break;
-                }
-                Ok(Ok(Err(e))) => {
-                    tracing::error!("Error handling message: {}", e);
-                    if let Err(send_err) = self
-                        .channels
-                        .respond(&message, OutgoingResponse::text(format!("Error: {}", e)))
-                        .await
-                    {
-                        tracing::error!(
-                            channel = %message.channel,
-                            error = %send_err,
-                            "Failed to send error response to channel"
-                        );
-                    }
                 }
             }
         }
@@ -1161,6 +1061,226 @@ impl Agent {
         self.channels.shutdown_all().await?;
 
         Ok(())
+    }
+
+    async fn prepare_message(&self, mut message: IncomingMessage) -> IncomingMessage {
+        if let Some(ref transcription) = self.deps.transcription {
+            transcription.process(&mut message).await;
+        }
+        if let Some(ref document_extraction) = self.deps.document_extraction {
+            document_extraction.process(&mut message).await;
+        }
+        self.store_extracted_documents(&message).await;
+        message
+    }
+
+    async fn handle_priority_interrupt(&self, message: IncomingMessage) {
+        let suppressed = AtomicBool::new(false);
+        let result = self.handle_message(&message, &suppressed).await;
+        let _ = self.deliver_message_result(&message, result).await;
+    }
+
+    async fn deliver_message_result(
+        &self,
+        message: &IncomingMessage,
+        result: Result<Option<String>, Error>,
+    ) -> MessageLoopControl {
+        match result {
+            Ok(Some(response)) if !response.is_empty() => {
+                self.deliver_outbound_with_hooks(message, response).await;
+                MessageLoopControl::Continue
+            }
+            Ok(Some(empty)) => {
+                tracing::debug!(
+                    channel = %message.channel,
+                    user = %message.user_id,
+                    empty_len = empty.len(),
+                    "Suppressed empty response (not sent to channel)"
+                );
+                MessageLoopControl::Continue
+            }
+            Ok(None) => MessageLoopControl::Shutdown,
+            Err(error) => {
+                tracing::error!("Error handling message: {error}");
+                if let Err(send_error) = self
+                    .channels
+                    .respond(message, OutgoingResponse::text(format!("Error: {error}")))
+                    .await
+                {
+                    tracing::error!(
+                        channel = %message.channel,
+                        error = %send_error,
+                        "Failed to send error response to channel"
+                    );
+                }
+                MessageLoopControl::Continue
+            }
+        }
+    }
+
+    async fn deliver_outbound_with_hooks(&self, message: &IncomingMessage, response: String) {
+        let event = crate::hooks::HookEvent::Outbound {
+            user_id: message.user_id.clone(),
+            channel: message.channel.clone(),
+            content: response.clone(),
+            thread_id: message.thread_id.clone(),
+        };
+        match self.hooks().run(&event).await {
+            Err(error) => {
+                tracing::warn!("BeforeOutbound hook blocked response: {error}");
+            }
+            Ok(crate::hooks::HookOutcome::Continue {
+                modified: Some(new_content),
+            }) => {
+                if let Err(error) = self
+                    .channels
+                    .respond(message, OutgoingResponse::text(new_content))
+                    .await
+                {
+                    tracing::error!(
+                        channel = %message.channel,
+                        error = %error,
+                        "Failed to send response to channel"
+                    );
+                }
+            }
+            _ => {
+                if let Err(error) = self
+                    .channels
+                    .respond(message, OutgoingResponse::text(response))
+                    .await
+                {
+                    tracing::error!(
+                        channel = %message.channel,
+                        error = %error,
+                        "Failed to send response to channel"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn handle_message_panic(
+        &self,
+        message: &IncomingMessage,
+        join_error: &tokio::task::JoinError,
+    ) {
+        tracing::error!(
+            channel = %message.channel,
+            user = %message.user_id,
+            error = %join_error,
+            "handle_message task panicked"
+        );
+
+        let (session, thread_id) = self
+            .session_manager
+            .resolve_thread(
+                &message.user_id,
+                &message.channel,
+                message.conversation_scope(),
+            )
+            .await;
+        {
+            let mut session = session.lock().await;
+            if let Some(thread) = session.threads.get_mut(&thread_id)
+                && thread.state == ThreadState::Processing
+            {
+                thread.fail_turn("handle_message panicked");
+                tracing::warn!(thread_id = %thread_id, "Reset stuck thread after panic");
+            }
+        }
+
+        let _ = self
+            .channels
+            .respond(
+                message,
+                OutgoingResponse::text(
+                    "Sorry, something went wrong. Please try again.".to_string(),
+                ),
+            )
+            .await;
+    }
+
+    async fn handle_soft_timeout(
+        self: &Arc<Self>,
+        message: &IncomingMessage,
+        suppressed: &AtomicBool,
+        soft_timeout: Duration,
+        abort_handle: tokio::task::AbortHandle,
+    ) {
+        suppressed.store(true, Ordering::SeqCst);
+        tracing::error!(
+            timeout_secs = soft_timeout.as_secs(),
+            channel = %message.channel,
+            user = %message.user_id,
+            "handle_message soft timeout — response suppressed, task continues"
+        );
+
+        let (session, thread_id) = self
+            .session_manager
+            .resolve_thread(
+                &message.user_id,
+                &message.channel,
+                message.conversation_scope(),
+            )
+            .await;
+        {
+            let session = session.lock().await;
+            if let Some(thread) = session.threads.get(&thread_id) {
+                tracing::warn!(
+                    %thread_id,
+                    state = ?thread.state,
+                    pending_messages = thread.pending_messages.len(),
+                    "SOFT TIMEOUT: thread state snapshot"
+                );
+            }
+        }
+
+        let _ = self
+            .channels
+            .respond(
+                message,
+                OutgoingResponse::text(
+                    "Sorry, your request timed out. Please try again.".to_string(),
+                ),
+            )
+            .await;
+
+        let hard_agent = Arc::clone(self);
+        let hard_user = message.user_id.clone();
+        let hard_channel = message.channel.clone();
+        let hard_scope = message.conversation_scope().map(String::from);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(HARD_KILL_GRACE_SECS)).await;
+            abort_handle.abort();
+
+            let (session, thread_id) = hard_agent
+                .session_manager
+                .resolve_thread(&hard_user, &hard_channel, hard_scope.as_deref())
+                .await;
+            let mut session = session.lock().await;
+            if let Some(thread) = session.threads.get_mut(&thread_id) {
+                let pre_state = thread.state;
+                if thread.state == ThreadState::Processing {
+                    let preserved = thread.pending_messages.len();
+                    thread.fail_turn("handle_message hard timeout");
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        ?pre_state,
+                        new_state = ?thread.state,
+                        preserved_pending = preserved,
+                        "HARD TIMEOUT: aborted task, reset thread, preserved pending messages for next turn"
+                    );
+                } else {
+                    tracing::debug!(
+                        thread_id = %thread_id,
+                        ?pre_state,
+                        pending_messages = thread.pending_messages.len(),
+                        "HARD TIMEOUT: thread not in Processing, no action taken"
+                    );
+                }
+            }
+        });
     }
 
     /// Store extracted document text in workspace memory for future search/recall.
@@ -1714,12 +1834,44 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::sync::Notify;
+
     use super::{
-        chat_tool_execution_metadata, resolve_routine_notification_user,
+        abort_and_wait, chat_tool_execution_metadata, resolve_routine_notification_user,
         should_fallback_routine_notification, truncate_for_preview,
     };
     use crate::channels::IncomingMessage;
     use crate::error::ChannelError;
+
+    #[tokio::test]
+    async fn abort_and_wait_drops_the_active_handler_before_returning() {
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let started = Arc::new(Notify::new());
+        let task_started = Arc::clone(&started);
+        let mut handle = tokio::spawn(async move {
+            let _flag = DropFlag(task_dropped);
+            task_started.notify_one();
+            std::future::pending::<()>().await;
+        });
+        started.notified().await;
+
+        abort_and_wait(&mut handle).await;
+
+        assert!(handle.is_finished());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn test_truncate_short_input() {

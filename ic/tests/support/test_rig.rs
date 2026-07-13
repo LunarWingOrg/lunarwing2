@@ -341,6 +341,15 @@ impl TestRig {
             handle.abort();
         }
     }
+
+    /// Abort the background agent and wait until cancellation has completed.
+    pub async fn shutdown_and_wait(mut self) {
+        self.channel.signal_shutdown();
+        if let Some(handle) = self.agent_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
 }
 
 impl Drop for TestRig {
@@ -378,6 +387,7 @@ pub struct TestRigBuilder {
     wasm_tools: Vec<WasmToolSpec>,
     keep_bootstrap: bool,
     channel_name: String,
+    handle_message_timeout: Option<Duration>,
 }
 
 impl TestRigBuilder {
@@ -396,6 +406,7 @@ impl TestRigBuilder {
             wasm_tools: Vec::new(),
             keep_bootstrap: false,
             channel_name: "test".to_string(),
+            handle_message_timeout: None,
         }
     }
 
@@ -437,6 +448,12 @@ impl TestRigBuilder {
     /// Override the in-process channel name.
     pub fn with_channel_name(mut self, channel_name: impl Into<String>) -> Self {
         self.channel_name = channel_name.into();
+        self
+    }
+
+    /// Override the agent's soft timeout for lifecycle tests.
+    pub fn with_handle_message_timeout(mut self, timeout: Duration) -> Self {
+        self.handle_message_timeout = Some(timeout);
         self
     }
 
@@ -522,6 +539,7 @@ impl TestRigBuilder {
             wasm_tools,
             keep_bootstrap,
             channel_name,
+            handle_message_timeout,
         } = self;
 
         // 1. Create temp dir + libSQL database + run migrations.
@@ -612,6 +630,9 @@ impl TestRigBuilder {
         // Force test-rig agent flags to the requested deterministic values.
         components.config.agent.auto_approve_tools = auto_approve_tools.unwrap_or(true);
         components.config.agent.allow_local_tools = true;
+        if let Some(timeout) = handle_message_timeout {
+            components.config.agent.handle_message_timeout = timeout;
+        }
 
         let scheduler_slot: lunarwing::tools::builtin::SchedulerSlot =
             Arc::new(tokio::sync::RwLock::new(None));
