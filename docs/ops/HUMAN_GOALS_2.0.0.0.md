@@ -1,19 +1,23 @@
-# AGENT PRE-RELEASE CHECKLIST for 2.0.0.0 Codename `Lightning`
+# PRE-RELEASE CHECKLIST for LunarWing v2.0.0.0 Codename `Kosoku (光速)`
 
-**Open TODOs (2.0.0.0) — To be done before release**
+## Release Codename:  光速
+## English Context:   Kōsoku / Kosoku
+## Pronunciation:     こうそく (kō-soku)
+
+**Open TODOs (v2.0.0.0) — To be done before release**
 
 ---
 
-1. [x] Ensure references to 1.2.0 in the code and documentation are replaced by 2.0.0 (where applicable only of course)
+1. [x] Ensure references to 1.2.0 in the code and documentation are replaced by 2.0.0.0 (or 2.0.0)
 2. [x] Create ov dir ( cd {this repo} && mkdir -p docs/ov/ )
-3. [x] Bump crates version from 1.1.9 to 2.0.0
+3. [x] Bump crates version from 1.1.9 to 2.0.0 (crate version schema remains unchanged from v1 days)
 4. [x] Make sure you DIDNT MISS ANY CRATES. RELEVANT LUNARWING crates and things such as xmpp bridge and wasm channels must have 2.0.0 version, NOT 1.1.9 or 1.1.8
-5. [ ] Multiple steps here for this one: First, read the blog post: https://blog.lunarwing.org/2026/07/12/lunarwingv2-the-next-frontier-of-private-self-hosted-ai-agents/ — THEN: Analyze the features not yet included in this AGENT_GOALS_2.0.0.0.md or in docs/ops/ROADMAP_2026.md and document all of them into a new document under docs/proposals please. (open pr)
+5. [x] Multiple steps here for this one: First, read the blog post: https://blog.lunarwing.org/2026/07/12/lunarwingv2-the-next-frontier-of-private-self-hosted-ai-agents/ — THEN: Analyze the features not yet included in this AGENT_GOALS_2.0.0.0.md or in docs/ops/ROADMAP_2026.md and document all of them into a new document under docs/proposals please. (open pr)
 6. [ ] Drop legacy `ironclaw-agent-v1` subprotocol offer from the daemon (delete the `SUBPROTOCOL_LEGACY` offer in `ic/src/orchestrator/external_worker.rs`) and `git rm` the 1.1.9-only repo-root compat symlinks `ironclaw_weechat_wss`, `darkirc_channel_for_ironclaw` (deployed tenants must have re-run mt-admin unit regen by then) (open pr)
 7. [x] LunarWing Web UI performance overhaul - lot of issues with UI - laggy, buttons dont animate, etc
 8. [x] LunarWing Web MT admin setup integration (part 2 of an earlier plan discussed some time ago) - started - go see: lunarwing_mt_onboard_web/ - this is being worked on by another agent or human
-9. [ ] Refine lunarwing web mt admin setup with more user options or build options. Other ideas: more sprites, splash screen, optional mascot, show tips on side panel instead of mascot?
-10. [ ] Write up a short doc with details of currently open PRs and Issues. Save it to docs/ops (open pr)
+9. [x] Refine lunarwing web mt admin setup with more user options or build options. Other ideas: more sprites, splash screen, optional mascot, show tips on side panel instead of mascot?
+10. [x] Write up a short doc with details of currently open PRs and Issues. Save it to docs/ops (open pr)
 11. [ ] Inspect status of cargo crates and create documented report of any crates that might still need to be updated. Verify if the info dump below is still correct, then write up a document in docs/ops detailing the status: is each piece verifiable? what outstanding issues remain? which points have already been addressed? (open pr)
     <details>
     <summary><b>INFO DUMP — Crate audit reference</b></summary>
