@@ -2,8 +2,7 @@
 
 ## Status
 
-Implemented and live SSE/persistence verified; browser visual verification is
-pending.
+Implemented and live verified.
 
 This design follows the completed Phase 2 work in
 `docs/proposals/ENGINE_LLM_STREAMING.md` and the approved channel-neutral
@@ -168,4 +167,5 @@ Gateway `2026.3.2` passed for both a new-thread first message (3 chunks) and an
 existing-thread continuation (93 chunks). Each case produced exactly one later
 terminal response on the same thread, showed no paired duplicate emission, and
 matched DB-backed persisted history. No receiver-lag warning or engine delivery
-error was logged. Browser visual verification remains pending.
+error was logged. The user also confirmed incremental text rendering in the
+live Gateway UI.

@@ -284,7 +284,7 @@ git diff --check
   matches the terminal content, including on a new thread's first message and an
   existing-thread continuation.
 
-- [ ] **Step 5: Browser UI check** — confirm partial text appears incrementally
+- [x] **Step 5: Browser UI check** — confirm partial text appears incrementally
   in one streaming bubble, then is replaced once by the markdown-rendered final
   response without a duplicate or orphan bubble.
 
@@ -296,6 +296,7 @@ Live verification on TensorZero Gateway `2026.3.2`:
   paired duplicate emission, persisted history matched.
 - The daemon logged no engine receiver lag or engine delivery error for either
   case.
+- The user confirmed incremental text rendering in the live Gateway UI.
 
 ## Notes / boundaries
 
