@@ -575,6 +575,7 @@ enum LlmHostCallOutcome {
 /// `cancellation.run_until_cancelled`, so a stop drops the in-flight
 /// acquisition future or open provider stream immediately and returns
 /// `LlmHostCallOutcome::Cancelled`.
+#[allow(clippy::too_many_arguments)]
 async fn handle_llm_complete(
     args: &[MontyObject],
     thread: &mut Thread,
