@@ -708,7 +708,7 @@ git commit -m "feat: stream native rig completions"
 - Modify: `ic/src/llm/retry.rs:140-228`
 - Test: `ic/src/llm/retry.rs`
 
-- [ ] **Step 1: Write first-item retry tests**
+- [x] **Step 1: Write first-item retry tests**
 
 Use `ScriptedStreamingProvider` to add:
 
@@ -721,7 +721,7 @@ Use `ScriptedStreamingProvider` to add:
 Use `RateLimited { retry_after: Some(Duration::ZERO) }` for retry tests so they
 do not sleep for the jittered one-second backoff.
 
-- [ ] **Step 2: Run one focused test and verify failure**
+- [x] **Step 2: Run one focused test and verify failure**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::retry::tests::stream_does_not_retry_after_first_chunk -- --exact --nocapture
@@ -730,7 +730,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::retry::tests::stream_does_not_retry_aft
 Expected: the inherited fallback calls blocking `complete()` and does not
 preserve the scripted stream.
 
-- [ ] **Step 3: Add a concrete borrowed-stream retry loop**
+- [x] **Step 3: Add a concrete borrowed-stream retry loop**
 
 Do not reuse generic `retry_loop<T>` with `T = LlmStream`; the returned stream
 borrows the provider. Add this explicit helper:
@@ -781,7 +781,7 @@ async fn retry_stream<'a>(
 Extract `retry_delay()` and use `cap_retry_after()` for both blocking and stream
 loops.
 
-- [ ] **Step 4: Override both stream methods**
+- [x] **Step 4: Override both stream methods**
 
 ```rust
 async fn complete_stream(
@@ -799,7 +799,7 @@ async fn complete_with_tools_stream(
 }
 ```
 
-- [ ] **Step 5: Run RetryProvider tests**
+- [x] **Step 5: Run RetryProvider tests**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::retry::tests:: -- --nocapture
@@ -807,7 +807,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::retry::tests:: -- --nocapture
 
 Expected: blocking and streaming retry tests pass.
 
-- [ ] **Step 6: Commit retry streaming**
+- [x] **Step 6: Commit retry streaming**
 
 ```bash
 git add ic/src/llm/retry.rs

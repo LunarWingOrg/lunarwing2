@@ -6,16 +6,12 @@ use crate::llm::provider::{
     CompletionRequest, LlmProvider, LlmStream, LlmStreamChunk, ToolCompletionRequest,
 };
 
-// JUSTIFICATION: Streaming decorators consume this shared request type in Tasks 3-4.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) enum ProviderStreamRequest {
     Plain(CompletionRequest),
     Tools(ToolCompletionRequest),
 }
 
-// JUSTIFICATION: Streaming decorators consume this dispatcher in Tasks 3-4.
-#[allow(dead_code)]
 impl ProviderStreamRequest {
     pub(crate) async fn open<'a>(
         &self,
@@ -28,8 +24,6 @@ impl ProviderStreamRequest {
     }
 }
 
-// JUSTIFICATION: Retry and failover consume first-item state in Tasks 3-4.
-#[allow(dead_code)]
 pub(crate) enum FirstStreamItem<'a> {
     Empty,
     Error(LlmError),
@@ -39,8 +33,6 @@ pub(crate) enum FirstStreamItem<'a> {
     },
 }
 
-// JUSTIFICATION: Retry and failover consume first-item state in Tasks 3-4.
-#[allow(dead_code)]
 pub(crate) async fn take_first<'a>(mut stream: LlmStream<'a>) -> FirstStreamItem<'a> {
     match stream.next().await {
         None => FirstStreamItem::Empty,
@@ -52,8 +44,6 @@ pub(crate) async fn take_first<'a>(mut stream: LlmStream<'a>) -> FirstStreamItem
     }
 }
 
-// JUSTIFICATION: Retry and failover replay the committed first chunk in Tasks 3-4.
-#[allow(dead_code)]
 pub(crate) fn replay_first<'a>(first: LlmStreamChunk, rest: LlmStream<'a>) -> LlmStream<'a> {
     stream::iter([Ok(first)]).chain(rest).boxed()
 }

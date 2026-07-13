@@ -10,14 +10,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use rand::Rng;
 use rust_decimal::Decimal;
 
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
-    CompletionRequest, CompletionResponse, LlmProvider, ModelMetadata, ToolCompletionRequest,
-    ToolCompletionResponse,
+    CompletionRequest, CompletionResponse, LlmProvider, LlmStream, ModelMetadata,
+    ToolCompletionRequest, ToolCompletionResponse,
 };
+use crate::llm::streaming::{FirstStreamItem, ProviderStreamRequest, replay_first, take_first};
 
 /// Upper bound for provider-suggested `Retry-After` delays.
 ///
@@ -76,6 +78,16 @@ pub(crate) fn retry_backoff_delay(attempt: u32) -> Duration {
 /// Clamp a provider-suggested retry delay to a safe maximum.
 pub(crate) fn cap_retry_after(duration: Duration) -> Duration {
     duration.min(Duration::from_secs(MAX_RETRY_AFTER_SECS))
+}
+
+fn retry_delay(error: &LlmError, attempt: u32) -> Duration {
+    match error {
+        LlmError::RateLimited {
+            retry_after: Some(duration),
+            ..
+        } => cap_retry_after(*duration),
+        _ => retry_backoff_delay(attempt),
+    }
 }
 
 /// Parse a `Retry-After` header value into a capped `Duration`.
@@ -152,13 +164,7 @@ impl RetryProvider {
                         return Err(err);
                     }
 
-                    let delay = match &err {
-                        LlmError::RateLimited {
-                            retry_after: Some(duration),
-                            ..
-                        } => *duration,
-                        _ => retry_backoff_delay(attempt),
-                    };
+                    let delay = retry_delay(&err, attempt);
 
                     tracing::warn!(
                         provider = %self.inner.model_name(),
@@ -179,6 +185,46 @@ impl RetryProvider {
             provider: self.inner.model_name().to_string(),
             reason: "retry loop exited unexpectedly".to_string(),
         }))
+    }
+
+    async fn retry_stream<'a>(
+        &'a self,
+        request: ProviderStreamRequest,
+        label: &str,
+    ) -> Result<LlmStream<'a>, LlmError> {
+        for attempt in 0..=self.config.max_retries {
+            let first = match request.open(self.inner.as_ref()).await {
+                Ok(stream) => take_first(stream).await,
+                Err(error) => FirstStreamItem::Error(error),
+            };
+
+            match first {
+                FirstStreamItem::Empty => return Ok(futures::stream::empty().boxed()),
+                FirstStreamItem::Chunk { first, rest } => {
+                    return Ok(replay_first(first, rest));
+                }
+                FirstStreamItem::Error(error) => {
+                    if !is_retryable(&error) || attempt == self.config.max_retries {
+                        return Err(error);
+                    }
+                    let delay = retry_delay(&error, attempt);
+                    tracing::warn!(
+                        provider = %self.inner.model_name(),
+                        attempt = attempt + 1,
+                        max_retries = self.config.max_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %error,
+                        "Retrying stream before first chunk{label}"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+
+        Err(LlmError::RequestFailed {
+            provider: self.inner.model_name().to_string(),
+            reason: "stream retry loop exhausted without a result".to_string(),
+        })
     }
 }
 
@@ -212,6 +258,11 @@ impl LlmProvider for RetryProvider {
         .await
     }
 
+    async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
+        self.retry_stream(ProviderStreamRequest::Plain(request), "")
+            .await
+    }
+
     async fn complete_with_tools(
         &self,
         request: ToolCompletionRequest,
@@ -225,6 +276,14 @@ impl LlmProvider for RetryProvider {
             " (tools)",
         )
         .await
+    }
+
+    async fn complete_with_tools_stream(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<LlmStream<'_>, LlmError> {
+        self.retry_stream(ProviderStreamRequest::Tools(request), " (tools)")
+            .await
     }
 
     async fn list_models(&self) -> Result<Vec<String>, LlmError> {
@@ -256,6 +315,10 @@ impl LlmProvider for RetryProvider {
 mod tests {
     use super::*;
 
+    use futures::StreamExt;
+
+    use crate::llm::provider::LlmStreamChunk;
+    use crate::llm::streaming_test_support::{ScriptedStreamingProvider, StreamScript};
     use crate::testing::StubLlm;
 
     fn make_request() -> CompletionRequest {
@@ -268,6 +331,23 @@ mod tests {
 
     fn fast_config(max_retries: u32) -> RetryConfig {
         RetryConfig { max_retries }
+    }
+
+    fn retryable_stream_error() -> LlmError {
+        LlmError::RateLimited {
+            provider: "scripted".to_string(),
+            retry_after: Some(Duration::ZERO),
+        }
+    }
+
+    fn successful_text_stream() -> StreamScript {
+        StreamScript::Items(vec![
+            Ok(LlmStreamChunk::TextDelta("hello".to_string())),
+            Ok(LlmStreamChunk::Done {
+                usage: None,
+                finish_reason: "stop".to_string(),
+            }),
+        ])
     }
 
     // -- Backoff delay tests --
@@ -431,6 +511,156 @@ mod tests {
         assert_eq!(retry.active_model_name(), "my-model");
         assert_eq!(retry.cost_per_token(), (Decimal::ZERO, Decimal::ZERO));
         assert_eq!(retry.calculate_cost(100, 50), Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn stream_retries_setup_error_before_first_chunk() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![
+                StreamScript::SetupError(retryable_stream_error()),
+                successful_text_stream(),
+            ],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(1));
+
+        let chunks = retry
+            .complete_stream(make_request())
+            .await
+            .expect("retry should open a stream")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(inner.plain_calls(), 2);
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "hello"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_retries_first_item_error_before_first_chunk() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![
+                StreamScript::Items(vec![Err(retryable_stream_error())]),
+                successful_text_stream(),
+            ],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(1));
+
+        let chunks = retry
+            .complete_stream(make_request())
+            .await
+            .expect("retry should open a stream")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(inner.plain_calls(), 2);
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "hello"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_does_not_retry_after_first_chunk() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![
+                StreamScript::Items(vec![
+                    Ok(LlmStreamChunk::TextDelta("visible".to_string())),
+                    Err(retryable_stream_error()),
+                ]),
+                successful_text_stream(),
+            ],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(1));
+
+        let chunks = retry
+            .complete_stream(make_request())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(inner.plain_calls(), 1);
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "visible"
+        ));
+        assert!(matches!(
+            chunks.get(1),
+            Some(Err(LlmError::RateLimited { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_stream_uses_same_retry_policy() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![],
+            vec![
+                StreamScript::SetupError(retryable_stream_error()),
+                StreamScript::Items(vec![
+                    Ok(LlmStreamChunk::ToolCallDelta {
+                        index: 0,
+                        id: Some("call_1".to_string()),
+                        name: Some("search".to_string()),
+                        args_delta: "{}".to_string(),
+                    }),
+                    Ok(LlmStreamChunk::Done {
+                        usage: None,
+                        finish_reason: "tool_calls".to_string(),
+                    }),
+                ]),
+            ],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(1));
+
+        let chunks = retry
+            .complete_with_tools_stream(make_tool_request())
+            .await
+            .expect("tool retry should open a stream")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(inner.tool_calls(), 2);
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::ToolCallDelta { index: 0, .. }))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_is_capped_in_retry_loop() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![
+                StreamScript::SetupError(LlmError::RateLimited {
+                    provider: "scripted".to_string(),
+                    retry_after: Some(Duration::from_secs(MAX_RETRY_AFTER_SECS + 17)),
+                }),
+                successful_text_stream(),
+            ],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner, fast_config(1));
+        let started = tokio::time::Instant::now();
+
+        let _stream = retry
+            .complete_stream(make_request())
+            .await
+            .expect("retry should open a stream");
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            Duration::from_secs(MAX_RETRY_AFTER_SECS)
+        );
     }
 
     // Regression test: Rate limiter fallback when Retry-After header is missing
