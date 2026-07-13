@@ -820,7 +820,7 @@ git commit -m "feat: retry llm streams before first chunk"
 - Modify: `ic/src/llm/failover.rs:108-381`
 - Test: `ic/src/llm/failover.rs`
 
-- [ ] **Step 1: Write failover boundary tests**
+- [x] **Step 1: Write failover boundary tests**
 
 Add:
 
@@ -833,7 +833,7 @@ Add:
 Assert call counts and exact delta order. The mid-stream test must receive the
 primary text and then its error, with zero fallback calls.
 
-- [ ] **Step 2: Run the fallback test and verify failure**
+- [x] **Step 2: Run the fallback test and verify failure**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::failover::tests::stream_fails_before_first_chunk_then_uses_fallback -- --exact --nocapture
@@ -841,7 +841,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::failover::tests::stream_fails_before_fi
 
 Expected: failure because the decorator uses blocking `complete()`.
 
-- [ ] **Step 3: Add concrete stream provider selection**
+- [x] **Step 3: Add concrete stream provider selection**
 
 Add `try_stream_providers<'a>` instead of passing streams through the existing
 generic closure, because each stream borrows a provider stored in `self`:
@@ -888,7 +888,7 @@ Extract `available_provider_indexes`, `record_provider_failure`, and the logging
 helper from the current blocking loop so both paths use identical cooldown
 selection and threshold behavior.
 
-- [ ] **Step 4: Override plain and tool streams**
+- [x] **Step 4: Override plain and tool streams**
 
 Each method calls `try_stream_providers`, binds the selected index to the
 current Tokio task before returning, and returns the selected stream unchanged:
@@ -899,7 +899,7 @@ self.bind_provider_to_current_task(provider_index);
 Ok(stream)
 ```
 
-- [ ] **Step 5: Run failover tests**
+- [x] **Step 5: Run failover tests**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::failover::tests:: -- --nocapture
@@ -908,7 +908,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::failover::tests:: -- --nocapture
 Expected: cooldown, concurrent model attribution, blocking failover, and new
 stream tests all pass.
 
-- [ ] **Step 6: Commit failover streaming**
+- [x] **Step 6: Commit failover streaming**
 
 ```bash
 git add ic/src/llm/failover.rs
@@ -921,7 +921,7 @@ git commit -m "feat: fail over llm streams before first chunk"
 - Modify: `ic/src/llm/circuit_breaker.rs:245-318`
 - Test: `ic/src/llm/circuit_breaker.rs`
 
-- [ ] **Step 1: Write circuit stream tests**
+- [x] **Step 1: Write circuit stream tests**
 
 Add:
 
@@ -931,7 +931,7 @@ Add:
 - `stream_drop_before_done_does_not_mark_success`
 - `tool_stream_uses_same_breaker_accounting`
 
-- [ ] **Step 2: Run the terminal success test and verify failure**
+- [x] **Step 2: Run the terminal success test and verify failure**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::circuit_breaker::tests::stream_done_marks_success -- --exact --nocapture
@@ -940,7 +940,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::circuit_breaker::tests::stream_done_mar
 Expected: the inherited fallback records success around blocking completion,
 not at the streamed terminal chunk.
 
-- [ ] **Step 3: Add the async outcome wrapper**
+- [x] **Step 3: Add the async outcome wrapper**
 
 Keep setup checks method-level, then use `StreamExt::then` for asynchronous
 breaker bookkeeping:
@@ -964,12 +964,12 @@ fn account_stream<'a>(&'a self, stream: LlmStream<'a>) -> LlmStream<'a> {
 If opening the inner stream returns an error, call `record_failure` before
 returning it. Dropping a stream before `Done` leaves breaker state unchanged.
 
-- [ ] **Step 4: Override both stream methods**
+- [x] **Step 4: Override both stream methods**
 
 Both methods must call `check_allowed()` before opening the inner stream and
 must return `account_stream(stream)` only after setup succeeds.
 
-- [ ] **Step 5: Run circuit breaker tests**
+- [x] **Step 5: Run circuit breaker tests**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::circuit_breaker::tests:: -- --nocapture
@@ -977,7 +977,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::circuit_breaker::tests:: -- --nocapture
 
 Expected: all state-machine and stream-accounting tests pass.
 
-- [ ] **Step 6: Commit circuit accounting**
+- [x] **Step 6: Commit circuit accounting**
 
 ```bash
 git add ic/src/llm/circuit_breaker.rs
@@ -990,7 +990,7 @@ git commit -m "feat: account for streamed circuit outcomes"
 - Modify: `ic/src/llm/timeout.rs:1-102`
 - Test: `ic/src/llm/timeout.rs`
 
-- [ ] **Step 1: Write total-deadline tests**
+- [x] **Step 1: Write total-deadline tests**
 
 Add:
 
@@ -1002,7 +1002,7 @@ Add:
 Use a scripted delayed stream and assert a visible first chunk can be followed
 by one `RequestFailed` timeout item, never a synthetic `Done`.
 
-- [ ] **Step 2: Run the mid-stream timeout test and verify failure**
+- [x] **Step 2: Run the mid-stream timeout test and verify failure**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::timeout::tests::complete_stream_times_out_after_visible_chunk -- --exact --nocapture
@@ -1011,7 +1011,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::timeout::tests::complete_stream_times_o
 Expected: the inherited fallback either blocks before returning or ignores the
 scripted stream timing.
 
-- [ ] **Step 3: Add an absolute-deadline stream wrapper**
+- [x] **Step 3: Add an absolute-deadline stream wrapper**
 
 After bounding stream acquisition, wrap every poll against one deadline:
 
@@ -1044,13 +1044,13 @@ fn deadline_stream<'a>(
 Compute the deadline before awaiting the inner stream so setup time, retries,
 failover, and consumption share one total budget.
 
-- [ ] **Step 4: Override both stream methods**
+- [x] **Step 4: Override both stream methods**
 
 Use `timeout_at(deadline, inner.complete_stream(...))` for acquisition. On
 success, return `deadline_stream`; on timeout, return the existing retryable
 turn-budget error.
 
-- [ ] **Step 5: Run timeout tests**
+- [x] **Step 5: Run timeout tests**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::timeout::tests:: -- --nocapture
@@ -1058,7 +1058,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::timeout::tests:: -- --nocapture
 
 Expected: blocking and native streams obey the configured total budget.
 
-- [ ] **Step 6: Commit stream timeout support**
+- [x] **Step 6: Commit stream timeout support**
 
 ```bash
 git add ic/src/llm/timeout.rs
@@ -1071,7 +1071,7 @@ git commit -m "feat: enforce turn budget on llm streams"
 - Modify: `ic/src/llm/response_cache.rs:55-317`
 - Test: `ic/src/llm/response_cache.rs`
 
-- [ ] **Step 1: Write cache stream tests**
+- [x] **Step 1: Write cache stream tests**
 
 Add:
 
@@ -1082,7 +1082,7 @@ Add:
 - `blocking_completion_and_stream_share_cache_entry`
 - `tool_stream_bypasses_cache`
 
-- [ ] **Step 2: Run the cache miss test and verify failure**
+- [x] **Step 2: Run the cache miss test and verify failure**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::response_cache::tests::stream_miss_forwards_chunks_and_populates_cache -- --exact --nocapture
@@ -1091,7 +1091,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::response_cache::tests::stream_miss_forw
 Expected: the inherited fallback returns one buffered delta and does not tee
 the scripted stream.
 
-- [ ] **Step 3: Extract cache lookup and insertion helpers**
+- [x] **Step 3: Extract cache lookup and insertion helpers**
 
 Move the existing lock-scoped hit and insertion logic into helpers shared by
 blocking and stream paths:
@@ -1111,7 +1111,7 @@ fn insert(
 The bodies must preserve TTL checks, total hit counting, LRU eviction, and
 statistics logging from the current `complete()` implementation.
 
-- [ ] **Step 4: Add cached replay and miss tee**
+- [x] **Step 4: Add cached replay and miss tee**
 
 Cache hits return:
 
@@ -1139,12 +1139,12 @@ text, terminal usage, and `&CachedProvider`. Forward every item unchanged. On
 `Done`, reconstruct `CompletionResponse` and insert it before yielding the
 terminal item. Never insert on `Err`, EOF before `Done`, or consumer drop.
 
-- [ ] **Step 5: Delegate tool streams without caching**
+- [x] **Step 5: Delegate tool streams without caching**
 
 `complete_with_tools_stream` must call the inner provider directly, matching
 the existing tool-call side-effect policy.
 
-- [ ] **Step 6: Run cache tests**
+- [x] **Step 6: Run cache tests**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::response_cache::tests:: -- --nocapture
@@ -1153,7 +1153,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::response_cache::tests:: -- --nocapture
 Expected: blocking cache, eviction, statistics, stream interop, and bypass tests
 pass.
 
-- [ ] **Step 7: Commit cache stream support**
+- [x] **Step 7: Commit cache stream support**
 
 ```bash
 git add ic/src/llm/response_cache.rs
@@ -1166,7 +1166,7 @@ git commit -m "feat: cache completed llm streams"
 - Modify: `ic/src/llm/smart_routing.rs:696-947`
 - Test: `ic/src/llm/smart_routing.rs`
 
-- [ ] **Step 1: Write route and cascade stream tests**
+- [x] **Step 1: Write route and cascade stream tests**
 
 Add:
 
@@ -1178,7 +1178,7 @@ Add:
 
 The escalation test must assert no cheap delta appears in the returned stream.
 
-- [ ] **Step 2: Run the cascade test and verify failure**
+- [x] **Step 2: Run the cascade test and verify failure**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::smart_routing::tests::moderate_cascade_discards_uncertain_cheap_before_primary_stream -- --exact --nocapture
@@ -1187,7 +1187,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::smart_routing::tests::moderate_cascade_
 Expected: the decorator inherits its blocking fallback and cannot expose the
 selected native stream.
 
-- [ ] **Step 3: Add strict plain stream collection**
+- [x] **Step 3: Add strict plain stream collection**
 
 Add a private collector that retains chunks and reconstructs the cheap response
 only after `Done`:
@@ -1240,7 +1240,7 @@ async fn buffer_completion_stream(
 Add `FinishReason::from_stream_reason(&str)` in `provider.rs` with exhaustive
 mapping for `stop`, `length`, `tool_calls`, `content_filter`, and unknown text.
 
-- [ ] **Step 4: Override routing streams**
+- [x] **Step 4: Override routing streams**
 
 Simple and Complex directly call the selected provider's `complete_stream`.
 Moderate without cascade directly calls cheap. Moderate with cascade buffers
@@ -1250,7 +1250,7 @@ stream. Tool streams always call `primary.complete_with_tools_stream`.
 
 Update routing counters exactly where the blocking path updates them.
 
-- [ ] **Step 5: Run smart-routing tests**
+- [x] **Step 5: Run smart-routing tests**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::smart_routing::tests:: -- --nocapture
@@ -1259,7 +1259,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::smart_routing::tests:: -- --nocapture
 Expected: scoring, blocking routing, statistics, native routes, and buffered
 cascade tests pass.
 
-- [ ] **Step 6: Commit SmartRouting stream support**
+- [x] **Step 6: Commit SmartRouting stream support**
 
 ```bash
 git add ic/src/llm/provider.rs ic/src/llm/smart_routing.rs
@@ -1272,7 +1272,7 @@ git commit -m "feat: preserve smart routing for llm streams"
 - Modify: `ic/src/llm/recording.rs:589-762`
 - Test: `ic/src/llm/recording.rs`
 
-- [ ] **Step 1: Write recording stream tests**
+- [x] **Step 1: Write recording stream tests**
 
 Add:
 
@@ -1284,7 +1284,7 @@ Add:
 The error tests may still record a new `UserInput` marker through
 `capture_new_messages`, but must not append a Text or ToolCalls response step.
 
-- [ ] **Step 2: Run the text recording test and verify failure**
+- [x] **Step 2: Run the text recording test and verify failure**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::recording::tests::stream_records_reassembled_text_and_usage -- --exact --nocapture
@@ -1293,7 +1293,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::recording::tests::stream_records_reasse
 Expected: the inherited fallback records the blocking result rather than the
 scripted stream sequence.
 
-- [ ] **Step 3: Add a stream trace accumulator**
+- [x] **Step 3: Add a stream trace accumulator**
 
 Define an accumulator keyed by tool index:
 
@@ -1317,7 +1317,7 @@ arguments. At `Done`, convert to one `TraceStep`: ToolCalls if the map is
 non-empty, otherwise Text. Parse complete argument strings as JSON; preserve a
 malformed value as `serde_json::Value::String`.
 
-- [ ] **Step 4: Tee both stream methods**
+- [x] **Step 4: Tee both stream methods**
 
 Call `capture_new_messages` before opening the inner stream. Wrap the stream
 with `unfold`, forward every chunk unchanged, and append one response step only
@@ -1326,7 +1326,7 @@ when `Done` arrives. Do not append on error, premature EOF, or consumer drop.
 Both plain and tool stream methods use the same tee helper, but plain streams
 must reject unexpected tool deltas as `InvalidResponse` before recording.
 
-- [ ] **Step 5: Run recording tests**
+- [x] **Step 5: Run recording tests**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::recording::tests:: -- --nocapture
@@ -1335,7 +1335,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::recording::tests:: -- --nocapture
 Expected: existing trace fixtures and new terminal-only stream recording tests
 pass.
 
-- [ ] **Step 6: Commit recording support**
+- [x] **Step 6: Commit recording support**
 
 ```bash
 git add ic/src/llm/recording.rs
@@ -1350,7 +1350,7 @@ git commit -m "feat: record completed llm streams"
 - Verify: `ic/FEATURE_PARITY.md`
 - Test: `ic/src/llm/mod.rs`
 
-- [ ] **Step 1: Write the failing full-chain composition test**
+- [x] **Step 1: Write the failing full-chain composition test**
 
 Manually compose a scripted native provider through Retry, SmartRouting,
 Failover, CircuitBreaker, CachedProvider, TimeoutProvider, and RecordingLlm.
@@ -1377,7 +1377,7 @@ assert_eq!(
 );
 ```
 
-- [ ] **Step 2: Run the composition test and verify failure before all wrappers are complete**
+- [x] **Step 2: Run the composition test and verify failure before all wrappers are complete**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::tests::native_stream_survives_full_decorator_chain -- --exact --nocapture
@@ -1386,13 +1386,13 @@ taskset -c 0-5 cargo test -j6 --lib llm::tests::native_stream_survives_full_deco
 Expected before Tasks 3-9: one or more wrappers collapse the stream to a
 blocking fallback. Expected after Tasks 3-9: PASS.
 
-- [ ] **Step 3: Add a tool-stream chain composition test**
+- [x] **Step 3: Add a tool-stream chain composition test**
 
 Compose the same chain with `complete_with_tools_stream` and assert a text
 delta, one tool delta, and `Done { finish_reason: "tool_calls" }` survive.
 Confirm CachedProvider bypasses tool caching and SmartRouting chooses primary.
 
-- [ ] **Step 4: Update the streaming proposal**
+- [x] **Step 4: Update the streaming proposal**
 
 Update `docs/proposals/ENGINE_LLM_STREAMING.md` to record:
 
@@ -1413,7 +1413,7 @@ Update `docs/proposals/ENGINE_LLM_STREAMING.md` to record:
 Do not update `ic/FEATURE_PARITY.md`: no engine or user surface consumes native
 provider deltas in Phase 1.
 
-- [ ] **Step 5: Run focused provider coverage**
+- [x] **Step 5: Run focused provider coverage**
 
 ```bash
 taskset -c 0-5 cargo test -j6 --lib llm::provider::tests:: -- --nocapture
@@ -1429,7 +1429,7 @@ taskset -c 0-5 cargo test -j6 --lib llm::recording::tests:: -- --nocapture
 
 Expected: all focused provider and decorator tests pass.
 
-- [ ] **Step 6: Run workspace verification**
+- [x] **Step 6: Run workspace verification**
 
 ```bash
 taskset -c 0-5 cargo fmt --all -- --check
@@ -1443,7 +1443,7 @@ Clippy still reports the previously observed unrelated `collapsible_if` in
 `ic/src/agent/agent_loop.rs`, verify the changed LLM targets separately and
 record that pre-existing failure without editing unrelated agent code.
 
-- [ ] **Step 7: Commit Phase 1 integration**
+- [x] **Step 7: Commit Phase 1 integration**
 
 ```bash
 git add ic/src/llm docs/proposals/ENGINE_LLM_STREAMING.md

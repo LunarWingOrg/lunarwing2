@@ -490,7 +490,13 @@ pub async fn build_provider_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::time::Duration;
+
+    use futures::StreamExt;
+
     use crate::llm::config::LunarWingCloudConfig;
+    use crate::llm::streaming_test_support::{ScriptedStreamingProvider, StreamScript};
 
     fn test_lunarwing_cloud_config() -> LunarWingCloudConfig {
         LunarWingCloudConfig {
@@ -529,6 +535,191 @@ mod tests {
             cheap_model: None,
             smart_routing_cascade: true,
         }
+    }
+
+    fn plain_stream_script() -> StreamScript {
+        StreamScript::Items(vec![
+            Ok(LlmStreamChunk::TextDelta("hel".to_string())),
+            Ok(LlmStreamChunk::TextDelta("lo".to_string())),
+            Ok(LlmStreamChunk::Done {
+                usage: Some(TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                }),
+                finish_reason: "stop".to_string(),
+            }),
+        ])
+    }
+
+    fn tool_stream_script() -> StreamScript {
+        StreamScript::Items(vec![
+            Ok(LlmStreamChunk::TextDelta("searching".to_string())),
+            Ok(LlmStreamChunk::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("search".to_string()),
+                args_delta: "{\"q\":\"rust\"}".to_string(),
+            }),
+            Ok(LlmStreamChunk::Done {
+                usage: Some(TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 3,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                }),
+                finish_reason: "tool_calls".to_string(),
+            }),
+        ])
+    }
+
+    fn full_test_chain(
+        primary: Arc<dyn LlmProvider>,
+        cheap: Arc<dyn LlmProvider>,
+        fallback: Arc<dyn LlmProvider>,
+    ) -> (RecordingLlm, Arc<CachedProvider>) {
+        let retry_config = RetryConfig { max_retries: 1 };
+        let primary: Arc<dyn LlmProvider> =
+            Arc::new(RetryProvider::new(primary, retry_config.clone()));
+        let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(cheap, retry_config));
+        let routed: Arc<dyn LlmProvider> = Arc::new(SmartRoutingProvider::new(
+            primary,
+            cheap,
+            SmartRoutingConfig {
+                cascade_enabled: false,
+                ..SmartRoutingConfig::default()
+            },
+        ));
+        let failover: Arc<dyn LlmProvider> =
+            Arc::new(FailoverProvider::new(vec![routed, fallback]).unwrap());
+        let breaker: Arc<dyn LlmProvider> = Arc::new(CircuitBreakerProvider::new(
+            failover,
+            CircuitBreakerConfig {
+                failure_threshold: 3,
+                recovery_timeout: Duration::from_secs(60),
+                half_open_successes_needed: 1,
+            },
+        ));
+        let cache = Arc::new(CachedProvider::new(breaker, ResponseCacheConfig::default()));
+        let timeout: Arc<dyn LlmProvider> =
+            Arc::new(TimeoutProvider::new(cache.clone(), Duration::from_secs(1)));
+        let recorder = RecordingLlm::new(
+            timeout,
+            std::path::PathBuf::from("unused-full-chain-trace.json"),
+            "full-chain-test".to_string(),
+        );
+        (recorder, cache)
+    }
+
+    #[tokio::test]
+    async fn native_stream_survives_full_decorator_chain() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![plain_stream_script()],
+            vec![],
+        ));
+        let cheap = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![plain_stream_script()],
+            vec![],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![plain_stream_script()],
+            vec![],
+        ));
+        let (chain, cache) = full_test_chain(primary.clone(), cheap.clone(), fallback.clone());
+
+        let chunks = chain
+            .complete_stream(CompletionRequest::new(vec![ChatMessage::user("hello")]))
+            .await
+            .expect("full-chain stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("full-chain stream should complete");
+
+        assert_eq!(
+            chunks,
+            vec![
+                LlmStreamChunk::TextDelta("hel".to_string()),
+                LlmStreamChunk::TextDelta("lo".to_string()),
+                LlmStreamChunk::Done {
+                    usage: Some(TokenUsage {
+                        input_tokens: 3,
+                        output_tokens: 2,
+                        cache_read_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                    }),
+                    finish_reason: "stop".to_string(),
+                },
+            ]
+        );
+        assert_eq!(cheap.plain_calls(), 1);
+        assert_eq!(primary.plain_calls(), 0);
+        assert_eq!(fallback.plain_calls(), 0);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn native_tool_stream_survives_full_decorator_chain() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![],
+            vec![tool_stream_script()],
+        ));
+        let cheap = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![],
+            vec![tool_stream_script()],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![],
+            vec![tool_stream_script()],
+        ));
+        let (chain, cache) = full_test_chain(primary.clone(), cheap.clone(), fallback.clone());
+
+        let chunks = chain
+            .complete_with_tools_stream(ToolCompletionRequest::new(
+                vec![ChatMessage::user("implement a search")],
+                vec![],
+            ))
+            .await
+            .expect("full-chain tool stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("full-chain tool stream should complete");
+
+        assert_eq!(
+            chunks,
+            vec![
+                LlmStreamChunk::TextDelta("searching".to_string()),
+                LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".to_string()),
+                    name: Some("search".to_string()),
+                    args_delta: "{\"q\":\"rust\"}".to_string(),
+                },
+                LlmStreamChunk::Done {
+                    usage: Some(TokenUsage {
+                        input_tokens: 5,
+                        output_tokens: 3,
+                        cache_read_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                    }),
+                    finish_reason: "tool_calls".to_string(),
+                },
+            ]
+        );
+        assert_eq!(primary.tool_calls(), 1);
+        assert_eq!(cheap.tool_calls(), 0);
+        assert_eq!(fallback.tool_calls(), 0);
+        assert!(cache.is_empty());
     }
 
     #[test]

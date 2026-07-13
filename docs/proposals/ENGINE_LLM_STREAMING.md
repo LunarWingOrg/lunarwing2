@@ -1,210 +1,251 @@
 # Engine LLM Streaming
 
-Add true token-level streaming to the LLM stack so engine responses render
-incrementally in the gateway (and so interrupt-mid-generation and long agentic
-runs become tractable). Today every LLM call — legacy and engine — is a
-blocking `complete()`: the full response is generated before anything reaches
-the user. For a ~14k-token context that is ~9s of dead air per turn.
+Add true token-level streaming to the LLM stack so Engine V2 responses can
+eventually render incrementally in the gateway, support cancellation during
+generation, and expose progress during long agentic runs.
 
-## Why this is foundational (not polish)
+## Status
 
-- **Interrupt mode** is near-meaningless without streaming. A blocking call is
-  an opaque 9s block; you can cancel before or after, but not cut into the
-  model mid-thought. Real interrupt needs a token stream that is cancellable
-  in-flight.
-- **Self-improvement / long agentic runs** — multi-step CodeAct with large
-  generations currently shows the user nothing until each step finishes.
-  Streaming gives live visibility (and a better signal for progress/stuck
-  detection: you can *see* tokens flowing, not just infer from step boundaries).
-- **Perceived latency** — the current "feels slow" is largely masked
-  time-to-first-token. Streaming fixes the feel on any endpoint.
+- **Phase 0 is complete** in commit `1c844d8`: the host and engine trait layers
+  have provider-neutral stream types and blocking fallbacks.
+- **Host Phase 1 is complete on the implementation branch**: Rig 0.40 streams
+  plain and tool-capable requests, and the complete production decorator chain
+  preserves those streams.
+- **Phase 1 is intentionally not user-visible.** The engine executor, bridge
+  event path, gateway SSE consumer, interrupts, and WASM channel delivery do
+  not consume native provider deltas yet.
+- **TensorZero Gateway `2026.3.2` is the compatibility target.** LunarWing uses
+  its OpenAI-compatible `/openai/v1/chat/completions` endpoint.
 
-## Current state (verified in-tree)
+The next work starts at the engine consumer. Provider streaming is no longer
+the blocker.
 
-The blocking path, bottom to top:
+## Why this is foundational
 
-1. **`LlmProvider` trait** (`ic/src/llm/provider.rs:363`) — the legacy provider
-   contract. Methods: `complete()`, `complete_with_tools()`, `model_name()`,
-   cost/model helpers. **No streaming method.** Many implementations, several of
-   them **decorators** that wrap another provider: `CircuitBreakerProvider`,
-   `FailoverProvider`, `TimeoutProvider`, `RetryProvider`, `SmartRoutingProvider`,
-   `CachedProvider`, `RecordingLlm`, plus concrete `LunarWingCloudChatProvider`
-   and the OpenAI-compatible registry path.
-2. **`LlmBackend` trait** (`ic/crates/lunarwing_engine/src/traits/llm.rs`) — the
-   engine's contract. Exactly `complete(messages, actions, config) -> LlmOutput`
-   and `model_name()`. **No streaming method** — the engine structurally cannot
-   stream today.
-3. **`LlmBridgeAdapter`** (`ic/src/bridge/llm_adapter.rs`) — wraps an
-   `Arc<dyn LlmProvider>` as an `LlmBackend`, converting `ThreadMessage` ↔
-   `ChatMessage` and calling `complete` / `complete_with_tools`.
-4. **Engine executor** — the Python orchestrator's `__llm_complete__` host
-   function awaits the full `LlmBackend::complete()` (blocking) per step.
-5. **`await_thread_outcome`** (`ic/src/bridge/router.rs`) — streams *coarse*
-   thread events to SSE (Thinking / ToolStarted / ToolCompleted) but the final
-   answer is one `AppEvent::Response` after the whole thread completes.
-6. **SSE layer** (`ic/src/channels/web/sse.rs`) — `SseEvent` enum already has a
-   **`StreamChunk` variant** (wire name `"stream_chunk"`), alongside `Response`,
-   `Thinking`, etc.
-7. **Gateway frontend** (`app.js`) — ALREADY has streaming scaffolding:
-   `_streamingThreadId`, `getOrCreateStreamingMessage(threadId)`,
-   `finalizeStreamingMessage(threadId, content)`, and a `resetStreamingState()`.
-   The `response` listener calls `finalizeStreamingMessage` (finalize a
-   streamed bubble) with a fallback to `addMessage`.
+- **Interrupt mode:** a blocking request is opaque until completion. A stream
+  can be dropped between chunks so the in-flight HTTP body is cancelled.
+- **Long agentic runs:** multi-step CodeAct can expose meaningful progress
+  instead of waiting for a complete generation at every step.
+- **Perceived latency:** provider chunks make time-to-first-token observable
+  and deliverable instead of hiding it inside `complete()`.
 
-**Two prior-author breadcrumbs confirm the intended design:**
-- `ic/src/channels/web/openai_compat.rs:590-596` (LunarWing's *own*
-  OpenAI-compatible server endpoint) already fakes streaming by word-splitting a
-  completed response, with the comment: *"The current LlmProvider returns
-  complete responses (no streaming method)… True token streaming can be added
-  later by extending LlmProvider with a `complete_stream()` method."*
-- `SseEvent::StreamChunk` already exists — the chunk-delivery wire event is in
-  place; nothing consumes it from the engine path yet.
+## Scope
 
-So the missing link is specifically the **provider→backend→engine streaming
-path**; the SSE event type and frontend rendering are largely present.
+Phase 1 owns the provider boundary and decorators:
 
-## Design
+```text
+RigAdapter
+  -> RetryProvider
+  -> SmartRoutingProvider
+  -> FailoverProvider
+  -> CircuitBreakerProvider
+  -> CachedProvider
+  -> TimeoutProvider
+  -> RecordingLlm
+```
 
-### The streaming primitive
-Add a streaming completion to both trait layers, returning an async stream of
-typed chunks rather than a single result. Define mirrored chunk types in
-`ic/src/llm/` and `ic/crates/lunarwing_engine/src/traits/llm.rs`; the bridge maps
-between them. Keep their variant schemas aligned:
+It does not change engine execution or channel behavior. Engine V2 remains
+gateway-only by default. Any future WASM channel opt-in must follow the
+channel-neutral delivery design in
+[`2026-07-12-engine-v2-channel-neutral-delivery-design.md`](../superpowers/specs/2026-07-12-engine-v2-channel-neutral-delivery-design.md).
+
+## Implemented host contract
+
+`LlmProvider` exposes both plain and tool-capable streams:
 
 ```rust
 pub enum LlmStreamChunk {
-    /// Incremental assistant text (the common case).
     TextDelta(String),
-    /// Incremental tool/action call (id/name + partial args), for CodeAct/tool use.
     ToolCallDelta {
         index: usize,
         id: Option<String>,
         name: Option<String>,
         args_delta: String,
     },
-    /// Terminal: usage/stop reason; stream ends after this.
-    Done { usage: Option<TokenUsage>, finish_reason: String },
+    Done {
+        usage: Option<TokenUsage>,
+        finish_reason: String,
+    },
 }
 ```
 
-- **`LlmProvider`** gains `async fn complete_stream(&self, request) ->
-  Result<BoxStream<'_, Result<LlmStreamChunk, LlmError>>, LlmError>` with a
-  **default impl that falls back to `complete()` and yields the whole response
-  as one `TextDelta` + `Done`.** This is the key to a safe rollout: every
-  existing provider/decorator compiles and works unchanged; only providers that
-  *natively* stream override it.
-- **`LlmBackend`** (engine) gains the analogous `complete_stream`, also with a
-  `complete()`-backed default. Because the current `LlmOutput` does not retain a
-  finish reason, its text/code fallback reports `"unknown"`; the structured
-  action-call variant can safely report `"tool_calls"`.
+- `complete_stream()` has a blocking fallback that emits one text chunk and
+  one `Done` chunk.
+- `complete_with_tools_stream()` has a blocking fallback that emits complete
+  text/tool chunks and `Done`.
+- Tool-capable streaming is required in Phase 1 because Engine V2 normally
+  supplies actions. Supporting only plain streaming would leave CodeAct turns
+  blocking.
+- User-visible rendering of partial tool arguments is still deferred. The host
+  contract preserves them now so the engine can make that decision later.
 
-### Layer-by-layer changes
+## Rig and TensorZero behavior
 
-1. **OpenAI-compatible provider path** (the `RigAdapter` registry path created in
-   `ic/src/llm/mod.rs`, which hits `LLM_BASE_URL` / TensorZero): implement real
-   `complete_stream` at that outbound boundary. The similarly named
-   `ic/src/channels/web/openai_compat.rs` is LunarWing's inbound server endpoint,
-   not the provider implementation; its SSE shapes are useful protocol
-   references but are not the code path to extend.
-2. **Decorators** (`Retry`, `Failover`, `CircuitBreaker`, `Timeout`,
-   `SmartRouting`, `Cached`, `Recording`): forward `complete_stream` to the
-   inner provider, preserving each decorator's semantics. These need care —
-   documented per-decorator below (see "Decorator semantics").
-3. **`LlmBridgeAdapter`**: implement `LlmBackend::complete_stream` by calling the
-   provider's `complete_stream` and mapping `LlmStreamChunk` → engine chunk type.
-4. **Engine executor / `__llm_complete__`**: consume the stream. Emit an engine
-   `ThreadEvent` per text delta (a new `EventKind::ResponseDelta { thread_id,
-   text }`) as tokens arrive, accumulating the full text for the step's final
-   result (so tool-call parsing and step state are unchanged downstream).
-5. **`await_thread_outcome` / bridge**: map `ResponseDelta` thread-events →
-   `SseEvent::StreamChunk { thread_id, delta }` (the variant already exists), and
-   keep the terminal `AppEvent::Response` as the finalize signal (frontend
-   already calls `finalizeStreamingMessage` on `response`).
-6. **Frontend**: wire a `stream_chunk` SSE listener → `getOrCreateStreamingMessage`
-   + append delta (scaffolding already present). `response` stays the finalizer.
+`RigAdapter` uses Rig 0.40's typed streaming API for plain and tool-capable
+requests. Compatibility tests use captured local SSE frames and do not require
+a live gateway.
 
-### Interrupt integration
-The engine already has a signal/interrupt channel (`SignalReceiver` in the
-execution loop). Streaming makes interrupt real: while consuming the chunk
-stream, check the interrupt signal between chunks and **drop the stream**
-(cancel the in-flight HTTP body) on interrupt, then transition the thread. This
-is the concrete payoff — design the stream-consume loop to be cancellation-aware
-from day one.
+The TensorZero `2026.3.2` wire contract relevant to LunarWing is:
 
-## Decorator semantics (the delicate part)
-A new trait method means every decorator must forward it correctly, and
-streaming changes some decorators' contracts:
+- JSON SSE `data:` frames end with `data: [DONE]`.
+- Rig 0.40 sends `stream_options.include_usage=true`; usage arrives in the
+  terminal response rather than ordinary deltas.
+- Tool-call IDs can appear only in the first chunk while names and arguments
+  arrive incrementally. TensorZero's numeric tool index remains stable.
+- OpenAI-shaped mid-stream `{"error": ...}` events terminate the stream. Rig
+  0.40 surfaces them; the previous Rig 0.30 parser could silently skip them.
+- `delta.tensorzero_extra_content` can contain thought or unknown blocks. The
+  generic Rig OpenAI parser does not expose those blocks, and Phase 1 does not
+  add a reasoning chunk type, so this content remains intentionally deferred.
 
-- **Retry / Failover / CircuitBreaker**: with a blocking call they retry on a
-  returned `Err`. With streaming, an error can occur **mid-stream** (after
-  chunks already emitted to the user). Decision: retry/failover only apply to
-  **pre-first-chunk** failures (connect/handshake). Once the first chunk is
-  delivered, a mid-stream error surfaces to the caller (no silent re-stream —
-  that would duplicate visible text). Document this explicitly.
-- **Timeout**: apply to time-to-first-chunk, not total duration (a long
-  legitimate generation must not be killed).
-- **Cached**: a cache hit yields the whole cached text as one `TextDelta` +
-  `Done` (trivially correct via the default).
-- **Recording**: record the reassembled full text (accumulate deltas), so
-  recordings stay comparable to the blocking path.
-- All others: forward via the default `complete()`-backed impl until/unless
-  native streaming is worth it.
+LunarWing maps Rig tool deltas by `internal_call_id`, assigning numeric indexes
+in first-seen order. It does not key by the provider tool ID because that ID can
+be absent on early deltas.
 
-## Phased rollout
+Rig's portable final event exposes usage but not a portable finish reason.
+LunarWing therefore reports `tool_calls` after any tool event and `stop`
+otherwise. A stream must contain Rig's `Final` event; EOF before `Final` is an
+`InvalidResponse`, not a successful partial completion.
 
-- **Phase 0 — traits + default fallback (no behavior change).** Add
-  `LlmStreamChunk`, `complete_stream` to both traits with `complete()`-backed
-  defaults; decorators inherit that fallback so their existing blocking
-  semantics remain unchanged. Everything compiles; nothing streams yet. Verifies
-  the abstraction with zero risk. `cargo check`.
-- **Phase 1 — native provider streaming.** Implement `complete_stream` on the
-  outbound OpenAI-compatible `RigAdapter` path (`stream:true` + delta parse).
-  Add decorator forwarding with the semantics above. Unit-test the SSE parse +
-  fallback.
-- **Phase 2 — engine consumes the stream.** Engine `__llm_complete__` consumes
-  chunks, emits `EventKind::ResponseDelta`; accumulate full text for step
-  result. Gate behind a flag (`ENGINE_STREAMING=true`) initially.
-- **Phase 3 — SSE + frontend.** Map `ResponseDelta` → `SseEvent::StreamChunk`;
-  wire the frontend `stream_chunk` listener to the existing streaming-message
-  scaffolding. This is where the user *sees* incremental output.
-- **Phase 4 — interrupt-aware consume loop.** Make the chunk loop check the
-  interrupt signal and cancel the in-flight stream. Unlocks true interrupt mode.
-- **Phase 5 (later) — legacy path + tool-call streaming.** Optionally stream the
-  legacy agentic loop too, and stream partial tool-call args for CodeAct.
+## Decorator semantics
 
-## Testing
-- Trait default: a non-streaming provider yields exactly one `TextDelta` + `Done`
-  equal to its `complete()` output.
-- OpenAI provider: parse a recorded `stream:true` SSE transcript into the right
-  chunk sequence; malformed/`[DONE]` handling; mid-stream error surfaces.
-- Decorators: retry/failover fire pre-first-chunk, NOT mid-stream; timeout on
-  TTFC; cached/recording reassemble correctly.
-- Engine: streamed step accumulates the same final text as the blocking path
-  (parity test — streamed vs `complete()` produce identical thread outcome).
-- Interrupt: a mid-stream interrupt cancels the HTTP body and transitions the
-  thread without emitting a spurious final Response.
-- Frontend: `stream_chunk` appends to the streaming bubble; `response`
-  finalizes; out-of-thread chunks ignored (isCurrentThread).
+Streaming changes when a decorator can safely commit state. Each production
+decorator now has an explicit policy.
 
-## Build constraints
-`taskset -c 0-5 cargo check -j6` / scoped `cargo test`. No full debug builds.
-Static assets are `include_bytes!`-compiled — the frontend change needs a
-release rebuild / tenant upgrade to take effect (same as prior gateway work).
+### Retry and failover
 
-## Non-goals / risks
-- Not changing the CodeAct "always use tools" behavior (separate concern; see
-  the over-working discussion — that's a prompt-design decision).
-- Not a rewrite of the provider stack — the default-fallback design keeps every
-  existing provider working; native streaming is opt-in per provider.
-- Main risk is the decorator semantics (retry/failover mid-stream) — hence they
-  get explicit rules and tests, and Phase 0/1 land them before anything user-
-  visible depends on them.
-- TensorZero must actually stream on the configured function/endpoint; if a
-  given function doesn't, the default fallback degrades gracefully to blocking.
+Retry and failover may switch attempts after setup failure or an error in the
+first stream item. The first successful chunk is the commit point. After that
+chunk, later errors pass through unchanged and no second provider is opened,
+preventing duplicate visible text.
+
+Failover binds the selected provider to the current Tokio task before returning
+the stream so model attribution remains request-scoped under concurrency.
+
+### Circuit breaker
+
+- Setup and mid-stream transient errors count as failures.
+- `Done` is the success commit point.
+- Opening a stream or receiving an ordinary delta is not success.
+- Dropping a stream before `Done` leaves breaker state unchanged.
+
+### Timeout
+
+`TimeoutProvider` retains its existing absolute total turn budget. One deadline
+covers acquisition, retries/failover inside the wrapper, and every stream poll.
+A visible chunk can therefore be followed by one retryable timeout error, but
+never a synthetic `Done`.
+
+This is deliberately not a time-to-first-chunk-only timeout. Weakening the
+existing watchdog would again allow stacked retries to exceed the agent turn
+budget and trigger the hard-kill path that clears queued follow-up messages. A
+separate idle or TTFC timeout can be designed later without replacing the hard
+total budget.
+
+### Cache
+
+- A cache hit emits the cached text as one `TextDelta` plus `Done`.
+- A miss forwards native chunks unchanged and inserts only when `Done` is
+  consumed.
+- Errors, premature EOF, and consumer drop never cache a partial response.
+- Blocking and streaming plain requests share cache keys and entries.
+- Tool-capable requests bypass the cache because replay could repeat side
+  effects.
+
+### Smart routing
+
+Simple, complex, and tool routes delegate directly to native provider streams.
+Tool-capable requests always use the primary provider.
+
+The moderate cascade is the one buffered path: SmartRouting consumes the cheap
+candidate through `Done`, reconstructs its response, and checks uncertainty.
+It then either replays the exact cheap chunks or discards them and opens the
+primary stream. No cheap delta escapes before the escalation decision.
+
+### Recording
+
+Recording forwards chunks immediately but appends a trace response only at
+`Done`. Text is concatenated, tool fragments are accumulated by numeric index,
+and complete arguments are parsed as JSON. Malformed arguments are preserved as
+strings. Errors, premature EOF, and consumer drop do not record a partial
+assistant response.
+
+## Remaining delivery path
+
+The engine and gateway still use the blocking outcome path:
+
+1. `LlmBridgeAdapter` must map host chunks to the engine stream type.
+2. The Engine V2 executor must consume chunks while accumulating the same final
+   step result used by tool parsing and thread state.
+3. The executor must emit provider-neutral response-delta thread events.
+4. The bridge/router must convert those events to channel-neutral application
+   events.
+5. Gateway SSE can map those events to the existing `stream_chunk` wire shape;
+   the terminal response remains the finalization signal.
+6. Interrupt handling must drop the active stream without emitting a spurious
+   successful terminal response.
+
+The gateway UI remains the first supported consumer. WASM channels stay on the
+current legacy-compatible path unless explicitly enabled after terminal
+delivery, approval, interrupt, and scope-isolation tests pass. If that contract
+cannot be made reliable for a WASM channel, Engine V2 remains gated to the
+gateway rather than exposing partial support.
+
+## Rollout
+
+- **Phase 0 - complete (`1c844d8`):** shared stream types and blocking
+  fallbacks, no behavior change.
+- **Phase 1 - implemented:** Rig 0.40 native plain/tool streams, TensorZero
+  `2026.3.2` fixtures, strict terminal handling, and decorator preservation.
+- **Phase 2:** bridge and Engine V2 consume provider streams and emit
+  provider-neutral deltas behind a gateway-scoped flag.
+- **Phase 3:** gateway SSE and frontend append deltas and finalize on the
+  existing terminal response.
+- **Phase 4:** interrupt-aware engine consumption and cancellation tests.
+- **Phase 5:** opt-in channel-neutral delivery for eligible WASM channels after
+  the approved safety gates pass.
+
+## Validation
+
+Phase 1 coverage includes:
+
+- blocking fallback parity for plain and tool-capable requests;
+- native Rig text, usage, tool-index, duplicate-full-call, strict EOF, and
+  mid-stream error mapping;
+- TensorZero `2026.3.2` text, usage, fragmented tool-call, `[DONE]`, and error
+  fixtures;
+- pre-first-chunk retry/failover boundaries and post-first-chunk error pass
+  through;
+- breaker terminal accounting, absolute stream deadlines, terminal-only cache
+  insertion, buffered moderate routing, and terminal-only trace recording;
+- full-chain plain and tool composition tests proving exact chunk order without
+  duplicate first items.
+
+Phase 1 verification uses scoped tests plus `cargo check`, Clippy with warnings
+denied, formatting checks, and `git diff --check`, all under the repository's
+six-thread build constraint.
+
+`FEATURE_PARITY.md` is intentionally unchanged in Phase 1 because neither the
+engine nor any user-facing channel consumes native provider deltas yet.
+
+## Non-goals and risks
+
+- No change to CodeAct's prompt or "always use tools" behavior.
+- No user-visible streaming claim until the engine and delivery phases land.
+- No reasoning stream is promised while `tensorzero_extra_content` is omitted.
+- No automatic WASM channel migration; gateway-first remains the safe default.
+- Provider deltas can split at arbitrary UTF-8-safe string boundaries, so
+  consumers must append chunks rather than treating them as words or tokens.
+
+The primary remaining risk has moved from provider parsing to lifecycle
+delivery: ensuring terminal response, interrupt, approval, thread scope, and
+channel scope remain coherent while deltas are in flight.
 
 ## Open questions
-- Chunk granularity for SSE: per-token (chattiest, smoothest) vs. small batches
-  (fewer SSE frames). Start per-provider-chunk, batch if frame overhead shows.
-- Should `ENGINE_STREAMING` be its own flag or implied by `ENGINE_V2`? Proposed:
-  separate flag through Phase 2-3, fold into default once proven.
-- Tool-call streaming (partial args) — defer to Phase 5; text streaming first.
+
+- Whether Engine V2 streaming should use a dedicated gateway-scoped flag or be
+  enabled automatically for gateway Engine V2 after Phase 2 validation.
+- Whether gateway SSE should forward provider chunks directly or batch small
+  adjacent text deltas after measuring frame overhead.
+- Which WASM channels, if any, can satisfy the channel-neutral delivery gates
+  without weakening the gateway-only default.
