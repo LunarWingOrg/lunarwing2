@@ -2475,19 +2475,10 @@ async fn await_thread_outcome(
         }
     };
 
-    if let Some(ref sse) = state.sse
-        && let ThreadOutcome::Completed {
-            response: Some(ref text),
-        } = outcome
-    {
-        sse.broadcast_for_user(
-            &message.user_id,
-            AppEvent::Response {
-                content: text.clone(),
-                thread_id: thread_id.to_string(),
-            },
-        );
-    }
+    // Terminal text is delivered once through the normal outbound handler
+    // (the outer agent loop calls ChannelManager::respond with the returned
+    // result), not a direct SSE Response here — emitting both would double-send
+    // on the gateway (Phase 5).
 
     // A Completed response that requests authentication enters auth mode via a
     // side-effectful early return; the prompt itself is not persisted to v1
@@ -4677,6 +4668,22 @@ mod tests {
                 response: Some("final".into()),
             }),
             Some("final".into())
+        );
+    }
+
+    #[test]
+    fn thread_outcome_response_maps_terminal_outcomes() {
+        // The normal outbound handler relies on this mapping for terminal
+        // delivery now that the direct SSE Response is gone.
+        assert_eq!(
+            thread_outcome_response(&ThreadOutcome::MaxIterations),
+            Some("Reached maximum iterations without completing.".into())
+        );
+        assert_eq!(
+            thread_outcome_response(&ThreadOutcome::Failed {
+                error: "boom".into()
+            }),
+            Some("Error: boom".into())
         );
     }
 

@@ -1302,49 +1302,28 @@ impl Agent {
         }
 
         // Engine V2 (parallel deployment, Strategy C): when ENGINE_V2=true, route
-        // gateway user input and interrupts through the v2 engine instead of the
-        // legacy loop. Gated to the web gateway channel for now; Phase 5
-        // generalizes control routing to opt-in non-gateway channels. We branch
-        // BEFORE legacy session/thread resolution because the engine manages its
-        // own threads via conversation_scope. The channel name "gateway" matches
-        // the web channel's Channel::name() and the IncomingMessage stamp in
-        // chat_send.
+        // user input on eligible channels through the v2 engine instead of the
+        // legacy loop. Eligibility is gateway-by-default plus the exact opt-in
+        // allowlist (`ENGINE_V2_CHANNELS`); see `should_route_to_engine_v2`. We
+        // branch BEFORE legacy session/thread resolution because the engine
+        // manages its own threads via conversation_scope.
         //
-        // User input: the engine delivers its reply over the gateway SSE stream
-        // itself (await_thread_outcome), so the returned text is swallowed here
-        // to avoid a double-send via channels.respond(). Phase 5 removes the
-        // direct terminal SSE and returns the reply through the normal outbound
-        // handler instead.
-        //
-        // Interrupt: routed to the engine so a stop cancels the in-flight stream
-        // in the correct scoped conversation; the single "Interrupted." ack is
-        // returned through the normal response path. Approvals, auth tokens,
-        // clear, and new-thread controls stay on the legacy path until Phase 5.
-        if crate::bridge::is_engine_v2_enabled() && message.channel == "gateway" {
-            match &submission {
-                Submission::UserInput { content } => {
-                    tracing::debug!(
-                        message_id = %message.id,
-                        user_id = %message.user_id,
-                        "ENGINE_V2 enabled — routing gateway user input through engine v2"
-                    );
-                    match crate::bridge::handle_with_engine(self, message, content).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::error!(
-                                message_id = %message.id,
-                                error = %e,
-                                "engine v2 message handling failed"
-                            );
-                        }
-                    }
-                    return Ok(Some(String::new()));
-                }
-                Submission::Interrupt => {
-                    return crate::bridge::handle_interrupt(self, message).await;
-                }
-                _ => {}
-            }
+        // The engine's terminal text is returned to the outer `Agent::run()`
+        // outbound handler, which applies `BeforeOutbound`, suppresses empty
+        // results, and calls `ChannelManager::respond()` exactly once — there is
+        // no direct terminal SSE anymore. Control submissions (approval, auth,
+        // interrupt, clear, new-thread) are routed in a later change; until then
+        // they fall through to the legacy path.
+        if crate::bridge::should_route_to_engine_v2(&message.channel)
+            && let Submission::UserInput { ref content } = submission
+        {
+            tracing::debug!(
+                message_id = %message.id,
+                user_id = %message.user_id,
+                channel = %message.channel,
+                "routing user input through engine v2"
+            );
+            return crate::bridge::handle_with_engine(self, message, content).await;
         }
 
         // Hydrate thread from DB if it's a historical thread not in memory
