@@ -15,15 +15,17 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use rust_decimal::Decimal;
 
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
-    CompletionRequest, CompletionResponse, LlmProvider, ModelMetadata, ToolCompletionRequest,
-    ToolCompletionResponse,
+    CompletionRequest, CompletionResponse, LlmProvider, LlmStream, ModelMetadata,
+    ToolCompletionRequest, ToolCompletionResponse,
 };
 
 use crate::llm::retry::is_retryable;
+use crate::llm::streaming::{FirstStreamItem, ProviderStreamRequest, replay_first, take_first};
 
 /// Configuration for per-provider cooldown behavior.
 ///
@@ -192,37 +194,23 @@ impl FailoverProvider {
             .and_then(|mut guard| guard.remove(&task_id))
     }
 
-    /// Try each provider in sequence until one succeeds or all fail.
-    ///
-    /// Providers in cooldown are skipped unless *all* providers are in
-    /// cooldown, in which case the one with the oldest cooldown timestamp
-    /// (most likely to have recovered) is tried.
-    async fn try_providers<T, F, Fut>(&self, mut call: F) -> Result<(usize, T), LlmError>
-    where
-        F: FnMut(Arc<dyn LlmProvider>) -> Fut,
-        Fut: Future<Output = Result<T, LlmError>>,
-    {
+    fn available_provider_indexes(&self) -> Result<Vec<usize>, LlmError> {
         let now_nanos = self.now_nanos();
         let cooldown_nanos = self.cooldown_config.cooldown_duration.as_nanos() as u64;
-
-        // Partition providers into available and cooled-down.
         let (mut available, cooled_down): (Vec<usize>, Vec<usize>) = (0..self.providers.len())
-            .partition(|&i| !self.cooldowns[i].is_in_cooldown(now_nanos, cooldown_nanos));
+            .partition(|&index| !self.cooldowns[index].is_in_cooldown(now_nanos, cooldown_nanos));
 
-        // Log skipped providers.
-        for &i in &cooled_down {
+        for index in cooled_down {
             tracing::info!(
-                provider = %self.providers[i].model_name(),
+                provider = %self.providers[index].model_name(),
                 "Skipping provider (in cooldown)"
             );
         }
 
-        // Never skip ALL providers: if every provider is in cooldown, pick
-        // the one with the oldest cooldown activation (most likely recovered).
         if available.is_empty() {
             let oldest = (0..self.providers.len())
-                .min_by_key(|&i| {
-                    self.cooldowns[i]
+                .min_by_key(|&index| {
+                    self.cooldowns[index]
                         .cooldown_activated_nanos
                         .load(Ordering::Relaxed)
                 })
@@ -237,44 +225,77 @@ impl FailoverProvider {
             available.push(oldest);
         }
 
+        Ok(available)
+    }
+
+    fn record_provider_failure(&self, provider_index: usize) {
+        let cooldown = &self.cooldowns[provider_index];
+        if cooldown.record_failure(self.cooldown_config.failure_threshold) {
+            cooldown.activate_cooldown(self.now_nanos());
+            tracing::warn!(
+                provider = %self.providers[provider_index].model_name(),
+                threshold = self.cooldown_config.failure_threshold,
+                cooldown_secs = self.cooldown_config.cooldown_duration.as_secs(),
+                "Provider entered cooldown after repeated failures"
+            );
+        }
+    }
+
+    fn log_next_provider(
+        &self,
+        position: usize,
+        available: &[usize],
+        provider_index: usize,
+        error: &LlmError,
+        operation: &str,
+    ) {
+        let Some(next_index) = available.get(position + 1) else {
+            return;
+        };
+        tracing::warn!(
+            provider = %self.providers[provider_index].model_name(),
+            error = %error,
+            next_provider = %self.providers[*next_index].model_name(),
+            operation,
+            "Provider failed with retryable error, trying next provider"
+        );
+    }
+
+    /// Try each provider in sequence until one succeeds or all fail.
+    ///
+    /// Providers in cooldown are skipped unless *all* providers are in
+    /// cooldown, in which case the one with the oldest cooldown timestamp
+    /// (most likely to have recovered) is tried.
+    async fn try_providers<T, F, Fut>(&self, mut call: F) -> Result<(usize, T), LlmError>
+    where
+        F: FnMut(Arc<dyn LlmProvider>) -> Fut,
+        Fut: Future<Output = Result<T, LlmError>>,
+    {
+        let available = self.available_provider_indexes()?;
         let mut last_error: Option<LlmError> = None;
 
-        for (pos, &i) in available.iter().enumerate() {
-            let provider = &self.providers[i];
+        for (position, provider_index) in available.iter().copied().enumerate() {
+            let provider = &self.providers[provider_index];
             let result = call(Arc::clone(provider)).await;
             match result {
                 Ok(response) => {
-                    self.last_used.store(i, Ordering::Relaxed);
-                    self.cooldowns[i].reset();
-                    return Ok((i, response));
+                    self.last_used.store(provider_index, Ordering::Relaxed);
+                    self.cooldowns[provider_index].reset();
+                    return Ok((provider_index, response));
                 }
-                Err(err) => {
-                    if !is_retryable(&err) {
-                        return Err(err);
+                Err(error) => {
+                    if !is_retryable(&error) {
+                        return Err(error);
                     }
-
-                    // Increment failure count; activate cooldown if threshold reached.
-                    if self.cooldowns[i].record_failure(self.cooldown_config.failure_threshold) {
-                        let nanos = self.now_nanos();
-                        self.cooldowns[i].activate_cooldown(nanos);
-                        tracing::warn!(
-                            provider = %provider.model_name(),
-                            threshold = self.cooldown_config.failure_threshold,
-                            cooldown_secs = self.cooldown_config.cooldown_duration.as_secs(),
-                            "Provider entered cooldown after repeated failures"
-                        );
-                    }
-
-                    if pos + 1 < available.len() {
-                        let next_i = available[pos + 1];
-                        tracing::warn!(
-                            provider = %provider.model_name(),
-                            error = %err,
-                            next_provider = %self.providers[next_i].model_name(),
-                            "Provider failed with retryable error, trying next provider"
-                        );
-                    }
-                    last_error = Some(err);
+                    self.record_provider_failure(provider_index);
+                    self.log_next_provider(
+                        position,
+                        &available,
+                        provider_index,
+                        &error,
+                        "completion",
+                    );
+                    last_error = Some(error);
                 }
             }
         }
@@ -282,6 +303,50 @@ impl FailoverProvider {
         Err(last_error.unwrap_or_else(|| LlmError::RequestFailed {
             provider: "failover".to_string(),
             reason: "Invariant violated in FailoverProvider: providers were exhausted but no last_error was recorded (this branch should be unreachable; possible causes: no provider attempts were made or `available` was unexpectedly empty).".to_string(),
+        }))
+    }
+
+    async fn try_stream_providers<'a>(
+        &'a self,
+        request: ProviderStreamRequest,
+    ) -> Result<(usize, LlmStream<'a>), LlmError> {
+        let available = self.available_provider_indexes()?;
+        let mut last_error = None;
+
+        for (position, provider_index) in available.iter().copied().enumerate() {
+            let provider = self.providers[provider_index].as_ref();
+            let first = match request.open(provider).await {
+                Ok(stream) => take_first(stream).await,
+                Err(error) => FirstStreamItem::Error(error),
+            };
+
+            match first {
+                FirstStreamItem::Empty => {
+                    return Ok((provider_index, futures::stream::empty().boxed()));
+                }
+                FirstStreamItem::Chunk { first, rest } => {
+                    self.last_used.store(provider_index, Ordering::Relaxed);
+                    self.cooldowns[provider_index].reset();
+                    return Ok((provider_index, replay_first(first, rest)));
+                }
+                FirstStreamItem::Error(error) if !is_retryable(&error) => return Err(error),
+                FirstStreamItem::Error(error) => {
+                    self.record_provider_failure(provider_index);
+                    self.log_next_provider(
+                        position,
+                        &available,
+                        provider_index,
+                        &error,
+                        "stream setup",
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| LlmError::RequestFailed {
+            provider: "failover".to_string(),
+            reason: "all available providers failed before the first stream chunk".to_string(),
         }))
     }
 }
@@ -315,6 +380,14 @@ impl LlmProvider for FailoverProvider {
         Ok(response)
     }
 
+    async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
+        let (provider_index, stream) = self
+            .try_stream_providers(ProviderStreamRequest::Plain(request))
+            .await?;
+        self.bind_provider_to_current_task(provider_index);
+        Ok(stream)
+    }
+
     async fn complete_with_tools(
         &self,
         request: ToolCompletionRequest,
@@ -327,6 +400,17 @@ impl LlmProvider for FailoverProvider {
             .await?;
         self.bind_provider_to_current_task(provider_idx);
         Ok(response)
+    }
+
+    async fn complete_with_tools_stream(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<LlmStream<'_>, LlmError> {
+        let (provider_index, stream) = self
+            .try_stream_providers(ProviderStreamRequest::Tools(request))
+            .await?;
+        self.bind_provider_to_current_task(provider_index);
+        Ok(stream)
     }
 
     fn active_model_name(&self) -> String {
@@ -388,7 +472,12 @@ mod tests {
     use std::sync::{Mutex, RwLock};
     use std::time::Duration;
 
-    use crate::llm::provider::{CompletionResponse, FinishReason, ToolCompletionResponse};
+    use futures::StreamExt;
+
+    use crate::llm::provider::{
+        CompletionResponse, FinishReason, LlmStreamChunk, ToolCompletionResponse,
+    };
+    use crate::llm::streaming_test_support::{ScriptedStreamingProvider, StreamScript};
 
     /// A mock LLM provider that returns a predetermined result.
     struct MockProvider {
@@ -542,6 +631,231 @@ mod tests {
 
     fn make_tool_request() -> ToolCompletionRequest {
         ToolCompletionRequest::new(vec![crate::llm::ChatMessage::user("hello")], vec![])
+    }
+
+    fn retryable_stream_error(provider: &str) -> LlmError {
+        LlmError::RequestFailed {
+            provider: provider.to_string(),
+            reason: "stream failed".to_string(),
+        }
+    }
+
+    fn successful_stream(text: &str) -> StreamScript {
+        StreamScript::Items(vec![
+            Ok(LlmStreamChunk::TextDelta(text.to_string())),
+            Ok(LlmStreamChunk::Done {
+                usage: None,
+                finish_reason: "stop".to_string(),
+            }),
+        ])
+    }
+
+    #[tokio::test]
+    async fn stream_fails_before_first_chunk_then_uses_fallback() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![StreamScript::SetupError(retryable_stream_error("primary"))],
+            vec![],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![successful_stream("fallback delta")],
+            vec![],
+        ));
+        let failover = FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap();
+
+        let chunks = failover
+            .complete_stream(make_request())
+            .await
+            .expect("fallback stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("fallback stream should complete");
+
+        assert_eq!(
+            chunks,
+            vec![
+                LlmStreamChunk::TextDelta("fallback delta".to_string()),
+                LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                },
+            ]
+        );
+        assert_eq!(primary.plain_calls(), 1);
+        assert_eq!(fallback.plain_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_midstream_error_does_not_fail_over() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![StreamScript::Items(vec![
+                Ok(LlmStreamChunk::TextDelta("primary delta".to_string())),
+                Err(retryable_stream_error("primary")),
+            ])],
+            vec![],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![successful_stream("fallback delta")],
+            vec![],
+        ));
+        let failover = FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap();
+
+        let chunks = failover
+            .complete_stream(make_request())
+            .await
+            .expect("primary stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(
+            &chunks[0],
+            Ok(LlmStreamChunk::TextDelta(text)) if text == "primary delta"
+        ));
+        assert!(matches!(
+            &chunks[1],
+            Err(LlmError::RequestFailed { provider, reason })
+                if provider == "primary" && reason == "stream failed"
+        ));
+        assert_eq!(primary.plain_calls(), 1);
+        assert_eq!(fallback.plain_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_nonretryable_first_error_does_not_fail_over() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![StreamScript::Items(vec![Err(LlmError::AuthFailed {
+                provider: "primary".to_string(),
+            })])],
+            vec![],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![successful_stream("fallback delta")],
+            vec![],
+        ));
+        let failover = FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap();
+
+        let result = failover.complete_stream(make_request()).await;
+
+        assert!(matches!(
+            result,
+            Err(LlmError::AuthFailed { provider }) if provider == "primary"
+        ));
+        assert_eq!(primary.plain_calls(), 1);
+        assert_eq!(fallback.plain_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_success_binds_effective_model_before_consumption() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![StreamScript::SetupError(retryable_stream_error("primary"))],
+            vec![],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![successful_stream("fallback delta")],
+            vec![],
+        ));
+        let failover = Arc::new(FailoverProvider::new(vec![primary, fallback]).unwrap());
+        let request_failover = Arc::clone(&failover);
+
+        let (effective_model, chunks) = tokio::spawn(async move {
+            let stream = request_failover
+                .complete_stream(make_request())
+                .await
+                .expect("fallback stream should open");
+            request_failover.last_used.store(0, Ordering::Relaxed);
+            let effective_model = request_failover.effective_model_name(None);
+            let chunks = stream
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("fallback stream should complete");
+            (effective_model, chunks)
+        })
+        .await
+        .expect("stream task should join");
+
+        assert_eq!(effective_model, "fallback");
+        assert_eq!(
+            chunks,
+            vec![
+                LlmStreamChunk::TextDelta("fallback delta".to_string()),
+                LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_stream_uses_same_failover_policy() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![],
+            vec![StreamScript::Items(vec![Err(retryable_stream_error(
+                "primary",
+            ))])],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![],
+            vec![StreamScript::Items(vec![
+                Ok(LlmStreamChunk::TextDelta("calling tool".to_string())),
+                Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".to_string()),
+                    name: Some("search".to_string()),
+                    args_delta: "{\"q\":\"rust\"}".to_string(),
+                }),
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "tool_calls".to_string(),
+                }),
+            ])],
+        ));
+        let failover = FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap();
+
+        let chunks = failover
+            .complete_with_tools_stream(make_tool_request())
+            .await
+            .expect("fallback tool stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("fallback tool stream should complete");
+
+        assert_eq!(
+            chunks,
+            vec![
+                LlmStreamChunk::TextDelta("calling tool".to_string()),
+                LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".to_string()),
+                    name: Some("search".to_string()),
+                    args_delta: "{\"q\":\"rust\"}".to_string(),
+                },
+                LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "tool_calls".to_string(),
+                },
+            ]
+        );
+        assert_eq!(primary.plain_calls(), 0);
+        assert_eq!(fallback.plain_calls(), 0);
+        assert_eq!(primary.tool_calls(), 1);
+        assert_eq!(fallback.tool_calls(), 1);
     }
 
     // Test 1: Primary succeeds, no failover occurs.
