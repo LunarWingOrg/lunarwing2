@@ -23,7 +23,7 @@ pub mod session;
 pub mod smart_routing;
 mod streaming;
 #[cfg(test)]
-mod streaming_test_support;
+pub(crate) mod streaming_test_support;
 mod timeout;
 pub mod transcription;
 
