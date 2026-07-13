@@ -58,7 +58,7 @@ pub use timeout::TimeoutProvider;
 
 use std::sync::Arc;
 
-use rig::client::CompletionClient;
+use rig_core::client::CompletionClient;
 use secrecy::ExposeSecret;
 
 // LlmConfig, LunarWingCloudConfig, RegistryProviderConfig, and LlmError are
@@ -137,18 +137,18 @@ fn create_openai_compat_from_registry(
     config: &RegistryProviderConfig,
     request_timeout_secs: u64,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
-    use rig::providers::openai;
+    use rig_core::providers::openai;
 
-    let mut extra_headers = reqwest::header::HeaderMap::new();
+    let mut extra_headers = http::HeaderMap::new();
     for (key, value) in &config.extra_headers {
-        let name = match reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
+        let name = match http::HeaderName::from_bytes(key.as_bytes()) {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(header = %key, error = %e, "Skipping extra header: invalid name");
                 continue;
             }
         };
-        let val = match reqwest::header::HeaderValue::from_str(value) {
+        let val = match http::HeaderValue::from_str(value) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(header = %key, error = %e, "Skipping extra header: invalid value");
@@ -172,7 +172,7 @@ fn create_openai_compat_from_registry(
             "no-key".to_string()
         });
 
-    let http_client = reqwest::Client::builder()
+    let http_client = rig_core::http_client::ReqwestClient::builder()
         .timeout(std::time::Duration::from_secs(request_timeout_secs))
         .build()
         .map_err(|e| LlmError::RequestFailed {
@@ -180,7 +180,7 @@ fn create_openai_compat_from_registry(
             reason: format!("Failed to create HTTP client: {e}"),
         })?;
 
-    let mut builder = openai::Client::<reqwest::Client>::builder()
+    let mut builder = openai::Client::builder()
         .api_key(&api_key)
         .http_client(http_client);
     if !config.base_url.is_empty() {
@@ -215,10 +215,10 @@ fn create_ollama_from_registry(
     config: &RegistryProviderConfig,
     request_timeout_secs: u64,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
-    use rig::client::Nothing;
-    use rig::providers::ollama;
+    use rig_core::client::Nothing;
+    use rig_core::providers::ollama;
 
-    let http_client = reqwest::Client::builder()
+    let http_client = rig_core::http_client::ReqwestClient::builder()
         .timeout(std::time::Duration::from_secs(request_timeout_secs))
         .build()
         .map_err(|e| LlmError::RequestFailed {
@@ -226,7 +226,7 @@ fn create_ollama_from_registry(
             reason: format!("Failed to create HTTP client: {e}"),
         })?;
 
-    let client = ollama::Client::<reqwest::Client>::builder()
+    let client = ollama::Client::builder()
         .base_url(&config.base_url)
         .api_key(Nothing)
         .http_client(http_client)

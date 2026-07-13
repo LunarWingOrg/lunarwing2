@@ -5,12 +5,12 @@
 
 use crate::llm::config::CacheRetention;
 use async_trait::async_trait;
-use rig::OneOrMany;
-use rig::completion::{
+use rig_core::OneOrMany;
+use rig_core::completion::{
     AssistantContent, CompletionModel, CompletionRequest as RigRequest,
     ToolDefinition as RigToolDefinition, Usage as RigUsage,
 };
-use rig::message::{
+use rig_core::message::{
     DocumentSourceKind, Image, ImageMediaType, Message as RigMessage, MimeType,
     ToolChoice as RigToolChoice, ToolFunction, ToolResult as RigToolResult, ToolResultContent,
     UserContent,
@@ -347,7 +347,7 @@ fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<RigMessage
                         let tool_call_id =
                             normalized_tool_call_id(Some(tc.id.as_str()), history.len() + idx);
                         contents.push(AssistantContent::ToolCall(
-                            rig::message::ToolCall::new(
+                            rig_core::message::ToolCall::new(
                                 tool_call_id.clone(),
                                 ToolFunction::new(tc.name.clone(), tc.arguments.clone()),
                             )
@@ -587,6 +587,7 @@ fn build_rig_request(
     };
 
     Ok(RigRequest {
+        model: None,
         preamble,
         chat_history,
         documents: Vec::new(),
@@ -595,6 +596,7 @@ fn build_rig_request(
         max_tokens: max_tokens.map(|t| t as u64),
         tool_choice,
         additional_params,
+        output_schema: None,
     })
 }
 
@@ -815,6 +817,144 @@ fn normalize_tool_name(name: &str, known_tools: &HashSet<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use crate::llm::LlmStreamChunk;
+    use futures::StreamExt;
+    use rig_core::completion::{CompletionError, GetTokenUsage};
+    use rig_core::streaming::{
+        RawStreamingChoice, StreamingCompletionResponse as RigStreamingCompletionResponse,
+    };
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct TestStreamingResponse {
+        usage: RigUsage,
+    }
+
+    impl TestStreamingResponse {
+        fn new(input_tokens: u64, output_tokens: u64, cached_input_tokens: u64) -> Self {
+            Self {
+                usage: RigUsage {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens: input_tokens.saturating_add(output_tokens),
+                    cached_input_tokens,
+                    cache_creation_input_tokens: 0,
+                    tool_use_prompt_tokens: 0,
+                    reasoning_tokens: 0,
+                },
+            }
+        }
+    }
+
+    impl GetTokenUsage for TestStreamingResponse {
+        fn token_usage(&self) -> RigUsage {
+            self.usage
+        }
+    }
+
+    type ScriptedStreamItem = Result<RawStreamingChoice<TestStreamingResponse>, CompletionError>;
+
+    #[derive(Clone)]
+    struct ScriptedCompletionModel {
+        stream_items: Arc<Mutex<Option<Vec<ScriptedStreamItem>>>>,
+    }
+
+    impl ScriptedCompletionModel {
+        fn new(items: Vec<ScriptedStreamItem>) -> Self {
+            Self {
+                stream_items: Arc::new(Mutex::new(Some(items))),
+            }
+        }
+    }
+
+    impl CompletionModel for ScriptedCompletionModel {
+        type Response = serde_json::Value;
+        type StreamingResponse = TestStreamingResponse;
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self::new(Vec::new())
+        }
+
+        fn completion(
+            &self,
+            _request: RigRequest,
+        ) -> impl std::future::Future<
+            Output = Result<
+                rig_core::completion::CompletionResponse<Self::Response>,
+                CompletionError,
+            >,
+        > + Send {
+            async {
+                Err(CompletionError::ProviderError(
+                    "blocking completion is not configured".to_string(),
+                ))
+            }
+        }
+
+        fn stream(
+            &self,
+            _request: RigRequest,
+        ) -> impl std::future::Future<
+            Output = Result<
+                RigStreamingCompletionResponse<Self::StreamingResponse>,
+                CompletionError,
+            >,
+        > + Send {
+            let items = self
+                .stream_items
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+                .unwrap_or_default();
+            async move {
+                Ok(RigStreamingCompletionResponse::stream(Box::pin(
+                    futures::stream::iter(items),
+                )))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_stream_emits_text_deltas_and_terminal_usage() {
+        let model = ScriptedCompletionModel::new(vec![
+            Ok(RawStreamingChoice::Message("hel".to_string())),
+            Ok(RawStreamingChoice::Message("lo".to_string())),
+            Ok(RawStreamingChoice::FinalResponse(
+                TestStreamingResponse::new(7, 3, 2),
+            )),
+        ]);
+        let adapter = RigAdapter::new(model, "test-model");
+
+        let chunks = adapter
+            .complete_stream(CompletionRequest::new(vec![ChatMessage::user("hi")]))
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "hel"
+        ));
+        assert!(matches!(
+            chunks.get(1),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "lo"
+        ));
+        assert!(matches!(
+            chunks.get(2),
+            Some(Ok(LlmStreamChunk::Done {
+                usage: Some(crate::llm::TokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    cache_read_input_tokens: 2,
+                    cache_creation_input_tokens: 0,
+                }),
+                finish_reason,
+            })) if finish_reason == "stop"
+        ));
+    }
 
     #[test]
     fn test_round_f32_to_f64_no_precision_artifacts() {
@@ -1284,8 +1424,8 @@ mod tests {
 
     #[test]
     fn test_with_unsupported_params_populates_set() {
-        use rig::client::CompletionClient;
-        use rig::providers::openai;
+        use rig_core::client::CompletionClient;
+        use rig_core::providers::openai;
 
         let client: openai::Client = openai::Client::builder()
             .api_key("test-key")
@@ -1303,8 +1443,8 @@ mod tests {
 
     #[test]
     fn test_strip_unsupported_completion_params() {
-        use rig::client::CompletionClient;
-        use rig::providers::openai;
+        use rig_core::client::CompletionClient;
+        use rig_core::providers::openai;
 
         let client: openai::Client = openai::Client::builder()
             .api_key("test-key")
@@ -1335,8 +1475,8 @@ mod tests {
 
     #[test]
     fn test_strip_unsupported_tool_params() {
-        use rig::client::CompletionClient;
-        use rig::providers::openai;
+        use rig_core::client::CompletionClient;
+        use rig_core::providers::openai;
 
         let client: openai::Client = openai::Client::builder()
             .api_key("test-key")
@@ -1360,8 +1500,8 @@ mod tests {
 
     #[test]
     fn test_unsupported_params_empty_by_default() {
-        use rig::client::CompletionClient;
-        use rig::providers::openai;
+        use rig_core::client::CompletionClient;
+        use rig_core::providers::openai;
 
         let client: openai::Client = openai::Client::builder()
             .api_key("test-key")
