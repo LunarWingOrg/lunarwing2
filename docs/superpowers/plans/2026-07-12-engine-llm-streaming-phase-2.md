@@ -349,7 +349,7 @@ git commit -m "feat: add engine response delta events"
 Add this private module declaration to `executor/mod.rs`:
 
 ```rust
-pub(crate) mod llm_stream;
+mod llm_stream;
 ```
 
 Create `executor/llm_stream.rs` with imports plus a test module. The first RED
@@ -449,6 +449,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_tool_chunk_after_done() {
+        let (result, _) = collect(vec![
+            done(None),
+            Ok(LlmStreamChunk::ToolCallDelta {
+                index: 0,
+                id: Some("call-1".to_string()),
+                name: Some("search".to_string()),
+                args_delta: "{}".to_string(),
+            }),
+        ])
+        .await;
+        assert!(matches!(result, Err(EngineError::Llm { reason }) if reason.contains("after Done")));
+    }
+
+    #[tokio::test]
     async fn rejects_second_done() {
         let (result, _) = collect(vec![done(None), done(None)]).await;
         assert!(matches!(result, Err(EngineError::Llm { reason }) if reason.contains("after Done")));
@@ -526,6 +541,21 @@ collector implementation:
     }
 
     #[tokio::test]
+    async fn tool_stream_without_text_has_no_content() {
+        let (result, deltas) = collect(vec![
+            tool(0, Some("call-1"), Some("search"), "{}"),
+            done(None),
+        ])
+        .await;
+
+        assert!(deltas.is_empty());
+        assert!(matches!(
+            result.expect("tool stream should collect").response,
+            LlmResponse::ActionCalls { content: None, .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn rejects_conflicting_tool_identity() {
         for items in [
             vec![
@@ -584,7 +614,7 @@ struct ToolCallAccumulator {
     arguments: String,
 }
 
-pub(crate) async fn collect_llm_stream(
+pub(super) async fn collect_llm_stream(
     mut stream: LlmStream<'_>,
     mut on_text_delta: impl FnMut(&str),
 ) -> Result<LlmOutput, EngineError> {
@@ -1018,7 +1048,7 @@ taskset -c 0-5 cargo test -j6 --lib bridge::llm_adapter::tests::complete_stream_
 Expected: tests fail because `LlmBridgeAdapter` inherits the engine's blocking
 fallback instead of opening the scripted native host streams.
 
-- [ ] **Step 4: Add failing request-parity tests**
+- [ ] **Step 4: Add request-parity characterization tests**
 
 Add this test-local provider. The inherited host stream fallbacks call its
 blocking methods, which records the exact request built by the bridge:
@@ -1140,10 +1170,30 @@ async fn stream_request_preserves_tool_config_and_choice() {
     assert_eq!(requests[0].tool_choice.as_deref(), Some("auto"));
     assert_eq!(requests[0].metadata.get("trace").map(String::as_str), Some("abc"));
 }
+
+#[tokio::test]
+async fn stream_request_uses_blocking_defaults() {
+    let provider = Arc::new(CapturingProvider::default());
+    let adapter = LlmBridgeAdapter::new(provider.clone(), None);
+
+    adapter
+        .complete_stream(&[ThreadMessage::user("hello")], &[], &LlmCallConfig::default())
+        .await
+        .expect("default plain stream should open")
+        .collect::<Vec<_>>()
+        .await;
+
+    let requests = provider.plain_requests.lock().expect("plain request lock");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].max_tokens, Some(4096));
+    assert_eq!(requests[0].temperature, Some(0.7));
+}
 ```
 
-Expected: the tool/plain routing assertions fail while the adapter still uses
-the inherited engine fallback.
+Run the complete bridge test module after adding these cases. Expected: the
+request characterization tests pass through the inherited engine fallback;
+the native mapping tests from Step 2 remain RED. These passing tests lock the
+blocking defaults before request construction is shared.
 
 - [ ] **Step 5: Share request construction and implement one-for-one chunk mapping**
 
@@ -1240,10 +1290,76 @@ fn map_stream_chunk(chunk: crate::llm::LlmStreamChunk) -> lunarwing_engine::LlmS
         },
     }
 }
+
+fn map_completion_response(response: crate::llm::CompletionResponse) -> LlmOutput {
+    let usage = map_usage_fields(
+        response.input_tokens,
+        response.output_tokens,
+        response.cache_read_input_tokens,
+        response.cache_creation_input_tokens,
+    );
+    LlmOutput {
+        response: LlmResponse::from_text(response.content),
+        usage,
+    }
+}
+
+fn map_tool_response(response: crate::llm::ToolCompletionResponse) -> LlmOutput {
+    let usage = map_usage_fields(
+        response.input_tokens,
+        response.output_tokens,
+        response.cache_read_input_tokens,
+        response.cache_creation_input_tokens,
+    );
+    let llm_response = if response.tool_calls.is_empty() {
+        LlmResponse::from_text(response.content.unwrap_or_default())
+    } else {
+        LlmResponse::ActionCalls {
+            calls: response
+                .tool_calls
+                .into_iter()
+                .map(|call| lunarwing_engine::ActionCall {
+                    id: call.id,
+                    action_name: call.name,
+                    parameters: call.arguments,
+                })
+                .collect(),
+            content: response.content,
+        }
+    };
+    LlmOutput {
+        response: llm_response,
+        usage,
+    }
+}
 ```
 
-Refactor `complete()` to match on `build_request()` and preserve its current
-blocking response conversion. Add the native trait override:
+Replace `complete()` with the shared request construction and conversion:
+
+```rust
+async fn complete(
+    &self,
+    messages: &[ThreadMessage],
+    actions: &[ActionDef],
+    config: &LlmCallConfig,
+) -> Result<LlmOutput, EngineError> {
+    let provider = self.provider_for_depth(config.depth);
+    match build_request(messages, actions, config) {
+        BridgeRequest::Plain(request) => provider
+            .complete(request)
+            .await
+            .map(map_completion_response)
+            .map_err(map_provider_error),
+        BridgeRequest::Tools(request) => provider
+            .complete_with_tools(request)
+            .await
+            .map(map_tool_response)
+            .map_err(map_provider_error),
+    }
+}
+```
+
+Add the native trait override:
 
 ```rust
 async fn complete_stream<'a>(
@@ -1265,10 +1381,8 @@ async fn complete_stream<'a>(
 }
 ```
 
-Import `futures::StreamExt`. Make both blocking response conversion branches
-call `map_usage_fields(response.input_tokens, response.output_tokens,
-response.cache_read_input_tokens, response.cache_creation_input_tokens)` so
-blocking and terminal stream usage share one widening implementation.
+Import `futures::StreamExt`. The response helpers and terminal chunk mapper now
+share `map_usage_fields`, so counter widening has one implementation.
 
 - [ ] **Step 6: Run the complete bridge test module**
 
@@ -1663,15 +1777,45 @@ async fn orchestrator_streams_without_event_sender() {
 
 - [ ] **Step 5: Switch only the primary host call to strict stream collection**
 
-Import the collector:
+Import the collector and move the response/output types into the module-level
+imports:
 
 ```rust
 use super::llm_stream::collect_llm_stream;
+use crate::traits::llm::{LlmBackend, LlmCallConfig, LlmOutput};
+use crate::types::step::{LlmResponse, StepId, TokenUsage};
 ```
 
 Remove the unused `_kwargs` argument from `handle_llm_complete()` so adding the
 event sender keeps the function at seven arguments. Update the dispatch call to
-pass `event_tx`.
+pass `event_tx`:
+
+```rust
+handle_llm_complete(
+    args,
+    thread,
+    llm,
+    effects,
+    leases,
+    &mut total_tokens,
+    event_tx,
+)
+.await
+```
+
+Use this handler signature:
+
+```rust
+async fn handle_llm_complete(
+    args: &[MontyObject],
+    thread: &mut Thread,
+    llm: &Arc<dyn LlmBackend>,
+    effects: &Arc<dyn EffectExecutor>,
+    leases: &Arc<LeaseManager>,
+    total_tokens: &mut TokenUsage,
+    event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
+) -> ExtFunctionResult {
+```
 
 Open and collect the stream before the existing output-to-Monty conversion:
 
@@ -1701,10 +1845,54 @@ match output {
 }
 ```
 
-Extract the existing successful conversion into
-`fn llm_output_result(output: LlmOutput, total_tokens: &mut TokenUsage) -> ExtFunctionResult`
-without changing its JSON shapes or usage accounting. Extract the existing
-error branch into:
+Close the handler after the result match. Extract the existing successful
+conversion without changing its JSON shapes or usage accounting:
+
+```rust
+fn llm_output_result(
+    output: LlmOutput,
+    total_tokens: &mut TokenUsage,
+) -> ExtFunctionResult {
+    total_tokens.input_tokens += output.usage.input_tokens;
+    total_tokens.output_tokens += output.usage.output_tokens;
+    total_tokens.cost_usd += output.usage.cost_usd;
+
+    let usage = serde_json::json!({
+        "input_tokens": output.usage.input_tokens,
+        "output_tokens": output.usage.output_tokens,
+        "cost_usd": output.usage.cost_usd,
+    });
+    let result = match output.response {
+        LlmResponse::Text(text) => {
+            serde_json::json!({"type": "text", "content": text, "usage": usage})
+        }
+        LlmResponse::Code { code, .. } => {
+            serde_json::json!({"type": "code", "code": code, "usage": usage})
+        }
+        LlmResponse::ActionCalls { calls, content } => {
+            let calls: Vec<serde_json::Value> = calls
+                .into_iter()
+                .map(|call| {
+                    serde_json::json!({
+                        "name": call.action_name,
+                        "call_id": call.id,
+                        "params": call.parameters,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "type": "actions",
+                "content": content,
+                "calls": calls,
+                "usage": usage,
+            })
+        }
+    };
+    ExtFunctionResult::Return(json_to_monty(&result))
+}
+```
+
+Extract the existing error branch into:
 
 ```rust
 fn llm_error_result(error: EngineError) -> ExtFunctionResult {
@@ -1796,9 +1984,17 @@ Update the rollout entry to:
   broadcast as transient provider-neutral events.
 ```
 
-Add the implemented collector, adapter, fallback, event, and full-loop tests to
-the Validation section. Keep Phase 3 as the next milestone and preserve the
-gateway-only/WASM safety language.
+Add this paragraph to the Validation section. Keep Phase 3 as the next
+milestone and preserve the gateway-only/WASM safety language.
+
+```markdown
+Phase 2 coverage adds host-to-engine plain/tool chunk mapping, request/default
+parity, depth routing, setup and item error mapping, strict engine terminal and
+tool reconstruction, complete-only fallback compatibility, response-delta
+Serde coverage, and real orchestrator text/code/tool/error/no-receiver streams.
+The integration tests also prove ordered live delta broadcast, non-persistence
+of provider chunks, and terminal-only usage commitment.
+```
 
 - [ ] **Step 2: Confirm no feature parity status change is warranted**
 
@@ -1829,7 +2025,8 @@ From `ic/`, start:
 
 ```bash
 tmux new-session -d -s phase2-engine-tests \
-  "taskset -c 0-5 cargo test -j6 -p lunarwing_engine -- --nocapture 2>&1 | tee /tmp/phase2-engine-tests.log"
+  "bash -o pipefail -c 'taskset -c 0-5 cargo test -j6 -p lunarwing_engine -- --nocapture 2>&1 | tee /tmp/phase2-engine-tests.log'"
+tmux set-option -t phase2-engine-tests remain-on-exit on
 ```
 
 Monitor with:
@@ -1839,6 +2036,8 @@ tmux capture-pane -pt phase2-engine-tests -S -80
 ```
 
 Expected: the session exits and the log ends with all engine tests passing.
+After recording the final status, close the completed session with
+`tmux kill-session -t phase2-engine-tests`.
 
 - [ ] **Step 5: Run host bridge tests and compile checks**
 
@@ -1872,7 +2071,7 @@ git diff --name-only 867e3f1..HEAD
 rg -n "StatusUpdate|AppEvent|SseEvent|StreamChunk" \
   crates/lunarwing_engine/src/executor/llm_stream.rs \
   crates/lunarwing_engine/src/executor/orchestrator.rs \
-  ../ic/src/bridge/llm_adapter.rs
+  src/bridge/llm_adapter.rs
 ```
 
 Expected: changed implementation files match the plan; the channel-type search
