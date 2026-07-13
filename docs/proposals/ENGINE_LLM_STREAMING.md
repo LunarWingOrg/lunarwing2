@@ -21,8 +21,7 @@ generation, and expose progress during long agentic runs.
   terminal `response`. The channel-neutral `StatusUpdate::StreamChunk` path is
   additionally wired for non-gateway channels (inert today; WASM channels ignore
   `StreamChunk`) to plumb the Phase 5 rollout.
-- **Phase 4 engine cancellation and interrupt-aware ingress are implemented on
-  the integration branch; the corrected Brightdawn live gate is pending.** Each
+- **Phase 4 engine cancellation and interrupt-aware ingress are complete.** Each
   running thread owns a `tokio_util` `CancellationToken`; a stop
   cancels it (in addition to the existing between-step `ThreadSignal::Stop`) so
   an in-flight provider stream — whether still acquiring or mid-collection — is
@@ -37,16 +36,18 @@ generation, and expose progress during long agentic runs.
   while every other message remains FIFO in a 256-entry bounded queue with an
   explicit busy response on overflow. The original agent-level regression first
   failed with zero responses after two seconds, then passed with the dispatcher;
-  five ingress lifecycle tests now cover acquisition cancellation, FIFO priority,
-  overflow, legacy fallback, and soft-timeout preservation. Phase 4 remains open
-  until Brightdawn repeats the TensorZero `2026.3.2` live gate successfully.
+  five ingress lifecycle tests cover acquisition cancellation, FIFO priority,
+  overflow, legacy fallback, and soft-timeout preservation. Brightdawn passed
+  the corrected TensorZero `2026.3.2` live gate on 2026-07-13 with 10-11 ms
+  interrupt acknowledgements, stable post-cancel chunk counts, no persisted
+  cancelled assistant response, successful same-thread recovery, and isolated
+  completion of the queued second thread.
 - **WASM channel delivery is still not covered.** That remains Phase 5.
 - **TensorZero Gateway `2026.3.2` is the compatibility target.** LunarWing uses
   its OpenAI-compatible `/openai/v1/chat/completions` endpoint.
 
-The next work is repeating the corrected Phase 4 Brightdawn live gate, then
-finishing opt-in WASM channel delivery (Phase 5). Provider, engine, and host
-dispatcher plumbing are no longer the blocker.
+The next work is opt-in WASM channel delivery (Phase 5). Provider, engine, host
+dispatcher, and gateway cancellation plumbing are verified.
 
 ## Why this is foundational
 
@@ -234,7 +235,7 @@ gateway rather than exposing partial support.
   non-gateway `StatusUpdate::StreamChunk` path is wired (inert today) for the
   Phase 5 rollout. Gateway delta and status are emitted through a single path to
   avoid duplicating streamed text.
-- **Phase 4 - implementation locally verified; corrected live gate pending:** per-thread
+- **Phase 4 - complete:** per-thread
   `CancellationToken` ownership in `ThreadManager`, cancellation propagated
   through `ExecutionLoop` into the orchestrator's LLM host call (wrapping stream
   acquisition and collection in `run_until_cancelled`), a typed
@@ -246,7 +247,8 @@ gateway rather than exposing partial support.
   The corrective dispatcher is now implemented and locally verified: exact
   interrupts overtake a bounded FIFO of ordinary messages without introducing
   ordinary-message concurrency, and active shutdown aborts and awaits its task.
-  Brightdawn must still repeat the live TensorZero `2026.3.2` cancellation gate.
+  Brightdawn passed the corrected live TensorZero `2026.3.2` cancellation gate
+  on 2026-07-13.
 - **Phase 5:** opt-in channel-neutral delivery for eligible WASM channels after
   the approved safety gates pass.
 
@@ -286,7 +288,21 @@ legacy fallback without cross-thread cancellation, and soft-timeout detachment.
 The full Engine crate passes 322 tests; focused agent-loop, dispatcher, and bridge
 suites pass 17, 2, and 30 tests respectively. Default, PostgreSQL-only, and
 libSQL-only checks, formatting, and zero-warning Clippy also pass under the
-six-thread constraint. These are local gates, not a substitute for Brightdawn.
+six-thread constraint.
+
+The final Brightdawn gate ran release commit `83af2e6` against TensorZero
+`2026.3.2` at `2026-07-13T18:52:49-04:00`. Thread
+`93d0d61d-6a2f-4593-972a-d1f8100724f7` emitted four chunks before cancellation;
+the acknowledgement arrived in 11 ms and the count remained four after the
+quiescence window. History contained zero cancelled assistant responses, then
+one persisted same-thread recovery response after 14 new chunks. Thread
+`67142c06-b447-4c05-9a46-bb637a798dee` remained queued with zero chunks until a
+second scoped interrupt was acknowledged in 10 ms, then completed with one
+terminal and one persisted response. The harness exited `0`; the scoped journal
+window contained no panic, receiver lag, rollback/failure signal, or duplicate
+response, and both gateway and agent health endpoints remained healthy. Tenant
+`env/`, `state/`, nested lockfile modifications, and installed WASM artifacts
+were preserved.
 
 `FEATURE_PARITY.md` is intentionally unchanged in Phase 2 because no
 user-facing channel consumes native provider deltas yet.
@@ -300,9 +316,9 @@ user-facing channel consumes native provider deltas yet.
 - Provider deltas can split at arbitrary UTF-8-safe string boundaries, so
   consumers must append chunks rather than treating them as words or tokens.
 
-The primary remaining risk has moved from provider parsing to lifecycle
-delivery: ensuring terminal response, interrupt, approval, thread scope, and
-channel scope remain coherent while deltas are in flight.
+The primary remaining risk is Phase 5 channel delivery: ensuring terminal
+response, interrupt, approval, thread scope, and channel scope remain coherent
+when opt-in WASM channels consume deltas.
 
 ## Open questions
 

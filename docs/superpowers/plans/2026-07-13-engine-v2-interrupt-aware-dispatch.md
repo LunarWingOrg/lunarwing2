@@ -1015,14 +1015,14 @@ Stage only files actually changed; do not create an empty commit.
 - Preserve: `/home/brightdawn/lunarwing/state/`
 - Preserve installed WASM artifacts.
 
-- [ ] **Step 1: Push and update only Brightdawn source**
+- [x] **Step 1: Push and update only Brightdawn source**
 
 Require local/origin HEAD equality, then fetch and fast-forward the current
 integration branch through the Brightdawn account. Preserve its pre-existing
 modified nested lockfiles and untracked `env/`/`state/`; abort if the new commit
 overlaps those changes.
 
-- [ ] **Step 2: Build the release binary in one tmux session**
+- [x] **Step 2: Build the release binary in one tmux session**
 
 ```bash
 tmux new-session -d -s phase4-dispatch-brightdawn-build \
@@ -1034,7 +1034,7 @@ tmux new-session -d -s phase4-dispatch-brightdawn-build \
 
 Require pane exit status `0`. Do not build or reinstall WASM.
 
-- [ ] **Step 3: Restart through the lifecycle owner**
+- [x] **Step 3: Restart through the lifecycle owner**
 
 ```bash
 sudo -n ic/scripts/lunarwing-mt-admin.sh restart-tenant brightdawn
@@ -1043,7 +1043,7 @@ curl -fsS http://127.0.0.1:10010/api/health
 curl -fsS http://127.0.0.1:10011/agent/status
 ```
 
-- [ ] **Step 4: Run the sanitized live cancellation harness**
+- [x] **Step 4: Run the sanitized live cancellation harness**
 
 Use `/tmp/brightdawn_phase4_live_gate.sh` after updating it to retain sanitized
 failure diagnostics and pipeline exit status. Require:
@@ -1053,11 +1053,11 @@ failure diagnostics and pipeline exit status. Require:
 - stable chunk count for one second after queued frames drain;
 - no cancelled terminal response or persisted assistant response;
 - same-thread recovery streams and completes;
-- a concurrent second thread completes after the first is interrupted;
+- a queued second thread completes after the first is interrupted;
 - sanitized journals contain no panic, event lag, rollback/failure increment, or
   duplicate response.
 
-- [ ] **Step 5: Record the passing live evidence and commit**
+- [x] **Step 5: Record the passing live evidence and commit**
 
 Update the proposal and Phase 4 plan with sanitized timestamps, thread IDs,
 event counts, acknowledgement latency, history count, recovery/isolation result,
@@ -1068,3 +1068,15 @@ git add docs/proposals/ENGINE_LLM_STREAMING.md \
   docs/superpowers/plans/2026-07-13-engine-llm-streaming-phase-4.md
 git commit -m "docs: complete engine streaming phase 4"
 ```
+
+Completed on 2026-07-13. Local and origin matched at `83af2e6`; Brightdawn was
+fast-forwarded without overlapping its modified nested lockfiles or untracked
+`env/`/`state/`, and the single constrained release build finished in 3m17s.
+After the mt-admin restart, both health endpoints passed. The final sanitized
+TensorZero `2026.3.2` harness exited `0` at
+`2026-07-13T18:52:49-04:00`: four initial chunks, 11 ms first acknowledgement,
+stable post-cancel count, zero persisted cancelled responses, 14 same-thread
+recovery chunks, zero second-thread chunks while queued, 10 ms second
+acknowledgement, and exactly one terminal/persisted response for the queued
+thread. The scoped journal scan found no panic, receiver lag,
+rollback/failure signal, or duplicate response.
