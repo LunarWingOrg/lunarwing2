@@ -2722,6 +2722,27 @@ async fn await_thread_outcome(
     result
 }
 
+/// Build the per-event status metadata for channel delivery.
+///
+/// For the gateway, this extends the original incoming metadata with the engine
+/// `thread_id` so `GatewayChannel::send_status` routes each SSE event to the
+/// correct thread (and keeps the original `user_id` for per-user scoping).
+/// Non-gateway channels pass their original metadata through unchanged.
+fn engine_status_metadata(message: &IncomingMessage, thread_id: &str) -> serde_json::Value {
+    let mut metadata = message.metadata.clone();
+    if message.channel != "gateway" {
+        return metadata;
+    }
+
+    if !metadata.is_object() {
+        metadata = serde_json::json!({});
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("thread_id".into(), serde_json::json!(thread_id));
+    }
+    metadata
+}
+
 async fn deliver_thread_event(
     agent: &Agent,
     state: &EngineState,
@@ -2729,7 +2750,13 @@ async fn deliver_thread_event(
     thread_id: &str,
     event: &lunarwing_engine::ThreadEvent,
 ) {
-    forward_event_to_channel(event, &agent.channels, &message.channel, &message.metadata).await;
+    // Progress is delivered channel-neutrally via `send_status` for every
+    // channel (gateway included). The gateway status metadata carries the
+    // engine thread id so SSE events route to the correct thread. Only
+    // structural events with no status equivalent still go through the direct
+    // SSE `AppEvent` path below.
+    let status_metadata = engine_status_metadata(message, thread_id);
+    forward_event_to_channel(event, &agent.channels, &message.channel, &status_metadata).await;
     if let Some(sse) = state.sse.as_ref() {
         for app_event in thread_event_to_app_events(event, thread_id) {
             sse.broadcast_for_user(&message.user_id, app_event);
@@ -2980,14 +3007,11 @@ async fn forward_event_to_channel(
                 )
                 .await;
         }
-        // The gateway receives streamed deltas via the direct SSE path in
-        // `await_thread_outcome` (see `thread_event_to_app_events`), which
-        // carries the real engine thread id and scopes by `message.user_id`.
-        // Emitting here as well would double the streamed text because the
-        // frontend appends chunks additively. Wire the channel-neutral status
-        // path for other channels only; WASM channels currently ignore
-        // `StreamChunk`, but this plumbs Phase 5 delivery.
-        EventKind::ResponseDelta { content } if channel_name != "gateway" => {
+        // Deltas are delivered channel-neutrally to every channel, including the
+        // gateway (whose `send_status` maps `StreamChunk` to the SSE
+        // `stream_chunk` event using the thread id in the status metadata). WASM
+        // channels still ignore `StreamChunk`.
+        EventKind::ResponseDelta { content } => {
             let _ = channels
                 .send_status(
                     channel_name,
@@ -3010,70 +3034,12 @@ fn thread_event_to_app_events(
 ) -> Vec<AppEvent> {
     use lunarwing_engine::EventKind;
 
+    // Progress events (StepStarted, action started/completed/failed, step
+    // completion, interpreted message status, skill activation, response
+    // deltas) are delivered channel-neutrally via `send_status` — see
+    // `forward_event_to_channel`. Only structural gateway events with no
+    // `StatusUpdate` equivalent are emitted directly on the SSE stream here.
     match &event.kind {
-        EventKind::StepStarted { .. } => vec![AppEvent::Thinking {
-            message: "Calling LLM...".into(),
-            thread_id: Some(thread_id.into()),
-        }],
-        EventKind::ActionExecuted {
-            action_name,
-            duration_ms,
-            params_summary,
-            ..
-        } => {
-            let display_name = format_action_display_name(action_name, params_summary);
-            vec![
-                AppEvent::ToolStarted {
-                    name: display_name.clone(),
-                    thread_id: Some(thread_id.into()),
-                },
-                AppEvent::ToolCompleted {
-                    name: display_name,
-                    success: true,
-                    error: None,
-                    parameters: Some(format!("{duration_ms}ms")),
-                    thread_id: Some(thread_id.into()),
-                },
-            ]
-        }
-        EventKind::ActionFailed {
-            action_name,
-            error,
-            params_summary,
-            ..
-        } => {
-            let display_name = format_action_display_name(action_name, params_summary);
-            vec![
-                AppEvent::ToolStarted {
-                    name: display_name.clone(),
-                    thread_id: Some(thread_id.into()),
-                },
-                AppEvent::ToolCompleted {
-                    name: display_name,
-                    success: false,
-                    error: Some(error.clone()),
-                    parameters: None,
-                    thread_id: Some(thread_id.into()),
-                },
-            ]
-        }
-        EventKind::StepCompleted { tokens, .. } => vec![AppEvent::Status {
-            message: format!(
-                "Step complete — {} in / {} out tokens",
-                tokens.input_tokens, tokens.output_tokens
-            ),
-            thread_id: Some(thread_id.into()),
-        }],
-        EventKind::MessageAdded {
-            role,
-            content_preview,
-        } => interpret_message_event(role, content_preview)
-            .map(|text| AppEvent::Thinking {
-                message: text.into(),
-                thread_id: Some(thread_id.into()),
-            })
-            .into_iter()
-            .collect(),
         EventKind::StateChanged { from, to, reason } => {
             vec![AppEvent::ThreadStateChanged {
                 thread_id: thread_id.into(),
@@ -3086,14 +3052,6 @@ fn thread_event_to_app_events(
             parent_thread_id: thread_id.into(),
             child_thread_id: child_id.to_string(),
             goal: goal.clone(),
-        }],
-        EventKind::SkillActivated { skill_names } => vec![AppEvent::SkillActivated {
-            skill_names: skill_names.clone(),
-            thread_id: Some(thread_id.into()),
-        }],
-        EventKind::ResponseDelta { content } => vec![AppEvent::StreamChunk {
-            content: content.clone(),
-            thread_id: Some(thread_id.into()),
         }],
         _ => vec![],
     }
@@ -4577,28 +4535,20 @@ mod tests {
     }
 
     #[test]
-    fn response_delta_maps_to_stream_chunk_app_event() {
-        let evt = lunarwing_engine::ThreadEvent::new(
+    fn response_delta_has_no_direct_gateway_app_event() {
+        // Deltas now flow to the gateway through channel status, not a direct
+        // SSE AppEvent, so the structural-only mapper returns nothing for them.
+        let event = lunarwing_engine::ThreadEvent::new(
             lunarwing_engine::ThreadId::new(),
             lunarwing_engine::EventKind::ResponseDelta {
-                content: "hi".to_string(),
+                content: "hi".into(),
             },
         );
-
-        let events = thread_event_to_app_events(&evt, "tid-1");
-
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            AppEvent::StreamChunk { content, thread_id } => {
-                assert_eq!(content, "hi");
-                assert_eq!(thread_id.as_deref(), Some("tid-1"));
-            }
-            other => panic!("expected StreamChunk, got {other:?}"),
-        }
+        assert!(thread_event_to_app_events(&event, "thread-1").is_empty());
     }
 
     #[tokio::test]
-    async fn response_delta_skips_gateway_but_forwards_to_other_channels() {
+    async fn response_delta_reaches_gateway_and_other_channels_via_status() {
         use crate::testing::StubChannel;
 
         let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
@@ -4619,22 +4569,44 @@ mod tests {
         );
         let metadata = serde_json::json!({});
 
-        // Gateway is served by the direct SSE path; forwarding here too would
-        // double the streamed text, so no status is sent to it.
+        // Both gateway and non-gateway channels get exactly one StreamChunk
+        // status; the gateway is no longer special-cased.
         forward_event_to_channel(&evt, &manager, "gateway", &metadata).await;
-        assert!(
-            gateway_statuses.lock().expect("poisoned").is_empty(),
-            "gateway must not receive ResponseDelta via send_status"
-        );
-
-        // Non-gateway channels get the channel-neutral StreamChunk status.
         forward_event_to_channel(&evt, &manager, "xmpp", &metadata).await;
-        let captured = xmpp_statuses.lock().expect("poisoned");
-        assert_eq!(captured.len(), 1);
-        assert!(
-            matches!(&captured[0], StatusUpdate::StreamChunk(c) if c == "hi"),
-            "expected StreamChunk(\"hi\"), got {:?}",
-            captured[0]
+
+        for (name, statuses) in [("gateway", &gateway_statuses), ("xmpp", &xmpp_statuses)] {
+            let captured = statuses.lock().expect("poisoned");
+            assert_eq!(captured.len(), 1, "{name} should receive one status");
+            assert!(
+                matches!(&captured[0], StatusUpdate::StreamChunk(c) if c == "hi"),
+                "{name}: expected StreamChunk(\"hi\"), got {:?}",
+                captured[0]
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_status_metadata_extends_instead_of_replacing_original() {
+        let message =
+            IncomingMessage::new("gateway", "alice", "hello").with_metadata(serde_json::json!({
+                "user_id": "alice",
+                "client_marker": "keep-me"
+            }));
+
+        let metadata = engine_status_metadata(&message, "engine-thread");
+        assert_eq!(metadata["user_id"], "alice");
+        assert_eq!(metadata["client_marker"], "keep-me");
+        assert_eq!(metadata["thread_id"], "engine-thread");
+    }
+
+    #[test]
+    fn non_gateway_status_metadata_is_passed_through_unchanged() {
+        let message = IncomingMessage::new("xmpp", "alice", "hi")
+            .with_metadata(serde_json::json!({"xmpp_room": "room@example.org"}));
+        let metadata = engine_status_metadata(&message, "engine-thread");
+        assert_eq!(
+            metadata,
+            serde_json::json!({"xmpp_room": "room@example.org"})
         );
     }
 
