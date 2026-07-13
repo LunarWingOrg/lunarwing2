@@ -1274,6 +1274,7 @@ async fn resolve_tool_future(
                 call_id: call_id.into(),
                 duration_ms: result.duration.as_millis() as u64,
                 params_summary,
+                result_preview: crate::types::event::preview_from_output(&result.output, 1000),
             });
             let monty_val = json_to_monty(&result.output);
             action_results.push(result);

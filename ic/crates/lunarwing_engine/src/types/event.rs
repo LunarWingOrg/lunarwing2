@@ -70,6 +70,24 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{}...", &s[..end])
     }
 }
+
+/// Build a short preview string from a tool's output value.
+///
+/// String outputs are used verbatim; other JSON values are compact-serialized.
+/// The result is truncated to `max` bytes at a UTF-8 char boundary. Returns
+/// `None` when the output is null or empty so callers can skip emitting a
+/// result preview for tools that produced nothing.
+pub fn preview_from_output(output: &serde_json::Value, max: usize) -> Option<String> {
+    let raw = match output {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if raw.is_empty() {
+        return None;
+    }
+    Some(truncate(&raw, max))
+}
 use crate::types::step::{StepId, TokenUsage};
 use crate::types::thread::{ThreadId, ThreadState};
 
@@ -141,6 +159,10 @@ pub enum EventKind {
         /// Short human-readable summary of parameters (e.g., URL for http tool).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         params_summary: Option<String>,
+        /// Truncated preview of the tool's output, for live UI display and
+        /// history reconstruction. `None` when the tool produced no output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_preview: Option<String>,
     },
     ActionFailed {
         step_id: StepId,
@@ -253,5 +275,39 @@ mod tests {
             decoded.kind,
             EventKind::ResponseDelta { content } if content == "partial response"
         ));
+    }
+
+    #[test]
+    fn preview_from_output_handles_strings_json_and_empty() {
+        use super::preview_from_output;
+
+        // Null and empty string produce no preview.
+        assert_eq!(preview_from_output(&serde_json::Value::Null, 100), None);
+        assert_eq!(preview_from_output(&serde_json::json!(""), 100), None);
+
+        // Short string used verbatim.
+        assert_eq!(
+            preview_from_output(&serde_json::json!("hello"), 100).as_deref(),
+            Some("hello")
+        );
+
+        // Long string truncated with an ellipsis.
+        let long = "a".repeat(50);
+        let out = preview_from_output(&serde_json::json!(long), 10).unwrap();
+        assert!(out.ends_with("..."));
+        assert!(out.starts_with("aaaa"));
+
+        // Non-string values are compact-serialized to JSON.
+        let obj = preview_from_output(&serde_json::json!({"k": 1}), 100).unwrap();
+        assert!(obj.contains("\"k\""));
+    }
+
+    #[test]
+    fn preview_from_output_respects_utf8_boundary() {
+        // Truncation must land on a char boundary and never panic mid-codepoint.
+        let s = "你好世界".repeat(5); // 3 bytes per char
+        let out = super::preview_from_output(&serde_json::json!(s), 7).unwrap();
+        assert!(out.ends_with("..."));
+        assert!(out.starts_with("你好"));
     }
 }

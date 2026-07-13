@@ -698,6 +698,7 @@ mod tests {
                 call_id: "c".into(),
                 duration_ms: 1,
                 params_summary: params.map(|s| s.to_string()),
+                result_preview: None,
             },
         )
     }

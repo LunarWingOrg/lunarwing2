@@ -2324,12 +2324,17 @@ async fn await_thread_outcome(
     // a denied approval where the thread fails to resume).
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
 
+    // Accumulate tool-call summaries as events stream so the completed turn's
+    // tool calls can be persisted to history and re-rendered after a reload.
+    let mut tool_call_summaries: Vec<serde_json::Value> = Vec::new();
+
     loop {
         tokio::select! {
             event = event_rx.recv() => {
                 match event {
                     Ok(ref evt) if evt.thread_id == thread_id => {
                         deliver_thread_event(agent, state, message, &tid_str, evt).await;
+                        collect_tool_call(evt, &mut tool_call_summaries);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -2346,6 +2351,7 @@ async fn await_thread_outcome(
                 if !state.thread_manager.is_running(thread_id).await {
                     for event in drain_pending_thread_events(&mut event_rx, thread_id) {
                         deliver_thread_event(agent, state, message, &tid_str, &event).await;
+                        collect_tool_call(&event, &mut tool_call_summaries);
                     }
                     break;
                 }
@@ -2372,6 +2378,15 @@ async fn await_thread_outcome(
         .await
         .map_err(|e| engine_err("conversation error", e))?;
 
+    // Serialize the turn's tool calls (if any) so they can be written to the
+    // v1 history immediately before the assistant message, letting the chat
+    // re-render the tool section after a reload or thread switch.
+    let tool_calls_json: Option<String> = if tool_call_summaries.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&tool_call_summaries).ok()
+    };
+
     // Helper: write the outcome response to the v1 DB so the history API
     // shows it correctly for all outcomes that produce a response.
     let write_v1_response = |db: &Arc<dyn crate::db::Database>, text: &str| {
@@ -2380,6 +2395,7 @@ async fn await_thread_outcome(
         let user_id = message.user_id.clone();
         let channel = message.channel.clone();
         let text = text.to_string();
+        let tool_calls_json = tool_calls_json.clone();
         async move {
             let v1_conv_id = if let Some(ref scope) = scope {
                 db.get_or_create_scoped_conversation(&channel, &user_id, scope)
@@ -2391,6 +2407,11 @@ async fn await_thread_outcome(
                     .ok()
             };
             if let Some(cid) = v1_conv_id {
+                // Persist tool calls between the user and assistant messages so
+                // `build_turns_from_db_messages` can reconstruct them on reload.
+                if let Some(ref tcj) = tool_calls_json {
+                    let _ = db.add_conversation_message(cid, "tool_calls", tcj).await;
+                }
                 let _ = db.add_conversation_message(cid, "assistant", &text).await;
             }
         }
@@ -2668,6 +2689,40 @@ async fn deliver_thread_event(
     }
 }
 
+/// Accumulate a persisted tool-call summary from an action event.
+///
+/// The JSON shape matches what `build_turns_from_db_messages`
+/// (`crate::channels::web::util`) expects: objects with a `name` and optional
+/// `result_preview` / `error`. Only executed/failed actions are recorded;
+/// other event kinds are ignored.
+fn collect_tool_call(event: &lunarwing_engine::ThreadEvent, out: &mut Vec<serde_json::Value>) {
+    use crate::channels::web::util::truncate_preview;
+    use lunarwing_engine::EventKind;
+
+    match &event.kind {
+        EventKind::ActionExecuted {
+            action_name,
+            result_preview,
+            ..
+        } => {
+            let mut obj = serde_json::json!({ "name": action_name });
+            if let Some(preview) = result_preview.as_deref().filter(|p| !p.is_empty()) {
+                obj["result_preview"] = serde_json::Value::String(truncate_preview(preview, 500));
+            }
+            out.push(obj);
+        }
+        EventKind::ActionFailed {
+            action_name, error, ..
+        } => {
+            out.push(serde_json::json!({
+                "name": action_name,
+                "error": truncate_preview(error, 200),
+            }));
+        }
+        _ => {}
+    }
+}
+
 fn drain_pending_thread_events(
     event_rx: &mut tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
     thread_id: lunarwing_engine::ThreadId,
@@ -2801,6 +2856,7 @@ async fn forward_event_to_channel(
             action_name,
             duration_ms,
             params_summary,
+            result_preview,
             ..
         } => {
             let display_name = format_action_display_name(action_name, params_summary);
@@ -2813,6 +2869,18 @@ async fn forward_event_to_channel(
                     metadata,
                 )
                 .await;
+            if let Some(preview) = result_preview.as_deref().filter(|p| !p.is_empty()) {
+                let _ = channels
+                    .send_status(
+                        channel_name,
+                        StatusUpdate::ToolResult {
+                            name: display_name.clone(),
+                            preview: preview.to_string(),
+                        },
+                        metadata,
+                    )
+                    .await;
+            }
             let _ = channels
                 .send_status(
                     channel_name,
@@ -2950,22 +3018,31 @@ fn thread_event_to_app_events(
             action_name,
             duration_ms,
             params_summary,
+            result_preview,
             ..
         } => {
             let display_name = format_action_display_name(action_name, params_summary);
-            vec![
-                AppEvent::ToolStarted {
+            let mut events = vec![AppEvent::ToolStarted {
+                name: display_name.clone(),
+                thread_id: Some(thread_id.into()),
+            }];
+            // Emit the tool output so the live card body is populated. Without
+            // this, a successful tool leaves an empty (unreadable) expanded card.
+            if let Some(preview) = result_preview.as_deref().filter(|p| !p.is_empty()) {
+                events.push(AppEvent::ToolResult {
                     name: display_name.clone(),
+                    preview: preview.to_string(),
                     thread_id: Some(thread_id.into()),
-                },
-                AppEvent::ToolCompleted {
-                    name: display_name,
-                    success: true,
-                    error: None,
-                    parameters: Some(format!("{duration_ms}ms")),
-                    thread_id: Some(thread_id.into()),
-                },
-            ]
+                });
+            }
+            events.push(AppEvent::ToolCompleted {
+                name: display_name,
+                success: true,
+                error: None,
+                parameters: Some(format!("{duration_ms}ms")),
+                thread_id: Some(thread_id.into()),
+            });
+            events
         }
         EventKind::ActionFailed {
             action_name,
@@ -4528,6 +4605,133 @@ mod tests {
             }
             other => panic!("expected StreamChunk, got {other:?}"),
         }
+    }
+
+    // Regression: a successful action must emit ToolStarted -> ToolResult ->
+    // ToolCompleted so the live tool card body is populated (was empty because
+    // the engine path never sent a ToolResult).
+    #[test]
+    fn action_executed_with_preview_emits_tool_result() {
+        let evt = lunarwing_engine::ThreadEvent::new(
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::EventKind::ActionExecuted {
+                step_id: lunarwing_engine::StepId::new(),
+                action_name: "shell".into(),
+                call_id: "c1".into(),
+                duration_ms: 12,
+                params_summary: Some("ls".into()),
+                result_preview: Some("file1.txt\nfile2.txt".into()),
+            },
+        );
+
+        let events = thread_event_to_app_events(&evt, "tid-1");
+        assert_eq!(events.len(), 3, "expected Started + Result + Completed");
+
+        let started_name = match &events[0] {
+            AppEvent::ToolStarted { name, .. } => name.clone(),
+            other => panic!("expected ToolStarted, got {other:?}"),
+        };
+        match &events[1] {
+            AppEvent::ToolResult {
+                name,
+                preview,
+                thread_id,
+            } => {
+                assert_eq!(name, &started_name);
+                assert_eq!(preview, "file1.txt\nfile2.txt");
+                assert_eq!(thread_id.as_deref(), Some("tid-1"));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        match &events[2] {
+            AppEvent::ToolCompleted { name, success, .. } => {
+                assert_eq!(name, &started_name);
+                assert!(success);
+            }
+            other => panic!("expected ToolCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_executed_without_preview_skips_tool_result() {
+        for preview in [None, Some(String::new())] {
+            let evt = lunarwing_engine::ThreadEvent::new(
+                lunarwing_engine::ThreadId::new(),
+                lunarwing_engine::EventKind::ActionExecuted {
+                    step_id: lunarwing_engine::StepId::new(),
+                    action_name: "time".into(),
+                    call_id: "c1".into(),
+                    duration_ms: 1,
+                    params_summary: None,
+                    result_preview: preview,
+                },
+            );
+            let events = thread_event_to_app_events(&evt, "tid-1");
+            assert_eq!(events.len(), 2, "expected only Started + Completed");
+            assert!(matches!(events[0], AppEvent::ToolStarted { .. }));
+            assert!(matches!(events[1], AppEvent::ToolCompleted { .. }));
+        }
+    }
+
+    // Regression: tool calls must be persisted so they survive a reload /
+    // thread switch. Verify collect_tool_call produces a record that
+    // build_turns_from_db_messages reconstructs.
+    #[test]
+    fn collect_tool_call_round_trips_through_history() {
+        let tid = lunarwing_engine::ThreadId::new();
+        let executed = lunarwing_engine::ThreadEvent::new(
+            tid,
+            lunarwing_engine::EventKind::ActionExecuted {
+                step_id: lunarwing_engine::StepId::new(),
+                action_name: "shell".into(),
+                call_id: "c1".into(),
+                duration_ms: 5,
+                params_summary: None,
+                result_preview: Some("output text".into()),
+            },
+        );
+        let failed = lunarwing_engine::ThreadEvent::new(
+            tid,
+            lunarwing_engine::EventKind::ActionFailed {
+                step_id: lunarwing_engine::StepId::new(),
+                action_name: "http".into(),
+                call_id: "c2".into(),
+                error: "timeout".into(),
+                params_summary: None,
+            },
+        );
+
+        let mut out = Vec::new();
+        collect_tool_call(&executed, &mut out);
+        collect_tool_call(&failed, &mut out);
+        assert_eq!(out.len(), 2);
+
+        let json = serde_json::to_string(&out).unwrap();
+        let now = chrono::Utc::now();
+        let msg = |role: &str, content: &str, off: i64| crate::history::ConversationMessage {
+            id: uuid::Uuid::new_v4(),
+            role: role.into(),
+            content: content.into(),
+            created_at: now + chrono::TimeDelta::milliseconds(off),
+        };
+        let messages = vec![
+            msg("user", "run it", 0),
+            msg("tool_calls", &json, 100),
+            msg("assistant", "done", 200),
+        ];
+
+        let turns = crate::channels::web::util::build_turns_from_db_messages(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 2);
+        assert_eq!(turns[0].tool_calls[0].name, "shell");
+        assert!(turns[0].tool_calls[0].has_result);
+        assert_eq!(
+            turns[0].tool_calls[0].result_preview.as_deref(),
+            Some("output text")
+        );
+        assert_eq!(turns[0].tool_calls[1].name, "http");
+        assert!(turns[0].tool_calls[1].has_error);
+        assert_eq!(turns[0].tool_calls[1].error.as_deref(), Some("timeout"));
     }
 
     #[tokio::test]
