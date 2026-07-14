@@ -412,6 +412,24 @@ async fn revert_always_allow(
     }
 }
 
+fn resolved_action_event(
+    pending: &PendingGate,
+    step_id: lunarwing_engine::StepId,
+    result: &lunarwing_engine::ActionResult,
+) -> lunarwing_engine::EventKind {
+    lunarwing_engine::EventKind::ActionExecuted {
+        step_id,
+        action_name: pending.action_name.clone(),
+        call_id: pending.call_id.clone(),
+        duration_ms: result.duration.as_millis() as u64,
+        params_summary: lunarwing_engine::types::event::summarize_params(
+            &pending.action_name,
+            &pending.parameters,
+        ),
+        result_preview: lunarwing_engine::types::event::preview_from_output(&result.output),
+    }
+}
+
 async fn execute_pending_gate_action(
     agent: &Agent,
     state: &EngineState,
@@ -452,6 +470,7 @@ async fn execute_pending_gate_action(
     };
 
     state.effect_adapter.reset_call_count();
+    let event_rx = state.thread_manager.subscribe_events();
     match state
         .effect_adapter
         .execute_resolved_pending_action(
@@ -464,7 +483,15 @@ async fn execute_pending_gate_action(
         .await
     {
         Ok(result) => {
-            let event_rx = state.thread_manager.subscribe_events();
+            state
+                .thread_manager
+                .record_waiting_event(
+                    pending.thread_id,
+                    &message.user_id,
+                    resolved_action_event(pending, exec_ctx.step_id, &result),
+                )
+                .await
+                .map_err(|error| engine_err("record approved action", error))?;
             state
                 .thread_manager
                 .resume_thread(
@@ -2577,6 +2604,21 @@ async fn await_thread_outcome(
         .await
         .map_err(|e| engine_err("conversation error", e))?;
 
+    let should_load_tool_history = match &outcome {
+        ThreadOutcome::Completed {
+            response: Some(text),
+        } => !text.is_empty(),
+        ThreadOutcome::MaxIterations | ThreadOutcome::Failed { .. } => true,
+        ThreadOutcome::Completed { response: None }
+        | ThreadOutcome::Stopped
+        | ThreadOutcome::GatePaused { .. } => false,
+    };
+    let tool_calls_json = if should_load_tool_history {
+        load_tool_calls_json(&state.store, thread_id).await
+    } else {
+        None
+    };
+
     // Helper: write the outcome response to the v1 DB so the history API
     // shows it correctly for all outcomes that produce a response.
     let write_v1_response = |db: &Arc<dyn crate::db::Database>, text: &str| {
@@ -2585,6 +2627,7 @@ async fn await_thread_outcome(
         let user_id = message.user_id.clone();
         let channel = message.channel.clone();
         let text = text.to_string();
+        let tool_calls_json = tool_calls_json.clone();
         async move {
             let v1_conv_id = if let Some(ref scope) = scope {
                 db.get_or_create_scoped_conversation(&channel, &user_id, scope)
@@ -2596,7 +2639,14 @@ async fn await_thread_outcome(
                     .ok()
             };
             if let Some(cid) = v1_conv_id {
-                let _ = db.add_conversation_message(cid, "assistant", &text).await;
+                if let Some(ref json) = tool_calls_json
+                    && let Err(error) = db.add_conversation_message(cid, "tool_calls", json).await
+                {
+                    tracing::warn!(%error, "failed to persist Engine V2 tool history");
+                }
+                if let Err(error) = db.add_conversation_message(cid, "assistant", &text).await {
+                    tracing::warn!(%error, "failed to persist Engine V2 assistant history");
+                }
             }
         }
     };
@@ -2896,6 +2946,77 @@ fn drain_pending_thread_events(
         }
     }
     events
+}
+
+/// Build bounded v1-compatible tool summaries for one Engine V2 thread.
+fn tool_call_summaries(events: &[lunarwing_engine::ThreadEvent]) -> Vec<serde_json::Value> {
+    use crate::channels::web::util::truncate_preview;
+    use lunarwing_engine::EventKind;
+
+    let mut summaries = Vec::new();
+    for event in events {
+        match &event.kind {
+            EventKind::ActionExecuted {
+                action_name,
+                call_id,
+                result_preview,
+                ..
+            } => {
+                let mut summary = serde_json::json!({ "name": action_name });
+                if !call_id.is_empty() {
+                    summary["call_id"] = serde_json::Value::String(call_id.clone());
+                }
+                if let Some(preview) = result_preview.as_deref().filter(|value| !value.is_empty()) {
+                    summary["result_preview"] =
+                        serde_json::Value::String(truncate_preview(preview, 500));
+                }
+                summaries.push(summary);
+            }
+            EventKind::ActionFailed {
+                action_name,
+                call_id,
+                error,
+                ..
+            } => {
+                let mut summary = serde_json::json!({
+                    "name": action_name,
+                    "error": truncate_preview(error, 200),
+                });
+                if !call_id.is_empty() {
+                    summary["call_id"] = serde_json::Value::String(call_id.clone());
+                }
+                summaries.push(summary);
+            }
+            _ => {}
+        }
+    }
+    summaries
+}
+
+/// Load and serialize bounded tool summaries from the durable thread snapshot.
+async fn load_tool_calls_json(
+    store: &Arc<dyn lunarwing_engine::Store>,
+    thread_id: lunarwing_engine::ThreadId,
+) -> Option<String> {
+    let thread = match store.load_thread(thread_id).await {
+        Ok(Some(thread)) => thread,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(%thread_id, %error, "failed to load tool history");
+            return None;
+        }
+    };
+    let summaries = tool_call_summaries(&thread.events);
+    if summaries.is_empty() {
+        return None;
+    }
+    match serde_json::to_string(&summaries) {
+        Ok(json) => Some(json),
+        Err(error) => {
+            tracing::warn!(%thread_id, %error, "failed to serialize tool history");
+            None
+        }
+    }
 }
 
 // ── Shared event display helpers ────────────────────────────
@@ -4783,6 +4904,141 @@ mod tests {
         assert!(matches!(
             captured[1],
             StatusUpdate::ToolCompleted { success: true, .. }
+        ));
+    }
+
+    #[test]
+    fn saved_thread_events_reconstruct_tool_history_in_order() {
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let events = vec![
+            lunarwing_engine::ThreadEvent::new(
+                thread_id,
+                lunarwing_engine::EventKind::ActionExecuted {
+                    step_id: lunarwing_engine::StepId::new(),
+                    action_name: "shell".into(),
+                    call_id: "call-before".into(),
+                    duration_ms: 5,
+                    params_summary: None,
+                    result_preview: Some("output text".into()),
+                },
+            ),
+            lunarwing_engine::ThreadEvent::new(
+                thread_id,
+                lunarwing_engine::EventKind::ApprovalReceived {
+                    call_id: "call-approved".into(),
+                    approved: true,
+                },
+            ),
+            lunarwing_engine::ThreadEvent::new(
+                thread_id,
+                lunarwing_engine::EventKind::ActionFailed {
+                    step_id: lunarwing_engine::StepId::new(),
+                    action_name: "http".into(),
+                    call_id: "call-after".into(),
+                    error: "timeout".into(),
+                    params_summary: None,
+                },
+            ),
+        ];
+
+        let summaries = tool_call_summaries(&events);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0]["call_id"], "call-before");
+        assert_eq!(summaries[0]["result_preview"], "output text");
+        assert_eq!(summaries[1]["call_id"], "call-after");
+        assert_eq!(summaries[1]["error"], "timeout");
+
+        let now = chrono::Utc::now();
+        let message =
+            |role: &str, content: &str, offset_ms: i64| crate::history::ConversationMessage {
+                id: uuid::Uuid::new_v4(),
+                role: role.into(),
+                content: content.into(),
+                created_at: now + chrono::TimeDelta::milliseconds(offset_ms),
+            };
+        let json = serde_json::to_string(&summaries).unwrap();
+        let messages = vec![
+            message("user", "run tools", 0),
+            message("tool_calls", &json, 100),
+            message("assistant", "done", 200),
+        ];
+
+        let turns = crate::channels::web::util::build_turns_from_db_messages(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 2);
+        assert_eq!(turns[0].tool_calls[0].name, "shell");
+        assert_eq!(
+            turns[0].tool_calls[0].result_preview.as_deref(),
+            Some("output text")
+        );
+        assert_eq!(turns[0].tool_calls[1].name, "http");
+        assert_eq!(turns[0].tool_calls[1].error.as_deref(), Some("timeout"));
+    }
+
+    #[tokio::test]
+    async fn saved_thread_tool_history_serializes_from_store() {
+        let store = Arc::new(TestStore::new());
+        let mut thread = lunarwing_engine::Thread::new(
+            "run a tool",
+            lunarwing_engine::ThreadType::Foreground,
+            lunarwing_engine::ProjectId::new(),
+            "alice",
+            lunarwing_engine::ThreadConfig::default(),
+        );
+        thread.add_event(lunarwing_engine::EventKind::ActionExecuted {
+            step_id: lunarwing_engine::StepId::new(),
+            action_name: "shell".into(),
+            call_id: "call-1".into(),
+            duration_ms: 5,
+            params_summary: None,
+            result_preview: Some("saved output".into()),
+        });
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+        let store: Arc<dyn lunarwing_engine::Store> = store;
+
+        let json = load_tool_calls_json(&store, thread_id)
+            .await
+            .expect("saved tool history should serialize");
+        let summaries: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0]["name"], "shell");
+        assert_eq!(summaries[0]["call_id"], "call-1");
+        assert_eq!(summaries[0]["result_preview"], "saved output");
+    }
+
+    #[test]
+    fn resolved_action_event_preserves_pending_identity_and_output() {
+        let pending = sample_pending_gate(
+            "alice",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let step_id = lunarwing_engine::StepId::new();
+        let result = lunarwing_engine::ActionResult {
+            call_id: String::new(),
+            action_name: pending.action_name.clone(),
+            output: serde_json::json!("approved output"),
+            is_error: false,
+            duration: std::time::Duration::from_millis(8),
+        };
+
+        let event = resolved_action_event(&pending, step_id, &result);
+
+        assert!(matches!(
+            event,
+            lunarwing_engine::EventKind::ActionExecuted {
+                step_id: actual_step_id,
+                ref action_name,
+                ref call_id,
+                duration_ms: 8,
+                result_preview: Some(ref preview),
+                ..
+            } if actual_step_id == step_id
+                && action_name == &pending.action_name
+                && call_id == &pending.call_id
+                && preview == "approved output"
         ));
     }
 
