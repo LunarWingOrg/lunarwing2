@@ -3723,33 +3723,64 @@ pub async fn fire_engine_mission(mission_id: &str, user_id: &str) -> Result<Opti
     Ok(result.map(|tid| tid.to_string()))
 }
 
-// ── B-1: self-improving skills — pending-patch approval surface ──────────
+// ── B-1/B-2/B-3: unified skill proposals approval surface ──────────────
+//
+// Generalizes the B-1 patch-only surface into a `kind`-discriminated proposals
+// surface (patch | prune | update) so one API/GUI panel can render and act on
+// all three propose-then-approve flows.
 
-/// A staged, awaiting-approval skill patch proposal (B-1).
+/// A staged, awaiting-approval skill proposal (B-1 patch, B-2 prune, B-3 update).
+///
+/// Kind-specific fields are `Option` and `skip_serializing_if = "Option::is_none"`
+/// so a prune/update proposal doesn't carry patch-only fields (and vice versa).
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct SkillPatchProposal {
+pub struct SkillProposal {
     pub doc_id: String,
     pub skill_name: String,
     pub current_version: u32,
-    /// Current live skill body (for side-by-side review).
-    pub current_content: String,
-    /// Proposed replacement body.
-    pub proposed_content: String,
-    /// Unified diff (current → proposed).
-    pub diff: String,
-    /// Why the patch was proposed.
+    /// Discriminator: patch | prune | update.
+    pub kind: lunarwing_skills::v2::ProposalKind,
+    /// Why the proposal was staged (all kinds carry this).
     pub reason: String,
-    /// Skill confidence at proposal time (what tripped the threshold).
-    pub confidence_at_proposal: f64,
-    /// The failing thread that motivated the proposal, if any.
+    /// When the proposal was staged (RFC3339).
+    pub staged_at: String,
+
+    // ── patch-specific ────────────────────────────────────────────────────
+    /// Current live skill body (patch only — for side-by-side review).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_content: Option<String>,
+    /// Proposed replacement body (patch only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed_content: Option<String>,
+    /// Unified diff, current → proposed (patch only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+
+    // ── shared context (patch/prune carry confidence; update may not) ─────
+    /// Skill confidence at staging time (patch: what tripped the threshold;
+    /// prune: the deadness evidence).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence_at_staging: Option<f64>,
+    /// Skill usage count at staging time (prune evidence).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_count_at_staging: Option<u64>,
+    /// The thread whose outcome motivated the proposal, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_thread_id: Option<String>,
-    pub proposed_at: String,
+
+    // ── update-specific ───────────────────────────────────────────────────
+    /// Newer registry version available (update only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_version_available: Option<String>,
+    /// Registry URL the update would be pulled from (update only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_url: Option<String>,
 }
 
-/// List all skills that currently have a pending patch proposal, visible to
-/// `user_id` (own + shared). Empty when the engine isn't running.
-pub async fn list_pending_skill_patches(user_id: &str) -> Result<Vec<SkillPatchProposal>, Error> {
+/// List all skills that currently have a pending proposal (patch, prune, or
+/// update), visible to `user_id` (own + shared). Empty when the engine isn't
+/// running or no proposals are staged.
+pub async fn list_pending_skill_proposals(user_id: &str) -> Result<Vec<SkillProposal>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
     };
@@ -3778,26 +3809,66 @@ pub async fn list_pending_skill_patches(user_id: &str) -> Result<Vec<SkillPatchP
         else {
             continue;
         };
-        let Some(pending) = meta.pending_patch else {
-            continue;
-        };
-        out.push(SkillPatchProposal {
-            doc_id: doc.id.0.to_string(),
-            skill_name: meta.name,
-            current_version: meta.version,
-            current_content: doc.content,
-            proposed_content: pending.proposed_content,
-            diff: pending.diff,
-            reason: pending.reason,
-            confidence_at_proposal: pending.confidence_at_proposal,
-            source_thread_id: pending.source_thread_id,
-            proposed_at: pending.proposed_at.to_rfc3339(),
-        });
+        // Emit one proposal per pending kind present on the skill.
+        if let Some(p) = meta.pending_patch {
+            out.push(SkillProposal {
+                doc_id: doc.id.0.to_string(),
+                skill_name: meta.name.clone(),
+                current_version: meta.version,
+                kind: lunarwing_skills::v2::ProposalKind::Patch,
+                reason: p.reason,
+                staged_at: p.proposed_at.to_rfc3339(),
+                current_content: Some(doc.content.clone()),
+                proposed_content: Some(p.proposed_content),
+                diff: Some(p.diff),
+                confidence_at_staging: Some(p.confidence_at_proposal),
+                usage_count_at_staging: None,
+                source_thread_id: p.source_thread_id,
+                registry_version_available: None,
+                registry_url: None,
+            });
+        }
+        if let Some(p) = meta.pending_prune {
+            out.push(SkillProposal {
+                doc_id: doc.id.0.to_string(),
+                skill_name: meta.name.clone(),
+                current_version: meta.version,
+                kind: lunarwing_skills::v2::ProposalKind::Prune,
+                reason: p.reason,
+                staged_at: p.staged_at.to_rfc3339(),
+                current_content: None,
+                proposed_content: None,
+                diff: None,
+                confidence_at_staging: Some(p.confidence_at_staging),
+                usage_count_at_staging: Some(p.usage_count_at_staging),
+                source_thread_id: p.source_thread_id,
+                registry_version_available: None,
+                registry_url: None,
+            });
+        }
+        if let Some(u) = meta.pending_update {
+            out.push(SkillProposal {
+                doc_id: doc.id.0.to_string(),
+                skill_name: meta.name.clone(),
+                current_version: meta.version,
+                kind: lunarwing_skills::v2::ProposalKind::Update,
+                reason: format!("registry update {} available", u.registry_version_available),
+                staged_at: u.staged_at.to_rfc3339(),
+                current_content: None,
+                proposed_content: None,
+                diff: None,
+                confidence_at_staging: None,
+                usage_count_at_staging: None,
+                source_thread_id: None,
+                registry_version_available: Some(u.registry_version_available),
+                registry_url: Some(u.registry_url),
+            });
+        }
     }
     Ok(out)
 }
 
-/// Resolve + ownership-check a skill doc for a patch action. Returns the
+/// Resolve + ownership-check a skill doc for a proposal action. Returns the
 /// verified DocId, or an error the caller maps to a 4xx.
 async fn resolve_owned_skill(
     state: &EngineState,
@@ -3822,9 +3893,13 @@ async fn resolve_owned_skill(
     Ok(did)
 }
 
-/// Approve (apply) a skill's pending patch. Bumps version, records history,
-/// epoch-resets metrics. Returns `true` on success.
-pub async fn approve_skill_patch(doc_id: &str, user_id: &str) -> Result<bool, Error> {
+/// Approve (apply) a skill's pending proposal of the given kind.
+/// Dispatches to the matching `SkillTracker` apply method. Returns `true`.
+pub async fn approve_skill_proposal(
+    doc_id: &str,
+    kind: lunarwing_skills::v2::ProposalKind,
+    user_id: &str,
+) -> Result<bool, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Err(engine_err("not initialized", "engine v2 is not running"));
     };
@@ -3834,15 +3909,44 @@ pub async fn approve_skill_patch(doc_id: &str, user_id: &str) -> Result<bool, Er
     };
     let did = resolve_owned_skill(state, doc_id, user_id).await?;
     let tracker = lunarwing_engine::memory::SkillTracker::new(Arc::clone(&state.store));
-    tracker
-        .apply_pending_patch(did)
-        .await
-        .map_err(|e| engine_err("apply skill patch", e))?;
+    match kind {
+        lunarwing_skills::v2::ProposalKind::Patch => {
+            tracker
+                .apply_pending_patch(did)
+                .await
+                .map_err(|e| engine_err("apply skill patch", e))?;
+        }
+        lunarwing_skills::v2::ProposalKind::Prune => {
+            // The staged reason carries the diagnosis; the user's approval
+            // confirms archival. Re-use the staged reason as the archive reason.
+            let reason = load_pending_prune_reason(state, did).await?;
+            tracker
+                .apply_prune(did, reason)
+                .await
+                .map_err(|e| engine_err("apply skill prune", e))?;
+        }
+        lunarwing_skills::v2::ProposalKind::Update => {
+            // Update application: the pending proposal carries the version +
+            // hash; applying stamps provenance + bumps version + epoch-resets
+            // metrics. (The actual content pull is a separate on-demand
+            // operation; here we record that the user accepted the update.)
+            let (version, hash) = load_pending_update_info(state, did).await?;
+            tracker
+                .apply_update(did, version, hash)
+                .await
+                .map_err(|e| engine_err("apply skill update", e))?;
+        }
+    }
     Ok(true)
 }
 
-/// Reject (discard) a skill's pending patch. Leaves the skill untouched.
-pub async fn reject_skill_patch(doc_id: &str, user_id: &str) -> Result<bool, Error> {
+/// Reject (discard) a skill's pending proposal of the given kind. Leaves the
+/// skill untouched (patch/prune) or clears the staged update.
+pub async fn reject_skill_proposal(
+    doc_id: &str,
+    kind: lunarwing_skills::v2::ProposalKind,
+    user_id: &str,
+) -> Result<bool, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Err(engine_err("not initialized", "engine v2 is not running"));
     };
@@ -3852,11 +3956,218 @@ pub async fn reject_skill_patch(doc_id: &str, user_id: &str) -> Result<bool, Err
     };
     let did = resolve_owned_skill(state, doc_id, user_id).await?;
     let tracker = lunarwing_engine::memory::SkillTracker::new(Arc::clone(&state.store));
-    tracker
-        .discard_pending_patch(did)
-        .await
-        .map_err(|e| engine_err("discard skill patch", e))?;
+    match kind {
+        lunarwing_skills::v2::ProposalKind::Patch => {
+            tracker
+                .discard_pending_patch(did)
+                .await
+                .map_err(|e| engine_err("discard skill patch", e))?;
+        }
+        lunarwing_skills::v2::ProposalKind::Prune => {
+            tracker
+                .discard_prune(did)
+                .await
+                .map_err(|e| engine_err("discard skill prune", e))?;
+        }
+        lunarwing_skills::v2::ProposalKind::Update => {
+            tracker
+                .discard_update(did)
+                .await
+                .map_err(|e| engine_err("discard skill update", e))?;
+        }
+    }
     Ok(true)
+}
+
+/// Load the staged prune reason for a skill (used to carry it into archival on
+/// approval). Errors if no prune is pending.
+async fn load_pending_prune_reason(
+    state: &EngineState,
+    did: lunarwing_engine::DocId,
+) -> Result<String, Error> {
+    let doc = state
+        .store
+        .load_memory_doc(did)
+        .await
+        .map_err(|e| engine_err("load skill", e))?
+        .ok_or_else(|| engine_err("skill", "skill not found"))?;
+    let meta: lunarwing_skills::v2::V2SkillMetadata =
+        serde_json::from_value(doc.metadata).map_err(|e| engine_err("parse skill meta", e))?;
+    meta.pending_prune
+        .map(|p| p.reason)
+        .ok_or_else(|| engine_err("skill", "no pending prune to apply"))
+}
+
+/// Load the staged update (version + hash) for a skill (B-3). Errors if no
+/// update is pending.
+async fn load_pending_update_info(
+    state: &EngineState,
+    did: lunarwing_engine::DocId,
+) -> Result<(String, String), Error> {
+    let doc = state
+        .store
+        .load_memory_doc(did)
+        .await
+        .map_err(|e| engine_err("load skill", e))?
+        .ok_or_else(|| engine_err("skill", "skill not found"))?;
+    let meta: lunarwing_skills::v2::V2SkillMetadata =
+        serde_json::from_value(doc.metadata).map_err(|e| engine_err("parse skill meta", e))?;
+    meta.pending_update
+        .map(|u| (u.registry_version_available, u.new_content_hash))
+        .ok_or_else(|| engine_err("skill", "no pending update to apply"))
+}
+
+// ── B-1 back-compat wrappers (keep the old patch-only names working) ──────
+
+/// Back-compat: list only patch proposals (B-1 callers). Prefer
+/// [`list_pending_skill_proposals`].
+pub async fn list_pending_skill_patches(user_id: &str) -> Result<Vec<SkillProposal>, Error> {
+    Ok(list_pending_skill_proposals(user_id)
+        .await?
+        .into_iter()
+        .filter(|p| p.kind == lunarwing_skills::v2::ProposalKind::Patch)
+        .collect())
+}
+
+/// Back-compat: approve a patch proposal (B-1 callers).
+pub async fn approve_skill_patch(doc_id: &str, user_id: &str) -> Result<bool, Error> {
+    approve_skill_proposal(doc_id, lunarwing_skills::v2::ProposalKind::Patch, user_id).await
+}
+
+/// Back-compat: reject a patch proposal (B-1 callers).
+pub async fn reject_skill_patch(doc_id: &str, user_id: &str) -> Result<bool, Error> {
+    reject_skill_proposal(doc_id, lunarwing_skills::v2::ProposalKind::Patch, user_id).await
+}
+
+// ── B-3: cross-agent skill sharing — publish surface ─────────────────────
+
+/// A publish result returned to the API/UI (B-3).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillPublishResult {
+    pub ok: bool,
+    pub slug: String,
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Publish a skill to the registry (B-3). Loads the skill from the engine
+/// store, enforces publish eligibility (Trusted + proven confidence/usage),
+/// leak-scans the body + snippets, builds the publish request, and POSTs to
+/// the registry using `CLAWHUB_TOKEN`. Auth-gated and user-scoped (ownership
+/// checked via [`resolve_owned_skill`]). Never automatic; always explicit.
+///
+/// `slug` is the target registry slug (e.g. "owner/skill-name").
+pub async fn publish_skill(
+    doc_id: &str,
+    user_id: &str,
+    slug: &str,
+    version: &str,
+    changelog: &str,
+    tags: Vec<String>,
+) -> Result<SkillPublishResult, Error> {
+    use lunarwing_skills::v2::{DEFAULT_PUBLISH_CONFIDENCE, DEFAULT_PUBLISH_MIN_USAGE};
+
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Err(engine_err("not initialized", "engine v2 is not running"));
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Err(engine_err("not initialized", "engine v2 is not running"));
+    };
+    let did = resolve_owned_skill(state, doc_id, user_id).await?;
+    let doc = state
+        .store
+        .load_memory_doc(did)
+        .await
+        .map_err(|e| engine_err("load skill", e))?
+        .ok_or_else(|| engine_err("skill", "skill not found"))?;
+    let meta: lunarwing_skills::v2::V2SkillMetadata = serde_json::from_value(doc.metadata.clone())
+        .map_err(|e| engine_err("parse skill meta", e))?;
+
+    // Eligibility: Trusted, proven, not archived, no pending patch.
+    if !meta.is_publish_eligible(DEFAULT_PUBLISH_CONFIDENCE, DEFAULT_PUBLISH_MIN_USAGE) {
+        return Ok(SkillPublishResult {
+            ok: false,
+            slug: slug.to_string(),
+            version: version.to_string(),
+            skill_id: None,
+            version_id: None,
+            error: Some(format!(
+                "skill not publish-eligible (requires Trusted + ≥{DEFAULT_PUBLISH_MIN_USAGE} uses at ≥{DEFAULT_PUBLISH_CONFIDENCE:.0} confidence)"
+            )),
+        });
+    }
+
+    // Leak-scan body + every code snippet (defense-in-depth pre-flight).
+    if let Err(e) = lunarwing_skills::catalog::SkillCatalog::leak_scan(&doc.content) {
+        return Ok(SkillPublishResult {
+            ok: false,
+            slug: slug.to_string(),
+            version: version.to_string(),
+            skill_id: None,
+            version_id: None,
+            error: Some(e.to_string()),
+        });
+    }
+    for sn in &meta.code_snippets {
+        if let Err(e) = lunarwing_skills::catalog::SkillCatalog::leak_scan(&sn.code) {
+            return Ok(SkillPublishResult {
+                ok: false,
+                slug: slug.to_string(),
+                version: version.to_string(),
+                skill_id: None,
+                version_id: None,
+                error: Some(format!("code snippet '{}': {}", sn.name, e)),
+            });
+        }
+    }
+
+    // Token from env (secret-bearing; never logged).
+    let token = std::env::var("CLAWHUB_TOKEN").map_err(|_| {
+        engine_err(
+            "publish skill",
+            "CLAWHUB_TOKEN is not set; cannot publish (run `clawhub login` and export the token)",
+        )
+    })?;
+
+    let req = lunarwing_skills::catalog::PublishRequest {
+        slug: slug.to_string(),
+        display_name: meta.name.clone(),
+        version: version.to_string(),
+        changelog: changelog.to_string(),
+        tags,
+        skill_md_content: doc.content.clone(),
+        code_snippet_files: meta
+            .code_snippets
+            .iter()
+            .map(|s| (format!("{}.py", s.name), s.code.clone()))
+            .collect(),
+    };
+
+    let catalog = lunarwing_skills::catalog::shared_catalog();
+    match catalog.publish(&req, &token).await {
+        Ok(resp) => Ok(SkillPublishResult {
+            ok: true,
+            slug: slug.to_string(),
+            version: version.to_string(),
+            skill_id: Some(resp.skill_id),
+            version_id: Some(resp.version_id),
+            error: None,
+        }),
+        Err(e) => Ok(SkillPublishResult {
+            ok: false,
+            slug: slug.to_string(),
+            version: version.to_string(),
+            skill_id: None,
+            version_id: None,
+            error: Some(e.to_string()),
+        }),
+    }
 }
 
 /// Pause a mission.

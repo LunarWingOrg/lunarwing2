@@ -20,7 +20,7 @@ use lunarwing_engine::types::shared_owner_id;
 
 use lunarwing_skills::SkillRegistry;
 use lunarwing_skills::types::{LoadedSkill, SkillSource};
-use lunarwing_skills::v2::{SkillMetrics, V2SkillMetadata, V2SkillSource};
+use lunarwing_skills::v2::{V2SkillMetadata, V2SkillSource};
 
 /// Migrate v1 skills to v2 MemoryDocs.
 ///
@@ -100,20 +100,28 @@ fn v1_skill_to_memory_doc(skill: &LoadedSkill, project_id: ProjectId) -> MemoryD
         SkillSource::Bundled(_) => V2SkillSource::Migrated,
     };
 
-    let meta = V2SkillMetadata {
+    let mut meta = V2SkillMetadata {
         name: skill.manifest.name.clone(),
-        version: 1,
         description: skill.manifest.description.clone(),
         activation: skill.manifest.activation.clone(),
         source: v2_source,
         trust: skill.trust,
-        code_snippets: vec![], // v1 skills are prompt-only
-        metrics: SkillMetrics::default(),
-        parent_version: None,
         content_hash: skill.content_hash.clone(),
-        patch_history: vec![], // B-1: no patches on freshly-migrated skills
-        pending_patch: None,
+        // SAFETY: `"{}"` deserializes to all-default V2SkillMetadata (every
+        // field is `#[serde(default)]`); infallible.
+        ..serde_json::from_str::<V2SkillMetadata>("{}").unwrap()
     };
+
+    // B-3: stamp registry provenance from a `.registry.json` sidecar next to
+    // the skill's SKILL.md, if present (written at install time for catalog
+    // pulls). Missing sidecar = locally-authored → provenance stays None.
+    if let Some(provenance) = read_registry_sidecar(&skill.source) {
+        meta.registry_url = Some(provenance.registry_url);
+        meta.registry_publisher = provenance.publisher;
+        meta.registry_version = provenance.version;
+        meta.pulled_at = Some(provenance.pulled_at);
+        meta.registry_content_hash = Some(provenance.content_hash);
+    }
 
     let mut doc = MemoryDoc::new(
         project_id,
@@ -125,6 +133,33 @@ fn v1_skill_to_memory_doc(skill: &LoadedSkill, project_id: ProjectId) -> MemoryD
     doc.metadata = serde_json::to_value(&meta).unwrap_or_default();
     doc.tags = vec!["migrated_from_v1".to_string()];
     doc
+}
+
+/// B-3 registry provenance sidecar (written at install time for catalog pulls).
+#[derive(Debug, serde::Deserialize)]
+struct RegistrySidecar {
+    registry_url: String,
+    #[serde(default)]
+    publisher: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    pulled_at: chrono::DateTime<chrono::Utc>,
+    content_hash: String,
+}
+
+/// Read a `.registry.json` sidecar from the skill's source directory. Returns
+/// `None` if the sidecar is absent or unreadable (best-effort — a missing
+/// sidecar just means the skill is locally-authored).
+fn read_registry_sidecar(source: &SkillSource) -> Option<RegistrySidecar> {
+    let dir = match source {
+        SkillSource::Workspace(p) | SkillSource::User(p) | SkillSource::Installed(p) => {
+            p.parent()?
+        }
+        SkillSource::Bundled(_) => return None, // bundled skills ship with the app
+    };
+    let sidecar = dir.join(".registry.json");
+    let contents = std::fs::read_to_string(&sidecar).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 #[cfg(test)]

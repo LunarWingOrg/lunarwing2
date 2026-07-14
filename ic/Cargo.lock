@@ -4555,6 +4555,7 @@ version = "2.0.0"
 dependencies = [
  "chrono",
  "futures",
+ "lunarwing_safety",
  "regex",
  "reqwest 0.12.28",
  "serde",

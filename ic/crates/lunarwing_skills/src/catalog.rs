@@ -74,10 +74,25 @@ pub struct CatalogEntry {
 ///
 /// The API returns `{"skill": {...}, "owner": {...}, "latestVersion": {...}}`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SkillDetailResponse {
     skill: SkillDetailInner,
     #[serde(default)]
     owner: Option<SkillOwner>,
+    /// The latest published version (B-3: used for version/change detection).
+    #[serde(default)]
+    latest_version: Option<SkillLatestVersion>,
+}
+
+/// The `latestVersion` object from the ClawHub detail response (B-3).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillLatestVersion {
+    pub version: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<u64>,
+    #[serde(default)]
+    pub changelog: Option<String>,
 }
 
 /// Inner `skill` object within `SkillDetailResponse`.
@@ -353,7 +368,11 @@ impl SkillCatalog {
             slug: inner.slug,
             display_name: inner.display_name,
             summary: inner.summary,
-            version: None, // not returned in detail response
+            // B-3: populate from latestVersion (previously dropped → always None).
+            version: wrapper
+                .latest_version
+                .as_ref()
+                .and_then(|v| v.version.clone()),
             stats: inner.stats,
             owner: wrapper.owner,
             updated_at: inner.updated_at,
@@ -400,6 +419,217 @@ impl SkillCatalog {
     pub async fn clear_cache(&self) {
         self.cache.write().await.clear();
     }
+
+    // ── B-3: cross-agent sharing (publish + update check) ─────────────────
+
+    /// Publish a skill version to the registry (B-3).
+    ///
+    /// Posts a multipart form (`payload` JSON + `files` blobs) to
+    /// `POST {registry_url}/api/v1/skills` with a `Bearer` token. Only
+    /// proven, leak-free skills should reach here — the caller (bridge) is
+    /// responsible for the publish-eligibility + leak-scan gates. Returns the
+    /// registry-assigned skill/version IDs on success.
+    pub async fn publish(
+        &self,
+        req: &PublishRequest,
+        token: &str,
+    ) -> Result<PublishResponse, CatalogError> {
+        use reqwest::multipart;
+
+        // Build the ClawHub `CliPublishRequest` payload (files list omits
+        // size/sha256/storageId in multipart mode — the server computes them).
+        let files_meta: Vec<serde_json::Value> = std::iter::once("SKILL.md")
+            .chain(req.code_snippet_files.iter().map(|(name, _)| name.as_str()))
+            .map(|path| serde_json::json!({ "path": path }))
+            .collect();
+
+        let payload = serde_json::json!({
+            "slug": req.slug,
+            "displayName": req.display_name,
+            "version": req.version,
+            "changelog": req.changelog,
+            "tags": req.tags,
+            "acceptLicenseTerms": true,
+            "files": files_meta,
+        });
+
+        let mut form = multipart::Form::new().text("payload", payload.to_string());
+        // SKILL.md body.
+        form = form.part(
+            "files",
+            multipart::Part::text(req.skill_md_content.clone())
+                .file_name("SKILL.md")
+                .mime_str("text/markdown")
+                .map_err(CatalogError::multipart)?,
+        );
+        // One part per code snippet (file_name = the snippet's module name).
+        for (name, body) in &req.code_snippet_files {
+            form = form.part(
+                "files",
+                multipart::Part::text(body.clone())
+                    .file_name(name.clone())
+                    .mime_str("text/x-python")
+                    .map_err(CatalogError::multipart)?,
+            );
+        }
+
+        let url = format!("{}/api/v1/skills", self.registry_url);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| CatalogError::Publish(format!("publish request failed: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(CatalogError::Publish(format!(
+                "registry returned {status}: {}",
+                body.chars().take(500).collect::<String>()
+            )));
+        }
+
+        resp.json::<PublishResponse>()
+            .await
+            .map_err(|e| CatalogError::Publish(format!("parse publish response: {e}")))
+    }
+
+    /// Check whether a newer registry version exists for a slug (B-3 update
+    /// detection). Hits `GET {registry_url}/api/v1/resolve?slug=...`. Returns
+    /// `Some(UpdateInfo)` when the registry's latest version differs from
+    /// `current_version`, `None` when up-to-date or the slug is unknown.
+    pub async fn check_for_update(
+        &self,
+        slug: &str,
+        current_version: &str,
+    ) -> Result<Option<UpdateInfo>, CatalogError> {
+        let url = format!(
+            "{}/api/v1/resolve?slug={}",
+            self.registry_url,
+            urlencoding::encode(slug)
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| CatalogError::UpdateCheck(format!("resolve request failed: {e}")))?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None); // slug unknown upstream — no update.
+        }
+        if !status.is_success() {
+            return Err(CatalogError::UpdateCheck(format!(
+                "resolve returned {status}"
+            )));
+        }
+
+        let parsed: ResolveResponse = resp
+            .json()
+            .await
+            .map_err(|e| CatalogError::UpdateCheck(format!("parse resolve response: {e}")))?;
+        let Some(latest) = parsed.latest_version else {
+            return Ok(None);
+        };
+        if latest.version.as_deref() == Some(current_version) {
+            return Ok(None); // up to date.
+        }
+        Ok(Some(UpdateInfo {
+            version: latest.version.unwrap_or_default(),
+            registry_url: self.registry_url.clone(),
+        }))
+    }
+
+    /// Scan skill content for leaked secrets before publishing (B-3
+    /// defense-in-depth). Returns `Ok(())` if clean, `Err` with the match
+    /// summary if any credential pattern is detected. The registry also scans
+    /// server-side; this is the client-side pre-flight.
+    pub fn leak_scan(content: &str) -> Result<(), CatalogError> {
+        let detector = lunarwing_safety::LeakDetector::new();
+        let result = detector.scan(content);
+        if result.is_clean() {
+            Ok(())
+        } else {
+            let summary = result
+                .max_severity()
+                .map(|s| format!("{s:?}"))
+                .unwrap_or_else(|| "leak detected".to_string());
+            Err(CatalogError::Leak(format!(
+                "skill body failed leak scan ({summary}); refusing to publish"
+            )))
+        }
+    }
+}
+
+/// Error from catalog publish/update operations (B-3).
+#[derive(Debug, thiserror::Error)]
+pub enum CatalogError {
+    #[error("publish failed: {0}")]
+    Publish(String),
+    #[error("update check failed: {0}")]
+    UpdateCheck(String),
+    #[error("leak detected: {0}")]
+    Leak(String),
+}
+
+impl CatalogError {
+    fn multipart(e: reqwest::Error) -> Self {
+        CatalogError::Publish(format!("build multipart part: {e}"))
+    }
+}
+
+/// A publish request (B-3). The caller gathers the skill's SKILL.md body and
+/// any code-snippet files; the catalog builds the multipart form.
+#[derive(Debug, Clone)]
+pub struct PublishRequest {
+    /// Target slug (e.g. "owner/skill-name").
+    pub slug: String,
+    /// Display name.
+    pub display_name: String,
+    /// Semver version string for this publish.
+    pub version: String,
+    /// Changelog for this version.
+    pub changelog: String,
+    /// Optional tags.
+    pub tags: Vec<String>,
+    /// The SKILL.md body.
+    pub skill_md_content: String,
+    /// Code-snippet files: (file_name, body) pairs (Python).
+    pub code_snippet_files: Vec<(String, String)>,
+}
+
+/// The registry's response to a successful publish (B-3).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublishResponse {
+    pub ok: bool,
+    #[serde(rename = "skillId")]
+    pub skill_id: String,
+    #[serde(rename = "versionId")]
+    pub version_id: String,
+}
+
+/// Info about a newer registry version available for update (B-3).
+#[derive(Debug, Clone)]
+pub struct UpdateInfo {
+    pub version: String,
+    pub registry_url: String,
+}
+
+/// ClawHub `/api/v1/resolve` response shape.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveResponse {
+    #[serde(default)]
+    latest_version: Option<ResolveVersion>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveVersion {
+    version: Option<String>,
 }
 
 impl Default for SkillCatalog {
@@ -610,5 +840,38 @@ mod tests {
         let parsed: CatalogEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.slug, "test/skill");
         assert_eq!(parsed.name, "Test Skill");
+    }
+
+    #[test]
+    fn test_leak_scan_refuses_credential_in_skill_body() {
+        // A skill body containing an obvious API-key pattern must be refused.
+        let body = "export OPENAI_API_KEY=\"sk-proj-abcdef1234567890ABCDEF1234567890abcdefAB\"";
+        assert!(SkillCatalog::leak_scan(body).is_err());
+    }
+
+    #[test]
+    fn test_leak_scan_accepts_clean_skill_body() {
+        // A normal skill body with no credential patterns passes.
+        let body = "---\nname: example\ndescription: an example skill\n---\n\nDo the thing.\n";
+        assert!(SkillCatalog::leak_scan(body).is_ok());
+    }
+
+    #[test]
+    fn test_skill_latest_version_populates_detail_version() {
+        // The detail endpoint's latestVersion.version should populate
+        // SkillDetail.version (previously dropped → always None).
+        let json = r#"{
+            "skill": {"slug": "owner/skill", "displayName": "Skill"},
+            "owner": {"handle": "owner"},
+            "latestVersion": {"version": "1.2.3", "createdAt": 1700000000000}
+        }"#;
+        let parsed: SkillDetailResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed
+                .latest_version
+                .as_ref()
+                .and_then(|v| v.version.as_deref()),
+            Some("1.2.3")
+        );
     }
 }

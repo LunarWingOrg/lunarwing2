@@ -486,6 +486,11 @@ pub async fn execute_orchestrator(
                         handle_propose_skill_patch(args, thread, store).await
                     }
 
+                    // __propose_skill_prune__(doc_id, reason)
+                    "__propose_skill_prune__" => {
+                        handle_propose_skill_prune(args, thread, store).await
+                    }
+
                     // Unknown — let Monty resolve it (user-defined functions, builtins)
                     other => ExtFunctionResult::NotFound(other.to_string()),
                 };
@@ -1806,6 +1811,18 @@ async fn handle_list_skills(
     let skills: Vec<serde_json::Value> = docs
         .into_iter()
         .filter(|d| d.doc_type == crate::types::memory::DocType::Skill)
+        // B-2 demotion/archive exclusion: deprecated (demoted) and archived
+        // (soft-deleted) skills are excluded from the set presented to the
+        // Python orchestrator for activation. This is the single choke point
+        // (per the user's design decision): the Python scorer's confidence
+        // math is left untouched, and `SkillTrust` is not modified — demotion
+        // is a metadata flag, not a trust tier. A demoted skill can be
+        // recovered via `SkillTracker::undeprecate_skill`.
+        .filter(|d| {
+            serde_json::from_value::<lunarwing_skills::v2::V2SkillMetadata>(d.metadata.clone())
+                .map(|m| m.deprecated_at.is_none() && m.archived_at.is_none())
+                .unwrap_or(true) // unparseable metadata: don't silently hide it
+        })
         .map(|d| {
             serde_json::json!({
                 "doc_id": d.id.0.to_string(),
@@ -1898,6 +1915,53 @@ async fn handle_propose_skill_patch(
         Ok(()) => ExtFunctionResult::Return(MontyObject::Bool(true)),
         Err(e) => {
             debug!("__propose_skill_patch__: failed: {e}");
+            ExtFunctionResult::Return(MontyObject::Bool(false))
+        }
+    }
+}
+
+/// Handle `__propose_skill_prune__(doc_id, reason)`.
+///
+/// Stages a proposed skill prune (archival) for later user approval (B-2,
+/// propose-then-approve). Does NOT archive the skill — it only records a
+/// `pending_prune` on the metadata. Called by the skill-maintenance sweep
+/// mission when a skill is confidently dead (`is_prune_candidate`). Returns
+/// `True` on successful stage, `False` otherwise (e.g. authored/Installed
+/// protected skills, or already-archived). Refusing authored/Installed is
+/// enforced by `SkillTracker::propose_prune`.
+async fn handle_propose_skill_prune(
+    args: &[MontyObject],
+    thread: &Thread,
+    store: Option<&Arc<dyn Store>>,
+) -> ExtFunctionResult {
+    let Some(store) = store else {
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    };
+
+    let doc_id_str = args.first().map(monty_to_string).unwrap_or_default();
+    let reason = args.get(1).map(monty_to_string).unwrap_or_default();
+
+    let Ok(uuid) = uuid::Uuid::parse_str(&doc_id_str) else {
+        debug!("__propose_skill_prune__: invalid doc_id: {doc_id_str}");
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    };
+    if reason.trim().is_empty() {
+        debug!("__propose_skill_prune__: empty reason, skipping");
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    }
+
+    let tracker = crate::memory::SkillTracker::new(Arc::clone(store));
+    match tracker
+        .propose_prune(
+            crate::types::memory::DocId(uuid),
+            reason,
+            Some(thread.id.0.to_string()),
+        )
+        .await
+    {
+        Ok(()) => ExtFunctionResult::Return(MontyObject::Bool(true)),
+        Err(e) => {
+            debug!("__propose_skill_prune__: failed: {e}");
             ExtFunctionResult::Return(MontyObject::Bool(false))
         }
     }

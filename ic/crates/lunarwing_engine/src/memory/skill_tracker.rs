@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use lunarwing_skills::SkillTrust;
 use lunarwing_skills::v2::{
-    MAX_PATCH_HISTORY, PendingSkillPatch, SkillPatch, V2SkillMetadata, compute_content_hash,
+    DEFAULT_DEMOTE_CONFIDENCE, DEFAULT_DEMOTE_MIN_USAGE, MAX_PATCH_HISTORY, PendingSkillPatch,
+    PendingSkillPrune, PendingSkillUpdate, SkillPatch, V2SkillMetadata, V2SkillSource,
+    compute_content_hash,
 };
 
 use crate::traits::store::Store;
@@ -57,6 +59,29 @@ impl SkillTracker {
             meta.metrics.failure_count += 1;
         }
         meta.metrics.last_used = Some(chrono::Utc::now());
+
+        // B-2 inline demotion: after recording this outcome, if the skill has
+        // fallen below the demotion floor (with enough usage) and isn't already
+        // deprecated, mark it deprecated. This is the automatic, reversible
+        // demotion — it excludes the skill from auto-activation going forward.
+        // Pruning (archival) stays propose→approve (never auto-destructive).
+        // Authored and Installed skills are exempt (is_demote_candidate checks).
+        if meta.deprecated_at.is_none()
+            && meta.is_demote_candidate(DEFAULT_DEMOTE_CONFIDENCE, DEFAULT_DEMOTE_MIN_USAGE)
+        {
+            let conf = meta.metrics.confidence();
+            meta.deprecated_at = Some(chrono::Utc::now());
+            meta.deprecation_reason = format!(
+                "auto-demoted: confidence {:.2} below demotion floor {:.2} over {} uses",
+                conf, DEFAULT_DEMOTE_CONFIDENCE, meta.metrics.usage_count
+            );
+            tracing::info!(
+                skill_doc = %doc_id.0,
+                confidence = conf,
+                usage = meta.metrics.usage_count,
+                "skill auto-demoted below confidence floor"
+            );
+        }
 
         let updated_doc = MemoryDoc {
             metadata: serde_json::to_value(&meta).map_err(|e| EngineError::Skill {
@@ -282,6 +307,220 @@ impl SkillTracker {
         self.store.save_memory_doc(&updated_doc).await
     }
 
+    // ── B-2: demotion & pruning ───────────────────────────────────────────
+
+    /// Demote (deprecate) a skill so it is excluded from auto-activation (B-2).
+    ///
+    /// Reversible via [`undeprecate_skill`]. Refuses authored and `Installed`
+    /// skills (authored intent is respected; external skills are read-only).
+    pub async fn demote_skill(&self, doc_id: DocId, reason: String) -> Result<(), EngineError> {
+        let doc = self.load_skill_doc(doc_id).await?;
+        let mut meta = self.meta_from_doc(doc_id, &doc)?;
+
+        if meta.source == V2SkillSource::Authored || meta.trust == SkillTrust::Installed {
+            return Err(EngineError::Skill {
+                reason: format!(
+                    "refusing to demote authored/Installed (protected) skill {}",
+                    doc_id.0
+                ),
+            });
+        }
+        meta.deprecated_at = Some(chrono::Utc::now());
+        meta.deprecation_reason = reason;
+        self.save_skill_meta(doc_id, doc, meta).await
+    }
+
+    /// Clear a skill's demotion (B-2 recovery). Used after a B-1 patch epoch-
+    /// reset earns the skill enough confidence back, or on manual user action.
+    /// Leaves content, version, and metrics untouched.
+    pub async fn undeprecate_skill(&self, doc_id: DocId) -> Result<(), EngineError> {
+        let doc = self.load_skill_doc(doc_id).await?;
+        let mut meta = self.meta_from_doc(doc_id, &doc)?;
+        meta.deprecated_at = None;
+        meta.deprecation_reason = String::new();
+        self.save_skill_meta(doc_id, doc, meta).await
+    }
+
+    /// Stage a proposed prune (archival) for later user approval (B-2,
+    /// propose-then-approve). Does NOT archive — it only records a
+    /// `pending_prune`. Refuses authored/Installed skills and already-archived
+    /// skills. Overwrites any prior pending prune.
+    pub async fn propose_prune(
+        &self,
+        doc_id: DocId,
+        reason: String,
+        source_thread_id: Option<String>,
+    ) -> Result<(), EngineError> {
+        let doc = self.load_skill_doc(doc_id).await?;
+        let mut meta = self.meta_from_doc(doc_id, &doc)?;
+
+        if meta.source == V2SkillSource::Authored || meta.trust == SkillTrust::Installed {
+            return Err(EngineError::Skill {
+                reason: format!(
+                    "refusing to propose prune for authored/Installed (protected) skill {}",
+                    doc_id.0
+                ),
+            });
+        }
+        if meta.archived_at.is_some() {
+            return Err(EngineError::Skill {
+                reason: format!("skill {} is already archived", doc_id.0),
+            });
+        }
+        meta.pending_prune = Some(PendingSkillPrune {
+            reason,
+            confidence_at_staging: meta.metrics.confidence(),
+            usage_count_at_staging: meta.metrics.usage_count,
+            source_thread_id,
+            staged_at: chrono::Utc::now(),
+        });
+        self.save_skill_meta(doc_id, doc, meta).await
+    }
+
+    /// Apply a skill's pending prune on user approval (B-2): archives the skill
+    /// (soft delete — sets `archived_at`, never removes the MemoryDoc) and
+    /// clears the pending proposal. Returns an error if no prune is pending.
+    pub async fn apply_prune(&self, doc_id: DocId, reason: String) -> Result<(), EngineError> {
+        let doc = self.load_skill_doc(doc_id).await?;
+        let mut meta = self.meta_from_doc(doc_id, &doc)?;
+        if meta.pending_prune.take().is_none() {
+            return Err(EngineError::Skill {
+                reason: format!("skill {} has no pending prune to apply", doc_id.0),
+            });
+        }
+        meta.archived_at = Some(chrono::Utc::now());
+        meta.archived_reason = reason;
+        self.save_skill_meta(doc_id, doc, meta).await
+    }
+
+    /// Discard a skill's pending prune on user rejection (B-2). Leaves the
+    /// skill's archived state untouched (it was never archived).
+    pub async fn discard_prune(&self, doc_id: DocId) -> Result<(), EngineError> {
+        let doc = self.load_skill_doc(doc_id).await?;
+        let mut meta = self.meta_from_doc(doc_id, &doc)?;
+        if meta.pending_prune.take().is_none() {
+            return Err(EngineError::Skill {
+                reason: format!("skill {} has no pending prune to discard", doc_id.0),
+            });
+        }
+        self.save_skill_meta(doc_id, doc, meta).await
+    }
+
+    // ── B-3: registry update proposals ────────────────────────────────────
+
+    /// Stage a proposed registry update for later user approval (B-3,
+    /// propose-then-approve). Does NOT pull or change the skill — it only
+    /// records a `pending_update`. Overwrites any prior pending update.
+    pub async fn propose_update(
+        &self,
+        doc_id: DocId,
+        registry_version_available: String,
+        registry_url: String,
+        new_content_hash: String,
+    ) -> Result<(), EngineError> {
+        let doc = self.load_skill_doc(doc_id).await?;
+        let mut meta = self.meta_from_doc(doc_id, &doc)?;
+        meta.pending_update = Some(PendingSkillUpdate {
+            registry_version_available,
+            registry_url,
+            new_content_hash,
+            staged_at: chrono::Utc::now(),
+        });
+        self.save_skill_meta(doc_id, doc, meta).await
+    }
+
+    /// Apply a registry update on user approval (B-3): record the new registry
+    /// version + content hash as provenance, clear the pending update. The
+    /// actual pull + content swap is performed by the caller (the bridge
+    /// re-installs the skill from the registry before calling this to stamp
+    /// provenance). Bumps the skill version (a content change occurred).
+    pub async fn apply_update(
+        &self,
+        doc_id: DocId,
+        new_registry_version: String,
+        new_content_hash: String,
+    ) -> Result<(), EngineError> {
+        let doc = self.load_skill_doc(doc_id).await?;
+        let mut meta = self.meta_from_doc(doc_id, &doc)?;
+        if meta.pending_update.take().is_none() {
+            return Err(EngineError::Skill {
+                reason: format!("skill {} has no pending update to apply", doc_id.0),
+            });
+        }
+        meta.parent_version = Some(meta.version);
+        meta.version += 1;
+        meta.registry_version = Some(new_registry_version);
+        meta.registry_content_hash = Some(new_content_hash);
+        meta.pulled_at = Some(chrono::Utc::now());
+        // Epoch-reset metrics: a freshly-updated skill earns a new evaluation
+        // window (mirrors the B-1 patch epoch-reset rationale).
+        meta.metrics.usage_count = 0;
+        meta.metrics.success_count = 0;
+        meta.metrics.failure_count = 0;
+        meta.metrics.last_used = None;
+        self.save_skill_meta(doc_id, doc, meta).await
+    }
+
+    /// Discard a pending registry update on user rejection (B-3). Leaves the
+    /// skill's content/version untouched.
+    pub async fn discard_update(&self, doc_id: DocId) -> Result<(), EngineError> {
+        let doc = self.load_skill_doc(doc_id).await?;
+        let mut meta = self.meta_from_doc(doc_id, &doc)?;
+        if meta.pending_update.take().is_none() {
+            return Err(EngineError::Skill {
+                reason: format!("skill {} has no pending update to discard", doc_id.0),
+            });
+        }
+        self.save_skill_meta(doc_id, doc, meta).await
+    }
+
+    // ── shared load/save helpers (private) ────────────────────────────────
+
+    /// Load a MemoryDoc, asserting it is a skill doc.
+    async fn load_skill_doc(&self, doc_id: DocId) -> Result<MemoryDoc, EngineError> {
+        let doc = self
+            .store
+            .load_memory_doc(doc_id)
+            .await?
+            .ok_or_else(|| EngineError::Skill {
+                reason: format!("skill doc not found: {}", doc_id.0),
+            })?;
+        if doc.doc_type != DocType::Skill {
+            return Err(EngineError::Skill {
+                reason: format!("doc {} is not a skill (type: {:?})", doc_id.0, doc.doc_type),
+            });
+        }
+        Ok(doc)
+    }
+
+    /// Parse a skill's V2SkillMetadata from its MemoryDoc.
+    fn meta_from_doc(
+        &self,
+        doc_id: DocId,
+        doc: &MemoryDoc,
+    ) -> Result<V2SkillMetadata, EngineError> {
+        serde_json::from_value(doc.metadata.clone()).map_err(|e| EngineError::Skill {
+            reason: format!("invalid skill metadata for {}: {e}", doc_id.0),
+        })
+    }
+
+    /// Serialize a skill's metadata back into a MemoryDoc and save it.
+    async fn save_skill_meta(
+        &self,
+        _doc_id: DocId,
+        doc: MemoryDoc,
+        meta: V2SkillMetadata,
+    ) -> Result<(), EngineError> {
+        let updated_doc = MemoryDoc {
+            metadata: serde_json::to_value(&meta).map_err(|e| EngineError::Skill {
+                reason: format!("failed to serialize skill metadata: {e}"),
+            })?,
+            updated_at: chrono::Utc::now(),
+            ..doc
+        };
+        self.store.save_memory_doc(&updated_doc).await
+    }
+
     /// Rollback a skill to its previous version.
     ///
     /// Decrements the version to `parent_version` if available. This is a
@@ -330,22 +569,15 @@ mod tests {
     fn make_skill_doc(project_id: ProjectId) -> MemoryDoc {
         let meta = V2SkillMetadata {
             name: "test-skill".to_string(),
-            version: 1,
-            description: "test".to_string(),
-            activation: Default::default(),
             source: V2SkillSource::Extracted,
             trust: SkillTrust::Trusted,
-            code_snippets: vec![],
             metrics: SkillMetrics {
                 usage_count: 5,
                 success_count: 3,
                 failure_count: 2,
                 last_used: None,
             },
-            parent_version: None,
-            content_hash: String::new(),
-            patch_history: vec![],
-            pending_patch: None,
+            ..serde_json::from_str::<V2SkillMetadata>("{}").unwrap()
         };
 
         let mut doc = MemoryDoc::new(
@@ -620,5 +852,265 @@ mod tests {
         assert_eq!(meta.version, 1);
         assert!(meta.pending_patch.is_none());
         assert!(meta.patch_history.is_empty());
+    }
+
+    // ── B-2: demotion & pruning ───────────────────────────────────────────
+
+    fn make_authored_skill_doc(project_id: ProjectId) -> MemoryDoc {
+        let mut doc = make_skill_doc(project_id);
+        let mut meta: V2SkillMetadata = serde_json::from_value(doc.metadata.clone()).unwrap();
+        meta.source = V2SkillSource::Authored;
+        doc.metadata = serde_json::to_value(&meta).unwrap();
+        doc
+    }
+
+    #[tokio::test]
+    async fn test_demote_skill_sets_deprecated_at() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker
+            .demote_skill(doc_id, "low confidence".to_string())
+            .await
+            .unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert!(meta.deprecated_at.is_some());
+        assert_eq!(meta.deprecation_reason, "low confidence");
+    }
+
+    #[tokio::test]
+    async fn test_demote_skill_refused_for_authored_and_installed() {
+        let project_id = ProjectId::new();
+
+        // Authored → refused.
+        let doc = make_authored_skill_doc(project_id);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store);
+        let r = tracker.demote_skill(doc_id, "r".into()).await;
+        assert!(r.is_err(), "must refuse authored skill");
+
+        // Installed → refused.
+        let doc = make_skill_doc_trust(project_id, SkillTrust::Installed);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store);
+        let r = tracker.demote_skill(doc_id, "r".into()).await;
+        assert!(r.is_err(), "must refuse Installed skill");
+    }
+
+    #[tokio::test]
+    async fn test_undeprecate_skill_clears_demotion() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker
+            .demote_skill(doc_id, "low confidence".to_string())
+            .await
+            .unwrap();
+        tracker.undeprecate_skill(doc_id).await.unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert!(meta.deprecated_at.is_none());
+        assert!(meta.deprecation_reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_propose_prune_stages_without_archiving() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker
+            .propose_prune(
+                doc_id,
+                "0% over 10 uses".to_string(),
+                Some("t-1".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        // NOT archived while pending.
+        assert!(meta.archived_at.is_none());
+        let pending = meta.pending_prune.expect("pending prune staged");
+        assert_eq!(pending.reason, "0% over 10 uses");
+        assert_eq!(pending.source_thread_id.as_deref(), Some("t-1"));
+        assert_eq!(pending.usage_count_at_staging, 5);
+    }
+
+    #[tokio::test]
+    async fn test_propose_prune_refused_for_protected_skills() {
+        let project_id = ProjectId::new();
+
+        // Authored → refused.
+        let doc = make_authored_skill_doc(project_id);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store);
+        assert!(
+            tracker
+                .propose_prune(doc_id, "r".into(), None)
+                .await
+                .is_err()
+        );
+
+        // Installed → refused.
+        let doc = make_skill_doc_trust(project_id, SkillTrust::Installed);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store);
+        assert!(
+            tracker
+                .propose_prune(doc_id, "r".into(), None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_prune_archives_and_clears_pending() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker
+            .propose_prune(doc_id, "dead".to_string(), None)
+            .await
+            .unwrap();
+        tracker
+            .apply_prune(doc_id, "user-approved archival".to_string())
+            .await
+            .unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert!(meta.archived_at.is_some());
+        assert_eq!(meta.archived_reason, "user-approved archival");
+        assert!(meta.pending_prune.is_none(), "pending cleared on apply");
+    }
+
+    #[tokio::test]
+    async fn test_discard_prune_clears_pending_without_archiving() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker
+            .propose_prune(doc_id, "dead".to_string(), None)
+            .await
+            .unwrap();
+        tracker.discard_prune(doc_id).await.unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert!(meta.archived_at.is_none(), "never archived on discard");
+        assert!(meta.pending_prune.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_apply_prune_without_pending_fails() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store);
+
+        let r = tracker.apply_prune(doc_id, "r".into()).await;
+        assert!(r.is_err(), "must refuse to apply with no pending prune");
+    }
+
+    #[tokio::test]
+    async fn test_record_usage_inline_demotes_below_floor() {
+        // Start with a Trusted Extracted skill at 1 success / 8 failures over 9
+        // uses (confidence ~0.11, below the 0.3 demotion floor). record_usage
+        // with a further failure should trip inline demotion.
+        let project_id = ProjectId::new();
+        let mut doc = make_skill_doc(project_id);
+        let mut meta: V2SkillMetadata = serde_json::from_value(doc.metadata.clone()).unwrap();
+        meta.metrics = SkillMetrics {
+            usage_count: 9,
+            success_count: 1,
+            failure_count: 8,
+            last_used: None,
+        };
+        doc.metadata = serde_json::to_value(&meta).unwrap();
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker.record_usage(doc_id, false).await.unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert!(
+            meta.deprecated_at.is_some(),
+            "should be auto-demoted below floor"
+        );
+        assert!(!meta.deprecation_reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_record_usage_no_demote_above_floor() {
+        // Healthy skill (3/2 = 0.6 confidence over 5 uses, above the 0.3 floor).
+        // record_usage with either outcome must NOT demote.
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id); // 3/2 = 0.6
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker.record_usage(doc_id, false).await.unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert!(
+            meta.deprecated_at.is_none(),
+            "healthy skill must not be demoted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_usage_no_demote_for_authored() {
+        // Authored skill below the floor — must NOT be auto-demoted (exempt).
+        let project_id = ProjectId::new();
+        let doc = make_authored_skill_doc(project_id);
+        let mut meta: V2SkillMetadata = serde_json::from_value(doc.metadata.clone()).unwrap();
+        meta.metrics = SkillMetrics {
+            usage_count: 9,
+            success_count: 0,
+            failure_count: 9,
+            last_used: None,
+        };
+        let mut doc = doc;
+        doc.metadata = serde_json::to_value(&meta).unwrap();
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker.record_usage(doc_id, false).await.unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert!(
+            meta.deprecated_at.is_none(),
+            "authored skills are exempt from demotion"
+        );
     }
 }
