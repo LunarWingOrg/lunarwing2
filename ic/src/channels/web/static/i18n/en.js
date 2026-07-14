@@ -562,13 +562,4 @@ I18n.register('en', {
 
   // Approval
   'approval.pressY': 'Press Y to approve, N to deny',
-
-  // Appearance Settings
-  'settings.appearance': 'Appearance',
-  'appearance.mascotSection': 'Mascot & Sidebar',
-  'appearance.splashSection': 'Startup Splash',
-  'appearance.showMascot': 'Show mascot in sidebar',
-  'appearance.showTipsInstead': 'Show tips panel instead of mascot',
-  'appearance.showSplash': 'Show splash screen on startup',
-  'appearance.tipsPreview': 'Tips Preview (shown in sidebar)',
 });

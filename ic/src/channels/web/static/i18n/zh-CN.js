@@ -562,13 +562,4 @@ I18n.register('zh-CN', {
 
   // Approval
   'approval.pressY': '按 Y 批准，N 拒绝',
-
-  // Appearance Settings
-  'settings.appearance': '外观',
-  'appearance.mascotSection': '吉祥物与侧边栏',
-  'appearance.splashSection': '启动画面',
-  'appearance.showMascot': '在侧边栏显示吉祥物',
-  'appearance.showTipsInstead': '显示提示面板而不是吉祥物',
-  'appearance.showSplash': '启动时显示启动画面',
-  'appearance.tipsPreview': '提示预览（显示在侧边栏）',
 });

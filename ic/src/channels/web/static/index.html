@@ -27,11 +27,6 @@
   <script src="/theme-init.js"></script>
 </head>
 <body>
-  <!-- Splash Screen -->
-  <div id="splash-screen">
-    <div class="splash-text">LunarWing</div>
-  </div>
-
   <!-- Auth Screen -->
   <div id="auth-screen">
     <div class="auth-card-login">
@@ -300,7 +295,6 @@
           <button class="settings-subtab" data-settings-subtab="extensions" data-i18n="tab.extensions">Extensions</button>
           <button class="settings-subtab" data-settings-subtab="mcp" data-i18n="settings.mcp">MCP</button>
           <button class="settings-subtab" data-settings-subtab="skills" data-i18n="tab.skills">Skills</button>
-          <button class="settings-subtab" data-settings-subtab="appearance" data-i18n="settings.appearance">Appearance</button>
           <button class="settings-theme-toggle" id="settings-theme-toggle" data-i18n="theme.tooltipSystem" title="Toggle theme">Theme</button>
         </div>
         <div class="settings-content">
@@ -413,47 +407,6 @@
                   <input type="text" id="skill-install-url" data-i18n-placeholder="skills.urlPlaceholder" placeholder="HTTPS URL to SKILL.md (optional)">
                   <button id="skill-install-btn" data-i18n="extensions.install">Install</button>
                 </div>
-              </div>
-            </div>
-          </div>
-          <div class="settings-subpanel" id="settings-appearance">
-            <div class="extensions-container">
-              <div class="appearance-section">
-                <h3 data-i18n="appearance.mascotSection">Mascot &amp; Sidebar</h3>
-                <div class="appearance-row">
-                  <label class="appearance-label" data-i18n="appearance.showMascot">Show mascot in sidebar</label>
-                  <label class="toggle-switch">
-                    <input type="checkbox" id="appearance-mascot-toggle" checked>
-                    <span class="toggle-slider"></span>
-                  </label>
-                </div>
-                <div class="appearance-row">
-                  <label class="appearance-label" data-i18n="appearance.showTipsInstead">Show tips panel instead of mascot</label>
-                  <label class="toggle-switch">
-                    <input type="checkbox" id="appearance-tips-toggle">
-                    <span class="toggle-slider"></span>
-                  </label>
-                </div>
-              </div>
-              <div class="appearance-section">
-                <h3 data-i18n="appearance.splashSection">Startup Splash</h3>
-                <div class="appearance-row">
-                  <label class="appearance-label" data-i18n="appearance.showSplash">Show splash screen on startup</label>
-                  <label class="toggle-switch">
-                    <input type="checkbox" id="appearance-splash-toggle" checked>
-                    <span class="toggle-slider"></span>
-                  </label>
-                </div>
-              </div>
-              <div class="appearance-tips-list" id="appearance-tips-content" style="display:none">
-                <h4 data-i18n="appearance.tipsPreview">Tips Preview (shown in sidebar)</h4>
-                <ul class="tips-list">
-                  <li>Use /help to see all commands</li>
-                  <li>Ctrl/Cmd+N creates a new thread</li>
-                  <li>Upload images with the paperclip button</li>
-                  <li>Use /tools to list available tools</li>
-                  <li>Check Memory tab for persistent files</li>
-                </ul>
               </div>
             </div>
           </div>
