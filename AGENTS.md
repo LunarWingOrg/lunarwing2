@@ -2,10 +2,11 @@
 
 ## Purpose and Precedence
 
+### some information may be outdated
+
 - `AGENTS.md` is the quick-start contract for coding agents. It is not the full architecture spec.
 - Read the relevant subsystem spec before changing a complex area. When a repo spec exists, treat it as authoritative.
-Start with these deeper docs as needed (keep in mind most of these are outdated so you need to actually verify any information from them):
-- `CLAUDE.md`
+Start with these deeper docs as needed (keep in mind most of these are outdated so you need to actually verify any information from them; also some of these files may no longer exist):
 - `src/agent/CLAUDE.md`
 - `src/channels/web/CLAUDE.md`
 - `src/db/CLAUDE.md`
@@ -51,7 +52,7 @@ Start with these deeper docs as needed (keep in mind most of these are outdated 
 
 ## Build Constraints (Gentoo Dev VM)
 
-This dev/test machine has limited resources. **All cargo commands must follow these rules:**
+This machine is a dedicated dev/test machine with limited resources. **All cargo commands must follow these rules:**
 
 - **6 threads max**: prefix every cargo command with `taskset -c 0-5`
 - **Use `cargo check` for compile verification, NOT `cargo build`** — DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS. Reserve release builds (`cargo build --release`) for deploying to a new tenant or upgrading an existing tenant's release binary.
@@ -216,8 +217,6 @@ Exceptions: comments/docs forbidding the pattern; code inside `ic/scripts/lunarw
 ## Docs, Parity, and Testing
 
 - If behavior changes, update the relevant docs/specs in the same branch.
-- If you change implementation status for any feature tracked in `FEATURE_PARITY.md`, update that file in the same branch.
-- Do not open a PR that changes feature behavior without checking `FEATURE_PARITY.md` for needed status updates (`❌`, `🚧`, `✅`, notes, and priorities).
 - Add the narrowest tests that validate the change: unit tests for local logic, integration tests for runtime/DB/routing behavior, and E2E or trace coverage for gateway, approvals, extensions, or other user-visible flows.
 - *DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS*
 
@@ -232,7 +231,6 @@ Exceptions: comments/docs forbidding the pattern; code inside `ic/scripts/lunarw
 
 ## Before Finishing
 
-- Confirm whether behavior changes require updates to `FEATURE_PARITY.md`, specs, API docs, or `CHANGELOG.md`.
 - Run the most targeted tests/checks that cover the change.
 - Re-check security-sensitive paths when touching auth, secrets, network listeners, sandboxing, or approvals.
 - Keep the final diff scoped to the task.
