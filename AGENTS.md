@@ -58,6 +58,7 @@ This machine is a dedicated dev/test machine with limited resources. **All cargo
 - **Use `cargo check` for compile verification, NOT `cargo build`** — DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS. Reserve release builds (`cargo build --release`) for deploying to a new tenant or upgrading an existing tenant's release binary.
 - **Use `taskset -c 0-5` for every cargo command**, not just `cargo build`. This applies to `cargo check`, `cargo test`, `cargo clippy`, `cargo doc`, etc.
 - DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS
+- Using /tmp as a place to store logs or other small files is totally acceptable. However, in general, storing massive files (over 1GB) to /tmp should not happen. You shouldn't be building entire rust binaries to /tmp - it's really stupid.
 
 ```bash
 taskset -c 0-5 cargo check -j6                              # compile check

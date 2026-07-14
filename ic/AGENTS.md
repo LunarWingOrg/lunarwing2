@@ -46,6 +46,8 @@ Start with these deeper docs as needed:
 - Observability: `src/observability/`
 - Extension registry catalog: `src/registry/`
 - OpenClaw port staging work: `ic/openclaw-ports/`. For OpenClaw port tasks, keep edits inside `ic/openclaw-ports/` unless the user explicitly approves touching core LunarWing files.
+- Using /tmp as a place to store logs or other small files is totally acceptabl
+e. However, in general, storing massive files (over 1GB) to /tmp should not happen. You shouldn't be building entire rust binaries to /tmp - it's really stupid.
 
 ## Ownership and Composition Rules
 
