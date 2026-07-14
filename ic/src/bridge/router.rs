@@ -3006,6 +3006,7 @@ async fn forward_event_to_channel(
             action_name,
             duration_ms,
             params_summary,
+            result_preview,
             ..
         } => {
             let display_name = format_action_display_name(action_name, params_summary);
@@ -3018,6 +3019,18 @@ async fn forward_event_to_channel(
                     metadata,
                 )
                 .await;
+            if let Some(preview) = result_preview.as_deref().filter(|value| !value.is_empty()) {
+                let _ = channels
+                    .send_status(
+                        channel_name,
+                        StatusUpdate::ToolResult {
+                            name: display_name.clone(),
+                            preview: preview.to_string(),
+                        },
+                        metadata,
+                    )
+                    .await;
+            }
             let _ = channels
                 .send_status(
                     channel_name,
@@ -4692,6 +4705,85 @@ mod tests {
                 captured[0]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn action_result_reaches_gateway_and_other_channels_via_status() {
+        use crate::testing::StubChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+
+        let (gateway_stub, _gateway_tx) = StubChannel::new("gateway");
+        let gateway_statuses = gateway_stub.captured_statuses_handle();
+        manager.add(Box::new(gateway_stub)).await;
+
+        let (xmpp_stub, _xmpp_tx) = StubChannel::new("xmpp");
+        let xmpp_statuses = xmpp_stub.captured_statuses_handle();
+        manager.add(Box::new(xmpp_stub)).await;
+
+        let event = lunarwing_engine::ThreadEvent::new(
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::EventKind::ActionExecuted {
+                step_id: lunarwing_engine::StepId::new(),
+                action_name: "shell".into(),
+                call_id: "call-1".into(),
+                duration_ms: 12,
+                params_summary: Some("ls".into()),
+                result_preview: Some("file.txt".into()),
+            },
+        );
+        let metadata = serde_json::json!({});
+
+        forward_event_to_channel(&event, &manager, "gateway", &metadata).await;
+        forward_event_to_channel(&event, &manager, "xmpp", &metadata).await;
+
+        for (name, statuses) in [("gateway", &gateway_statuses), ("xmpp", &xmpp_statuses)] {
+            let captured = statuses.lock().expect("poisoned");
+            assert_eq!(captured.len(), 3, "{name} should receive three statuses");
+            assert!(matches!(captured[0], StatusUpdate::ToolStarted { .. }));
+            assert!(matches!(
+                &captured[1],
+                StatusUpdate::ToolResult { preview, .. } if preview == "file.txt"
+            ));
+            assert!(matches!(
+                captured[2],
+                StatusUpdate::ToolCompleted { success: true, .. }
+            ));
+        }
+
+        assert!(thread_event_to_app_events(&event, "thread-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn action_without_preview_skips_only_tool_result_status() {
+        use crate::testing::StubChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (stub, _tx) = StubChannel::new("gateway");
+        let statuses = stub.captured_statuses_handle();
+        manager.add(Box::new(stub)).await;
+
+        let event = lunarwing_engine::ThreadEvent::new(
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::EventKind::ActionExecuted {
+                step_id: lunarwing_engine::StepId::new(),
+                action_name: "time".into(),
+                call_id: "call-2".into(),
+                duration_ms: 1,
+                params_summary: None,
+                result_preview: None,
+            },
+        );
+
+        forward_event_to_channel(&event, &manager, "gateway", &serde_json::json!({})).await;
+
+        let captured = statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 2);
+        assert!(matches!(captured[0], StatusUpdate::ToolStarted { .. }));
+        assert!(matches!(
+            captured[1],
+            StatusUpdate::ToolCompleted { success: true, .. }
+        ));
     }
 
     #[test]
