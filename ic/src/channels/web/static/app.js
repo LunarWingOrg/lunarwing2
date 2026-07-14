@@ -1,5 +1,111 @@
 // LunarWing Web Gateway - Client
 
+// --- Splash Screen ---
+
+function shouldShowSplash() {
+  return localStorage.getItem('lunarwing-show-splash') !== 'false';
+}
+
+function dismissSplashScreen() {
+  const splash = document.getElementById('splash-screen');
+  if (!splash) return;
+  splash.classList.add('hidden');
+  setTimeout(() => { splash.remove(); }, 400);
+}
+
+(function initSplash() {
+  if (!shouldShowSplash()) {
+    const splash = document.getElementById('splash-screen');
+    if (splash) splash.remove();
+    return;
+  }
+  setTimeout(dismissSplashScreen, 1200);
+})();
+
+// --- Appearance Preferences ---
+
+function getAppearancePref(key, defaultVal) {
+  const val = localStorage.getItem('lunarwing-appearance-' + key);
+  return val === null ? defaultVal : val === 'true';
+}
+
+function setAppearancePref(key, val) {
+  localStorage.setItem('lunarwing-appearance-' + key, String(val));
+}
+
+const SIDEBAR_TIPS = [
+  'Use /help to see all commands',
+  'Ctrl/Cmd+N creates a new thread',
+  'Upload images with the paperclip button',
+  'Use /tools to list available tools',
+  'Check Memory tab for persistent files',
+];
+
+function applyMascotVisibility() {
+  const showMascot = getAppearancePref('show-mascot', true);
+  const showTips = getAppearancePref('show-tips', false);
+  const assistantItem = document.getElementById('assistant-thread');
+  if (!assistantItem) return;
+  const sidebar = document.getElementById('thread-sidebar');
+  let tipsPanel = document.getElementById('sidebar-tips-panel');
+
+  if (showTips && showMascot) {
+    if (!tipsPanel) {
+      tipsPanel = document.createElement('div');
+      tipsPanel.id = 'sidebar-tips-panel';
+      tipsPanel.className = 'tips-panel';
+      const title = document.createElement('div');
+      title.className = 'tips-panel-title';
+      title.textContent = 'Tips';
+      tipsPanel.appendChild(title);
+      SIDEBAR_TIPS.forEach(function(tip) {
+        const item = document.createElement('div');
+        item.className = 'tips-panel-item';
+        item.textContent = tip;
+        tipsPanel.appendChild(item);
+      });
+      sidebar.insertBefore(tipsPanel, assistantItem.nextSibling);
+    }
+    tipsPanel.style.display = '';
+  } else if (tipsPanel) {
+    tipsPanel.style.display = 'none';
+  }
+
+  assistantItem.style.display = showMascot ? '' : 'none';
+}
+
+function initAppearanceToggles() {
+  const mascotToggle = document.getElementById('appearance-mascot-toggle');
+  const tipsToggle = document.getElementById('appearance-tips-toggle');
+  const splashToggle = document.getElementById('appearance-splash-toggle');
+  const tipsContent = document.getElementById('appearance-tips-content');
+
+  if (mascotToggle) {
+    mascotToggle.checked = getAppearancePref('show-mascot', true);
+    mascotToggle.addEventListener('change', function() {
+      setAppearancePref('show-mascot', mascotToggle.checked);
+      applyMascotVisibility();
+    });
+  }
+  if (tipsToggle) {
+    tipsToggle.checked = getAppearancePref('show-tips', false);
+    tipsToggle.addEventListener('change', function() {
+      setAppearancePref('show-tips', tipsToggle.checked);
+      applyMascotVisibility();
+      if (tipsContent) tipsContent.style.display = tipsToggle.checked ? 'block' : 'none';
+    });
+  }
+  if (splashToggle) {
+    splashToggle.checked = shouldShowSplash();
+    splashToggle.addEventListener('change', function() {
+      setAppearancePref('show-splash', splashToggle.checked);
+    });
+  }
+  if (tipsContent) {
+    tipsContent.style.display = getAppearancePref('show-tips', false) ? 'block' : 'none';
+  }
+}
+
 // --- Theme Management (dark / light / system) ---
 // Icon switching is handled by pure CSS via data-theme-mode on <html>.
 
@@ -199,6 +305,7 @@ function authenticate() {
       loadThreads();
       loadMemoryTree();
       loadJobs();
+      applyMascotVisibility();
       // Apply URL log_level param if present, otherwise just sync the dropdown
       if (urlLogLevel) {
         setServerLogLevel(urlLogLevel);
@@ -5202,6 +5309,7 @@ function switchSettingsSubtab(subtab) {
     document.querySelector('.settings-layout').classList.add('settings-detail-active');
   }
   loadSettingsSubtab(subtab);
+  if (subtab === 'appearance') initAppearanceToggles();
 }
 
 function settingsBack() {
