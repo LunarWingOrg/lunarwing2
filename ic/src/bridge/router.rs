@@ -310,6 +310,61 @@ async fn insert_and_notify_pending_gate(
     }
 }
 
+async fn persist_and_notify_thread_gate(
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    state: &EngineState,
+    message: &IncomingMessage,
+    conversation_id: lunarwing_engine::ConversationId,
+    thread_id: lunarwing_engine::ThreadId,
+    outcome: ThreadOutcome,
+) -> Result<Option<String>, Error> {
+    let ThreadOutcome::GatePaused {
+        gate_name,
+        action_name,
+        call_id,
+        parameters,
+        resume_kind,
+        resume_output,
+    } = outcome
+    else {
+        return Err(engine_err(
+            "gate outcome",
+            "expected ThreadOutcome::GatePaused",
+        ));
+    };
+
+    let redacted_params = if let Some(tool) = state.effect_adapter.tools().get(&action_name).await {
+        crate::tools::redact_params(&parameters, tool.sensitive_params())
+    } else {
+        parameters.clone()
+    };
+
+    let pending = PendingGate {
+        request_id: uuid::Uuid::new_v4(),
+        gate_name: gate_name.clone(),
+        user_id: message.user_id.clone(),
+        thread_id,
+        conversation_id,
+        source_channel: message.channel.clone(),
+        action_name: action_name.clone(),
+        call_id,
+        parameters,
+        display_parameters: Some(redacted_params),
+        description: format!(
+            "Tool '{}' requires {} (gate: {gate_name})",
+            action_name,
+            resume_kind.kind_name()
+        ),
+        resume_kind,
+        created_at: chrono::Utc::now(),
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+        original_message: None,
+        resume_output,
+    };
+
+    insert_and_notify_pending_gate(channels, state, message, pending).await
+}
+
 fn is_valid_tool_permission_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -2747,123 +2802,16 @@ async fn await_thread_outcome(
     // terminal response via `thread_outcome_response`. Stopped yields the empty
     // sentinel so no terminal reply or history row is committed for a user stop.
     let result = match outcome {
-        ThreadOutcome::GatePaused {
-            gate_name,
-            action_name,
-            call_id,
-            parameters,
-            resume_kind,
-            resume_output,
-        } => {
-            use crate::gate::pending::PendingGate;
-
-            // Redact sensitive params before storing/broadcasting
-            let redacted_params =
-                if let Some(tool) = state.effect_adapter.tools().get(&action_name).await {
-                    crate::tools::redact_params(&parameters, tool.sensitive_params())
-                } else {
-                    parameters.clone()
-                };
-
-            // Store in unified PendingGateStore (keyed by user_id + thread_id)
-            let pending = PendingGate {
-                request_id: uuid::Uuid::new_v4(),
-                gate_name: gate_name.clone(),
-                user_id: message.user_id.clone(),
+        gate @ ThreadOutcome::GatePaused { .. } => {
+            persist_and_notify_thread_gate(
+                &agent.channels,
+                state,
+                message,
+                conv_id,
                 thread_id,
-                conversation_id: conv_id,
-                source_channel: message.channel.clone(),
-                action_name: action_name.clone(),
-                call_id,
-                parameters,
-                display_parameters: Some(redacted_params.clone()),
-                description: format!(
-                    "Tool '{}' requires {} (gate: {gate_name})",
-                    action_name,
-                    resume_kind.kind_name()
-                ),
-                resume_kind: resume_kind.clone(),
-                created_at: chrono::Utc::now(),
-                expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
-                original_message: None,
-                resume_output,
-            };
-
-            if let Err(e) = state.pending_gates.insert(pending.clone()).await {
-                tracing::debug!(
-                    gate = %gate_name,
-                    error = %e,
-                    "failed to store pending gate (may be duplicate)"
-                );
-            }
-
-            // Send appropriate StatusUpdate via channel
-            match &resume_kind {
-                lunarwing_engine::ResumeKind::Approval { allow_always } => {
-                    let _ = agent
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::ApprovalNeeded {
-                                request_id: pending.request_id.to_string(),
-                                tool_name: action_name.clone(),
-                                description: pending.description.clone(),
-                                parameters: redacted_params,
-                                allow_always: *allow_always,
-                            },
-                            &message.metadata,
-                        )
-                        .await;
-
-                    // Status carries the prompt; return empty to avoid a
-                    // duplicate terminal message.
-                    Ok(Some(String::new()))
-                }
-                lunarwing_engine::ResumeKind::Authentication {
-                    credential_name,
-                    instructions,
-                    auth_url,
-                } => {
-                    let _ = agent
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::AuthRequired {
-                                extension_name: credential_name.clone(),
-                                instructions: Some(instructions.clone()),
-                                auth_url: auth_url.clone(),
-                                setup_url: None,
-                            },
-                            &message.metadata,
-                        )
-                        .await;
-
-                    // `send_status(AuthRequired)` is the single gateway mapping
-                    // now; no direct SSE broadcast, and empty sentinel return.
-                    Ok(Some(String::new()))
-                }
-                lunarwing_engine::ResumeKind::External { callback_id } => {
-                    tracing::debug!(
-                        gate = %gate_name,
-                        callback = %callback_id,
-                        "GatePaused(External)"
-                    );
-                    // External gates emit no Approval/Auth status; send one
-                    // best-effort waiting indication before the empty sentinel.
-                    let _ = agent
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::Status(format!(
-                                "Waiting for external confirmation (gate: {gate_name})..."
-                            )),
-                            &message.metadata,
-                        )
-                        .await;
-
-                    Ok(Some(String::new()))
-                }
-            }
+                gate,
+            )
+            .await
         }
         other => Ok(thread_outcome_response(&other)),
     };
@@ -5094,6 +5042,75 @@ mod tests {
         assert_eq!(result, Some(String::new()));
 
         // Exactly one ApprovalNeeded status reached the channel.
+        let captured = statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 1);
+        assert!(matches!(captured[0], StatusUpdate::ApprovalNeeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn execute_time_gate_uses_shared_notification_path() {
+        use crate::testing::StubChannel;
+        use futures::StreamExt;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (stub, _tx) = StubChannel::new("xmpp");
+        let statuses = stub.captured_statuses_handle();
+        manager.add(Box::new(stub)).await;
+
+        let store = Arc::new(TestStore::new());
+        let mut state = make_expected_test_state(store);
+        let sse = Arc::new(SseManager::new());
+        let mut events = sse
+            .subscribe_raw(Some("alice".to_string()))
+            .expect("SSE subscription should be available");
+        state.sse = Some(sse);
+
+        let message = IncomingMessage::new("xmpp", "alice", "run a tool");
+        let conversation_id = lunarwing_engine::ConversationId::new();
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let outcome = ThreadOutcome::GatePaused {
+            gate_name: "approval".into(),
+            action_name: "http".into(),
+            call_id: "call-http".into(),
+            parameters: serde_json::json!({"url": "https://example.com", "method": "POST"}),
+            resume_kind: lunarwing_engine::ResumeKind::Approval { allow_always: true },
+            resume_output: None,
+        };
+
+        let result = persist_and_notify_thread_gate(
+            &manager,
+            &state,
+            &message,
+            conversation_id,
+            thread_id,
+            outcome,
+        )
+        .await
+        .expect("execute-time gate should be persisted and announced");
+
+        assert_eq!(result, Some(String::new()));
+        let pending = state.pending_gates.list_for_user("alice").await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].thread_id, thread_id);
+        assert_eq!(pending[0].conversation_id, conversation_id);
+        assert_eq!(pending[0].action_name, "http");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .expect("GateRequired should be broadcast")
+            .expect("SSE stream should remain open");
+        assert!(matches!(
+            event,
+            crate::channels::web::types::SseEvent::GateRequired {
+                ref request_id,
+                ref tool_name,
+                thread_id: Some(ref event_thread_id),
+                ..
+            } if request_id == &pending[0].request_id.to_string()
+                && tool_name == "http"
+                && event_thread_id == &thread_id.to_string()
+        ));
+
         let captured = statuses.lock().expect("poisoned");
         assert_eq!(captured.len(), 1);
         assert!(matches!(captured[0], StatusUpdate::ApprovalNeeded { .. }));
