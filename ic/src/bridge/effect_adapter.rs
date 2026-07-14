@@ -517,7 +517,10 @@ impl EffectBridgeAdapter {
             // Always-gated tools (ApprovalRequirement::Always) should not offer
             // the "always approve" option in supervised mode either, so we set
             // allow_always = false to be conservative.
-            if context.supervised_mode {
+            // A resolved pending action already has explicit approval for this
+            // call. Later calls enter with `approval_already_granted = false`
+            // and are gated again by supervision.
+            if context.supervised_mode && !approval_already_granted {
                 let requirement = tool.requires_approval(&parameters);
                 let allow_always = !matches!(requirement, ApprovalRequirement::Always);
                 return Err(Self::gate_paused(
@@ -1243,6 +1246,53 @@ mod tests {
                 parameters,
                 &lease(),
                 &exec_ctx(thread_id, Some("call_always_2")),
+            )
+            .await;
+        assert!(matches!(next, Err(EngineError::GatePaused { .. })));
+    }
+
+    #[tokio::test]
+    async fn resolved_always_approval_bypasses_supervised_mode_once() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalTestTool)).await;
+
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let parameters = serde_json::json!({"value": "x", "always": true});
+        let context = exec_ctx_supervised(thread_id, Some("call_supervised_always_1"));
+
+        let first = adapter
+            .execute_action("approval_test", parameters.clone(), &lease(), &context)
+            .await;
+        assert!(matches!(first, Err(EngineError::GatePaused { .. })));
+
+        let resolved = adapter
+            .execute_resolved_pending_action(
+                "approval_test",
+                parameters.clone(),
+                &lease(),
+                &context,
+                true,
+            )
+            .await
+            .expect("resolved supervised action should execute once");
+        assert!(!resolved.is_error);
+
+        let next = adapter
+            .execute_action(
+                "approval_test",
+                parameters,
+                &lease(),
+                &exec_ctx_supervised(thread_id, Some("call_supervised_always_2")),
             )
             .await;
         assert!(matches!(next, Err(EngineError::GatePaused { .. })));
