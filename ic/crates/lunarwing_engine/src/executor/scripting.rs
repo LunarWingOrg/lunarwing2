@@ -561,7 +561,6 @@ pub async fn execute_code_with_skills(
                                 action_name,
                                 call_id: str_call_id,
                                 lease_id: lease.id,
-                                parameters: params.clone(),
                                 params_summary: ps,
                             },
                         );
@@ -644,6 +643,7 @@ pub async fn execute_code_with_skills(
 
                 let mut results: Vec<(u32, ExtFunctionResult)> =
                     Vec::with_capacity(pending_ids.len());
+                let mut first_gate = None;
 
                 for &mid in &pending_ids {
                     let ext_result = if let Some(pf) = pending_futures.remove(&mid) {
@@ -653,15 +653,13 @@ pub async fn execute_code_with_skills(
                                 action_name,
                                 call_id,
                                 lease_id,
-                                parameters,
                                 params_summary,
                             } => {
-                                resolve_tool_future(
+                                match resolve_tool_future(
                                     handle,
                                     &action_name,
                                     &call_id,
                                     lease_id,
-                                    parameters,
                                     params_summary,
                                     leases,
                                     context,
@@ -669,19 +667,43 @@ pub async fn execute_code_with_skills(
                                     &mut events,
                                 )
                                 .await
+                                {
+                                    ToolFutureResolution::Monty(result) => Some(result),
+                                    ToolFutureResolution::GatePaused(outcome) => {
+                                        if first_gate.is_none() {
+                                            first_gate = Some(outcome);
+                                        }
+                                        None
+                                    }
+                                }
                             }
                             PendingFuture::Llm { handle } => {
-                                resolve_llm_future(handle, &mut recursive_tokens).await
+                                Some(resolve_llm_future(handle, &mut recursive_tokens).await)
                             }
                         }
                     } else {
                         debug!(call_id = mid, "ResolveFutures: unknown pending call_id");
-                        ExtFunctionResult::Error(MontyException::new(
+                        Some(ExtFunctionResult::Error(MontyException::new(
                             ExcType::RuntimeError,
                             Some(format!("unknown pending call_id {mid}")),
-                        ))
+                        )))
                     };
-                    results.push((mid, ext_result));
+                    if let Some(ext_result) = ext_result {
+                        results.push((mid, ext_result));
+                    }
+                }
+
+                if let Some(outcome) = first_gate {
+                    return Ok(CodeExecutionResult {
+                        return_value: serde_json::Value::Null,
+                        stdout,
+                        action_results,
+                        events,
+                        need_approval: Some(outcome),
+                        recursive_tokens,
+                        final_answer: None,
+                        had_error,
+                    });
                 }
 
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -801,13 +823,17 @@ enum PendingFuture {
         action_name: String,
         call_id: String,
         lease_id: crate::types::capability::LeaseId,
-        parameters: serde_json::Value,
         params_summary: Option<String>,
     },
     /// LLM call (llm_query / llm_query_batched / rlm_query).
     Llm {
         handle: tokio::task::JoinHandle<(ExtFunctionResult, TokenUsage)>,
     },
+}
+
+enum ToolFutureResolution {
+    Monty(ExtFunctionResult),
+    GatePaused(crate::runtime::messaging::ThreadOutcome),
 }
 
 /// Result of preflight checks (lease + policy) for a tool call.
@@ -1259,13 +1285,12 @@ async fn resolve_tool_future(
     action_name: &str,
     call_id: &str,
     lease_id: crate::types::capability::LeaseId,
-    parameters: serde_json::Value,
     params_summary: Option<String>,
     leases: &LeaseManager,
     context: &ThreadExecutionContext,
     action_results: &mut Vec<ActionResult>,
     events: &mut Vec<EventKind>,
-) -> ExtFunctionResult {
+) -> ToolFutureResolution {
     match handle.await {
         Ok(Ok(result)) => {
             events.push(EventKind::ActionExecuted {
@@ -1278,16 +1303,21 @@ async fn resolve_tool_future(
             });
             let monty_val = json_to_monty(&result.output);
             action_results.push(result);
-            ExtFunctionResult::Return(monty_val)
+            ToolFutureResolution::Monty(ExtFunctionResult::Return(monty_val))
         }
         Ok(Err(EngineError::GatePaused {
             gate_name,
             action_name,
             call_id,
+            parameters: gate_parameters,
             resume_kind,
             resume_output,
             ..
         })) => {
+            let parameters = *gate_parameters;
+            let resume_kind = *resume_kind;
+            let resume_output = resume_output.map(|output| *output);
+
             // Pre-execution gate only: post-execution gates carry `resume_output`
             // and must keep their lease use consumed (see
             // `interrupted_call_needs_refund` in executor/structured.rs).
@@ -1295,21 +1325,25 @@ async fn resolve_tool_future(
                 let _ = leases.refund_use(lease_id).await;
             }
             events.push(EventKind::ApprovalRequested {
-                action_name,
-                call_id,
-                parameters: Some(parameters),
+                action_name: action_name.clone(),
+                call_id: call_id.clone(),
+                parameters: Some(parameters.clone()),
                 description: None,
-                allow_always: match *resume_kind {
-                    crate::gate::ResumeKind::Approval { allow_always } => Some(allow_always),
+                allow_always: match &resume_kind {
+                    crate::gate::ResumeKind::Approval { allow_always } => Some(*allow_always),
                     _ => None,
                 },
                 gate_name: Some(gate_name.clone()),
                 params_summary,
             });
-            ExtFunctionResult::Error(MontyException::new(
-                ExcType::RuntimeError,
-                Some(format!("execution paused by gate '{gate_name}'")),
-            ))
+            ToolFutureResolution::GatePaused(crate::runtime::messaging::ThreadOutcome::GatePaused {
+                gate_name,
+                action_name,
+                call_id,
+                parameters,
+                resume_kind,
+                resume_output,
+            })
         }
         Ok(Err(e)) => {
             events.push(EventKind::ActionFailed {
@@ -1326,17 +1360,17 @@ async fn resolve_tool_future(
                 is_error: true,
                 duration: Duration::ZERO,
             });
-            ExtFunctionResult::Error(MontyException::new(
+            ToolFutureResolution::Monty(ExtFunctionResult::Error(MontyException::new(
                 ExcType::RuntimeError,
                 Some(e.to_string()),
-            ))
+            )))
         }
         Err(e) => {
             debug!("async tool task panicked: {e}");
-            ExtFunctionResult::Error(MontyException::new(
+            ToolFutureResolution::Monty(ExtFunctionResult::Error(MontyException::new(
                 ExcType::RuntimeError,
                 Some(format!("tool execution panicked: {e}")),
-            ))
+            )))
         }
     }
 }
@@ -1595,8 +1629,6 @@ mod tests {
         thread: &Thread,
     ) -> Result<CodeExecutionResult, EngineError> {
         let leases = LeaseManager::new();
-        let policy = PolicyEngine::new();
-        let ctx = make_exec_context(thread);
 
         // Grant a wildcard lease
         leases
@@ -1604,18 +1636,235 @@ mod tests {
             .await
             .unwrap();
 
+        run_code_with_leases(code, effects, thread, &leases).await
+    }
+
+    async fn run_code_with_leases(
+        code: &str,
+        effects: Arc<dyn EffectExecutor>,
+        thread: &Thread,
+        leases: &LeaseManager,
+    ) -> Result<CodeExecutionResult, EngineError> {
+        let policy = PolicyEngine::new();
+        let ctx = make_exec_context(thread);
+
         execute_code(
             code,
             thread,
             &(Arc::new(StubLlm) as Arc<dyn crate::traits::llm::LlmBackend>),
             &effects,
-            &leases,
+            leases,
             &policy,
             &ctx,
             &[],
             &serde_json::json!({}),
         )
         .await
+    }
+
+    // ── Execute-time gate propagation ──────────────────────
+
+    #[tokio::test]
+    async fn execute_time_gate_returns_structured_pause() {
+        let thread = make_test_thread();
+        let gate_parameters = serde_json::json!({
+            "method": "POST",
+            "url": "https://httpbin.org/anything",
+            "body": {"probe": "PHASE5_HTTP_APPROVAL_OK"},
+        });
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("http")],
+            vec![Err(EngineError::GatePaused {
+                gate_name: "approval".into(),
+                action_name: "http".into(),
+                call_id: "effect_gate_call".into(),
+                parameters: Box::new(gate_parameters.clone()),
+                resume_kind: Box::new(crate::gate::ResumeKind::Approval { allow_always: true }),
+                resume_output: None,
+            })],
+        ));
+        let leases = LeaseManager::new();
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(2))
+            .await
+            .unwrap();
+        let code = r#"
+try:
+    await http(
+        method="POST",
+        url="https://httpbin.org/anything",
+        body={"probe": "PHASE5_HTTP_APPROVAL_OK"},
+    )
+    FINAL("tool completed")
+except Exception as error:
+    print("caught: " + str(error))
+    FINAL("caught gate")
+"#;
+
+        let result = run_code_with_leases(code, effects, &thread, &leases)
+            .await
+            .unwrap();
+
+        assert!(result.final_answer.is_none());
+        assert!(!result.had_error, "gate control flow is not a script error");
+        assert!(!result.stdout.contains("execution paused by gate"));
+        assert!(result.action_results.is_empty());
+        match result.need_approval.as_ref() {
+            Some(crate::runtime::messaging::ThreadOutcome::GatePaused {
+                gate_name,
+                action_name,
+                call_id,
+                parameters,
+                resume_kind,
+                resume_output,
+            }) => {
+                assert_eq!(gate_name, "approval");
+                assert_eq!(action_name, "http");
+                assert_eq!(call_id, "effect_gate_call");
+                assert_eq!(parameters, &gate_parameters);
+                assert!(matches!(
+                    resume_kind,
+                    crate::gate::ResumeKind::Approval { allow_always: true }
+                ));
+                assert!(resume_output.is_none());
+            }
+            other => panic!("expected structured GatePaused, got {other:?}"),
+        }
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            EventKind::ApprovalRequested {
+                action_name,
+                call_id,
+                parameters: Some(parameters),
+                allow_always: Some(true),
+                gate_name: Some(gate_name),
+                ..
+            } if action_name == "http"
+                && call_id == "effect_gate_call"
+                && parameters == &gate_parameters
+                && gate_name == "approval"
+        )));
+
+        let after = leases.check(lease.id).await.unwrap();
+        assert_eq!(
+            after.uses_remaining,
+            Some(2),
+            "pre-execution gate must refund its consumed lease use"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_execution_gate_preserves_resume_output_without_refund() {
+        let thread = make_test_thread();
+        let resume_output = serde_json::json!({"already": "executed"});
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("http")],
+            vec![Err(EngineError::GatePaused {
+                gate_name: "authentication".into(),
+                action_name: "http".into(),
+                call_id: "post_exec_gate".into(),
+                parameters: Box::new(serde_json::json!({
+                    "url": "https://api.example.com/data",
+                })),
+                resume_kind: Box::new(crate::gate::ResumeKind::Authentication {
+                    credential_name: "github_token".into(),
+                    instructions: "Authorize to continue".into(),
+                    auth_url: None,
+                }),
+                resume_output: Some(Box::new(resume_output.clone())),
+            })],
+        ));
+        let leases = LeaseManager::new();
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(2))
+            .await
+            .unwrap();
+
+        let result = run_code_with_leases(
+            r#"await http(url="https://api.example.com/data")"#,
+            effects,
+            &thread,
+            &leases,
+        )
+        .await
+        .unwrap();
+
+        match result.need_approval.as_ref() {
+            Some(crate::runtime::messaging::ThreadOutcome::GatePaused {
+                gate_name,
+                action_name,
+                call_id,
+                resume_kind,
+                resume_output: actual_output,
+                ..
+            }) => {
+                assert_eq!(gate_name, "authentication");
+                assert_eq!(action_name, "http");
+                assert_eq!(call_id, "post_exec_gate");
+                assert!(matches!(
+                    resume_kind,
+                    crate::gate::ResumeKind::Authentication {
+                        credential_name,
+                        ..
+                    } if credential_name == "github_token"
+                ));
+                assert_eq!(actual_output.as_ref(), Some(&resume_output));
+            }
+            other => panic!("expected structured GatePaused, got {other:?}"),
+        }
+
+        let after = leases.check(lease.id).await.unwrap();
+        assert_eq!(
+            after.uses_remaining,
+            Some(1),
+            "post-execution gate must keep its lease use consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_time_gate_preserves_successful_sibling_result() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("approval_tool"), test_action("echo")],
+            vec![
+                Err(EngineError::GatePaused {
+                    gate_name: "approval".into(),
+                    action_name: "approval_tool".into(),
+                    call_id: "parallel_gate".into(),
+                    parameters: Box::new(serde_json::json!({})),
+                    resume_kind: Box::new(crate::gate::ResumeKind::Approval {
+                        allow_always: false,
+                    }),
+                    resume_output: None,
+                }),
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "echo".into(),
+                    output: serde_json::json!("sibling complete"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+            ],
+        ));
+        let code = r#"
+import asyncio
+await asyncio.gather(approval_tool(), echo())
+FINAL("should not reach")
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+
+        assert!(result.need_approval.is_some());
+        assert!(result.final_answer.is_none());
+        assert!(result.action_results.iter().any(|action_result| {
+            !action_result.is_error && action_result.output == serde_json::json!("sibling complete")
+        }));
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|event| matches!(event, EventKind::ActionExecuted { .. }))
+        );
     }
 
     // ── Single await tool call ──────────────────────────────
@@ -1836,6 +2085,8 @@ FINAL("should not reach")
             result.final_answer.is_none()
                 || result.final_answer.as_deref() != Some("should not reach")
         );
+        assert!(result.need_approval.is_none());
+        assert!(result.stdout.contains("tool exploded"));
     }
 
     // ── Tool with no lease (denied in preflight) ────────────
