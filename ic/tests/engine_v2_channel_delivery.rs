@@ -29,6 +29,7 @@ const TERMINAL_RESPONSE: &str = "channel-final";
 const AUTH_TERMINAL_RESPONSE: &str = "authenticated-final";
 const APPROVAL_CALL_ID: &str = "callgate1";
 const APPROVAL_REPLAY_CALL_ID: &str = "callgate2";
+const APPROVAL_CONTEXT_MARKER: &str = "The user explicitly approved this action";
 const OUTBOUND_POINTS: [HookPoint; 1] = [HookPoint::BeforeOutbound];
 
 struct DeterministicStreamingLlm;
@@ -72,7 +73,19 @@ impl ApprovalLlm {
         })
     }
 
-    fn next_stream(&self, has_executed_result: bool) -> Result<LlmStream<'static>, LlmError> {
+    fn has_approval_context(request: &ToolCompletionRequest) -> bool {
+        request.messages.iter().any(|message| {
+            message.role == Role::Tool
+                && message.tool_call_id.as_deref() == Some(APPROVAL_CALL_ID)
+                && message.content.contains(APPROVAL_CONTEXT_MARKER)
+        })
+    }
+
+    fn next_stream(
+        &self,
+        has_executed_result: bool,
+        has_approval_context: bool,
+    ) -> Result<LlmStream<'static>, LlmError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         let chunks = match call {
             0 => vec![
@@ -87,9 +100,18 @@ impl ApprovalLlm {
                     finish_reason: "tool_calls".to_string(),
                 }),
             ],
-            1 if has_executed_result => vec![
+            1 if has_executed_result && has_approval_context => vec![
                 Ok(LlmStreamChunk::TextDelta(
                     "```repl\nFINAL('approved-final')\n```".to_string(),
+                )),
+                Ok(LlmStreamChunk::Done {
+                    usage: Some(TokenUsage::default()),
+                    finish_reason: "stop".to_string(),
+                }),
+            ],
+            1 if has_executed_result => vec![
+                Ok(LlmStreamChunk::TextDelta(
+                    "```repl\nFINAL('approval-context-missing')\n```".to_string(),
                 )),
                 Ok(LlmStreamChunk::Done {
                     usage: Some(TokenUsage::default()),
@@ -372,7 +394,7 @@ impl LlmProvider for ApprovalLlm {
         &self,
         _request: CompletionRequest,
     ) -> Result<LlmStream<'_>, LlmError> {
-        self.next_stream(false)
+        self.next_stream(false, false)
     }
 
     async fn complete_with_tools(
@@ -380,6 +402,7 @@ impl LlmProvider for ApprovalLlm {
         request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
         let has_executed_result = Self::has_executed_result(&request);
+        let has_approval_context = Self::has_approval_context(&request);
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         match call {
             0 => Ok(ToolCompletionResponse {
@@ -396,8 +419,17 @@ impl LlmProvider for ApprovalLlm {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             }),
-            1 if has_executed_result => Ok(ToolCompletionResponse {
+            1 if has_executed_result && has_approval_context => Ok(ToolCompletionResponse {
                 content: Some("```repl\nFINAL('approved-final')\n```".to_string()),
+                tool_calls: Vec::new(),
+                input_tokens: 1,
+                output_tokens: 1,
+                finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }),
+            1 if has_executed_result => Ok(ToolCompletionResponse {
+                content: Some("```repl\nFINAL('approval-context-missing')\n```".to_string()),
                 tool_calls: Vec::new(),
                 input_tokens: 1,
                 output_tokens: 1,
@@ -427,7 +459,10 @@ impl LlmProvider for ApprovalLlm {
         &self,
         request: ToolCompletionRequest,
     ) -> Result<LlmStream<'_>, LlmError> {
-        self.next_stream(Self::has_executed_result(&request))
+        self.next_stream(
+            Self::has_executed_result(&request),
+            Self::has_approval_context(&request),
+        )
     }
 }
 

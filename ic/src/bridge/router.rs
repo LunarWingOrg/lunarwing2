@@ -197,9 +197,19 @@ fn resumed_action_result_message(
     call_id: &str,
     action_name: &str,
     output: &serde_json::Value,
+    explicitly_approved: bool,
 ) -> lunarwing_engine::ThreadMessage {
     let rendered = serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
-    lunarwing_engine::ThreadMessage::action_result(call_id, action_name, rendered)
+    let gate_context = if explicitly_approved {
+        "The user explicitly approved this action. LunarWing executed it exactly once."
+    } else {
+        "LunarWing executed this pending action exactly once after its gate was resolved."
+    };
+    lunarwing_engine::ThreadMessage::action_result(
+        call_id,
+        action_name,
+        format!("{gate_context}\nAction result:\n{rendered}"),
+    )
 }
 
 async fn insert_and_notify_pending_gate(
@@ -464,6 +474,7 @@ async fn execute_pending_gate_action(
                         &pending.call_id,
                         &pending.action_name,
                         &result.output,
+                        approval_already_granted,
                     )),
                     approval_event,
                     Some(pending.call_id.clone()),
@@ -1252,7 +1263,12 @@ pub async fn resolve_engine_auth_callback(
             pending.thread_id,
             user_id.to_string(),
             pending.resume_output.as_ref().map(|resume_output| {
-                resumed_action_result_message(&pending.call_id, &pending.action_name, resume_output)
+                resumed_action_result_message(
+                    &pending.call_id,
+                    &pending.action_name,
+                    resume_output,
+                    false,
+                )
             }),
             None,
             Some(pending.call_id.clone()),
@@ -1816,6 +1832,7 @@ pub async fn resolve_gate(
                                 &pending.call_id,
                                 &pending.action_name,
                                 &resume_output,
+                                false,
                             )),
                             None,
                             Some(pending.call_id.clone()),
@@ -1862,6 +1879,7 @@ pub async fn resolve_gate(
                             &pending.call_id,
                             &pending.action_name,
                             &resume_output,
+                            false,
                         )),
                         None,
                         Some(pending.call_id.clone()),
