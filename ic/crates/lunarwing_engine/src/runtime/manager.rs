@@ -280,6 +280,9 @@ impl ThreadManager {
         }
 
         if let Some(message) = injected_message {
+            if message.role == MessageRole::ActionResult {
+                thread.config.require_action_attempt = false;
+            }
             // Once the orchestrator has materialized an internal transcript, it
             // becomes the inference source on resume. Keep injected context in
             // both transcripts so the model sees it and the visible history
@@ -1592,6 +1595,66 @@ mod tests {
             .unwrap();
         wait_for_delta(&mut events).await;
 
+        mgr.stop_thread(tid, "user").await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), mgr.join_thread(tid))
+            .await
+            .expect("resumed stop should be prompt")
+            .expect("thread should join");
+        assert!(matches!(outcome, ThreadOutcome::Stopped));
+    }
+
+    #[tokio::test]
+    async fn resuming_with_action_result_consumes_action_requirement() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(PendingStreamLlm {
+            opened: Notify::new(),
+            drop_count: Arc::clone(&drop_count),
+            stream_calls: AtomicUsize::new(0),
+        });
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(llm, Arc::clone(&store));
+        let project = ProjectId::new();
+
+        let config = ThreadConfig {
+            require_action_attempt: true,
+            ..ThreadConfig::default()
+        };
+        let mut thread = Thread::new(
+            "perform one action",
+            ThreadType::Foreground,
+            project,
+            "user",
+            config,
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread
+            .transition_to(ThreadState::Waiting, Some("approval".into()))
+            .unwrap();
+        let tid = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let mut events = mgr.subscribe_events();
+        mgr.resume_thread(
+            tid,
+            "user",
+            Some(ThreadMessage::action_result(
+                "call-http",
+                "http",
+                "approved output",
+            )),
+            Some(("call-http".into(), true)),
+            Some("call-http".into()),
+        )
+        .await
+        .unwrap();
+
+        let resumed = store.load_thread(tid).await.unwrap().unwrap();
+        assert!(
+            !resumed.config.require_action_attempt,
+            "the approved action result must satisfy the one-shot action requirement"
+        );
+
+        wait_for_delta(&mut events).await;
         mgr.stop_thread(tid, "user").await.unwrap();
         let outcome = tokio::time::timeout(Duration::from_secs(1), mgr.join_thread(tid))
             .await
