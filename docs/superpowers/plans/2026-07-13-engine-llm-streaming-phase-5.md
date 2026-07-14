@@ -19,6 +19,71 @@ channels continue ignoring `StatusUpdate::StreamChunk`.
 SSE, WASM channel wrapper and current channel WIT, Engine V2 pending gates,
 XMPP/DarkIRC/WeeChat routing metadata, TensorZero Gateway `2026.3.2`.
 
+## Progress Checkpoint (2026-07-13)
+
+**Status: paused after the XMPP pilot; implementation retained.** Brightdawn is
+healthy on release commit `7e2573d` with `ENGINE_V2=true` and
+`ENGINE_V2_CHANNELS=xmpp`. Gateway and XMPP use Engine V2. DarkIRC and WeeChat
+remain absent from the allowlist and therefore continue through the legacy path.
+Their live rollout is intentionally deferred until Phase 5 work resumes; this is
+not an implementation rollback and does not broaden the enabled channel set.
+
+The implementation and corrective commits now deployed from
+`integration/enginep4p5-uifix-skillsb2b3/v2.0.0.0` are:
+
+- `8044774` - channel-neutral Phase 5 routing, delivery, controls, and matrix;
+- `12a6a74` - supervised one-shot approvals honor an already granted approval;
+- `88a78fd` - approved action results resume as a structured tool result tied to
+  the original call ID and internal inference transcript;
+- `7e2573d` - resumed tool results preserve trusted gate-resolution context so
+  the model knows the user explicitly approved the action.
+
+Automated evidence after the approval fixes:
+
+- `engine_v2_channel_delivery_matrix`: `1/1`, including a RED/GREEN regression
+  for an identical post-approval tool replay and a second RED/GREEN regression
+  for missing approval context in the resumed model turn;
+- effect-adapter approval suite: `25/25`;
+- bridge router suite: `30/30`;
+- thread-manager suite: `13/13` after the internal-transcript resume change;
+- default and all-feature compile checks, default and all-feature Clippy with
+  warnings denied, formatting, and `git diff --check` passed under the six-thread
+  constraint;
+- the Brightdawn release build for `7e2573d` completed with
+  `BUILD_EXIT_STATUS=0`, followed by a clean `mt-admin` restart and healthy
+  gateway, daemon, XMPP bridge, PostgreSQL, and SSH-agent checks.
+
+Live evidence collected before the pause:
+
+- Gateway after XMPP opt-in: two stream chunks, one terminal response, and one
+  persisted response (`/tmp/brightdawn_phase5_gateway_gate.result`).
+- XMPP direct message: one OMEMO-tagged ingress, one XMPP-scoped Engine V2 turn,
+  one terminal response, zero chunk messages, and one persisted response
+  (`/tmp/brightdawn_phase5_xmpp_gate.result`).
+- XMPP approval: one approval prompt was sent, one `yes` was received, one SSH
+  execution sequence produced `PHASE5_XMPP_APPROVAL_TOOL_OK`, one terminal reply
+  was sent, and no second gate remained. The first terminal reply incorrectly
+  claimed that no gate fired even though the journal proved the pause and resume;
+  `7e2573d` fixes that missing transcript context. The strengthened automated
+  matrix passes, but the corrected final wording has not been rerun live.
+- The pending-gate store was empty after the run and remained empty after the
+  final deployment restart.
+
+Remaining live work is deliberately deferred:
+
+- XMPP room validation has no configured Brightdawn room; XMPP auth and scoped
+  interrupt remain live-gate follow-ups even though their local matrix coverage
+  passes.
+- DarkIRC remains out of `ENGINE_V2_CHANNELS`; its live gate is pending.
+- WeeChat remains out of `ENGINE_V2_CHANNELS`; its live gate is pending.
+- The Phase 5 completion gate stays open. Resume from the deployed `7e2573d`
+  checkpoint, optionally rerun the corrected XMPP approval wording, finish the
+  remaining XMPP live cases, then enable DarkIRC and WeeChat one at a time only
+  when the operator chooses to continue the rollout.
+
+The detailed task checkboxes below remain the original execution procedure. This
+checkpoint is the authoritative record of completed, deployed, and deferred work.
+
 ---
 
 ## Fixed Decisions And Boundaries
@@ -1003,24 +1068,24 @@ git commit -m "docs: document engine channel rollout"
 - Preserve: `/home/brightdawn/lunarwing/state/`
 - No automatic WASM reinstall.
 
-- [ ] **Step 1: Push before deployment**
+- [x] **Step 1: Push before deployment**
 
 ```bash
 git status --short --branch
-git push origin feat/wire-engine-p345
+git push origin integration/enginep4p5-uifix-skillsb2b3/v2.0.0.0
 ```
 
 Require a clean worktree and exact local/origin HEAD equality.
 
-- [ ] **Step 2: Update source and build only the release binary**
+- [x] **Step 2: Update source and build only the release binary**
 
 ```bash
 sudo -n -u brightdawn git -C /home/brightdawn/lunarwing fetch origin \
-  feat/wire-engine-p345
+  integration/enginep4p5-uifix-skillsb2b3/v2.0.0.0
 sudo -n -u brightdawn git -C /home/brightdawn/lunarwing switch \
-  feat/wire-engine-p345
+  integration/enginep4p5-uifix-skillsb2b3/v2.0.0.0
 sudo -n -u brightdawn git -C /home/brightdawn/lunarwing merge --ff-only \
-  origin/feat/wire-engine-p345
+  origin/integration/enginep4p5-uifix-skillsb2b3/v2.0.0.0
 tmux new-session -d -s phase5-brightdawn-build \
   "cd /home/brightdawn/lunarwing/ic && taskset -c 0-5 cargo build --release -j6 --bin lunarwing 2>&1 | tee /tmp/phase5-brightdawn-build.log"
 ```
@@ -1038,7 +1103,7 @@ sudo -n ic/scripts/lunarwing-mt-admin.sh restart-tenant brightdawn
 sudo -n ic/scripts/lunarwing-mt-admin.sh status brightdawn
 ```
 
-- [ ] **Step 4: Enable only XMPP with a targeted env-key update**
+- [x] **Step 4: Enable only XMPP with a targeted env-key update**
 
 Back up the env file without reading it into logs, then update or append only
 `ENGINE_V2_CHANNELS`:
@@ -1058,7 +1123,12 @@ Record the unique backup path. Do not print the full env file. The edit may
 change only `ENGINE_V2_CHANNELS`; compare key presence/value without displaying
 unrelated secret-bearing lines.
 
-- [ ] **Step 5: Pass the XMPP gate**
+- [ ] **Step 5: Pass the XMPP gate (pilot partially complete)**
+
+Direct-message delivery and one-shot approval passed live. The corrected
+approval-context wording is deployed and covered locally but has not been rerun
+live. Room validation is blocked by zero configured rooms; live auth and scoped
+interrupt checks are deferred with the rest of Phase 5.
 
 Test a direct chat and a room independently. For each, require:
 
@@ -1077,6 +1147,10 @@ any item fails.
 
 - [ ] **Step 6: Enable and test DarkIRC only when configured**
 
+**Deferred by operator on 2026-07-13.** Keep `darkirc` absent from
+`ENGINE_V2_CHANNELS`; local routing and scope coverage remain in place for the
+future live gate.
+
 After XMPP passes, set `ENGINE_V2_CHANNELS=xmpp,darkirc`, restart, and require
 one final response to the original nick, no token messages, nick-scope approval
 and interrupt isolation, and no cross-nick delivery. If Brightdawn's DarkIRC
@@ -1085,6 +1159,10 @@ the live gate as pending; automated tests must still pass.
 
 - [ ] **Step 7: Enable and test WeeChat only when configured**
 
+**Deferred by operator on 2026-07-13.** Keep `weechat` absent from
+`ENGINE_V2_CHANNELS`; local routing and scope coverage remain in place for the
+future live gate.
+
 After DarkIRC passes or is explicitly deferred, add `weechat` only on a tenant
 where its relay/adapter/channel are healthy. Require one final response to the
 original buffer/target, no token messages, DM/group isolation, scoped approval,
@@ -1092,6 +1170,9 @@ scoped interrupt, and no delivery to another buffer. If Brightdawn's WeeChat
 path is not configured, leave it out and record the live gate as pending.
 
 - [ ] **Step 8: Record evidence and final rollback procedure**
+
+Evidence available at the pause is summarized in the progress checkpoint above.
+Final per-channel evidence remains open until the deferred live gates run.
 
 For each enabled channel record sanitized timestamps, channel/scope labels,
 status/chunk counts, terminal-response count, approval/auth/interrupt results,
@@ -1115,6 +1196,10 @@ never replace `state/` or regenerate the rest of `env/`.
 ## Phase 5 Completion Gate
 
 Phase 5 implementation is complete only when every applicable item is true:
+
+**Current decision:** do not mark this gate complete. XMPP is the only live
+opt-in pilot; DarkIRC and WeeChat are intentionally deferred and remain on the
+legacy path.
 
 - [ ] `ENGINE_V2=false` disables every channel.
 - [ ] Unset/empty allowlist preserves gateway-only Engine V2.

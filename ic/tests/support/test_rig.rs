@@ -15,12 +15,13 @@ use lunarwing::channels::web::log_layer::LogBroadcaster;
 use lunarwing::channels::{OutgoingResponse, StatusUpdate};
 use lunarwing::config::Config;
 use lunarwing::db::Database;
+use lunarwing::hooks::Hook;
 use lunarwing::llm::{LlmProvider, SessionConfig, SessionManager};
 use lunarwing::tools::Tool;
 
 use crate::support::instrumented_llm::InstrumentedLlm;
 use crate::support::metrics::{ToolInvocation, TraceMetrics};
-use crate::support::test_channel::{TestChannel, TestChannelHandle};
+use crate::support::test_channel::{CapturedDelivery, TestChannel, TestChannelHandle};
 use crate::support::trace_llm::{LlmTrace, TraceLlm};
 
 use lunarwing::llm::recording::{HttpExchange, HttpInterceptor, ReplayingHttpInterceptor};
@@ -98,6 +99,11 @@ impl TestRig {
         self.channel.wait_for_responses(n, timeout).await
     }
 
+    /// Return a snapshot of all captured responses.
+    pub fn captured_responses(&self) -> Vec<OutgoingResponse> {
+        self.channel.captured_responses()
+    }
+
     /// Return the names of all `ToolStarted` events captured so far.
     pub fn tool_calls_started(&self) -> Vec<String> {
         self.channel.tool_calls_started()
@@ -121,6 +127,11 @@ impl TestRig {
     /// Return a snapshot of all captured status events.
     pub fn captured_status_events(&self) -> Vec<StatusUpdate> {
         self.channel.captured_status_events()
+    }
+
+    /// Return status and response deliveries in exact channel call order.
+    pub fn captured_deliveries(&self) -> Vec<CapturedDelivery> {
+        self.channel.captured_deliveries()
     }
 
     /// Clear all captured responses and status events.
@@ -336,6 +347,15 @@ impl TestRig {
             handle.abort();
         }
     }
+
+    /// Abort the background agent and wait until cancellation has completed.
+    pub async fn shutdown_and_wait(mut self) {
+        self.channel.signal_shutdown();
+        if let Some(handle) = self.agent_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
 }
 
 impl Drop for TestRig {
@@ -370,8 +390,11 @@ pub struct TestRigBuilder {
     enable_routines: bool,
     http_exchanges: Vec<HttpExchange>,
     extra_tools: Vec<Arc<dyn Tool>>,
+    extra_hooks: Vec<Arc<dyn Hook>>,
     wasm_tools: Vec<WasmToolSpec>,
     keep_bootstrap: bool,
+    channel_name: String,
+    handle_message_timeout: Option<Duration>,
 }
 
 impl TestRigBuilder {
@@ -387,8 +410,11 @@ impl TestRigBuilder {
             enable_routines: false,
             http_exchanges: Vec::new(),
             extra_tools: Vec::new(),
+            extra_hooks: Vec::new(),
             wasm_tools: Vec::new(),
             keep_bootstrap: false,
+            channel_name: "test".to_string(),
+            handle_message_timeout: None,
         }
     }
 
@@ -424,6 +450,24 @@ impl TestRigBuilder {
     /// Override the LLM provider directly (takes precedence over trace).
     pub fn with_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
         self.llm = Some(llm);
+        self
+    }
+
+    /// Override the in-process channel name.
+    pub fn with_channel_name(mut self, channel_name: impl Into<String>) -> Self {
+        self.channel_name = channel_name.into();
+        self
+    }
+
+    /// Register an additional lifecycle hook in the test agent.
+    pub fn with_hook(mut self, hook: Arc<dyn Hook>) -> Self {
+        self.extra_hooks.push(hook);
+        self
+    }
+
+    /// Override the agent's soft timeout for lifecycle tests.
+    pub fn with_handle_message_timeout(mut self, timeout: Duration) -> Self {
+        self.handle_message_timeout = Some(timeout);
         self
     }
 
@@ -506,8 +550,11 @@ impl TestRigBuilder {
             enable_routines,
             http_exchanges: explicit_http_exchanges,
             extra_tools,
+            extra_hooks,
             wasm_tools,
             keep_bootstrap,
+            channel_name,
+            handle_message_timeout,
         } = self;
 
         // 1. Create temp dir + libSQL database + run migrations.
@@ -598,6 +645,12 @@ impl TestRigBuilder {
         // Force test-rig agent flags to the requested deterministic values.
         components.config.agent.auto_approve_tools = auto_approve_tools.unwrap_or(true);
         components.config.agent.allow_local_tools = true;
+        if let Some(timeout) = handle_message_timeout {
+            components.config.agent.handle_message_timeout = timeout;
+        }
+        for hook in extra_hooks {
+            components.hooks.register(hook).await;
+        }
 
         let scheduler_slot: lunarwing::tools::builtin::SchedulerSlot =
             Arc::new(tokio::sync::RwLock::new(None));
@@ -769,11 +822,12 @@ impl TestRigBuilder {
         // 7. Create TestChannel and ChannelManager.
         // When testing bootstrap, the channel must be named "gateway" because
         // the bootstrap greeting targets only the gateway channel.
-        let test_channel = if self.keep_bootstrap {
-            Arc::new(TestChannel::new().with_name("gateway"))
+        let channel_name = if keep_bootstrap {
+            "gateway".to_string()
         } else {
-            Arc::new(TestChannel::new())
+            channel_name
         };
+        let test_channel = Arc::new(TestChannel::new().with_name(channel_name));
         let handle = TestChannelHandle::new(Arc::clone(&test_channel));
         let channel_manager = ChannelManager::new();
         channel_manager.add(Box::new(handle)).await;

@@ -70,6 +70,23 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{}...", &s[..end])
     }
 }
+
+pub const ACTION_RESULT_PREVIEW_MAX_BYTES: usize = 1000;
+
+/// Build a bounded display preview from a tool output value.
+pub fn preview_from_output(output: &serde_json::Value) -> Option<String> {
+    let raw = match output {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(value) => value.clone(),
+        value => value.to_string(),
+    };
+
+    if raw.is_empty() {
+        None
+    } else {
+        Some(truncate(&raw, ACTION_RESULT_PREVIEW_MAX_BYTES))
+    }
+}
 use crate::types::step::{StepId, TokenUsage};
 use crate::types::thread::{ThreadId, ThreadState};
 
@@ -141,6 +158,9 @@ pub enum EventKind {
         /// Short human-readable summary of parameters (e.g., URL for http tool).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         params_summary: Option<String>,
+        /// Bounded preview of the post-safety tool output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_preview: Option<String>,
     },
     ActionFailed {
         step_id: StepId,
@@ -232,7 +252,7 @@ pub enum EventKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventKind, ThreadEvent};
+    use super::{EventKind, ThreadEvent, preview_from_output};
     use crate::types::thread::ThreadId;
 
     #[test]
@@ -252,6 +272,60 @@ mod tests {
         assert!(matches!(
             decoded.kind,
             EventKind::ResponseDelta { content } if content == "partial response"
+        ));
+    }
+
+    #[test]
+    fn action_result_preview_handles_strings_json_and_empty_values() {
+        assert_eq!(preview_from_output(&serde_json::Value::Null), None);
+        assert_eq!(preview_from_output(&serde_json::json!("")), None);
+        assert_eq!(
+            preview_from_output(&serde_json::json!("hello")).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            preview_from_output(&serde_json::json!({"count": 2})).as_deref(),
+            Some("{\"count\":2}")
+        );
+    }
+
+    #[test]
+    fn action_result_preview_truncates_at_utf8_boundary() {
+        let preview = preview_from_output(&serde_json::json!("你".repeat(400)))
+            .expect("non-empty output should produce a preview");
+
+        assert!(preview.len() <= 1003);
+        assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn action_executed_without_preview_round_trips_as_legacy_event() {
+        let event = ThreadEvent::new(
+            ThreadId::new(),
+            EventKind::ActionExecuted {
+                step_id: crate::types::step::StepId::new(),
+                action_name: "shell".into(),
+                call_id: "call-1".into(),
+                duration_ms: 1,
+                params_summary: None,
+                result_preview: None,
+            },
+        );
+
+        let json = serde_json::to_value(&event).expect("event should serialize");
+        assert!(
+            json["kind"]["ActionExecuted"]
+                .get("result_preview")
+                .is_none()
+        );
+        let decoded: ThreadEvent =
+            serde_json::from_value(json).expect("legacy event should deserialize");
+        assert!(matches!(
+            decoded.kind,
+            EventKind::ActionExecuted {
+                result_preview: None,
+                ..
+            }
         ));
     }
 }

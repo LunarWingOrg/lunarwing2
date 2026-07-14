@@ -15,20 +15,47 @@ generation, and expose progress during long agentic runs.
   native streams, the primary Engine V2 orchestrator consumes them strictly,
   and engine text deltas are broadcast as transient provider-neutral events.
 - **Phase 3 is complete on the implementation branch and is user-visible.** The
-  bridge translates engine `ResponseDelta` events into the gateway SSE
-  `stream_chunk` event (via the direct SSE path in `await_thread_outcome`), and
-  the existing web frontend renders deltas incrementally, finalizing on the
-  terminal `response`. The channel-neutral `StatusUpdate::StreamChunk` path is
-  additionally wired for non-gateway channels (inert today; WASM channels ignore
-  `StreamChunk`) to plumb the Phase 5 rollout.
-- **Interrupts and WASM channel delivery are still not covered.** Those remain
-  Phase 4 and Phase 5.
+  bridge translates engine `ResponseDelta` events into channel-neutral
+  `StatusUpdate::StreamChunk` updates. The gateway maps those updates to its SSE
+  `stream_chunk` event, and the existing web frontend renders deltas
+  incrementally before finalizing on the terminal `response`.
+- **Phase 4 engine cancellation and interrupt-aware ingress are complete.** Each
+  running thread owns a `tokio_util` `CancellationToken`; a stop
+  cancels it (in addition to the existing between-step `ThreadSignal::Stop`) so
+  an in-flight provider stream — whether still acquiring or mid-collection — is
+  dropped promptly. A cancelled LLM call is control flow, not an error: the
+  thread returns `ThreadOutcome::Stopped` and commits no terminal assistant
+  reply, no usage from the cancelled call, no cache entry, and no recording
+  trace. Cancellation is isolated by owner and conversation scope, resumed and
+  subsequent turns get fresh tokens, and the gateway `Submission::Interrupt` is
+  routed to Engine V2 (returning a single `Interrupted.` acknowledgement). The
+  host dispatcher now continues polling channel input while one ordinary handler
+  is active: exact `/interrupt` and `/stop` controls use the normal scoped route,
+  while every other message remains FIFO in a 256-entry bounded queue with an
+  explicit busy response on overflow. The original agent-level regression first
+  failed with zero responses after two seconds, then passed with the dispatcher;
+  five ingress lifecycle tests cover acquisition cancellation, FIFO priority,
+  overflow, legacy fallback, and soft-timeout preservation. Brightdawn passed
+  the corrected TensorZero `2026.3.2` live gate on 2026-07-13 with 10-11 ms
+  interrupt acknowledgements, stable post-cancel chunk counts, no persisted
+  cancelled assistant response, successful same-thread recovery, and isolated
+  completion of the queued second thread.
+- **Phase 5 implementation and local verification are complete.** Engine V2
+  remains gateway-only by default; `ENGINE_V2_CHANNELS` can opt in the exact
+  eligible names `xmpp`, `darkirc`, and `weechat`. Completed turns return through
+  the normal outer outbound handler, preserving `BeforeOutbound`, original
+  routing metadata, persistence, and exactly-once terminal delivery. WASM
+  channels intentionally ignore incremental `StreamChunk` updates, so they
+  receive one final response rather than one message per provider chunk.
+  Approval, authentication, and interrupt controls are conversation-scoped,
+  including non-UUID channel scopes. Brightdawn live channel validation remains
+  a separate staged rollout gate.
 - **TensorZero Gateway `2026.3.2` is the compatibility target.** LunarWing uses
   its OpenAI-compatible `/openai/v1/chat/completions` endpoint.
 
-The next work is interrupt-aware cancellation (Phase 4) and opt-in WASM channel
-delivery (Phase 5). Provider streaming and gateway delivery are no longer the
-blocker.
+The next work is staged Brightdawn validation for each configured opt-in
+channel. Provider, engine, dispatcher, gateway, and local channel-delivery gates
+are verified.
 
 ## Why this is foundational
 
@@ -180,26 +207,21 @@ and complete arguments are parsed as JSON. Malformed arguments are preserved as
 strings. Errors, premature EOF, and consumer drop do not record a partial
 assistant response.
 
-## Remaining delivery path
+## Implemented delivery path
 
 The bridge and primary Engine V2 executor now consume native provider streams,
 strictly reconstruct the existing text/code/action result, and broadcast
-transient provider-neutral `ResponseDelta` thread events. Provider streaming is
-still not user-visible because the bridge/router does not translate those
-events into channel statuses yet.
+transient provider-neutral `ResponseDelta` thread events. The bridge maps each
+delta once to `StatusUpdate::StreamChunk`; the gateway turns that status into
+the existing SSE `stream_chunk` wire shape. Terminal text returns through the
+agent's normal outbound handler and remains the finalization signal.
 
-1. The bridge/router must convert those events to channel-neutral application
-   events.
-2. Gateway SSE can map those events to the existing `stream_chunk` wire shape;
-   the terminal response remains the finalization signal.
-3. Interrupt handling must drop the active stream without emitting a spurious
-   successful terminal response.
-
-The gateway UI remains the first supported consumer. WASM channels stay on the
-current legacy-compatible path unless explicitly enabled after terminal
-delivery, approval, interrupt, and scope-isolation tests pass. If that contract
-cannot be made reliable for a WASM channel, Engine V2 remains gated to the
-gateway rather than exposing partial support.
+The gateway is enabled whenever Engine V2 is enabled. XMPP, DarkIRC, and WeeChat
+stay on the legacy path unless their exact names are present in
+`ENGINE_V2_CHANNELS`. Their WASM wrappers intentionally ignore stream chunks and
+use the original incoming metadata for one terminal `respond()` call. A gate
+pause, auth pause, or stopped turn returns an empty no-reply sentinel, preventing
+duplicate prompts and empty assistant history rows.
 
 ## Rollout
 
@@ -210,15 +232,29 @@ gateway rather than exposing partial support.
 - **Phase 2 - implemented:** the host bridge maps native streams, the primary
   Engine V2 orchestrator consumes them strictly, and engine text deltas are
   broadcast as transient provider-neutral events.
-- **Phase 3 - implemented:** the bridge maps engine `ResponseDelta` to the
-  gateway SSE `stream_chunk` event via the direct SSE path; the existing web
-  frontend appends deltas and finalizes on the terminal `response`. The
-  non-gateway `StatusUpdate::StreamChunk` path is wired (inert today) for the
-  Phase 5 rollout. Gateway delta and status are emitted through a single path to
-  avoid duplicating streamed text.
-- **Phase 4:** interrupt-aware engine consumption and cancellation tests.
-- **Phase 5:** opt-in channel-neutral delivery for eligible WASM channels after
-  the approved safety gates pass.
+- **Phase 3 - implemented:** the bridge maps engine `ResponseDelta` once to
+  `StatusUpdate::StreamChunk`; the gateway maps that status to its SSE
+  `stream_chunk` event. The existing web frontend appends deltas and finalizes on
+  the terminal `response`.
+- **Phase 4 - complete:** per-thread
+  `CancellationToken` ownership in `ThreadManager`, cancellation propagated
+  through `ExecutionLoop` into the orchestrator's LLM host call (wrapping stream
+  acquisition and collection in `run_until_cancelled`), a typed
+  `ThreadOutcome::Stopped` that resumes neither Monty nor failure/rollback
+  accounting, terminal-only decorator state preserved on stream drop, and a
+  scoped gateway interrupt route. The between-step `ThreadSignal::Stop` contract
+  is retained. The 2026-07-13 Brightdawn gate proved that the old serialized
+  agent loop did not dequeue `/interrupt` while an ordinary handler was active.
+  The corrective dispatcher is now implemented and locally verified: exact
+  interrupts overtake a bounded FIFO of ordinary messages without introducing
+  ordinary-message concurrency, and active shutdown aborts and awaits its task.
+  Brightdawn passed the corrected live TensorZero `2026.3.2` cancellation gate
+  on 2026-07-13.
+- **Phase 5 - implementation and local gates complete:** exact opt-in routing
+  for XMPP, DarkIRC, and WeeChat; normal exactly-once terminal delivery; original
+  metadata preservation; no-token WASM status behavior; and conversation-scoped
+  approval, authentication, and interrupt handling. Brightdawn enables and
+  validates configured channels one at a time.
 
 ## Validation
 
@@ -247,6 +283,41 @@ Serde coverage, and real orchestrator text/code/tool/error/no-receiver streams.
 The integration tests also prove ordered live delta broadcast, non-persistence
 of provider chunks, and terminal-only usage commitment.
 
+Phase 4 ingress coverage adds an agent-level pending-acquisition regression. It
+was observed RED against the old loop (`0` responses after the two-second
+deadline) and GREEN after the dispatcher. The final isolated target passes five
+tests covering one acknowledgement with no cancelled terminal response, FIFO
+priority across scopes, the real 256-message overflow response, unmatched-scope
+legacy fallback without cross-thread cancellation, and soft-timeout detachment.
+The full Engine crate passes 322 tests; focused agent-loop, dispatcher, and bridge
+suites pass 17, 2, and 30 tests respectively. Default, PostgreSQL-only, and
+libSQL-only checks, formatting, and zero-warning Clippy also pass under the
+six-thread constraint.
+
+The final Brightdawn gate ran release commit `83af2e6` against TensorZero
+`2026.3.2` at `2026-07-13T18:52:49-04:00`. Thread
+`93d0d61d-6a2f-4593-972a-d1f8100724f7` emitted four chunks before cancellation;
+the acknowledgement arrived in 11 ms and the count remained four after the
+quiescence window. History contained zero cancelled assistant responses, then
+one persisted same-thread recovery response after 14 new chunks. Thread
+`67142c06-b447-4c05-9a46-bb637a798dee` remained queued with zero chunks until a
+second scoped interrupt was acknowledged in 10 ms, then completed with one
+terminal and one persisted response. The harness exited `0`; the scoped journal
+window contained no panic, receiver lag, rollback/failure signal, or duplicate
+response, and both gateway and agent health endpoints remained healthy. Tenant
+`env/`, `state/`, nested lockfile modifications, and installed WASM artifacts
+were preserved.
+
+Phase 5 local coverage uses one serialized real-agent matrix for gateway, XMPP,
+DarkIRC, and WeeChat. It proves ordered status before terminal delivery, original
+metadata, one persisted assistant row, exact legacy fallback, outbound-hook
+modification and rejection, one provider error response, stopped-turn no-reply,
+one-shot explicit approval, and scoped authentication across two non-UUID XMPP
+conversations without storing the credential message in either history. Host
+WASM wrapper tests prove `StreamChunk` remains a no-op, and the three channel
+crate suites lock their JID/room, nick, and buffer/network/target metadata
+contracts without a WIT change.
+
 `FEATURE_PARITY.md` is intentionally unchanged in Phase 2 because no
 user-facing channel consumes native provider deltas yet.
 
@@ -259,9 +330,8 @@ user-facing channel consumes native provider deltas yet.
 - Provider deltas can split at arbitrary UTF-8-safe string boundaries, so
   consumers must append chunks rather than treating them as words or tokens.
 
-The primary remaining risk has moved from provider parsing to lifecycle
-delivery: ensuring terminal response, interrupt, approval, thread scope, and
-channel scope remain coherent while deltas are in flight.
+The remaining Phase 5 risk is operational: each configured Brightdawn channel
+must pass its staged live gate before it is added to the tenant allowlist.
 
 ## Open questions
 
@@ -269,5 +339,5 @@ channel scope remain coherent while deltas are in flight.
   enabled automatically for gateway Engine V2 after Phase 2 validation.
 - Whether gateway SSE should forward provider chunks directly or batch small
   adjacent text deltas after measuring frame overhead.
-- Which WASM channels, if any, can satisfy the channel-neutral delivery gates
-  without weakening the gateway-only default.
+- Whether a future channel protocol with message editing should opt into
+  incremental updates instead of the current final-response-only WASM contract.

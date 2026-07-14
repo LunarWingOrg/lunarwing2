@@ -381,6 +381,14 @@ Environment:
   LUNARWING_MT_GOTIFY_TITLE        Default Gotify notification title for new tenants
   LUNARWING_MT_BACKUP_DIR          Backup directory (default /var/lib/lunarwing-backups)
   LUNARWING_MT_BACKUP_KEEP         Keep last N dumps per tenant (default 7; 0 = keep all)
+
+Per-tenant LLM tunables (written to each tenant's lunarwing.env with the
+fleet defaults below; edit the file + restart-tenant to override — an existing
+value is preserved across re-provision):
+  LLM_CIRCUIT_BREAKER_THRESHOLD    Consecutive fully-retried LLM failures before
+                                   the breaker opens and fast-fails (default 7)
+  LLM_CIRCUIT_BREAKER_RECOVERY_SECS  Seconds the breaker stays open before it
+                                   probes for recovery (default 45)
 EOF
 }
 
@@ -2260,6 +2268,12 @@ write_tenant_lunarwing_env() {
   [[ -n "$nanocode_base_url" ]] || nanocode_base_url="$(_env_existing "$path" NANOCODE_BASE_URL)"
   [[ -n "$opencode_model" ]]    || opencode_model="$(_env_existing "$path" OPENCODE_MODEL)"
   [[ -n "$opencode_base_url" ]] || opencode_base_url="$(_env_existing "$path" OPENCODE_BASE_URL)"
+  # LLM circuit breaker: fleet defaults (open after 7 fully-retried failures,
+  # probe again after 45s). These are tunables, so preserve an operator's
+  # per-tenant override across re-provision rather than clobbering it.
+  local cb_threshold cb_recovery
+  cb_threshold="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_THRESHOLD)";  cb_threshold="${cb_threshold:-7}"
+  cb_recovery="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_RECOVERY_SECS)"; cb_recovery="${cb_recovery:-45}"
   # Stable + migration-safe; resolved before the heredoc so it can read an
   # existing DATABASE_URL (preserving an already-initialised DB's password).
   pg_password="$(tenant_pg_password "$name")"
@@ -2320,6 +2334,11 @@ LLM_BASE_URL=${llm_base_url_effective}
 LLM_API_KEY=${llm_api_key:-token-${name}}
 LLM_MODEL=$llm_model_effective
 ALLOW_PRIVATE_IPS=1
+# Circuit breaker: fast-fail once the LLM backend is degraded, then auto-probe
+# to recover. Guards against a sick gateway amplifying transient blips into
+# tenant-wide slowness. Backend-agnostic (wraps whatever provider is built).
+LLM_CIRCUIT_BREAKER_THRESHOLD=$cb_threshold
+LLM_CIRCUIT_BREAKER_RECOVERY_SECS=$cb_recovery
 
 # Runtime identity
 AGENT_NAME=$name

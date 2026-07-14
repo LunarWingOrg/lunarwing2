@@ -11,8 +11,26 @@
   LW.startStarfield($('starfield'));
   const moon = LW.Moon($('moon-host'), $('moon-label'));
   const bat = LW.Bat($('bat-host'), $('bat-mood'));
+  const tips = LW.Tips($('tips-panel'));
   // Wave hello on first load, then Lunar eases into the ambient idle cycle.
   bat.greet();
+
+  // Appearance settings: mascot + tips visibility (splash is handled at load
+  // by splash.js). Mascot hides Lunar's dock elements without stopping its JS.
+  LW.initSettings($('settings-btn'), $('settings-panel'), [
+    { key: 'splash', label: 'splash', default: true },
+    {
+      key: 'mascot', label: 'mascot', default: true,
+      onChange: (on) => {
+        $('bat-host').classList.toggle('hidden', !on);
+        $('bat-mood').classList.toggle('hidden', !on);
+      },
+    },
+    {
+      key: 'tips', label: 'tips', default: true,
+      onChange: (on) => (on ? tips.show() : tips.hide()),
+    },
+  ]);
 
   const panel = LW.RunPanel({
     title: $('run-title'),

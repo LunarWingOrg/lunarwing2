@@ -17,6 +17,7 @@ mod commands;
 pub mod compaction;
 pub mod context_monitor;
 pub mod cost_guard;
+mod dispatch;
 mod dispatcher;
 mod heartbeat;
 pub mod job_monitor;

@@ -2852,7 +2852,11 @@ mod tests {
         let thread = failed_thread_activating(project_id, "alice", vec!["flaky".to_string()]);
 
         let out = collect_patch_candidate_skills(&store, &thread).await;
-        assert_eq!(out.len(), 1, "below-confidence activated skill should be flagged");
+        assert_eq!(
+            out.len(),
+            1,
+            "below-confidence activated skill should be flagged"
+        );
         assert_eq!(out[0]["name"], "flaky");
     }
 
@@ -2995,7 +2999,10 @@ mod tests {
         assert_eq!(doc.content, "skill body", "content unchanged while pending");
         let pending = meta.pending_patch.expect("a patch is pending");
         assert_eq!(pending.proposed_content, "patched skill body");
-        assert_eq!(pending.source_thread_id.as_deref(), Some(thread.id.0.to_string().as_str()));
+        assert_eq!(
+            pending.source_thread_id.as_deref(),
+            Some(thread.id.0.to_string().as_str())
+        );
 
         // 5. APPROVE (what POST .../approve does): apply the patch.
         tracker.apply_pending_patch(doc_id).await.unwrap();
@@ -3010,14 +3017,23 @@ mod tests {
         assert_eq!(meta2.parent_version, Some(1));
         assert!(meta2.pending_patch.is_none(), "pending cleared after apply");
         assert_eq!(meta2.patch_history.len(), 1);
-        assert_eq!(meta2.patch_history[0].metrics_before.failure_count, 6, "old metrics snapshotted");
+        assert_eq!(
+            meta2.patch_history[0].metrics_before.failure_count, 6,
+            "old metrics snapshotted"
+        );
         assert_eq!(meta2.metrics.usage_count, 0, "metrics epoch-reset");
         assert_eq!(meta2.metrics.failure_count, 0);
-        assert!((meta2.metrics.confidence() - 1.0).abs() < f64::EPSILON, "confidence reset to 1.0");
+        assert!(
+            (meta2.metrics.confidence() - 1.0).abs() < f64::EPSILON,
+            "confidence reset to 1.0"
+        );
 
         // 7. Post-approval: the skill is no longer a patch candidate (fresh slate).
         let after = collect_patch_candidate_skills(store.as_ref(), &thread).await;
-        assert!(after.is_empty(), "patched skill should not immediately re-flag");
+        assert!(
+            after.is_empty(),
+            "patched skill should not immediately re-flag"
+        );
     }
 
     #[tokio::test]
@@ -3041,7 +3057,13 @@ mod tests {
 
         let tracker = SkillTracker::new(store.clone());
         tracker
-            .propose_patch(doc_id, "new body".into(), String::new(), "reason".into(), None)
+            .propose_patch(
+                doc_id,
+                "new body".into(),
+                String::new(),
+                "reason".into(),
+                None,
+            )
             .await
             .unwrap();
 

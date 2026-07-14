@@ -11,6 +11,14 @@
 <body>
   <canvas id="starfield" aria-hidden="true"></canvas>
 
+  <!-- Startup splash (removed by splash.js after it fades) -->
+  <div id="splash-screen" aria-hidden="true">
+    <div class="splash-inner">
+      <div class="splash-title">Lunar<span>Wing</span></div>
+      <div class="splash-sub">Multi-Tenant Onboarding</div>
+    </div>
+  </div>
+
   <div id="token-error" class="token-error hidden">
     <strong>Session token missing or invalid.</strong>
     Re-open the URL printed by the launcher, including the <code>?token=…</code> part.
@@ -23,7 +31,28 @@
       <p class="subtitle">Multi-Tenant Onboarding</p>
     </div>
     <span id="mode-badge" class="badge badge-demo hidden"></span>
+    <button id="settings-btn" class="settings-btn" type="button"
+            aria-label="Appearance settings" title="Appearance">⚙</button>
   </header>
+
+  <!-- Appearance popover — body-level so no ancestor transform/stacking
+       context (header animation, cosmos dock) can trap it below the dock. -->
+  <div id="settings-panel" class="settings-panel glass hidden" role="dialog"
+       aria-label="Appearance settings">
+    <h3 class="settings-title">Appearance</h3>
+    <label class="settings-row">
+      <input type="checkbox" id="set-splash" />
+      <span>Show splash on startup</span>
+    </label>
+    <label class="settings-row">
+      <input type="checkbox" id="set-mascot" />
+      <span>Show Lunar (mascot)</span>
+    </label>
+    <label class="settings-row">
+      <input type="checkbox" id="set-tips" />
+      <span>Show onboarding tips</span>
+    </label>
+  </div>
 
   <div class="stage">
   <div class="main-column">
@@ -108,6 +137,10 @@
     <div id="moon-label" class="moon-label">New moon</div>
     <div id="bat-host" class="bat-host"></div>
     <div id="bat-mood" class="bat-mood">content</div>
+    <div id="tips-panel" class="tips-panel hidden">
+      <div class="tips-label">tip</div>
+      <div class="tips-body"></div>
+    </div>
   </aside>
   </div><!-- /stage -->
 
@@ -115,6 +148,9 @@
     LunarWing · runs on 127.0.0.1 · every action is audit-logged
   </footer>
 
+  <script src="/static/js/settings.js"></script>
+  <script src="/static/js/splash.js"></script>
+  <script src="/static/js/tips.js"></script>
   <script src="/static/js/starfield.js"></script>
   <script src="/static/js/moon.js"></script>
   <script src="/static/js/bat.js"></script>
