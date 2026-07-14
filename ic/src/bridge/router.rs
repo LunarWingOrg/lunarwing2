@@ -36,6 +36,82 @@ pub fn is_engine_v2_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Non-gateway channels that may opt in to Engine V2 via `ENGINE_V2_CHANNELS`.
+const ENGINE_V2_OPT_IN_CHANNELS: [&str; 3] = ["xmpp", "darkirc", "weechat"];
+
+/// Pure Engine V2 channel routing policy.
+///
+/// - `ENGINE_V2=false` disables every channel.
+/// - With Engine V2 enabled, `gateway` is always routed.
+/// - Only the eligible channels `xmpp`, `darkirc`, `weechat` may opt in, and
+///   only when named as an exact (trimmed, case-insensitive) comma-separated
+///   entry in `ENGINE_V2_CHANNELS`. Empty and unknown entries are ignored;
+///   substring matches never qualify.
+fn engine_v2_channel_allowed(
+    engine_enabled: bool,
+    configured_channels: Option<&str>,
+    channel: &str,
+) -> bool {
+    if !engine_enabled {
+        return false;
+    }
+
+    let channel = channel.trim().to_ascii_lowercase();
+    if channel == "gateway" {
+        return true;
+    }
+    if !ENGINE_V2_OPT_IN_CHANNELS.contains(&channel.as_str()) {
+        return false;
+    }
+
+    configured_channels.is_some_and(|configured| {
+        configured
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .any(|entry| entry.eq_ignore_ascii_case(&channel))
+    })
+}
+
+/// Whether a message on `channel` should be routed through Engine V2, reading
+/// the live `ENGINE_V2` and `ENGINE_V2_CHANNELS` environment. The parameterized
+/// [`engine_v2_channel_allowed`] stays private for deterministic tests.
+pub fn should_route_to_engine_v2(channel: &str) -> bool {
+    let configured = std::env::var("ENGINE_V2_CHANNELS").ok();
+    engine_v2_channel_allowed(is_engine_v2_enabled(), configured.as_deref(), channel)
+}
+
+/// Build the scoped engine conversation key for a message.
+///
+/// When the message carries a conversation scope (e.g. the gateway thread id),
+/// the key is `channel:scope` so each scope maps to a distinct engine
+/// conversation. Ordinary input, interrupts, clears, and `/expected` must all
+/// use this single key or they will address different conversations.
+fn engine_conversation_key(message: &IncomingMessage) -> String {
+    match message.conversation_scope() {
+        Some(scope) => format!("{}:{scope}", message.channel),
+        None => message.channel.clone(),
+    }
+}
+
+/// Map a thread outcome to the terminal channel response.
+///
+/// `Stopped` (and any future no-reply outcome) uses the empty-string sentinel,
+/// which the outbound handler suppresses and which is never written to v1
+/// compatibility history. `GatePaused` returns `None` because the caller drives
+/// its channel status side effects separately.
+fn thread_outcome_response(outcome: &ThreadOutcome) -> Option<String> {
+    match outcome {
+        ThreadOutcome::Completed { response } => response.clone(),
+        ThreadOutcome::Stopped => Some(String::new()),
+        ThreadOutcome::MaxIterations => {
+            Some("Reached maximum iterations without completing.".into())
+        }
+        ThreadOutcome::Failed { error } => Some(format!("Error: {error}")),
+        ThreadOutcome::GatePaused { .. } => None,
+    }
+}
+
 /// Shorthand for building an `Error` from an engine-related failure.
 fn engine_err(context: &str, e: impl std::fmt::Display) -> Error {
     Error::from(crate::error::JobError::ContextError {
@@ -118,19 +194,26 @@ fn gate_display_parameters(pending: &PendingGate) -> serde_json::Value {
 }
 
 fn resumed_action_result_message(
+    call_id: &str,
     action_name: &str,
     output: &serde_json::Value,
+    explicitly_approved: bool,
 ) -> lunarwing_engine::ThreadMessage {
     let rendered = serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
-    lunarwing_engine::ThreadMessage::user(format!(
-        "The pending action '{action_name}' has already been executed.\n\
-         Do not call it again unless the user explicitly asks.\n\
-         Continue from this result:\n{rendered}"
-    ))
+    let gate_context = if explicitly_approved {
+        "The user explicitly approved this action. LunarWing executed it exactly once."
+    } else {
+        "LunarWing executed this pending action exactly once after its gate was resolved."
+    };
+    lunarwing_engine::ThreadMessage::action_result(
+        call_id,
+        action_name,
+        format!("{gate_context}\nAction result:\n{rendered}"),
+    )
 }
 
 async fn insert_and_notify_pending_gate(
-    agent: &Agent,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
     state: &EngineState,
     message: &IncomingMessage,
     pending: PendingGate,
@@ -143,6 +226,8 @@ async fn insert_and_notify_pending_gate(
         .await
         .map_err(|e| engine_err("pending gate insert", e))?;
 
+    // GateRequired is a structural engine-gate event with no `StatusUpdate`
+    // equivalent, so it stays on the direct SSE path.
     if let Some(ref sse) = state.sse {
         sse.broadcast_for_user(
             &message.user_id,
@@ -159,10 +244,13 @@ async fn insert_and_notify_pending_gate(
         );
     }
 
+    // The channel status carries the human-readable prompt (WASM channels build
+    // it from ApprovalNeeded/AuthRequired). The bridge returns the empty
+    // sentinel so the outer outbound handler does not also send a prompt as a
+    // terminal message — that would double-prompt on WASM channels.
     match &pending.resume_kind {
         lunarwing_engine::ResumeKind::Approval { allow_always } => {
-            let _ = agent
-                .channels
+            let _ = channels
                 .send_status(
                     &message.channel,
                     StatusUpdate::ApprovalNeeded {
@@ -176,18 +264,14 @@ async fn insert_and_notify_pending_gate(
                 )
                 .await;
 
-            Ok(Some(format!(
-                "Tool '{}' requires approval. Reply 'yes' to approve, 'no' to deny.",
-                pending.action_name
-            )))
+            Ok(Some(String::new()))
         }
         lunarwing_engine::ResumeKind::Authentication {
             credential_name,
             instructions,
             auth_url,
         } => {
-            let _ = agent
-                .channels
+            let _ = channels
                 .send_status(
                     &message.channel,
                     StatusUpdate::AuthRequired {
@@ -200,10 +284,7 @@ async fn insert_and_notify_pending_gate(
                 )
                 .await;
 
-            Ok(Some(format!(
-                "Authentication required for '{}'. Paste your token below (or type 'cancel'):",
-                credential_name
-            )))
+            Ok(Some(String::new()))
         }
         lunarwing_engine::ResumeKind::External { callback_id } => {
             tracing::debug!(
@@ -211,20 +292,77 @@ async fn insert_and_notify_pending_gate(
                 callback = %callback_id,
                 "GatePaused(External)"
             );
-            Ok(Some(format!(
-                "Waiting for external confirmation (gate: {})...",
-                pending.gate_name
-            )))
+            // External gates emit no Approval/Auth status; send one best-effort
+            // waiting indication so non-gateway users are not left without any.
+            let _ = channels
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::Status(format!(
+                        "Waiting for external confirmation (gate: {})...",
+                        pending.gate_name
+                    )),
+                    &message.metadata,
+                )
+                .await;
+
+            Ok(Some(String::new()))
         }
     }
 }
 
-fn approval_thread_scope_hint(message: &IncomingMessage) -> Option<&str> {
-    if message.channel == "gateway" {
-        message.conversation_scope()
+async fn persist_and_notify_thread_gate(
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    state: &EngineState,
+    message: &IncomingMessage,
+    conversation_id: lunarwing_engine::ConversationId,
+    thread_id: lunarwing_engine::ThreadId,
+    outcome: ThreadOutcome,
+) -> Result<Option<String>, Error> {
+    let ThreadOutcome::GatePaused {
+        gate_name,
+        action_name,
+        call_id,
+        parameters,
+        resume_kind,
+        resume_output,
+    } = outcome
+    else {
+        return Err(engine_err(
+            "gate outcome",
+            "expected ThreadOutcome::GatePaused",
+        ));
+    };
+
+    let redacted_params = if let Some(tool) = state.effect_adapter.tools().get(&action_name).await {
+        crate::tools::redact_params(&parameters, tool.sensitive_params())
     } else {
-        None
-    }
+        parameters.clone()
+    };
+
+    let pending = PendingGate {
+        request_id: uuid::Uuid::new_v4(),
+        gate_name: gate_name.clone(),
+        user_id: message.user_id.clone(),
+        thread_id,
+        conversation_id,
+        source_channel: message.channel.clone(),
+        action_name: action_name.clone(),
+        call_id,
+        parameters,
+        display_parameters: Some(redacted_params),
+        description: format!(
+            "Tool '{}' requires {} (gate: {gate_name})",
+            action_name,
+            resume_kind.kind_name()
+        ),
+        resume_kind,
+        created_at: chrono::Utc::now(),
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+        original_message: None,
+        resume_output,
+    };
+
+    insert_and_notify_pending_gate(channels, state, message, pending).await
 }
 
 fn is_valid_tool_permission_name(name: &str) -> bool {
@@ -329,6 +467,24 @@ async fn revert_always_allow(
     }
 }
 
+fn resolved_action_event(
+    pending: &PendingGate,
+    step_id: lunarwing_engine::StepId,
+    result: &lunarwing_engine::ActionResult,
+) -> lunarwing_engine::EventKind {
+    lunarwing_engine::EventKind::ActionExecuted {
+        step_id,
+        action_name: pending.action_name.clone(),
+        call_id: pending.call_id.clone(),
+        duration_ms: result.duration.as_millis() as u64,
+        params_summary: lunarwing_engine::types::event::summarize_params(
+            &pending.action_name,
+            &pending.parameters,
+        ),
+        result_preview: lunarwing_engine::types::event::preview_from_output(&result.output),
+    }
+}
+
 async fn execute_pending_gate_action(
     agent: &Agent,
     state: &EngineState,
@@ -369,6 +525,7 @@ async fn execute_pending_gate_action(
     };
 
     state.effect_adapter.reset_call_count();
+    let event_rx = state.thread_manager.subscribe_events();
     match state
         .effect_adapter
         .execute_resolved_pending_action(
@@ -381,15 +538,25 @@ async fn execute_pending_gate_action(
         .await
     {
         Ok(result) => {
-            let event_rx = state.thread_manager.subscribe_events();
+            state
+                .thread_manager
+                .record_waiting_event(
+                    pending.thread_id,
+                    &message.user_id,
+                    resolved_action_event(pending, exec_ctx.step_id, &result),
+                )
+                .await
+                .map_err(|error| engine_err("record approved action", error))?;
             state
                 .thread_manager
                 .resume_thread(
                     pending.thread_id,
                     message.user_id.clone(),
                     Some(resumed_action_result_message(
+                        &pending.call_id,
                         &pending.action_name,
                         &result.output,
+                        approval_already_granted,
                     )),
                     approval_event,
                     Some(pending.call_id.clone()),
@@ -442,7 +609,7 @@ async fn execute_pending_gate_action(
                 original_message: None,
                 resume_output: resume_output.map(|value| *value),
             };
-            insert_and_notify_pending_gate(agent, state, message, pending_gate).await
+            insert_and_notify_pending_gate(&agent.channels, state, message, pending_gate).await
         }
         Err(e) => Err(engine_err("execute pending gate action", e)),
     }
@@ -1178,7 +1345,12 @@ pub async fn resolve_engine_auth_callback(
             pending.thread_id,
             user_id.to_string(),
             pending.resume_output.as_ref().map(|resume_output| {
-                resumed_action_result_message(&pending.action_name, resume_output)
+                resumed_action_result_message(
+                    &pending.call_id,
+                    &pending.action_name,
+                    resume_output,
+                    false,
+                )
             }),
             None,
             Some(pending.call_id.clone()),
@@ -1187,6 +1359,172 @@ pub async fn resolve_engine_auth_callback(
         .map_err(|e| engine_err("resume oauth callback", e))?;
 
     Ok(true)
+}
+
+/// True when `responding_channel` may resolve `pending` — the same channel that
+/// created it, or a trusted gateway channel. Mirrors the authorization that
+/// `PendingGateStore::take_verified` enforces atomically at resolution time.
+fn gate_channel_matches(pending: &PendingGate, responding_channel: &str) -> bool {
+    pending.source_channel == responding_channel
+        || crate::gate::store::TRUSTED_GATE_CHANNELS.contains(&responding_channel)
+}
+
+/// Read-only lookup of the engine conversation for a message's scoped key.
+///
+/// Uses [`engine_conversation_key`] and `list_conversations`, so it never
+/// creates state (unlike `get_or_create_conversation`). Required for DarkIRC and
+/// WeeChat whose scopes (`darkirc:dm:...`, `weechat:group:...`) are not UUIDs
+/// and therefore cannot be matched by `parse_scope_uuid`.
+async fn find_engine_conversation_for_message(
+    state: &EngineState,
+    message: &IncomingMessage,
+) -> Option<lunarwing_engine::ConversationSurface> {
+    let key = engine_conversation_key(message);
+    state
+        .conversation_manager
+        .list_conversations(&message.user_id)
+        .await
+        .into_iter()
+        .find(|conversation| conversation.channel == key)
+}
+
+/// Find the single pending approval gate for the message's scoped conversation.
+///
+/// Returns `None` for zero or ambiguous (2+) matches so callers fall back to the
+/// legacy path rather than resolving a gate from another conversation. A trusted
+/// gateway channel supplying an explicit `request_id` plus an engine `ThreadId`
+/// scope may resolve that exact gate cross-channel; otherwise matching is scoped
+/// to the message's own conversation. Resolution still goes through
+/// `take_verified`, which re-checks request id, channel, and expiry atomically.
+async fn matching_engine_approval_gate(
+    state: &EngineState,
+    message: &IncomingMessage,
+    request_id: Option<uuid::Uuid>,
+) -> Option<PendingGate> {
+    // Trusted-gateway explicit-scope path: the gateway approval UI resolves a
+    // gate that originated on another channel by exact (thread_id, request_id).
+    if let Some(request_id) = request_id
+        && crate::gate::store::TRUSTED_GATE_CHANNELS.contains(&message.channel.as_str())
+        && let Some(thread_id) = parse_engine_thread_id(message.conversation_scope())
+    {
+        let scoped = state
+            .pending_gates
+            .list_for_user(&message.user_id)
+            .await
+            .into_iter()
+            .find(|gate| {
+                gate.thread_id == thread_id
+                    && gate.request_id == request_id
+                    && matches!(
+                        gate.resume_kind,
+                        lunarwing_engine::ResumeKind::Approval { .. }
+                    )
+            });
+        if scoped.is_some() {
+            return scoped;
+        }
+    }
+
+    let conversation = find_engine_conversation_for_message(state, message).await?;
+    let mut matches: Vec<PendingGate> = state
+        .pending_gates
+        .list_for_user(&message.user_id)
+        .await
+        .into_iter()
+        .filter(|gate| {
+            gate.conversation_id == conversation.id
+                && matches!(
+                    gate.resume_kind,
+                    lunarwing_engine::ResumeKind::Approval { .. }
+                )
+                && request_id.is_none_or(|rid| gate.request_id == rid)
+                && gate_channel_matches(gate, &message.channel)
+        })
+        .collect();
+
+    // Exactly one match, or None for zero/ambiguous.
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    }
+}
+
+/// Find a pending authentication gate for the message's scoped conversation.
+///
+/// Non-UUID channel scopes must resolve through the engine conversation key;
+/// treating them as an absent thread hint can consume a credential from another
+/// conversation owned by the same user.
+async fn matching_engine_auth_gate(
+    state: &EngineState,
+    message: &IncomingMessage,
+) -> PendingGateResolution {
+    let Some(conversation) = find_engine_conversation_for_message(state, message).await else {
+        return PendingGateResolution::None;
+    };
+    let mut matches: Vec<PendingGate> = state
+        .pending_gates
+        .list_for_user(&message.user_id)
+        .await
+        .into_iter()
+        .filter(|gate| {
+            gate.conversation_id == conversation.id
+                && matches!(
+                    gate.resume_kind,
+                    lunarwing_engine::ResumeKind::Authentication { .. }
+                )
+                && gate_channel_matches(gate, &message.channel)
+        })
+        .collect();
+
+    match matches.len() {
+        0 => PendingGateResolution::None,
+        1 => matches.pop().map_or(PendingGateResolution::None, |gate| {
+            PendingGateResolution::Resolved(Box::new(gate))
+        }),
+        _ => PendingGateResolution::Ambiguous,
+    }
+}
+
+/// Read-only predicate: does the user's scoped engine conversation have a
+/// pending approval gate (optionally matching `request_id`)? Never initializes
+/// or mutates engine state, so the legacy approval path stays reachable when no
+/// engine match exists.
+pub async fn has_matching_engine_approval(
+    message: &IncomingMessage,
+    request_id: Option<uuid::Uuid>,
+) -> bool {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return false;
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return false;
+    };
+    matching_engine_approval_gate(state, message, request_id)
+        .await
+        .is_some()
+}
+
+/// Read-only predicate: is at least one thread in the message's scoped engine
+/// conversation currently running? Never creates a conversation.
+pub async fn has_active_engine_thread(message: &IncomingMessage) -> bool {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return false;
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return false;
+    };
+    let Some(conversation) = find_engine_conversation_for_message(state, message).await else {
+        return false;
+    };
+    for tid in &conversation.active_threads {
+        if state.thread_manager.is_running(*tid).await {
+            return true;
+        }
+    }
+    false
 }
 
 /// Handle an approval response (yes/no/always) for engine v2.
@@ -1208,33 +1546,17 @@ pub async fn handle_approval(
         .as_ref()
         .ok_or_else(|| engine_err("init", "engine state is empty"))?;
 
-    let pending = match resolve_pending_gate_for_user(
-        &state.pending_gates,
-        &message.user_id,
-        approval_thread_scope_hint(message),
-    )
-    .await
-    {
-        PendingGateResolution::Resolved(p) => p,
-        PendingGateResolution::None => {
-            debug!(user_id = %message.user_id, "engine v2: no pending approval for user, ignoring");
+    // Conversation-scoped matcher: only an approval gate in this exact
+    // user/channel/scope conversation is eligible. `None` (zero or ambiguous)
+    // returns a generic message rather than resolving another conversation's
+    // gate. The matcher only returns Approval-kind gates.
+    let pending = match matching_engine_approval_gate(state, message, None).await {
+        Some(pending) => pending,
+        None => {
+            debug!(user_id = %message.user_id, "engine v2: no matching pending approval for user, ignoring");
             return Ok(Some("No pending approval for this thread.".into()));
         }
-        PendingGateResolution::Ambiguous => {
-            return Ok(Some(
-                "Multiple pending gates are waiting. Resolve from the original thread or retry with that thread selected.".into(),
-            ));
-        }
     };
-
-    if !matches!(
-        pending.resume_kind,
-        lunarwing_engine::ResumeKind::Approval { .. }
-    ) {
-        return Ok(Some(
-            "The selected pending gate is not an approval request.".into(),
-        ));
-    }
 
     let request_id = pending.request_id;
     let thread_id = pending.thread_id;
@@ -1271,46 +1593,10 @@ pub async fn handle_exec_approval(
         .as_ref()
         .ok_or_else(|| engine_err("init", "engine state is empty"))?;
 
-    if let Some(thread_id) = parse_engine_thread_id(message.conversation_scope())
-        && let Some(gate) = state
-            .pending_gates
-            .peek(&crate::gate::pending::PendingGateKey {
-                user_id: message.user_id.clone(),
-                thread_id,
-            })
-            .await
-        && gate.request_id == request_id.to_string()
-        && matches!(
-            gate.resume_kind,
-            lunarwing_engine::ResumeKind::Approval { .. }
-        )
-    {
-        drop(guard);
-        return resolve_gate(
-            agent,
-            message,
-            thread_id,
-            request_id,
-            if approved {
-                lunarwing_engine::GateResolution::Approved { always }
-            } else {
-                lunarwing_engine::GateResolution::Denied { reason: None }
-            },
-        )
-        .await;
-    }
-
-    let pending = state
-        .pending_gates
-        .list_for_user(&message.user_id)
-        .await
-        .into_iter()
-        .find(|gate| {
-            matches!(
-                gate.resume_kind,
-                lunarwing_engine::ResumeKind::Approval { .. }
-            ) && gate.request_id == request_id
-        });
+    // Conversation-scoped matcher with the explicit request id (also honors the
+    // trusted-gateway cross-channel approval path). Resolution stays atomic via
+    // `resolve_gate` -> `take_verified`.
+    let pending = matching_engine_approval_gate(state, message, Some(request_id)).await;
     drop(guard);
 
     if let Some(pending) = pending {
@@ -1625,8 +1911,10 @@ pub async fn resolve_gate(
                             pending.thread_id,
                             message.user_id.clone(),
                             Some(resumed_action_result_message(
+                                &pending.call_id,
                                 &pending.action_name,
                                 &resume_output,
+                                false,
                             )),
                             None,
                             Some(pending.call_id.clone()),
@@ -1670,8 +1958,10 @@ pub async fn resolve_gate(
                         pending.thread_id,
                         message.user_id.clone(),
                         Some(resumed_action_result_message(
+                            &pending.call_id,
                             &pending.action_name,
                             &resume_output,
+                            false,
                         )),
                         None,
                         Some(pending.call_id.clone()),
@@ -1712,9 +2002,21 @@ pub async fn handle_interrupt(
         .as_ref()
         .ok_or_else(|| engine_err("init", "engine state is empty"))?;
 
+    interrupt_engine_conversation(state, message).await
+}
+
+/// Stop every running thread in the message's scoped engine conversation.
+///
+/// Uses [`engine_conversation_key`] so an interrupt only targets threads in the
+/// same `channel:scope` conversation the user is interacting with; threads in
+/// other scopes (or other users) are untouched.
+async fn interrupt_engine_conversation(
+    state: &EngineState,
+    message: &IncomingMessage,
+) -> Result<Option<String>, Error> {
     let conv_id = state
         .conversation_manager
-        .get_or_create_conversation(&message.channel, &message.user_id)
+        .get_or_create_conversation(&engine_conversation_key(message), &message.user_id)
         .await
         .map_err(|e| engine_err("conversation error", e))?;
 
@@ -1787,11 +2089,7 @@ pub async fn handle_expected(
         .ok_or_else(|| engine_err("init", "engine state is empty"))?;
 
     // Find the conversation for this channel+user
-    let scope = message.conversation_scope();
-    let channel_key = match scope {
-        Some(tid) => format!("{}:{}", message.channel, tid),
-        None => message.channel.clone(),
-    };
+    let channel_key = engine_conversation_key(message);
 
     let conv_id = state
         .conversation_manager
@@ -1940,7 +2238,7 @@ async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> 
 
     let conv_id = state
         .conversation_manager
-        .get_or_create_conversation(&message.channel, &message.user_id)
+        .get_or_create_conversation(&engine_conversation_key(message), &message.user_id)
         .await
         .map_err(|e| engine_err("conversation error", e))?;
 
@@ -2127,33 +2425,27 @@ async fn handle_with_engine_inner(
     let thread_scope = message.conversation_scope();
     let scoped_thread_id = parse_engine_thread_id(thread_scope);
 
-    if let PendingGateResolution::Resolved(gate) =
-        resolve_pending_gate_for_user(&state.pending_gates, &message.user_id, thread_scope).await
-        && matches!(
-            gate.resume_kind,
-            lunarwing_engine::ResumeKind::Authentication { .. }
-        )
-    {
-        let request_id = gate.request_id;
-        let resolution =
-            if content.trim().is_empty() || content.trim().eq_ignore_ascii_case("cancel") {
-                lunarwing_engine::GateResolution::Cancelled
-            } else {
-                lunarwing_engine::GateResolution::CredentialProvided {
-                    token: content.trim().to_string(),
-                }
-            };
-        drop(guard);
-        return resolve_gate(agent, message, gate.thread_id, request_id, resolution).await;
-    }
-
-    if matches!(
-        resolve_pending_gate_for_user(&state.pending_gates, &message.user_id, thread_scope).await,
-        PendingGateResolution::Ambiguous
-    ) {
-        return Ok(Some(
-            "Multiple authentication prompts are waiting. Reply from the original thread.".into(),
-        ));
+    match matching_engine_auth_gate(state, message).await {
+        PendingGateResolution::Resolved(gate) => {
+            let request_id = gate.request_id;
+            let resolution =
+                if content.trim().is_empty() || content.trim().eq_ignore_ascii_case("cancel") {
+                    lunarwing_engine::GateResolution::Cancelled
+                } else {
+                    lunarwing_engine::GateResolution::CredentialProvided {
+                        token: content.trim().to_string(),
+                    }
+                };
+            drop(guard);
+            return resolve_gate(agent, message, gate.thread_id, request_id, resolution).await;
+        }
+        PendingGateResolution::Ambiguous => {
+            return Ok(Some(
+                "Multiple authentication prompts are waiting. Reply from the original thread."
+                    .into(),
+            ));
+        }
+        PendingGateResolution::None => {}
     }
 
     if let Some(thread_id) = scoped_thread_id
@@ -2207,16 +2499,11 @@ async fn handle_with_engine_inner(
     // Reset the per-step call counter so each thread starts fresh
     state.effect_adapter.reset_call_count();
 
-    // Scope the engine conversation by (channel, user, thread).
-    // When the frontend sends a thread_id (user created a new conversation),
-    // use it as part of the channel key so each v1 thread maps to a distinct
-    // engine conversation. Without this, all threads share one conversation
-    // and messages appear in the wrong place.
-    let scope = message.conversation_scope();
-    let channel_key = match scope {
-        Some(tid) => format!("{}:{}", message.channel, tid),
-        None => message.channel.clone(),
-    };
+    // Scope the engine conversation by (channel, user, thread). When the
+    // frontend sends a thread_id (user created a new conversation), the scoped
+    // key maps each v1 thread to a distinct engine conversation. Interrupt and
+    // clear use the same key so they address this exact conversation.
+    let channel_key = engine_conversation_key(message);
 
     // Get or create conversation for this scoped channel+user
     let conv_id = state
@@ -2372,6 +2659,21 @@ async fn await_thread_outcome(
         .await
         .map_err(|e| engine_err("conversation error", e))?;
 
+    let should_load_tool_history = match &outcome {
+        ThreadOutcome::Completed {
+            response: Some(text),
+        } => !text.is_empty(),
+        ThreadOutcome::MaxIterations | ThreadOutcome::Failed { .. } => true,
+        ThreadOutcome::Completed { response: None }
+        | ThreadOutcome::Stopped
+        | ThreadOutcome::GatePaused { .. } => false,
+    };
+    let tool_calls_json = if should_load_tool_history {
+        load_tool_calls_json(&state.store, thread_id).await
+    } else {
+        None
+    };
+
     // Helper: write the outcome response to the v1 DB so the history API
     // shows it correctly for all outcomes that produce a response.
     let write_v1_response = |db: &Arc<dyn crate::db::Database>, text: &str| {
@@ -2380,6 +2682,7 @@ async fn await_thread_outcome(
         let user_id = message.user_id.clone();
         let channel = message.channel.clone();
         let text = text.to_string();
+        let tool_calls_json = tool_calls_json.clone();
         async move {
             let v1_conv_id = if let Some(ref scope) = scope {
                 db.get_or_create_scoped_conversation(&channel, &user_id, scope)
@@ -2391,266 +2694,160 @@ async fn await_thread_outcome(
                     .ok()
             };
             if let Some(cid) = v1_conv_id {
-                let _ = db.add_conversation_message(cid, "assistant", &text).await;
+                if let Some(ref json) = tool_calls_json
+                    && let Err(error) = db.add_conversation_message(cid, "tool_calls", json).await
+                {
+                    tracing::warn!(%error, "failed to persist Engine V2 tool history");
+                }
+                if let Err(error) = db.add_conversation_message(cid, "assistant", &text).await {
+                    tracing::warn!(%error, "failed to persist Engine V2 assistant history");
+                }
             }
         }
     };
 
-    if let Some(ref sse) = state.sse
-        && let ThreadOutcome::Completed {
-            response: Some(ref text),
-        } = outcome
+    // Terminal text is delivered once through the normal outbound handler
+    // (the outer agent loop calls ChannelManager::respond with the returned
+    // result), not a direct SSE Response here — emitting both would double-send
+    // on the gateway (Phase 5).
+
+    // A Completed response that requests authentication enters auth mode via a
+    // side-effectful early return; the prompt itself is not persisted to v1
+    // history. This is a defense-in-depth safety net — the pre-flight auth gate
+    // should catch most cases before execution.
+    if let ThreadOutcome::Completed {
+        response: Some(ref text),
+    } = outcome
+        && text.contains("authentication_required")
     {
-        sse.broadcast_for_user(
-            &message.user_id,
-            AppEvent::Response {
-                content: text.clone(),
-                thread_id: thread_id.to_string(),
-            },
+        debug!(
+            thread_id = %thread_id,
+            "text-based auth fallback triggered — pre-flight gate did not catch this"
         );
+
+        // Extract credential name from the response text and validate
+        // it against the expected pattern (alphanumeric + underscores).
+        let cred_name = text
+            .split("credential_name")
+            .nth(1)
+            .and_then(|s| {
+                // Handle both JSON ("credential_name":"foo") and prose
+                s.split(&['"', '\'', '`'][..])
+                    .find(|seg| !seg.is_empty() && !seg.contains(':') && !seg.contains(' '))
+            })
+            .filter(|name| {
+                // Reject names that don't look like valid credential identifiers
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Look up setup instructions via AuthManager (or fall back to inline lookup)
+        let setup_hint = state
+            .auth_manager
+            .as_ref()
+            .and_then(|mgr| mgr.get_setup_instructions(&cred_name))
+            .unwrap_or_else(|| format!("Provide your {} token", cred_name));
+
+        let pending = PendingGate {
+            request_id: uuid::Uuid::new_v4(),
+            gate_name: "authentication".into(),
+            user_id: message.user_id.clone(),
+            thread_id,
+            conversation_id: conv_id,
+            source_channel: message.channel.clone(),
+            action_name: "authentication_fallback".into(),
+            call_id: format!("fallback-auth-{thread_id}"),
+            parameters: serde_json::json!({ "credential_name": cred_name }),
+            display_parameters: None,
+            description: format!("Authentication required for '{}'.", cred_name),
+            resume_kind: lunarwing_engine::ResumeKind::Authentication {
+                credential_name: cred_name.clone(),
+                instructions: setup_hint.clone(),
+                auth_url: None,
+            },
+            created_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            original_message: Some(message.content.clone()),
+            resume_output: None,
+        };
+        if let Err(e) = state.pending_gates.insert(pending).await {
+            tracing::debug!(error = %e, "failed to store fallback auth gate");
+        }
+
+        // Show auth prompt via channel
+        let _ = agent
+            .channels
+            .send_status(
+                &message.channel,
+                StatusUpdate::AuthRequired {
+                    extension_name: cred_name.clone(),
+                    instructions: Some(setup_hint.clone()),
+                    auth_url: None,
+                    setup_url: None,
+                },
+                &message.metadata,
+            )
+            .await;
+
+        // `GatewayChannel::send_status(AuthRequired)` is now the single gateway
+        // mapping for auth prompts, so there is no direct SSE broadcast here.
+        // The empty sentinel avoids a duplicate terminal prompt on any channel.
+        return Ok(Some(String::new()));
     }
 
+    // Completed (non-auth), Stopped, MaxIterations, and Failed map to their
+    // terminal response via `thread_outcome_response`. Stopped yields the empty
+    // sentinel so no terminal reply or history row is committed for a user stop.
     let result = match outcome {
-        ThreadOutcome::Completed { response } => {
-            debug!(thread_id = %thread_id, "engine v2: completed");
-
-            // Text-based auth fallback: detect authentication_required in the
-            // response and enter auth mode. This is a defense-in-depth safety net
-            // — the pre-flight auth gate should catch most cases before execution.
-            if let Some(ref text) = response
-                && text.contains("authentication_required")
-            {
-                debug!(
-                    thread_id = %thread_id,
-                    "text-based auth fallback triggered — pre-flight gate did not catch this"
-                );
-
-                // Extract credential name from the response text and validate
-                // it against the expected pattern (alphanumeric + underscores).
-                let cred_name = text
-                    .split("credential_name")
-                    .nth(1)
-                    .and_then(|s| {
-                        // Handle both JSON ("credential_name":"foo") and prose
-                        s.split(&['"', '\'', '`'][..])
-                            .find(|seg| !seg.is_empty() && !seg.contains(':') && !seg.contains(' '))
-                    })
-                    .filter(|name| {
-                        // Reject names that don't look like valid credential identifiers
-                        !name.is_empty()
-                            && name.len() <= 64
-                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    })
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                // Look up setup instructions via AuthManager (or fall back to inline lookup)
-                let setup_hint = state
-                    .auth_manager
-                    .as_ref()
-                    .and_then(|mgr| mgr.get_setup_instructions(&cred_name))
-                    .unwrap_or_else(|| format!("Provide your {} token", cred_name));
-
-                let pending = PendingGate {
-                    request_id: uuid::Uuid::new_v4(),
-                    gate_name: "authentication".into(),
-                    user_id: message.user_id.clone(),
-                    thread_id,
-                    conversation_id: conv_id,
-                    source_channel: message.channel.clone(),
-                    action_name: "authentication_fallback".into(),
-                    call_id: format!("fallback-auth-{thread_id}"),
-                    parameters: serde_json::json!({ "credential_name": cred_name }),
-                    display_parameters: None,
-                    description: format!("Authentication required for '{}'.", cred_name),
-                    resume_kind: lunarwing_engine::ResumeKind::Authentication {
-                        credential_name: cred_name.clone(),
-                        instructions: setup_hint.clone(),
-                        auth_url: None,
-                    },
-                    created_at: chrono::Utc::now(),
-                    expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
-                    original_message: Some(message.content.clone()),
-                    resume_output: None,
-                };
-                if let Err(e) = state.pending_gates.insert(pending).await {
-                    tracing::debug!(error = %e, "failed to store fallback auth gate");
-                }
-
-                // Show auth prompt via channel
-                let _ = agent
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::AuthRequired {
-                            extension_name: cred_name.clone(),
-                            instructions: Some(setup_hint.clone()),
-                            auth_url: None,
-                            setup_url: None,
-                        },
-                        &message.metadata,
-                    )
-                    .await;
-
-                if let Some(ref sse) = state.sse {
-                    sse.broadcast_for_user(
-                        &message.user_id,
-                        AppEvent::AuthRequired {
-                            extension_name: cred_name.clone(),
-                            instructions: Some(setup_hint.clone()),
-                            auth_url: None,
-                            setup_url: None,
-                            thread_id: Some(thread_id.to_string()),
-                        },
-                    );
-                }
-
-                return Ok(Some(format!(
-                    "Authentication required for '{}'. Paste your token below (or type 'cancel'):",
-                    cred_name
-                )));
-            }
-
-            Ok(response)
-        }
-        ThreadOutcome::Stopped => Ok(Some("Thread was stopped.".into())),
-        ThreadOutcome::MaxIterations => Ok(Some(
-            "Reached maximum iterations without completing.".into(),
-        )),
-        ThreadOutcome::Failed { error } => Ok(Some(format!("Error: {error}"))),
-        ThreadOutcome::GatePaused {
-            gate_name,
-            action_name,
-            call_id,
-            parameters,
-            resume_kind,
-            resume_output,
-        } => {
-            use crate::gate::pending::PendingGate;
-
-            // Redact sensitive params before storing/broadcasting
-            let redacted_params =
-                if let Some(tool) = state.effect_adapter.tools().get(&action_name).await {
-                    crate::tools::redact_params(&parameters, tool.sensitive_params())
-                } else {
-                    parameters.clone()
-                };
-
-            // Store in unified PendingGateStore (keyed by user_id + thread_id)
-            let pending = PendingGate {
-                request_id: uuid::Uuid::new_v4(),
-                gate_name: gate_name.clone(),
-                user_id: message.user_id.clone(),
+        gate @ ThreadOutcome::GatePaused { .. } => {
+            persist_and_notify_thread_gate(
+                &agent.channels,
+                state,
+                message,
+                conv_id,
                 thread_id,
-                conversation_id: conv_id,
-                source_channel: message.channel.clone(),
-                action_name: action_name.clone(),
-                call_id,
-                parameters,
-                display_parameters: Some(redacted_params.clone()),
-                description: format!(
-                    "Tool '{}' requires {} (gate: {gate_name})",
-                    action_name,
-                    resume_kind.kind_name()
-                ),
-                resume_kind: resume_kind.clone(),
-                created_at: chrono::Utc::now(),
-                expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
-                original_message: None,
-                resume_output,
-            };
-
-            if let Err(e) = state.pending_gates.insert(pending.clone()).await {
-                tracing::debug!(
-                    gate = %gate_name,
-                    error = %e,
-                    "failed to store pending gate (may be duplicate)"
-                );
-            }
-
-            // Send appropriate StatusUpdate via channel
-            match &resume_kind {
-                lunarwing_engine::ResumeKind::Approval { allow_always } => {
-                    let _ = agent
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::ApprovalNeeded {
-                                request_id: pending.request_id.to_string(),
-                                tool_name: action_name.clone(),
-                                description: pending.description.clone(),
-                                parameters: redacted_params,
-                                allow_always: *allow_always,
-                            },
-                            &message.metadata,
-                        )
-                        .await;
-
-                    Ok(Some(format!(
-                        "Tool '{}' requires approval. Reply 'yes' to approve, 'no' to deny.",
-                        action_name
-                    )))
-                }
-                lunarwing_engine::ResumeKind::Authentication {
-                    credential_name,
-                    instructions,
-                    auth_url,
-                } => {
-                    let _ = agent
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::AuthRequired {
-                                extension_name: credential_name.clone(),
-                                instructions: Some(instructions.clone()),
-                                auth_url: auth_url.clone(),
-                                setup_url: None,
-                            },
-                            &message.metadata,
-                        )
-                        .await;
-
-                    if let Some(ref sse) = state.sse {
-                        sse.broadcast_for_user(
-                            &message.user_id,
-                            AppEvent::AuthRequired {
-                                extension_name: credential_name.clone(),
-                                instructions: Some(instructions.clone()),
-                                auth_url: auth_url.clone(),
-                                setup_url: None,
-                                thread_id: Some(thread_id.to_string()),
-                            },
-                        );
-                    }
-
-                    Ok(Some(format!(
-                        "Authentication required for '{}'. Paste your token below (or type 'cancel'):",
-                        credential_name
-                    )))
-                }
-                lunarwing_engine::ResumeKind::External { callback_id } => {
-                    tracing::debug!(
-                        gate = %gate_name,
-                        callback = %callback_id,
-                        "GatePaused(External)"
-                    );
-                    Ok(Some(format!(
-                        "Waiting for external confirmation (gate: {gate_name})..."
-                    )))
-                }
-            }
+                gate,
+            )
+            .await
         }
+        other => Ok(thread_outcome_response(&other)),
     };
 
-    // Write the response to the v1 DB for all outcomes so the history
-    // endpoint shows the correct state (not just for Completed).
+    // Write the response to the v1 DB for all outcomes that produce a
+    // non-empty response so the history endpoint shows the correct state. The
+    // empty sentinel (e.g. a stopped turn) writes no assistant row.
     if let Ok(Some(ref text)) = result
+        && !text.is_empty()
         && let Some(ref db) = state.db
     {
         write_v1_response(db, text).await;
     }
 
     result
+}
+
+/// Build the per-event status metadata for channel delivery.
+///
+/// For the gateway, this extends the original incoming metadata with the engine
+/// `thread_id` so `GatewayChannel::send_status` routes each SSE event to the
+/// correct thread (and keeps the original `user_id` for per-user scoping).
+/// Non-gateway channels pass their original metadata through unchanged.
+fn engine_status_metadata(message: &IncomingMessage, thread_id: &str) -> serde_json::Value {
+    let mut metadata = message.metadata.clone();
+    if message.channel != "gateway" {
+        return metadata;
+    }
+
+    if !metadata.is_object() {
+        metadata = serde_json::json!({});
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("thread_id".into(), serde_json::json!(thread_id));
+    }
+    metadata
 }
 
 async fn deliver_thread_event(
@@ -2660,7 +2857,13 @@ async fn deliver_thread_event(
     thread_id: &str,
     event: &lunarwing_engine::ThreadEvent,
 ) {
-    forward_event_to_channel(event, &agent.channels, &message.channel, &message.metadata).await;
+    // Progress is delivered channel-neutrally via `send_status` for every
+    // channel (gateway included). The gateway status metadata carries the
+    // engine thread id so SSE events route to the correct thread. Only
+    // structural events with no status equivalent still go through the direct
+    // SSE `AppEvent` path below.
+    let status_metadata = engine_status_metadata(message, thread_id);
+    forward_event_to_channel(event, &agent.channels, &message.channel, &status_metadata).await;
     if let Some(sse) = state.sse.as_ref() {
         for app_event in thread_event_to_app_events(event, thread_id) {
             sse.broadcast_for_user(&message.user_id, app_event);
@@ -2691,6 +2894,77 @@ fn drain_pending_thread_events(
         }
     }
     events
+}
+
+/// Build bounded v1-compatible tool summaries for one Engine V2 thread.
+fn tool_call_summaries(events: &[lunarwing_engine::ThreadEvent]) -> Vec<serde_json::Value> {
+    use crate::channels::web::util::truncate_preview;
+    use lunarwing_engine::EventKind;
+
+    let mut summaries = Vec::new();
+    for event in events {
+        match &event.kind {
+            EventKind::ActionExecuted {
+                action_name,
+                call_id,
+                result_preview,
+                ..
+            } => {
+                let mut summary = serde_json::json!({ "name": action_name });
+                if !call_id.is_empty() {
+                    summary["call_id"] = serde_json::Value::String(call_id.clone());
+                }
+                if let Some(preview) = result_preview.as_deref().filter(|value| !value.is_empty()) {
+                    summary["result_preview"] =
+                        serde_json::Value::String(truncate_preview(preview, 500));
+                }
+                summaries.push(summary);
+            }
+            EventKind::ActionFailed {
+                action_name,
+                call_id,
+                error,
+                ..
+            } => {
+                let mut summary = serde_json::json!({
+                    "name": action_name,
+                    "error": truncate_preview(error, 200),
+                });
+                if !call_id.is_empty() {
+                    summary["call_id"] = serde_json::Value::String(call_id.clone());
+                }
+                summaries.push(summary);
+            }
+            _ => {}
+        }
+    }
+    summaries
+}
+
+/// Load and serialize bounded tool summaries from the durable thread snapshot.
+async fn load_tool_calls_json(
+    store: &Arc<dyn lunarwing_engine::Store>,
+    thread_id: lunarwing_engine::ThreadId,
+) -> Option<String> {
+    let thread = match store.load_thread(thread_id).await {
+        Ok(Some(thread)) => thread,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(%thread_id, %error, "failed to load tool history");
+            return None;
+        }
+    };
+    let summaries = tool_call_summaries(&thread.events);
+    if summaries.is_empty() {
+        return None;
+    }
+    match serde_json::to_string(&summaries) {
+        Ok(json) => Some(json),
+        Err(error) => {
+            tracing::warn!(%thread_id, %error, "failed to serialize tool history");
+            None
+        }
+    }
 }
 
 // ── Shared event display helpers ────────────────────────────
@@ -2801,6 +3075,7 @@ async fn forward_event_to_channel(
             action_name,
             duration_ms,
             params_summary,
+            result_preview,
             ..
         } => {
             let display_name = format_action_display_name(action_name, params_summary);
@@ -2813,6 +3088,18 @@ async fn forward_event_to_channel(
                     metadata,
                 )
                 .await;
+            if let Some(preview) = result_preview.as_deref().filter(|value| !value.is_empty()) {
+                let _ = channels
+                    .send_status(
+                        channel_name,
+                        StatusUpdate::ToolResult {
+                            name: display_name.clone(),
+                            preview: preview.to_string(),
+                        },
+                        metadata,
+                    )
+                    .await;
+            }
             let _ = channels
                 .send_status(
                     channel_name,
@@ -2911,14 +3198,11 @@ async fn forward_event_to_channel(
                 )
                 .await;
         }
-        // The gateway receives streamed deltas via the direct SSE path in
-        // `await_thread_outcome` (see `thread_event_to_app_events`), which
-        // carries the real engine thread id and scopes by `message.user_id`.
-        // Emitting here as well would double the streamed text because the
-        // frontend appends chunks additively. Wire the channel-neutral status
-        // path for other channels only; WASM channels currently ignore
-        // `StreamChunk`, but this plumbs Phase 5 delivery.
-        EventKind::ResponseDelta { content } if channel_name != "gateway" => {
+        // Deltas are delivered channel-neutrally to every channel, including the
+        // gateway (whose `send_status` maps `StreamChunk` to the SSE
+        // `stream_chunk` event using the thread id in the status metadata). WASM
+        // channels still ignore `StreamChunk`.
+        EventKind::ResponseDelta { content } => {
             let _ = channels
                 .send_status(
                     channel_name,
@@ -2941,70 +3225,12 @@ fn thread_event_to_app_events(
 ) -> Vec<AppEvent> {
     use lunarwing_engine::EventKind;
 
+    // Progress events (StepStarted, action started/completed/failed, step
+    // completion, interpreted message status, skill activation, response
+    // deltas) are delivered channel-neutrally via `send_status` — see
+    // `forward_event_to_channel`. Only structural gateway events with no
+    // `StatusUpdate` equivalent are emitted directly on the SSE stream here.
     match &event.kind {
-        EventKind::StepStarted { .. } => vec![AppEvent::Thinking {
-            message: "Calling LLM...".into(),
-            thread_id: Some(thread_id.into()),
-        }],
-        EventKind::ActionExecuted {
-            action_name,
-            duration_ms,
-            params_summary,
-            ..
-        } => {
-            let display_name = format_action_display_name(action_name, params_summary);
-            vec![
-                AppEvent::ToolStarted {
-                    name: display_name.clone(),
-                    thread_id: Some(thread_id.into()),
-                },
-                AppEvent::ToolCompleted {
-                    name: display_name,
-                    success: true,
-                    error: None,
-                    parameters: Some(format!("{duration_ms}ms")),
-                    thread_id: Some(thread_id.into()),
-                },
-            ]
-        }
-        EventKind::ActionFailed {
-            action_name,
-            error,
-            params_summary,
-            ..
-        } => {
-            let display_name = format_action_display_name(action_name, params_summary);
-            vec![
-                AppEvent::ToolStarted {
-                    name: display_name.clone(),
-                    thread_id: Some(thread_id.into()),
-                },
-                AppEvent::ToolCompleted {
-                    name: display_name,
-                    success: false,
-                    error: Some(error.clone()),
-                    parameters: None,
-                    thread_id: Some(thread_id.into()),
-                },
-            ]
-        }
-        EventKind::StepCompleted { tokens, .. } => vec![AppEvent::Status {
-            message: format!(
-                "Step complete — {} in / {} out tokens",
-                tokens.input_tokens, tokens.output_tokens
-            ),
-            thread_id: Some(thread_id.into()),
-        }],
-        EventKind::MessageAdded {
-            role,
-            content_preview,
-        } => interpret_message_event(role, content_preview)
-            .map(|text| AppEvent::Thinking {
-                message: text.into(),
-                thread_id: Some(thread_id.into()),
-            })
-            .into_iter()
-            .collect(),
         EventKind::StateChanged { from, to, reason } => {
             vec![AppEvent::ThreadStateChanged {
                 thread_id: thread_id.into(),
@@ -3017,14 +3243,6 @@ fn thread_event_to_app_events(
             parent_thread_id: thread_id.into(),
             child_thread_id: child_id.to_string(),
             goal: goal.clone(),
-        }],
-        EventKind::SkillActivated { skill_names } => vec![AppEvent::SkillActivated {
-            skill_names: skill_names.clone(),
-            thread_id: Some(thread_id.into()),
-        }],
-        EventKind::ResponseDelta { content } => vec![AppEvent::StreamChunk {
-            content: content.clone(),
-            thread_id: Some(thread_id.into()),
         }],
         _ => vec![],
     }
@@ -3531,9 +3749,7 @@ pub struct SkillPatchProposal {
 
 /// List all skills that currently have a pending patch proposal, visible to
 /// `user_id` (own + shared). Empty when the engine isn't running.
-pub async fn list_pending_skill_patches(
-    user_id: &str,
-) -> Result<Vec<SkillPatchProposal>, Error> {
+pub async fn list_pending_skill_patches(user_id: &str) -> Result<Vec<SkillPatchProposal>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
     };
@@ -4510,28 +4726,20 @@ mod tests {
     }
 
     #[test]
-    fn response_delta_maps_to_stream_chunk_app_event() {
-        let evt = lunarwing_engine::ThreadEvent::new(
+    fn response_delta_has_no_direct_gateway_app_event() {
+        // Deltas now flow to the gateway through channel status, not a direct
+        // SSE AppEvent, so the structural-only mapper returns nothing for them.
+        let event = lunarwing_engine::ThreadEvent::new(
             lunarwing_engine::ThreadId::new(),
             lunarwing_engine::EventKind::ResponseDelta {
-                content: "hi".to_string(),
+                content: "hi".into(),
             },
         );
-
-        let events = thread_event_to_app_events(&evt, "tid-1");
-
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            AppEvent::StreamChunk { content, thread_id } => {
-                assert_eq!(content, "hi");
-                assert_eq!(thread_id.as_deref(), Some("tid-1"));
-            }
-            other => panic!("expected StreamChunk, got {other:?}"),
-        }
+        assert!(thread_event_to_app_events(&event, "thread-1").is_empty());
     }
 
     #[tokio::test]
-    async fn response_delta_skips_gateway_but_forwards_to_other_channels() {
+    async fn response_delta_reaches_gateway_and_other_channels_via_status() {
         use crate::testing::StubChannel;
 
         let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
@@ -4552,22 +4760,786 @@ mod tests {
         );
         let metadata = serde_json::json!({});
 
-        // Gateway is served by the direct SSE path; forwarding here too would
-        // double the streamed text, so no status is sent to it.
+        // Both gateway and non-gateway channels get exactly one StreamChunk
+        // status; the gateway is no longer special-cased.
         forward_event_to_channel(&evt, &manager, "gateway", &metadata).await;
-        assert!(
-            gateway_statuses.lock().expect("poisoned").is_empty(),
-            "gateway must not receive ResponseDelta via send_status"
+        forward_event_to_channel(&evt, &manager, "xmpp", &metadata).await;
+
+        for (name, statuses) in [("gateway", &gateway_statuses), ("xmpp", &xmpp_statuses)] {
+            let captured = statuses.lock().expect("poisoned");
+            assert_eq!(captured.len(), 1, "{name} should receive one status");
+            assert!(
+                matches!(&captured[0], StatusUpdate::StreamChunk(c) if c == "hi"),
+                "{name}: expected StreamChunk(\"hi\"), got {:?}",
+                captured[0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn action_result_reaches_gateway_and_other_channels_via_status() {
+        use crate::testing::StubChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+
+        let (gateway_stub, _gateway_tx) = StubChannel::new("gateway");
+        let gateway_statuses = gateway_stub.captured_statuses_handle();
+        manager.add(Box::new(gateway_stub)).await;
+
+        let (xmpp_stub, _xmpp_tx) = StubChannel::new("xmpp");
+        let xmpp_statuses = xmpp_stub.captured_statuses_handle();
+        manager.add(Box::new(xmpp_stub)).await;
+
+        let event = lunarwing_engine::ThreadEvent::new(
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::EventKind::ActionExecuted {
+                step_id: lunarwing_engine::StepId::new(),
+                action_name: "shell".into(),
+                call_id: "call-1".into(),
+                duration_ms: 12,
+                params_summary: Some("ls".into()),
+                result_preview: Some("file.txt".into()),
+            },
+        );
+        let metadata = serde_json::json!({});
+
+        forward_event_to_channel(&event, &manager, "gateway", &metadata).await;
+        forward_event_to_channel(&event, &manager, "xmpp", &metadata).await;
+
+        for (name, statuses) in [("gateway", &gateway_statuses), ("xmpp", &xmpp_statuses)] {
+            let captured = statuses.lock().expect("poisoned");
+            assert_eq!(captured.len(), 3, "{name} should receive three statuses");
+            assert!(matches!(captured[0], StatusUpdate::ToolStarted { .. }));
+            assert!(matches!(
+                &captured[1],
+                StatusUpdate::ToolResult { preview, .. } if preview == "file.txt"
+            ));
+            assert!(matches!(
+                captured[2],
+                StatusUpdate::ToolCompleted { success: true, .. }
+            ));
+        }
+
+        assert!(thread_event_to_app_events(&event, "thread-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn action_without_preview_skips_only_tool_result_status() {
+        use crate::testing::StubChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (stub, _tx) = StubChannel::new("gateway");
+        let statuses = stub.captured_statuses_handle();
+        manager.add(Box::new(stub)).await;
+
+        let event = lunarwing_engine::ThreadEvent::new(
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::EventKind::ActionExecuted {
+                step_id: lunarwing_engine::StepId::new(),
+                action_name: "time".into(),
+                call_id: "call-2".into(),
+                duration_ms: 1,
+                params_summary: None,
+                result_preview: None,
+            },
         );
 
-        // Non-gateway channels get the channel-neutral StreamChunk status.
-        forward_event_to_channel(&evt, &manager, "xmpp", &metadata).await;
-        let captured = xmpp_statuses.lock().expect("poisoned");
-        assert_eq!(captured.len(), 1);
-        assert!(
-            matches!(&captured[0], StatusUpdate::StreamChunk(c) if c == "hi"),
-            "expected StreamChunk(\"hi\"), got {:?}",
-            captured[0]
+        forward_event_to_channel(&event, &manager, "gateway", &serde_json::json!({})).await;
+
+        let captured = statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 2);
+        assert!(matches!(captured[0], StatusUpdate::ToolStarted { .. }));
+        assert!(matches!(
+            captured[1],
+            StatusUpdate::ToolCompleted { success: true, .. }
+        ));
+    }
+
+    #[test]
+    fn saved_thread_events_reconstruct_tool_history_in_order() {
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let events = vec![
+            lunarwing_engine::ThreadEvent::new(
+                thread_id,
+                lunarwing_engine::EventKind::ActionExecuted {
+                    step_id: lunarwing_engine::StepId::new(),
+                    action_name: "shell".into(),
+                    call_id: "call-before".into(),
+                    duration_ms: 5,
+                    params_summary: None,
+                    result_preview: Some("output text".into()),
+                },
+            ),
+            lunarwing_engine::ThreadEvent::new(
+                thread_id,
+                lunarwing_engine::EventKind::ApprovalReceived {
+                    call_id: "call-approved".into(),
+                    approved: true,
+                },
+            ),
+            lunarwing_engine::ThreadEvent::new(
+                thread_id,
+                lunarwing_engine::EventKind::ActionFailed {
+                    step_id: lunarwing_engine::StepId::new(),
+                    action_name: "http".into(),
+                    call_id: "call-after".into(),
+                    error: "timeout".into(),
+                    params_summary: None,
+                },
+            ),
+        ];
+
+        let summaries = tool_call_summaries(&events);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0]["call_id"], "call-before");
+        assert_eq!(summaries[0]["result_preview"], "output text");
+        assert_eq!(summaries[1]["call_id"], "call-after");
+        assert_eq!(summaries[1]["error"], "timeout");
+
+        let now = chrono::Utc::now();
+        let message =
+            |role: &str, content: &str, offset_ms: i64| crate::history::ConversationMessage {
+                id: uuid::Uuid::new_v4(),
+                role: role.into(),
+                content: content.into(),
+                created_at: now + chrono::TimeDelta::milliseconds(offset_ms),
+            };
+        let json = serde_json::to_string(&summaries).unwrap();
+        let messages = vec![
+            message("user", "run tools", 0),
+            message("tool_calls", &json, 100),
+            message("assistant", "done", 200),
+        ];
+
+        let turns = crate::channels::web::util::build_turns_from_db_messages(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_calls.len(), 2);
+        assert_eq!(turns[0].tool_calls[0].name, "shell");
+        assert_eq!(
+            turns[0].tool_calls[0].result_preview.as_deref(),
+            Some("output text")
         );
+        assert_eq!(turns[0].tool_calls[1].name, "http");
+        assert_eq!(turns[0].tool_calls[1].error.as_deref(), Some("timeout"));
+    }
+
+    #[tokio::test]
+    async fn saved_thread_tool_history_serializes_from_store() {
+        let store = Arc::new(TestStore::new());
+        let mut thread = lunarwing_engine::Thread::new(
+            "run a tool",
+            lunarwing_engine::ThreadType::Foreground,
+            lunarwing_engine::ProjectId::new(),
+            "alice",
+            lunarwing_engine::ThreadConfig::default(),
+        );
+        thread.add_event(lunarwing_engine::EventKind::ActionExecuted {
+            step_id: lunarwing_engine::StepId::new(),
+            action_name: "shell".into(),
+            call_id: "call-1".into(),
+            duration_ms: 5,
+            params_summary: None,
+            result_preview: Some("saved output".into()),
+        });
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+        let store: Arc<dyn lunarwing_engine::Store> = store;
+
+        let json = load_tool_calls_json(&store, thread_id)
+            .await
+            .expect("saved tool history should serialize");
+        let summaries: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0]["name"], "shell");
+        assert_eq!(summaries[0]["call_id"], "call-1");
+        assert_eq!(summaries[0]["result_preview"], "saved output");
+    }
+
+    #[test]
+    fn resolved_action_event_preserves_pending_identity_and_output() {
+        let pending = sample_pending_gate(
+            "alice",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let step_id = lunarwing_engine::StepId::new();
+        let result = lunarwing_engine::ActionResult {
+            call_id: String::new(),
+            action_name: pending.action_name.clone(),
+            output: serde_json::json!("approved output"),
+            is_error: false,
+            duration: std::time::Duration::from_millis(8),
+        };
+
+        let event = resolved_action_event(&pending, step_id, &result);
+
+        assert!(matches!(
+            event,
+            lunarwing_engine::EventKind::ActionExecuted {
+                step_id: actual_step_id,
+                ref action_name,
+                ref call_id,
+                duration_ms: 8,
+                result_preview: Some(ref preview),
+                ..
+            } if actual_step_id == step_id
+                && action_name == &pending.action_name
+                && call_id == &pending.call_id
+                && preview == "approved output"
+        ));
+    }
+
+    #[test]
+    fn gateway_status_metadata_extends_instead_of_replacing_original() {
+        let message =
+            IncomingMessage::new("gateway", "alice", "hello").with_metadata(serde_json::json!({
+                "user_id": "alice",
+                "client_marker": "keep-me"
+            }));
+
+        let metadata = engine_status_metadata(&message, "engine-thread");
+        assert_eq!(metadata["user_id"], "alice");
+        assert_eq!(metadata["client_marker"], "keep-me");
+        assert_eq!(metadata["thread_id"], "engine-thread");
+    }
+
+    #[test]
+    fn non_gateway_status_metadata_is_passed_through_unchanged() {
+        let message = IncomingMessage::new("xmpp", "alice", "hi")
+            .with_metadata(serde_json::json!({"xmpp_room": "room@example.org"}));
+        let metadata = engine_status_metadata(&message, "engine-thread");
+        assert_eq!(
+            metadata,
+            serde_json::json!({"xmpp_room": "room@example.org"})
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_gate_approval_returns_empty_and_sends_one_status() {
+        use crate::testing::StubChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (stub, _tx) = StubChannel::new("xmpp");
+        let statuses = stub.captured_statuses_handle();
+        manager.add(Box::new(stub)).await;
+
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+        let message = IncomingMessage::new("xmpp", "alice", "run a tool");
+        let gate = sample_pending_gate(
+            "alice",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+
+        let result = insert_and_notify_pending_gate(&manager, &state, &message, gate)
+            .await
+            .expect("gate notify should succeed");
+
+        // The status carries the prompt; the bridge returns the empty sentinel
+        // so no duplicate terminal message is sent (would double-prompt WASM).
+        assert_eq!(result, Some(String::new()));
+
+        // Exactly one ApprovalNeeded status reached the channel.
+        let captured = statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 1);
+        assert!(matches!(captured[0], StatusUpdate::ApprovalNeeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn execute_time_gate_uses_shared_notification_path() {
+        use crate::testing::StubChannel;
+        use futures::StreamExt;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (stub, _tx) = StubChannel::new("xmpp");
+        let statuses = stub.captured_statuses_handle();
+        manager.add(Box::new(stub)).await;
+
+        let store = Arc::new(TestStore::new());
+        let mut state = make_expected_test_state(store);
+        let sse = Arc::new(SseManager::new());
+        let mut events = sse
+            .subscribe_raw(Some("alice".to_string()))
+            .expect("SSE subscription should be available");
+        state.sse = Some(sse);
+
+        let message = IncomingMessage::new("xmpp", "alice", "run a tool");
+        let conversation_id = lunarwing_engine::ConversationId::new();
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let outcome = ThreadOutcome::GatePaused {
+            gate_name: "approval".into(),
+            action_name: "http".into(),
+            call_id: "call-http".into(),
+            parameters: serde_json::json!({"url": "https://example.com", "method": "POST"}),
+            resume_kind: lunarwing_engine::ResumeKind::Approval { allow_always: true },
+            resume_output: None,
+        };
+
+        let result = persist_and_notify_thread_gate(
+            &manager,
+            &state,
+            &message,
+            conversation_id,
+            thread_id,
+            outcome,
+        )
+        .await
+        .expect("execute-time gate should be persisted and announced");
+
+        assert_eq!(result, Some(String::new()));
+        let pending = state.pending_gates.list_for_user("alice").await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].thread_id, thread_id);
+        assert_eq!(pending[0].conversation_id, conversation_id);
+        assert_eq!(pending[0].action_name, "http");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .expect("GateRequired should be broadcast")
+            .expect("SSE stream should remain open");
+        assert!(matches!(
+            event,
+            crate::channels::web::types::SseEvent::GateRequired {
+                ref request_id,
+                ref tool_name,
+                thread_id: Some(ref event_thread_id),
+                ..
+            } if request_id == &pending[0].request_id.to_string()
+                && tool_name == "http"
+                && event_thread_id == &thread_id.to_string()
+        ));
+
+        let captured = statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 1);
+        assert!(matches!(captured[0], StatusUpdate::ApprovalNeeded { .. }));
+    }
+
+    // ── Phase 5: scoped control routing ──────────────────────────
+
+    fn gate_in_conversation(
+        user_id: &str,
+        source_channel: &str,
+        conversation_id: lunarwing_engine::ConversationId,
+        resume_kind: lunarwing_engine::ResumeKind,
+    ) -> PendingGate {
+        let thread_id = lunarwing_engine::ThreadId::new();
+        PendingGate {
+            request_id: uuid::Uuid::new_v4(),
+            gate_name: resume_kind.kind_name().to_string(),
+            user_id: user_id.into(),
+            thread_id,
+            conversation_id,
+            source_channel: source_channel.into(),
+            action_name: "shell".into(),
+            call_id: format!("call-{thread_id}"),
+            parameters: serde_json::json!({}),
+            display_parameters: None,
+            description: "gate".into(),
+            resume_kind,
+            created_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            original_message: None,
+            resume_output: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_matcher_is_conversation_scoped() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        let conv_b = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-b", "alice")
+            .await
+            .unwrap();
+
+        let gate_a = gate_in_conversation(
+            "alice",
+            "gateway",
+            conv_a,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let gate_b = gate_in_conversation(
+            "alice",
+            "gateway",
+            conv_b,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let tid_a = gate_a.thread_id;
+        state.pending_gates.insert(gate_a).await.unwrap();
+        state.pending_gates.insert(gate_b).await.unwrap();
+
+        // A "yes" scoped to thread-a resolves only thread-a's gate, never B's.
+        let msg =
+            IncomingMessage::new("gateway", "alice", "yes").with_conversation_scope("thread-a");
+        let matched = matching_engine_approval_gate(&state, &msg, None).await;
+        assert_eq!(matched.map(|gate| gate.thread_id), Some(tid_a));
+    }
+
+    #[tokio::test]
+    async fn approval_matcher_ignores_authentication_gates() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+        let conv = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        state
+            .pending_gates
+            .insert(gate_in_conversation(
+                "alice",
+                "gateway",
+                conv,
+                lunarwing_engine::ResumeKind::Authentication {
+                    credential_name: "github".into(),
+                    instructions: "paste token".into(),
+                    auth_url: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let msg =
+            IncomingMessage::new("gateway", "alice", "yes").with_conversation_scope("thread-a");
+        assert!(
+            matching_engine_approval_gate(&state, &msg, None)
+                .await
+                .is_none(),
+            "authentication gates must not be classified as approvals"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_active_engine_thread_is_scoped() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let project_id = state.default_project_id;
+        let mut events = state.thread_manager.subscribe_events();
+
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        let tid_a = state
+            .conversation_manager
+            .handle_user_message(
+                conv_a,
+                "hi",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let wait = async {
+            while let Ok(evt) = events.recv().await {
+                if matches!(evt.kind, lunarwing_engine::EventKind::ResponseDelta { .. }) {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait)
+            .await
+            .expect("stream should start");
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let scoped_a =
+            IncomingMessage::new("gateway", "alice", "/stop").with_conversation_scope("thread-a");
+        let scoped_b =
+            IncomingMessage::new("gateway", "alice", "/stop").with_conversation_scope("thread-b");
+        assert!(has_active_engine_thread(&scoped_a).await);
+        assert!(!has_active_engine_thread(&scoped_b).await);
+
+        // Clean up the running thread and clear global engine state.
+        {
+            let guard = lock.read().await;
+            let state = guard.as_ref().unwrap();
+            let _ = state.thread_manager.stop_thread(tid_a, "alice").await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.thread_manager.join_thread(tid_a),
+            )
+            .await;
+        }
+        *lock.write().await = None;
+    }
+
+    // ── Phase 4: scoped interrupt + outcome mapping ──────────────
+
+    #[test]
+    fn engine_conversation_key_includes_non_gateway_scope() {
+        let msg =
+            IncomingMessage::new("xmpp", "alice", "hi").with_conversation_scope("room@example.org");
+        assert_eq!(engine_conversation_key(&msg), "xmpp:room@example.org");
+    }
+
+    #[test]
+    fn engine_conversation_key_without_scope_is_channel() {
+        let msg = IncomingMessage::new("gateway", "alice", "hi");
+        assert_eq!(engine_conversation_key(&msg), "gateway");
+    }
+
+    #[test]
+    fn stopped_outcome_uses_empty_response_sentinel() {
+        assert_eq!(
+            thread_outcome_response(&ThreadOutcome::Stopped),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn completed_outcome_returns_its_text() {
+        assert_eq!(
+            thread_outcome_response(&ThreadOutcome::Completed {
+                response: Some("final".into()),
+            }),
+            Some("final".into())
+        );
+    }
+
+    #[test]
+    fn thread_outcome_response_maps_terminal_outcomes() {
+        // The normal outbound handler relies on this mapping for terminal
+        // delivery now that the direct SSE Response is gone.
+        assert_eq!(
+            thread_outcome_response(&ThreadOutcome::MaxIterations),
+            Some("Reached maximum iterations without completing.".into())
+        );
+        assert_eq!(
+            thread_outcome_response(&ThreadOutcome::Failed {
+                error: "boom".into()
+            }),
+            Some("Error: boom".into())
+        );
+    }
+
+    #[test]
+    fn engine_v2_channel_policy_is_gateway_default_and_exact_opt_in() {
+        let cases = [
+            (false, None, "gateway", false),
+            (false, Some("xmpp"), "xmpp", false),
+            (true, None, "gateway", true),
+            (true, None, "xmpp", false),
+            (true, Some(""), "gateway", true),
+            (true, Some(""), "darkirc", false),
+            (true, Some(" xmpp, DARKIRC ,weechat "), "xmpp", true),
+            (true, Some(" xmpp, DARKIRC ,weechat "), "darkirc", true),
+            (true, Some(" xmpp, DARKIRC ,weechat "), "weechat", true),
+            (true, Some("notxmpp"), "xmpp", false),
+            (true, Some("xmpp-extra"), "xmpp", false),
+            (true, Some("telegram"), "telegram", false),
+            (true, Some(",,xmpp,,"), "xmpp", true),
+        ];
+
+        for (engine_enabled, configured, channel, expected) in cases {
+            assert_eq!(
+                engine_v2_channel_allowed(engine_enabled, configured, channel),
+                expected,
+                "enabled={engine_enabled}, configured={configured:?}, channel={channel}",
+            );
+        }
+    }
+
+    /// Backend whose stream emits one delta then stays pending, so only a stop
+    /// ends it.
+    struct InterruptTestLlm;
+
+    #[async_trait::async_trait]
+    impl lunarwing_engine::LlmBackend for InterruptTestLlm {
+        async fn complete(
+            &self,
+            _: &[lunarwing_engine::ThreadMessage],
+            _: &[lunarwing_engine::ActionDef],
+            _: &lunarwing_engine::LlmCallConfig,
+        ) -> Result<lunarwing_engine::LlmOutput, lunarwing_engine::EngineError> {
+            Err(lunarwing_engine::EngineError::Llm {
+                reason: "blocking completion must not be called".into(),
+            })
+        }
+
+        async fn complete_stream<'a>(
+            &'a self,
+            _: &[lunarwing_engine::ThreadMessage],
+            _: &[lunarwing_engine::ActionDef],
+            _: &lunarwing_engine::LlmCallConfig,
+        ) -> Result<lunarwing_engine::LlmStream<'a>, lunarwing_engine::EngineError> {
+            use futures::StreamExt;
+            Ok(
+                futures::stream::iter([Ok(lunarwing_engine::LlmStreamChunk::TextDelta(
+                    "before-cancel".into(),
+                ))])
+                .chain(futures::stream::pending())
+                .boxed(),
+            )
+        }
+
+        fn model_name(&self) -> &str {
+            "interrupt-pending"
+        }
+    }
+
+    struct InterruptTestEffects;
+
+    #[async_trait::async_trait]
+    impl lunarwing_engine::EffectExecutor for InterruptTestEffects {
+        async fn execute_action(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: &lunarwing_engine::CapabilityLease,
+            _: &lunarwing_engine::ThreadExecutionContext,
+        ) -> Result<lunarwing_engine::ActionResult, lunarwing_engine::EngineError> {
+            unreachable!("pending stream never reaches action execution")
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[lunarwing_engine::CapabilityLease],
+        ) -> Result<Vec<lunarwing_engine::ActionDef>, lunarwing_engine::EngineError> {
+            Ok(vec![])
+        }
+    }
+
+    fn make_interrupt_test_state(store: Arc<TestStore>) -> EngineState {
+        let store_dyn: Arc<dyn Store> = store;
+        let effect_adapter = Arc::new(EffectBridgeAdapter::new(
+            Arc::new(crate::tools::ToolRegistry::new()),
+            Arc::new(lunarwing_safety::SafetyLayer::new(
+                &lunarwing_safety::SafetyConfig {
+                    max_output_length: 10_000,
+                    injection_check_enabled: false,
+                },
+            )),
+            Arc::new(crate::hooks::HookRegistry::default()),
+        ));
+
+        let tm = Arc::new(ThreadManager::new(
+            Arc::new(InterruptTestLlm),
+            Arc::new(InterruptTestEffects),
+            store_dyn.clone(),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+
+        let cm = ConversationManager::new(Arc::clone(&tm), store_dyn.clone());
+
+        EngineState {
+            thread_manager: tm,
+            conversation_manager: cm,
+            effect_adapter,
+            store: store_dyn,
+            default_project_id: lunarwing_engine::ProjectId::new(),
+            pending_gates: Arc::new(crate::gate::store::PendingGateStore::in_memory()),
+            sse: None,
+            db: None,
+            secrets_store: None,
+            auth_manager: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_only_stops_the_scoped_conversation() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let project_id = state.default_project_id;
+
+        let mut events = state.thread_manager.subscribe_events();
+
+        // Two scoped gateway conversations for the same user.
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        let conv_b = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-b", "alice")
+            .await
+            .unwrap();
+
+        let tid_a = state
+            .conversation_manager
+            .handle_user_message(
+                conv_a,
+                "hi a",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let tid_b = state
+            .conversation_manager
+            .handle_user_message(
+                conv_b,
+                "hi b",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Wait until both threads' streams are active.
+        let wait_two = async {
+            let mut seen = 0;
+            while let Ok(evt) = events.recv().await {
+                if matches!(evt.kind, lunarwing_engine::EventKind::ResponseDelta { .. }) {
+                    seen += 1;
+                    if seen >= 2 {
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait_two)
+            .await
+            .expect("both streams should start");
+
+        // Interrupt only thread-a's scope.
+        let msg = IncomingMessage::new("gateway", "alice", "/interrupt")
+            .with_conversation_scope("thread-a");
+        let result = interrupt_engine_conversation(&state, &msg)
+            .await
+            .expect("interrupt should succeed");
+        assert_eq!(result, Some("Interrupted.".to_string()));
+
+        // Thread A stops; thread B is untouched.
+        let outcome_a = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.thread_manager.join_thread(tid_a),
+        )
+        .await
+        .expect("thread A should stop promptly")
+        .expect("thread A should join");
+        assert!(matches!(outcome_a, ThreadOutcome::Stopped));
+        assert!(state.thread_manager.is_running(tid_b).await);
+
+        // Clean up thread B.
+        let _ = state.thread_manager.stop_thread(tid_b, "alice").await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.thread_manager.join_thread(tid_b),
+        )
+        .await;
     }
 }

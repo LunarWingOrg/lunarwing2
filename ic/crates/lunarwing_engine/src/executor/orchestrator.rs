@@ -26,6 +26,7 @@ use monty::{
     ExtFunctionResult, LimitedTracker, MontyObject, MontyRun, NameLookupResult, PrintWriter,
     ResourceLimits, RunProgress,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::capability::lease::LeaseManager;
@@ -303,6 +304,7 @@ pub async fn execute_orchestrator(
     leases: &Arc<LeaseManager>,
     policy: &Arc<PolicyEngine>,
     signal_rx: &mut SignalReceiver,
+    cancellation: &CancellationToken,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
     retrieval: Option<&RetrievalEngine>,
     store: Option<&Arc<dyn Store>>,
@@ -391,7 +393,7 @@ pub async fn execute_orchestrator(
 
                     // __llm_complete__(messages, actions, config)
                     "__llm_complete__" => {
-                        handle_llm_complete(
+                        match handle_llm_complete(
                             args,
                             thread,
                             llm,
@@ -399,8 +401,31 @@ pub async fn execute_orchestrator(
                             leases,
                             &mut total_tokens,
                             event_tx,
+                            cancellation,
                         )
                         .await
+                        {
+                            LlmHostCallOutcome::Finished(result) => result,
+                            LlmHostCallOutcome::Cancelled => {
+                                // User stop during the LLM stream. Do not resume
+                                // Monty with a fabricated result: end the run as
+                                // Stopped. This is control flow, not an error, so
+                                // no failure/rollback accounting occurs.
+                                if thread.state == ThreadState::Running {
+                                    thread.transition_to(
+                                        ThreadState::Completed,
+                                        Some("stopped during LLM stream".into()),
+                                    )?;
+                                }
+                                return Ok(OrchestratorResult {
+                                    outcome: ThreadOutcome::Stopped,
+                                    // Earlier completed steps remain accounted
+                                    // for. The cancelled call never reached Done
+                                    // and therefore added nothing to this value.
+                                    tokens_used: total_tokens,
+                                });
+                            }
+                        }
                     }
 
                     // __execute_code_step__(code, state)
@@ -529,11 +554,28 @@ pub async fn execute_orchestrator(
 
 // ── Host function handlers ──────────────────────────────────
 
+/// Outcome of the `__llm_complete__` host call.
+///
+/// `Finished` (success or LLM error) is resumed back into the Monty
+/// orchestrator as a normal result. `Cancelled` means the run's cancellation
+/// token fired during stream acquisition or collection; the caller ends the
+/// run as `Stopped` without resuming Monty and without committing usage, a
+/// terminal response, cache entry, or trace response for the cancelled call.
+enum LlmHostCallOutcome {
+    Finished(ExtFunctionResult),
+    Cancelled,
+}
+
 /// Handle `__llm_complete__(messages, actions, config)`.
 ///
 /// Calls the LLM and returns the response as a dict:
 /// `{type: "text"|"code"|"actions", content/code/calls: ..., usage: {...}}`
 ///
+/// The entire stream operation (acquisition plus collection) runs inside
+/// `cancellation.run_until_cancelled`, so a stop drops the in-flight
+/// acquisition future or open provider stream immediately and returns
+/// `LlmHostCallOutcome::Cancelled`.
+#[allow(clippy::too_many_arguments)]
 async fn handle_llm_complete(
     args: &[MontyObject],
     thread: &mut Thread,
@@ -542,7 +584,8 @@ async fn handle_llm_complete(
     leases: &Arc<LeaseManager>,
     total_tokens: &mut TokenUsage,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
-) -> ExtFunctionResult {
+    cancellation: &CancellationToken,
+) -> LlmHostCallOutcome {
     let explicit_messages = args.first().map(monty_to_json).filter(|v| !v.is_null());
     let explicit_config = args.get(2).map(monty_to_json).filter(|v| !v.is_null());
     let messages = explicit_messages
@@ -576,28 +619,34 @@ async fn handle_llm_complete(
         metadata: HashMap::new(),
     };
 
-    let stream = match llm.complete_stream(&messages, &actions, &config).await {
-        Ok(stream) => stream,
-        Err(error) => return llm_error_result(error),
-    };
     let thread_id = thread.id;
-    let output = collect_llm_stream(stream, |content| {
-        let Some(tx) = event_tx else {
-            return;
-        };
-        let event = ThreadEvent::new(
-            thread_id,
-            EventKind::ResponseDelta {
-                content: content.to_string(),
-            },
-        );
-        let _ = tx.send(event);
-    })
-    .await;
 
-    match output {
-        Ok(output) => llm_output_result(output, total_tokens),
-        Err(error) => llm_error_result(error),
+    // Acquire and collect the stream as one cancellable unit. Returning `None`
+    // drops this future, which owns and drops the acquisition future or the
+    // open provider stream. Do not fabricate an `LlmStreamChunk::Done`.
+    let stream_result = cancellation
+        .run_until_cancelled(async {
+            let stream = llm.complete_stream(&messages, &actions, &config).await?;
+            collect_llm_stream(stream, |content| {
+                let Some(tx) = event_tx else {
+                    return;
+                };
+                let event = ThreadEvent::new(
+                    thread_id,
+                    EventKind::ResponseDelta {
+                        content: content.to_string(),
+                    },
+                );
+                let _ = tx.send(event);
+            })
+            .await
+        })
+        .await;
+
+    match stream_result {
+        Some(Ok(output)) => LlmHostCallOutcome::Finished(llm_output_result(output, total_tokens)),
+        Some(Err(error)) => LlmHostCallOutcome::Finished(llm_error_result(error)),
+        None => LlmHostCallOutcome::Cancelled,
     }
 }
 
@@ -939,6 +988,7 @@ async fn handle_execute_action(
                     call_id: call_id.clone(),
                     duration_ms: r.duration.as_millis() as u64,
                     params_summary: ps.clone(),
+                    result_preview: crate::types::event::preview_from_output(&r.output),
                 },
                 &call_id,
                 &name,
@@ -1387,6 +1437,7 @@ async fn execute_single_action(
                 call_id: call_id.to_string(),
                 duration_ms: r.duration.as_millis() as u64,
                 params_summary: params_summary.clone(),
+                result_preview: crate::types::event::preview_from_output(&r.output),
             };
             let result_json = serde_json::json!({
                 "action_name": r.action_name,
@@ -1514,6 +1565,7 @@ fn handle_emit_event(
                 call_id,
                 duration_ms: 0,
                 params_summary: None,
+                result_preview: None,
             }
         }
         "action_failed" => {
@@ -2090,8 +2142,16 @@ fn extract_u64_kwarg(kwargs: &[(MontyObject, MontyObject)], name: &str) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::messaging::signal_channel;
+    use crate::traits::llm::{LlmStream, LlmStreamChunk};
+    use crate::types::capability::CapabilityLease;
     use crate::types::memory::{DocType, MemoryDoc};
+    use crate::types::message::MessageRole;
     use crate::types::project::ProjectId;
+    use crate::types::step::ActionResult;
+    use crate::types::thread::{ThreadConfig, ThreadType};
+    use futures::StreamExt;
+    use std::time::Duration;
 
     // ── Python helper unit tests via Monty ──────────────────────
     //
@@ -2592,5 +2652,140 @@ mod tests {
         // Non-gate result → not a refund candidate.
         let ok = serde_json::json!({"output": "result"});
         assert!(!interrupted_result_needs_refund(&ok));
+    }
+
+    // ── Streaming cancellation ──────────────────────────────────
+
+    /// Backend whose stream emits one delta then stays pending, so a
+    /// cancellation during collection is the only way it ends.
+    struct PendingStreamLlm;
+
+    #[async_trait::async_trait]
+    impl LlmBackend for PendingStreamLlm {
+        async fn complete(
+            &self,
+            _: &[ThreadMessage],
+            _: &[crate::types::capability::ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            Err(EngineError::Llm {
+                reason: "blocking completion must not be called".into(),
+            })
+        }
+
+        async fn complete_stream<'a>(
+            &'a self,
+            _: &[ThreadMessage],
+            _: &[crate::types::capability::ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmStream<'a>, EngineError> {
+            Ok(
+                futures::stream::iter([Ok(LlmStreamChunk::TextDelta("before-cancel".into()))])
+                    .chain(futures::stream::pending())
+                    .boxed(),
+            )
+        }
+
+        fn model_name(&self) -> &str {
+            "pending-stream"
+        }
+    }
+
+    struct EmptyEffects;
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for EmptyEffects {
+        async fn execute_action(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            Ok(ActionResult {
+                call_id: String::new(),
+                action_name: String::new(),
+                output: serde_json::json!({}),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<crate::types::capability::ActionDef>, EngineError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_llm_stream_returns_stopped_without_usage() {
+        let code = "__llm_complete__(None, None, None)\nFINAL('unreached')";
+        let project = ProjectId::new();
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            project,
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(PendingStreamLlm);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(EmptyEffects);
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let (_signal_tx, mut signal_rx) = signal_channel(16);
+        let token = CancellationToken::new();
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<ThreadEvent>(32);
+        let state = serde_json::json!({});
+
+        // Cancel once the stream has proved active by emitting its first delta.
+        let canceller = {
+            let token = token.clone();
+            async move {
+                while let Ok(event) = event_rx.recv().await {
+                    if let EventKind::ResponseDelta { content } = &event.kind
+                        && content == "before-cancel"
+                    {
+                        break;
+                    }
+                }
+                token.cancel();
+            }
+        };
+
+        let run = execute_orchestrator(
+            code,
+            &mut thread,
+            &llm,
+            &effects,
+            &leases,
+            &policy,
+            &mut signal_rx,
+            &token,
+            Some(&event_tx),
+            None,
+            None,
+            &state,
+        );
+
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(run, canceller)
+        })
+        .await
+        .expect("cancelled orchestrator should finish promptly");
+
+        let result = result.expect("orchestrator should return Ok");
+        assert!(matches!(result.outcome, ThreadOutcome::Stopped));
+        assert_eq!(result.tokens_used, TokenUsage::default());
+        assert_eq!(thread.state, ThreadState::Completed);
+        assert!(
+            !thread
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Assistant)
+        );
     }
 }

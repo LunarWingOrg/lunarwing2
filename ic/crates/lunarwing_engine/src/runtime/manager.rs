@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 use crate::capability::lease::LeaseManager;
@@ -17,6 +18,7 @@ use crate::traits::effect::EffectExecutor;
 use crate::traits::llm::LlmBackend;
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
+use crate::types::event::{EventKind, ThreadEvent};
 use crate::types::message::{MessageRole, ThreadMessage};
 use crate::types::project::ProjectId;
 use crate::types::thread::{Thread, ThreadConfig, ThreadId, ThreadState, ThreadType};
@@ -24,6 +26,9 @@ use crate::types::thread::{Thread, ThreadConfig, ThreadId, ThreadState, ThreadTy
 /// Handle to a running thread for checking results.
 struct RunningThread {
     signal_tx: SignalSender,
+    /// Cancels this run's in-flight provider stream. A fresh token is created
+    /// for every `start_thread` call (including resumes) and never reused.
+    cancellation: CancellationToken,
     handle: tokio::task::JoinHandle<Result<ThreadOutcome, EngineError>>,
 }
 
@@ -86,6 +91,39 @@ impl ThreadManager {
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::types::event::ThreadEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Persist and broadcast an event produced while a thread awaits a gate.
+    pub async fn record_waiting_event(
+        &self,
+        thread_id: ThreadId,
+        user_id: &str,
+        kind: EventKind,
+    ) -> Result<(), EngineError> {
+        let mut thread = self
+            .store
+            .load_thread(thread_id)
+            .await?
+            .ok_or(EngineError::ThreadNotFound(thread_id))?;
+
+        if !thread.is_owned_by(user_id) {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("thread {thread_id}"),
+            });
+        }
+        if thread.state != ThreadState::Waiting {
+            return Err(EngineError::Store {
+                reason: format!("thread {thread_id} is not waiting"),
+            });
+        }
+
+        let event = ThreadEvent::new(thread_id, kind);
+        thread.events.push(event.clone());
+        thread.updated_at = chrono::Utc::now();
+        self.store.save_thread(&thread).await?;
+        let _ = self.event_tx.send(event);
+        Ok(())
     }
 
     /// Spawn a new thread and start executing it.
@@ -242,6 +280,16 @@ impl ThreadManager {
         }
 
         if let Some(message) = injected_message {
+            if message.role == MessageRole::ActionResult {
+                thread.config.require_action_attempt = false;
+            }
+            // Once the orchestrator has materialized an internal transcript, it
+            // becomes the inference source on resume. Keep injected context in
+            // both transcripts so the model sees it and the visible history
+            // retains the existing resume semantics.
+            if !thread.internal_messages.is_empty() {
+                thread.add_internal_message(message.clone());
+            }
             thread.add_message(message);
         }
 
@@ -270,6 +318,12 @@ impl ThreadManager {
         // Create signal channel
         let (tx, rx) = messaging::signal_channel(32);
 
+        // Create a fresh cancellation token for this run. Resumes and new turns
+        // never reuse a cancelled token. A clone drives stream cancellation
+        // inside the execution loop; the original stays here so stop requests
+        // can cancel it.
+        let cancellation = CancellationToken::new();
+
         // Build execution loop
         let llm = Arc::clone(&self.llm);
         let effects = Arc::clone(&self.effects);
@@ -280,6 +334,7 @@ impl ThreadManager {
         let retrieval = crate::memory::RetrievalEngine::new(store_for_retrieval);
 
         let mut exec_loop = ExecutionLoop::new(thread, llm, effects, leases, policy, rx, user_id)
+            .with_cancellation_token(cancellation.clone())
             .with_capabilities(Arc::clone(&self.capabilities))
             .with_event_tx(self.event_tx.clone())
             .with_retrieval(retrieval)
@@ -349,6 +404,7 @@ impl ThreadManager {
             thread_id,
             RunningThread {
                 signal_tx: tx,
+                cancellation,
                 handle,
             },
         );
@@ -360,7 +416,30 @@ impl ThreadManager {
         Ok(thread_id)
     }
 
-    /// Send a stop signal to a running thread.
+    /// Cancel a running thread's in-flight stream and request a stop.
+    ///
+    /// Cancels the run's `CancellationToken` first so any active provider
+    /// stream (acquisition or collection) is dropped immediately, then sends
+    /// the between-step `ThreadSignal::Stop` for stops observed outside an LLM
+    /// call. The map lock is released before awaiting the signal send.
+    async fn request_stop(&self, thread_id: ThreadId) -> Result<(), EngineError> {
+        let (signal_tx, cancellation) = {
+            let running = self.running.read().await;
+            let running_thread = running
+                .get(&thread_id)
+                .ok_or(EngineError::ThreadNotFound(thread_id))?;
+            (
+                running_thread.signal_tx.clone(),
+                running_thread.cancellation.clone(),
+            )
+        };
+
+        cancellation.cancel();
+        let _ = signal_tx.send(ThreadSignal::Stop).await;
+        Ok(())
+    }
+
+    /// Stop a running thread (cancel its stream and signal stop).
     pub async fn stop_thread(&self, thread_id: ThreadId, user_id: &str) -> Result<(), EngineError> {
         // Validate ownership before allowing stop.
         if let Some(thread) = self.store.load_thread(thread_id).await?
@@ -371,24 +450,12 @@ impl ThreadManager {
                 entity: format!("thread {thread_id}"),
             });
         }
-        let running = self.running.read().await;
-        if let Some(rt) = running.get(&thread_id) {
-            let _ = rt.signal_tx.send(ThreadSignal::Stop).await;
-            Ok(())
-        } else {
-            Err(EngineError::ThreadNotFound(thread_id))
-        }
+        self.request_stop(thread_id).await
     }
 
-    /// Send a stop signal without ownership check (system operations).
+    /// Stop a running thread without ownership check (system operations).
     pub async fn stop_thread_system(&self, thread_id: ThreadId) -> Result<(), EngineError> {
-        let running = self.running.read().await;
-        if let Some(rt) = running.get(&thread_id) {
-            let _ = rt.signal_tx.send(ThreadSignal::Stop).await;
-            Ok(())
-        } else {
-            Err(EngineError::ThreadNotFound(thread_id))
-        }
+        self.request_stop(thread_id).await
     }
 
     /// Inject a user message into a running thread.
@@ -622,15 +689,21 @@ fn is_resolved_call_message(message: &ThreadMessage, call_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::llm::{LlmCallConfig, LlmOutput};
+    use crate::traits::llm::{LlmCallConfig, LlmOutput, LlmStream, LlmStreamChunk};
     use crate::types::capability::{ActionDef, Capability, CapabilityLease, EffectType};
-    use crate::types::event::ThreadEvent;
+    use crate::types::event::{EventKind, ThreadEvent};
     use crate::types::memory::{DocId, MemoryDoc};
+    use crate::types::message::MessageRole;
     use crate::types::project::Project;
-    use crate::types::step::{ActionResult, LlmResponse, Step, TokenUsage};
+    use crate::types::step::{ActionResult, LlmResponse, Step, StepId, TokenUsage};
     use crate::types::thread::ThreadState;
+    use futures::{Stream, StreamExt};
+    use std::pin::Pin;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     // ── Mocks ───────────────────────────────────────────────
 
@@ -922,27 +995,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_thread_works() {
-        // LLM that returns many action responses
-        let responses: Vec<LlmOutput> = (0..100)
-            .map(|i| LlmOutput {
-                response: LlmResponse::ActionCalls {
-                    calls: vec![crate::types::step::ActionCall {
-                        id: format!("c{i}"),
-                        action_name: "test_tool".into(),
-                        parameters: serde_json::json!({}),
-                    }],
-                    content: None,
-                },
-                usage: TokenUsage::default(),
-            })
-            .collect();
+    async fn record_waiting_event_persists_and_broadcasts_once() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("done"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "approved action",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Waiting;
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
 
-        let mgr = make_manager(Arc::new(MockLlm {
-            responses: Mutex::new(responses),
-        }));
+        let mut receiver = mgr.subscribe_events();
+        mgr.record_waiting_event(
+            thread_id,
+            "alice",
+            EventKind::ActionExecuted {
+                step_id: StepId::new(),
+                action_name: "ssh".into(),
+                call_id: "call-approved".into(),
+                duration_ms: 4,
+                params_summary: None,
+                result_preview: Some("ok".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let delivered = receiver.recv().await.unwrap();
+        let saved = store.load_thread(thread_id).await.unwrap().unwrap();
+        assert_eq!(
+            saved
+                .events
+                .iter()
+                .filter(|event| event.id == delivered.id)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn record_waiting_event_rejects_wrong_owner_and_non_waiting_thread() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("done"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "approved action",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Waiting;
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let event = || EventKind::ActionExecuted {
+            step_id: StepId::new(),
+            action_name: "ssh".into(),
+            call_id: "call-approved".into(),
+            duration_ms: 4,
+            params_summary: None,
+            result_preview: Some("ok".into()),
+        };
+        let mut receiver = mgr.subscribe_events();
+
+        let wrong_owner = mgr.record_waiting_event(thread_id, "bob", event()).await;
+        assert!(matches!(wrong_owner, Err(EngineError::AccessDenied { .. })));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        thread.state = ThreadState::Running;
+        store.save_thread(&thread).await.unwrap();
+        let wrong_state = mgr.record_waiting_event(thread_id, "alice", event()).await;
+        assert!(matches!(wrong_state, Err(EngineError::Store { .. })));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_thread_works() {
+        // A stop during an active provider stream deterministically yields
+        // `Stopped` (not a race against completion or max-iterations).
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(PendingStreamLlm {
+            opened: Notify::new(),
+            drop_count: Arc::clone(&drop_count),
+            stream_calls: AtomicUsize::new(0),
+        });
+        let mgr = make_manager(llm);
         let project = ProjectId::new();
 
+        let mut events = mgr.subscribe_events();
         let tid = mgr
             .spawn_thread(
                 "test",
@@ -955,15 +1107,601 @@ mod tests {
             .await
             .unwrap();
 
-        // Give it a moment to start, then stop
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let _ = mgr.stop_thread(tid, "test-user").await;
+        wait_for_delta(&mut events).await;
+        mgr.stop_thread(tid, "user").await.unwrap();
 
-        let outcome = mgr.join_thread(tid).await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), mgr.join_thread(tid))
+            .await
+            .expect("stop should be prompt")
+            .expect("thread should join");
+        assert!(matches!(outcome, ThreadOutcome::Stopped));
+    }
+
+    // ── Streaming cancellation mocks ─────────────────────────
+
+    /// Wraps an inner engine stream and records when it is dropped, proving a
+    /// stop request drops the active provider stream rather than draining it.
+    struct DropProbeStream {
+        inner: LlmStream<'static>,
+        drop_count: Arc<AtomicUsize>,
+    }
+
+    impl Stream for DropProbeStream {
+        type Item = Result<LlmStreamChunk, EngineError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.inner.as_mut().poll_next(cx)
+        }
+    }
+
+    impl Drop for DropProbeStream {
+        fn drop(&mut self) {
+            self.drop_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Backend whose stream emits one delta then stays pending forever, so a
+    /// stop must interrupt an already-open stream. `drop_count` counts every
+    /// dropped stream so isolation tests can prove only the target dropped.
+    struct PendingStreamLlm {
+        opened: Notify,
+        drop_count: Arc<AtomicUsize>,
+        stream_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for PendingStreamLlm {
+        async fn complete(
+            &self,
+            _: &[ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            Err(EngineError::Llm {
+                reason: "blocking completion must not be called".into(),
+            })
+        }
+
+        async fn complete_stream<'a>(
+            &'a self,
+            _: &[ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmStream<'a>, EngineError> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            self.opened.notify_one();
+            let inner =
+                futures::stream::iter([Ok(LlmStreamChunk::TextDelta("before-cancel".into()))])
+                    .chain(futures::stream::pending())
+                    .boxed();
+            Ok(Box::pin(DropProbeStream {
+                inner,
+                drop_count: Arc::clone(&self.drop_count),
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            "pending-stream"
+        }
+    }
+
+    /// Dropped when the acquisition future is dropped, proving a stop before
+    /// response headers cancels `complete_stream().await` itself.
+    struct AcquisitionProbe {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for AcquisitionProbe {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Backend whose `complete_stream` never resolves, so a stop must cancel
+    /// the acquisition future before any stream exists.
+    struct AcquisitionPendingLlm {
+        opened: Arc<Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for AcquisitionPendingLlm {
+        async fn complete(
+            &self,
+            _: &[ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            Err(EngineError::Llm {
+                reason: "blocking completion must not be called".into(),
+            })
+        }
+
+        async fn complete_stream<'a>(
+            &'a self,
+            _: &[ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmStream<'a>, EngineError> {
+            let _probe = AcquisitionProbe {
+                dropped: Arc::clone(&self.dropped),
+            };
+            self.opened.notify_one();
+            // Never resolves; the probe drops only when this future is dropped.
+            futures::future::pending::<Result<LlmStream<'a>, EngineError>>().await
+        }
+
+        fn model_name(&self) -> &str {
+            "acquisition-pending"
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_during_llm_stream_is_prompt_and_drops_stream() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(PendingStreamLlm {
+            opened: Notify::new(),
+            drop_count: Arc::clone(&drop_count),
+            stream_calls: AtomicUsize::new(0),
+        });
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(llm, Arc::clone(&store));
+        let project = ProjectId::new();
+
+        let mut events = mgr.subscribe_events();
+
+        let thread_id = mgr
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+
+        // Wait for the first streamed delta so the stream is provably active.
+        let wait_delta = async {
+            while let Ok(event) = events.recv().await {
+                if let EventKind::ResponseDelta { content } = &event.kind
+                    && content == "before-cancel"
+                {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), wait_delta)
+            .await
+            .expect("stream should emit a delta before stop");
+
+        mgr.stop_thread(thread_id, "user").await.unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), mgr.join_thread(thread_id))
+            .await
+            .expect("cancelled stream should stop promptly")
+            .expect("thread should join");
+
+        assert!(matches!(outcome, ThreadOutcome::Stopped));
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+
+        let stored = store
+            .load_thread(thread_id)
+            .await
+            .expect("thread lookup should work")
+            .expect("thread should be persisted");
+        assert_eq!(stored.state, ThreadState::Done);
+        assert_eq!(stored.total_tokens_used, 0);
+        assert!(!stored.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant && message.content.contains("before-cancel")
+        }));
+    }
+
+    #[tokio::test]
+    async fn stop_during_stream_acquisition_is_prompt_and_drops_future() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let opened = Arc::new(Notify::new());
+        let llm = Arc::new(AcquisitionPendingLlm {
+            opened: Arc::clone(&opened),
+            dropped: Arc::clone(&dropped),
+        });
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(llm, Arc::clone(&store));
+        let project = ProjectId::new();
+
+        let mut events = mgr.subscribe_events();
+
+        let thread_id = mgr
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+
+        // Acquisition started but no stream (and therefore no delta) exists yet.
+        tokio::time::timeout(Duration::from_secs(1), opened.notified())
+            .await
+            .expect("stream acquisition should start");
+
+        mgr.stop_thread(thread_id, "user").await.unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), mgr.join_thread(thread_id))
+            .await
+            .expect("cancelled acquisition should stop promptly")
+            .expect("thread should join");
+
+        assert!(matches!(outcome, ThreadOutcome::Stopped));
+        assert!(dropped.load(Ordering::SeqCst));
+
+        let mut saw_delta = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event.kind, EventKind::ResponseDelta { .. }) {
+                saw_delta = true;
+            }
+        }
+        assert!(
+            !saw_delta,
+            "no delta should exist before acquisition resolves"
+        );
+
+        let stored = store
+            .load_thread(thread_id)
+            .await
+            .expect("thread lookup should work")
+            .expect("thread should be persisted");
+        assert_eq!(stored.state, ThreadState::Done);
+        assert_eq!(stored.total_tokens_used, 0);
+        assert!(
+            !stored
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Assistant)
+        );
+    }
+
+    /// First stream is pending (for the cancelled thread); every later stream
+    /// completes with the text "recovered", proving a fresh token runs normally.
+    struct PendingThenRecoveredLlm {
+        calls: AtomicUsize,
+        drop_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for PendingThenRecoveredLlm {
+        async fn complete(
+            &self,
+            _: &[ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            Err(EngineError::Llm {
+                reason: "blocking completion must not be called".into(),
+            })
+        }
+
+        async fn complete_stream<'a>(
+            &'a self,
+            _: &[ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmStream<'a>, EngineError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                let inner =
+                    futures::stream::iter([Ok(LlmStreamChunk::TextDelta("before-cancel".into()))])
+                        .chain(futures::stream::pending())
+                        .boxed();
+                Ok(Box::pin(DropProbeStream {
+                    inner,
+                    drop_count: Arc::clone(&self.drop_count),
+                }))
+            } else {
+                Ok(futures::stream::iter([
+                    Ok(LlmStreamChunk::TextDelta("recovered".into())),
+                    Ok(LlmStreamChunk::Done {
+                        usage: Some(TokenUsage::default()),
+                        finish_reason: "stop".into(),
+                    }),
+                ])
+                .boxed())
+            }
+        }
+
+        fn model_name(&self) -> &str {
+            "pending-then-recovered"
+        }
+    }
+
+    /// Wait until one `ResponseDelta` is observed, proving a stream is active.
+    async fn wait_for_delta(events: &mut tokio::sync::broadcast::Receiver<ThreadEvent>) {
+        let fut = async {
+            while let Ok(event) = events.recv().await {
+                if matches!(event.kind, EventKind::ResponseDelta { .. }) {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), fut)
+            .await
+            .expect("a response delta should arrive");
+    }
+
+    /// Wait until `n` `ResponseDelta`s are observed (one per active stream).
+    async fn wait_for_deltas(events: &mut tokio::sync::broadcast::Receiver<ThreadEvent>, n: usize) {
+        let fut = async {
+            let mut seen = 0;
+            while let Ok(event) = events.recv().await {
+                if matches!(event.kind, EventKind::ResponseDelta { .. }) {
+                    seen += 1;
+                    if seen >= n {
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("expected response deltas");
+    }
+
+    #[tokio::test]
+    async fn stop_only_cancels_the_target_thread() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(PendingStreamLlm {
+            opened: Notify::new(),
+            drop_count: Arc::clone(&drop_count),
+            stream_calls: AtomicUsize::new(0),
+        });
+        let mgr = make_manager(llm);
+        let project = ProjectId::new();
+
+        let mut events = mgr.subscribe_events();
+        let first = mgr
+            .spawn_thread(
+                "a",
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+        let second = mgr
+            .spawn_thread(
+                "b",
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+
+        // Both streams are open.
+        wait_for_deltas(&mut events, 2).await;
+
+        mgr.stop_thread(first, "user").await.unwrap();
+        let first_outcome = tokio::time::timeout(Duration::from_secs(1), mgr.join_thread(first))
+            .await
+            .expect("target stop should be prompt")
+            .expect("thread should join");
+        assert!(matches!(first_outcome, ThreadOutcome::Stopped));
+        // Only the target's stream dropped; the other is still running.
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        assert!(mgr.is_running(second).await);
+
+        // Clean up the second thread so no task is left behind.
+        mgr.stop_thread(second, "user").await.unwrap();
+        let second_outcome = tokio::time::timeout(Duration::from_secs(1), mgr.join_thread(second))
+            .await
+            .expect("second stop should be prompt")
+            .expect("thread should join");
+        assert!(matches!(second_outcome, ThreadOutcome::Stopped));
+        assert_eq!(drop_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn new_thread_after_cancel_gets_fresh_token() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(PendingThenRecoveredLlm {
+            calls: AtomicUsize::new(0),
+            drop_count: Arc::clone(&drop_count),
+        });
+        let mgr = make_manager(llm);
+        let project = ProjectId::new();
+
+        let mut events = mgr.subscribe_events();
+        let cancelled = mgr
+            .spawn_thread(
+                "first",
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+        wait_for_delta(&mut events).await;
+        mgr.stop_thread(cancelled, "user").await.unwrap();
+        let cancelled_outcome =
+            tokio::time::timeout(Duration::from_secs(1), mgr.join_thread(cancelled))
+                .await
+                .expect("stop should be prompt")
+                .expect("thread should join");
+        assert!(matches!(cancelled_outcome, ThreadOutcome::Stopped));
+
+        // A brand-new thread gets a fresh, non-cancelled token and completes.
+        let recovered = mgr
+            .spawn_thread(
+                "second",
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+        let recovered_outcome =
+            tokio::time::timeout(Duration::from_secs(2), mgr.join_thread(recovered))
+                .await
+                .expect("fresh thread should finish")
+                .expect("thread should join");
         assert!(matches!(
-            outcome,
-            ThreadOutcome::Stopped | ThreadOutcome::Completed { .. } | ThreadOutcome::MaxIterations
+            recovered_outcome,
+            ThreadOutcome::Completed { response: Some(r) } if r == "recovered"
         ));
+    }
+
+    #[tokio::test]
+    async fn resumed_thread_gets_fresh_token() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(PendingStreamLlm {
+            opened: Notify::new(),
+            drop_count: Arc::clone(&drop_count),
+            stream_calls: AtomicUsize::new(0),
+        });
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(llm, Arc::clone(&store));
+        let project = ProjectId::new();
+
+        // Persist a Waiting thread owned by "user".
+        let mut thread = Thread::new(
+            "resume me",
+            ThreadType::Foreground,
+            project,
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread
+            .transition_to(ThreadState::Waiting, Some("await input".into()))
+            .unwrap();
+        let tid = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let mut events = mgr.subscribe_events();
+        mgr.resume_thread(tid, "user", None, None, None)
+            .await
+            .unwrap();
+        wait_for_delta(&mut events).await;
+
+        mgr.stop_thread(tid, "user").await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), mgr.join_thread(tid))
+            .await
+            .expect("resumed stop should be prompt")
+            .expect("thread should join");
+        assert!(matches!(outcome, ThreadOutcome::Stopped));
+    }
+
+    #[tokio::test]
+    async fn resuming_with_action_result_consumes_action_requirement() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(PendingStreamLlm {
+            opened: Notify::new(),
+            drop_count: Arc::clone(&drop_count),
+            stream_calls: AtomicUsize::new(0),
+        });
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(llm, Arc::clone(&store));
+        let project = ProjectId::new();
+
+        let config = ThreadConfig {
+            require_action_attempt: true,
+            ..ThreadConfig::default()
+        };
+        let mut thread = Thread::new(
+            "perform one action",
+            ThreadType::Foreground,
+            project,
+            "user",
+            config,
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread
+            .transition_to(ThreadState::Waiting, Some("approval".into()))
+            .unwrap();
+        let tid = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let mut events = mgr.subscribe_events();
+        mgr.resume_thread(
+            tid,
+            "user",
+            Some(ThreadMessage::action_result(
+                "call-http",
+                "http",
+                "approved output",
+            )),
+            Some(("call-http".into(), true)),
+            Some("call-http".into()),
+        )
+        .await
+        .unwrap();
+
+        let resumed = store.load_thread(tid).await.unwrap().unwrap();
+        assert!(
+            !resumed.config.require_action_attempt,
+            "the approved action result must satisfy the one-shot action requirement"
+        );
+
+        wait_for_delta(&mut events).await;
+        mgr.stop_thread(tid, "user").await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), mgr.join_thread(tid))
+            .await
+            .expect("resumed stop should be prompt")
+            .expect("thread should join");
+        assert!(matches!(outcome, ThreadOutcome::Stopped));
+    }
+
+    #[tokio::test]
+    async fn wrong_owner_cannot_cancel_stream() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(PendingStreamLlm {
+            opened: Notify::new(),
+            drop_count: Arc::clone(&drop_count),
+            stream_calls: AtomicUsize::new(0),
+        });
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(llm, Arc::clone(&store));
+        let project = ProjectId::new();
+
+        let mut events = mgr.subscribe_events();
+        let tid = mgr
+            .spawn_thread(
+                "t",
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "owner",
+            )
+            .await
+            .unwrap();
+        wait_for_delta(&mut events).await;
+
+        // A different user cannot stop the thread; the stream keeps running.
+        let denied = mgr.stop_thread(tid, "intruder").await.unwrap_err();
+        assert!(matches!(denied, EngineError::AccessDenied { .. }));
+        assert!(mgr.is_running(tid).await);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+
+        // The owning user can stop it.
+        mgr.stop_thread(tid, "owner").await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), mgr.join_thread(tid))
+            .await
+            .expect("owner stop should be prompt")
+            .expect("thread should join");
+        assert!(matches!(outcome, ThreadOutcome::Stopped));
     }
 
     #[tokio::test]

@@ -1106,6 +1106,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_drop_before_done_does_not_record_response() {
+        // The stream carries a terminal Done, but the consumer drops after the
+        // first delta. A response is recorded only when Done is consumed, so the
+        // trace keeps just the UserInput marker.
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![StreamScript::Items(vec![
+                Ok(LlmStreamChunk::TextDelta("partial".to_string())),
+                Ok(LlmStreamChunk::Done {
+                    usage: Some(TokenUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_read_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                    }),
+                    finish_reason: "stop".to_string(),
+                }),
+            ])],
+            vec![],
+        ));
+        let recorder = make_stream_recorder(provider);
+
+        let mut stream = recorder
+            .complete_stream(stream_request())
+            .await
+            .expect("stream should open");
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "partial"
+        ));
+        drop(stream);
+
+        let steps = recorder.steps.lock().await;
+        assert_eq!(steps.len(), 1);
+        assert!(matches!(steps[0].response, TraceResponse::UserInput { .. }));
+    }
+
+    #[tokio::test]
     async fn plain_stream_rejects_tool_delta_without_recording() {
         let provider = Arc::new(ScriptedStreamingProvider::new(
             "scripted",

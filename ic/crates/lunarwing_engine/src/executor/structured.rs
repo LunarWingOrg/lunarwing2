@@ -329,6 +329,7 @@ fn classify_exec_result(
                 call_id: call.id.clone(),
                 duration_ms: action_result.duration.as_millis() as u64,
                 params_summary: None,
+                result_preview: crate::types::event::preview_from_output(&action_result.output),
             };
             (action_result, event)
         }
@@ -539,11 +540,13 @@ mod tests {
         if let Some(EventKind::ActionExecuted {
             call_id,
             action_name,
+            result_preview,
             ..
         }) = exec_event
         {
             assert_eq!(call_id, "call_r2o5mqBgdNUlH8KzskncUGaX");
             assert_eq!(action_name, "web_search");
+            assert_eq!(result_preview.as_deref(), Some("{\"results\":[]}"));
         }
     }
 

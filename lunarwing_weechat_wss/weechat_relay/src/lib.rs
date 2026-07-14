@@ -1848,6 +1848,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_response_routing_metadata_roundtrip() {
+        let metadata = WeechatMessageMetadata {
+            buffer: "irc.libera.#lunarwing".to_string(),
+            network: "libera".to_string(),
+            target: "#lunarwing".to_string(),
+            nick: "alice".to_string(),
+            is_dm: false,
+        };
+        let encoded = serde_json::to_string(&metadata).expect("metadata should serialize");
+        let decoded: WeechatMessageMetadata =
+            serde_json::from_str(&encoded).expect("metadata should deserialize");
+
+        assert_eq!(decoded.buffer, "irc.libera.#lunarwing");
+        assert_eq!(decoded.network, "libera");
+        assert_eq!(decoded.target, "#lunarwing");
+        assert_eq!(decoded.nick, "alice");
+        assert!(!decoded.is_dm);
+    }
+
+    #[test]
     fn test_pairing_instructions_uses_lunarwing_binary() {
         let msg = pairing_instructions(CHANNEL_NAME, "XN1234");
         assert!(

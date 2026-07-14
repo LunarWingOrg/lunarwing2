@@ -168,6 +168,36 @@ The auth token is generated during tenant creation. To retrieve it:
 grep GATEWAY_AUTH_TOKEN /home/<tenant>/lunarwing/env/lunarwing.env
 ```
 
+## Engine V2 Channel Rollout
+
+Engine V2 is disabled unless `ENGINE_V2=true`. When enabled, the gateway uses
+Engine V2 by default and other channels remain on the legacy engine unless they
+are explicitly allowlisted:
+
+```bash
+ENGINE_V2=true
+ENGINE_V2_CHANNELS=                 # gateway only
+ENGINE_V2_CHANNELS=xmpp             # gateway plus XMPP
+ENGINE_V2_CHANNELS=xmpp,weechat     # gateway plus XMPP and WeeChat
+```
+
+The only eligible non-gateway names are `xmpp`, `darkirc`, and `weechat`.
+Entries are comma-separated, trimmed, lowercased, and matched exactly; empty or
+unknown entries do nothing. `ENGINE_V2=false` disables Engine V2 for every
+channel regardless of the allowlist.
+
+Gateway responses stream incrementally. Current WASM channels ignore provider
+chunks and receive one final response through their existing `on_respond`
+contract, preserving the original JID/room, nick, or buffer metadata. No WIT
+migration or WASM reinstall is required for this rollout.
+
+Enable one configured channel at a time and restart through
+`lunarwing-mt-admin.sh`. To roll back a channel, remove only its allowlist entry
+and restart the tenant. Setting `ENGINE_V2_CHANNELS=` immediately restores the
+gateway-only default without a database migration or state restore. Back up the
+tenant env file before introducing the key; do not replace the rest of `env/` or
+anything under `state/`.
+
 ## WASM Extensions
 
 ```bash

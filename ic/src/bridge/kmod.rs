@@ -37,6 +37,8 @@ pub use router::{
     handle_interrupt,
     handle_new_thread,
     handle_with_engine,
+    has_active_engine_thread,
+    has_matching_engine_approval,
     has_pending_auth,
     // Initialization
     init_engine,
@@ -50,6 +52,7 @@ pub use router::{
     resolve_engine_auth_callback,
     resolve_gate,
     resume_engine_mission,
+    should_route_to_engine_v2,
 };
 
 #[cfg(feature = "libsql")]

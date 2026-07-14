@@ -4,29 +4,41 @@ This document audits the accuracy of
 [`WEECHAT_SERVICES_FOR_MT_INFODUMP.md`](WEECHAT_SERVICES_FOR_MT_INFODUMP.md)
 against the current codebase and running configurations.
 
+**Re-verified:** 2026-07-13 against branch `rarity/item-1-20260713-2101`.
+
 ## Summary
 
-**Overall verdict: accurate.** Every component, port offset, environment variable,
-subcommand, and service-unit reference in the infodump exists in the current
-codebase. No stale or misleading claims were found. There are a few
-system-runtime checks that can only be verified against a live deployment; those
-are called out below.
+**Overall verdict: mostly accurate, with one naming discrepancy and several
+stale line numbers.** Every component, port offset, environment variable,
+subcommand, and backfill mechanism described in the infodump exists in the
+current codebase. However:
+
+1. **Naming discrepancy (material):** The infodump uses `weechat-<name>` for
+   the WeeChat service unit / init script in several places, but the actual
+   rendered name is `lunarwing-weechat-<name>` (with the `lunarwing-` prefix).
+   This affects systemd units, OpenRC init scripts, dependency wiring, and
+   `lunarwing_rc_need`.
+2. **Stale line numbers:** Several `lunarwing-mt-admin.sh` line references have
+   drifted as the script grew. Corrected below.
+3. **Misattributed citation:** `setup.rs:540-541` was cited for "WASM channel
+   sends directly to relay" but those lines are test-config field definitions,
+   not relay-sending code.
 
 ## Component Map
 
 | Claim in infodump | Status | Evidence |
 |---|---|---|
 | 3 components: WeeChat, ws_adapter.py, WASM channel | ✅ Verified | [`ic/src/channels/wasm/bundled.rs:22`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/src/channels/wasm/bundled.rs) — `("weechat", "weechat_relay_channel")` |
-| Adapter at `lunarwing_weechat_wss/weechat_relay/ws_adapter.py` | ✅ Verified | File exists at repo root |
-| POLICY: WASM channel polls adapter every 3s | ⚠ Not directly grepped | Polling interval is set in WASM channel runtime; verifiable only at runtime |
-| WASM channel sends directly to relay | ✅ Verified | [`ic/src/channels/wasm/setup.rs:540-541`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/src/channels/wasm/setup.rs) |
-| Dependency chain weechat → adapter → daemon | ✅ Verified | `Requires=`/`After=` wired in [`ic/scripts/lunarwing-mt-admin.sh:4754-4756`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
+| Adapter at `lunarwing_weechat_wss/weechat_relay/ws_adapter.py` | ✅ Verified | File exists at repo root; path resolved at [`ic/scripts/lunarwing-mt-admin.sh:4706`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
+| POLICY: WASM channel polls adapter every 3s | ⚠ Not directly grepped | Polling interval lives in WASM channel runtime source (not in this repo) |
+| WASM channel sends directly to relay | ✅ Architecturally verified | The infodump's architecture diagram is consistent with the design. No single line citation is possible — the send logic is in the compiled WASM channel, not in the Rust setup code. The original citation of `setup.rs:540-541` was incorrect (those lines are test-config field definitions, not relay-sending code). |
+| Dependency chain weechat → adapter → daemon | ✅ Verified | `Requires=`/`After=` wired at [`ic/scripts/lunarwing-mt-admin.sh:4754-4756`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) (systemd); `need`/`before` at lines 5384-5385 and 5443-5444 (OpenRC) |
 
 ## Port Allocation
 
 | Claim | Status | Evidence |
 |---|---|---|
-| 10-port block per tenant | ✅ Verified | [`ic/scripts/lunarwing-mt-admin.sh:1283-1294`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
+| 10-port block per tenant | ✅ Verified | [`ic/scripts/lunarwing-mt-admin.sh:1281-1294`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
 | `weechat` = base+5 | ✅ Verified | `weechat: ($base + 5)` at line 1289 |
 | `weechat_adapter` = base+9 | ✅ Verified | `weechat_adapter: ($base + 9)` at line 1293 |
 | Both bind `127.0.0.1` only | ✅ Verified | The default WeeChat relay setup (`bind_address` set via WeeChat `/set`) defaults to localhost-only |
@@ -49,18 +61,19 @@ by the installer and consumed by the components shown.
 — it does not read them directly from the environment at the process level. The
 env vars are loaded by the daemon and injected into WASM channel config as
 structured fields. See the test at
-[`ic/src/channels/wasm/setup.rs:671-684`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/src/channels/wasm/setup.rs).
+[`ic/src/channels/wasm/setup.rs:671-689`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/src/channels/wasm/setup.rs)
+(`weechat_relay_password_injected_from_env`).
 
 ## mt-admin Subcommands
 
 | Subcommand | Status | Location |
 |---|---|---|
-| `patch-env <name>` | ✅ Exists | [`ic/scripts/lunarwing-mt-admin.sh:7025-7031`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
-| `render-units <name>` | ✅ Exists | lines 316, 6877-6879 |
-| `stop-tenant <name>` | ✅ Exists | lines 314, 6865-6867 |
-| `start-tenant <name>` | ✅ Exists | lines 313, 6859-6861 |
-| `add-tenant <name>` | ✅ Exists | lines 239, 6675-6680 |
-| `patch-env-all` | ✅ Exists (bonus) | line 352, 7036 |
+| `patch-env <name>` | ✅ Exists | [`ic/scripts/lunarwing-mt-admin.sh:7028-7034`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
+| `render-units <name>` | ✅ Exists | help line 316, case at 6877 |
+| `stop-tenant <name>` | ✅ Exists | help line 314, case at 6865 |
+| `start-tenant <name>` | ✅ Exists | help line 313, case at 6859 |
+| `add-tenant <name>` | ✅ Exists | help line 239, case at 6640 |
+| `patch-env-all` | ✅ Exists (bonus) | help line 352, case at 7036 |
 
 Note: the infodump uses the shortened `mt-admin` invocation in examples. The
 canonical script name is `lunarwing-mt-admin.sh` (no `mt-admin` symlink in the
@@ -71,51 +84,75 @@ repo). On a typical deployment, operators will use the full path
 
 ### Systemd (user-level)
 
-| Claim | Status | Evidence |
+| Claim in infodump | Status | Evidence |
 |---|---|---|
 | Units installed to `~/.config/systemd/user/` | ✅ Verified | Standard systemd user-unit path |
-| `weechat-<name>.service` uses `Type=forking` | ✅ Verified at render time | [`ic/scripts/lunarwing-mt-admin.sh:4740-4748`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
+| WeeChat unit uses `Type=forking` | ✅ Verified | [`ic/scripts/lunarwing-mt-admin.sh:4740`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
 | `ExecStart` uses `tmux -L weechat-<name> new-session -d -s weechat` | ✅ Verified | line 4741 |
 | `ExecStop` uses `tmux -L weechat-<name> kill-session -t weechat` | ✅ Verified | line 4742 |
-| `lunarwing-weechat-adapter-<name>.service` has `PartOf=lunarwing-<name>.service` | ✅ Verified | line 4756 |
-| `Requires=weechat-<name>.service` on adapter | ✅ Verified | line 4755 |
+| Adapter unit has `PartOf=lunarwing-<name>.service` | ✅ Verified | line 4756 |
+| Adapter has `Requires=` on WeeChat unit | ✅ Verified | line 4755 |
 | `EnvironmentFile=<env_dir>/lunarwing.env` | ✅ Verified | line 4761 |
 | `WorkingDirectory=<repo>/lunarwing_weechat_wss/weechat_relay` | ✅ Verified | line 4760 |
 
-**Minor deviations from infodump example:**
+**⚠ Naming discrepancy discovered:**
 
-- The rendered `weechat` adapter unit is named
-  `lunarwing-weechat-adapter-<name>.service` (prefixed with `lunarwing-`),
-  whereas the infodump's description says `lunarwing-weechat-adapter-<name>`
-  without the outer `lunarwing-` prefix before the daemon name check. Checking
-  the adapter unit file: rendered name is
-  `lunarwing-weechat-adapter-<name>.service`, which matches `lunarwing-<name>`.
-  The infodump example used `lunarwing-weechat-adapter-<name>.service` which is
-  verbatim identical. ✅ Consistent.
+The infodump describes the WeeChat systemd unit as `weechat-<name>.service` and
+the OpenRC init script as `weechat-<name>`. The **actual rendered names** are:
 
-  Wait — let me clarify. The infodump specifies the adapter unit as
-  `lunarwing-weechat-adapter-<name>.service` (lines 103-123) and the rendered
-  name at line 4751 is exactly `lunarwing-weechat-adapter-${name}.service`.
-  These match character-for-character. ✅
+| Infodump name | Actual rendered name | Rendered at |
+|---|---|---|
+| `weechat-<name>.service` | `lunarwing-weechat-<name>.service` | `lunarwing-mt-admin.sh:4734` |
+| `weechat-<name>` (OpenRC) | `lunarwing-weechat-<name>` | `lunarwing-mt-admin.sh:5362` |
 
-- The infodump lists `ExecStart=/usr/bin/python3 <repo>/lunarwing_weechat_wss/...`.
-  The actual rendered unit uses `$(command -v python3)` which is more portable.
-  This is a non-discrepancy — `command -v python3` typically resolves to
-  `/usr/bin/python3`. The rendered unit also expands `<repo>` to the tenant's
-  actual clone path via `tenant_lw_root`. ✅ Functionally equivalent.
+The `lunarwing-` prefix is present on all WeeChat service names. The adapter
+unit name (`lunarwing-weechat-adapter-<name>`) is correct in the infodump.
+
+This discrepancy propagates to the main daemon unit's dependency wiring. The
+infodump shows:
+
+```ini
+After=... weechat-<name>.service lunarwing-weechat-adapter-<name>.service
+Wants=... weechat-<name>.service lunarwing-weechat-adapter-<name>.service
+```
+
+The actual rendered unit ([line 4858-4859](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh)):
+
+```ini
+After=... lunarwing-weechat-<name>.service lunarwing-weechat-adapter-<name>.service
+Wants=... lunarwing-weechat-<name>.service lunarwing-weechat-adapter-<name>.service
+```
+
+**Impact:** Low — the rendered units are internally consistent (the unit file
+name, the `Requires=`/`After=` references, and the `Wants=` all use
+`lunarwing-weechat-<name>`). An operator following the infodump's example
+commands using `weechat-<name>` instead of `lunarwing-weechat-<name>` would get
+"unit not found" errors. **Recommendation: update the infodump to use the
+correct `lunarwing-weechat-<name>` naming throughout.**
+
+**Minor non-discrepancy:** The infodump shows
+`ExecStart=/usr/bin/python3 <repo>/...`. The actual rendered unit uses
+`$(command -v python3)` which is more portable. Functionally equivalent.
 
 ### OpenRC (system-level)
 
 | Claim | Status | Evidence |
 |---|---|---|
 | Init scripts in `/etc/init.d/` | ✅ Standard OpenRC layout | Not contradicted by codebase |
-| `lunarwing_rc_need` includes `weechat-<name>` and `lunarwing-weechat-adapter-<name>` | ✅ Verified | [`ic/scripts/lunarwing-mt-admin.sh:5544`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
-| `before lunarwing-<name>` ordering | ✅ Standard supervise-daemon pattern in rendered OpenRC services |
+| WeeChat OpenRC init script name | ⚠ **`lunarwing-weechat-<name>`, not `weechat-<name>`** | [`ic/scripts/lunarwing-mt-admin.sh:5362`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
+| Adapter OpenRC init script name | ✅ `lunarwing-weechat-adapter-<name>` | line 5406 |
+| `lunarwing_rc_need` includes WeeChat services | ✅ Verified | [`ic/scripts/lunarwing-mt-admin.sh:5544`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
+| `before lunarwing-<name>` ordering | ✅ Standard supervise-daemon pattern in rendered OpenRC services | lines 5384-5385, 5443-5444 |
 
-**Note:** the infodump's OpenRC `depend()` block example uses the shorthand
-adapter name `lunarwing-weechat-adapter-<name>`. Actual OpenRC service names
-are prefixed with `lunarwing-` → `lunarwing-weechat-adapter-<name>`, which
-matches. ✅
+**Same naming discrepancy as systemd:** The infodump's OpenRC `depend()` blocks
+and conf.d examples reference `weechat-<name>` where the actual rendered
+services use `lunarwing-weechat-<name>`. For example:
+
+- Infodump `depend()`: `need net weechat-<name>`
+- Actual rendered: `need net lunarwing-weechat-<name>` (line 5443)
+
+- Infodump `lunarwing_rc_need`: `weechat-<name> lunarwing-weechat-adapter-<name>`
+- Actual rendered: `lunarwing-weechat-<name> lunarwing-weechat-adapter-<name>` (line 5544)
 
 ## Known-Issue: `LUNARWING_BASE_DIR` and Pairing Approve
 
@@ -149,11 +186,12 @@ These items were open at the time of the original infodump and are now resolved:
 
 | Issue | Status |
 |---|---|
-| `WS_ADAPTER_URL` backfill for existing tenants via `patch-env` | ✅ Implemented ([`ic/scripts/lunarwing-mt-admin.sh:2977-2979`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh)) |
-| `RELAY_URL` backfill via same | ✅ Implemented (lines 2983-2990) |
-| `weechat_adapter` port migration (v4→v5 of ports.json) | ✅ Historical migration exists (lines 957-967) |
-| WASM channel config `relay_url`, `ws_adapter_url`, `relay_password` env-source | ✅ Implemented ([`ic/src/channels/wasm/setup.rs:493,540-541`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/src/channels/wasm/setup.rs)) |
-| OpenRC conf.d includes weechat ports | ✅ Verified (`lunarwing_rc_need` at line 5544) |
+| `WS_ADAPTER_URL` backfill for existing tenants via `patch-env` | ✅ Implemented ([`ic/scripts/lunarwing-mt-admin.sh:2975-2979`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh)) |
+| `RELAY_URL` backfill via same | ✅ Implemented (lines 2985-2990) |
+| `weechat_adapter` port migration (v4→v5 of ports.json) | ✅ Historical migration exists ([`ports_migrate_v5()` at line 956](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh)) |
+| WASM channel config `relay_password` env-source | ✅ Implemented ([`ic/src/channels/wasm/setup.rs:493`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/src/channels/wasm/setup.rs)) |
+| WASM channel config `relay_url`, `ws_adapter_url` env-source | ✅ Implemented via capabilities-env bridge (fields with `"env"` key in `ChannelCapabilitiesFile`) |
+| OpenRC conf.d includes WeeChat ports | ✅ Verified (`lunarwing_rc_need` at line 5544) |
 
 ## Outstanding / Only Verifiable at Runtime
 
@@ -170,7 +208,12 @@ These claims are constructed but can only be confirmed on a live deployment:
 
 ## Recommendations
 
-1. **Left as-is.** The infodump is accurate; no correction needed.
+1. **Fix the naming discrepancy.** Update the infodump to use
+   `lunarwing-weechat-<name>` (with the `lunarwing-` prefix) consistently for:
+   the systemd unit name (`weechat-<name>.service` → `lunarwing-weechat-<name>.service`),
+   the OpenRC init script (`weechat-<name>` → `lunarwing-weechat-<name>`),
+   the main daemon's `After=`/`Wants=` references, the adapter's `Requires=`,
+   the OpenRC `depend()` `need`/`after` entries, and `lunarwing_rc_need`.
 2. **Optional:** add a `pairing-wrapper` subcommand to the CLI that
    auto-injects `LUNARWING_BASE_DIR` from the tenant env file when called with
    `--tenant <name>`. This would close the only remaining ergonomic gap.

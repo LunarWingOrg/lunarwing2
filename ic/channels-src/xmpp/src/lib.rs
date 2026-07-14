@@ -544,4 +544,38 @@ fn json_response(status: u16, value: serde_json::Value) -> OutgoingHttpResponse 
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_routing_prefers_target_and_falls_back_to_room() {
+        let direct = serde_json::json!({
+            "xmpp_target": "alice@example.org",
+            "xmpp_room": "room@conference.example.org",
+            "xmpp_type": "chat",
+        });
+        assert_eq!(
+            target_from_metadata_json(&direct.to_string()).as_deref(),
+            Some("alice@example.org")
+        );
+
+        let room = serde_json::json!({
+            "xmpp_room": "room@conference.example.org",
+            "xmpp_type": "groupchat",
+        });
+        assert_eq!(
+            target_from_metadata_json(&room.to_string()).as_deref(),
+            Some("room@conference.example.org")
+        );
+        assert!(metadata_is_groupchat(&room.to_string()));
+    }
+
+    #[test]
+    fn response_routing_rejects_missing_or_invalid_metadata() {
+        assert!(target_from_metadata_json("{}").is_none());
+        assert!(target_from_metadata_json("not-json").is_none());
+    }
+}
+
 export!(XmppChannel);

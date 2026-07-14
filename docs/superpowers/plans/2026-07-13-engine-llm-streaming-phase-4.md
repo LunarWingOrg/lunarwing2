@@ -18,6 +18,11 @@ returns a typed stopped result instead of an LLM error.
 `CancellationToken`, `futures 0.3` streams, Engine V2 thread events, existing
 gateway/channel response suppression.
 
+**Status (2026-07-13): Complete.** The cancellation implementation, corrective
+interrupt-aware dispatcher, local verification matrix, Brightdawn release
+deployment, and live TensorZero `2026.3.2` gate all passed. Phase 5 remains
+separate.
+
 ---
 
 ## Fixed Decisions And Boundaries
@@ -879,20 +884,71 @@ the next turn remains cancelled. Roll back the tenant binary/source to the last
 known-good Phase 3 commit and restart with `lunarwing-mt-admin.sh`; do not alter
 `env/` or `state/`.
 
+### Task 8: Correct The Live Ingress Scheduling Blocker
+
+The first Brightdawn live gate failed before cancellation routing was reached.
+The target thread started at `20:24:08Z`, completed normally at `20:25:39Z`, and
+the queued `/interrupt` was not parsed until `20:25:58Z`. `Agent::run()` awaited
+the ordinary `handle_message()` task before polling channel input again.
+
+- [x] Add an agent-level pending-acquisition regression and observe RED: the old
+  loop returned zero responses at the two-second deadline.
+- [x] Add parser-based priority classification plus a bounded 256-message FIFO.
+- [x] Keep one ordinary handler active while exact `/interrupt` and `/stop`
+  controls use the existing `handle_message()` and outbound-hook path.
+- [x] Preserve soft-timeout detachment and the independent hard-kill
+  `AbortHandle`; abort and await the active task for process shutdown.
+- [x] Cover FIFO priority, real-capacity overflow, unmatched scoped fallback,
+  timeout suppression, and single-acknowledgement cancellation in the isolated
+  `engine_v2_interrupt_ingress` target (`5 passed; 0 failed`).
+- [x] Run local gates: Engine `322/322`, agent loop `17/17`, dispatcher `2/2`,
+  bridge/router `30/30`, default/PostgreSQL/libSQL checks, formatting, and
+  zero-warning Clippy.
+- [x] Push the corrected integration branch, rebuild Brightdawn without touching
+  tenant `env/`, `state/`, or installed WASM artifacts, and repeat the measured
+  TensorZero `2026.3.2` live gate.
+
+### Task 9: Complete The Corrected Brightdawn Gate
+
+- [x] Push `83af2e6` and confirm local/origin equality on
+  `integration/enginep4p5-uifix-skillsb2b3/v2.0.0.0`.
+- [x] Fast-forward only `/home/brightdawn/lunarwing` source after proving the
+  incoming paths did not overlap its modified nested lockfiles or untracked
+  `env/` and `state/` directories.
+- [x] Build `lunarwing` in release mode with `taskset -c 0-5` and `-j6`. The
+  single tmux build completed in 3m17s without rebuilding or reinstalling WASM.
+- [x] Restart through `ic/scripts/lunarwing-mt-admin.sh`; tenant status, gateway
+  health, and agent status passed.
+- [x] Calibrate the live harness to the dispatcher contract: ordinary messages
+  remain globally serialized, so the second thread must remain queued until the
+  first thread is interrupted. Recovery and isolation assert scoped streaming,
+  completion, persistence, and absence of errors rather than exact model wording.
+- [x] Pass the live gate at `2026-07-13T18:52:49-04:00` with exit status `0`:
+  primary thread `93d0d61d-6a2f-4593-972a-d1f8100724f7`, isolation thread
+  `67142c06-b447-4c05-9a46-bb637a798dee`, four initial chunks, 11 ms first
+  acknowledgement, stable count of four after quiescence, zero persisted
+  cancelled assistant responses, 14 recovery chunks, one persisted recovery,
+  zero isolation chunks while queued, 10 ms second acknowledgement, and one
+  terminal/persisted isolation response.
+- [x] Scan the scoped journal window. It contained no panic, receiver lag,
+  rollback/failure signal, or duplicate response. Tenant `env/`, `state/`,
+  installed WASM artifacts, and pre-existing nested lockfile changes remained
+  intact.
+
 ## Phase 4 Completion Gate
 
 Phase 4 is complete only when every item below is true:
 
-- [ ] Active stream acquisition or collection is dropped promptly.
-- [ ] The outcome is exactly `ThreadOutcome::Stopped`.
-- [ ] No provider delta is produced after cancellation; any delta already queued
+- [x] Active stream acquisition or collection is dropped promptly.
+- [x] The outcome is exactly `ThreadOutcome::Stopped`.
+- [x] No provider delta is produced after cancellation; any delta already queued
   before the request is bounded and recorded. No synthetic `Done`, cancelled-call
   usage, cache entry, trace response, assistant message, or terminal channel
   response is committed.
-- [ ] Existing between-step `ThreadSignal::Stop` behavior still passes.
-- [ ] Cancellation is isolated by owner and conversation scope.
-- [ ] Resume and subsequent new turns use fresh, non-cancelled tokens.
-- [ ] Gateway interrupt reaches Engine V2 and returns one acknowledgement.
-- [ ] All local checks pass under the six-thread constraint.
-- [ ] Brightdawn passes the live TensorZero `2026.3.2` gate without changing
+- [x] Existing between-step `ThreadSignal::Stop` behavior still passes.
+- [x] Cancellation is isolated by owner and conversation scope.
+- [x] Resume and subsequent new turns use fresh, non-cancelled tokens.
+- [x] Gateway interrupt reaches Engine V2 and returns one acknowledgement.
+- [x] All local checks pass under the six-thread constraint.
+- [x] Brightdawn passes the live TensorZero `2026.3.2` gate without changing
   tenant `env/`, tenant `state/`, or installed WASM channels.
