@@ -18,7 +18,7 @@ use lunarwing::error::LlmError;
 use lunarwing::hooks::{Hook, HookContext, HookError, HookEvent, HookOutcome, HookPoint};
 use lunarwing::llm::{
     CompletionRequest, CompletionResponse, FinishReason, LlmProvider, LlmStream, LlmStreamChunk,
-    TokenUsage, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
+    Role, TokenUsage, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
 };
 use lunarwing::tools::{ApprovalRequirement, Tool, ToolError, ToolOutput};
 
@@ -27,6 +27,8 @@ use support::test_rig::TestRigBuilder;
 
 const TERMINAL_RESPONSE: &str = "channel-final";
 const AUTH_TERMINAL_RESPONSE: &str = "authenticated-final";
+const APPROVAL_CALL_ID: &str = "callgate1";
+const APPROVAL_REPLAY_CALL_ID: &str = "callgate2";
 const OUTBOUND_POINTS: [HookPoint; 1] = [HookPoint::BeforeOutbound];
 
 struct DeterministicStreamingLlm;
@@ -61,13 +63,22 @@ impl ApprovalLlm {
         }
     }
 
-    fn next_stream(&self) -> Result<LlmStream<'static>, LlmError> {
+    fn has_executed_result(request: &ToolCompletionRequest) -> bool {
+        request.messages.iter().any(|message| {
+            message.role == Role::Tool
+                && message.tool_call_id.as_deref() == Some(APPROVAL_CALL_ID)
+                && message.name.as_deref() == Some("phase5_gate")
+                && message.content.contains("gate executed")
+        })
+    }
+
+    fn next_stream(&self, has_executed_result: bool) -> Result<LlmStream<'static>, LlmError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         let chunks = match call {
             0 => vec![
                 Ok(LlmStreamChunk::ToolCallDelta {
                     index: 0,
-                    id: Some("callgate1".to_string()),
+                    id: Some(APPROVAL_CALL_ID.to_string()),
                     name: Some("phase5_gate".to_string()),
                     args_delta: "{}".to_string(),
                 }),
@@ -76,13 +87,25 @@ impl ApprovalLlm {
                     finish_reason: "tool_calls".to_string(),
                 }),
             ],
-            1 => vec![
+            1 if has_executed_result => vec![
                 Ok(LlmStreamChunk::TextDelta(
                     "```repl\nFINAL('approved-final')\n```".to_string(),
                 )),
                 Ok(LlmStreamChunk::Done {
                     usage: Some(TokenUsage::default()),
                     finish_reason: "stop".to_string(),
+                }),
+            ],
+            1 => vec![
+                Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some(APPROVAL_REPLAY_CALL_ID.to_string()),
+                    name: Some("phase5_gate".to_string()),
+                    args_delta: "{}".to_string(),
+                }),
+                Ok(LlmStreamChunk::Done {
+                    usage: Some(TokenUsage::default()),
+                    finish_reason: "tool_calls".to_string(),
                 }),
             ],
             _ => return Err(provider_failure()),
@@ -349,19 +372,20 @@ impl LlmProvider for ApprovalLlm {
         &self,
         _request: CompletionRequest,
     ) -> Result<LlmStream<'_>, LlmError> {
-        self.next_stream()
+        self.next_stream(false)
     }
 
     async fn complete_with_tools(
         &self,
-        _request: ToolCompletionRequest,
+        request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
+        let has_executed_result = Self::has_executed_result(&request);
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         match call {
             0 => Ok(ToolCompletionResponse {
                 content: None,
                 tool_calls: vec![ToolCall {
-                    id: "callgate1".to_string(),
+                    id: APPROVAL_CALL_ID.to_string(),
                     name: "phase5_gate".to_string(),
                     arguments: serde_json::json!({}),
                     reasoning: None,
@@ -372,12 +396,26 @@ impl LlmProvider for ApprovalLlm {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             }),
-            1 => Ok(ToolCompletionResponse {
+            1 if has_executed_result => Ok(ToolCompletionResponse {
                 content: Some("```repl\nFINAL('approved-final')\n```".to_string()),
                 tool_calls: Vec::new(),
                 input_tokens: 1,
                 output_tokens: 1,
                 finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }),
+            1 => Ok(ToolCompletionResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: APPROVAL_REPLAY_CALL_ID.to_string(),
+                    name: "phase5_gate".to_string(),
+                    arguments: serde_json::json!({}),
+                    reasoning: None,
+                }],
+                input_tokens: 1,
+                output_tokens: 1,
+                finish_reason: FinishReason::ToolUse,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             }),
@@ -387,9 +425,9 @@ impl LlmProvider for ApprovalLlm {
 
     async fn complete_with_tools_stream(
         &self,
-        _request: ToolCompletionRequest,
+        request: ToolCompletionRequest,
     ) -> Result<LlmStream<'_>, LlmError> {
-        self.next_stream()
+        self.next_stream(Self::has_executed_result(&request))
     }
 }
 
@@ -802,6 +840,24 @@ async fn wait_for_approval_status(rig: &support::test_rig::TestRig) -> bool {
     .is_ok()
 }
 
+async fn wait_for_approval_completion_or_replay(rig: &support::test_rig::TestRig) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let approval_count = rig
+                .captured_status_events()
+                .iter()
+                .filter(|status| matches!(status, StatusUpdate::ApprovalNeeded { .. }))
+                .count();
+            if !rig.captured_responses().is_empty() || approval_count > 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("approved action should complete or expose an approval replay");
+}
+
 async fn wait_for_auth_status_count(rig: &support::test_rig::TestRig, expected: usize) -> bool {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -888,7 +944,16 @@ async fn assert_approval_case() {
         .with_conversation_scope(scope.clone())
         .with_metadata(metadata);
     rig.send_incoming(approval).await;
-    let responses = rig.wait_for_responses(1, Duration::from_secs(10)).await;
+    wait_for_approval_completion_or_replay(&rig).await;
+    assert_eq!(
+        rig.captured_status_events()
+            .iter()
+            .filter(|status| matches!(status, StatusUpdate::ApprovalNeeded { .. }))
+            .count(),
+        1,
+        "the approved action must not create a second approval gate"
+    );
+    let responses = rig.captured_responses();
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0].content, "approved-final");
     assert_eq!(executions.load(Ordering::SeqCst), 1);

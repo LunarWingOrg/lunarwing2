@@ -194,15 +194,12 @@ fn gate_display_parameters(pending: &PendingGate) -> serde_json::Value {
 }
 
 fn resumed_action_result_message(
+    call_id: &str,
     action_name: &str,
     output: &serde_json::Value,
 ) -> lunarwing_engine::ThreadMessage {
     let rendered = serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
-    lunarwing_engine::ThreadMessage::user(format!(
-        "The pending action '{action_name}' has already been executed.\n\
-         Do not call it again unless the user explicitly asks.\n\
-         Continue from this result:\n{rendered}"
-    ))
+    lunarwing_engine::ThreadMessage::action_result(call_id, action_name, rendered)
 }
 
 async fn insert_and_notify_pending_gate(
@@ -464,6 +461,7 @@ async fn execute_pending_gate_action(
                     pending.thread_id,
                     message.user_id.clone(),
                     Some(resumed_action_result_message(
+                        &pending.call_id,
                         &pending.action_name,
                         &result.output,
                     )),
@@ -1254,7 +1252,7 @@ pub async fn resolve_engine_auth_callback(
             pending.thread_id,
             user_id.to_string(),
             pending.resume_output.as_ref().map(|resume_output| {
-                resumed_action_result_message(&pending.action_name, resume_output)
+                resumed_action_result_message(&pending.call_id, &pending.action_name, resume_output)
             }),
             None,
             Some(pending.call_id.clone()),
@@ -1815,6 +1813,7 @@ pub async fn resolve_gate(
                             pending.thread_id,
                             message.user_id.clone(),
                             Some(resumed_action_result_message(
+                                &pending.call_id,
                                 &pending.action_name,
                                 &resume_output,
                             )),
@@ -1860,6 +1859,7 @@ pub async fn resolve_gate(
                         pending.thread_id,
                         message.user_id.clone(),
                         Some(resumed_action_result_message(
+                            &pending.call_id,
                             &pending.action_name,
                             &resume_output,
                         )),

@@ -246,6 +246,13 @@ impl ThreadManager {
         }
 
         if let Some(message) = injected_message {
+            // Once the orchestrator has materialized an internal transcript, it
+            // becomes the inference source on resume. Keep injected context in
+            // both transcripts so the model sees it and the visible history
+            // retains the existing resume semantics.
+            if !thread.internal_messages.is_empty() {
+                thread.add_internal_message(message.clone());
+            }
             thread.add_message(message);
         }
 
