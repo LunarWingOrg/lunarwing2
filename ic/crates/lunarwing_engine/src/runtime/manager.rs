@@ -18,6 +18,7 @@ use crate::traits::effect::EffectExecutor;
 use crate::traits::llm::LlmBackend;
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
+use crate::types::event::{EventKind, ThreadEvent};
 use crate::types::message::{MessageRole, ThreadMessage};
 use crate::types::project::ProjectId;
 use crate::types::thread::{Thread, ThreadConfig, ThreadId, ThreadState, ThreadType};
@@ -90,6 +91,39 @@ impl ThreadManager {
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::types::event::ThreadEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Persist and broadcast an event produced while a thread awaits a gate.
+    pub async fn record_waiting_event(
+        &self,
+        thread_id: ThreadId,
+        user_id: &str,
+        kind: EventKind,
+    ) -> Result<(), EngineError> {
+        let mut thread = self
+            .store
+            .load_thread(thread_id)
+            .await?
+            .ok_or(EngineError::ThreadNotFound(thread_id))?;
+
+        if !thread.is_owned_by(user_id) {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("thread {thread_id}"),
+            });
+        }
+        if thread.state != ThreadState::Waiting {
+            return Err(EngineError::Store {
+                reason: format!("thread {thread_id} is not waiting"),
+            });
+        }
+
+        let event = ThreadEvent::new(thread_id, kind);
+        thread.events.push(event.clone());
+        thread.updated_at = chrono::Utc::now();
+        self.store.save_thread(&thread).await?;
+        let _ = self.event_tx.send(event);
+        Ok(())
     }
 
     /// Spawn a new thread and start executing it.
@@ -658,7 +692,7 @@ mod tests {
     use crate::types::memory::{DocId, MemoryDoc};
     use crate::types::message::MessageRole;
     use crate::types::project::Project;
-    use crate::types::step::{ActionResult, LlmResponse, Step, TokenUsage};
+    use crate::types::step::{ActionResult, LlmResponse, Step, StepId, TokenUsage};
     use crate::types::thread::ThreadState;
     use futures::{Stream, StreamExt};
     use std::pin::Pin;
@@ -955,6 +989,93 @@ mod tests {
 
         let outcome = mgr.join_thread(tid).await.unwrap();
         assert!(matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "Hello!"));
+    }
+
+    #[tokio::test]
+    async fn record_waiting_event_persists_and_broadcasts_once() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("done"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "approved action",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Waiting;
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let mut receiver = mgr.subscribe_events();
+        mgr.record_waiting_event(
+            thread_id,
+            "alice",
+            EventKind::ActionExecuted {
+                step_id: StepId::new(),
+                action_name: "ssh".into(),
+                call_id: "call-approved".into(),
+                duration_ms: 4,
+                params_summary: None,
+                result_preview: Some("ok".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let delivered = receiver.recv().await.unwrap();
+        let saved = store.load_thread(thread_id).await.unwrap().unwrap();
+        assert_eq!(
+            saved
+                .events
+                .iter()
+                .filter(|event| event.id == delivered.id)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn record_waiting_event_rejects_wrong_owner_and_non_waiting_thread() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("done"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "approved action",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Waiting;
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let event = || EventKind::ActionExecuted {
+            step_id: StepId::new(),
+            action_name: "ssh".into(),
+            call_id: "call-approved".into(),
+            duration_ms: 4,
+            params_summary: None,
+            result_preview: Some("ok".into()),
+        };
+        let mut receiver = mgr.subscribe_events();
+
+        let wrong_owner = mgr.record_waiting_event(thread_id, "bob", event()).await;
+        assert!(matches!(wrong_owner, Err(EngineError::AccessDenied { .. })));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        thread.state = ThreadState::Running;
+        store.save_thread(&thread).await.unwrap();
+        let wrong_state = mgr.record_waiting_event(thread_id, "alice", event()).await;
+        assert!(matches!(wrong_state, Err(EngineError::Store { .. })));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
