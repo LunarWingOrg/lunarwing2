@@ -988,6 +988,7 @@ async fn handle_execute_action(
                     call_id: call_id.clone(),
                     duration_ms: r.duration.as_millis() as u64,
                     params_summary: ps.clone(),
+                    result_preview: crate::types::event::preview_from_output(&r.output),
                 },
                 &call_id,
                 &name,
@@ -1436,6 +1437,7 @@ async fn execute_single_action(
                 call_id: call_id.to_string(),
                 duration_ms: r.duration.as_millis() as u64,
                 params_summary: params_summary.clone(),
+                result_preview: crate::types::event::preview_from_output(&r.output),
             };
             let result_json = serde_json::json!({
                 "action_name": r.action_name,
@@ -1563,6 +1565,7 @@ fn handle_emit_event(
                 call_id,
                 duration_ms: 0,
                 params_summary: None,
+                result_preview: None,
             }
         }
         "action_failed" => {

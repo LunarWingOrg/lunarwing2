@@ -1466,7 +1466,7 @@ mod tests {
             vec![Ok(ActionResult {
                 call_id: String::new(),
                 action_name: "test_tool".into(),
-                output: serde_json::json!({}),
+                output: serde_json::json!({"data": "result"}),
                 is_error: false,
                 duration: Duration::from_millis(1),
             })],
@@ -1493,6 +1493,17 @@ mod tests {
                 "ActionExecuted event must have non-empty call_id"
             );
         }
+
+        let previews: Vec<_> = exec
+            .thread
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::ActionExecuted { result_preview, .. } => result_preview.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(previews, ["{\"data\":\"result\"}"]);
     }
 
     /// When a tool call fails (no lease), the internal ActionResult message and

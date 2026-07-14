@@ -1274,6 +1274,7 @@ async fn resolve_tool_future(
                 call_id: call_id.into(),
                 duration_ms: result.duration.as_millis() as u64,
                 params_summary,
+                result_preview: crate::types::event::preview_from_output(&result.output),
             });
             let monty_val = json_to_monty(&result.output);
             action_results.push(result);
@@ -1650,6 +1651,11 @@ FINAL(str(result))
             result.stdout
         );
         assert_eq!(result.action_results.len(), 1);
+        let preview = result.events.iter().find_map(|event| match event {
+            EventKind::ActionExecuted { result_preview, .. } => result_preview.as_deref(),
+            _ => None,
+        });
+        assert_eq!(preview, Some("hello world"));
     }
 
     // ── asyncio.gather parallel execution ───────────────────
