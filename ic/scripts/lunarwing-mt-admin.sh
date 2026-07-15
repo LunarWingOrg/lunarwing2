@@ -2319,21 +2319,31 @@ configure_weechat_relay() {  # <tenant>
     return 1
   fi
 
-  # Invariant: the weechat.env backfill MUST stay before the preserve-and-fail
-  # check below so legacy existing configs still receive the credential file
+  # Invariant: the weechat.env credential file must exist before the
+  # preserve-and-fail check so legacy existing configs receive the file
   # required by the rendered systemd/OpenRC service unit.
+  #
+  # Non-empty legacy config (preserve-and-fail): backfill weechat.env only
+  # when it does not exist yet, then return 1 — existing env values must
+  # survive alongside the existing config.
   local weechat_env_file
   weechat_env_file="$(tenant_env_dir "$tenant")/weechat.env"
-  if [[ ! -f "$weechat_env_file" ]]; then
-    if ! _write_weechat_env "$tenant" "$relay_password"; then
-      printf 'error: unable to write the dedicated WeeChat credential environment\n' >&2
-      return 1
+  if [[ -d "$target_home" ]] && _weechat_config_dir_has_entries "$target_home"; then
+    if [[ ! -f "$weechat_env_file" ]]; then
+      if ! _write_weechat_env "$tenant" "$relay_password"; then
+        printf 'error: unable to write the dedicated WeeChat credential environment\n' >&2
+        return 1
+      fi
     fi
+    printf 'error: WeeChat config already exists at %s — configure-weechat-relay never overwrites existing config\n' "$target_home" >&2
+    return 1
   fi
 
-  # Refuse if target already has content (preserve-and-fail).
-  if [[ -d "$target_home" ]] && _weechat_config_dir_has_entries "$target_home"; then
-    printf 'error: WeeChat config already exists at %s — configure-weechat-relay never overwrites existing config\n' "$target_home" >&2
+  # Fresh generation path: atomically synchronize weechat.env to the current
+  # lunarwing.env password before generating config. This overwrites stale
+  # values left from a prior tenant or aborted run.
+  if ! _write_weechat_env "$tenant" "$relay_password"; then
+    printf 'error: unable to write the dedicated WeeChat credential environment\n' >&2
     return 1
   fi
 
