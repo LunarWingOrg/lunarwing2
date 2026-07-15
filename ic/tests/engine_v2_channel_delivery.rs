@@ -1,6 +1,5 @@
 mod support;
 
-use std::ffi::OsString;
 use std::future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22,6 +21,7 @@ use lunarwing::llm::{
 };
 use lunarwing::tools::{ApprovalRequirement, Tool, ToolError, ToolOutput};
 
+use support::engine_v2_env::EngineV2EnvGuard;
 use support::test_channel::CapturedDelivery;
 use support::test_rig::TestRigBuilder;
 
@@ -515,59 +515,6 @@ impl LlmProvider for AuthLlm {
         _request: ToolCompletionRequest,
     ) -> Result<LlmStream<'_>, LlmError> {
         self.next_stream()
-    }
-}
-
-struct EngineEnvGuard {
-    engine_v2: Option<OsString>,
-    channels: Option<OsString>,
-}
-
-impl EngineEnvGuard {
-    fn enable(channels: Option<&str>) -> Self {
-        let guard = Self {
-            engine_v2: std::env::var_os("ENGINE_V2"),
-            channels: std::env::var_os("ENGINE_V2_CHANNELS"),
-        };
-
-        // SAFETY: this dedicated integration binary contains one serialized
-        // test, and the guard restores both variables after the agent stops.
-        unsafe {
-            std::env::set_var("ENGINE_V2", "true");
-            match channels {
-                Some(value) => std::env::set_var("ENGINE_V2_CHANNELS", value),
-                None => std::env::remove_var("ENGINE_V2_CHANNELS"),
-            }
-        }
-        guard
-    }
-
-    fn set_channels(&self, channels: Option<&str>) {
-        // SAFETY: the single integration test owns this process environment.
-        unsafe {
-            match channels {
-                Some(value) => std::env::set_var("ENGINE_V2_CHANNELS", value),
-                None => std::env::remove_var("ENGINE_V2_CHANNELS"),
-            }
-        }
-    }
-}
-
-impl Drop for EngineEnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: the dedicated test has stopped its background agent before
-        // this guard is dropped, so no concurrent environment reader remains.
-        unsafe {
-            restore_env("ENGINE_V2", self.engine_v2.take());
-            restore_env("ENGINE_V2_CHANNELS", self.channels.take());
-        }
-    }
-}
-
-unsafe fn restore_env(key: &str, value: Option<OsString>) {
-    match value {
-        Some(value) => unsafe { std::env::set_var(key, value) },
-        None => unsafe { std::env::remove_var(key) },
     }
 }
 
@@ -1134,7 +1081,7 @@ async fn assert_auth_case() {
 
 #[tokio::test]
 async fn engine_v2_channel_delivery_matrix() {
-    let env = EngineEnvGuard::enable(Some("xmpp,darkirc,weechat"));
+    let env = EngineV2EnvGuard::enable(Some("xmpp,darkirc,weechat"));
     let gateway_scope = Uuid::new_v4().to_string();
     let xmpp_scope = Uuid::new_v4().to_string();
     let cases = [
@@ -1191,4 +1138,6 @@ async fn engine_v2_channel_delivery_matrix() {
     assert_stopped_case().await;
     assert_approval_case().await;
     assert_auth_case().await;
+
+    env.cleanup().await;
 }
