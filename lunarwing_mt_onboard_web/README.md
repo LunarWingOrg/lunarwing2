@@ -72,6 +72,24 @@ passwords, API keys, secret payloads — are redacted and never written to disk.
   gateway UI. `moon.js` renders the waxing SVG moon; `bat.js` is the mascot
   state machine; `progress.js` is the run panel; `wizard.js` builds the forms.
 
+## Provisioning defaults
+
+The provision wizard enables the following by default:
+
+- SSH harness
+- Host health pipeline
+- WeeChat relay bootstrap (automatic relay configuration)
+
+Unchecking **Automatically configure WeeChat relay** sends
+`no_weechat_bootstrap: true`, which forwards `--no-weechat-bootstrap` to
+`lunarwing-mt-admin.sh add-tenant`. This skips WeeChat command execution and
+`relay.conf` generation but still writes the minimal `weechat.env` and renders
+the WeeChat service units — so the services can start without relay
+configuration. Use `configure-weechat-relay <tenant>` later to enable the
+relay without re-running provisioning.
+
+Import (Kawarimi) forms do not expose a WeeChat opt-out control.
+
 ## Requirements
 
 Python 3.10+ and a venv with `fastapi`, `uvicorn`, `websockets`

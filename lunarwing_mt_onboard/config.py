@@ -52,6 +52,7 @@ class TenantConfig:
     secrets_master_key: str = ""
     no_ssh: bool = False
     no_health: bool = False
+    no_weechat_bootstrap: bool = False
 
     # ------------------------------------------------------------------
     # Validation
@@ -118,6 +119,7 @@ class TenantConfig:
             secrets_master_key=data.get("secrets_master_key", ""),
             no_ssh=data.get("no_ssh", False),
             no_health=data.get("no_health", False),
+            no_weechat_bootstrap=data.get("no_weechat_bootstrap", False),
         )
 
     @classmethod

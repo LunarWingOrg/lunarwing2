@@ -72,6 +72,8 @@ HEALTH_OPT_OUT=false   # set true by --no-health
 DEFAULT_SSH_ENABLED="${LUNARWING_MT_SSH_ENABLED:-true}"
 SSH_OPT_OUT=false   # set true by --no-ssh
 
+WEECHAT_BOOTSTRAP_OPT_OUT=false   # set true by --no-weechat-bootstrap
+
 # ── Per-tenant PostgreSQL image ──────────────────────────────────────────────
 # Fully-qualified (registry host included) so rootless podman resolves it WITHOUT
 # depending on the host's unqualified-search-registries: docker silently defaults
@@ -248,6 +250,8 @@ Commands:
     --gotify-url <url>             Custom Gotify server URL (e.g. https://gotify.example.com)
     --no-health                    Don't enable the host-global health/self-heal pipeline
     --no-ssh                       Don't provision SSH harness (key pair, config, agent)
+    --no-weechat-bootstrap         Don't run WeeChat relay auto-bootstrap (still writes
+                                   minimal weechat.env; services remain rendered)
     --enable-darkirc               Provision DarkIRC daemon + adapter for this tenant
                                    (disabled by default; darkirc services are NOT created)
     --with-nanocode                Select the nanocode worker for this tenant (recorded
@@ -272,10 +276,10 @@ Commands:
                                    the agent (added to the tenant's own JID;
                                    written to both lunarwing.env and xmpp-bridge.env)
 
-  add-tenants <names> [options]    Comma-separated list (e.g. "Ruffles,Miyuki")
+   add-tenants <names> [options]    Comma-separated list (e.g. "Ruffles,Miyuki")
      (same options as add-tenant apply to all, including --enable-darkirc,
       --nanocode-model/--nanocode-base-url, --opencode-model/--opencode-base-url,
-      --llm-model, --gateway-host, and --xmpp-allow-from)
+      --llm-model, --gateway-host, --xmpp-allow-from, and --no-weechat-bootstrap)
 
   remove-tenant <name>             Stop services, deallocate ports
     --purge                        Also delete OS user and home directory
@@ -343,10 +347,14 @@ Commands:
     --base-url <url>               TensorZero baseURL (OPENCODE_BASE_URL; full URL)
                                    (restart the worker after: stop-tenant && start-tenant)
 
-  configure-ssh <name>             Provision SSH harness for an existing tenant
-    --host <host>                  SSH host (default: 127.0.0.1)
-    --user <user>                  SSH user (default: tenant name)
+   configure-ssh <name>             Provision SSH harness for an existing tenant
+     --host <host>                  SSH host (default: 127.0.0.1)
+     --user <user>                  SSH user (default: tenant name)
                                    (restart the tenant after to upload the key: restart-tenant)
+
+  configure-weechat-relay <name>   Generate WeeChat relay config for a tenant.
+                                   Preserves existing config: fails on any
+                                   non-empty ~/.config/weechat without modifying it.
 
   patch-env <name>                 Add missing env vars (e.g. ORCHESTRATOR_PORT)
   patch-env-all                    Patch env for all registered tenants
@@ -2213,6 +2221,187 @@ build_xmpp_allow_from_json() {  # <owner_jid> <extras_csv>
     quoted+=("\"$jid\"")
   done
   echo "[${quoted[*]}]" | tr ' ' ',' | sed 's/,,*/,/g; s/^\[,/[/; s/,\]$/\]/'
+}
+
+# ── WeeChat relay auto-bootstrap ──────────────────────────────────────────────
+
+# WeeChat home directory for a tenant.
+tenant_weechat_home() {  # <tenant>
+  printf '%s/.config/weechat' "$(tenant_home "$1")"
+}
+
+# Read the LAST literal value of KEY from an env file without sourcing it.
+# Returns empty if file or key is absent. Never prints the file's other content.
+_read_env_value() {  # <file> <KEY>
+  [[ -f "$1" ]] || return 0
+  sed -n "s/^$2=//p" "$1" | tail -1
+}
+
+# Success when <dir> contains any entry (normal or dotfile).
+_weechat_config_dir_has_entries() {  # <dir>
+  [[ -d "$1" ]] || return 1
+  local count
+  count="$(ls -A "$1" 2>/dev/null | wc -l)"
+  [[ "$count" -gt 0 ]]
+}
+
+# Validate a generated WeeChat relay config directory.
+# Requires relay.conf with the literal ${env:RELAY_PASSWORD} expression,
+# bind_address=127.0.0.1, allow_empty_password=off, [api] section with api=<port>,
+# and rejects any occurrence of the plaintext password.
+_weechat_validate_relay_config() {  # <dir> <port> <plaintext_password>
+  local dir="$1" port="$2" plaintext="$3"
+  local conf="$dir/relay.conf"
+  [[ -f "$conf" ]] || return 1
+  # Reject plaintext password leak
+  if [[ -n "$plaintext" ]] && grep -qF -- "$plaintext" "$conf"; then
+    return 1
+  fi
+  # Require literal env expression
+  grep -qF '${env:RELAY_PASSWORD}' "$conf" || return 1
+  # Require loopback bind
+  grep -q 'bind_address.*127\.0\.0\.1' "$conf" || return 1
+  # Require allow_empty_password = off
+  grep -q 'allow_empty_password.*off' "$conf" || return 1
+  # Require [api] section
+  grep -q '\[api\]' "$conf" || return 1
+  # Require api = <port>
+  grep -q "^[[:space:]]*api[[:space:]]*=[[:space:]]*${port}\$" "$conf" || return 1
+  return 0
+}
+
+# Invoke WeeChat as the tenant to generate a relay.conf in <temp_dir>.
+# The plaintext password is read from <lunarwing_env> and passed via
+# environment inheritance only; never in argv.
+_weechat_generate_relay_config() {  # <tenant> <temp_dir> <port> <lunarwing_env>
+  local tenant="$1" temp_dir="$2" relay_port="$3" lunarwing_env="$4"
+  local relay_password weechat_bin
+  relay_password="$(_read_env_value "$lunarwing_env" RELAY_PASSWORD)"
+  [[ -n "$relay_password" ]] || return 1
+  weechat_bin="$(command -v weechat 2>/dev/null || true)"
+  if [[ -z "$weechat_bin" ]]; then
+    printf 'error: required command not found: weechat\n' >&2
+    return 1
+  fi
+  # The backslash before ${env:RELAY_PASSWORD} is mandatory: WeeChat evaluates
+  # --run-command arguments before /set stores the value, so the escape ensures
+  # the literal expression is written to relay.conf, not the resolved password.
+  RELAY_PASSWORD="$relay_password" sudo --preserve-env=RELAY_PASSWORD -u "$tenant" \
+    "$weechat_bin" --dir "$temp_dir" \
+    --run-command '/set relay.network.password "\${env:RELAY_PASSWORD}"' \
+    --run-command '/set relay.network.allow_empty_password off' \
+    --run-command '/set relay.network.bind_address "127.0.0.1"' \
+    --run-command "/relay add api ${relay_port}" \
+    --run-command '/save' \
+    --run-command '/quit'
+}
+
+# Full one-shot relay bootstrap for a tenant: generate, validate, atomically
+# promote. Rejects non-empty existing config. Cleans all failure paths.
+configure_weechat_relay() {  # <tenant>
+  local tenant="$1"
+  local target_home relay_port lunarwing_env relay_password
+
+  target_home="$(tenant_weechat_home "$tenant")"
+  relay_port="$(ports_get "$tenant" weechat)"
+  if [[ -z "$relay_port" || "$relay_port" == "0" ]]; then
+    printf 'error: no weechat port allocated for tenant %q\n' "$tenant" >&2
+    return 1
+  fi
+  lunarwing_env="$(tenant_env_dir "$tenant")/lunarwing.env"
+  if [[ ! -f "$lunarwing_env" ]]; then
+    printf 'error: tenant env file not found: %s\n' "$lunarwing_env" >&2
+    return 1
+  fi
+  relay_password="$(_read_env_value "$lunarwing_env" RELAY_PASSWORD)"
+  if [[ -z "$relay_password" ]]; then
+    printf 'error: RELAY_PASSWORD missing from %s\n' "$lunarwing_env" >&2
+    return 1
+  fi
+
+  # Refuse if target already has content (preserve-and-fail).
+  if [[ -d "$target_home" ]] && _weechat_config_dir_has_entries "$target_home"; then
+    printf 'error: WeeChat config already exists at %s — configure-weechat-relay never overwrites existing config\n' "$target_home" >&2
+    return 1
+  fi
+
+  if ! _write_weechat_env "$tenant" "$relay_password"; then
+    printf 'error: unable to write the dedicated WeeChat credential environment\n' >&2
+    return 1
+  fi
+
+  # Temp directory as a sibling of the target (same filesystem for atomic rename).
+  local config_parent temp_home
+  config_parent="$(dirname "$target_home")"
+  if ! mkdir -p "$config_parent" || ! chown "$tenant:$tenant" "$config_parent"; then
+    printf 'error: unable to prepare WeeChat config parent: %s\n' "$config_parent" >&2
+    return 1
+  fi
+  temp_home="$(mktemp -d "${config_parent}/.weechat-bootstrap.XXXXXX")" || {
+    printf 'error: unable to create WeeChat bootstrap directory under %s\n' "$config_parent" >&2
+    return 1
+  }
+
+  (
+    trap '[[ -n "${temp_home:-}" && -d "$temp_home" ]] && rm -rf -- "$temp_home"' EXIT
+    if ! chown "$tenant:$tenant" "$temp_home"; then
+      return 1
+    fi
+
+    # Generate via WeeChat one-shot.
+    if ! _weechat_generate_relay_config "$tenant" "$temp_home" "$relay_port" "$lunarwing_env"; then
+      return 1
+    fi
+
+    # Validate the generated config.
+    if ! _weechat_validate_relay_config "$temp_home" "$relay_port" "$relay_password"; then
+      say "generated WeeChat relay config failed validation"
+      return 1
+    fi
+
+    # Atomically promote: remove empty target if present, then rename.
+    if [[ -d "$target_home" ]]; then
+      if ! rmdir "$target_home" 2>/dev/null; then
+        printf 'error: target %s exists and is not empty (cannot promote)\n' "$target_home" >&2
+        return 1
+      fi
+    fi
+    if ! mv -T -- "$temp_home" "$target_home"; then
+      return 1
+    fi
+    temp_home=""
+  )
+
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    return $rc
+  fi
+
+  if ! chown -R "$tenant:$tenant" "$target_home"; then
+    printf 'error: unable to set WeeChat config ownership: %s\n' "$target_home" >&2
+    return 1
+  fi
+  say "WeeChat relay configured for tenant '$tenant' (port $relay_port, loopback)"
+}
+
+# Write a dedicated mode-0600 weechat.env containing only RELAY_PASSWORD.
+# Uses a temp file in the same directory then atomically renames.
+_write_weechat_env() {  # <tenant> <relay_password>
+  local tenant="$1" relay_password="$2"
+  local env_dir env_file tmp_file
+  env_dir="$(tenant_env_dir "$tenant")"
+  env_file="$env_dir/weechat.env"
+  mkdir -p "$env_dir" || return 1
+  tmp_file="$(mktemp "$env_dir/.weechat.env.XXXXXX")" || return 1
+  (
+    trap '[[ -n "${tmp_file:-}" && -f "$tmp_file" ]] && rm -f -- "$tmp_file"' EXIT
+    umask 077
+    printf 'RELAY_PASSWORD=%s\n' "$relay_password" >"$tmp_file" || return 1
+    chmod 0600 "$tmp_file" || return 1
+    chown "$tenant:$tenant" "$tmp_file" || return 1
+    mv -T -- "$tmp_file" "$env_file" || return 1
+    tmp_file=""
+  )
 }
 
 write_tenant_lunarwing_env() {
@@ -4703,6 +4892,31 @@ EOF
   chown -R "$name:$name" "$(tenant_home "$name")/.config/containers"
 }
 
+# Render the WeeChat systemd user unit into <out_dir>.
+# Loads only weechat.env (RELAY_PASSWORD), not the full lunarwing.env.
+_render_weechat_systemd_unit() {  # <tenant> <out_dir>
+  local name="$1" out_dir="$2"
+  local weechat_home env_dir
+  weechat_home="$(tenant_weechat_home "$name")"
+  env_dir="$(tenant_env_dir "$name")"
+  cat >"$out_dir/lunarwing-weechat-${name}.service" <<EOF
+[Unit]
+Description=WeeChat IRC client ($name)
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=$(command -v tmux) -L weechat-${name} new-session -d -s weechat '$(command -v weechat) --dir ${weechat_home}'
+ExecStop=$(command -v tmux) -L weechat-${name} kill-session -t weechat
+EnvironmentFile=$env_dir/weechat.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
 render_tenant_systemd_units() {
   local name="$1"
   ensure_container_runtime
@@ -4753,21 +4967,7 @@ EOF
   mkdir -p "$weechat_home"
   chown "$name:$name" "$weechat_home"
 
-  cat >"$user_unit_dir/lunarwing-weechat-${name}.service" <<EOF
-[Unit]
-Description=WeeChat IRC client ($name)
-After=network.target
-
-[Service]
-Type=forking
-ExecStart=$(command -v tmux) -L weechat-${name} new-session -d -s weechat '$(command -v weechat) --dir ${weechat_home}'
-ExecStop=$(command -v tmux) -L weechat-${name} kill-session -t weechat
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-EOF
+  _render_weechat_systemd_unit "$name" "$user_unit_dir"
 
   # WeeChat WS adapter unit
   cat >"$user_unit_dir/lunarwing-weechat-adapter-${name}.service" <<EOF
@@ -5007,6 +5207,69 @@ uninstall_tenant_systemd() {
 
   _systemctl_user "$name" daemon-reload 2>/dev/null || true
   say "uninstalled systemd units for $name"
+}
+
+# Render the WeeChat OpenRC init script into <out_file>.
+# Includes a load_env() that parses only RELAY_PASSWORD from weechat.env;
+# tenant-controlled env content is never sourced by OpenRC as root.
+_render_weechat_openrc_unit() {  # <tenant> <out_file>
+  local name="$1" out_file="$2"
+  local weechat_home env_dir run_dir log_dir
+  weechat_home="$(tenant_weechat_home "$name")"
+  env_dir="$(tenant_env_dir "$name")"
+  run_dir="$(tenant_run_dir "$name")"
+  log_dir="$(tenant_log_dir "$name")"
+  cat >"$out_file" <<INITEOF
+#!/sbin/openrc-run
+
+description="WeeChat IRC client ($name)"
+
+: "\${weechat_user:=$name}"
+: "\${weechat_group:=$name}"
+: "\${weechat_home:=$weechat_home}"
+: "\${weechat_pidfile:=$run_dir/weechat.pid}"
+: "\${weechat_runtime_dir:=$run_dir}"
+: "\${weechat_log_dir:=$log_dir}"
+: "\${weechat_output_log:=\${weechat_log_dir}/weechat.log}"
+: "\${weechat_error_log:=\${weechat_log_dir}/weechat.err}"
+: "\${weechat_retry:=SIGTERM/30/KILL/5}"
+: "\${weechat_env_file:=$env_dir/weechat.env}"
+
+command="$(command -v tmux)"
+command_args="-L weechat-${name} new-session -d -s weechat '$(command -v weechat) --dir \${weechat_home}'"
+command_user="\${weechat_user}:\${weechat_group}"
+
+depend() {
+    need net
+    use dns
+    after firewall
+    before lunarwing-weechat-adapter-${name} lunarwing-${name}
+}
+
+load_env() {
+    [ -n "\${weechat_env_file}" ] && [ -r "\${weechat_env_file}" ] || return 1
+    RELAY_PASSWORD="\$(sed -n 's/^RELAY_PASSWORD=//p' "\${weechat_env_file}" | tail -n 1)"
+    [ -n "\${RELAY_PASSWORD}" ] || return 1
+    export RELAY_PASSWORD
+}
+
+start() {
+    ebegin "Starting WeeChat ($name)"
+    load_env || return 1
+    checkpath -d -m 0750 -o "\${weechat_user}:\${weechat_group}" "\${weechat_home}"
+    checkpath -d -m 0750 -o "\${weechat_user}:\${weechat_group}" "\${weechat_runtime_dir}"
+    start-stop-daemon --start --background --user "\${weechat_user}" \\
+        --exec $(command -v tmux) -- -L weechat-${name} new-session -d -s weechat "$(command -v weechat) --dir \${weechat_home}"
+    eend \$?
+}
+
+stop() {
+    ebegin "Stopping WeeChat ($name)"
+    su -s /bin/sh "\${weechat_user}" -c "$(command -v tmux) -L weechat-${name} kill-session -t weechat 2>/dev/null" || true
+    eend 0
+}
+INITEOF
+  chmod 0755 "$out_file"
 }
 
 # ── OpenRC service units ─────────────────────────────────────────────────────
@@ -5381,48 +5644,7 @@ INITEOF
   fi
 
   # ── WeeChat init script (tmux-based) ──
-  cat >"/etc/init.d/lunarwing-weechat-${name}" <<INITEOF
-#!/sbin/openrc-run
-
-description="WeeChat IRC client ($name)"
-
-: "\${weechat_user:=$name}"
-: "\${weechat_group:=$name}"
-: "\${weechat_home:=$weechat_home}"
-: "\${weechat_pidfile:=$run_dir/weechat.pid}"
-: "\${weechat_runtime_dir:=$run_dir}"
-: "\${weechat_log_dir:=$log_dir}"
-: "\${weechat_output_log:=\${weechat_log_dir}/weechat.log}"
-: "\${weechat_error_log:=\${weechat_log_dir}/weechat.err}"
-: "\${weechat_retry:=SIGTERM/30/KILL/5}"
-
-command="$(command -v tmux)"
-command_args="-L weechat-${name} new-session -d -s weechat '$(command -v weechat) --dir \${weechat_home}'"
-command_user="\${weechat_user}:\${weechat_group}"
-
-depend() {
-    need net
-    use dns
-    after firewall
-    before lunarwing-weechat-adapter-${name} lunarwing-${name}
-}
-
-start() {
-    ebegin "Starting WeeChat ($name)"
-    checkpath -d -m 0750 -o "\${weechat_user}:\${weechat_group}" "\${weechat_home}"
-    checkpath -d -m 0750 -o "\${weechat_user}:\${weechat_group}" "\${weechat_runtime_dir}"
-    start-stop-daemon --start --background --user "\${weechat_user}" \\
-        --exec $(command -v tmux) -- -L weechat-${name} new-session -d -s weechat "$(command -v weechat) --dir \${weechat_home}"
-    eend \$?
-}
-
-stop() {
-    ebegin "Stopping WeeChat ($name)"
-    su -s /bin/sh "\${weechat_user}" -c "$(command -v tmux) -L weechat-${name} kill-session -t weechat 2>/dev/null" || true
-    eend 0
-}
-INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-weechat-${name}"
+  _render_weechat_openrc_unit "$name" "/etc/init.d/lunarwing-weechat-${name}"
 
   # WeeChat WS adapter init script
   cat >"/etc/init.d/lunarwing-weechat-adapter-${name}" <<INITEOF
@@ -5978,6 +6200,28 @@ add_tenant() {
   ensure_external_worker_config "$name" "pebble" "pebble_wss"
   ensure_external_worker_config "$name" "opencode" "opencode_wss"
 
+  # WeeChat relay auto-bootstrap: write a dedicated minimal weechat.env, then
+  # attempt a one-shot relay configuration. Non-fatal: a degraded WeeChat setup
+  # must not strand the base tenant. Recovery: configure-weechat-relay <name>.
+  local weechat_bootstrap_ok="configured"
+  if [[ "$WEECHAT_BOOTSTRAP_OPT_OUT" == "true" ]]; then
+    local relay_password
+    relay_password="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" RELAY_PASSWORD)"
+    if [[ -n "$relay_password" ]] && _write_weechat_env "$name" "$relay_password"; then
+      weechat_bootstrap_ok="disabled (--no-weechat-bootstrap)"
+    else
+      weechat_bootstrap_ok="disabled (credential env setup failed)"
+      say "WARNING: WeeChat bootstrap was disabled, but the minimal credential env could not be written." >&2
+    fi
+  elif ! configure_weechat_relay "$name" 2>&1; then
+    weechat_bootstrap_ok="needs recovery"
+    say ""
+    say "WARNING: WeeChat relay auto-bootstrap failed for tenant '$name'."
+    say "         WeeChat will start but the relay is not configured."
+    say "         Recovery: sudo $0 configure-weechat-relay $name"
+    say ""
+  fi
+
   # SSH harness: config.toml [[ssh.hosts]] block + ed25519 key pair.
   # Enabled by default; opt out with --no-ssh or LUNARWING_MT_SSH_ENABLED=false.
   if [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]]; then
@@ -6033,6 +6277,7 @@ add_tenant() {
   say "  proxy:            $( [[ "$enable_proxy" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-proxy to enable)" )"
   say "  workers:          $( _selected="$( [[ "$with_nanocode" == "true" ]] && printf 'nanocode '; [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-nanocode/--with-pebble/--with-opencode to select)" )"
   say "  ssh:              $( [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]] && echo "enabled (key upload + activation handled by start-tenant)" || echo "disabled (pass --no-ssh)" )"
+  say "  weechat relay:    $weechat_bootstrap_ok"
   say ""
   say "Next steps:"
   say "  sudo $0 build-tenant $name --with-wasm --with-nanocode"
@@ -6668,6 +6913,7 @@ main() {
           --xmpp-jid)        xmpp_jid="$2"; shift 2 ;;
           --no-health)       HEALTH_OPT_OUT=true; shift ;;
           --no-ssh)          SSH_OPT_OUT=true; shift ;;
+          --no-weechat-bootstrap) WEECHAT_BOOTSTRAP_OPT_OUT=true; shift ;;
           --enable-darkirc)  enable_darkirc="true"; shift ;;
           --enable-proxy)    enable_proxy="true"; shift ;;
           --with-nanocode)   with_nanocode="true"; shift ;;
@@ -6708,6 +6954,7 @@ main() {
           --xmpp-domain)     xmpp_domain="$2"; shift 2 ;;
           --no-health)       HEALTH_OPT_OUT=true; shift ;;
           --no-ssh)          SSH_OPT_OUT=true; shift ;;
+          --no-weechat-bootstrap) WEECHAT_BOOTSTRAP_OPT_OUT=true; shift ;;
           --enable-darkirc)  enable_darkirc="true"; shift ;;
           --enable-proxy)    enable_proxy="true"; shift ;;
           --with-nanocode)   with_nanocode="true"; shift ;;
@@ -7045,6 +7292,17 @@ main() {
       say ""
       say "SSH harness configured for tenant '$name' (host=$ssh_host user=$ssh_user)"
       say "Run '$0 restart-tenant $name' to start the daemon and upload the key to the secrets store"
+      ;;
+
+    configure-weechat-relay)
+      [[ -n "${1:-}" ]] || die "usage: configure-weechat-relay <name>"
+      [[ $# -eq 1 ]]   || die "usage: configure-weechat-relay <name> (unexpected extra arguments)"
+      require_root
+      local name
+      name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+      configure_weechat_relay "$name"
       ;;
 
     patch-env)

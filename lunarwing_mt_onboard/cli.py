@@ -413,6 +413,9 @@ def _configure_secrets(config: TenantConfig) -> None:
     config.no_health = not _q_confirm(
         "Enable host health pipeline for tenant?", default=True
     )
+    config.no_weechat_bootstrap = not _q_confirm(
+        "Automatically configure the WeeChat relay?", default=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +455,7 @@ def _show_summary(config: TenantConfig) -> bool:
     )
     table.add_row("SSH harness", str(not config.no_ssh))
     table.add_row("Health pipeline", str(not config.no_health))
+    table.add_row("WeeChat relay bootstrap", str(not config.no_weechat_bootstrap))
     console.print(table)
     return _q_confirm("Proceed with add-tenant?", default=True)
 

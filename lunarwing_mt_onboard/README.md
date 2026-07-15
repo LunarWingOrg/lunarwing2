@@ -268,7 +268,8 @@ unittest.TextTestRunner(verbosity=2).run(
   "llm_api_key": "",
   "secrets_master_key": "",
   "no_ssh": false,
-  "no_health": false
+  "no_health": false,
+  "no_weechat_bootstrap": false
 }
 ```
 

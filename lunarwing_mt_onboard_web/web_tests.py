@@ -29,13 +29,21 @@ class ModelMappingTests(unittest.TestCase):
             name="  sphinx  ",
             workers=["nanocode", "bogus", "opencode"],
             no_ssh=True,
+            no_weechat_bootstrap=True,
             xmpp_allow_from=["a@x", "  ", "b@y"],
         )
         cfg = req.to_tenant_config()
         self.assertEqual(cfg.name, "sphinx")
         self.assertEqual(cfg.workers, [WorkerType.NANOCODE, WorkerType.OPENCODE])
         self.assertTrue(cfg.no_ssh)
+        self.assertTrue(cfg.no_weechat_bootstrap)
         self.assertEqual(cfg.xmpp_allow_from, ["a@x", "b@y"])
+
+    def test_provision_weechat_bootstrap_defaults_false(self) -> None:
+        """When omitted, no_weechat_bootstrap defaults to False."""
+        req = ProvisionRequest(name="sphinx")
+        cfg = req.to_tenant_config()
+        self.assertFalse(cfg.no_weechat_bootstrap)
 
     def test_upgrade_and_export_mappers(self) -> None:
         u = UpgradeRequest(tenant="griffin", target="v1.1.9", apply=True).to_upgrade_config()
@@ -314,6 +322,14 @@ class ImportUiTests(unittest.TestCase):
             self.assertIn(field, import_form)
         self.assertIn("stage-only by default", import_form.lower())
         self.assertIn("old host stopped", import_form.lower())
+
+
+class ProvisionWeechatUiTests(unittest.TestCase):
+    def test_wizard_js_contains_weechat_bootstrap_control(self) -> None:
+        wizard = (Path(__file__).resolve().parent / "static" / "js" / "wizard.js").read_text()
+        self.assertIn("weechat_bootstrap: true", wizard)
+        self.assertIn("no_weechat_bootstrap: !data.weechat_bootstrap", wizard)
+        self.assertIn("Automatically configure WeeChat relay", wizard)
 
 
 if __name__ == "__main__":

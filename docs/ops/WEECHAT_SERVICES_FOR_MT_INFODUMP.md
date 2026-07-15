@@ -4,6 +4,24 @@ Adds troubleshooting section for the 'no pairing file' error caused by LUNARWING
 Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
 Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
 
+> **⚠ HISTORICAL / SUPERSEDED DOCUMENT**
+>
+> This "infodump" captured the state of WeeChat multi-tenant services as of an earlier
+> implementation phase. It has been **superseded** by the active operational guide:
+> [`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md).
+>
+> Key differences in the active guide:
+> - Automatic relay bootstrap during `add-tenant` is the primary path.
+> - Manual `/relay` commands are explicitly documented as recovery-only.
+> - Canonical service names (`lunarwing-weechat-<tenant>`) are used consistently.
+> - A dedicated minimal `env/weechat.env` (mode `0600`) provides `RELAY_PASSWORD` to WeeChat.
+> - `configure-weechat-relay <tenant>` is the supported command for missing configuration; it never overwrites existing content.
+> - `lunarwing-weechat-preflight.sh` validates generated relay config and minimal env.
+>
+> This document is retained for historical context and archival completeness only.
+> **Do not use it for operational procedures.** Refer to `WEECHAT-SERVICES.md`
+> for the current, authoritative operations guide.
+
 # WeeChat Services for Multi-Tenant Deployments
 
 How WeeChat IRC access is managed as init services in LunarWing multi-tenant deployments. Each tenant runs a WeeChat instance in a tmux session plus a Python WebSocket adapter that bridges WeeChat's relay API to an HTTP endpoint polled by the LunarWing WASM channel.

@@ -55,6 +55,7 @@ ROOTLESS="true"                     # true for podman, false for docker
 ENABLE_DARKIRC=true                 # DarkIRC daemon + adapter
 ENABLE_SSH=true                     # SSH harness (key pair, agent, config.toml)
 ENABLE_HEALTH=true                  # Host-global health/self-heal pipeline
+ENABLE_WEECHAT_BOOTSTRAP=true       # Generate relay.conf during add-tenants
 BUILD_WASM=true                     # Build + install WASM tools and channels
 BUILD_NANOCODE=true                 # Build nanocode worker Docker image
 BUILD_PEBBLE=true                   # Build pebble worker Docker image
@@ -241,6 +242,7 @@ phase_1() {
   flags+=(--xmpp-domain "$XMPP_DOMAIN")
   [[ "$ENABLE_HEALTH" == false ]] && flags+=(--no-health)
   [[ "$ENABLE_SSH" == false ]] && flags+=(--no-ssh)
+  [[ "$ENABLE_WEECHAT_BOOTSTRAP" == false ]] && flags+=(--no-weechat-bootstrap)
 
   say "adding tenants: $TENANTS"
   mt add-tenants "$TENANTS" "${flags[@]}"

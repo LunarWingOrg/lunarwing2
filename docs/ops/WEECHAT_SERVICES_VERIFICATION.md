@@ -4,23 +4,35 @@ This document audits the accuracy of
 [`WEECHAT_SERVICES_FOR_MT_INFODUMP.md`](WEECHAT_SERVICES_FOR_MT_INFODUMP.md)
 against the current codebase and running configurations.
 
-**Re-verified:** 2026-07-13 against branch `rarity/item-1-20260713-2101`.
+> **Note:** The infodump has been superseded as an operational reference.
+> [`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md) is the active operations guide.
+> This verification report remains useful as a codebase audit and records which
+> discrepancies have been resolved. It describes the implementation-branch state
+> and does not claim a production release or deployment.
+
+**Re-verified:** 2026-07-15 against the WeeChat relay auto-bootstrap implementation branch.
 
 ## Summary
 
-**Overall verdict: mostly accurate, with one naming discrepancy and several
-stale line numbers.** Every component, port offset, environment variable,
-subcommand, and backfill mechanism described in the infodump exists in the
-current codebase. However:
+**Overall verdict: naming discrepancy resolved, manual relay setup resolved.**
+Every component, port offset, environment variable, subcommand, and backfill
+mechanism described in the infodump exists in the current codebase. The two
+material issues identified in the original audit have been addressed:
 
-1. **Naming discrepancy (material):** The infodump uses `weechat-<name>` for
+1. **Naming discrepancy (resolved):** The infodump used `weechat-<name>` for
    the WeeChat service unit / init script in several places, but the actual
    rendered name is `lunarwing-weechat-<name>` (with the `lunarwing-` prefix).
-   This affects systemd units, OpenRC init scripts, dependency wiring, and
-   `lunarwing_rc_need`.
-2. **Stale line numbers:** Several `lunarwing-mt-admin.sh` line references have
+   The active operations guide
+   ([`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md)) now uses canonical names
+   consistently. The infodump itself has been marked as historical/superseded.
+2. **Manual first-run relay setup (resolved):** Fresh tenants now receive an
+   automatic relay bootstrap during `add-tenant`. The explicit recovery command
+`configure-weechat-relay <tenant>` is available to generate missing configuration. Manual
+   `/relay` commands inside WeeChat are documented as a last-resort recovery
+   path only.
+3. **Stale line numbers:** Several `lunarwing-mt-admin.sh` line references have
    drifted as the script grew. Corrected below.
-3. **Misattributed citation:** `setup.rs:540-541` was cited for "WASM channel
+4. **Misattributed citation:** `setup.rs:540-541` was cited for "WASM channel
    sends directly to relay" but those lines are test-config field definitions,
    not relay-sending code.
 
@@ -192,6 +204,10 @@ These items were open at the time of the original infodump and are now resolved:
 | WASM channel config `relay_password` env-source | ✅ Implemented ([`ic/src/channels/wasm/setup.rs:493`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/src/channels/wasm/setup.rs)) |
 | WASM channel config `relay_url`, `ws_adapter_url` env-source | ✅ Implemented via capabilities-env bridge (fields with `"env"` key in `ChannelCapabilitiesFile`) |
 | OpenRC conf.d includes WeeChat ports | ✅ Verified (`lunarwing_rc_need` at line 5544) |
+| **Service naming `weechat-<name>` → `lunarwing-weechat-<name>`** | ✅ **Resolved** — active docs ([`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md)) use canonical names; infodump marked historical |
+| **Manual relay setup required on first run** | ✅ **Resolved** — `add-tenant` performs automatic relay bootstrap; `configure-weechat-relay` provides explicit recovery; manual `/relay` is last-resort only |
+| **Dedicated minimal `weechat.env`** | ✅ **Implemented** — `env/weechat.env` (mode `0600`) contains only `RELAY_PASSWORD`; loaded by both systemd and OpenRC WeeChat services |
+| **Preflight validation of generated relay config** | ✅ **Extended** — `lunarwing-weechat-preflight.sh` validates `relay.conf` (literal password expression, loopback bind, API port) and `weechat.env` without sourcing either file |
 
 ## Outstanding / Only Verifiable at Runtime
 
@@ -203,21 +219,30 @@ These claims are constructed but can only be confirmed on a live deployment:
    construction but unverified in CI.
 3. **All service-unit dependency orders actually serialize at runtime** —
    systemd/OpenRC behavior not exercised in unit tests.
-4. **Password mismatch detection lives only in adapter logs** — no structured
-   diagnostic exists.
+4. **Password mismatch detection** — now surfaced by the extended preflight
+   (`lunarwing-weechat-preflight.sh`), which validates that `relay.conf`
+   contains the literal `${env:RELAY_PASSWORD}` expression and that `weechat.env`
+   exists. Runtime adapter logs remain the diagnostic for a live mismatch.
 
 ## Recommendations
 
-1. **Fix the naming discrepancy.** Update the infodump to use
-   `lunarwing-weechat-<name>` (with the `lunarwing-` prefix) consistently for:
-   the systemd unit name (`weechat-<name>.service` → `lunarwing-weechat-<name>.service`),
-   the OpenRC init script (`weechat-<name>` → `lunarwing-weechat-<name>`),
-   the main daemon's `After=`/`Wants=` references, the adapter's `Requires=`,
-   the OpenRC `depend()` `need`/`after` entries, and `lunarwing_rc_need`.
-2. **Optional:** add a `pairing-wrapper` subcommand to the CLI that
+### Resolved
+
+1. **Service naming:** The active operations guide
+   ([`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md)) now uses canonical
+   `lunarwing-weechat-<name>` names consistently. The infodump has been
+   marked historical/superseded.
+2. **Manual relay setup:** Fresh tenants receive automatic relay bootstrap
+   during `add-tenant`. Explicit recovery (`configure-weechat-relay <tenant>`)
+   provides a supported path when configuration is still absent. Manual `/relay` commands inside
+   WeeChat are documented as last-resort only.
+
+### Remaining
+
+1. **Optional:** add a `pairing-wrapper` subcommand to the CLI that
    auto-injects `LUNARWING_BASE_DIR` from the tenant env file when called with
    `--tenant <name>`. This would close the only remaining ergonomic gap.
-3. **Optional:** add structured diagnostics for relay-config drift (password
-   mismatch, wrong port, bind-address misconfig) to the gateway `/api/health`
-   or `/api/status` surface.
-
+2. **Optional:** extend the gateway `/api/health` or `/api/status` surface
+   with relay-config drift diagnostics (password mismatch, wrong port,
+   bind-address misconfig) — though this is already covered by preflight
+   for operators willing to run it.

@@ -20,7 +20,7 @@ Line numbers below drift; treat them as hints, not contracts. Source of truth:
 
 | Component | Where | Role |
 |-----------|-------|------|
-| **WeeChat** | per-tenant, runs in `tmux` (`weechat-<tenant>.service`) | The actual IRC client. Exposes the **relay `api`** plugin on the `weechat` port (MT: base+5). |
+| **WeeChat** | per-tenant, runs in `tmux` (`lunarwing-weechat-<tenant>.service`) | The actual IRC client. Exposes the **relay `api`** plugin on the `weechat` port (MT: base+5). |
 | **`ws_adapter.py`** | per-tenant Python process (`lunarwing-weechat-adapter-<tenant>.service`), `lunarwing_weechat_wss/weechat_relay/ws_adapter.py` | Holds a **WebSocket** to WeeChat's relay, subscribes to updates, buffers lines, and re-serves them over a small **HTTP API** on the `weechat_adapter` port (MT: base+9). |
 | **WeeChat WASM channel** | in the LunarWing daemon; source `lunarwing_weechat_wss/weechat_relay/src/lib.rs` → `wasm32-wasip2`; loaded/run by `ic/src/channels/wasm/{loader,wrapper,runtime,setup}.rs` | Sandboxed channel that **long-polls (or polls) the adapter over HTTP**, applies policy, and emits `IncomingMessage`s to the agent; sends replies back to WeeChat. |
 
@@ -44,6 +44,20 @@ daemon's link.
 **Implication:** IRC messages reach the adapter instantly and are buffered there; in long-poll
 mode the daemon picks them up within a network round-trip (~ms), so end-to-end inbound latency is
 near real-time. In the polling fallback, latency ≈ the poll cadence instead (see §3).
+
+### Relay configuration ownership
+
+The WeeChat relay configuration (`~/.config/weechat/relay.conf`) is generated automatically during
+`add-tenant` via the supported WeeChat command interface. The password is stored as the literal
+expression `${env:RELAY_PASSWORD}` in `relay.conf`; the resolved value is provided to the WeeChat
+process through a dedicated, tenant-owned `env/weechat.env` file (mode `0600`) containing only
+`RELAY_PASSWORD`. The full tenant `lunarwing.env` is never loaded into the WeeChat process.
+
+The adapter and daemon continue to source `RELAY_PASSWORD` from `lunarwing.env` through their
+existing paths (capabilities-env bridge for the WASM channel, direct env for the adapter). The
+explicit recovery command `configure-weechat-relay <tenant>` generates a missing relay configuration
+using the same mechanism, with a preserve-and-fail guarantee: existing non-empty WeeChat
+configuration is never overwritten.
 
 ---
 
@@ -338,12 +352,14 @@ The adapter and WASM must update **together** (the WASM probes `/api/health` for
 
 ## Cross-references
 
-- `docs/ops/WEECHAT-SERVICES.md` — services, ports, env vars, day-to-day ops.
+- `docs/ops/WEECHAT-SERVICES.md` — services, ports, env vars, day-to-day ops, automatic relay
+  bootstrap, and recovery.
 - `WEECHAT-MULTITENANT-PORT-BUG.md` — the per-tenant port/password fix and the
   env-sourced-fields mechanism (archived to `docs/internal/history/archive/ops/`).
 - `docs/proposals/WEECHAT_WS_ADAPTER_SYNC_PROTOCOL.md`,
    `docs/proposals/WEECHAT_WS_ADAPTER_MISSING_DEPENDENCY_AND_AUTOMATION.md` — the adapter sync protocol,
    dependency + automation.
-- `ic/scripts/lunarwing-weechat-preflight.sh` — read-only env-vs-registry pre-flight.
+- `ic/scripts/lunarwing-weechat-preflight.sh` — read-only pre-flight that validates the generated
+  relay configuration and dedicated minimal env without sourcing either file.
 - Code: `lunarwing_weechat_wss/weechat_relay/src/lib.rs`, `…/ws_adapter.py`,
   `ic/src/channels/wasm/{setup,wrapper,runtime,loader}.rs`.
