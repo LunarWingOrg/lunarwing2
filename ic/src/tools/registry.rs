@@ -179,17 +179,25 @@ impl ToolRegistry {
         self.tools.write().await.remove(name)
     }
 
-    /// Resolve a tool name, accepting hyphenated legacy aliases.
+    /// Resolve a tool name, accepting legacy and provider-safe aliases.
     ///
-    /// Returns the canonical snake_case name if the tool exists, or the
-    /// hyphen-to-underscore alias if that resolves instead.
+    /// Returns the name actually stored in the registry.
     pub async fn resolve_name(&self, name: &str) -> Option<String> {
         let tools = self.tools.read().await;
         if tools.contains_key(name) {
             return Some(name.to_string());
         }
-        crate::extensions::naming::legacy_extension_alias(name)
+        if let Some(alias) = crate::extensions::naming::legacy_extension_alias(name)
             .filter(|alias| tools.contains_key(alias))
+        {
+            return Some(alias);
+        }
+
+        let mut matches = tools
+            .keys()
+            .filter(|registered| registered.replace('-', "_") == name);
+        let resolved = matches.next()?.clone();
+        matches.next().is_none().then_some(resolved)
     }
 
     /// Get a tool by name, resolving legacy hyphenated aliases.
@@ -909,6 +917,42 @@ mod tests {
         assert!(registry.has("echo").await);
         assert!(registry.get("echo").await.is_some());
         assert!(registry.get("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolves_provider_safe_name_with_mixed_separators() {
+        struct MixedNameTool;
+
+        #[async_trait::async_trait]
+        impl Tool for MixedNameTool {
+            fn name(&self) -> &str {
+                "mock-mcp_mock_search"
+            }
+
+            fn description(&self) -> &str {
+                "Mixed separator test tool"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+
+            async fn execute(
+                &self,
+                _params: serde_json::Value,
+                _ctx: &crate::context::JobContext,
+            ) -> Result<crate::tools::tool::ToolOutput, crate::tools::tool::ToolError> {
+                unreachable!()
+            }
+        }
+
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(MixedNameTool)).await;
+
+        assert_eq!(
+            registry.resolve_name("mock_mcp_mock_search").await,
+            Some("mock-mcp_mock_search".to_string())
+        );
     }
 
     #[tokio::test]

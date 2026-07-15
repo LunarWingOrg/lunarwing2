@@ -5853,4 +5853,465 @@ mod tests {
         )
         .await;
     }
+
+    // ── Phase 5: explicit DarkIRC / WeeChat scope isolation ─────
+
+    #[tokio::test]
+    async fn darkirc_dm_scopes_do_not_cross_match_controls() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+
+        let scope_a = "darkirc:dm:user-a";
+        let scope_b = "darkirc:dm:user-b";
+
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation(
+                &engine_conversation_key(
+                    &IncomingMessage::new("darkirc", "alice", "hi")
+                        .with_conversation_scope(scope_a),
+                ),
+                "alice",
+            )
+            .await
+            .unwrap();
+        let conv_b = state
+            .conversation_manager
+            .get_or_create_conversation(
+                &engine_conversation_key(
+                    &IncomingMessage::new("darkirc", "alice", "hi")
+                        .with_conversation_scope(scope_b),
+                ),
+                "alice",
+            )
+            .await
+            .unwrap();
+
+        let approval_a = gate_in_conversation(
+            "alice",
+            "darkirc",
+            conv_a,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let tid_a = approval_a.thread_id;
+        let req_a = approval_a.request_id;
+        state.pending_gates.insert(approval_a).await.unwrap();
+
+        state
+            .pending_gates
+            .insert(gate_in_conversation(
+                "alice",
+                "darkirc",
+                conv_b,
+                lunarwing_engine::ResumeKind::Approval { allow_always: true },
+            ))
+            .await
+            .unwrap();
+
+        state
+            .pending_gates
+            .insert(gate_in_conversation(
+                "alice",
+                "darkirc",
+                conv_a,
+                lunarwing_engine::ResumeKind::Authentication {
+                    credential_name: "github".into(),
+                    instructions: "paste token".into(),
+                    auth_url: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        // An approval scoped to scope_a with an explicit request_id must not
+        // resolve the gate in scope_b.
+        let msg_a =
+            IncomingMessage::new("darkirc", "alice", "yes").with_conversation_scope(scope_a);
+        let matched = matching_engine_approval_gate(&state, &msg_a, Some(req_a)).await;
+        assert_eq!(
+            matched.map(|gate| gate.thread_id),
+            Some(tid_a),
+            "exact request_id from scope_a must match only scope_a's gate"
+        );
+
+        let msg_b =
+            IncomingMessage::new("darkirc", "alice", "yes").with_conversation_scope(scope_b);
+        let matched_b = matching_engine_approval_gate(&state, &msg_b, Some(req_a)).await;
+        assert!(
+            matched_b.is_none(),
+            "request_id from scope_a must not resolve a gate in scope_b"
+        );
+
+        // An auth token from scope_a must leave scope_b's pending auth gate
+        // unresolved.
+        let auth_resolution_a = matching_engine_auth_gate(&state, &msg_a).await;
+        assert!(
+            matches!(auth_resolution_a, PendingGateResolution::Resolved(_)),
+            "scope_a should find its own auth gate"
+        );
+
+        // scope_b has no auth gate, so it should resolve to None.
+        let auth_resolution_b = matching_engine_auth_gate(&state, &msg_b).await;
+        assert!(
+            matches!(auth_resolution_b, PendingGateResolution::None),
+            "scope_b should not resolve scope_a's auth gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn weechat_dm_and_group_scopes_do_not_cross_match_controls() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+
+        let scope_dm = "weechat:dm:buddy";
+        let scope_group = "weechat:group:#room";
+
+        let conv_dm = state
+            .conversation_manager
+            .get_or_create_conversation(
+                &engine_conversation_key(
+                    &IncomingMessage::new("weechat", "alice", "hi")
+                        .with_conversation_scope(scope_dm),
+                ),
+                "alice",
+            )
+            .await
+            .unwrap();
+        let conv_group = state
+            .conversation_manager
+            .get_or_create_conversation(
+                &engine_conversation_key(
+                    &IncomingMessage::new("weechat", "alice", "hi")
+                        .with_conversation_scope(scope_group),
+                ),
+                "alice",
+            )
+            .await
+            .unwrap();
+
+        let approval_dm = gate_in_conversation(
+            "alice",
+            "weechat",
+            conv_dm,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let tid_dm = approval_dm.thread_id;
+        let req_dm = approval_dm.request_id;
+        state.pending_gates.insert(approval_dm).await.unwrap();
+
+        state
+            .pending_gates
+            .insert(gate_in_conversation(
+                "alice",
+                "weechat",
+                conv_group,
+                lunarwing_engine::ResumeKind::Approval { allow_always: true },
+            ))
+            .await
+            .unwrap();
+
+        state
+            .pending_gates
+            .insert(gate_in_conversation(
+                "alice",
+                "weechat",
+                conv_group,
+                lunarwing_engine::ResumeKind::Authentication {
+                    credential_name: "linear".into(),
+                    instructions: "paste token".into(),
+                    auth_url: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        // An approval from the DM scope must not resolve the group scope's gate.
+        let msg_dm =
+            IncomingMessage::new("weechat", "alice", "yes").with_conversation_scope(scope_dm);
+        let matched_dm = matching_engine_approval_gate(&state, &msg_dm, Some(req_dm)).await;
+        assert_eq!(
+            matched_dm.map(|gate| gate.thread_id),
+            Some(tid_dm),
+            "DM scope approval must match only the DM gate"
+        );
+
+        let msg_group =
+            IncomingMessage::new("weechat", "alice", "yes").with_conversation_scope(scope_group);
+        let matched_group = matching_engine_approval_gate(&state, &msg_group, Some(req_dm)).await;
+        assert!(
+            matched_group.is_none(),
+            "DM scope request_id must not resolve a group scope gate"
+        );
+
+        // An auth token from the group scope must leave the DM scope without
+        // a resolvable auth gate (the DM scope has no auth gate of its own).
+        let auth_dm = matching_engine_auth_gate(&state, &msg_dm).await;
+        assert!(
+            matches!(auth_dm, PendingGateResolution::None),
+            "DM scope has no auth gate and must not resolve the group scope's"
+        );
+
+        let auth_group = matching_engine_auth_gate(&state, &msg_group).await;
+        assert!(
+            matches!(auth_group, PendingGateResolution::Resolved(_)),
+            "group scope should find its own auth gate"
+        );
+    }
+
+    // ── Phase 5: DarkIRC / WeeChat live thread scope isolation ──
+
+    #[tokio::test]
+    async fn darkirc_active_thread_is_scoped_to_dm() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let project_id = state.default_project_id;
+
+        let scope_a = "darkirc:dm:user-a";
+        let scope_b = "darkirc:dm:user-b";
+
+        let key_a = engine_conversation_key(
+            &IncomingMessage::new("darkirc", "alice", "hi").with_conversation_scope(scope_a),
+        );
+        let key_b = engine_conversation_key(
+            &IncomingMessage::new("darkirc", "alice", "hi").with_conversation_scope(scope_b),
+        );
+
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation(&key_a, "alice")
+            .await
+            .unwrap();
+        let conv_b = state
+            .conversation_manager
+            .get_or_create_conversation(&key_b, "alice")
+            .await
+            .unwrap();
+
+        let mut events = state.thread_manager.subscribe_events();
+
+        let tid_a = state
+            .conversation_manager
+            .handle_user_message(
+                conv_a,
+                "hi a",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let tid_b = state
+            .conversation_manager
+            .handle_user_message(
+                conv_b,
+                "hi b",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let wait_two = async {
+            let mut seen = 0;
+            while let Ok(evt) = events.recv().await {
+                if matches!(evt.kind, lunarwing_engine::EventKind::ResponseDelta { .. }) {
+                    seen += 1;
+                    if seen >= 2 {
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait_two)
+            .await
+            .expect("both darkirc streams should start");
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let msg_a =
+            IncomingMessage::new("darkirc", "alice", "/interrupt").with_conversation_scope(scope_a);
+        let msg_b =
+            IncomingMessage::new("darkirc", "alice", "/interrupt").with_conversation_scope(scope_b);
+
+        assert!(
+            has_active_engine_thread(&msg_a).await,
+            "scope_a should report an active thread"
+        );
+        assert!(
+            has_active_engine_thread(&msg_b).await,
+            "scope_b should report an active thread"
+        );
+
+        let result_a = interrupt_engine_conversation(&lock.read().await.as_ref().unwrap(), &msg_a)
+            .await
+            .expect("interrupt should succeed");
+        assert_eq!(result_a, Some("Interrupted.".to_string()));
+
+        let outcome_a = {
+            let guard = lock.read().await;
+            let state = guard.as_ref().unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.thread_manager.join_thread(tid_a),
+            )
+            .await
+            .expect("thread A should stop promptly")
+            .expect("thread A should join")
+        };
+        assert!(matches!(outcome_a, ThreadOutcome::Stopped));
+
+        assert!(
+            !has_active_engine_thread(&msg_a).await,
+            "scope_a thread should be stopped after interrupt"
+        );
+        assert!(
+            has_active_engine_thread(&msg_b).await,
+            "scope_b thread must remain active after interrupting scope_a"
+        );
+
+        {
+            let guard = lock.read().await;
+            let state = guard.as_ref().unwrap();
+            let _ = state.thread_manager.stop_thread(tid_b, "alice").await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.thread_manager.join_thread(tid_b),
+            )
+            .await;
+        }
+        *lock.write().await = None;
+    }
+
+    #[tokio::test]
+    async fn weechat_active_thread_is_scoped_between_dm_and_group() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let project_id = state.default_project_id;
+
+        let scope_dm = "weechat:dm:buddy";
+        let scope_group = "weechat:group:#room";
+
+        let key_dm = engine_conversation_key(
+            &IncomingMessage::new("weechat", "alice", "hi").with_conversation_scope(scope_dm),
+        );
+        let key_group = engine_conversation_key(
+            &IncomingMessage::new("weechat", "alice", "hi").with_conversation_scope(scope_group),
+        );
+
+        let conv_dm = state
+            .conversation_manager
+            .get_or_create_conversation(&key_dm, "alice")
+            .await
+            .unwrap();
+        let conv_group = state
+            .conversation_manager
+            .get_or_create_conversation(&key_group, "alice")
+            .await
+            .unwrap();
+
+        let mut events = state.thread_manager.subscribe_events();
+
+        let tid_dm = state
+            .conversation_manager
+            .handle_user_message(
+                conv_dm,
+                "hi dm",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let tid_group = state
+            .conversation_manager
+            .handle_user_message(
+                conv_group,
+                "hi group",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let wait_two = async {
+            let mut seen = 0;
+            while let Ok(evt) = events.recv().await {
+                if matches!(evt.kind, lunarwing_engine::EventKind::ResponseDelta { .. }) {
+                    seen += 1;
+                    if seen >= 2 {
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait_two)
+            .await
+            .expect("both weechat streams should start");
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let msg_dm = IncomingMessage::new("weechat", "alice", "/interrupt")
+            .with_conversation_scope(scope_dm);
+        let msg_group = IncomingMessage::new("weechat", "alice", "/interrupt")
+            .with_conversation_scope(scope_group);
+
+        assert!(
+            has_active_engine_thread(&msg_dm).await,
+            "DM scope should report an active thread"
+        );
+        assert!(
+            has_active_engine_thread(&msg_group).await,
+            "group scope should report an active thread"
+        );
+
+        let result_dm =
+            interrupt_engine_conversation(&lock.read().await.as_ref().unwrap(), &msg_dm)
+                .await
+                .expect("interrupt should succeed");
+        assert_eq!(result_dm, Some("Interrupted.".to_string()));
+
+        let outcome_dm = {
+            let guard = lock.read().await;
+            let state = guard.as_ref().unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.thread_manager.join_thread(tid_dm),
+            )
+            .await
+            .expect("DM thread should stop promptly")
+            .expect("DM thread should join")
+        };
+        assert!(matches!(outcome_dm, ThreadOutcome::Stopped));
+
+        assert!(
+            !has_active_engine_thread(&msg_dm).await,
+            "DM scope thread should be stopped after interrupt"
+        );
+        assert!(
+            has_active_engine_thread(&msg_group).await,
+            "group scope thread must remain active after interrupting DM scope"
+        );
+
+        {
+            let guard = lock.read().await;
+            let state = guard.as_ref().unwrap();
+            let _ = state.thread_manager.stop_thread(tid_group, "alice").await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.thread_manager.join_thread(tid_group),
+            )
+            .await;
+        }
+        *lock.write().await = None;
+    }
 }

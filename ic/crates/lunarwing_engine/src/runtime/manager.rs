@@ -17,6 +17,7 @@ use crate::runtime::tree::ThreadTree;
 use crate::traits::effect::EffectExecutor;
 use crate::traits::llm::LlmBackend;
 use crate::traits::store::Store;
+use crate::types::capability::Capability;
 use crate::types::error::EngineError;
 use crate::types::event::{EventKind, ThreadEvent};
 use crate::types::message::{MessageRole, ThreadMessage};
@@ -263,6 +264,8 @@ impl ThreadManager {
             });
         }
 
+        self.refresh_resumed_thread_leases(&mut thread).await?;
+
         if let Some((call_id, approved)) = approval_event {
             let event = crate::types::event::ThreadEvent::new(
                 thread_id,
@@ -304,6 +307,52 @@ impl ThreadManager {
 
         self.store.save_thread(&thread).await?;
         self.start_thread(thread, uid, true).await?;
+        Ok(())
+    }
+
+    async fn refresh_resumed_thread_leases(&self, thread: &mut Thread) -> Result<(), EngineError> {
+        let active_leases = self.leases.active_for_thread(thread.id).await;
+        let available_actions = self.effects.available_actions(&active_leases).await?;
+        let mut missing_actions = Vec::new();
+        for action in available_actions {
+            if self
+                .leases
+                .find_lease_for_action(thread.id, &action.name)
+                .await
+                .is_none()
+            {
+                missing_actions.push(action);
+            }
+        }
+        if missing_actions.is_empty() {
+            return Ok(());
+        }
+
+        let mut resumed_capabilities = CapabilityRegistry::new();
+        resumed_capabilities.register(Capability {
+            name: "resumed_tools".into(),
+            description: "Tools activated while the thread was waiting".into(),
+            actions: missing_actions,
+            knowledge: Vec::new(),
+            policies: Vec::new(),
+        });
+        for grant in self
+            .lease_planner
+            .plan_for_thread(thread.thread_type, &resumed_capabilities)
+        {
+            let lease = self
+                .leases
+                .grant(
+                    thread.id,
+                    grant.capability_name,
+                    grant.granted_actions,
+                    None,
+                    None,
+                )
+                .await?;
+            self.store.save_lease(&lease).await?;
+            thread.capability_leases.push(lease.id);
+        }
         Ok(())
     }
 

@@ -4111,20 +4111,68 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_chunk_is_noop() {
+        use crate::channels::IncomingMessage;
+        use tokio::sync::oneshot;
+
         let channel = create_test_channel();
         let _stream = channel.start().await.expect("Channel should start");
 
         let metadata = serde_json::json!({"chat_id": 123});
 
-        // StreamChunk should not start a typing task
-        let result = channel
-            .send_status(
-                crate::channels::StatusUpdate::StreamChunk("chunk".into()),
-                &metadata,
-            )
-            .await;
-        assert!(result.is_ok());
+        // Create an incoming message and insert a pending response waiter so we
+        // can verify StreamChunk does not spuriously complete it.
+        let msg = IncomingMessage::new("test", "user1", "hello").with_metadata(metadata.clone());
+        let msg_id = msg.id;
+        let (tx, rx) = oneshot::channel::<String>();
+        channel.pending_responses.write().await.insert(msg_id, tx);
+
+        // Send three distinct StreamChunk values.
+        tokio::pin!(rx);
+        for chunk in ["chunk-1", "chunk-2", "chunk-3"] {
+            let result = channel
+                .send_status(
+                    crate::channels::StatusUpdate::StreamChunk(chunk.into()),
+                    &metadata,
+                )
+                .await;
+            assert!(result.is_ok()); // safety: test-only assertion
+        }
+
+        // typing_task must remain None — StreamChunk is a pure no-op.
         assert!(channel.typing_task.read().await.is_none());
+
+        // The pending receiver must NOT complete during a 50ms window.
+        let timeout_result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut rx).await;
+        assert!(
+            timeout_result.is_err(),
+            "receiver should not complete during StreamChunk no-op"
+        );
+
+        // Call respond() with the same message ID — it should complete the receiver.
+        let _ = channel
+            .respond(&msg, crate::channels::OutgoingResponse::text("final reply"))
+            .await;
+
+        // The receiver should complete within one second with the terminal text.
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), &mut rx)
+            .await
+            .expect("receiver should complete within 1s after respond()");
+        assert_eq!(
+            received.expect("oneshot should succeed"), // safety: test-only
+            "final reply"
+        );
+
+        // The pending map should no longer contain the ID.
+        assert!(
+            channel
+                .pending_responses
+                .read()
+                .await
+                .get(&msg_id)
+                .is_none(),
+            "pending map should be cleaned up after respond()"
+        );
 
         channel.shutdown().await.expect("Shutdown should succeed");
     }
@@ -5165,6 +5213,47 @@ mod tests {
             channel.poll_task.read().await.is_none(),
             "poll_task should be None after shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn test_respond_uses_original_incoming_metadata() {
+        use crate::channels::{IncomingMessage, OutgoingResponse};
+
+        let channel = create_test_channel();
+        let _stream = channel.start().await.expect("Channel should start");
+
+        let incoming_metadata = serde_json::json!({
+            "source": "incoming",
+            "chat_id": 42
+        });
+        let msg = IncomingMessage::new("test", "default", "hello").with_metadata(incoming_metadata);
+
+        let response_metadata = serde_json::json!({
+            "source": "response",
+            "chat_id": 99
+        });
+        let response = OutgoingResponse {
+            content: "reply".to_string(),
+            thread_id: None,
+            attachments: Vec::new(),
+            metadata: response_metadata,
+        };
+
+        let result = channel.respond(&msg, response).await;
+        assert!(result.is_ok()); // safety: test-only
+
+        // respond() derives metadata_json from msg.metadata (incoming), not
+        // response.metadata.  When msg.user_id == owner_scope_id, that
+        // metadata is stored via update_broadcast_metadata, giving us an
+        // observable side-effect to assert against.
+        let stored = channel.last_broadcast_metadata.read().await.clone();
+        assert_eq!(
+            stored.as_deref(),
+            Some(r#"{"chat_id":42,"source":"incoming"}"#),
+            "respond() must use incoming message metadata, not response metadata"
+        );
+
+        channel.shutdown().await.expect("Shutdown should succeed");
     }
 
     #[test]

@@ -854,6 +854,21 @@ async fn oauth_callback_handler(
     State(state): State<Arc<GatewayState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    oauth_callback_impl(
+        state.extension_manager.as_ref(),
+        state.session_manager.as_ref(),
+        &state.owner_id,
+        params,
+    )
+    .await
+}
+
+async fn oauth_callback_impl(
+    extension_manager: Option<&Arc<ExtensionManager>>,
+    session_manager: Option<&Arc<SessionManager>>,
+    owner_id: &str,
+    params: std::collections::HashMap<String, String>,
+) -> axum::response::Response {
     use crate::cli::oauth_defaults;
 
     // Check for error from OAuth provider (e.g., user denied consent)
@@ -880,7 +895,7 @@ async fn oauth_callback_handler(
     };
 
     // Look up the pending flow by CSRF state (atomic remove prevents replay)
-    let ext_mgr = match state.extension_manager.as_ref() {
+    let ext_mgr = match extension_manager {
         Some(mgr) => mgr,
         None => {
             return oauth_error_page("LunarWing");
@@ -896,7 +911,7 @@ async fn oauth_callback_handler(
                 error = %error,
                 "OAuth callback received with malformed state"
             );
-            clear_auth_mode(&state, &state.owner_id).await;
+            clear_session_auth_mode(session_manager, owner_id).await;
             return oauth_error_page("LunarWing");
         }
     };
@@ -939,7 +954,7 @@ async fn oauth_callback_handler(
                 },
             );
         }
-        clear_auth_mode(&state, &flow.user_id).await;
+        clear_session_auth_mode(session_manager, &flow.user_id).await;
         return oauth_error_page(&flow.display_name);
     }
 
@@ -1045,30 +1060,53 @@ async fn oauth_callback_handler(
 
     // Clear auth mode regardless of outcome so the next user message goes
     // through to the LLM instead of being intercepted as a token.
-    clear_auth_mode(&state, &flow.user_id).await;
+    clear_session_auth_mode(session_manager, &flow.user_id).await;
 
     // After successful OAuth, auto-activate the extension so it moves
     // from "Installed (Authenticate)" → "Active" without a second click.
     // OAuth success is independent of activation — tokens are already stored.
     // Report auth as successful and attempt activation as a bonus step.
-    let final_message = if success {
+    let (final_message, activation_succeeded) = if success {
         match ext_mgr.activate(&flow.extension_name, &flow.user_id).await {
-            Ok(result) => result.message,
+            Ok(result) => (result.message, true),
             Err(e) => {
                 tracing::warn!(
                     extension = %flow.extension_name,
                     error = %e,
                     "Auto-activation after OAuth failed"
                 );
-                format!(
-                    "{} authenticated successfully. Activation failed: {}. Try activating manually.",
-                    flow.display_name, e
+                (
+                    format!(
+                        "{} authenticated successfully. Activation failed: {}. Try activating manually.",
+                        flow.display_name, e
+                    ),
+                    false,
                 )
             }
         }
     } else {
-        message
+        (message, false)
     };
+
+    if activation_succeeded {
+        let resume_result =
+            match crate::bridge::resolve_engine_auth_callback(&flow.user_id, &flow.secret_name)
+                .await
+            {
+                Ok(false) if flow.extension_name != flow.secret_name => {
+                    crate::bridge::resolve_engine_auth_callback(&flow.user_id, &flow.extension_name)
+                        .await
+                }
+                result => result,
+            };
+        if let Err(error) = resume_result {
+            tracing::warn!(
+                extension = %flow.extension_name,
+                error = %error,
+                "Failed to resume Engine V2 thread after OAuth callback"
+            );
+        }
+    }
 
     // Broadcast SSE event to notify the web UI
     if let Some(ref sse) = flow.sse_manager {
@@ -1084,6 +1122,14 @@ async fn oauth_callback_handler(
 
     let html = oauth_defaults::landing_html(&flow.display_name, success);
     axum::response::Html(html).into_response()
+}
+
+#[cfg(feature = "integration")]
+pub async fn oauth_callback_for_test(
+    extension_manager: &Arc<ExtensionManager>,
+    params: std::collections::HashMap<String, String>,
+) -> axum::response::Response {
+    oauth_callback_impl(Some(extension_manager), None, "integration-test", params).await
 }
 
 // --- Chat handlers ---
@@ -1394,7 +1440,11 @@ async fn chat_auth_cancel_handler(
 
 /// Clear pending auth mode on the active thread.
 pub async fn clear_auth_mode(state: &GatewayState, user_id: &str) {
-    if let Some(ref sm) = state.session_manager {
+    clear_session_auth_mode(state.session_manager.as_ref(), user_id).await;
+}
+
+async fn clear_session_auth_mode(session_manager: Option<&Arc<SessionManager>>, user_id: &str) {
+    if let Some(sm) = session_manager {
         let session = sm.get_or_create_session(user_id).await;
         let mut sess = session.lock().await;
         if let Some(thread_id) = sess.active_thread
