@@ -38,10 +38,15 @@ impl RetrievalEngine {
         }
 
         // Include both user-owned and shared system docs for context retrieval.
-        let all_docs = self
+        let all_docs: Vec<MemoryDoc> = self
             .store
             .list_memory_docs_with_shared(project_id, user_id)
-            .await?;
+            .await?
+            .into_iter()
+            // Skills use deterministic activation in the orchestrator. Generic
+            // retrieval must not bypass that selector and inject them as knowledge.
+            .filter(|doc| doc.doc_type != DocType::Skill)
+            .collect();
         if all_docs.is_empty() {
             return Ok(Vec::new());
         }
@@ -311,6 +316,37 @@ mod tests {
             .await
             .unwrap();
         assert!(docs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retrieve_excludes_skills_from_generic_context() {
+        let project = ProjectId::new();
+        let store = make_store(vec![
+            MemoryDoc::new(
+                project,
+                "test-user",
+                DocType::Skill,
+                "skill:selection-proof",
+                "SKILL_CONTEXT_PROOF",
+            ),
+            MemoryDoc::new(
+                project,
+                "test-user",
+                DocType::Lesson,
+                "selection lesson",
+                "Use deterministic selection",
+            ),
+        ]);
+        let engine = RetrievalEngine::new(store);
+
+        let docs = engine
+            .retrieve_context(project, "test-user", "selection proof", 5)
+            .await
+            .unwrap();
+
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].doc_type, DocType::Lesson);
+        assert!(!docs[0].content.contains("SKILL_CONTEXT_PROOF"));
     }
 
     #[tokio::test]
