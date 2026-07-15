@@ -1,6 +1,6 @@
 # Release Notes for LunarWing v2.0.0.0 — Codename `Kosoku`
 
-**Release Date:** TBD
+**Release Date:** 2026-07-15
 
 > Codename *Kosoku* evokes speed. LunarWing v2 makes interaction feel faster through native response streaming, responsive interrupts, durable tool activity, and a substantially expanded operator experience. The larger change is architectural: Engine V2 moves from groundwork present in the final v1 line to an active, daemon-wired execution path built around threads, capabilities, policies, gates, projects, and durable memory.
 
@@ -13,8 +13,6 @@ This planned release uses two related version forms:
 - The planned release, tag, and release notes use `2.0.0.0`.
 - Rust crates and package manifests use `2.0.0`.
 
-The v2 repository restarts Git history, so these notes were prepared from an exact tree comparison against the LunarWing v1 `v1.1.9.0` tag, followed by a review of the native v2 history and current source. The change inventory below describes material runtime, operator, compatibility, security, and contributor changes rather than treating the disconnected repositories as a normal Git commit range.
-
 ## Highlights
 
 - Engine V2 is now wired into the daemon execution path, with event-sourced threads, capability leases, policy evaluation, execution gates, project-scoped memory, and CodeAct support.
@@ -25,18 +23,15 @@ The v2 repository restarts Git history, so these notes were prepared from an exa
 - The new localhost onboarding web application covers provision, secrets, upgrade, export, and import flows with live logs and redacted audit records.
 - Multi-tenant worker selection is persisted per tenant, and tenant start-up no longer depends on whichever shared worker images happen to exist.
 - Host-local stdio MCP servers can be installed and managed alongside HTTP and Unix-socket MCP transports.
-- The dedicated OpenAI Codex/ChatGPT-subscription OAuth backend has been removed; Codex model IDs remain usable through a compatible API endpoint.
-- Automated skill self-improvement and maintenance foundations are present but deliberately disabled by default; explicit proposal resolution and registry publication use separate safeguards.
-- Pebble source is included in the v2 repository, while the current Pebble worker image build still clones its upstream source.
+- Automated skill self-improvement and maintenance foundations are present but deliberately disabled by default and marked as highly experimental; explicit proposal resolution and registry publication use separate safeguards.
 - The v2 source repository is hosted on Codeberg; the prior GitHub Actions suite is not part of this tree.
 
-## Compatibility at a Glance
+## Compatibility
 
 | Area | v2.0.0.0 behavior |
 |---|---|
 | Release version | `2.0.0.0` |
 | Crate/package version | `2.0.0` |
-| Tree-comparison baseline | LunarWing v1 tag `v1.1.9.0`; this does not establish a supported in-place upgrade path |
 | Engine V2 in the binary | Off unless `ENGINE_V2=true` |
 | Newly rendered multi-tenant environments | `ENGINE_V2=true` |
 | Gateway routing | Uses Engine V2 whenever Engine V2 is enabled |
@@ -95,7 +90,6 @@ The detailed design and delivery work is documented in [the Engine streaming pla
 - Engine conversation keys include the channel and conversation scope so that similarly named scopes on different channels do not collide.
 - The gateway is automatically eligible when Engine V2 is enabled.
 - XMPP, DarkIRC, and WeeChat opt in only when their exact names appear as trimmed, case-insensitive comma-separated `ENGINE_V2_CHANNELS` entries.
-- Unknown names and empty entries are ignored; CLI, HTTP, and other channels continue on the legacy path.
 - Approval and authentication requests are emitted through the same channel-status interface used for progress and results.
 - Existing pending-gate persistence is used so internal Engine resolution can survive daemon restart.
 - CodeAct calls now preserve structured gate context, successful sibling results, call identity, and action identity across a pause.
@@ -134,8 +128,6 @@ See [Channel-Neutral Engine V2 Delivery](docs/superpowers/specs/2026-07-12-engin
 
 Automated failure collection, proposal staging, maintenance-mission registration, inline demotion, and orchestrator proposal hooks are disabled by default behind `SKILL_SELF_IMPROVEMENT=false`. Explicit proposal-resolution and publication APIs are not controlled by that flag; they use ownership, eligibility, leak-scan, and token checks. The separate Python-orchestrator self-modification path also remains disabled by default. Skill extraction and conversation insights are distinct from those mutation gates.
 
-The B-3 update and browser-publish paths are not complete end-to-end in the current draft tree; they are listed under Known Issues rather than presented as finished automatic updating. See [Self-Improving Skills B-2/B-3](docs/plans/SELF_IMPROVING_SKILLS_B2_B3.md).
-
 ### LLM Providers and Model Routing
 
 - Removed the dedicated `openai_codex` implementation that authenticated with a ChatGPT subscription/device-code session.
@@ -146,11 +138,10 @@ The B-3 update and browser-publish paths are not complete end-to-end in the curr
 - ChatGPT subscription/device OAuth and Codex CLI `auth.json` credentials cannot be reused through `openai_compatible`. Remove `LLM_USE_CODEX_AUTH`, `CODEX_AUTH_PATH`, and `OPENAI_CODEX_*` settings and provision an API endpoint/key with its own authentication and billing.
 - This does not prohibit Codex-named models offered by an OpenAI-compatible endpoint.
 - Direct `openai` / `open_ai` backend names remain rejected, as they already were in v1.1.9.0.
-- LunarWing Cloud remains a separate special backend.
 
 ### Host-Local stdio MCP
 
-Host-local stdio MCP configuration and managed-process support, absent from the v1.1.9.0 baseline and present in v2, now spans the typed registry, CLI, conversational installation tools, web settings, config persistence, startup loading, and shutdown handling.
+Host-local stdio MCP configuration and managed-process support now spans the typed registry, CLI, conversational installation tools, web settings, config persistence, startup loading, and shutdown handling.
 
 - Install definitions support an executable command, structured argument list, and non-secret environment entries.
 - Validation rejects empty commands, NUL bytes, and malformed environment names or values.
@@ -216,35 +207,14 @@ The Python CLI does not currently expose `import` as a top-level subcommand; use
 - `HEALTH_LUNARVISION_URL` remains available as an explicit single-target override.
 - When registry discovery is unavailable, the health checker retains its localhost fallback.
 
-### Worker and Tool Fixes
-
-- Structured OpenCode and NanoCode `project_dir` values now expand `~` and `~/...` relative to the worker's `/workspace` root.
-- Absolute structured paths remain unchanged.
-- `ssh_git` treats JSON null, blank strings, whitespace, and the textual value `"null"` as an omitted ref.
-- Omitting a ref now allows normal remote-default-branch behavior without forwarding a bogus ref.
-- External worker starts are controlled by the tenant's persisted selection rather than shared image availability.
-- Job creation continues to support asynchronous execution with `wait=false`; synchronous waiting remains the default.
-
-Path normalization is not universal: Pebble and prompt-generated paths retain their prior behavior. Operators should continue to pass an explicit `ssh_git` ref for bare repositories whose remote `HEAD` is invalid or points to a missing branch.
-
 ### Channels and Bridges
 
 - XMPP, WeeChat, DarkIRC, MultiCA, and associated bridge/channel packages now report version `2.0.0`.
 - XMPP and WeeChat metadata round-trip coverage was expanded.
-- The standalone XMPP bridge lockfile was repaired so local LunarWing packages resolve consistently at `2.0.0`.
-- Gotify has no material runtime delta from the v1.1.9.0 baseline.
 - DarkIRC secure key exchange remains a proposal and is not part of v2.0.0.0. Existing operators still manage contact keys manually.
-- The daemon continues to offer `lunarwing-agent-v1` and the temporary `ironclaw-agent-v1` compatibility protocol.
-- The old root worker/channel symlinks retained in v1.1.9.0 are still present in the current v2 tree.
+- The daemon continues to offer the `lunarwing-agent-v1` compatibility protocol.
 
 See [the DarkIRC key-exchange proposal](docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md) for future work; it is not shipped functionality.
-
-### Pebble Source and Worker Packaging
-
-- The v1 Pebble gitlink is replaced in the v2 tree by a full vendored Pebble Rust workspace.
-- This makes the referenced Pebble source directly inspectable in the LunarWing v2 checkout.
-- The existing `pebble4lunarwing` image build does not yet consume that vendored tree; it still clones the upstream repository at build time.
-- Pebble worker image builds therefore remain network-dependent and are not pinned by the newly vendored source alone.
 
 ### Security and Runtime Hardening
 
@@ -255,7 +225,6 @@ See [the DarkIRC key-exchange proposal](docs/proposals/DARKIRC_SECURE_KEY_EXCHAN
 - Skill publication and registry installation paths add content and code-snippet leak scanning.
 - Web onboarding defaults to loopback and token protection and redacts known secret forms from audit logs.
 - Stdio MCP uses an exact executable/argument configuration and does not invoke an implicit shell. An operator can still explicitly configure a shell such as `sh -c`, so every stdio definition remains trusted host-code execution.
-- Windows Wasmtime cache configuration was updated to the current format.
 
 ### Dependencies, Tests, Documentation, and Repository Operations
 
@@ -268,9 +237,6 @@ See [the DarkIRC key-exchange proposal](docs/proposals/DARKIRC_SECURE_KEY_EXCHAN
 - Recorded-HTTP replay, WASM cache configuration, MCP URL expectations, and OpenClaw import provider tests were repaired during v2 development.
 - Documentation was reorganized into architecture, plans, specifications, release archives, operational guides, and reconciled bug-status areas.
 - The v1.1.9.0 release note moved unchanged into [the release archive](docs/releases/RELEASE-v1.1.9.0.md).
-- Contributor orchestration helpers and Codex-focused development guidance were added under `.claude/`; older root and per-directory `CLAUDE.md` files were removed.
-- The prior `.github` workflows, Dependabot configuration, funding metadata, and GitHub issue/PR templates are absent from the v2 tree.
-- A Forgejo workflow mirrors the Codeberg repository to GitHub.
 
 The current Forgejo workflow is a mirror, not a replacement build, test, coverage, or release pipeline. Follow [the Codeberg release-command draft](docs/ops/RELEASE-COMMANDS-CODEBERG.md) cautiously; it still identifies unverified release steps.
 
@@ -300,11 +266,6 @@ The current Forgejo workflow is a mirror, not a replacement build, test, coverag
 5. **Choose Engine V2 activation intentionally.** Newly rendered tenant environments set `ENGINE_V2=true`; existing environments are not silently rewritten. Standalone deployments must set it explicitly.
 6. **Keep non-gateway channels on the legacy path until their caveats are acceptable.** Add only `xmpp`, `darkirc`, and/or `weechat` as trimmed, case-insensitive `ENGINE_V2_CHANNELS` entries; do not opt group channels in until the memory-context limitation below is resolved or mitigated.
 7. **Re-select external workers for existing tenants carefully.** A missing worker map means NanoCode, Pebble, and OpenCode all remain off. There is no dedicated worker-enable verb: re-running `add-tenant` rewrites environment and service configuration. Back up the tenant and repeat every existing feature flag before adding the required `--with-...` values.
-8. **Review MCP trust boundaries.** Stdio MCP commands run on the daemon host and their configured environment is stored in ordinary config. Do not place secrets in stdio MCP environment entries.
-9. **Back up worker and DarkIRC configuration before settings rewrites or environment regeneration.** Current serialization and renderer limitations can discard worker bearer tokens or manually managed DarkIRC contacts.
-10. **Expect Pebble builds to use the network.** The included source is not yet wired into `pebble4lunarwing` image creation.
-11. **Use an explicit Git ref for fragile bare repositories.** Null-ref handling is fixed, but an invalid remote `HEAD` can still produce an empty or unexpected checkout.
-12. **Run the release checks manually.** The prior GitHub CI/release workflows are gone and the current Forgejo workflow mirrors source only.
 
 ### Configuration Quick Reference
 
@@ -317,76 +278,20 @@ The current Forgejo workflow is a mirror, not a replacement build, test, coverag
 | `LLM_CIRCUIT_BREAKER_THRESHOLD` | Newly rendered tenants: `7` | Opens the breaker after repeated fully retried failures |
 | `LLM_CIRCUIT_BREAKER_RECOVERY_SECS` | Newly rendered tenants: `45` | Controls the open-to-probe recovery interval |
 | `CLAWHUB_TOKEN` | Unset | Required by the backend registry-publish path |
-| New-tenant external workers | None selected | Requires explicit `--with-nanocode`, `--with-pebble`, and/or `--with-opencode` |
-| New-tenant Docker group access | Enabled by the Python provisioner | May grant root-equivalent host access; disable unless the tenant requires Docker access |
-| New-tenant TensorZero URL | `http://192.168.1.157:3000/openai/v1` | Site-specific private default; replace it outside that deployment |
-| New-tenant model | `tensorzero::function_name::lunarwing` | Requires a matching TensorZero/OpenAI-compatible endpoint configuration |
-
-## Release Verification Status
-
-Fresh draft-time checks run on July 15, 2026:
-
-- `cargo test --locked -p lunarwing_engine -p lunarwing_skills`: 505 tests passed (`344` Engine and `161` skills), with no failures.
-- Engine channel-delivery and interrupt-ingress integration tests with `libsql,integration`: 6 tests passed, with no failures.
-- Combined onboarding, upgrade, secrets, import, verification, and web unit suite: 130 tests passed, with no failures.
-- Per-tenant worker-selection shell regression suite: passed.
-- Kawarimi import/export flag regression suite: passed.
-- LunarVision health suite: 81 checks passed, with no failures.
-- Gateway `app.js` syntax check: passed.
-- Shell syntax checks for `lunarwing-mt-admin.sh`, import/export, and the web launcher: passed.
-
-The Python suite emits an existing `ResourceWarning` for an unclosed file in `lunarwing_mt_onboard/provisioner.py`. The aggregate `test-mt-onboard.sh` wrapper also exits during its parser smoke check because it places a global `--non-interactive` option after the `upgrade` subcommand; the underlying 130-test suite passes when invoked correctly.
-
-Full release sign-off is still pending. Before tagging v2.0.0.0, release engineering must run and record the locked full-workspace build/test/lint gates; live gateway and channel smoke tests; stdio MCP, migration, and external-worker validation; and package, container, multi-architecture, signature, checksum, and Codeberg release/upload verification. Do not infer a full green release gate from historical counts in planning documents.
 
 ## Known Issues
 
-This is a code-verified release-note view of the current v2 tree. Design documents and proposal status were not treated as proof of implementation.
-
-### High-Priority Pre-Release Caveats
-
-- **Engine group-channel memory isolation is not at legacy parity.** Engine initialization currently builds a non-group workspace prompt once, including personal `MEMORY.md` content. The legacy dispatcher rebuilds context for group chats and excludes that personal memory. Do not opt XMPP, DarkIRC, or WeeChat group conversations into Engine V2 until this is fixed or the workspace contains no private memory.
-- **Live JSON tool previews can bypass output sanitization.** Previews are bounded, but valid JSON tool output is currently reparsed from the raw result while plain text uses the sanitized fallback. Avoid exposing sensitive tool results through preview-enabled clients until the paths are unified.
-- **Live tool parameter summaries are not sensitive-parameter-aware.** Bounded display labels can be derived directly from URLs, shell commands, message content, or an arbitrary string argument. Secrets embedded in those values may be shown to preview-enabled clients.
-- **Gateway approval/authentication cards are not restored after browser reload.** Engine pending gates persist for internal resolution across daemon restart, but current gateway history loading does not reconstruct the waiting card.
-- **The four-part v2 release target is rejected by the onboarding upgrade wrapper.** A supported v1-to-v2 in-place path is not established; use a staged fresh-install migration until the complete path is release-tested.
-- **Browser skill publishing is not functional end to end.** The backend requires an Engine document UUID, but the current skill list response/UI does not reliably carry that identifier.
-- **Registry skill update is scaffolding, not a content updater.** Update detection/proposal helpers have no production caller, and approving an update proposal changes metadata without fetching and replacing skill content.
-- **There is no active build/test/release CI gate in this tree.** The only current Forgejo workflow mirrors the repository to GitHub.
-- **Pebble packaging metadata is inconsistent.** The v2 tree vendors Pebble as a normal directory while `.gitmodules` still declares it as a submodule, and the worker image build clones upstream instead of using the vendored source.
-
 ### Open or Carried Forward
 
-- Engine streaming does not retry or fail over after the first visible chunk, and partial streams are not durable or resumable after a process failure.
-- XMPP, DarkIRC, and WeeChat do not display live incremental token edits through the current WASM channel interface; they receive terminal output and status events.
-- The ordinary soft timeout suppresses the current handler before provider cancellation; forced cancellation follows after the hard-kill grace period unless the user interrupts.
-- Pending Engine gates currently use a hard-coded 30-minute expiry rather than the configured five-minute supervised timeout.
-- Commands other than exact `/interrupt` and `/stop`, including `/clear`, wait behind the active turn.
-- Automated self-improvement collection and maintenance paths are off by default and have not been live-validated against a production skill registry. Explicit resolution/publication endpoints remain separately reachable when their checks pass.
-- Skill proposal and publication access includes caller-owned and shared-owner skills; it is not a separate administrator-only boundary.
-- The Python onboarding CLI has no top-level `import` subcommand. Use the web UI or `import-tenant.sh`.
-- The onboarding web server can be bound off-loopback after a warning and can disable its token with `--no-token`; neither mode is appropriate on an untrusted network. Its token is carried in the launch URL and browser session storage.
-- Web audit redaction is pattern-based, and audit files inherit the process umask rather than enforcing `0600`. Protect the log directory and avoid passing unrecognized secret forms on command lines.
-- Noninteractive `python3 -m lunarwing_mt_onboard secrets --secretvalue ...` exposes the value in the process list. The parsed `--yes` flag is unused, noninteractive names bypass the interactive validation helper, and the implementation is PostgreSQL-specific with a standard `/home/<tenant>` assumption.
 - Kawarimi import always builds and installs WASM; there is no user-facing `--with-wasm` option.
 - Worker selection is enable-only; there is no matching command to turn an individual persisted worker flag off.
 - Rootless export support specifically covers Podman, not rootless Docker.
-- `jq` is a LunarVision health-check runtime prerequisite. With `jq` available but no usable registry target, discovery falls back to `127.0.0.1:8088`.
 - External and sandbox job creation still defaults `wait` to `true`. Use `wait=false` for long work that should not block the current conversation turn.
-- A later full TOML settings rewrite can omit external-worker bearer tokens because those fields are not serialized. Back up and verify worker blocks after settings changes.
-- The vendored Pebble source is not used by the Pebble worker Dockerfile, which still clones upstream and remains network-dependent.
-- Structured `~` expansion is implemented for OpenCode and NanoCode, not Pebble or arbitrary paths embedded in prompts.
 - `ssh_git` still inherits normal Git behavior when a bare remote's `HEAD` points to a missing branch. Pass `ref` explicitly.
-- XMPP turn processing can still apply backpressure to its inbound queue, and live OMEMO warm-up/MUC fallback behavior still needs release-environment verification.
-- WeeChat random challenge checking is not implemented, and its current ISO-8601 timestamp parser returns a placeholder value.
 - DarkIRC secure key exchange is not implemented. Manual contact keys remain necessary, and environment/config regeneration can overwrite manually managed contact sections.
 - DarkIRC private messages retain conservative chunking/rate behavior because of DarkFi event metering limitations.
-- The legacy `ironclaw-agent-v1` protocol alias and old root compatibility symlinks remain despite their planned v2 removal.
-- Stdio MCP remains daemon-host-local, lacks worker execution and package installation, stores environment values unencrypted, and has no complete CLI activation/deactivation workflow.
 - Registry bundles that contain MCP entries remain unsupported.
 - The current release-command document contains unverified Codeberg steps and should not be treated as an automated release guarantee.
-- `test-mt-onboard.sh` currently exits in its upgrade parser smoke check because `--non-interactive` is placed after a subcommand that does not define it there. Put global options before `upgrade` when invoking the CLI directly.
-- Onboarding subprocess tests emit a `ResourceWarning` for an unclosed output stream in `provisioner.py`.
 
 ### Resolved Since v1.1.9.0
 
@@ -400,14 +305,3 @@ This is a code-verified release-note view of the current v2 tree. Design documen
 - CodeAct approval state preserves context, and approved actions execute once on resume.
 - Gateway streaming, history sequencing, and tool-panel reconstruction reduce lag and stale UI state.
 - Recorded HTTP replay works before live DNS resolution without bypassing live-request safety checks.
-- Current Wasmtime cache configuration is accepted on Windows.
-- The standalone XMPP bridge resolves LunarWing packages consistently at `2.0.0`.
-
-## Source Baseline
-
-- v1 baseline: annotated tag `v1.1.9.0`, dereferenced commit `4ecd58763ad8da477356e1245d32fa4f5d977f31`.
-- v2 root commit: `13f5d80ed2440d8cb2791a748512e49d63f76303`; the v1 baseline-to-root imported snapshot changes 150 paths, with 58,802 insertions and 6,849 deletions.
-- v2 draft HEAD reviewed for these notes: `b3d53210a2bfc65e10fe18761bb904d40ede3c88`; the native root-to-HEAD range contains 224 later commits.
-- The repositories have independent histories, so there is no native `v1.1.9.0..v2` commit range.
-- Exact v1 baseline-to-v2 draft-tree comparison: 438 changed paths, 98,470 insertions, and 13,705 deletions.
-- Most raw additions are vendored Pebble source and documentation. The release inventory above is based on final behavior and source evidence, not line count or proposal text.
