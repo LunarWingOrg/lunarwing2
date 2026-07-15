@@ -149,7 +149,7 @@ If/when you do revisit, **Option C (Channel-Layer Token)** is probably the clean
 - `ic/src/channels/web/sse.rs` — SSE event filtering
 - `ic/src/agent/dispatcher.rs` — pass turn token through agentic loop
 - `ic/src/tools/mod.rs` — tool execution context
-- `ic/src/llm/delegate.rs` — ChatDelegate emission
+- `ic/src/agent/dispatcher.rs` — ChatDelegate emission
 
 ## Decision Log
 

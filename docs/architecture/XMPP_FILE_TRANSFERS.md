@@ -120,11 +120,31 @@ The WASM XMPP channel (`ic/channels-src/xmpp/src/lib.rs`) decodes inbound attach
 
 ## Supported Attachment Types
 
-The WASM host enforces a MIME-type allowlist. `AttachmentKind` classification:
+The WASM host enforces an explicit MIME-type prefix allowlist. Any MIME type
+not matching one of these prefixes is rejected.
 
-- `Image` — `image/*`
-- `Audio` — `audio/*`
-- `Document` — everything else (PDF, text, archives, etc.)
+`AttachmentKind::from_mime_type()` determines the classification for accepted
+types. The allowlist and the kind classification are independent decisions:
+`image/*` maps to `Image`, `audio/*` maps to `Audio`, and every other allowed
+prefix, including `video/*`, maps to `Document`.
+
+| Prefix | Allowed | AttachmentKind |
+|--------|---------|---------------|
+| `image/` | yes | Image |
+| `audio/` | yes | Audio |
+| `video/` | yes | Document |
+| `application/pdf` | yes | Document |
+| `application/vnd.` | yes | Document |
+| `application/msword` | yes | Document |
+| `application/rtf` | yes | Document |
+| `text/` | yes | Document |
+| `application/json` | yes | Document |
+| `application/zip` | yes | Document |
+| `application/gzip` | yes | Document |
+| `application/x-tar` | yes | Document |
+| `application/octet-stream` | yes | Document |
+
+All other MIME types are rejected outright.
 
 ## OMEMO Considerations
 

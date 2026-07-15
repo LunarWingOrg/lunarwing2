@@ -19,6 +19,12 @@ manually-run host-level step focused on the **service-level watchdog** (restarts
 `/usr/local/sbin` but does **not** schedule them — that scheduling is now handled
 by the `add-tenant` `ensure_health_pipeline()` flow.
 
+> **Scheduling ownership:** the self-heal pipeline is scheduled exclusively by
+> `add-tenant` / `ensure_health_pipeline()`. The `install-lunarwing-watchdog.sh`
+> installer copies the self-heal scripts to `/usr/local/sbin` but will never
+> schedule them. On a host where the watchdog installer ran but `add-tenant`
+> hasn't, the scripts are on disk but unscheduled.
+
 ## Two distinct "watchdogs" (don't conflate them)
 
 | | Service-level watchdog | Infrastructure self-heal |
