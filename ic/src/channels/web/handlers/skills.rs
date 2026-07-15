@@ -171,6 +171,47 @@ pub async fn skills_install_handler(
         )));
     };
 
+    // B-3: leak-scan the fetched skill body before installing it. Pulled skills
+    // come from a public registry and must not bring credentials in. The
+    // registry also scans server-side; this is the client-side gate.
+    {
+        let scan = lunarwing_safety::LeakDetector::new().scan(&content);
+        if !scan.is_clean() {
+            tracing::warn!(
+                user_id = %user.user_id,
+                skill = %req.name,
+                "refusing to install skill: leak scan detected credentials"
+            );
+            return Ok(Json(ActionResponse::fail(
+                "Skill body failed leak scan (credentials detected); refusing to install"
+                    .to_string(),
+            )));
+        }
+    }
+
+    // Track registry provenance for the catalog-pull branch (B-3): written as
+    // a `.registry.json` sidecar next to SKILL.md so the v1→v2 migration can
+    // stamp it into V2SkillMetadata. None for inline-content / explicit-URL
+    // installs (those aren't catalog pulls).
+    let registry_provenance: Option<serde_json::Value> =
+        if req.content.is_none() && req.url.is_none() {
+            state.skill_catalog.as_ref().map(|cat| {
+                let content_hash = {
+                    use sha2::{Digest, Sha256};
+                    let mut h = Sha256::new();
+                    h.update(content.as_bytes());
+                    format!("sha256:{:x}", h.finalize())
+                };
+                serde_json::json!({
+                    "registry_url": cat.registry_url(),
+                    "content_hash": content_hash,
+                    "pulled_at": chrono::Utc::now(),
+                })
+            })
+        } else {
+            None
+        };
+
     // Parse, check duplicates, and get install_dir under a brief read lock.
     let (user_dir, skill_name_from_parse) = {
         let guard = registry.read().map_err(|e| {
@@ -205,6 +246,19 @@ pub async fn skills_install_handler(
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // B-3: write the registry provenance sidecar for catalog-pulled skills so
+    // the v1→v2 migration can stamp it. Best-effort — a failed write just means
+    // the skill installs without provenance (treated as locally-authored).
+    if let Some(ref provenance) = registry_provenance {
+        let sidecar = user_dir.join(&skill_name).join(".registry.json");
+        if let Err(e) = std::fs::write(
+            &sidecar,
+            serde_json::to_string_pretty(provenance).unwrap_or_default(),
+        ) {
+            tracing::warn!("failed to write registry sidecar for {skill_name}: {e}");
+        }
+    }
 
     // Commit: brief write lock for in-memory addition
     let mut guard = registry.write().map_err(|e| {
@@ -330,4 +384,138 @@ pub async fn skill_patch_reject_handler(
         )))),
         Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
     }
+}
+
+// ── B-1/B-2/B-3: unified skill proposals approval API ────────────────────
+//
+// Generalizes the patch-only surface with a `kind` discriminator so the GUI
+// panel can render and act on patch, prune, and update proposals through one
+// endpoint. The patch routes above are kept as thin aliases for back-compat.
+
+/// Body for approve/reject: `{ "kind": "patch" | "prune" | "update" }`.
+#[derive(Debug, serde::Deserialize)]
+pub struct ProposalActionBody {
+    pub kind: Option<String>,
+}
+
+/// Parse the kind body, defaulting to `patch` (back-compat with B-1 callers
+/// that hit the unified endpoint without specifying kind).
+fn parse_kind(body: &ProposalActionBody) -> lunarwing_skills::v2::ProposalKind {
+    use lunarwing_skills::v2::ProposalKind;
+    match body
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("patch")
+        .to_lowercase()
+        .as_str()
+    {
+        "prune" => ProposalKind::Prune,
+        "update" => ProposalKind::Update,
+        _ => ProposalKind::Patch,
+    }
+}
+
+/// GET /api/skills/proposals — list all pending skill proposals (patch/prune/update).
+pub async fn skill_proposals_list_handler(
+    State(_state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let proposals = crate::bridge::list_pending_skill_proposals(&user.user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let count = proposals.len();
+    Ok(Json(serde_json::json!({
+        "proposals": proposals,
+        "count": count,
+    })))
+}
+
+/// POST /api/skills/proposals/{doc_id}/approve — apply a pending proposal.
+/// Body: `{ "kind": "patch" | "prune" | "update" }` (defaults to `patch`).
+pub async fn skill_proposal_approve_handler(
+    State(_state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Path(doc_id): Path<String>,
+    body: Option<Json<ProposalActionBody>>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let kind = parse_kind(
+        &body
+            .map(|b| b.0)
+            .unwrap_or(ProposalActionBody { kind: None }),
+    );
+    match crate::bridge::approve_skill_proposal(&doc_id, kind, &user.user_id).await {
+        Ok(_) => Ok(Json(ActionResponse::ok(format!(
+            "Skill {kind:?} proposal approved for {doc_id}"
+        )))),
+        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
+    }
+}
+
+/// POST /api/skills/proposals/{doc_id}/reject — discard a pending proposal.
+/// Body: `{ "kind": "patch" | "prune" | "update" }` (defaults to `patch`).
+pub async fn skill_proposal_reject_handler(
+    State(_state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Path(doc_id): Path<String>,
+    body: Option<Json<ProposalActionBody>>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let kind = parse_kind(
+        &body
+            .map(|b| b.0)
+            .unwrap_or(ProposalActionBody { kind: None }),
+    );
+    match crate::bridge::reject_skill_proposal(&doc_id, kind, &user.user_id).await {
+        Ok(_) => Ok(Json(ActionResponse::ok(format!(
+            "Skill {kind:?} proposal rejected for {doc_id}"
+        )))),
+        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
+    }
+}
+
+// ── B-3: cross-agent skill sharing — publish API ──────────────────────────
+
+/// Body for publish: `{ "slug", "version", "changelog"?, "tags"? }`.
+#[derive(Debug, serde::Deserialize)]
+pub struct PublishBody {
+    pub slug: String,
+    pub version: String,
+    #[serde(default)]
+    pub changelog: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// POST /api/skills/{doc_id}/publish — publish a skill to the registry.
+/// Auth-gated, user-scoped, explicit (never automatic). The bridge enforces
+/// publish eligibility (Trusted + proven) + leak-scans before sending.
+pub async fn skill_publish_handler(
+    State(_state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Path(doc_id): Path<String>,
+    body: Option<Json<PublishBody>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let body = body.map(|b| b.0).unwrap_or(PublishBody {
+        slug: String::new(),
+        version: String::new(),
+        changelog: String::new(),
+        tags: vec![],
+    });
+    if body.slug.trim().is_empty() || body.version.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "slug and version are required".to_string(),
+        ));
+    }
+    let result = crate::bridge::publish_skill(
+        &doc_id,
+        &user.user_id,
+        &body.slug,
+        &body.version,
+        &body.changelog,
+        body.tags,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }

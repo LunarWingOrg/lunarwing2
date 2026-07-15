@@ -509,13 +509,24 @@ impl MissionManager {
                                 .take(10)
                                 .collect();
 
-                            // B-1: attribute the failure to any activated skills
-                            // that are ALSO below the patch-confidence threshold,
-                            // so the self-improvement mission can propose a patch.
-                            // Empty when no such skill was active — the mission
-                            // then only does its prompt/config/orchestrator work.
-                            let active_skills =
-                                collect_patch_candidate_skills(mgr.store.as_ref(), &thread).await;
+                            let self_improvement_on = crate::skill_self_improvement_enabled();
+
+                            let active_skills = if self_improvement_on {
+                                collect_patch_candidate_skills(mgr.store.as_ref(), &thread).await
+                            } else {
+                                Vec::new()
+                            };
+
+                            let prune_candidates = if self_improvement_on {
+                                collect_prune_candidate_skills(
+                                    mgr.store.as_ref(),
+                                    thread.project_id,
+                                    &thread.user_id,
+                                )
+                                .await
+                            } else {
+                                Vec::new()
+                            };
 
                             let payload = serde_json::json!({
                                 "source_thread_id": event.thread_id.0.to_string(),
@@ -523,6 +534,7 @@ impl MissionManager {
                                 "issues": issues,
                                 "error_messages": error_messages,
                                 "active_skills": active_skills,
+                                "candidates": prune_candidates,
                             });
 
                             if let Err(e) = mgr
@@ -737,9 +749,13 @@ impl MissionManager {
         // 0. Seed compiled-in orchestrator v0 so it's visible in workspace
         self.seed_orchestrator_v0(project_id).await?;
 
+        let self_improvement_on = crate::skill_self_improvement_enabled();
+
         // 1. Error diagnosis (self-improvement) — per-user
-        self.ensure_self_improvement_mission(project_id, user_id)
-            .await?;
+        if self_improvement_on {
+            self.ensure_self_improvement_mission(project_id, user_id)
+                .await?;
+        }
 
         // 2. Skill extraction (formerly playbook extraction)
         self.ensure_mission_by_metadata(
@@ -788,6 +804,29 @@ impl MissionManager {
             5, // max 5/day
         )
         .await?;
+
+        // 5. Skill maintenance (B-2 prune sweep) — fires on the same
+        // thread-completed-with-issues event as self-improvement. The sweep
+        // stages prune proposals for confidently-dead skills (0.0 confidence
+        // over ≥ prune min-usage); the user approves archival via the proposals
+        // surface. Inline demotion (in record_usage) handles the immediate
+        // below-floor case; this sweep catches stale, never-succeeding skills.
+        if self_improvement_on {
+            self.ensure_mission_by_metadata(
+                project_id,
+                user_id,
+                "skill_maintenance",
+                "skill-maintenance",
+                SKILL_MAINTENANCE_GOAL,
+                MissionCadence::OnSystemEvent {
+                    source: "engine".into(),
+                    event_type: "thread_completed_with_issues".into(),
+                },
+                "Scan for dead skills and stage user-approved prune (archive) proposals",
+                1, // max 1/day — sweep is cheap, catches what inline demotion misses
+            )
+            .await?;
+        }
 
         Ok(())
     }
@@ -1020,6 +1059,60 @@ async fn collect_patch_candidate_skills(
             .metrics
             .is_patch_candidate(DEFAULT_PATCH_CONFIDENCE_THRESHOLD, DEFAULT_PATCH_MIN_USAGE)
         {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "doc_id": doc.id.0.to_string(),
+            "name": meta.name,
+            "version": meta.version,
+            "confidence": meta.metrics.confidence(),
+            "usage_count": meta.metrics.usage_count,
+        }));
+    }
+    out
+}
+
+/// Enumerate all skills visible to `user_id` that are confidently dead and
+/// therefore candidates for user-approved pruning (archival), B-2.
+///
+/// Unlike [`collect_patch_candidate_skills`], this scans the entire library
+/// (not just skills activated in a specific thread) and uses the stricter
+/// `is_prune_candidate` gate (0.0 confidence over the prune minimum usage).
+/// Authored and `Installed` skills are excluded by the predicate. The result
+/// feeds the skill-maintenance sweep mission's `candidates` payload.
+async fn collect_prune_candidate_skills(
+    store: &dyn Store,
+    project_id: crate::types::project::ProjectId,
+    user_id: &str,
+) -> Vec<serde_json::Value> {
+    use lunarwing_skills::v2::{
+        DEFAULT_PRUNE_CONFIDENCE, DEFAULT_PRUNE_MIN_USAGE, V2SkillMetadata,
+    };
+
+    let docs = match store
+        .list_memory_docs_with_shared(project_id, user_id)
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            debug!("collect_prune_candidate_skills: store error: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+    for doc in docs {
+        if doc.doc_type != crate::types::memory::DocType::Skill {
+            continue;
+        }
+        if !seen.insert(doc.id.0) {
+            continue;
+        }
+        let Ok(meta) = serde_json::from_value::<V2SkillMetadata>(doc.metadata.clone()) else {
+            continue;
+        };
+        if !meta.is_prune_candidate(DEFAULT_PRUNE_CONFIDENCE, DEFAULT_PRUNE_MIN_USAGE) {
             continue;
         }
         out.push(serde_json::json!({
@@ -1417,6 +1510,9 @@ const CONVERSATION_INSIGHTS_GOAL: &str =
 
 /// The goal for the expected-behavior mission (user feedback loop).
 const EXPECTED_BEHAVIOR_GOAL: &str = include_str!("../../prompts/mission_expected_behavior.md");
+
+/// The goal for the skill-maintenance (prune-sweep) mission (B-2).
+const SKILL_MAINTENANCE_GOAL: &str = include_str!("../../prompts/mission_skill_maintenance.md");
 
 /// Seed content for the fix pattern database.
 const SEED_FIX_PATTERNS: &str = "\
@@ -2522,6 +2618,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_cannot_pause_another_users_learning_mission() {
+        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();
@@ -2685,6 +2782,7 @@ mod tests {
 
     #[tokio::test]
     async fn fire_on_system_event_scoped_to_user() {
+        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();
@@ -2756,6 +2854,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_learning_missions_idempotent_per_user() {
+        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();
@@ -3078,5 +3177,96 @@ mod tests {
         assert!(meta.patch_history.is_empty(), "no history entry on reject");
         // Metrics NOT reset — the skill still carries its poor record.
         assert_eq!(meta.metrics.failure_count, 6);
+    }
+
+    // ── B-2: prune-candidate collection ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_collect_prune_candidates_finds_dead_skills() {
+        let project_id = ProjectId::new();
+        let store = TestStore::new();
+        // Dead: 0/12 = 0.0 confidence, 12 uses, Trusted Extracted → candidate.
+        store
+            .save_memory_doc(&seed_skill(
+                project_id,
+                "alice",
+                "dead",
+                lunarwing_skills::SkillTrust::Trusted,
+                12,
+                0,
+                12,
+            ))
+            .await
+            .unwrap();
+        // Not-dead-enough: 1/9 = 0.11 confidence (not 0.0) → not a prune
+        // candidate (it IS a patch/demote candidate, but prune floor is 0.0).
+        store
+            .save_memory_doc(&seed_skill(
+                project_id,
+                "alice",
+                "flaky",
+                lunarwing_skills::SkillTrust::Trusted,
+                9,
+                1,
+                8,
+            ))
+            .await
+            .unwrap();
+        // Too few uses: 0/5 = 0.0 but below prune min-usage (10) → excluded.
+        store
+            .save_memory_doc(&seed_skill(
+                project_id,
+                "alice",
+                "newbad",
+                lunarwing_skills::SkillTrust::Trusted,
+                5,
+                0,
+                5,
+            ))
+            .await
+            .unwrap();
+
+        let out = collect_prune_candidate_skills(&store, project_id, "alice").await;
+        assert_eq!(out.len(), 1, "only the dead skill qualifies, got {out:?}");
+        assert_eq!(out[0]["name"], "dead");
+    }
+
+    #[tokio::test]
+    async fn test_collect_prune_candidates_excludes_protected_skills() {
+        let project_id = ProjectId::new();
+        let store = TestStore::new();
+        // Dead but Installed (read-only) → excluded.
+        store
+            .save_memory_doc(&seed_skill(
+                project_id,
+                "alice",
+                "vendor",
+                lunarwing_skills::SkillTrust::Installed,
+                12,
+                0,
+                12,
+            ))
+            .await
+            .unwrap();
+        // Dead but Authored → excluded (authored intent respected).
+        let mut authored = seed_skill(
+            project_id,
+            "alice",
+            "mine",
+            lunarwing_skills::SkillTrust::Trusted,
+            12,
+            0,
+            12,
+        );
+        {
+            let mut m: lunarwing_skills::v2::V2SkillMetadata =
+                serde_json::from_value(authored.metadata.clone()).unwrap();
+            m.source = lunarwing_skills::v2::V2SkillSource::Authored;
+            authored.metadata = serde_json::to_value(&m).unwrap();
+        }
+        store.save_memory_doc(&authored).await.unwrap();
+
+        let out = collect_prune_candidate_skills(&store, project_id, "alice").await;
+        assert!(out.is_empty(), "protected skills never pruned, got {out:?}");
     }
 }

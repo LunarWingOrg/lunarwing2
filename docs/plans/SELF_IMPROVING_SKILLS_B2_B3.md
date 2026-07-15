@@ -1,7 +1,7 @@
 ---
 plan name: SELF_IMPROVING_SKILLS_B2_B3
 plan description: Skill confidence-based demotion/pruning (B-2) and cross-agent skill sharing (B-3)
-plan status: proposed
+plan status: delivered
 ---
 
 # B-2 + B-3 — Skills ecosystem: demotion/pruning and cross-agent sharing
@@ -186,13 +186,124 @@ the existing (pull-only) ClawHub catalog.
 - Nothing is auto-destructive: demotion is reversible, pruning and updates are
   user-approved, `Installed`/authored skills are protected.
 
-## Open questions
-- Demotion floor (`SKILL_DEMOTE_CONFIDENCE` 0.3?) and prune criteria (N failures?
-  confidence 0.0 over M uses?) — tune with real data, expose as config.
-- Does pruning **delete** or **archive** (soft-delete, recoverable)? Recommend
-  archive given the "never-delete data retention" ethos noted in the Hermes doc.
-- B-3 registry: reuse ClawHub, or is a self-hosted/private registry needed for
-  cross-instance sharing within an operator's own fleet? Publish endpoint + auth
-  model depends on this.
-- B-3 requires a publish-capable registry API to exist — confirm ClawHub
-  supports publish, or scope a minimal self-hosted registry first.
+## Open questions (resolved)
+- **Demotion floor / prune criteria** → `DEFAULT_DEMOTE_CONFIDENCE = 0.3` /
+  `DEFAULT_DEMOTE_MIN_USAGE = 5`; `DEFAULT_PRUNE_CONFIDENCE = 0.0` /
+  `DEFAULT_PRUNE_MIN_USAGE = 10`. Prune is strictly worse than demote (0.0 over
+  more uses). Exposed as named consts in `v2.rs`; tune with real data.
+- **Delete vs archive** → **archive** (soft delete via `archived_at`). Matches
+  the never-delete retention ethos; the MemoryDoc is retained for
+  audit/recovery.
+- **ClawHub publish feasibility** → **confirmed feasible.** ClawHub
+  (`openclaw/clawhub`, Convex backend at `wry-manatee-359.convex.site`, the same
+  host LunarWing already pulls from) supports `POST /api/v1/skills`
+  (`publishSkillV1Handler`) with `multipart/form-data` (`payload` JSON + `files`
+  blobs), Bearer-token auth, and server-side `/api/v1/skills/-/scan` secret
+  scanning. Versioned update detection via `GET /api/v1/resolve?slug=&hash=`.
+  Self-hosting is **not** required for publish; a private fleet can point
+  `CLAWHUB_REGISTRY` at a ClawHub-compatible endpoint (e.g. SkillHub) for free.
+- **Trigger model** → `OnSystemEvent` on `thread_completed_with_issues` (NOT
+  cron). Key finding: `MissionCadence::Cron` missions don't fire in production
+  today (`next_fire_at` is never populated for missions — only the routine
+  subsystem computes cron fire times). The maintenance sweep rides the same
+  event as self-improvement; inline demotion in `record_usage` handles the
+  immediate below-floor case.
+
+---
+
+## Implementation summary (2026-07-13) — DELIVERED
+
+B-2 and B-3 are implemented end-to-end (engine + bridge + API + GUI), all layers
+verified with scoped `cargo test`/`cargo check` and JS syntax checks. Branch
+`feat/skills-b2-b3-01`.
+
+### Shared surface (Part A — generalized the B-1 patch-only surface)
+- **Data** (`v2.rs`): `ProposalKind` enum (patch | prune | update, default =
+  patch for back-compat).
+- **Bridge** (`router.rs`): `SkillProposal` DTO (kind-discriminated,
+  kind-specific fields `Option`/`skip_serializing_if`),
+  `list_pending_skill_proposals` / `approve_skill_proposal` /
+  `reject_skill_proposal` (dispatch on kind). B-1 `SkillPatchProposal` /
+  `list_pending_skill_patches` / `approve_skill_patch` / `reject_skill_patch`
+  kept as thin back-compat wrappers.
+- **API** (`handlers/skills.rs` + `server.rs`): `GET /api/skills/proposals`,
+  `POST /api/skills/proposals/{doc_id}/{approve,reject}` (body `{kind}`).
+  `/api/skills/patches*` kept as aliases.
+- **GUI** (`app.js` + i18n en/zh-CN): panel generalized to render patch/prune/
+  update cards via a `kind` badge + per-kind approve label.
+
+### B-2 — demotion & pruning
+- **Data** (`v2.rs`): `deprecated_at`/`deprecation_reason`,
+  `archived_at`/`archived_reason`, `pending_prune: Option<PendingSkillPrune>`,
+  `is_demote_candidate` / `is_prune_candidate` predicates (authored/Installed
+  exempt; SkillTrust untouched), threshold consts.
+- **Runtime** (`orchestrator.rs`): `handle_list_skills` excludes
+  deprecated/archived skills — the single choke point (user decision). Python
+  scorer's confidence math left untouched.
+- **Storage** (`skill_tracker.rs`): `demote_skill` / `undeprecate_skill` /
+  `propose_prune` / `apply_prune` / `discard_prune`. Inline demotion in
+  `record_usage` (auto, reversible below the floor).
+- **Mission** (`mission.rs` + `prompts/mission_skill_maintenance.md`): 5th
+  learning mission (`skill_maintenance`, `OnSystemEvent`, max 1/day) +
+  `collect_prune_candidate_skills` enrichment.
+- **Host fn** (`orchestrator.rs`): `__propose_skill_prune__`.
+
+### B-3 — cross-agent sharing
+- **Dep** (`lunarwing_skills/Cargo.toml`): `lunarwing_safety` optional behind
+  `catalog`; `reqwest` gains `multipart`.
+- **Data** (`v2.rs`): provenance fields (`registry_url`/`registry_publisher`/
+  `registry_version`/`pulled_at`/`registry_content_hash`),
+  `pending_update: Option<PendingSkillUpdate>`, `is_publish_eligible`,
+  publish consts.
+- **Catalog** (`catalog.rs`): `publish()` (multipart `payload`+`files` →
+  `POST /api/v1/skills`, Bearer), `check_for_update()` (`GET /api/v1/resolve`),
+  `leak_scan()` (defense-in-depth pre-flight). Fixed `SkillDetail.version`
+  (now populated from `latestVersion`, previously dropped → always `None`).
+- **Provenance** (`skill_migration.rs`): `.registry.json` sidecar read at v1→v2
+  migration stamps provenance into `V2SkillMetadata`.
+- **Install** (`handlers/skills.rs`): leak-scan on pull; sidecar written for
+  catalog pulls.
+- **Storage** (`skill_tracker.rs`): `propose_update` / `apply_update` /
+  `discard_update`.
+- **Bridge** (`router.rs`): `publish_skill` (eligibility + leak-scan body &
+  snippets + `CLAWHUB_TOKEN` from env, never logged) +
+  `SkillPublishResult` DTO.
+- **API** (`handlers/skills.rs` + `server.rs`): `POST /api/skills/publish/{doc_id}`.
+- **GUI** (`app.js` + i18n): Publish button on trusted skill cards; update-kind
+  proposal card already rendered via Part A.
+
+### Verification
+- `cargo test -p lunarwing_skills`: 161 passed (incl. 17 new B-2/B-3 tests).
+- `cargo test -p lunarwing_engine`: 327 passed (incl. 13 new B-2 tests:
+  demote/prune tracker + prune-candidate collectors).
+- `cargo clippy --all --benches --tests --examples -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+- Skills auth regression (`test_skills_handlers_require_auth`): covers the 4
+  new routes (`/api/skills/proposals*` + `/api/skills/publish/{doc_id}`).
+- JS syntax checks (`app.js`, `en.js`, `zh-CN.js`): clean.
+
+### Decisions honored
+- Demotion = metadata flag, NOT a trust tier (SAETY comment on `SkillTrust`
+  ordering preserved).
+- Demotion hook in Rust `handle_list_skills` (single choke point), Python
+  scorer untouched.
+- Sweep via `OnSystemEvent` (cron-mission gap avoided — not in scope to fix).
+- Prune = archive (soft delete); `Installed`/authored never pruned/demoted.
+- Publish explicit + eligibility-gated + leak-scanned; `CLAWHUB_TOKEN` secret.
+- Pulled skills install at `SkillTrust::Installed` (existing security model).
+
+### Note
+Gateway static assets are `include_bytes!`-compiled — the GUI (Publish button,
+unified proposals panel) requires a release rebuild / next tenant build to
+appear.
+
+### Deferred
+- Live HTTP integration tests against ClawHub (publish/resolve) — `#[ignore]`-
+  gated, need a real `CLAWHUB_TOKEN`.
+- Update-application content pull (the bridge stamps provenance + bumps version
+  on approval, but does not yet re-download the newer SKILL.md body — that
+  needs the install path wired into the approve flow; the proposal surface is
+  in place).
+- Gotify notification on demotion/prune (the `MissionNotification` broadcast +
+  `notify_channels` surface exists; wiring a channel name is a one-line
+  follow-up).

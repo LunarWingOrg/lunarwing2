@@ -23,6 +23,17 @@ pub mod runtime;
 pub mod traits;
 pub mod types;
 
+/// Whether the B-1/B-2/B-3 skill self-improvement subsystem is enabled.
+///
+/// Gated by the `SKILL_SELF_IMPROVEMENT` env var (default: `false`).
+/// When disabled, all skill self-improvement collection, mission registration,
+/// inline demotion, and ext-fn hooks are inert no-ops.
+pub fn skill_self_improvement_enabled() -> bool {
+    std::env::var("SKILL_SELF_IMPROVEMENT")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
 // ── Re-exports: types ───────────────────────────────────────
 
 pub use types::capability::{

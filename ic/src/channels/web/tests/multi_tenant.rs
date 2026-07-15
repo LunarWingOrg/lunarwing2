@@ -708,6 +708,18 @@ mod auth_enforcement {
             .route("/api/skills/patches", get(authed_handler))
             .route("/api/skills/patches/{doc_id}/approve", post(authed_handler))
             .route("/api/skills/patches/{doc_id}/reject", post(authed_handler))
+            // B-1/B-2/B-3: unified skill proposals surface.
+            .route("/api/skills/proposals", get(authed_handler))
+            .route(
+                "/api/skills/proposals/{doc_id}/approve",
+                post(authed_handler),
+            )
+            .route(
+                "/api/skills/proposals/{doc_id}/reject",
+                post(authed_handler),
+            )
+            // B-3: cross-agent skill sharing — publish surface.
+            .route("/api/skills/publish/{doc_id}", post(authed_handler))
             .route("/api/skills/{name}", delete(authed_handler))
             // Logs
             .route("/api/logs/events", get(authed_handler))
@@ -779,6 +791,12 @@ mod auth_enforcement {
         assert_requires_auth(&app, Method::GET, "/api/skills/patches").await;
         assert_requires_auth(&app, Method::POST, "/api/skills/patches/abc/approve").await;
         assert_requires_auth(&app, Method::POST, "/api/skills/patches/abc/reject").await;
+        // B-1/B-2/B-3: unified proposals surface is auth-gated.
+        assert_requires_auth(&app, Method::GET, "/api/skills/proposals").await;
+        assert_requires_auth(&app, Method::POST, "/api/skills/proposals/abc/approve").await;
+        assert_requires_auth(&app, Method::POST, "/api/skills/proposals/abc/reject").await;
+        // B-3: publish surface is auth-gated.
+        assert_requires_auth(&app, Method::POST, "/api/skills/publish/abc").await;
     }
 
     #[tokio::test]
