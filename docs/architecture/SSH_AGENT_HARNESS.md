@@ -40,7 +40,7 @@ bytes never touch disk and never cross the container boundary.
 │   Secrets store (AES-256-GCM) ──────► decrypt keys into memory (Zeroizing)      │
 │                                       │                                         │
 │                                       ▼                                         │
-│                             SshAgentServer  ──► russh_keys agent protocol       │
+│                             SshAgentServer  ──► russh::keys agent protocol     │
 │                             Unix socket at                                      │
 │                     /home/<tenant>/lunarwing/run/ssh-agent.sock                 │
 │                                       ▲                                         │
@@ -61,13 +61,14 @@ All paths are under `ic/src/`. Line numbers are indicative (verified 2026-07-01)
 | File | Responsibility |
 |------|----------------|
 | `bridge/ssh.rs` | **Core coordination + type definitions.** Owns `SSHBridge`, defines all public config/credential/error/audit types, host CRUD, and the load-bearing `start_agent_server()`. Pure orchestration — delegates crypto to `secrets` and the wire protocol to `ssh_agent`. |
-| `bridge/ssh_agent.rs` | **In-process ssh-agent server.** `SshAgentServer` binds the Unix socket, parses keys with `russh_keys::decode_secret_key`, runs `russh_keys::agent::server::serve`, and self-connects to `add_identity` each key into russh's internal keystore. |
+| `bridge/ssh_agent.rs` | **In-process ssh-agent server.** `SshAgentServer` binds the Unix socket, parses keys with `russh::keys::decode_secret_key`, runs `russh::keys::agent::server::serve`, and self-connects to `add_identity` each key into russh's internal keystore. |
 | `bridge/ssh_secrets.rs` | **Key ↔ secrets-store adapter.** `SshSecretsManager` derives secret names, stores/loads/deletes keys and passphrases, and heuristically classifies key format. |
-| `bridge/ssh_hostkeys.rs` | **Host-key verification / known_hosts (in memory).** `HostKeyVerifier` — Strict / AcceptFirst (TOFU), SHA256 fingerprints, mismatch detection. **Built and unit-tested, but not yet wired into a live connection path** (see §7). |
+| `bridge/ssh_hostkeys.rs` | **Host-key verification / known_hosts (in memory).** `HostKeyVerifier` — Strict / AcceptFirst (TOFU), SHA256 fingerprints, mismatch detection. **Live** for the in-process `ssh` and `ssh_git` tool paths (see §7). |
 | `bridge/ssh_api.rs` | **HTTP REST management surface (axum).** CRUD over hosts, key upload/delete/status, agent status/keys. |
+| `bridge/ssh_client.rs` | **In-process russh client.** `connect_and_exec` used by the `ssh` and WASM `ssh` tools. Wires `HostKeyVerifier` via russh's `Handler::check_server_key`. |
 | `config/ssh.rs` | **Config deserialization.** `SshConfig` / `SshHostEntry` map `[ssh]` / `[[ssh.hosts]]` TOML into typed config; `to_host_map()` flattens global defaults against per-host overrides. |
 
-Module registration: `bridge/mod.rs` declares all five submodules (no feature
+Module registration: `bridge/mod.rs` declares all six submodules (no feature
 gate); public types are re-exported from `lib.rs`.
 
 ## 3. Data model
@@ -111,12 +112,14 @@ absent per-host override from the global default.
 Fields: `tenant_id: Uuid`, `tenant_name: String`, `hosts:
 Arc<RwLock<HashMap<String, SSHHostConfig>>>`, `secrets_store: Arc<dyn
 SecretsStore>`, `audit_logger: Arc<dyn AuditLogger>`, `agent_server:
-Option<Arc<SshAgentServer>>` (None until started).
+Option<Arc<SshAgentServer>>` (None until started), `host_key_verifier:
+Arc<HostKeyVerifier>`.
 
 Key methods: `new` (`:338`), `validate` (`:363`), `get_host_config` (`:404`),
 `list_hosts` (`:413`), `add_host` (`:419`), `remove_host` (`:438`),
 `start_agent_server` (`:464`), `stop_agent_server` (`:546`),
-`get_agent_socket_path` (`:554`), `agent_server` (`:561`).
+`get_agent_socket_path` (`:554`), `agent_server` (`:561`), `load_key`
+(`:577`), `host_key_verifier` (`:583`).
 
 ### `SshEvent` / `AuditLogger` (`ssh.rs:253`, `:293`)
 
@@ -171,8 +174,8 @@ does **not** check that a key secret exists (keys may be uploaded later).
    - removes any stale socket, `UnixListener::bind`, then **chmods the socket
      `0o666`** (`ssh_agent.rs:122`) so the worker's OS user (e.g. `nanocode`,
      a different UID than the daemon) can read/write it;
-   - parses each key with `russh_keys::decode_secret_key`;
-   - spawns `russh_keys::agent::server::serve` over the `UnixListenerStream`;
+   - parses each key with `russh::keys::decode_secret_key`;
+   - spawns `russh::keys::agent::server::serve` over the `UnixListenerStream`;
    - **sleeps 100 ms**, then self-connects as an `AgentClient` and calls
      `add_identity` for each key (`ssh_agent.rs:166-190`) — this is what
      populates russh's internal keystore, which actually answers
@@ -259,9 +262,9 @@ PascalCase (`"Strict"`) — clients must match the casing.
   stable; secrets are scoped by `user_id = tenant_id`; the socket lives in the
   tenant-owned run directory.
 - **Host-key trust.** `Strict` (default) or `AcceptFirst` (TOFU + pin). No
-  `AcceptAny`. **Note:** the verifier is not yet wired into a live path (§7),
-  so runtime host-key checking is currently whatever the worker's own `ssh`
-  client does with its container-local `known_hosts`.
+  `AcceptAny`. **Note:** the verifier is live for the in-process `ssh` and
+  `ssh_git` tool paths (§7); the worker-mode path still relies on the worker's
+  own `ssh` client and its container-local `known_hosts`.
 
 ### Hardening notes / current sharp edges
 
@@ -292,9 +295,9 @@ PascalCase (`"Strict"`) — clients must match the casing.
   (capability) instead of a key file (bearer secret) means keys never leave the
   daemon and are never written to a container filesystem. It also means standard
   `git`/`ssh` "just work" with zero SSH-specific code in the worker.
-- **`russh_keys` in-process agent, not the OpenSSH `ssh-agent` binary.** Avoids
+- **`russh::keys` in-process agent, not the OpenSSH `ssh-agent` binary.** Avoids
   spawning/managing an external process and keeps key material inside the
-  daemon's address space. (`russh` / `russh-keys` 0.45, `ic/Cargo.toml:153`.)
+  daemon's address space. (`russh` 0.62, `ic/Cargo.toml:148`. `russh-keys` is now a module within the `russh` crate, not a separate dependency.)
 - **Run-dir socket, not `/tmp`.** Required because the daemon runs with
   `PrivateTmp=true`; a `/tmp` socket would be invisible to bind-mounted workers.
 - **No `AcceptAny` host-key mode.** Refuses to offer a footgun; the strictest
@@ -307,7 +310,7 @@ PascalCase (`"Strict"`) — clients must match the casing.
 Built and working:
 
 - `SSHBridge` + all types, host CRUD, validation.
-- `SshAgentServer` — real `russh_keys` agent, socket lifecycle, key loading at
+- `SshAgentServer` — real `russh::keys` agent, socket lifecycle, key loading at
   startup, chmod, self-`add_identity`.
 - `SshSecretsManager` — store/load/delete keys + passphrases against the
   encrypted secrets store.
@@ -323,9 +326,9 @@ Now wired into live paths (via the delivery mechanisms — see
   delivery tools: the built-in `ssh` tool feeds live server keys into
   `verify_from_config` through russh's `check_server_key`
   (`ic/src/bridge/ssh_client.rs`), and the `ssh_git` tool materializes a
-  `known_hosts` from its pins. The in-process **russh 0.45 client**
+  `known_hosts` from its pins. The in-process **russh 0.62 client**
   (`ssh_client.rs`) is likewise now live (the harness previously used only the
-  `russh_keys` agent server). Host-key pinning **is** enforced for the in-process
+  `russh::keys` agent server). Host-key pinning **is** enforced for the in-process
   tools; the worker-mode path (Option 1) still relies on the worker's own `ssh`
   client + `known_hosts`.
 
@@ -345,7 +348,7 @@ Known limitations / follow-ups:
 
 ## 8. Test coverage
 
-21 unit tests, all in-module (`#[cfg(test)]`), none in `ic/tests/`:
+26 unit tests, all in-module (`#[cfg(test)]`), none in `ic/tests/`:
 
 | File | Tests |
 |------|-------|
@@ -354,12 +357,13 @@ Known limitations / follow-ups:
 | `ssh_secrets.rs` | 6 — store/load, passphrase, missing key, delete, format detection (ed25519/rsa) |
 | `ssh_hostkeys.rs` | 9 — fingerprint, parse, add/verify, strict reject, AcceptFirst pin, mismatch, remove, per-port |
 | `ssh_api.rs` | 1 — `HostRequest` → `SSHHostConfig` conversion |
+| `ssh_client.rs` | 3 — `append_capped` under-limit, crossing-limit, and already-full output behavior |
 | `config/ssh.rs` | 2 — parse config, `to_host_map` defaults/overrides |
 
 Notable gaps: the agent server is never tested with a **real** key (the sole
-test uses an empty map); there are no HTTP-handler tests; and `HostKeyVerifier`,
-though well-tested in isolation, has no integration coverage because it is not
-wired in.
+test uses an empty map); there are no HTTP-handler tests; and `HostKeyVerifier`
+is unit-tested and wired into the in-process client path, though live-server
+integration test coverage remains an open gap.
 
 > The `config/ssh.rs` tests parse a **bare** `SshConfig`, so their TOML uses
 > top-level `[[hosts]]` (no `ssh.` prefix). Do **not** copy that shape into a
@@ -374,6 +378,7 @@ wired in.
 | Secrets adapter | `ic/src/bridge/ssh_secrets.rs` |
 | Host-key verifier | `ic/src/bridge/ssh_hostkeys.rs` |
 | HTTP API | `ic/src/bridge/ssh_api.rs` |
+| In-process SSH client | `ic/src/bridge/ssh_client.rs` |
 | Config parsing | `ic/src/config/ssh.rs` |
 | Settings field | `ic/src/settings.rs` (`Settings.ssh`) |
 | Startup wiring | `ic/src/app.rs` (`AppComponents.ssh_bridge`) |
