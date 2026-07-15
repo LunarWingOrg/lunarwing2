@@ -172,7 +172,7 @@ Added `lunarwing_mt_onboard_web/`, a FastAPI/Uvicorn browser interface over the 
 Quick start:
 
 ```bash
-# Safe demonstration mode
+# Safe demonstration mode (no token)
 ./lunarwing_mt_onboard_web/run.sh --demo
 
 # Real provisioning and tenant operations
