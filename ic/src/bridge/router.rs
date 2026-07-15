@@ -5866,18 +5866,24 @@ mod tests {
 
         let conv_a = state
             .conversation_manager
-            .get_or_create_conversation(&engine_conversation_key(
-                &IncomingMessage::new("darkirc", "alice", "hi")
-                    .with_conversation_scope(scope_a),
-            ), "alice")
+            .get_or_create_conversation(
+                &engine_conversation_key(
+                    &IncomingMessage::new("darkirc", "alice", "hi")
+                        .with_conversation_scope(scope_a),
+                ),
+                "alice",
+            )
             .await
             .unwrap();
         let conv_b = state
             .conversation_manager
-            .get_or_create_conversation(&engine_conversation_key(
-                &IncomingMessage::new("darkirc", "alice", "hi")
-                    .with_conversation_scope(scope_b),
-            ), "alice")
+            .get_or_create_conversation(
+                &engine_conversation_key(
+                    &IncomingMessage::new("darkirc", "alice", "hi")
+                        .with_conversation_scope(scope_b),
+                ),
+                "alice",
+            )
             .await
             .unwrap();
 
@@ -5919,20 +5925,18 @@ mod tests {
 
         // An approval scoped to scope_a with an explicit request_id must not
         // resolve the gate in scope_b.
-        let msg_a = IncomingMessage::new("darkirc", "alice", "yes")
-            .with_conversation_scope(scope_a);
-        let matched =
-            matching_engine_approval_gate(&state, &msg_a, Some(req_a)).await;
+        let msg_a =
+            IncomingMessage::new("darkirc", "alice", "yes").with_conversation_scope(scope_a);
+        let matched = matching_engine_approval_gate(&state, &msg_a, Some(req_a)).await;
         assert_eq!(
             matched.map(|gate| gate.thread_id),
             Some(tid_a),
             "exact request_id from scope_a must match only scope_a's gate"
         );
 
-        let msg_b = IncomingMessage::new("darkirc", "alice", "yes")
-            .with_conversation_scope(scope_b);
-        let matched_b =
-            matching_engine_approval_gate(&state, &msg_b, Some(req_a)).await;
+        let msg_b =
+            IncomingMessage::new("darkirc", "alice", "yes").with_conversation_scope(scope_b);
+        let matched_b = matching_engine_approval_gate(&state, &msg_b, Some(req_a)).await;
         assert!(
             matched_b.is_none(),
             "request_id from scope_a must not resolve a gate in scope_b"
@@ -5940,16 +5944,14 @@ mod tests {
 
         // An auth token from scope_a must leave scope_b's pending auth gate
         // unresolved.
-        let auth_resolution_a =
-            matching_engine_auth_gate(&state, &msg_a).await;
+        let auth_resolution_a = matching_engine_auth_gate(&state, &msg_a).await;
         assert!(
             matches!(auth_resolution_a, PendingGateResolution::Resolved(_)),
             "scope_a should find its own auth gate"
         );
 
         // scope_b has no auth gate, so it should resolve to None.
-        let auth_resolution_b =
-            matching_engine_auth_gate(&state, &msg_b).await;
+        let auth_resolution_b = matching_engine_auth_gate(&state, &msg_b).await;
         assert!(
             matches!(auth_resolution_b, PendingGateResolution::None),
             "scope_b should not resolve scope_a's auth gate"
@@ -5966,18 +5968,24 @@ mod tests {
 
         let conv_dm = state
             .conversation_manager
-            .get_or_create_conversation(&engine_conversation_key(
-                &IncomingMessage::new("weechat", "alice", "hi")
-                    .with_conversation_scope(scope_dm),
-            ), "alice")
+            .get_or_create_conversation(
+                &engine_conversation_key(
+                    &IncomingMessage::new("weechat", "alice", "hi")
+                        .with_conversation_scope(scope_dm),
+                ),
+                "alice",
+            )
             .await
             .unwrap();
         let conv_group = state
             .conversation_manager
-            .get_or_create_conversation(&engine_conversation_key(
-                &IncomingMessage::new("weechat", "alice", "hi")
-                    .with_conversation_scope(scope_group),
-            ), "alice")
+            .get_or_create_conversation(
+                &engine_conversation_key(
+                    &IncomingMessage::new("weechat", "alice", "hi")
+                        .with_conversation_scope(scope_group),
+                ),
+                "alice",
+            )
             .await
             .unwrap();
 
@@ -6018,21 +6026,18 @@ mod tests {
             .unwrap();
 
         // An approval from the DM scope must not resolve the group scope's gate.
-        let msg_dm = IncomingMessage::new("weechat", "alice", "yes")
-            .with_conversation_scope(scope_dm);
-        let matched_dm =
-            matching_engine_approval_gate(&state, &msg_dm, Some(req_dm)).await;
+        let msg_dm =
+            IncomingMessage::new("weechat", "alice", "yes").with_conversation_scope(scope_dm);
+        let matched_dm = matching_engine_approval_gate(&state, &msg_dm, Some(req_dm)).await;
         assert_eq!(
             matched_dm.map(|gate| gate.thread_id),
             Some(tid_dm),
             "DM scope approval must match only the DM gate"
         );
 
-        let msg_group = IncomingMessage::new("weechat", "alice", "yes")
-            .with_conversation_scope(scope_group);
-        let matched_group =
-            matching_engine_approval_gate(&state, &msg_group, Some(req_dm))
-                .await;
+        let msg_group =
+            IncomingMessage::new("weechat", "alice", "yes").with_conversation_scope(scope_group);
+        let matched_group = matching_engine_approval_gate(&state, &msg_group, Some(req_dm)).await;
         assert!(
             matched_group.is_none(),
             "DM scope request_id must not resolve a group scope gate"
@@ -6040,15 +6045,13 @@ mod tests {
 
         // An auth token from the group scope must leave the DM scope without
         // a resolvable auth gate (the DM scope has no auth gate of its own).
-        let auth_dm =
-            matching_engine_auth_gate(&state, &msg_dm).await;
+        let auth_dm = matching_engine_auth_gate(&state, &msg_dm).await;
         assert!(
             matches!(auth_dm, PendingGateResolution::None),
             "DM scope has no auth gate and must not resolve the group scope's"
         );
 
-        let auth_group =
-            matching_engine_auth_gate(&state, &msg_group).await;
+        let auth_group = matching_engine_auth_gate(&state, &msg_group).await;
         assert!(
             matches!(auth_group, PendingGateResolution::Resolved(_)),
             "group scope should find its own auth gate"
@@ -6068,12 +6071,10 @@ mod tests {
         let scope_b = "darkirc:dm:user-b";
 
         let key_a = engine_conversation_key(
-            &IncomingMessage::new("darkirc", "alice", "hi")
-                .with_conversation_scope(scope_a),
+            &IncomingMessage::new("darkirc", "alice", "hi").with_conversation_scope(scope_a),
         );
         let key_b = engine_conversation_key(
-            &IncomingMessage::new("darkirc", "alice", "hi")
-                .with_conversation_scope(scope_b),
+            &IncomingMessage::new("darkirc", "alice", "hi").with_conversation_scope(scope_b),
         );
 
         let conv_a = state
@@ -6091,12 +6092,26 @@ mod tests {
 
         let tid_a = state
             .conversation_manager
-            .handle_user_message(conv_a, "hi a", project_id, "alice", ThreadConfig::default(), None)
+            .handle_user_message(
+                conv_a,
+                "hi a",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
             .await
             .unwrap();
         let tid_b = state
             .conversation_manager
-            .handle_user_message(conv_b, "hi b", project_id, "alice", ThreadConfig::default(), None)
+            .handle_user_message(
+                conv_b,
+                "hi b",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -6132,10 +6147,9 @@ mod tests {
             "scope_b should report an active thread"
         );
 
-        let result_a =
-            interrupt_engine_conversation(&lock.read().await.as_ref().unwrap(), &msg_a)
-                .await
-                .expect("interrupt should succeed");
+        let result_a = interrupt_engine_conversation(&lock.read().await.as_ref().unwrap(), &msg_a)
+            .await
+            .expect("interrupt should succeed");
         assert_eq!(result_a, Some("Interrupted.".to_string()));
 
         let outcome_a = {
@@ -6184,12 +6198,10 @@ mod tests {
         let scope_group = "weechat:group:#room";
 
         let key_dm = engine_conversation_key(
-            &IncomingMessage::new("weechat", "alice", "hi")
-                .with_conversation_scope(scope_dm),
+            &IncomingMessage::new("weechat", "alice", "hi").with_conversation_scope(scope_dm),
         );
         let key_group = engine_conversation_key(
-            &IncomingMessage::new("weechat", "alice", "hi")
-                .with_conversation_scope(scope_group),
+            &IncomingMessage::new("weechat", "alice", "hi").with_conversation_scope(scope_group),
         );
 
         let conv_dm = state
@@ -6207,12 +6219,26 @@ mod tests {
 
         let tid_dm = state
             .conversation_manager
-            .handle_user_message(conv_dm, "hi dm", project_id, "alice", ThreadConfig::default(), None)
+            .handle_user_message(
+                conv_dm,
+                "hi dm",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
             .await
             .unwrap();
         let tid_group = state
             .conversation_manager
-            .handle_user_message(conv_group, "hi group", project_id, "alice", ThreadConfig::default(), None)
+            .handle_user_message(
+                conv_group,
+                "hi group",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -6234,10 +6260,10 @@ mod tests {
         let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
         *lock.write().await = Some(state);
 
-        let msg_dm =
-            IncomingMessage::new("weechat", "alice", "/interrupt").with_conversation_scope(scope_dm);
-        let msg_group =
-            IncomingMessage::new("weechat", "alice", "/interrupt").with_conversation_scope(scope_group);
+        let msg_dm = IncomingMessage::new("weechat", "alice", "/interrupt")
+            .with_conversation_scope(scope_dm);
+        let msg_group = IncomingMessage::new("weechat", "alice", "/interrupt")
+            .with_conversation_scope(scope_group);
 
         assert!(
             has_active_engine_thread(&msg_dm).await,

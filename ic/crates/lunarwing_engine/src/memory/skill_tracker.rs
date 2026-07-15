@@ -1039,7 +1039,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_usage_inline_demotes_below_floor() {
-        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
+        unsafe {
+            std::env::set_var("SKILL_SELF_IMPROVEMENT", "true");
+        }
         // Start with a Trusted Extracted skill at 1 success / 8 failures over 9
         // uses (confidence ~0.11, below the 0.3 demotion floor). record_usage
         // with a further failure should trip inline demotion.

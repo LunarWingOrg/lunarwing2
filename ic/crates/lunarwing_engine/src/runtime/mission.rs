@@ -2618,7 +2618,9 @@ mod tests {
 
     #[tokio::test]
     async fn user_cannot_pause_another_users_learning_mission() {
-        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
+        unsafe {
+            std::env::set_var("SKILL_SELF_IMPROVEMENT", "true");
+        }
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();
@@ -2782,7 +2784,9 @@ mod tests {
 
     #[tokio::test]
     async fn fire_on_system_event_scoped_to_user() {
-        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
+        unsafe {
+            std::env::set_var("SKILL_SELF_IMPROVEMENT", "true");
+        }
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();
@@ -2854,7 +2858,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_learning_missions_idempotent_per_user() {
-        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
+        unsafe {
+            std::env::set_var("SKILL_SELF_IMPROVEMENT", "true");
+        }
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();

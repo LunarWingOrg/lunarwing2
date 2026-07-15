@@ -10,6 +10,8 @@ use std::ffi::OsString;
 
 use lunarwing::bridge::reset_engine_state;
 
+pub static ENGINE_V2_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Restores `ENGINE_V2` and `ENGINE_V2_CHANNELS` on drop. The support
 /// module intentionally keeps serialization (and the async reset used
 /// by callers) in the dedicated integration binaries; this guard only
@@ -100,17 +102,11 @@ unsafe fn restore_env(key: &str, value: Option<OsString>) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    use super::EngineV2EnvGuard;
-
-    /// Process-local serialization so environment mutation cannot
-    /// overlap across test threads within a single binary.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use super::{ENGINE_V2_ENV_LOCK, EngineV2EnvGuard};
 
     #[tokio::test]
     async fn save_and_restore_roundtrip() {
-        let _guard = ENV_LOCK.lock().expect("mutex poisoned");
+        let _guard = ENGINE_V2_ENV_LOCK.lock().await;
 
         let saved_engine_v2 = std::env::var_os("ENGINE_V2");
         let saved_channels = std::env::var_os("ENGINE_V2_CHANNELS");
@@ -118,6 +114,10 @@ mod tests {
         let env = EngineV2EnvGuard::enable(Some("xmpp"));
         assert_eq!(std::env::var("ENGINE_V2").unwrap(), "true");
         assert_eq!(std::env::var("ENGINE_V2_CHANNELS").unwrap(), "xmpp");
+        env.set_channels(Some("darkirc"));
+        assert_eq!(std::env::var("ENGINE_V2_CHANNELS").unwrap(), "darkirc");
+        env.set_channels(None);
+        assert_eq!(std::env::var_os("ENGINE_V2_CHANNELS"), None);
 
         env.cleanup().await;
 

@@ -630,6 +630,7 @@ def run_loop(context, goal, actions, state, config):
                     "call_id": gate.get("call_id", ""),
                     "parameters": gate.get("parameters", {}),
                     "resume_kind": gate.get("resume_kind", {}),
+                    "resume_output": gate.get("resume_output"),
                 }
 
             # Check for approval or authentication needed (legacy path)
@@ -739,6 +740,7 @@ def run_loop(context, goal, actions, state, config):
                         "call_id": orig_call.get("call_id", ""),
                         "parameters": orig_call.get("params", {}),
                         "resume_kind": gate.get("resume_kind", {}),
+                        "resume_output": gate.get("resume_output"),
                     }
 
                 if r.get("need_authentication"):

@@ -18,6 +18,8 @@ use lunarwing::db::Database;
 use lunarwing::hooks::Hook;
 use lunarwing::llm::{LlmProvider, SessionConfig, SessionManager};
 use lunarwing::tools::Tool;
+use lunarwing::tools::mcp::config::save_mcp_servers_to_db;
+use lunarwing::tools::mcp::config::{McpServerConfig, McpServersFile};
 
 use crate::support::instrumented_llm::InstrumentedLlm;
 use crate::support::metrics::{ToolInvocation, TraceMetrics};
@@ -395,6 +397,7 @@ pub struct TestRigBuilder {
     keep_bootstrap: bool,
     channel_name: String,
     handle_message_timeout: Option<Duration>,
+    mcp_server_configs: Vec<McpServerConfig>,
 }
 
 impl TestRigBuilder {
@@ -415,6 +418,7 @@ impl TestRigBuilder {
             keep_bootstrap: false,
             channel_name: "test".to_string(),
             handle_message_timeout: None,
+            mcp_server_configs: Vec::new(),
         }
     }
 
@@ -528,6 +532,19 @@ impl TestRigBuilder {
         self
     }
 
+    /// Seed an MCP server configuration that the real `ExtensionManager`
+    /// will discover during `AppBuilder::build_all()`.
+    ///
+    /// During `build()`, each seeded config is upserted into a
+    /// `McpServersFile` and persisted to the test database via
+    /// `save_mcp_servers_to_db`. This lets the real `tool_activate` path
+    /// discover the server and produce an authentication gate when the
+    /// server requires OAuth.
+    pub fn with_mcp_server_config(mut self, config: McpServerConfig) -> Self {
+        self.mcp_server_configs.push(config);
+        self
+    }
+
     /// Build the test rig, creating a real agent and spawning it in the background.
     ///
     /// Uses `AppBuilder::build_all()` to get the same component set as the real
@@ -555,6 +572,7 @@ impl TestRigBuilder {
             keep_bootstrap,
             channel_name,
             handle_message_timeout,
+            mcp_server_configs,
         } = self;
 
         // 1. Create temp dir + libSQL database + run migrations.
@@ -580,6 +598,18 @@ impl TestRigBuilder {
         config.skills.enabled = enable_skills;
         if let Some(v) = auto_approve_tools {
             config.agent.auto_approve_tools = v;
+        }
+
+        // 2b. Seed MCP server configurations into the test database so the
+        // real ExtensionManager discovers them during AppBuilder::build_all().
+        if !mcp_server_configs.is_empty() {
+            let mut servers = McpServersFile::default();
+            for cfg in &mcp_server_configs {
+                servers.upsert(cfg.clone());
+            }
+            save_mcp_servers_to_db(db.as_ref(), &config.owner_id, &servers)
+                .await
+                .expect("failed to seed MCP server configs");
         }
 
         // 3. Create SessionManager + LogBroadcaster.

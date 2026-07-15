@@ -4124,11 +4124,7 @@ mod tests {
         let msg = IncomingMessage::new("test", "user1", "hello").with_metadata(metadata.clone());
         let msg_id = msg.id;
         let (tx, rx) = oneshot::channel::<String>();
-        channel
-            .pending_responses
-            .write()
-            .await
-            .insert(msg_id, tx);
+        channel.pending_responses.write().await.insert(msg_id, tx);
 
         // Send three distinct StreamChunk values.
         tokio::pin!(rx);
@@ -4146,11 +4142,8 @@ mod tests {
         assert!(channel.typing_task.read().await.is_none());
 
         // The pending receiver must NOT complete during a 50ms window.
-        let timeout_result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            &mut rx,
-        )
-        .await;
+        let timeout_result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut rx).await;
         assert!(
             timeout_result.is_err(),
             "receiver should not complete during StreamChunk no-op"
@@ -4172,7 +4165,12 @@ mod tests {
 
         // The pending map should no longer contain the ID.
         assert!(
-            channel.pending_responses.read().await.get(&msg_id).is_none(),
+            channel
+                .pending_responses
+                .read()
+                .await
+                .get(&msg_id)
+                .is_none(),
             "pending map should be cleaned up after respond()"
         );
 
@@ -5228,8 +5226,7 @@ mod tests {
             "source": "incoming",
             "chat_id": 42
         });
-        let msg = IncomingMessage::new("test", "default", "hello")
-            .with_metadata(incoming_metadata);
+        let msg = IncomingMessage::new("test", "default", "hello").with_metadata(incoming_metadata);
 
         let response_metadata = serde_json::json!({
             "source": "response",

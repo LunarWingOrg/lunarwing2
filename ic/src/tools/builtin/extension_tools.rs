@@ -421,10 +421,11 @@ impl Tool for ToolActivateTool {
             }
             Err(activate_err) => {
                 let err_str = activate_err.to_string();
-                let needs_auth = err_str.contains("authentication")
-                    || err_str.contains("401")
-                    || err_str.contains("Unauthorized")
-                    || err_str.contains("not authenticated");
+                let err_lower = err_str.to_ascii_lowercase();
+                let needs_auth = err_lower.contains("authentication")
+                    || err_lower.contains("401")
+                    || err_lower.contains("unauthorized")
+                    || err_lower.contains("not authenticated");
 
                 if !needs_auth {
                     return Err(ToolError::ExecutionFailed(err_str));
