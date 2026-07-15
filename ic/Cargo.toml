@@ -265,6 +265,10 @@ name = "engine_v2_skill_selection"
 required-features = ["libsql", "integration"]
 
 [[test]]
+name = "engine_v2_tensorzero_streaming"
+required-features = ["libsql", "integration"]
+
+[[test]]
 name = "html_to_markdown"
 required-features = ["html-to-markdown"]
 

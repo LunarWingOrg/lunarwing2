@@ -19,7 +19,52 @@ channels continue ignoring `StatusUpdate::StreamChunk`.
 SSE, WASM channel wrapper and current channel WIT, Engine V2 pending gates,
 XMPP/DarkIRC/WeeChat routing metadata, TensorZero Gateway `2026.3.2`.
 
-## Progress Checkpoint (2026-07-13)
+## Local Compatibility Checkpoint (2026-07-15)
+
+**Status: implementation and hermetic local compatibility proof complete; live
+rollout remains open.** The verified worktree is based on `a230c29` but contains
+uncommitted Task 6-8 changes, so it is not yet a release commit. The retained
+release binary at `ic/target/release/lunarwing` built successfully from that
+worktree; its SHA-256 is
+`a3508709d626869e8952af71b576a7c357b032a259ce61501e63b154991c99b6`.
+
+Sanitized local evidence:
+
+- `engine_v2_interrupt_ingress`: `6/6`;
+- `engine_v2_channel_delivery`: `2/2`;
+- `engine_v2_mcp_compatibility`: `3/3` using real HTTP transport and OAuth;
+- `engine_v2_wasm_tool`: `3/3` using real Wasmtime execution and denial;
+- `engine_v2_skill_selection`: `5/5` covering migration, idempotence,
+  deterministic selection, and context injection;
+- `engine_v2_tensorzero_streaming`: `5/5` covering text, usage, fragmented tool
+  fields, mid-stream JSON failure, and premature EOF;
+- RigAdapter unit tests: `46/46`; bridge-router tests: `40/40`; gateway
+  credential/thread matching regressions: `2/2`;
+- isolated release-binary browser target: `4/4`, covering partial text,
+  exactly-once approval and authentication resume, token non-disclosure in the
+  DOM, interrupt acknowledgement, cancelled-terminal suppression, and
+  same-thread recovery;
+- Python syntax checks, Rust formatting, and `git diff --check` passed. Task 9
+  also passed default, PostgreSQL-only, libSQL-only, and all-feature compile
+  checks; engine (`365/365`), effect-adapter (`25/25`), gate (`24/24`), and WASM
+  wrapper (`61` passed, `1` intentionally ignored) suites; XMPP (`2/2`),
+  DarkIRC (`25/25`), and WeeChat (`13/13`) channel crates; and default plus
+  all-feature Clippy with warnings denied.
+
+`scripts/pre-commit-safety.sh`, WIT ABI comparison, and the manual streaming
+source invariants pass. `scripts/check-boundaries.sh` still reports its
+pre-existing repository baseline: direct database-driver references outside the
+declared DB layer, eight old integration targets without the script's expected
+feature gate, silent skips in `workspace_integration.rs`, and existing LLM
+cross-module imports. None of the reported files changed in this worktree.
+
+This proof preserves the gateway/WASM boundary: the gateway renders provider
+deltas incrementally, while current WASM channels receive only the final
+response. It does not prove a deployed XMPP, DarkIRC, or WeeChat bridge. Their
+live validation belongs to the separate disposable-tenant rollout, and no live
+allowlist was changed here.
+
+## Live Pilot Checkpoint (2026-07-13)
 
 **Status: paused after the XMPP pilot; implementation retained.** Brightdawn is
 healthy on release commit `7e2573d` with `ENGINE_V2=true` and
@@ -82,7 +127,8 @@ Remaining live work is deliberately deferred:
   when the operator chooses to continue the rollout.
 
 The detailed task checkboxes below remain the original execution procedure. This
-checkpoint is the authoritative record of completed, deployed, and deferred work.
+checkpoint is the historical record of the deployed XMPP pilot and deferred
+live work.
 
 ---
 
@@ -1197,28 +1243,28 @@ never replace `state/` or regenerate the rest of `env/`.
 
 Phase 5 implementation is complete only when every applicable item is true:
 
-**Current decision:** do not mark this gate complete. XMPP is the only live
-opt-in pilot; DarkIRC and WeeChat are intentionally deferred and remain on the
-legacy path.
+**Current decision:** do not mark the overall gate complete. Local compatibility
+is proven, but XMPP is the only live opt-in pilot; DarkIRC and WeeChat are
+intentionally deferred and remain on the legacy path.
 
-- [ ] `ENGINE_V2=false` disables every channel.
-- [ ] Unset/empty allowlist preserves gateway-only Engine V2.
-- [ ] Only exact eligible entries enable XMPP, DarkIRC, and WeeChat.
-- [ ] Disabled and unknown channels stay legacy.
-- [ ] Every completed Engine V2 turn uses `ChannelManager::respond()` once with
+- [x] `ENGINE_V2=false` disables every channel.
+- [x] Unset/empty allowlist preserves gateway-only Engine V2.
+- [x] Only exact eligible entries enable XMPP, DarkIRC, and WeeChat.
+- [x] Disabled and unknown channels stay legacy.
+- [x] Every completed Engine V2 turn uses `ChannelManager::respond()` once with
   the original routing metadata.
-- [ ] Gateway receives each delta once through channel status and each terminal
+- [x] Gateway receives each delta once through channel status and each terminal
   response once through `GatewayChannel::respond()`.
-- [ ] WASM channels ignore every `StreamChunk` and receive one final response.
-- [ ] Gate/auth/stopped no-reply outcomes do not create duplicate messages or
+- [x] WASM channels ignore every `StreamChunk` and receive one final response.
+- [x] Gate/auth/stopped no-reply outcomes do not create duplicate messages or
   empty assistant history rows.
-- [ ] `BeforeOutbound` modification/rejection and engine error handling retain
+- [x] `BeforeOutbound` modification/rejection and engine error handling retain
   their existing behavior.
-- [ ] XMPP room/JID, DarkIRC nick, and WeeChat buffer/target scopes do not
+- [x] XMPP room/JID, DarkIRC nick, and WeeChat buffer/target scopes do not
   collide for conversation, approval, authentication, or interrupt handling.
-- [ ] No WIT, DB schema, TensorZero provider, frontend, or automatic WASM
+- [x] No WIT, DB schema, TensorZero provider, frontend, or automatic WASM
   installation change was introduced.
-- [ ] Local default-feature, postgres-only, libsql-only, integration, Clippy,
+- [x] Local default-feature, postgres-only, libsql-only, integration, Clippy,
   formatting, and channel-crate gates pass under the six-thread constraint.
 - [ ] Each live-configured channel passes its staged Brightdawn gate; any
   unconfigured channel is explicitly documented as live validation pending and

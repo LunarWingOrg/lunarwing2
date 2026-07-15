@@ -185,7 +185,7 @@ This document tracks feature parity between LunarWing (Rust implementation) and 
 | Skill path compaction | ✅ | ❌ | ~ prefix to reduce prompt tokens |
 | Thinking modes (off/minimal/low/medium/high/xhigh/adaptive) | ✅ | 🚧 | thinkingConfig for Gemini models (thinkingBudget/thinkingLevel); no per-level control yet |
 | Per-model thinkingDefault override | ✅ | ❌ | Override thinking level per model; Anthropic Claude 4.6 defaults to adaptive |
-| Block-level streaming | ✅ | 🚧 | Engine V2 gateway: provider text deltas stream to the web UI via SSE `stream_chunk` (Phase 3). Interrupt cancels the in-flight provider stream without committing terminal response/usage/cache/trace (Phase 4). XMPP, DarkIRC, and WeeChat now support exact opt-in Engine V2 final-response delivery with scoped controls; their current WASM contract intentionally ignores incremental chunks (Phase 5). Tool-arg streaming remains deferred. |
+| Block-level streaming | ✅ | 🚧 | Engine V2 gateway: provider text deltas stream to the web UI via SSE `stream_chunk` (Phase 3). Interrupt cancels the in-flight provider stream without committing terminal response/usage/cache/trace (Phase 4). XMPP, DarkIRC, and WeeChat support exact opt-in Engine V2 final-response delivery with scoped controls; their current WASM contract intentionally ignores incremental chunks (Phase 5). Hermetic browser, real MCP, real Wasmtime, skill migration/selection, and TensorZero-shaped streaming coverage passes locally; deployed XMPP/DarkIRC/WeeChat bridge validation remains pending. Tool-arg streaming remains deferred. |
 | Tool-level streaming | ✅ | ❌ | |
 | Z.AI tool_stream | ✅ | ❌ | Real-time tool call streaming |
 | Plugin tools | ✅ | ✅ | WASM tools |

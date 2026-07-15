@@ -318,6 +318,21 @@ WASM wrapper tests prove `StreamChunk` remains a no-op, and the three channel
 crate suites lock their JID/room, nick, and buffer/network/target metadata
 contracts without a WIT change.
 
+The 2026-07-15 local compatibility checkpoint extends that proof through the
+production adapters and registries. Current-tree focused targets pass for
+interrupt ingress (`6/6`), Phase 5 delivery (`2/2`), real MCP transport/OAuth
+(`3/3`), real Wasmtime tool execution and capability denial (`3/3`), skill
+migration/selection/context injection (`5/5`), and TensorZero-shaped streaming
+(`5/5`). RigAdapter unit coverage passes `46/46`, bridge-router coverage passes
+`40/40`, and the isolated release-binary browser target passes `4/4` for partial
+text, approval, authentication, interruption, and same-thread recovery. The
+browser auth case also proves that its synthetic token is absent from rendered
+DOM and that completion is emitted exactly once.
+
+This is local proof only. XMPP, DarkIRC, and WeeChat still require validation on
+a fresh disposable tenant before any live allowlist is broadened; no hermetic
+test claims to exercise a deployed protocol bridge.
+
 `FEATURE_PARITY.md` is intentionally unchanged in Phase 2 because no
 user-facing channel consumes native provider deltas yet.
 

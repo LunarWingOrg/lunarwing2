@@ -41,7 +41,7 @@ use crate::types::event::{EventKind, ThreadEvent, summarize_params};
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
 use crate::types::shared_owner_id;
-use crate::types::step::{LlmResponse, StepId, TokenUsage};
+use crate::types::step::{ActionCall, LlmResponse, StepId, TokenUsage};
 use crate::types::thread::{Thread, ThreadState};
 
 use super::llm_stream::collect_llm_stream;
@@ -2089,9 +2089,7 @@ fn json_to_thread_messages(value: &serde_json::Value) -> Option<Vec<ThreadMessag
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let action_calls = item
-            .get("action_calls")
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let action_calls = item.get("action_calls").and_then(json_to_action_calls);
 
         let message = match role {
             "System" | "system" => ThreadMessage::system(content),
@@ -2117,6 +2115,24 @@ fn json_to_thread_messages(value: &serde_json::Value) -> Option<Vec<ThreadMessag
     }
 
     Some(messages)
+}
+
+fn json_to_action_calls(value: &serde_json::Value) -> Option<Vec<ActionCall>> {
+    if let Ok(calls) = serde_json::from_value(value.clone()) {
+        return Some(calls);
+    }
+
+    value
+        .as_array()?
+        .iter()
+        .map(|item| {
+            Some(ActionCall {
+                id: item.get("call_id")?.as_str()?.to_string(),
+                action_name: item.get("name")?.as_str()?.to_string(),
+                parameters: item.get("params").cloned().unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 fn sync_runtime_state(thread: &mut Thread, state: Option<&serde_json::Value>) {
@@ -2332,6 +2348,41 @@ mod tests {
                 _ => panic!("Unexpected RunProgress variant in test"),
             }
         }
+    }
+
+    #[test]
+    fn orchestrator_action_call_wire_shape_round_trips_to_thread_messages() {
+        let value = serde_json::json!([
+            {
+                "role": "Assistant",
+                "content": "",
+                "action_calls": [{
+                    "call_id": "provider-call-1",
+                    "name": "echo",
+                    "params": {"message": "hello"}
+                }]
+            },
+            {
+                "role": "ActionResult",
+                "content": "echoed",
+                "action_name": "echo",
+                "action_call_id": "provider-call-1"
+            }
+        ]);
+
+        let messages = json_to_thread_messages(&value).expect("wire messages should decode");
+        let call = messages[0]
+            .action_calls
+            .as_ref()
+            .and_then(|calls| calls.first())
+            .expect("assistant call should be retained");
+        assert_eq!(call.id, "provider-call-1");
+        assert_eq!(call.action_name, "echo");
+        assert_eq!(call.parameters, serde_json::json!({"message": "hello"}));
+        assert_eq!(
+            messages[1].action_call_id.as_deref(),
+            Some("provider-call-1")
+        );
     }
 
     // ── True positives (should trigger nudge) ───────────────────

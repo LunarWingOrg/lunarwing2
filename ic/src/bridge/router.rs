@@ -1850,38 +1850,27 @@ pub async fn resolve_gate(
                     ss.create(&message.user_id, params)
                         .await
                         .map_err(|e| engine_err("secrets", e))?;
-
-                    let _ = agent
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::AuthCompleted {
-                                extension_name: credential_name.clone(),
-                                success: true,
-                                message: format!(
-                                    "Credential '{}' stored. Resuming...",
-                                    credential_name
-                                ),
-                            },
-                            &message.metadata,
-                        )
-                        .await;
-
-                    if let Some(ref sse) = state.sse {
-                        sse.broadcast_for_user(
-                            &message.user_id,
-                            AppEvent::AuthCompleted {
-                                extension_name: credential_name.clone(),
-                                success: true,
-                                message: format!(
-                                    "Credential '{}' stored. Resuming...",
-                                    credential_name
-                                ),
-                                thread_id: Some(pending.thread_id.to_string()),
-                            },
-                        );
-                    }
                 }
+
+                // Route completion through the originating channel exactly once.
+                // HTTP auth may already have stored the token before entering this
+                // control path, so completion must not depend on this registry's
+                // optional secrets-store handle.
+                let _ = agent
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::AuthCompleted {
+                            extension_name: credential_name.clone(),
+                            success: true,
+                            message: format!(
+                                "Credential '{}' stored. Resuming...",
+                                credential_name
+                            ),
+                        },
+                        &message.metadata,
+                    )
+                    .await;
 
                 if pending.action_name == "authentication_fallback"
                     && let Some(retry_content) = pending.original_message.clone()

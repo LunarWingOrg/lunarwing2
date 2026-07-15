@@ -13,6 +13,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import httpx
 import pytest
 
 from helpers import (
@@ -146,6 +147,52 @@ def _forward_coverage_env(env: dict[str, str]) -> None:
             env[key] = val
 
 
+def _server_env(
+    *,
+    home_dir: str,
+    db_path: str,
+    gateway_port: int,
+    http_port: int,
+    mock_llm_url: str,
+    wasm_tools_dir: str,
+    wasm_channels_dir: str,
+) -> dict[str, str]:
+    """Build the shared single-node gateway environment."""
+    return {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": home_dir,
+        "LUNARWING_BASE_DIR": os.path.join(home_dir, ".lunarwing"),
+        "RUST_LOG": "lunarwing=info",
+        "RUST_BACKTRACE": "1",
+        "LUNARWING_OWNER_ID": OWNER_SCOPE_ID,
+        "GATEWAY_ENABLED": "true",
+        "GATEWAY_HOST": "127.0.0.1",
+        "GATEWAY_PORT": str(gateway_port),
+        "GATEWAY_AUTH_TOKEN": AUTH_TOKEN,
+        "GATEWAY_USER_ID": "e2e-web-sender",
+        "HTTP_HOST": "127.0.0.1",
+        "HTTP_PORT": str(http_port),
+        "HTTP_WEBHOOK_SECRET": HTTP_WEBHOOK_SECRET,
+        "CLI_ENABLED": "false",
+        "LLM_BACKEND": "openai_compatible",
+        "LLM_BASE_URL": mock_llm_url,
+        "LLM_MODEL": "mock-model",
+        "DATABASE_BACKEND": "libsql",
+        "LIBSQL_PATH": db_path,
+        "SANDBOX_ENABLED": "false",
+        "SKILLS_ENABLED": "true",
+        "ROUTINES_ENABLED": "true",
+        "HEARTBEAT_ENABLED": "false",
+        "EMBEDDING_ENABLED": "false",
+        "WASM_ENABLED": "true",
+        "WASM_TOOLS_DIR": wasm_tools_dir,
+        "WASM_CHANNELS_DIR": wasm_channels_dir,
+        "ONBOARD_COMPLETED": "true",
+        "LUNARWING_OAUTH_CALLBACK_URL": "https://oauth.test.example/oauth/callback",
+        "LUNARWING_OAUTH_EXCHANGE_URL": mock_llm_url,
+    }
+
+
 @pytest.fixture(scope="session")
 def lunarwing_binary():
     """Ensure lunarwing binary is built. Returns the binary path."""
@@ -159,6 +206,25 @@ def lunarwing_binary():
             timeout=600,
         )
     assert binary.exists(), f"Binary not found at {binary}"
+    return str(binary)
+
+
+@pytest.fixture(scope="session")
+def engine_v2_binary():
+    """Return the explicit release binary used by isolated Engine V2 E2E."""
+    configured = os.environ.get("LUNARWING_E2E_BINARY", "").strip()
+    if not configured:
+        pytest.fail(
+            "LUNARWING_E2E_BINARY is required for Engine V2 E2E. "
+            "Build the release binary under tmux, then pass its absolute path."
+        )
+
+    binary = Path(configured).expanduser().resolve()
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        pytest.fail(
+            f"LUNARWING_E2E_BINARY must name an executable file: {binary}. "
+            "Build the release binary under tmux before running this target."
+        )
     return str(binary)
 
 
@@ -259,45 +325,15 @@ async def lunarwing_server(
     for sock in server_ports["sockets"]:
         if sock.fileno() != -1:
             sock.close()
-    env = {
-        # Minimal env: PATH for process spawning, HOME for Rust/cargo defaults
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": home_dir,
-        "LUNARWING_BASE_DIR": os.path.join(home_dir, ".lunarwing"),
-        "LUNARWING_BASE_DIR": os.path.join(home_dir, ".lunarwing"),
-        "RUST_LOG": "lunarwing=info",
-        "RUST_BACKTRACE": "1",
-        "LUNARWING_OWNER_ID": OWNER_SCOPE_ID,
-        "GATEWAY_ENABLED": "true",
-        "GATEWAY_HOST": "127.0.0.1",
-        "GATEWAY_PORT": str(gateway_port),
-        "GATEWAY_AUTH_TOKEN": AUTH_TOKEN,
-        "GATEWAY_USER_ID": "e2e-web-sender",
-        "HTTP_HOST": "127.0.0.1",
-        "HTTP_PORT": str(http_port),
-        "HTTP_WEBHOOK_SECRET": HTTP_WEBHOOK_SECRET,
-        "CLI_ENABLED": "false",
-        "LLM_BACKEND": "openai_compatible",
-        "LLM_BASE_URL": mock_llm_server,
-        "LLM_MODEL": "mock-model",
-        "DATABASE_BACKEND": "libsql",
-        "LIBSQL_PATH": os.path.join(_DB_TMPDIR.name, "e2e.db"),
-        "SANDBOX_ENABLED": "false",
-        "SKILLS_ENABLED": "true",
-        "ROUTINES_ENABLED": "true",
-        "HEARTBEAT_ENABLED": "false",
-        "EMBEDDING_ENABLED": "false",
-        # WASM tool/channel support
-        "WASM_ENABLED": "true",
-        "WASM_TOOLS_DIR": wasm_tools_dir,
-        "WASM_CHANNELS_DIR": _WASM_CHANNELS_TMPDIR.name,
-        # Prevent onboarding wizard from triggering
-        "ONBOARD_COMPLETED": "true",
-        # Force gateway OAuth callback mode (non-loopback URL) and point
-        # token exchange at mock_llm.py so OAuth tests work without Google.
-        "LUNARWING_OAUTH_CALLBACK_URL": "https://oauth.test.example/oauth/callback",
-        "LUNARWING_OAUTH_EXCHANGE_URL": mock_llm_server,
-    }
+    env = _server_env(
+        home_dir=home_dir,
+        db_path=os.path.join(_DB_TMPDIR.name, "e2e.db"),
+        gateway_port=gateway_port,
+        http_port=http_port,
+        mock_llm_url=mock_llm_server,
+        wasm_tools_dir=wasm_tools_dir,
+        wasm_channels_dir=_WASM_CHANNELS_TMPDIR.name,
+    )
     _forward_coverage_env(env)
     proc = await asyncio.create_subprocess_exec(
         lunarwing_binary, "--no-onboard",
@@ -339,6 +375,97 @@ async def lunarwing_server(
                 await _stop_process(proc, sig=signal.SIGINT, timeout=10)
                 if proc.returncode is None:
                     await _stop_process(proc, timeout=2)
+
+
+@pytest.fixture(scope="session")
+async def engine_v2_server(engine_v2_binary, mock_llm_server):
+    """Start an isolated Engine V2 gateway using only the explicit release binary."""
+    reserved = _reserve_loopback_sockets(2)
+    home_tmpdir = tempfile.TemporaryDirectory(prefix="lunarwing-engine-v2-e2e-home-")
+    db_tmpdir = tempfile.TemporaryDirectory(prefix="lunarwing-engine-v2-e2e-db-")
+    wasm_tools_tmpdir = tempfile.TemporaryDirectory(prefix="lunarwing-engine-v2-e2e-tools-")
+    wasm_channels_tmpdir = tempfile.TemporaryDirectory(prefix="lunarwing-engine-v2-e2e-channels-")
+    proc = None
+
+    try:
+        gateway_port = reserved[0].getsockname()[1]
+        http_port = reserved[1].getsockname()[1]
+        for sock in reserved:
+            sock.close()
+
+        env = _server_env(
+            home_dir=home_tmpdir.name,
+            db_path=os.path.join(db_tmpdir.name, "engine-v2-e2e.db"),
+            gateway_port=gateway_port,
+            http_port=http_port,
+            mock_llm_url=mock_llm_server,
+            wasm_tools_dir=wasm_tools_tmpdir.name,
+            wasm_channels_dir=wasm_channels_tmpdir.name,
+        )
+        env["ENGINE_V2"] = "true"
+        env["AGENT_AUTO_APPROVE_TOOLS"] = "false"
+        env["ROUTINES_ENABLED"] = "false"
+        env.pop("ENGINE_V2_CHANNELS", None)
+        _forward_coverage_env(env)
+
+        proc = await asyncio.create_subprocess_exec(
+            engine_v2_binary,
+            "--no-onboard",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        base_url = f"http://127.0.0.1:{gateway_port}"
+        try:
+            await wait_for_ready(f"{base_url}/api/health", timeout=60)
+        except TimeoutError:
+            await _stop_process(proc, timeout=2)
+            stderr_bytes = b""
+            if proc.stderr:
+                try:
+                    stderr_bytes = await asyncio.wait_for(proc.stderr.read(8192), timeout=2)
+                except asyncio.TimeoutError:
+                    pass
+            pytest.fail(
+                "isolated Engine V2 server failed to start "
+                f"(returncode={proc.returncode}).\nstderr:\n"
+                + stderr_bytes.decode("utf-8", errors="replace")
+            )
+
+        async with httpx.AsyncClient() as client:
+            install = await client.post(
+                f"{base_url}/api/extensions/install",
+                headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+                json={
+                    "name": "engine-v2-auth",
+                    "kind": "mcp_server",
+                    "transport": "http",
+                    "url": f"{mock_llm_server}/mcp",
+                },
+                timeout=10,
+            )
+            install_data = install.json()
+            if install.status_code != 200 or not install_data.get("success"):
+                pytest.fail(
+                    "failed to install isolated Engine V2 MCP auth fixture: "
+                    f"status={install.status_code}, response={install_data}"
+                )
+            await client.post(f"{mock_llm_server}/__mock/engine-v2/reset", timeout=5)
+
+        yield base_url
+    finally:
+        if proc is not None and proc.returncode is None:
+            await _stop_process(proc, sig=signal.SIGINT, timeout=10)
+            if proc.returncode is None:
+                await _stop_process(proc, timeout=2)
+        for sock in reserved:
+            if sock.fileno() != -1:
+                sock.close()
+        wasm_channels_tmpdir.cleanup()
+        wasm_tools_tmpdir.cleanup()
+        db_tmpdir.cleanup()
+        home_tmpdir.cleanup()
 
 
 @pytest.fixture(scope="session")
@@ -573,4 +700,59 @@ async def page(lunarwing_server, browser):
     # Wait for the app to initialize (auth screen hidden, SSE connected)
     await pg.wait_for_selector("#auth-screen", state="hidden", timeout=15000)
     yield pg
+    await context.close()
+
+
+@pytest.fixture(scope="session")
+async def engine_v2_browser(engine_v2_server):
+    """Browser process dedicated to the isolated Engine V2 server."""
+    from playwright.async_api import async_playwright
+
+    headless = os.environ.get("HEADED", "").strip() not in ("1", "true")
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=headless)
+        yield browser
+        await browser.close()
+
+
+@pytest.fixture
+async def engine_v2_page(engine_v2_server, engine_v2_browser):
+    """Fresh Engine V2 page with sanitized SSE and request metadata capture."""
+    context = await engine_v2_browser.new_context(viewport={"width": 1280, "height": 720})
+    await context.add_init_script(
+        """
+        window.__engineV2SseEvents = [];
+        window.__engineV2Network = [];
+
+        const nativeAddEventListener = EventSource.prototype.addEventListener;
+        EventSource.prototype.addEventListener = function(type, listener, options) {
+          const wrapped = function(event) {
+            if (window.__engineV2SseEvents.length < 500) {
+              window.__engineV2SseEvents.push({
+                type,
+                data: event.data || '',
+                timestamp: Date.now(),
+              });
+            }
+            if (typeof listener === 'function') return listener.call(this, event);
+            return listener.handleEvent(event);
+          };
+          return nativeAddEventListener.call(this, type, wrapped, options);
+        };
+
+        const nativeFetch = window.fetch.bind(window);
+        window.fetch = function(input, init) {
+          const url = typeof input === 'string' ? input : input.url;
+          const method = (init && init.method) || 'GET';
+          if (window.__engineV2Network.length < 500) {
+            window.__engineV2Network.push({url, method, timestamp: Date.now()});
+          }
+          return nativeFetch(input, init);
+        };
+        """
+    )
+    page = await context.new_page()
+    await page.goto(f"{engine_v2_server}/?token={AUTH_TOKEN}")
+    await page.wait_for_selector("#auth-screen", state="hidden", timeout=15000)
+    yield page
     await context.close()
