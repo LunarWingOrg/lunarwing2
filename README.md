@@ -1,374 +1,212 @@
-# LunarWing Introduction
+# LunarWing
 
-## Claws are overrated. So, grow your wings and fly...
+> Claws are overrated. Grow your wings and fly.
 
-### Secure, privacy-focused AI agents you can self-host.
+LunarWing is a self-hosted, privacy-focused AI agent runtime and operations platform written in Rust. It connects agents to open communication protocols, extensible WASM tools, and operator-controlled infrastructure.
 
-LunarWing is an agentic software framework built in Rust. It connects AI agents to privacy-respecting communication layers — IRC, DarkIRC, XMPP with OMEMO, and more — with real secret management baked in from the start.
-
-It's a hard fork of NearAI's IronClaw, diverging significantly since February 2026. LunarWing is not affiliated with NearAI.
-
-## Why LunarWing
-
-- **Self-hostable end to end** — runs entirely on your own infrastructure, no third-party dependencies required.
-- **Privacy-first channels** — XMPP/OMEMO, WeeChat relay, and DarkIRC (opt-in as of v1.1.8). No Slack, Discord, or Telegram — by design.
-- **WASM plugin system** — extend agents with tools and channel adapters compiled to WebAssembly.
-- **Built-in secret management** — specialized wrappers for Postgres and LibSQL credential handling.
-- **Self-healing infrastructure** — advanced healthchecks and automatic recovery for LunarWing, channel bridges, adapters, daemons, and even scheduled routines.
-- **TensorZero integration** — Native TensorZero model routing support for local and remote providers. (The optional custom HTTP proxy was removed in v1.1.9; use a standalone TensorZero gateway instead.)
-- **Lunarpunk values** — AGPLv3 forever. Free software, free infrastructure, no compromises.
+LunarWing began as a hard fork of NearAI IronClaw and has diverged substantially since February 2026. LunarWing is not affiliated with NearAI.
 
 <p align="center">
   <img src="./crszsslw2412c09c1-8ea9-46bd-8063-084ccdd2f332.jpg" alt="LunarWing" width="400">
 </p>
 
-## Quick Links
+## LunarWing v2
 
-- Website: [lunarwing.org](https://lunarwing.org)
-- Source: [LunarWing_v2](https://codeberg.org/LunarWing/LunarWing_v2)
-- IRC: `#lunarwing` on [irc.libera.chat](https://web.libera.chat/?channel=#lunarwing) (port 6697, TLS)
-- License: [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.en.html)
+LunarWing v2 is an unreleased development line preparing for release/tag **2.0.0.0 — Kosoku**. The v2 line introduces the new execution engine, a browser-based multi-tenant onboarding console, richer gateway interactions, and a refreshed foundation for skills, memory, workers, and tools.
 
-[LunarWing](https://lunarwing.org/)
+Read the [v2.0.0.0 release notes](RELEASE-v2.0.0.0.md) for the complete change list, compatibility notes, and known limitations.
 
-[![Chat on IRC](https://img.shields.io/badge/IRC-%23lunarwing-00b0aa?style=for-the-badge&labelColor=000000)](https://web.libera.chat/?channel=#lunarwing)
+## Quick links
 
-##### End of Introduction
----
+- [Website](https://lunarwing.org/)
+- [Documentation index](docs/README.md)
+- [Community guide](COMMUNITY.md)
+- [Project manifesto](MANIFESTO.md)
+- [Canonical source on Codeberg](https://codeberg.org/LunarWing/LunarWing_v2)
+- [IRC: #lunarwing on Libera.Chat](https://web.libera.chat/?channel=#lunarwing)
+- [AGPL-3.0-or-later license](LICENSE)
 
-# Finer Details
+## Why LunarWing
 
-The LunarWing project began in February 2026. Initially a hard fork of the Ironclaw project to support custom tools and channels, the project eventually evolved to introduce deep infrastructural changes over time.
+- **Operator controlled** — run the agent, database, providers, workers, and communication bridges on infrastructure you control.
+- **Open communication** — prioritize XMPP, IRC through WeeChat, DarkIRC, Signal, and other open or self-hostable paths.
+- **Extensible by design** — add sandboxed WASM tools and channel adapters without folding every integration into the core daemon.
+- **Secret-aware operations** — encrypted secret storage and tenant-scoped operational tooling are built into the deployment model.
+- **Production multi-tenancy** — isolate tenants with separate OS users, services, databases, ports, configuration, and optional workers.
+- **Reliable automation** — scheduled routines, retry and backoff, health checks, and self-healing tooling support unattended operation.
+- **Lunarpunk values** — the core and bundled extensions remain free software under AGPL-3.0-or-later.
 
-LunarWing is a self-hosted, privacy-first AI agent. The fork prioritizes useful tools, bridges, and channels such as XMPP/OMEMO, Gotify, scheduled routines with fallbacks, systemd deployment, OpenRC, and open-protocol channels. Proprietary service centered channels (Slack, Discord, Telegram) are intentionally unsupported within the monorepo and are gradually being fully removed.
+## Key v2 capabilities
 
-The LunarWing project strictly maintains the AGPLv3 license on the core project and all extensions, tools, and channels. We will use the same license across our other repositories if legally possible.
+### Engine V2 and the gateway
 
-## Why "LunarWing"?
+Engine V2 provides the channel-neutral execution path used by the v2 gateway, including streaming events, interrupts, stop handling, approval gates, and richer tool-result presentation. New multi-tenant configurations enable Engine V2 by default; direct single-instance configurations must opt in explicitly.
 
-**Lunar** -- We are firm believers in Lunarpunk.
+The gateway receives the full interactive experience. XMPP, DarkIRC, and WeeChat can opt in through `ENGINE_V2_CHANNELS`; other channels remain on the legacy path. Opted-in WASM channels currently receive terminal responses and status updates rather than live token edits. Review the caveats in the [release notes](RELEASE-v2.0.0.0.md) before enabling Engine V2 for group channels.
 
-**Wing** -- Wings are extensions of the body which allow flight. We chose the term `wing` to differentiate ourselves from most open source agentic software which uses the term `claw`. We are not required to remain on the ground.
+Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 
-## Features
+### Channels and interfaces
 
-LunarWing adds real privacy-respecting tools and channels, with full secret support, right out of the box:
+- Browser gateway, CLI, and HTTP interfaces
+- Built-in Signal channel through a configured `signal-cli` HTTP daemon
+- WASM channels for XMPP, WeeChat, DarkIRC, and Multica
+- Optional Gotify notifications and SSH tooling
 
-### Channels & Communication
-* **XMPP with OMEMO** -- WASM channel, bridge service, and core code changes for full encrypted chat (1:1 and group), with XEP-0363 HTTP file upload support
-* **Weechat** -- WASM channel allowing the agent to use Weechat as an IRC/DarkIRC/Signal/XMPP/Slack/Matrix/Rocketchat client
-* **Enjin** -- optional weechat plugin to enable E2E for normal IRC
-* **DarkIRC** -- DarkIRC WASM channel, p2p e2e protocol from DarkFi. **As of v1.1.8, DarkIRC is hard-disabled by default** — services are not created and the binary is not built unless explicitly opted in via `--enable-darkirc` (on `add-tenant`/`start-tenant`) and `build-darkirc`. Existing tenants are unaffected until their units are re-rendered.
+DarkIRC is opt-in. It is neither rendered nor built for a new tenant unless the operator enables it during tenant creation and builds its supporting service.
 
-### Tools & Notifications
-* **Gotify** -- WASM tool for agent-initiated push notifications
-* **LunarVision (Vision Service / OCR Sidecar)** -- Standalone Rust service for OCR (Tesseract) and vision-language analysis (Qwen3-VL), with smart routing, PaddleOCR fallback, disk-backed cache persistence, an API-versioned HTTP surface with an OpenAPI spec, and a self-reported `/health` endpoint. Runs rootless under Podman (`projects/ocr-sidecar/`)
-* **vision-analyze WASM Tool** -- Native WASM tool for image analysis via the LunarVision sidecar; rewritten from scratch in v1.1.7 and re-registered with the WASM toolset (`ic/tools-src/vision-analyze/`)
-* **Lunartica** -- Free Open Source Self Hostable Agent Coordination Platform (separate repo)
-* **SSH WASM Tool** -- Secure SSH access via WASM using Russh
+### External workers
 
-### Worker Containers
-* **Nanocode Worker** -- Persistent NanoGPT community Nanocode worker container with optional ACP bridge, git/ssh key support, persistent storage, and development tools (`lunarcode4lunarwing/`)
-* **Pebble Worker** -- Persistent Rust-based Pebble agentic coding harness worker with NDJSON event streaming and health endpoints (`pebble4lunarwing/`)
-* **Opencode Worker** -- Persistent [opencode](https://opencode.ai) (sst/opencode) worker container speaking the `lunarwing-agent-v1` WebSocket protocol (legacy alias `ironclaw-agent-v1` still accepted), with the `@opencode-ai/sdk`, optional Paseo MCP integration, git/ssh key support, and health endpoints (`opencode4lunarwing/`)
-* **Reworked Built-in Worker - Debloated** -- Native worker running inside the LunarWing daemon getting debloated, rip out obsolete worker modes in favor of specialized worker container support (`ic/src/worker/`)
-* **Reworked Sandbox Worker - Debloated** -- Docker-isolated execution sandbox, debloated (`ic/src/sandbox/`)
+LunarWing can attach persistent NanoCode, Pebble, or OpenCode worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant.
 
-### Infrastructure & Operations
-* **Agent SSH Harness** (introduced v1.1.7, tooling completed v1.1.8) -- A centralized, per-tenant SSH bridge that lets worker containers authenticate to a host over SSH **without the private key ever touching disk** inside the container (or on the host outside the encrypted secrets store). Key material lives AES-256-GCM-encrypted in the secrets store and is served to workers over a per-tenant `ssh-agent` Unix socket; the agent signs challenges in memory. Host-key verification is fail-closed. **v1.1.8 added the consuming tools:** a built-in in-process Rust `ssh` tool (delivery Option 2), a `ssh_git` tool for git-over-SSH through the harness, and a WASM `ssh` guest tool (delivery Option 3). `start-tenant` now uploads the staged key, bounces the daemon once to load it, and starts workers after the socket is real. Enabled by default for new tenants; configurable via `configure-ssh` and the `[ssh]` section of `config.toml`. Live-validated on systemd and OpenRC.
-* Specialized secret management wrapper scripts for both PostgreSQL and libSQL and interactive, easy to use, secure secret management where passwords, tokens, and other secrets are never shown in framebuffer
-* Optional systemd, launchd, and OpenRC services for LunarWing, channel bridges, and healthcheck services (with optional notifications!)
-* Improved scheduling system with native retry and exponential backoff for transient failures, stuck-run recovery, configurable lightweight execution timeouts, and automatic sweeping of orphaned routine runs. Most robust agentic routine system, unlike any other.
-* Self-healing healthchecks for channel bridge services, the daemon, and the routines system. Infrastructure health checks auto-detect init system (systemd, OpenRC, launchd)
-* Production multi-tenant deployment via `scripts/lunarwing-mt-admin.sh` with per-user OS isolation, port registry (v11 schema — dedicated per-tenant ports for workers, DarkIRC, and the LunarVision sidecar), and support for systemd, macOS (launchd), and OpenRC
-* TensorZero model routing support (the optional custom HTTP proxy was removed in v1.1.9; use a standalone TensorZero gateway)
-* Support for embedded memory search models
-* Reflex compiler for LLM-free fast-path execution of recurring prompts with exact, fuzzy (Jaro-Winkler), and semantic matching, auto-promotion, and stale pattern eviction
-* Supervised mode (`--supervised`) for human-gated tool execution — all tool actions require explicit approval regardless of tier (similar to Hermes Agent)
-* Response suppression and future cancellation with soft timeout and secondary hard-kill mechanism
-* Advanced MCP server features
+### Model providers
 
-### Development & Testing
-* Automated test suite with trace-replay E2E testing (no real LLM required)
-* Worker test harness for all worker types with Docker Compose isolation (`tests/`)
-* REPLv2 server and client with better output formatting and subagent support, backout and approval support included
-* Support for external agentic coding tools via external worker mode
-* Cross-platform test harness (`lunarwing-xmpp-test-env.sh`) with launchd (macOS), systemd (Linux), and OpenRC support as well as a production-grade developer testing suite
+| Provider path | Intended use |
+| --- | --- |
+| LunarWing Cloud | Default backend when no provider is configured; requires LunarWing Cloud authentication |
+| `openai_compatible` | OpenAI-compatible endpoints, including compatible routing gateways |
+| `ollama` | Local Ollama deployments |
 
-### Philosophy
+The shipped multi-tenant configuration uses `openai_compatible`. The `openai`, `open_ai`, `openai_codex`, and `codex` backend names are unsupported; connect OpenAI or compatible APIs through `openai_compatible`. TensorZero can be used through a compatible endpoint; the legacy proxy remains available only as an explicit compatibility option.
 
-LunarWing developers care about your freedom as a user. We do not support proprietary platforms in our official repository. All WASM tools and channels that developers wish to create for proprietary platforms can be maintained elsewhere. We focus on self-hostable communication layers and open protocols.
+## Get started with the onboarding GUI
 
-The LunarWing core development team is not affiliated with NearAI.
+The browser-based onboarding console is the recommended setup path for LunarWing v2. It wraps the multi-tenant administration scripts while showing configuration, command output, validation results, and recovery guidance in one local interface.
 
-Our core team uses a self-hosted Vikunja kanban board to track tasks. Additionally, we use our own LunarWing agents to keep track of project progress.
+Run these commands from the repository root.
 
-#### As of now, we are entirely self-funded and work on this project on a voluntary basis. No VCs, Corporate Overlords, or sponsorships/grants. This will be updated in the future if it changes.
-
-## Instance Setup
-
-The primary deployment model is **multi-tenant production** — each tenant is a real OS user with its own home, repo clone, release build, rootless Podman container store, per-tenant PostgreSQL, per-tenant secrets, a 10-port block, and per-tenant systemd (or OpenRC) service units.
-
-As of v1.1.9, the recommended way to get started is the **`lunarwing_mt_onboard` interactive CLI** (the "MT Admin CLI wrapper"), which automates the full provisioning lifecycle end to end. Under the hood it wraps `ic/scripts/lunarwing-mt-admin.sh`, which remains the source of truth and is available directly for operators who need full control over every flag.
-
-### Getting Started: MT Admin CLI Wrapper (`lunarwing_mt_onboard`)
-
-The `lunarwing_mt_onboard` CLI (new in v1.1.9) walks an operator through the full tenant provisioning lifecycle: tenant identity, port allocation, secrets generation, LLM and channel configuration, external worker selection, build, and start/verify. It is a thin interactive wrapper around `lunarwing-mt-admin.sh` — it does not duplicate provisioning logic.
-
-**Requirements:** Python 3.10+, `rich` and `questionary` (see `requirements.txt`), root/sudo.
-
-**Install dependencies:**
+### 1. Explore safely in demo mode
 
 ```bash
-pip install -r lunarwing_mt_onboard/requirements.txt
+./lunarwing_mt_onboard_web/run.sh --demo
 ```
 
-**Interactive provisioning (recommended for first-time setup):**
+Demo mode does not create tenants or modify host services. The launcher still creates its local Python virtual environment, installs the GUI dependencies when needed, and writes local audit logs.
+
+### 2. Prepare the production host
+
+The supported production path assumes Python 3.10 or newer with `venv` and pip, a Linux host using systemd or OpenRC, root or sudo access, Docker or Podman, `jq`, `git`, download access on first launch, and adequate time and disk space for builds.
 
 ```bash
-sudo python3 -m lunarwing_mt_onboard
-```
-
-This launches a guided session that collects all tenant configuration (name, LLM provider/model, XMPP, Gotify, workers, SSH, health checks), then runs `add-tenant` → `build-tenant` → `start-tenant` with live log output and post-start verification.
-
-**Resume a saved session:**
-
-```bash
-sudo python3 -m lunarwing_mt_onboard --resume /path/to/tenant.json
-```
-
-**Non-interactive (CI / bulk provisioning):**
-
-```bash
-sudo python3 -m lunarwing_mt_onboard \
-  --non-interactive \
-  --resume tenant.json \
-  --save result.json
-```
-
-| Flag | Description |
-|------|-------------|
-| `--non-interactive` | Skip all prompts; requires `--resume` |
-| `--accept-defaults` | Accept default values for any unspecified fields |
-| `--resume FILE` | Load a previously saved `TenantConfig` JSON |
-| `--save FILE` | Save the collected config to JSON before provisioning |
-| `--skip-build` | Only run `add-tenant` |
-| `--skip-start` | Run `add-tenant` + `build-tenant`, skip `start-tenant` |
-
-**In-place tenant upgrade:**
-
-The `upgrade` subcommand wraps `upgrade-preflight.sh` and `upgrade-tenant-version.sh` for same-host version bumps of existing tenants. Dry-run by default.
-
-```bash
-# Interactive dry-run
-sudo python3 -m lunarwing_mt_onboard upgrade
-
-# Non-interactive dry-run
-sudo python3 -m lunarwing_mt_onboard upgrade \
-  --tenant ruffles \
-  --target v1.1.9 \
-  --non-interactive
-
-# Apply the upgrade
-sudo python3 -m lunarwing_mt_onboard upgrade \
-  --tenant ruffles \
-  --target v1.1.9 \
-  --apply \
-  --yes \
-  --non-interactive
-```
-
-**Kawarimi tenant export (cross-host migration):**
-
-The `export` subcommand wraps `export-tenant.sh` for cross-host migration. Dry-run by default.
-
-```bash
-# Interactive dry-run
-sudo python3 -m lunarwing_mt_onboard export
-
-# Apply (stops tenant and writes bundle)
-sudo python3 -m lunarwing_mt_onboard export \
-  --tenant ruffles \
-  --apply \
-  --non-interactive
-```
-
-See [lunarwing_mt_onboard/README.md](lunarwing_mt_onboard/README.md) for the full CLI reference, configuration file format, and module layout.
-
-### Manual Multi-Tenant Path (`lunarwing-mt-admin.sh`)
-
-For operators who need direct control over every flag, `lunarwing-mt-admin.sh` is the underlying provisioning tool. Full walkthrough: [docs/guides/MT-ADMIN-QUICKSTART.md](docs/guides/MT-ADMIN-QUICKSTART.md). Production reference: [docs/ops/MULTITENANCY-PRODUCTION.md](docs/ops/MULTITENANCY-PRODUCTION.md).
-
-Prerequisites: root/sudo, Docker **or** Podman, `jq`, `git`. No host Rust toolchain needed — `add-tenant` installs a per-tenant rustup toolchain with WASM targets.
-
-```bash
-# 1. Check dependencies
 sudo ic/scripts/lunarwing-mt-admin.sh doctor
+```
 
-# 2. Provision a tenant (creates OS user, allocates ports, clones repo,
-#    writes env files, starts per-tenant PostgreSQL, renders service units)
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --docker-group
+The doctor command checks the current host, init system, container runtime, toolchain, and other provisioning dependencies. It does not verify the Python `venv` module.
 
-# 3. Build the tenant's release binary (+ WASM tools)
-sudo ic/scripts/lunarwing-mt-admin.sh build-tenant ruffles --with-wasm
-sudo ic/scripts/lunarwing-mt-admin.sh install-wasm ruffles
+### 3. Start the real onboarding console
 
-# 4. Start it
+```bash
+sudo ./lunarwing_mt_onboard_web/run.sh
+```
+
+Open the token-bearing session URL printed by the launcher, normally `http://127.0.0.1:1969/?token=...`. Keep the process running until the workflow finishes, then stop it with `Ctrl+C`.
+
+The GUI supports five operator workflows:
+
+| Workflow | Purpose |
+| --- | --- |
+| Provision | Create, configure, build, start, and verify a new tenant |
+| Secrets | Store or replace one named secret in the encrypted secrets store for a tenant |
+| Legacy upgrade | Run preflight and legacy same-host upgrade tooling |
+| Kawarimi export | Preview or create a migration bundle; Apply stops the tenant daemon and bridge |
+| Kawarimi import | Inspect, stage, and restore a migration bundle on a v2 host |
+
+Full GUI reference: [Browser onboarding console](lunarwing_mt_onboard_web/README.md).
+
+### Review these defaults before provisioning
+
+- The gateway binds to `127.0.0.1` by default.
+- New tenants enable Engine V2, SSH support, health checks, build, and start.
+- DarkIRC, Gotify, external workers, and optional toolchains remain disabled until selected.
+- Leaving the XMPP fields blank does not disable XMPP: the administration script assigns `<tenant>@xmpp.localhost` and provisions the bridge.
+- Container-runtime group membership is enabled by default. Membership in the rootful Docker group is effectively root-equivalent; rootless Podman normally uses per-user storage, and a `podman` group may not exist.
+- The form defaults to model `tensorzero::function_name::lunarwing` and upstream `http://192.168.1.157:3000/openai/v1`. Replace the LAN-specific upstream URL and verify the model and credentials.
+
+### Treat the GUI as a privileged local console
+
+The onboarding server is designed for one trusted operator on loopback. It does not provide user accounts or TLS. Keep `--host 127.0.0.1` and token authentication enabled; do not bind a non-loopback address or use `--no-token`. Use an SSH tunnel for remote administration. Treat the session URL, browser session, generated secrets, and audit directory as credentials. Audit redaction is heuristic and log files follow the process umask, so choose a protected `--log-dir` and handle logs as sensitive data.
+
+## Advanced setup paths
+
+### Interactive Python CLI
+
+The terminal onboarding client remains available for provisioning, secrets, exports, and legacy upgrade operations. It does not provide the guided Kawarimi import flow available in the GUI.
+
+```bash
+python3 -m venv .venv-mt-onboard
+./.venv-mt-onboard/bin/python -m pip install rich questionary
+sudo ./.venv-mt-onboard/bin/python -m lunarwing_mt_onboard
+```
+
+See the [Python onboarding CLI reference](lunarwing_mt_onboard/README.md) for resume files and non-interactive use.
+
+### Direct multi-tenant administration
+
+`ic/scripts/lunarwing-mt-admin.sh` remains the source of truth for operators who need exact flag-level control.
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh doctor
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-opencode
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant ruffles --with-wasm --with-opencode
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant ruffles
-
-# 5. Inspect
-sudo ic/scripts/lunarwing-mt-admin.sh status ruffles     # service + container health
-sudo ic/scripts/lunarwing-mt-admin.sh tokens ruffles     # gateway auth token, ports, etc.
+sudo ic/scripts/lunarwing-mt-admin.sh status ruffles
 ```
 
-The gateway binds `127.0.0.1` by default; for remote access, tunnel the HTTP port over SSH (e.g. `ssh -L 10000:127.0.0.1:10000 user@host`, then open `http://localhost:10000`). Batch provisioning is supported: `add-tenants "Ruffles,Miyuki,Sparkie" --docker-group` then `build-all --with-wasm` / `install-wasm-all`.
+The production scripts support rootless per-user Podman or a configured rootful Docker deployment, with systemd or OpenRC service management. Choose a worker on `add-tenant`, repeat its flag on `build-tenant` to build the image, and let `start-tenant` launch the stored selection. For DarkIRC, use `--enable-darkirc` when adding the tenant, then run `sudo ic/scripts/lunarwing-mt-admin.sh build-darkirc --tenant ruffles` before starting it.
 
-Additional worker containers (nanocode, pebble, opencode) can be attached at build time with `--with-nanocode` / `--with-pebble` / `--with-opencode`. DarkIRC is opt-in (`--enable-darkirc` + `build-darkirc`). See the quickstart for the full flag reference.
+- [Multi-tenant quickstart](docs/guides/MT-ADMIN-QUICKSTART.md)
+- [Production operations reference](docs/ops/MULTITENANCY-PRODUCTION.md)
 
-### Local single-instance (unmaintained)
+## Upgrades and migration
 
-For quick local testing without multi-tenant isolation, build the release binary and let the onboarding wizard configure everything. On first run with no database configured, `lunarwing run` auto-triggers **quick onboarding**, which defaults every non-LLM choice (embedded libSQL at `~/.lunarwing/lunarwing.db`, keychain-or-env secrets) and only prompts for the inference provider and model.
+The GUI legacy-upgrade workflow wraps the PostgreSQL and rootful-Docker v1 upgrader. It runs preflight and dry-run by default, accepts three-part `vX.Y.Z` targets, and uses `v1.1.2` when the target is blank. It rejects `v2.0.0.0` and is not a supported v1-to-v2 upgrade path.
 
-> **Note:** This path is not actively maintained and may not work reliably. The multi-tenant CLI above is the supported path.
+For a v1 tenant moving to v2, prepare a separate v2 deployment and rehearse a staged Kawarimi export/import. Validate the restored tenant before cutover. Before selecting Start, the operator must stop the old tenant daemon and bridge when both tenants use the same XMPP identity; the GUI does not enforce this gate.
+
+GUI import defaults to `apply=false` and `start=false`: it validates the real bundle and prints a dry-run plan. Apply restores and stages the tenant; Start is a separate opt-in. These safe defaults are GUI-specific—the direct import script mutates the host unless `--dry-run` is passed explicitly.
+
+Kawarimi supports PostgreSQL tenants; libSQL bundles are refused. A real export stops tenant writers and produces a sensitive root-owned `0600` bundle containing the master key and XMPP credentials. Import creates fresh host-local gateway and webhook tokens, so clients must authenticate again. Back up first, review the plan, protect bundles in transit, and delete them after the restored tenant is verified.
+
+- [Machine migration runbook](docs/ops/MT-MACHINE-MIGRATION.md)
+- [Legacy upgrade notes](docs/ops/MT-LEGACY-UPGRADE-NOTES.md)
+
+## Development and testing
+
+The Rust workspace lives under `ic/`, uses Rust 1.92, and reports package version `2.0.0` for the v2 release line.
 
 ```bash
 cd ic
-cargo build --release
-./target/release/lunarwing run          # auto-triggers quick onboarding on first run
-# or explicitly:
-./target/release/lunarwing onboard --quick
+cargo fmt --all -- --check
+cargo test --locked --features "libsql integration"
 ```
 
-`ic/run.sh` wraps the release binary with sane dev defaults (`HTTP_PORT=9098`, `ALLOW_PRIVATE_IPS=1`, `PGSSLMODE=disable`, `AGENT_NAME=lunarwing`, 2s start delay):
+Additional test surfaces:
 
-```bash
-cd ic
-LUNARWING_BASE_DIR=/path/to/instance ./run.sh
-```
+- [Rust and browser E2E tests](ic/tests/e2e/README.md)
+- [External worker harness](tests/README.md)
+- [Testing guide](docs/guides/TESTING_GUIDE.md)
+- [XMPP integration harness](ic/testing/lunarwing-xmpp/README.md)
 
-### Preseeding persona files (optional)
+## Documentation
 
-You can give an agent a custom identity and memories *before* its first interaction. Workspace files are imported from `$LUNARWING_BASE_DIR/workspace-template/` at runtime. Copy persona files (`SOUL.md`, `IDENTITY.md`, `AGENTS.md`, `TOOLS.md`, `USER.md`, `MEMORY.md`, `HEARTBEAT.md`) from [ic/deploy/workspace-template/](ic/deploy/workspace-template/) into that directory, customize them, then run onboarding.
+| Area | Reference |
+| --- | --- |
+| Documentation index | [docs/README.md](docs/README.md) |
+| Architecture | [docs/architecture/](docs/architecture/) |
+| Operator guides | [docs/guides/](docs/guides/) |
+| Production operations | [docs/ops/](docs/ops/) |
+| Historical releases through v1.1.9.0 | [docs/releases/](docs/releases/) |
+| Known bugs and status | [docs/bugs/README.md](docs/bugs/README.md) |
+| v2.0.0.0 release | [RELEASE-v2.0.0.0.md](RELEASE-v2.0.0.0.md) |
 
-### Config defaults
+## Project and community
 
-The shipped runtime config template is [ic/deploy/config.toml](ic/deploy/config.toml). Defaults: `llm_backend = "openai_compatible"`, `selected_model = "tensorzero::function_name::lunarwing"`, `agent.name = "lunarwing"`, `openai_compatible_base_url = "http://127.0.0.1:3000/openai/v1"`. Override any of these via env vars or `config.toml` for your environment.
-
-`SECRETS_MASTER_KEY` (a 64-char hex value) enables the encrypted secrets store without depending on the OS keychain. On Linux, `lunarwing onboard --quick` generates and persists this automatically when missing; in multi-tenant setups `lunarwing-mt-admin.sh` provisions it per tenant.
-
-## Upgrading & Migration
-
-LunarWing ships dedicated tooling for two distinct operations, both driven by `ic/scripts/lunarwing-mt-admin.sh` and documented under `docs/ops/`:
-
-- **Same-host version upgrade** — bump an existing tenant from an older LunarWing release to a newer one in place. The general-purpose upgrader is `ic/scripts/upgrade-tenant-version.sh` (PostgreSQL, rootful Docker; supports `--target <version>` and a read-only dry-run by default, `--apply` to execute). A readiness preflight is available via `ic/scripts/upgrade-preflight.sh`. See `docs/ops/MT-LEGACY-UPGRADE-NOTES.md` for the full runbook and gates.
-
-- **Cross-host migration (Kawarimi)** — move a tenant to a different host while leaving the old one as a rollback standby. The flow is `export-tenant.sh <tenant>` on the source (produces a `0600` bundle: `pg_dump`, env manifests, OMEMO store + workspace) → `import-tenant.sh <bundle.tar>` on the target. **PostgreSQL-only**; libSQL tenants are refused. This is a cutover with per-tenant downtime. See `docs/guides/MIGRATE_IRONCLAW_TO_LUNARWING.md` and `docs/ops/MT-MACHINE-MIGRATION.md`.
-
-Both paths are **hardened but should be rehearsed** against a non-production tenant before being trusted on live data. Always back up first (`mt-admin.sh backup-tenant <name>`).
-
-## Testing
-
-### Rust Unit & Integration Tests
-
-```bash
-cd ic
-cargo test                          # unit tests
-cargo test --features integration   # + PostgreSQL tests
-cargo test test_name -- --nocapture # single test with output
-```
-
-### E2E Tests (Python/Playwright)
-
-Browser-based E2E tests against a live instance with a mock LLM. See [ic/tests/e2e/CLAUDE.md](ic/tests/e2e/CLAUDE.md).
-
-```bash
-cd ic/tests/e2e
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-playwright install chromium
-pytest scenarios/
-```
-
-### Worker Test Harness
-
-Matrix test suite for all external worker types (nanocode, pebble, opencode), plus the built-in and sandbox workers. Validates health endpoints, WebSocket protocol, error handling, and resource cleanup.
-
-```bash
-cd tests
-pip install -r requirements.txt
-python runner.py --mode smoke     # happy paths only (CI)
-python runner.py --mode full      # + chaos scenarios (nightly)
-python runner.py --worker nanocode   # single worker type
-```
-
-See [tests/README.md](tests/README.md) for the full test matrix and mock service architecture.
-
-### Integration Test Harness
-
-`ic/scripts/lunarwing-xmpp-test-env.sh` is the full-stack test harness for PostgreSQL, TensorZero proxy, XMPP bridge, WASM artifacts, and the daemon. Works on Linux and macOS.
-
-- Single-tenant quick start: see [docs/ops/HARNESS-SINGLE-TENANT.md](docs/ops/HARNESS-SINGLE-TENANT.md)
-- Multi-tenant quick start: see [docs/ops/MULTITENANCY-HARNESS.md](docs/ops/MULTITENANCY-HARNESS.md)
-- Full single-tenant reference: [ic/testing/lunarwing-xmpp/README.md](ic/testing/lunarwing-xmpp/README.md)
-
-## Watchdog Scheduler
-
-```bash
-sudo ic/scripts/install-lunarwing-watchdog.sh
-```
-
-Behavior depends on the detected service manager:
-
-- **systemd**: installs `lunarwing-watchdog.service` + `lunarwing-watchdog.timer`
-- **OpenRC**: installs `lunarwing-watchdog-openrc` + either an hourly hook or a managed root `fcrontab` entry
-
-The OpenRC default is intentionally conservative:
-- If `cronie`, `crond`, or `dcron` is already present, the installer keeps the cron-hourly path
-- If no cron daemon is present but `fcron` is available, the installer uses `fcron` automatically. `fcron` is the recommended and most tested cron implementation.
-
-Force a specific OpenRC mode:
-
-```bash
-sudo LUNARWING_WATCHDOG_SCHEDULER=fcron ic/scripts/install-lunarwing-watchdog.sh
-sudo LUNARWING_WATCHDOG_SCHEDULER=hourly ic/scripts/install-lunarwing-watchdog.sh
-```
-
-Use `LUNARWING_WATCHDOG_CRON_DIR=/path/to/hourly-dir` for nonstandard directory layouts.
-
-## Further Reading
-
-Full documentation index: [docs/README.md](docs/README.md)
-
-### By topic
-
-- **Architecture & design:** [docs/architecture/](docs/architecture/) — Engine V2, semantic memory, WeeChat, XMPP file transfers, SSH harness, self-heal wiring
-- **How-to guides:** [docs/guides/](docs/guides/) — setup, migration, embeddings, vision/OCR sidecar, TensorZero, REPLv2
-- **Operations & multi-tenancy:** [docs/ops/](docs/ops/) — production MT, per-tenant config, harness guides, worker containers, release cadence
-- **Release notes:** [docs/releases/](docs/releases/) — v1.0.7 → v1.1.8 (latest: [RELEASE-v1.1.8.md](docs/releases/RELEASE-v1.1.8.md))
-- **Bug tracker:** [docs/bugs/README.md](docs/bugs/README.md)
-- **Active proposals:** [docs/proposals/](docs/proposals/)
-- **Specs:** [docs/specs/](docs/specs/) — standalone subsystem specifications
-- **Reviews:** [docs/reviews/](docs/reviews/) — architecture and code reviews
-- **Superpowers:** [docs/superpowers/](docs/superpowers/) — agent-driven plans and design specs
-- **Vision service:** [projects/ocr-sidecar/README.md](projects/ocr-sidecar/README.md)
-- **Testing guide:** [docs/guides/TESTING_GUIDE.md](docs/guides/TESTING_GUIDE.md)
-
-## Community
-
-### Interested in development or otherwise general discussion of LunarWing?
+LunarWing focuses on user freedom, self-hostable infrastructure, and open communication protocols. Read the [manifesto](MANIFESTO.md) for the project philosophy and the [community guide](COMMUNITY.md) for participation details.
 
 [![Chat on IRC](https://img.shields.io/badge/IRC-%23lunarwing-00b0aa?style=for-the-badge&labelColor=000000)](https://web.libera.chat/?channel=#lunarwing)
 
-#### See: COMMUNITY.md for more information
+- [Project blog](https://blog.lunarwing.org/)
+- [Codeberg development repository](https://codeberg.org/LunarWing/LunarWing_v2)
+- [GitHub convenience mirror](https://github.com/LunarWingOrg/lunarwing2) — the mirror may lag behind Codeberg
 
-## Our Blog (Announcements for the LunarWing project, Philosophy, Discussion regarding Technology and Agorism)
-
-[Blog](https://blog.lunarwing.org/)
-
-## Codeberg
-
-Actual development repo is on [Codeberg](https://codeberg.org/LunarWing/LunarWing_v2)
-
-## Github
-
-Mirrored to [Github](https://github.com/LunarWingOrg/lunarwing2) on a 12 hour interval
+LunarWing is self-funded and maintained by volunteers. The project is licensed under [AGPL-3.0-or-later](LICENSE).
