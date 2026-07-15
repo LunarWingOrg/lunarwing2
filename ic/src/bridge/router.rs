@@ -6147,9 +6147,12 @@ mod tests {
             "scope_b should report an active thread"
         );
 
-        let result_a = interrupt_engine_conversation(&lock.read().await.as_ref().unwrap(), &msg_a)
-            .await
-            .expect("interrupt should succeed");
+        let result_a = {
+            let guard = lock.read().await;
+            interrupt_engine_conversation(guard.as_ref().unwrap(), &msg_a)
+                .await
+                .expect("interrupt should succeed")
+        };
         assert_eq!(result_a, Some("Interrupted.".to_string()));
 
         let outcome_a = {
@@ -6274,10 +6277,12 @@ mod tests {
             "group scope should report an active thread"
         );
 
-        let result_dm =
-            interrupt_engine_conversation(&lock.read().await.as_ref().unwrap(), &msg_dm)
+        let result_dm = {
+            let guard = lock.read().await;
+            interrupt_engine_conversation(guard.as_ref().unwrap(), &msg_dm)
                 .await
-                .expect("interrupt should succeed");
+                .expect("interrupt should succeed")
+        };
         assert_eq!(result_dm, Some("Interrupted.".to_string()));
 
         let outcome_dm = {

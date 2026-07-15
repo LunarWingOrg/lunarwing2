@@ -16,8 +16,8 @@ use lunarwing::llm::{
     Role, TokenUsage, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
 };
 
-use support::engine_v2_env::EngineV2EnvGuard;
-use support::test_rig::TestRigBuilder;
+use support::engine_v2_env::{ENGINE_V2_ENV_LOCK, EngineV2EnvGuard};
+use support::test_rig::{TestRig, TestRigBuilder};
 
 // ── Constants ─────────────────────────────────────────────────────────
 
@@ -297,10 +297,20 @@ fn gateway_message(thread_id: Uuid, content: &str) -> IncomingMessage {
         }))
 }
 
+async fn register_gateway_thread(rig: &TestRig, thread_id: Uuid) {
+    let conversation = rig
+        .database()
+        .get_or_create_scoped_conversation("gateway", "test-user", &thread_id.to_string())
+        .await
+        .expect("gateway conversation should be registered");
+    assert_eq!(conversation, thread_id);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn engine_v2_wasm_echo_executes_through_wasmtime() {
+    let _lock = ENGINE_V2_ENV_LOCK.lock().await;
     assert_artifact_exists();
 
     let env = EngineV2EnvGuard::enable(Some("gateway"));
@@ -320,6 +330,7 @@ async fn engine_v2_wasm_echo_executes_through_wasmtime() {
         .await;
 
     let thread_id = Uuid::new_v4();
+    register_gateway_thread(&rig, thread_id).await;
     rig.send_incoming(gateway_message(thread_id, "run echo"))
         .await;
 
@@ -388,6 +399,7 @@ async fn engine_v2_wasm_echo_executes_through_wasmtime() {
 
 #[tokio::test]
 async fn engine_v2_wasm_denied_capability_rejects_http_without_connection() {
+    let _lock = ENGINE_V2_ENV_LOCK.lock().await;
     assert_artifact_exists();
 
     let env = EngineV2EnvGuard::enable(Some("gateway"));
@@ -407,6 +419,7 @@ async fn engine_v2_wasm_denied_capability_rejects_http_without_connection() {
         .await;
 
     let thread_id = Uuid::new_v4();
+    register_gateway_thread(&rig, thread_id).await;
     rig.send_incoming(gateway_message(thread_id, "run denied probe"))
         .await;
 

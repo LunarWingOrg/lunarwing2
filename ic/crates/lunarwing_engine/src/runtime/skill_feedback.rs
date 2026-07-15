@@ -20,7 +20,7 @@ pub(crate) const ACTIVE_SKILL_DOC_IDS_METADATA_KEY: &str =
 pub(crate) const MAX_EMITTED_SKILL_IDS: usize = 64;
 
 /// Build the set of skill DocIds visible to a given thread scope (user-owned
-/// + shared-owner docs in the same project). Returns `None` on lookup failure
+/// and shared-owner docs in the same project). Returns `None` on lookup failure
 /// so callers can fail closed.
 pub(crate) async fn visible_skill_ids(
     store: &Arc<dyn Store>,

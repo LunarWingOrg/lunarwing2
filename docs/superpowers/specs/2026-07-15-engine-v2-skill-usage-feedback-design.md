@@ -1,7 +1,7 @@
 # Engine V2 Skill Usage Feedback Design
 
-**Date:** 2026-07-15  
-**Status:** Approved for implementation planning  
+**Date:** 2026-07-15
+**Status:** Approved for implementation planning
 **Scope:** Lifecycle-exactly-once feedback for activated Engine V2 skills
 
 ## Problem
