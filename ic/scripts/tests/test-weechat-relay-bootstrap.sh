@@ -439,6 +439,53 @@ else
   failures=$((failures + 1))
 fi
 
+# Regression: preserved non-empty legacy config without weechat.env
+# must still create weechat.env — systemd/OpenRC rendered units require it.
+legacy_tenant="cw-legacy-no-env"
+legacy_weechat_home="$(tenant_weechat_home "$legacy_tenant")"
+mkdir -p "$legacy_weechat_home"
+# Sentinel content that must survive byte-for-byte.
+printf 'legacy-sentinel-config\n' >"$legacy_weechat_home/weechat.conf"
+printf 'legacy-relay-sentinel\n' >"$legacy_weechat_home/relay.conf"
+# Snapshot for byte-for-byte comparison.
+legacy_snapshot="$MT_FIXTURE/legacy-snapshot"
+cp -a "$legacy_weechat_home" "$legacy_snapshot"
+
+write_fixture_env "$legacy_tenant"
+# Explicitly ensure no weechat.env exists before the call.
+legacy_weechat_env="$(tenant_env_dir "$legacy_tenant")/weechat.env"
+rm -f "$legacy_weechat_env"
+
+rm -rf "$WEECHAT_CALL_DIR"
+mkdir -p "$WEECHAT_CALL_DIR"
+
+# Run in subshell so die()'s exit 1 doesn't kill the test script.
+if ( configure_weechat_relay "$legacy_tenant" ) >/dev/null 2>&1; then
+  echo "  FAIL: legacy config without weechat.env should fail"
+  failures=$((failures + 1))
+else
+  echo "  PASS: legacy config without weechat.env fails"
+fi
+
+# Verify target config unchanged (byte-for-byte).
+if diff -rq "$legacy_snapshot" "$(tenant_weechat_home "$legacy_tenant")" >/dev/null 2>&1; then
+  echo "  PASS: legacy config preserved unchanged"
+else
+  echo "  FAIL: legacy config was modified"
+  failures=$((failures + 1))
+fi
+
+# The critical regression: weechat.env must be created even though
+# configure returned nonzero, because systemd/OpenRC rendered units
+# require it at service startup.
+assert_ok "legacy path creates weechat.env" test -f "$legacy_weechat_env"
+legacy_env_content=""
+if [[ -f "$legacy_weechat_env" ]]; then
+  legacy_env_content="$(<"$legacy_weechat_env")"
+fi
+assert_eq "legacy path weechat.env has RELAY_PASSWORD" \
+  "$legacy_env_content" "RELAY_PASSWORD=$FIXTURE_PASSWORD"
+
 # Failure path: missing RELAY_PASSWORD in env
 no_pass_tenant="cw-nopass"
 mkdir -p "$(tenant_home "$no_pass_tenant")/.config"

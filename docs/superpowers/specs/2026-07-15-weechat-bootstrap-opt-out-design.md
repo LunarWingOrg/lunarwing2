@@ -1,6 +1,6 @@
 # WeeChat Bootstrap Opt-Out Design
 
-**Status:** Approved design  
+**Status:** Approved design
 **Date:** 2026-07-15
 
 ## Goal

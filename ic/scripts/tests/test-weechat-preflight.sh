@@ -19,6 +19,8 @@
 #   9. empty-lw-relay-pw    — empty lunarwing.env RELAY_PASSWORD with valid
 #                             expression-based relay.conf; must NOT falsely
 #                             report a plaintext password leak
+#  10. mismatch-pw          — non-empty weechat.env RELAY_PASSWORD that differs
+#                             from lunarwing.env; must FAIL and exit 1
 #
 set -euo pipefail
 
@@ -27,6 +29,8 @@ PREFLIGHT="$SCRIPT_DIR/../lunarwing-weechat-preflight.sh"
 
 # Fixture secret — must NEVER appear in preflight output.
 FIXTURE_SECRET='FIXTURE_RELAY_SECRET_aaa111'
+# Second distinct non-empty secret for mismatch tests — also must NEVER appear.
+MISMATCH_SECRET='FIXTURE_RELAY_SECRET_bbb222'
 
 failures=0
 total=0
@@ -127,6 +131,10 @@ JSON
       ;;
     empty-env|empty-lw-relay-pw)
       printf 'RELAY_PASSWORD=\n' \
+        > "$tdir/lunarwing/env/weechat.env"
+      ;;
+    mismatch-pw)
+      printf 'RELAY_PASSWORD=%s\n' "$MISMATCH_SECRET" \
         > "$tdir/lunarwing/env/weechat.env"
       ;;
     *)
@@ -326,6 +334,20 @@ assert_not_in "no false plaintext leak" "$PREFLIGHT_OUT" 'plaintext password'
 assert_in  "relay.conf still OK" "$PREFLIGHT_OUT" '[OK  ] relay.conf'
 assert_in  "weechat.env FAIL (empty pw)" "$PREFLIGHT_OUT" '[FAIL] weechat.env'
 assert_not_in "no secret in output" "$PREFLIGHT_OUT" "$FIXTURE_SECRET"
+
+# ============================================================
+# 10. Mismatched non-empty RELAY_PASSWORD between weechat.env and lunarwing.env
+#     The regression emitted WARN and exited 0; this locks FAIL and exit 1.
+# ============================================================
+echo "=== 10. mismatch-pw (non-empty mismatch must FAIL) ==="
+create_fixture mismatch-pw
+run_preflight
+assert_exit "mismatch-pw → exit 1" 1 "$PREFLIGHT_EXIT"
+assert_in  "weechat.env FAIL" "$PREFLIGHT_OUT" '[FAIL] weechat.env'
+assert_in  "mismatch detail" "$PREFLIGHT_OUT" 'does not match'
+assert_not_in "no WARN for weechat.env" "$PREFLIGHT_OUT" '[WARN] weechat.env'
+assert_not_in "no fixture secret in output" "$PREFLIGHT_OUT" "$FIXTURE_SECRET"
+assert_not_in "no mismatch secret in output" "$PREFLIGHT_OUT" "$MISMATCH_SECRET"
 
 # ============================================================
 # Summary

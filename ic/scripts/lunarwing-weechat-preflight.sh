@@ -165,7 +165,7 @@ _verify_minimal_env() {  # <env_file> <plaintext_ref>
   if [[ "$pw" == "$plaintext" ]]; then
     mark OK "weechat.env" "RELAY_PASSWORD set (${#pw} chars)"
   else
-    mark WARN "weechat.env" "RELAY_PASSWORD set (${#pw} chars) but does not match lunarwing.env"
+    mark FAIL "weechat.env" "RELAY_PASSWORD set (${#pw} chars) but does not match lunarwing.env"
   fi
   return 0
 }
