@@ -4,15 +4,13 @@
 
 LunarWing is a self-hosted, privacy-focused AI agent runtime and operations platform written in Rust. It connects agents to open communication protocols, extensible WASM tools, and operator-controlled infrastructure.
 
-LunarWing began as a hard fork of NearAI IronClaw and has diverged substantially since February 2026. LunarWing is not affiliated with NearAI.
-
 <p align="center">
   <img src="./crszsslw2412c09c1-8ea9-46bd-8063-084ccdd2f332.jpg" alt="LunarWing" width="400">
 </p>
 
 ## LunarWing v2
 
-LunarWing v2 is an unreleased development line preparing for release/tag **2.0.0.0 — Kosoku**. The v2 line introduces the new execution engine, a browser-based multi-tenant onboarding console, richer gateway interactions, and a refreshed foundation for skills, memory, workers, and tools.
+The v2 line introduces the new execution engine, a browser-based multi-tenant onboarding console, richer gateway interactions, and a refreshed foundation for skills, memory, workers, and tools.
 
 Read the [v2.0.0.0 release notes](RELEASE-v2.0.0.0.md) for the complete change list, compatibility notes, and known limitations.
 
@@ -29,7 +27,7 @@ Read the [v2.0.0.0 release notes](RELEASE-v2.0.0.0.md) for the complete change l
 ## Why LunarWing
 
 - **Operator controlled** — run the agent, database, providers, workers, and communication bridges on infrastructure you control.
-- **Open communication** — prioritize XMPP, IRC through WeeChat, DarkIRC, Signal, and other open or self-hostable paths.
+- **Open communication** — prioritize XMPP, IRC through WeeChat, DarkIRC, and other open or self-hostable paths.
 - **Extensible by design** — add sandboxed WASM tools and channel adapters without folding every integration into the core daemon.
 - **Secret-aware operations** — encrypted secret storage and tenant-scoped operational tooling are built into the deployment model.
 - **Production multi-tenancy** — isolate tenants with separate OS users, services, databases, ports, configuration, and optional workers.
@@ -49,7 +47,6 @@ Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 ### Channels and interfaces
 
 - Browser gateway, CLI, and HTTP interfaces
-- Built-in Signal channel through a configured `signal-cli` HTTP daemon
 - WASM channels for XMPP, WeeChat, DarkIRC, and Multica
 - Optional Gotify notifications and SSH tooling
 
@@ -63,11 +60,8 @@ LunarWing can attach persistent NanoCode, Pebble, or OpenCode worker containers.
 
 | Provider path | Intended use |
 | --- | --- |
-| LunarWing Cloud | Default backend when no provider is configured; requires LunarWing Cloud authentication |
 | `openai_compatible` | OpenAI-compatible endpoints, including compatible routing gateways |
 | `ollama` | Local Ollama deployments |
-
-The shipped multi-tenant configuration uses `openai_compatible`. The `openai`, `open_ai`, `openai_codex`, and `codex` backend names are unsupported; connect OpenAI or compatible APIs through `openai_compatible`. TensorZero can be used through a compatible endpoint; the legacy proxy remains available only as an explicit compatibility option.
 
 ## Get started with the onboarding GUI
 
@@ -120,7 +114,6 @@ Full GUI reference: [Browser onboarding console](lunarwing_mt_onboard_web/README
 - DarkIRC, Gotify, external workers, and optional toolchains remain disabled until selected.
 - Leaving the XMPP fields blank does not disable XMPP: the administration script assigns `<tenant>@xmpp.localhost` and provisions the bridge.
 - Container-runtime group membership is enabled by default. Membership in the rootful Docker group is effectively root-equivalent; rootless Podman normally uses per-user storage, and a `podman` group may not exist.
-- The form defaults to model `tensorzero::function_name::lunarwing` and upstream `http://192.168.1.157:3000/openai/v1`. Replace the LAN-specific upstream URL and verify the model and credentials.
 
 ### Treat the GUI as a privileged local console
 
@@ -172,7 +165,7 @@ Kawarimi supports PostgreSQL tenants; libSQL bundles are refused. A real export 
 
 ## Development and testing
 
-The Rust workspace lives under `ic/`, uses Rust 1.92, and reports package version `2.0.0` for the v2 release line.
+The Rust workspace lives under `ic/`, uses Rust 1.96, and reports package version `2.0.0` for the v2 release line.
 
 ```bash
 cd ic
