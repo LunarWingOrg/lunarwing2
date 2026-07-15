@@ -2398,6 +2398,9 @@ ADAPTER_PORT=$weechat_adapter_port
 WEECHAT_ADAPTER_PORT=$weechat_adapter_port
 WS_ADAPTER_URL=http://127.0.0.1:${weechat_adapter_port}
 
+# Engine V2 (parallel execution path with streaming, gates, missions)
+ENGINE_V2=true
+
 # Daemon mode
 CLI_ENABLED=false
 ONBOARD_COMPLETED=true
