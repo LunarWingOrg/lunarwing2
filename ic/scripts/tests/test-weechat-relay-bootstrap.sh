@@ -611,6 +611,42 @@ fi
 assert_ok "promoted config valid for empty target" \
   _weechat_validate_relay_config "$(tenant_weechat_home "$empty_tenant")" 18000 "$FIXTURE_PASSWORD"
 
+# Regression: fresh config generation with an existing STALE weechat.env.
+# A pre-existing weechat.env carrying a value that differs from lunarwing.env
+# must be synchronized on fresh generation.  Historically configure_weechat_relay
+# only wrote the env when absent, leaving the stale credential in place and
+# causing a preflight mismatch.
+stale_tenant="cw-stale-env"
+stale_weechat_home="$(tenant_weechat_home "$stale_tenant")"
+mkdir -p "$(dirname "$stale_weechat_home")"
+write_fixture_env "$stale_tenant"
+
+stale_weechat_env_file="$(tenant_env_dir "$stale_tenant")/weechat.env"
+printf 'RELAY_PASSWORD=STALE-PASSWORD-SHOULD-BE-OVERWRITTEN\n' >"$stale_weechat_env_file"
+
+rm -rf "$WEECHAT_CALL_DIR"
+mkdir -p "$WEECHAT_CALL_DIR"
+
+if configure_weechat_relay "$stale_tenant" >/dev/null 2>&1; then
+  echo "  PASS: stale-env configure succeeds (empty target)"
+else
+  echo "  FAIL: stale-env configure should succeed (empty target)"
+  failures=$((failures + 1))
+fi
+
+assert_ok "stale-env generated relay.conf validates" \
+  _weechat_validate_relay_config "$stale_weechat_home" 18000 "$FIXTURE_PASSWORD"
+
+if ! grep -qr "$FIXTURE_PASSWORD" "$stale_weechat_home"; then
+  echo "  PASS: stale-env no plaintext password in config dir"
+else
+  echo "  FAIL: stale-env plaintext password found in config dir"
+  failures=$((failures + 1))
+fi
+
+assert_eq "stale-env weechat.env synchronizes to lunarwing.env" \
+  "$(<"$stale_weechat_env_file")" "RELAY_PASSWORD=$FIXTURE_PASSWORD"
+
 unique_tenant="cw-unique-temp"
 unique_parent="$(tenant_home "$unique_tenant")/.config"
 mkdir -p "$unique_parent/.weechat-bootstrap-tmp.$$"
