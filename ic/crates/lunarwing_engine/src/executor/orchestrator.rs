@@ -1844,6 +1844,10 @@ async fn handle_record_skill_usage(
     args: &[MontyObject],
     store: Option<&Arc<dyn Store>>,
 ) -> ExtFunctionResult {
+    if !crate::skill_self_improvement_enabled() {
+        return ExtFunctionResult::Return(MontyObject::None);
+    }
+
     let Some(store) = store else {
         return ExtFunctionResult::Return(MontyObject::None);
     };
@@ -1883,6 +1887,10 @@ async fn handle_propose_skill_patch(
     thread: &Thread,
     store: Option<&Arc<dyn Store>>,
 ) -> ExtFunctionResult {
+    if !crate::skill_self_improvement_enabled() {
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    }
+
     let Some(store) = store else {
         return ExtFunctionResult::Return(MontyObject::Bool(false));
     };

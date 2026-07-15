@@ -66,7 +66,8 @@ impl SkillTracker {
         // demotion — it excludes the skill from auto-activation going forward.
         // Pruning (archival) stays propose→approve (never auto-destructive).
         // Authored and Installed skills are exempt (is_demote_candidate checks).
-        if meta.deprecated_at.is_none()
+        if crate::skill_self_improvement_enabled()
+            && meta.deprecated_at.is_none()
             && meta.is_demote_candidate(DEFAULT_DEMOTE_CONFIDENCE, DEFAULT_DEMOTE_MIN_USAGE)
         {
             let conf = meta.metrics.confidence();
@@ -1038,6 +1039,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_usage_inline_demotes_below_floor() {
+        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
         // Start with a Trusted Extracted skill at 1 success / 8 failures over 9
         // uses (confidence ~0.11, below the 0.3 demotion floor). record_usage
         // with a further failure should trip inline demotion.

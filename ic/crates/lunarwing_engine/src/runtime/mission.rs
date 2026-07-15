@@ -509,25 +509,24 @@ impl MissionManager {
                                 .take(10)
                                 .collect();
 
-                            // B-1: attribute the failure to any activated skills
-                            // that are ALSO below the patch-confidence threshold,
-                            // so the self-improvement mission can propose a patch.
-                            // Empty when no such skill was active — the mission
-                            // then only does its prompt/config/orchestrator work.
-                            let active_skills =
-                                collect_patch_candidate_skills(mgr.store.as_ref(), &thread).await;
+                            let self_improvement_on = crate::skill_self_improvement_enabled();
 
-                            // B-2: enumerate confidently-dead skills across the
-                            // whole library (not just ones active in this thread)
-                            // so the skill-maintenance sweep mission can propose
-                            // pruning them. Empty when nothing is at the prune
-                            // floor (0.0 confidence over ≥ prune min-usage).
-                            let prune_candidates = collect_prune_candidate_skills(
-                                mgr.store.as_ref(),
-                                thread.project_id,
-                                &thread.user_id,
-                            )
-                            .await;
+                            let active_skills = if self_improvement_on {
+                                collect_patch_candidate_skills(mgr.store.as_ref(), &thread).await
+                            } else {
+                                Vec::new()
+                            };
+
+                            let prune_candidates = if self_improvement_on {
+                                collect_prune_candidate_skills(
+                                    mgr.store.as_ref(),
+                                    thread.project_id,
+                                    &thread.user_id,
+                                )
+                                .await
+                            } else {
+                                Vec::new()
+                            };
 
                             let payload = serde_json::json!({
                                 "source_thread_id": event.thread_id.0.to_string(),
@@ -750,9 +749,13 @@ impl MissionManager {
         // 0. Seed compiled-in orchestrator v0 so it's visible in workspace
         self.seed_orchestrator_v0(project_id).await?;
 
+        let self_improvement_on = crate::skill_self_improvement_enabled();
+
         // 1. Error diagnosis (self-improvement) — per-user
-        self.ensure_self_improvement_mission(project_id, user_id)
-            .await?;
+        if self_improvement_on {
+            self.ensure_self_improvement_mission(project_id, user_id)
+                .await?;
+        }
 
         // 2. Skill extraction (formerly playbook extraction)
         self.ensure_mission_by_metadata(
@@ -808,20 +811,22 @@ impl MissionManager {
         // over ≥ prune min-usage); the user approves archival via the proposals
         // surface. Inline demotion (in record_usage) handles the immediate
         // below-floor case; this sweep catches stale, never-succeeding skills.
-        self.ensure_mission_by_metadata(
-            project_id,
-            user_id,
-            "skill_maintenance",
-            "skill-maintenance",
-            SKILL_MAINTENANCE_GOAL,
-            MissionCadence::OnSystemEvent {
-                source: "engine".into(),
-                event_type: "thread_completed_with_issues".into(),
-            },
-            "Scan for dead skills and stage user-approved prune (archive) proposals",
-            1, // max 1/day — sweep is cheap, catches what inline demotion misses
-        )
-        .await?;
+        if self_improvement_on {
+            self.ensure_mission_by_metadata(
+                project_id,
+                user_id,
+                "skill_maintenance",
+                "skill-maintenance",
+                SKILL_MAINTENANCE_GOAL,
+                MissionCadence::OnSystemEvent {
+                    source: "engine".into(),
+                    event_type: "thread_completed_with_issues".into(),
+                },
+                "Scan for dead skills and stage user-approved prune (archive) proposals",
+                1, // max 1/day — sweep is cheap, catches what inline demotion misses
+            )
+            .await?;
+        }
 
         Ok(())
     }
@@ -2613,6 +2618,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_cannot_pause_another_users_learning_mission() {
+        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();
@@ -2776,6 +2782,7 @@ mod tests {
 
     #[tokio::test]
     async fn fire_on_system_event_scoped_to_user() {
+        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();
@@ -2847,6 +2854,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_learning_missions_idempotent_per_user() {
+        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();
