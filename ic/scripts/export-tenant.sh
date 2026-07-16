@@ -44,6 +44,7 @@ set -euo pipefail
 OUT_DIR="${LUNARWING_MIGRATE_DIR:-/var/lib/lunarwing-migrate}"
 NO_QUIESCE=false
 DRY_RUN=false
+NO_ENCRYPT=false
 TENANT=""
 
 while [[ $# -gt 0 ]]; do
@@ -51,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --out-dir)    OUT_DIR="$2"; shift 2 ;;
     --no-quiesce) NO_QUIESCE=true; shift ;;
     --dry-run)    DRY_RUN=true; shift ;;
+    --no-encrypt) NO_ENCRYPT=true; shift ;;
     -*)           printf 'unknown arg: %s\n' "$1" >&2; exit 2 ;;
     *)            TENANT="$1"; shift ;;
   esac
@@ -62,10 +64,11 @@ banner() { printf '\n========== %s ==========\n' "$*"; }
 note()   { printf '  · %s\n' "$*"; }
 run()    { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; return 0; fi; printf '  + %s\n' "$*"; "$@"; }
 
-[[ -n "$TENANT" ]] || die "usage: $0 <tenant> [--out-dir DIR] [--no-quiesce] [--dry-run]"
+[[ -n "$TENANT" ]] || die "usage: $0 <tenant> [--out-dir DIR] [--no-quiesce] [--dry-run] [--no-encrypt]"
 [[ "$(id -u)" -eq 0 ]] || die "run as root (sudo): stops the tenant services, reads its home/state, execs its DB container"
 command -v jq  >/dev/null 2>&1 || die "jq required"
 command -v tar >/dev/null 2>&1 || die "tar required"
+command -v 7z >/dev/null 2>&1 || die "7z (p7zip) required for encrypted bundles"
 
 id "$TENANT" >/dev/null 2>&1 || die "OS user '$TENANT' not found"
 UID_T="$(id -u "$TENANT")"
@@ -272,9 +275,13 @@ fi
 
 # ---- 5. seal the bundle ------------------------------------------------------
 banner "5/5  Seal bundle"
-BUNDLE="$OUT_DIR/${TENANT}-migrate-${STAMP}.tar"
+
 if $DRY_RUN; then
-  note "[dry-run] would write meta.txt and seal -> $BUNDLE (0600)"
+  if $NO_ENCRYPT; then
+    note "[dry-run] would write meta.txt and seal -> $OUT_DIR/${TENANT}-migrate-${STAMP}.tar (0600, UNENCRYPTED)"
+  else
+    note "[dry-run] would write meta.txt and seal -> $OUT_DIR/${TENANT}-migrate-${STAMP}.7z (0600, AES-256 encrypted)"
+  fi
   say ""; say "DRY RUN complete — no bundle written, services NOT stopped."
   exit 0
 fi
@@ -288,15 +295,54 @@ mkdir -p "$OUT_DIR"; chmod 0700 "$OUT_DIR"
   printf 'db_backend=%s\n' "$DB_BACKEND"
   printf 'created=%s\n' "$STAMP"
 } > "$WORK/meta.txt"
-( umask 077; tar cf "$BUNDLE" -C "$WORK" . )
-chmod 0600 "$BUNDLE"
+
+if $NO_ENCRYPT; then
+  # Legacy plaintext tar — for testing only
+  BUNDLE="$OUT_DIR/${TENANT}-migrate-${STAMP}.tar"
+  ( umask 077; tar cf "$BUNDLE" -C "$WORK" . )
+  chmod 0600 "$BUNDLE"
+  say "  WARNING: bundle is UNENCRYPTED (--no-encrypt)" >&2
+else
+  # Encrypted 7z with header encryption
+  BUNDLE="$OUT_DIR/${TENANT}-migrate-${STAMP}.7z"
+
+  # Collect passphrase: env var, key file, or interactive prompt
+  if [[ -n "${KAWARIMI_PASS:-}" ]]; then
+    : # from environment
+  elif [[ -n "${KAWARIMI_PASS_FILE:-}" ]]; then
+    [[ -f "$KAWARIMI_PASS_FILE" ]] || die "passphrase file not found: $KAWARIMI_PASS_FILE"
+    KAWARIMI_PASS=$(<"$KAWARIMI_PASS_FILE")
+  else
+    read -s -p "Enter encryption passphrase: " KAWARIMI_PASS
+    echo
+    read -s -p "Confirm passphrase: " KAWARIMI_PASS_CONFIRM
+    echo
+    [[ "$KAWARIMI_PASS" == "$KAWARIMI_PASS_CONFIRM" ]] || die "passphrases do not match"
+  fi
+
+  # Create encrypted 7z: AES-256, header encryption, moderate compression
+  7z a -t7z \
+    -mhe=on \
+    -p"$KAWARIMI_PASS" \
+    -mx=5 \
+    "$BUNDLE" "$WORK"/* \
+    >/dev/null 2>&1 || die "7z encryption failed"
+  chmod 0600 "$BUNDLE"
+  # Clear passphrase from memory
+  unset KAWARIMI_PASS KAWARIMI_PASS_CONFIRM
+fi
 
 banner "Done — bundle written (tenant is STOPPED — cutover in progress)"
 say "  $BUNDLE ($(du -h "$BUNDLE" | cut -f1))"
 say ""
+if $NO_ENCRYPT; then
+say "WARNING: bundle is UNENCRYPTED. Contains SECRETS_MASTER_KEY + XMPP password."
+say "         Transfer over ssh (0600), delete from both hosts after verify."
+else
 say "The '$TENANT' daemon + bridge are now STOPPED on this host (PG still up for the"
-say "dump; you may stop it too). The bundle contains SECRETS_MASTER_KEY + the XMPP"
-say "password — transfer it over ssh (0600), and delete it from both hosts after verify."
+say "dump; you may stop it too). The 7z bundle is AES-256 encrypted — the passphrase"
+say "is required to even list contents. Transfer over ssh, and delete from both hosts after verify."
+fi
 say ""
 say "Next, on the NEW host:  sudo ic/scripts/import-tenant.sh $(basename "$BUNDLE") --start"
 say "Rollback: this host is intact — restart '$TENANT' here to abort the migration."
