@@ -10,9 +10,13 @@
 
 1. [ ] See vault
 2. [ ] Work on docs/ops/WEECHAT_SERVICES_VERIFICATION.md
-3. [x] CREATE DETAILED PLAN OF PHASE 4 OF BIG STREAM Phase 4 is interruption/cancellation; Phase 5 is opt-in WASM delivery.
+3. [ ] kawarimi security enhancement
 4. [x] CREATE DETAILED PLAN OF PHASE 5 OF BIG STREAM Phase 4 is interruption/cancellation; Phase 5 is opt-in WASM delivery.
 5. [ ] PHASE 4 OF 5 NOW COMPLETE FOR v2 engine overhaul. Phase 5 is only PARTIALLY complete at this time. You must ensure compatibility with all tools, mcp, skills, channels. ensure streaming. ensure gateway ui functionality. ensure tool compatibility in tensorzero. multiple phases. record progress. lot of tests needed
+6. [ ] verify phase 5
+7. [ ] verify self improve skill
+8. [ ] more docs
+9. [ ] bump crate versions
 6. [ ] Drop legacy `ironclaw-agent-v1` subprotocol offer from the daemon (delete the `SUBPROTOCOL_LEGACY` offer in `ic/src/orchestrator/external_worker.rs`) and `git rm` the 1.1.9-only repo-root compat symlinks `ironclaw_weechat_wss`, `darkirc_channel_for_ironclaw` (deployed tenants must have re-run mt-admin unit regen by then) See: rarity/item-6-20260712-1200
 7. [x] LunarWing Web UI performance overhaul - lot of issues with UI - laggy, buttons dont animate, etc
 8. [x] LunarWing Web MT admin setup integration (part 2 of an earlier plan discussed some time ago) - started - go see: lunarwing_mt_onboard_web/ - this is being worked on by another agent or human
