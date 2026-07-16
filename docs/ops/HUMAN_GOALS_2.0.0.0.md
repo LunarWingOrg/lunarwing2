@@ -126,5 +126,44 @@
 24. [ ] Go through all documents under guides directory in docs/ and update all outdated documentation. Then, consolidate documents.
 25. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.0.0 explaining all relevant changes since v1.1.9.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/release for reference as to how to write up this document. The codename for this release is: `Unknown` — The file you write will be RELEASE-v2.0.0.0.md and should be written to the ROOT of the repo.
 26. [ ] Improve accuracy of RELEASE-v2.0.0.0.md
+## Summary
+
+The kawarimi (tenant migration) bundle contained SECRETS_MASTER_KEY, full PostgreSQL dump, XMPP credentials, and OMEMO store as plaintext in a 0600 tar file. File permissions only protect against other users on the same host — nothing during transit or at rest.
+
+## Changes
+
+**export-tenant.sh:**
+- Replace `tar cf` with `7z a -t7z -mhe=on` (AES-256 + header encryption)
+- Add `--no-encrypt` flag for testing/debugging
+- Passphrase via `KAWARIMI_PASS` env, `KAWARIMI_PASS_FILE`, or interactive prompt with confirmation
+- Passphrase cleared from memory after use
+- 7z dependency check added
+
+**import-tenant.sh:**
+- Auto-detect `.7z` vs `.tar` by extension
+- `.7z`: decrypt with passphrase (env, file, or prompt)
+- `.tar`: legacy backward compat with deprecation warning
+- Wrong passphrase = clean failure with helpful message
+- Passphrase cleared from memory after use
+
+## Security Properties
+
+| Property | Before (tar) | After (7z) |
+|----------|-------------|------------|
+| Contents at rest | Plaintext | AES-256 encrypted |
+| Filenames | Visible | Encrypted (mhe=on) |
+| Transit security | SSH only | SSH + AES-256 |
+| If intercepted | Full compromise | Useless without passphrase |
+| SECRETS_MASTER_KEY | Plaintext in tar | Encrypted in 7z |
+
+## Test Plan
+
+- [ ] Export a tenant → verify .7z created
+- [ ] `7z l` without password shows nothing (header encryption)
+- [ ] Import .7z with correct passphrase → all secrets land correctly
+- [ ] Import legacy .tar → works with warning
+- [ ] Wrong passphrase → clean failure
+- [ ] SECRETS_MASTER_KEY survives round-trip
+- [ ] OMEMO store survives round-trip
 
 ---
