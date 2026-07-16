@@ -80,6 +80,12 @@ pub const DEFAULT_PRUNE_CONFIDENCE: f64 = 0.0;
 /// Minimum usage before a skill can be staged for pruning. Higher than the
 /// demotion min-usage so we accumulate strong evidence before proposing removal.
 pub const DEFAULT_PRUNE_MIN_USAGE: u64 = 10;
+/// Default quarantine after automatic demotion before a skill may be staged
+/// for pruning without accumulating more usage.
+pub const DEFAULT_PRUNE_QUARANTINE_DAYS: u64 = 30;
+/// Prefix used by legacy automatic demotions written before typed provenance
+/// was added. Retained so those documents can enter the quarantine lifecycle.
+pub const AUTOMATIC_DEMOTION_REASON_PREFIX: &str = "auto-demoted:";
 
 // ── B-3: cross-agent sharing publish gate ────────────────────────────────
 /// Minimum confidence for a skill to be publishable to the registry. Higher
@@ -155,8 +161,59 @@ impl V2SkillMetadata {
             && self.source == V2SkillSource::Extracted
             && self.archived_at.is_none()
             && self.deprecated_at.is_none()
+            && self.pending_patch.is_none()
             && self.metrics.usage_count >= min_usage
             && self.metrics.confidence() <= threshold
+    }
+
+    /// Whether this skill is currently demoted by the automatic confidence
+    /// floor. The reason-prefix fallback preserves the lifecycle for metadata
+    /// written before `automatic_demotion` existed.
+    pub fn is_automatically_demoted(&self) -> bool {
+        self.deprecated_at.is_some()
+            && (self.automatic_demotion
+                || self
+                    .deprecation_reason
+                    .starts_with(AUTOMATIC_DEMOTION_REASON_PREFIX))
+    }
+
+    /// Whether an automatically demoted skill has completed its quarantine and
+    /// may be staged for user-approved pruning. Demoted skills cannot accumulate
+    /// more usage because activation excludes them, so elapsed quarantine time
+    /// is the evidence gate for this branch of the lifecycle.
+    pub fn is_quarantine_prune_candidate(
+        &self,
+        now: &DateTime<Utc>,
+        quarantine: std::time::Duration,
+    ) -> bool {
+        if self.trust == SkillTrust::Installed
+            || self.source != V2SkillSource::Extracted
+            || self.archived_at.is_some()
+            || self.pending_patch.is_some()
+            || self.pending_prune.is_some()
+            || !self.is_automatically_demoted()
+        {
+            return false;
+        }
+
+        let Some(deprecated_at) = self.deprecated_at else {
+            return false;
+        };
+        now.signed_duration_since(deprecated_at)
+            .to_std()
+            .is_ok_and(|elapsed| elapsed >= quarantine)
+    }
+
+    /// Clear demotion state only when it was produced automatically. Returns
+    /// whether the skill was reactivated.
+    pub fn clear_automatic_demotion(&mut self) -> bool {
+        if !self.is_automatically_demoted() {
+            return false;
+        }
+        self.deprecated_at = None;
+        self.deprecation_reason.clear();
+        self.automatic_demotion = false;
+        true
     }
 
     /// Whether this skill is eligible to be published to a registry (B-3):
@@ -268,6 +325,9 @@ pub struct PendingSkillPrune {
 pub struct PendingSkillUpdate {
     /// The newer version available on the registry.
     pub registry_version_available: String,
+    /// Exact registry slug to download on approval.
+    #[serde(default)]
+    pub registry_slug: String,
     /// Registry URL the update would be pulled from.
     #[serde(default)]
     pub registry_url: String,
@@ -331,6 +391,10 @@ pub struct V2SkillMetadata {
     /// Human-readable reason for the current demotion (empty when not demoted).
     #[serde(default)]
     pub deprecation_reason: String,
+    /// True only when the current demotion was applied automatically by the
+    /// confidence floor. Manual/operator demotions remain false.
+    #[serde(default)]
+    pub automatic_demotion: bool,
     /// B-2 archive (soft-delete) flag: when set, the skill is fully excluded
     /// from activation and is considered retired. Set only by user-approved
     /// prune. The MemoryDoc is retained for audit/recovery (never hard-deleted).
@@ -349,12 +413,18 @@ pub struct V2SkillMetadata {
     /// Publisher handle at the registry, if known.
     #[serde(default)]
     pub registry_publisher: Option<String>,
+    /// Exact registry slug used for publish, pull, and update checks.
+    #[serde(default)]
+    pub registry_slug: Option<String>,
     /// Registry version string installed, if pulled from a registry.
     #[serde(default)]
     pub registry_version: Option<String>,
     /// When the skill was pulled from the registry, if applicable.
     #[serde(default)]
     pub pulled_at: Option<DateTime<Utc>>,
+    /// When this local skill was most recently published to the registry.
+    #[serde(default)]
+    pub published_at: Option<DateTime<Utc>>,
     /// Content hash recorded at pull time (for update change detection).
     #[serde(default)]
     pub registry_content_hash: Option<String>,
@@ -453,14 +523,17 @@ mod tests {
             // B-2 demotion/prune fields
             deprecated_at: None,
             deprecation_reason: String::new(),
+            automatic_demotion: false,
             archived_at: None,
             archived_reason: String::new(),
             pending_prune: None,
             // B-3 provenance fields
             registry_url: Some("https://example.registry".to_string()),
             registry_publisher: Some("alice".to_string()),
+            registry_slug: Some("alice/test-skill".to_string()),
             registry_version: Some("1.2.3".to_string()),
             pulled_at: Some(Utc::now()),
+            published_at: None,
             registry_content_hash: Some("sha256:dead".to_string()),
             pending_update: None,
         };
@@ -486,6 +559,7 @@ mod tests {
         );
         assert_eq!(parsed.registry_version.as_deref(), Some("1.2.3"));
         assert_eq!(parsed.registry_publisher.as_deref(), Some("alice"));
+        assert_eq!(parsed.registry_slug.as_deref(), Some("alice/test-skill"));
     }
 
     #[test]
@@ -504,11 +578,14 @@ mod tests {
         // B-2/B-3 fields default empty/None on old skills (forward compat).
         assert!(parsed.deprecated_at.is_none());
         assert!(parsed.deprecation_reason.is_empty());
+        assert!(!parsed.automatic_demotion);
         assert!(parsed.archived_at.is_none());
         assert!(parsed.archived_reason.is_empty());
         assert!(parsed.pending_prune.is_none());
         assert!(parsed.registry_url.is_none());
+        assert!(parsed.registry_slug.is_none());
         assert!(parsed.registry_version.is_none());
+        assert!(parsed.published_at.is_none());
         assert!(parsed.pending_update.is_none());
     }
 
@@ -600,6 +677,81 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_demotion_becomes_prune_candidate_after_quarantine() {
+        let now = Utc::now();
+        let quarantine = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+        let mut m = extracted_trusted(0, 5, 5);
+        m.deprecated_at = Some(now - chrono::Duration::days(31));
+        m.deprecation_reason = format!("{AUTOMATIC_DEMOTION_REASON_PREFIX} low confidence");
+        m.automatic_demotion = true;
+
+        assert!(m.is_quarantine_prune_candidate(&now, quarantine));
+    }
+
+    #[test]
+    fn test_auto_demotion_is_not_prune_candidate_before_quarantine() {
+        let now = Utc::now();
+        let quarantine = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+        let mut m = extracted_trusted(0, 5, 5);
+        m.deprecated_at = Some(now - chrono::Duration::days(29));
+        m.deprecation_reason = format!("{AUTOMATIC_DEMOTION_REASON_PREFIX} low confidence");
+        m.automatic_demotion = true;
+
+        assert!(!m.is_quarantine_prune_candidate(&now, quarantine));
+    }
+
+    #[test]
+    fn test_manual_demotion_never_enters_automatic_quarantine_pruning() {
+        let now = Utc::now();
+        let quarantine = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+        let mut m = extracted_trusted(0, 5, 5);
+        m.deprecated_at = Some(now - chrono::Duration::days(90));
+        m.deprecation_reason = "operator disabled this skill".to_string();
+
+        assert!(!m.is_quarantine_prune_candidate(&now, quarantine));
+    }
+
+    #[test]
+    fn test_pending_patch_blocks_quarantine_pruning() {
+        let now = Utc::now();
+        let quarantine = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+        let mut m = extracted_trusted(0, 5, 5);
+        m.deprecated_at = Some(now - chrono::Duration::days(31));
+        m.deprecation_reason = format!("{AUTOMATIC_DEMOTION_REASON_PREFIX} low confidence");
+        m.automatic_demotion = true;
+        m.pending_patch = Some(PendingSkillPatch {
+            proposed_content: "patched".to_string(),
+            diff: String::new(),
+            reason: "recover".to_string(),
+            source_thread_id: None,
+            confidence_at_proposal: 0.0,
+            base_content_hash: "sha256:old".to_string(),
+            proposed_at: now,
+        });
+
+        assert!(!m.is_quarantine_prune_candidate(&now, quarantine));
+    }
+
+    #[test]
+    fn test_legacy_auto_demotion_deserializes_into_quarantine_lifecycle() {
+        let deprecated_at = Utc::now() - chrono::Duration::days(31);
+        let json = serde_json::json!({
+            "source": "extracted",
+            "trust": "trusted",
+            "deprecated_at": deprecated_at,
+            "deprecation_reason": "auto-demoted: legacy metadata"
+        });
+        let parsed: V2SkillMetadata = serde_json::from_value(json).expect("deserialize legacy");
+
+        assert!(!parsed.automatic_demotion);
+        assert!(parsed.is_automatically_demoted());
+        assert!(parsed.is_quarantine_prune_candidate(
+            &Utc::now(),
+            std::time::Duration::from_secs(30 * 24 * 60 * 60)
+        ));
+    }
+
+    #[test]
     fn test_is_publish_eligible_proven_trusted() {
         // 9/1 = 0.9 confidence, 10 uses, Trusted → publishable.
         let m = extracted_trusted(9, 1, 10);
@@ -671,6 +823,7 @@ mod tests {
             name: "s".to_string(),
             pending_update: Some(PendingSkillUpdate {
                 registry_version_available: "2.0.0".to_string(),
+                registry_slug: "alice/s".to_string(),
                 registry_url: "https://reg".to_string(),
                 new_content_hash: "sha256:new".to_string(),
                 staged_at: Utc::now(),
@@ -681,6 +834,7 @@ mod tests {
         let parsed: V2SkillMetadata = serde_json::from_str(&json).expect("deserialize");
         let u = parsed.pending_update.expect("pending update present");
         assert_eq!(u.registry_version_available, "2.0.0");
+        assert_eq!(u.registry_slug, "alice/s");
         assert_eq!(u.new_content_hash, "sha256:new");
     }
 

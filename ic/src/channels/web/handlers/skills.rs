@@ -189,6 +189,11 @@ pub async fn skills_install_handler(
         }
     }
 
+    let normalized = crate::skills::normalize_line_endings(&content);
+    let parsed = crate::skills::parser::parse_skill_md(&normalized)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let skill_name_from_parse = parsed.manifest.name.clone();
+
     // Track registry provenance for the catalog-pull branch (B-3): written as
     // a `.registry.json` sidecar next to SKILL.md so the v1→v2 migration can
     // stamp it into V2SkillMetadata. None for inline-content / explicit-URL
@@ -196,24 +201,26 @@ pub async fn skills_install_handler(
     let registry_provenance: Option<serde_json::Value> =
         if req.content.is_none() && req.url.is_none() {
             state.skill_catalog.as_ref().map(|cat| {
-                let content_hash = {
-                    use sha2::{Digest, Sha256};
-                    let mut h = Sha256::new();
-                    h.update(content.as_bytes());
-                    format!("sha256:{:x}", h.finalize())
-                };
-                serde_json::json!({
-                    "registry_url": cat.registry_url(),
-                    "content_hash": content_hash,
-                    "pulled_at": chrono::Utc::now(),
-                })
+            let slug = req.slug.clone().unwrap_or_else(|| req.name.clone());
+            let publisher = req.publisher.clone().or_else(|| {
+                slug.split_once('/')
+                    .map(|(publisher, _)| publisher.to_string())
+            });
+            serde_json::json!({
+                "registry_url": cat.registry_url(),
+                "slug": slug,
+                "publisher": publisher,
+                "version": req.version,
+                "content_hash": lunarwing_skills::v2::compute_content_hash(&parsed.prompt_content),
+                "pulled_at": chrono::Utc::now(),
             })
+        })
         } else {
             None
         };
 
     // Parse, check duplicates, and get install_dir under a brief read lock.
-    let (user_dir, skill_name_from_parse) = {
+    let user_dir = {
         let guard = registry.read().map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -221,23 +228,17 @@ pub async fn skills_install_handler(
             )
         })?;
 
-        let normalized = crate::skills::normalize_line_endings(&content);
-        let parsed = crate::skills::parser::parse_skill_md(&normalized)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        let skill_name = parsed.manifest.name.clone();
-
-        if guard.has(&skill_name) {
+        if guard.has(&skill_name_from_parse) {
             return Ok(Json(ActionResponse::fail(format!(
                 "Skill '{}' already exists",
-                skill_name
+                skill_name_from_parse
             ))));
         }
 
-        (guard.install_target_dir().to_path_buf(), skill_name)
+        guard.install_target_dir().to_path_buf()
     };
 
     // Perform async I/O (write to disk, load) with no lock held.
-    let normalized = crate::skills::normalize_line_endings(&content);
     let (skill_name, loaded_skill) =
         crate::skills::registry::SkillRegistry::prepare_install_to_disk(
             &user_dir,

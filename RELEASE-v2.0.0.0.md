@@ -124,9 +124,10 @@ See [Channel-Neutral Engine V2 Delivery](docs/superpowers/specs/2026-07-12-engin
 - Patch, prune-to-archive, and update proposal records use explicit review and approval; registry publication is a separate explicit action.
 - Gateway endpoints and proposal cards expose the new maintenance workflow.
 - Registry publication on the backend requires trusted/proven metadata, a `CLAWHUB_TOKEN`, eligibility checks, and leak scanning of skill bodies and code snippets.
-- Registry-fetched skills are leak-scanned before installation.
+- Successful publication uploads a parseable `SKILL.md` manifest and records the registry slug, publisher, version, content hash, and publish time locally.
+- Registry-fetched skills are leak-scanned before installation. Catalog installs preserve exact slug/version provenance; the gated daily update sweep stages hash-bound proposals, and approval downloads, revalidates, and replaces prompt/activation/snippet content.
 
-Automated failure collection, proposal staging, maintenance-mission registration, inline demotion, and orchestrator proposal hooks are disabled by default behind `SKILL_SELF_IMPROVEMENT=false`. Explicit proposal-resolution and publication APIs are not controlled by that flag; they use ownership, eligibility, leak-scan, and token checks. The separate Python-orchestrator self-modification path also remains disabled by default. Skill extraction and conversation insights are distinct from those mutation gates.
+Automated failure collection, proposal staging, maintenance-mission registration, inline demotion, and orchestrator proposal hooks are disabled by default behind `SKILL_SELF_IMPROVEMENT=false`. When enabled, automatically demoted skills complete a 30-day quarantine before they can be staged for user-approved pruning; `SKILL_PRUNE_QUARANTINE_DAYS` overrides that interval. Explicit proposal-resolution and publication APIs are not controlled by the main flag; they use ownership, eligibility, leak-scan, and token checks. The separate Python-orchestrator self-modification path also remains disabled by default. Skill extraction and conversation insights are distinct from those mutation gates.
 
 ### LLM Providers and Model Routing
 
@@ -274,6 +275,7 @@ The current Forgejo workflow is a mirror, not a replacement build, test, coverag
 | `ENGINE_V2` | Binary default `false`; newly rendered tenants `true` | Enables the Engine V2 daemon path |
 | `ENGINE_V2_CHANNELS` | Empty | Keeps XMPP, DarkIRC, and WeeChat on the legacy path; gateway remains Engine-eligible |
 | `SKILL_SELF_IMPROVEMENT` | `false` | Gates automated collection, proposal staging, maintenance missions, inline demotion, and orchestrator proposal hooks |
+| `SKILL_PRUNE_QUARANTINE_DAYS` | `30` | Sets the quarantine before an automatically demoted skill can be proposed for user-approved pruning; inert while self-improvement is disabled |
 | `ORCHESTRATOR_SELF_MODIFY` | Disabled | Keeps Python orchestrator self-modification inactive |
 | `LLM_CIRCUIT_BREAKER_THRESHOLD` | Newly rendered tenants: `7` | Opens the breaker after repeated fully retried failures |
 | `LLM_CIRCUIT_BREAKER_RECOVERY_SECS` | Newly rendered tenants: `45` | Controls the open-to-probe recovery interval |

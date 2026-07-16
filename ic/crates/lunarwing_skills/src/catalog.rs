@@ -7,6 +7,7 @@
 //! Configuration:
 //! - `CLAWHUB_REGISTRY` env var overrides the default base URL
 
+use std::io::Read as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,11 @@ const MAX_RESULTS: usize = 25;
 
 /// HTTP request timeout for catalog queries.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum compressed registry response accepted for a skill download.
+const MAX_DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum number of files accepted from a registry skill archive.
+const MAX_ARCHIVE_FILES: usize = 64;
 
 /// Result of a catalog search, carrying both results and any error that occurred.
 #[derive(Debug, Clone)]
@@ -492,9 +498,16 @@ impl SkillCatalog {
             )));
         }
 
-        resp.json::<PublishResponse>()
+        let parsed = resp
+            .json::<PublishResponse>()
             .await
-            .map_err(|e| CatalogError::Publish(format!("parse publish response: {e}")))
+            .map_err(|e| CatalogError::Publish(format!("parse publish response: {e}")))?;
+        if !parsed.ok {
+            return Err(CatalogError::Publish(
+                "registry returned a non-success publish response".to_string(),
+            ));
+        }
+        Ok(parsed)
     }
 
     /// Check whether a newer registry version exists for a slug (B-3 update
@@ -505,15 +518,14 @@ impl SkillCatalog {
         &self,
         slug: &str,
         current_version: &str,
+        current_content_hash: Option<&str>,
     ) -> Result<Option<UpdateInfo>, CatalogError> {
-        let url = format!(
-            "{}/api/v1/resolve?slug={}",
-            self.registry_url,
-            urlencoding::encode(slug)
-        );
-        let resp = self
-            .client
-            .get(&url)
+        let url = format!("{}/api/v1/resolve", self.registry_url);
+        let mut request = self.client.get(&url).query(&[("slug", slug)]);
+        if let Some(hash) = current_content_hash.filter(|hash| !hash.is_empty()) {
+            request = request.query(&[("hash", hash)]);
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| CatalogError::UpdateCheck(format!("resolve request failed: {e}")))?;
@@ -544,6 +556,43 @@ impl SkillCatalog {
         }))
     }
 
+    /// Download and decode a registry skill package. ClawHub returns a ZIP with
+    /// `SKILL.md` and optional snippet files; compatible registries may return a
+    /// plain UTF-8 `SKILL.md` body.
+    pub async fn download(&self, slug: &str) -> Result<DownloadedSkill, CatalogError> {
+        let url = skill_download_url(&self.registry_url, slug);
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| CatalogError::Download(format!("download request failed: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(CatalogError::Download(format!(
+                "registry returned {status}"
+            )));
+        }
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_DOWNLOAD_BYTES as u64)
+        {
+            return Err(CatalogError::Download(format!(
+                "registry response exceeds {MAX_DOWNLOAD_BYTES} bytes"
+            )));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| CatalogError::Download(format!("read download body: {e}")))?;
+        if bytes.len() > MAX_DOWNLOAD_BYTES {
+            return Err(CatalogError::Download(format!(
+                "registry response exceeds {MAX_DOWNLOAD_BYTES} bytes"
+            )));
+        }
+        decode_download(&bytes)
+    }
+
     /// Scan skill content for leaked secrets before publishing (B-3
     /// defense-in-depth). Returns `Ok(())` if clean, `Err` with the match
     /// summary if any credential pattern is detected. The registry also scans
@@ -572,6 +621,8 @@ pub enum CatalogError {
     Publish(String),
     #[error("update check failed: {0}")]
     UpdateCheck(String),
+    #[error("download failed: {0}")]
+    Download(String),
     #[error("leak detected: {0}")]
     Leak(String),
 }
@@ -619,6 +670,13 @@ pub struct UpdateInfo {
     pub registry_url: String,
 }
 
+/// Decoded files from a registry skill download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadedSkill {
+    pub skill_md_content: String,
+    pub code_snippet_files: Vec<(String, String)>,
+}
+
 /// ClawHub `/api/v1/resolve` response shape.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -630,6 +688,90 @@ struct ResolveResponse {
 #[derive(Debug, Deserialize)]
 struct ResolveVersion {
     version: Option<String>,
+}
+
+fn decode_download(bytes: &[u8]) -> Result<DownloadedSkill, CatalogError> {
+    if !bytes.starts_with(b"PK\x03\x04") {
+        return Ok(DownloadedSkill {
+            skill_md_content: decode_utf8_limited(bytes, crate::MAX_PROMPT_FILE_SIZE as usize)?,
+            code_snippet_files: Vec::new(),
+        });
+    }
+
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|e| CatalogError::Download(format!("invalid ZIP archive: {e}")))?;
+    if archive.len() > MAX_ARCHIVE_FILES {
+        return Err(CatalogError::Download(format!(
+            "archive contains more than {MAX_ARCHIVE_FILES} files"
+        )));
+    }
+
+    let mut skill_md_content = None;
+    let mut code_snippet_files = Vec::new();
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|e| CatalogError::Download(format!("read ZIP entry: {e}")))?;
+        if file.is_dir() {
+            continue;
+        }
+        let Some(path) = file.enclosed_name() else {
+            return Err(CatalogError::Download(
+                "archive contains an unsafe file path".to_string(),
+            ));
+        };
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name == "SKILL.md" {
+            skill_md_content = Some(read_zip_text(
+                &mut file,
+                crate::MAX_PROMPT_FILE_SIZE as usize,
+                "SKILL.md",
+            )?);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+            let content =
+                read_zip_text(&mut file, crate::MAX_PROMPT_FILE_SIZE as usize, file_name)?;
+            code_snippet_files.push((file_name.to_string(), content));
+        }
+    }
+
+    let skill_md_content = skill_md_content.ok_or_else(|| {
+        CatalogError::Download("registry archive does not contain SKILL.md".to_string())
+    })?;
+    Ok(DownloadedSkill {
+        skill_md_content,
+        code_snippet_files,
+    })
+}
+
+fn read_zip_text(
+    reader: &mut impl std::io::Read,
+    max_bytes: usize,
+    label: &str,
+) -> Result<String, CatalogError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| CatalogError::Download(format!("read {label}: {e}")))?;
+    if bytes.len() > max_bytes {
+        return Err(CatalogError::Download(format!(
+            "{label} exceeds {max_bytes} bytes"
+        )));
+    }
+    decode_utf8_limited(&bytes, max_bytes)
+}
+
+fn decode_utf8_limited(bytes: &[u8], max_bytes: usize) -> Result<String, CatalogError> {
+    if bytes.len() > max_bytes {
+        return Err(CatalogError::Download(format!(
+            "skill content exceeds {max_bytes} bytes"
+        )));
+    }
+    String::from_utf8(bytes.to_vec())
+        .map_err(|e| CatalogError::Download(format!("skill content is not UTF-8: {e}")))
 }
 
 impl Default for SkillCatalog {
@@ -681,6 +823,82 @@ pub fn shared_catalog() -> Arc<SkillCatalog> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+
+    async fn serve_once(
+        content_type: &str,
+        response_body: Vec<u8>,
+    ) -> (String, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let content_type = content_type.to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let expected_len = loop {
+                let read = socket.read(&mut buffer).await.expect("read request");
+                assert!(read > 0, "request ended before headers");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    break header_end + 4 + content_length;
+                }
+            };
+            while request.len() < expected_len {
+                let read = socket.read(&mut buffer).await.expect("read request body");
+                assert!(read > 0, "request body ended early");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let _ = request_tx.send(request);
+
+            let response_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+            socket
+                .write_all(response_head.as_bytes())
+                .await
+                .expect("write response headers");
+            socket
+                .write_all(&response_body)
+                .await
+                .expect("write response body");
+        });
+        (format!("http://{address}"), request_rx)
+    }
+
+    fn make_skill_zip(skill_md: &str, snippet: &str) -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer
+            .start_file("SKILL.md", options)
+            .expect("start SKILL.md");
+        writer
+            .write_all(skill_md.as_bytes())
+            .expect("write SKILL.md");
+        writer
+            .start_file("helpers.py", options)
+            .expect("start snippet");
+        writer.write_all(snippet.as_bytes()).expect("write snippet");
+        writer.finish().expect("finish ZIP").into_inner()
+    }
 
     #[test]
     fn test_default_registry_url() {
@@ -693,6 +911,83 @@ mod tests {
     fn test_custom_registry_url() {
         let catalog = SkillCatalog::with_url("https://custom.registry.example");
         assert_eq!(catalog.registry_url(), "https://custom.registry.example");
+    }
+
+    #[tokio::test]
+    async fn test_publish_contract_sends_authenticated_multipart() {
+        let response = br#"{"ok":true,"skillId":"skill-1","versionId":"version-1"}"#.to_vec();
+        let (url, request_rx) = serve_once("application/json", response).await;
+        let catalog = SkillCatalog::with_url(&url);
+        let request = PublishRequest {
+            slug: "owner/example".to_string(),
+            display_name: "Example".to_string(),
+            version: "1.2.3".to_string(),
+            changelog: "Fix behavior".to_string(),
+            tags: vec!["utility".to_string()],
+            skill_md_content: "---\nname: example\n---\n\nDo the thing.\n".to_string(),
+            code_snippet_files: vec![(
+                "helpers.py".to_string(),
+                "def helper():\n    return 1\n".to_string(),
+            )],
+        };
+
+        let published = catalog
+            .publish(&request, "test-token")
+            .await
+            .expect("publish succeeds");
+        let raw_request = request_rx.await.expect("captured request");
+        let request_text = String::from_utf8_lossy(&raw_request);
+
+        assert_eq!(published.skill_id, "skill-1");
+        assert!(request_text.starts_with("POST /api/v1/skills HTTP/1.1\r\n"));
+        assert!(request_text.contains("authorization: Bearer test-token\r\n"));
+        assert!(request_text.contains("name=\"payload\""));
+        assert!(request_text.contains("\"slug\":\"owner/example\""));
+        assert!(request_text.contains("filename=\"SKILL.md\""));
+        assert!(request_text.contains("filename=\"helpers.py\""));
+    }
+
+    #[tokio::test]
+    async fn test_update_check_contract_sends_slug_and_hash() {
+        let response = br#"{"latestVersion":{"version":"2.0.0"}}"#.to_vec();
+        let (url, request_rx) = serve_once("application/json", response).await;
+        let catalog = SkillCatalog::with_url(&url);
+
+        let update = catalog
+            .check_for_update("owner/example", "1.0.0", Some("sha256:old"))
+            .await
+            .expect("update check succeeds")
+            .expect("new version returned");
+        let raw_request = request_rx.await.expect("captured request");
+        let request_text = String::from_utf8_lossy(&raw_request);
+
+        assert_eq!(update.version, "2.0.0");
+        assert!(request_text.starts_with("GET /api/v1/resolve?"));
+        assert!(request_text.contains("slug=owner%2Fexample"));
+        assert!(request_text.contains("hash=sha256%3Aold"));
+    }
+
+    #[tokio::test]
+    async fn test_download_contract_decodes_skill_and_snippets() {
+        let skill_md = "---\nname: example\nversion: 2.0.0\n---\n\nUpdated prompt.\n";
+        let snippet = "def helper():\n    return 2\n";
+        let response = make_skill_zip(skill_md, snippet);
+        let (url, request_rx) = serve_once("application/zip", response).await;
+        let catalog = SkillCatalog::with_url(&url);
+
+        let downloaded = catalog
+            .download("owner/example")
+            .await
+            .expect("download succeeds");
+        let raw_request = request_rx.await.expect("captured request");
+        let request_text = String::from_utf8_lossy(&raw_request);
+
+        assert!(request_text.starts_with("GET /api/v1/download?slug=owner%2Fexample"));
+        assert_eq!(downloaded.skill_md_content, skill_md);
+        assert_eq!(
+            downloaded.code_snippet_files,
+            vec![("helpers.py".to_string(), snippet.to_string())]
+        );
     }
 
     #[tokio::test]

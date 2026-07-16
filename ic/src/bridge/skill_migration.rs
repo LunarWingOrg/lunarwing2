@@ -19,7 +19,7 @@ use lunarwing_engine::types::project::ProjectId;
 use lunarwing_engine::types::shared_owner_id;
 
 use lunarwing_skills::SkillRegistry;
-use lunarwing_skills::types::{LoadedSkill, SkillSource};
+use lunarwing_skills::types::{LoadedSkill, SkillSource, SkillTrust};
 use lunarwing_skills::v2::{V2SkillMetadata, V2SkillSource};
 
 /// Migrate v1 skills to v2 MemoryDocs.
@@ -60,10 +60,30 @@ pub async fn migrate_v1_skill_list(
         })
         .filter(|h| !h.is_empty())
         .collect();
+    let existing_registry_installed_names: std::collections::HashSet<String> = existing_docs
+        .iter()
+        .filter(|doc| doc.doc_type == DocType::Skill)
+        .filter_map(|doc| serde_json::from_value::<V2SkillMetadata>(doc.metadata.clone()).ok())
+        .filter(|meta| meta.trust == SkillTrust::Installed && meta.registry_slug.is_some())
+        .map(|meta| meta.name)
+        .collect();
 
     let mut migrated = 0;
 
     for skill in v1_skills {
+        // Engine V2 registry updates replace the durable MemoryDoc, while the
+        // legacy filesystem copy may still contain the pre-update package.
+        // Preserve the updated registry doc instead of re-importing stale
+        // content as a duplicate on restart.
+        if skill.trust == SkillTrust::Installed
+            && existing_registry_installed_names.contains(skill.name())
+        {
+            tracing::debug!(
+                skill = %skill.name(),
+                "skipping v1 registry skill migration: durable registry doc already exists"
+            );
+            continue;
+        }
         // Skip if content hasn't changed (idempotent)
         if existing_hashes.contains(&skill.content_hash) {
             tracing::debug!(
@@ -118,6 +138,7 @@ fn v1_skill_to_memory_doc(skill: &LoadedSkill, project_id: ProjectId) -> MemoryD
     if let Some(provenance) = read_registry_sidecar(&skill.source) {
         meta.registry_url = Some(provenance.registry_url);
         meta.registry_publisher = provenance.publisher;
+        meta.registry_slug = provenance.slug;
         meta.registry_version = provenance.version;
         meta.pulled_at = Some(provenance.pulled_at);
         meta.registry_content_hash = Some(provenance.content_hash);
@@ -139,6 +160,8 @@ fn v1_skill_to_memory_doc(skill: &LoadedSkill, project_id: ProjectId) -> MemoryD
 #[derive(Debug, serde::Deserialize)]
 struct RegistrySidecar {
     registry_url: String,
+    #[serde(default)]
+    slug: Option<String>,
     #[serde(default)]
     publisher: Option<String>,
     #[serde(default)]

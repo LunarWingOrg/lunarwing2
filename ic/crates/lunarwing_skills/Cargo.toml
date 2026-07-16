@@ -16,7 +16,7 @@ dist = false
 [features]
 default = ["registry", "catalog"]
 registry = ["dep:tempfile"]
-catalog = ["dep:reqwest", "dep:urlencoding", "dep:futures", "dep:lunarwing_safety"]
+catalog = ["dep:reqwest", "dep:urlencoding", "dep:futures", "dep:lunarwing_safety", "dep:zip"]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
@@ -26,7 +26,7 @@ serde_json = "1"
 serde_norway = "0.9"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["sync", "process", "fs"] }
+tokio = { version = "1", features = ["sync", "process", "fs", "rt"] }
 tracing = "0.1"
 
 # Optional (catalog feature)
@@ -36,6 +36,7 @@ urlencoding = { version = "2", optional = true }
 # Leak detection for the B-3 publish path (defense-in-depth before sending skill
 # bodies to the registry). Sibling workspace crate.
 lunarwing_safety = { path = "../lunarwing_safety", version = "2.0.0", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 
 # Optional (registry feature — tempfile needed for dev-dep in tests, but also
 # the registry module itself uses no extra deps beyond tokio::fs)

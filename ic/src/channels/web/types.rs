@@ -1060,6 +1060,12 @@ pub struct SkillInstallRequest {
     /// Registry slug (e.g. "owner/skill-name"). Preferred over `name` for
     /// constructing the download URL when fetching from ClawHub.
     pub slug: Option<String>,
+    /// Registry version selected by the catalog UI.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Registry publisher selected by the catalog UI.
+    #[serde(default)]
+    pub publisher: Option<String>,
     pub url: Option<String>,
     pub content: Option<String>,
 }
