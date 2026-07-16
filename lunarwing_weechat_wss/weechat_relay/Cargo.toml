@@ -1,6 +1,6 @@
 [package]
 name = "weechat-relay-channel"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 description = "WeeChat Relay WASM channel for LunarWing"
 license = "AGPL-3.0-or-later"

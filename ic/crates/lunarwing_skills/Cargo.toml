@@ -1,6 +1,6 @@
 [package]
 name = "lunarwing_skills"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 rust-version = "1.92"
 description = "Skill selection, scoring, and management for LunarWing"
@@ -35,7 +35,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 urlencoding = { version = "2", optional = true }
 # Leak detection for the B-3 publish path (defense-in-depth before sending skill
 # bodies to the registry). Sibling workspace crate.
-lunarwing_safety = { path = "../lunarwing_safety", version = "2.0.0", optional = true }
+lunarwing_safety = { path = "../lunarwing_safety", version = "2.0.1", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 
 # Optional (registry feature — tempfile needed for dev-dep in tests, but also

@@ -1,6 +1,6 @@
 [package]
 name = "xmpp-bridge"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 description = "Local XMPP bridge for the LunarWing installable XMPP channel"
 authors = ["LunarWing Team"]
