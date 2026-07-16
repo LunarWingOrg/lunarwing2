@@ -1,6 +1,6 @@
 [package]
 name = "lunarwing_common"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 rust-version = "1.92"
 description = "Shared types and utilities for the LunarWing workspace"
