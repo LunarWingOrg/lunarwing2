@@ -169,6 +169,8 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
         args.append("--no-ssh")
     if config.no_health:
         args.append("--no-health")
+    if config.no_weechat_bootstrap:
+        args.append("--no-weechat-bootstrap")
     return args
 
 

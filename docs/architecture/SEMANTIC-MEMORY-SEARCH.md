@@ -88,6 +88,7 @@ trait EmbeddingProvider: Send + Sync {
 | **OpenAI** | `text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002` | 1536 / 3072 / 1536 | `OPENAI_API_KEY` |
 | **Ollama** | `nomic-embed-text`, `mxbai-embed-large`, `all-minilm` | 768 / 1024 / 384 | `OLLAMA_BASE_URL` (default `http://localhost:11434`) |
 | **LunarWing Cloud** | Configurable | Configurable | LunarWing Cloud session auth |
+| **OpenAI-compatible** | Any compatible model | Configurable | `EMBEDDING_PROVIDER=openai_compatible`, `OPENAI_API_KEY`; `EMBEDDING_BASE_URL` optional (defaults to `https://api.openai.com`, required for non-default endpoints) |
 | **Mock** | Deterministic | Configurable | Test harness only |
 
 Source: `ic/src/workspace/embeddings.rs`
@@ -319,6 +320,7 @@ The v2 engine's `RetrievalEngine` is a lighter-weight system that retrieves rele
 | `ic/src/workspace/search.rs` | RRF + WeightedScore fusion algorithms |
 | `ic/src/workspace/chunker.rs` | Document chunking with overlap |
 | `ic/src/workspace/document.rs` | Core types (MemoryDocument, MemoryChunk, well-known paths) |
+| `ic/src/workspace/hygiene.rs` | Workspace cleanup/maintenance |
 | `ic/src/workspace/layer.rs` | Memory layers (scoped access, sensitivity classification) |
 | `ic/src/workspace/privacy.rs` | Privacy classifier trait for sensitive content detection |
 | `ic/src/tools/builtin/memory.rs` | Agent-facing tools (search, read, write, tree) |

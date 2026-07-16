@@ -31,7 +31,7 @@ The adapter script lives at `lunarwing_weechat_wss/weechat_relay/ws_adapter.py` 
 ## Service Dependency Chain
 
 ```
-weechat-<name> → lunarwing-weechat-adapter-<name> → lunarwing-<name>
+lunarwing-weechat-<name> → lunarwing-weechat-adapter-<name> → lunarwing-<name>
 ```
 
 WeeChat must be running before the adapter starts. The adapter must be running before the main daemon starts. The MT admin script wires this automatically via `Requires=`/`After=` (systemd) or `need`/`before` (OpenRC).
@@ -61,7 +61,7 @@ The following are written to `lunarwing.env` by the MT admin script:
 | `ADAPTER_PORT` | `<base+9>` | adapter | Bare HTTP port the standalone adapter listens on |
 | `WEECHAT_ADAPTER_PORT` | `<base+9>` | adapter | Alias of `ADAPTER_PORT` |
 
-`RELAY_PASSWORD` is generated per tenant during `add-tenant` and must match the password configured inside WeeChat (see [WeeChat Relay Setup](#weechat-relay-setup)).
+`RELAY_PASSWORD` is generated per tenant during `add-tenant` and must match the password configured inside WeeChat (see [WeeChat Relay Setup](#weechat-relay-setup)). On fresh tenants the automatic bootstrap writes the password as the literal `${env:RELAY_PASSWORD}` expression into `relay.conf` and provides the resolved value through a dedicated `env/weechat.env` file (mode `0600`).
 
 > **Per-tenant ports & the in-process WASM channel.** The LunarWing daemon
 > (which hosts the WeeChat WASM channel in-process) sources `relay_url`,
@@ -77,7 +77,7 @@ The following are written to `lunarwing.env` by the MT admin script:
 
 Units are installed to `~/.config/systemd/user/` per tenant.
 
-**`weechat-<name>.service`**
+**`lunarwing-weechat-<name>.service`**
 
 ```ini
 [Unit]
@@ -88,6 +88,7 @@ After=network.target
 Type=forking
 ExecStart=/usr/bin/tmux -L weechat-<name> new-session -d -s weechat '/usr/bin/weechat --dir /home/<name>/.config/weechat'
 ExecStop=/usr/bin/tmux -L weechat-<name> kill-session -t weechat
+EnvironmentFile=<env_dir>/weechat.env
 Restart=on-failure
 RestartSec=5
 
@@ -102,8 +103,8 @@ Uses `Type=forking` because tmux daemonizes after creating the session.
 ```ini
 [Unit]
 Description=LunarWing WeeChat WS adapter (<name>)
-After=network.target weechat-<name>.service
-Requires=weechat-<name>.service
+After=network.target lunarwing-weechat-<name>.service
+Requires=lunarwing-weechat-<name>.service
 PartOf=lunarwing-<name>.service
 
 [Service]
@@ -124,17 +125,17 @@ The `PartOf=lunarwing-<name>.service` means stopping the main daemon also stops 
 **Main daemon unit** (`lunarwing-<name>.service`) includes WeeChat services in its dependency list:
 
 ```ini
-After=... weechat-<name>.service lunarwing-weechat-adapter-<name>.service
-Wants=... weechat-<name>.service lunarwing-weechat-adapter-<name>.service
+After=... lunarwing-weechat-<name>.service lunarwing-weechat-adapter-<name>.service
+Wants=... lunarwing-weechat-<name>.service lunarwing-weechat-adapter-<name>.service
 ```
 
 ### OpenRC (system-level)
 
 Init scripts are installed to `/etc/init.d/` with conf.d files in `/etc/conf.d/`.
 
-**`/etc/init.d/weechat-<name>`**
+**`/etc/init.d/lunarwing-weechat-<name>`**
 
-Runs WeeChat in a tmux session via `start-stop-daemon`. The `start()` function creates the tmux session; `stop()` kills it with `tmux kill-session`. Configurable via conf.d variables: `weechat_user`, `weechat_group`, `weechat_home`.
+Runs WeeChat in a tmux session via `start-stop-daemon`. The `start()` function loads `env/weechat.env` (containing only `RELAY_PASSWORD`) before launching tmux, so the WeeChat process inherits the credential. `stop()` kills the session with `tmux kill-session`. Configurable via conf.d variables: `weechat_user`, `weechat_group`, `weechat_home`, `weechat_env_file`.
 
 Dependency wiring:
 
@@ -155,9 +156,9 @@ Dependency wiring:
 
 ```
 depend() {
-    need net weechat-<name>
+    need net lunarwing-weechat-<name>
     use dns
-    after firewall weechat-<name>
+    after firewall lunarwing-weechat-<name>
     before lunarwing-<name>
 }
 ```
@@ -165,26 +166,146 @@ depend() {
 **Conf.d for the main daemon** (`/etc/conf.d/lunarwing-<name>`) includes:
 
 ```
-lunarwing_rc_need="xmpp-bridge-<name> lunarwing-proxy-<name> weechat-<name> lunarwing-weechat-adapter-<name>"
+lunarwing_rc_need="xmpp-bridge-<name> lunarwing-proxy-<name> lunarwing-weechat-<name> lunarwing-weechat-adapter-<name>"
 ```
 
 ## WeeChat Relay Setup
 
-After starting the WeeChat service for the first time, the relay must be configured inside WeeChat. Attach to the tmux session and run these commands in WeeChat:
+### Automatic bootstrap (fresh tenants)
 
+During `add-tenant`, after tenant environment files are written but before service rendering and startup, the MT admin script attempts a one-shot WeeChat relay bootstrap. This generates a complete relay configuration by invoking the `weechat` binary as the tenant user with a minimal, secret-safe command sequence:
+
+```bash
+--run-command '/set relay.network.password "\${env:RELAY_PASSWORD}"'
+--run-command '/set relay.network.allow_empty_password off'
+--run-command '/set relay.network.bind_address "127.0.0.1"'
+--run-command '/relay add api <registry_weechat_port>'
+--run-command '/save'
+--run-command '/quit'
 ```
+
+Key properties of the automatic bootstrap:
+
+- **Secret-safe:** The relay password is stored as the literal expression `${env:RELAY_PASSWORD}` in `relay.conf`. The resolved password is passed only via environment inheritance — never as a positional argument, in a command string, in a systemd unit value, in log output, or in the generated WeeChat configuration.
+- **Loopback-only:** The relay binds to `127.0.0.1`.
+- **Preserve-and-fail:** If the target `~/.config/weechat` directory already contains any content, the bootstrap fails without modifying the existing configuration. The explicit recovery command also refuses to overwrite existing content.
+- **Non-fatal:** If the automatic bootstrap fails for any reason, base tenant provisioning continues. A prominent warning is printed showing the exact recovery command.
+- **Dedicated minimal env:** The WeeChat process receives only `RELAY_PASSWORD` through a dedicated, tenant-owned `env/weechat.env` file (mode `0600`). The full tenant `lunarwing.env` is never loaded into the WeeChat process, preventing unrelated DB, LLM, XMPP, and gateway secrets from being exposed.
+
+No manual interaction is required for a fresh tenant to receive a working relay.
+
+### Disabling relay bootstrap: `--no-weechat-bootstrap`
+
+By default, `add-tenant` and `add-tenants` run the full WeeChat relay bootstrap. Pass `--no-weechat-bootstrap` to skip the WeeChat command execution and `relay.conf` generation:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --no-weechat-bootstrap
+```
+
+What the flag does:
+
+- **No WeeChat process is started.** The one-shot `weechat --run-command` invocation is skipped entirely.
+- **No `relay.conf` is generated.** The tenant's `~/.config/weechat` directory is not created or populated.
+- **Minimal `weechat.env` is still written.** The tenant's existing `RELAY_PASSWORD` from `lunarwing.env` is copied into the dedicated `env/weechat.env` file (mode `0600`, tenant-owned). This lets the rendered WeeChat service start without loading the full `lunarwing.env`.
+- **Services are still rendered.** The systemd user unit (`lunarwing-weechat-<name>.service`) or OpenRC init script (`/etc/init.d/lunarwing-weechat-<name>`) is generated and installed as usual. When the service starts, WeeChat launches but has no relay configured.
+- **Base provisioning continues.** SSH, health, database, workspace, and all other tenant setup proceeds normally.
+
+The `add-tenant` summary line reports one of three WeeChat relay states:
+
+| Summary line | Meaning |
+|---|---|
+| `weechat relay:    configured` | Automatic bootstrap succeeded. `relay.conf` exists and is validated. |
+| `weechat relay:    needs recovery` | Bootstrap failed. WeeChat will start but the relay is not configured. Run `configure-weechat-relay` (see below). |
+| `weechat relay:    disabled (--no-weechat-bootstrap)` | Opt-out succeeded. `weechat.env` written, no relay config generated. Run `configure-weechat-relay` to add a relay later. |
+
+If the minimal credential env could not be written (for example, `RELAY_PASSWORD` is absent from `lunarwing.env`), the summary shows `disabled (credential env setup failed)` and a warning is printed.
+
+#### Recovering an opted-out tenant
+
+To generate the relay configuration after a tenant was created with `--no-weechat-bootstrap`, run the explicit recovery command and then verify with preflight:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-weechat-relay <name>
+sudo ic/scripts/lunarwing-weechat-preflight.sh <name>
+```
+
+`configure-weechat-relay` generates `relay.conf` using the same secret-safe one-shot WeeChat invocation as the automatic bootstrap. It refuses any existing non-empty `~/.config/weechat` without mutation. After it succeeds, restart the WeeChat service so the relay loads the new configuration:
+
+```bash
+# systemd
+sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
+  systemctl --user restart lunarwing-weechat-<name>.service
+
+# OpenRC
+rc-service lunarwing-weechat-<name> restart
+```
+
+#### Propagation across provisioning surfaces
+
+The opt-out is wired through every new-tenant path. Kawarimi import does not expose it.
+
+| Surface | Field or flag | Default |
+|---|---|---|
+| `add-tenant` / `add-tenants` (shell) | `--no-weechat-bootstrap` | Disabled (bootstrap runs) |
+| Python onboarding CLI (`lunarwing_mt_onboard`) | `TenantConfig.no_weechat_bootstrap` | `False` (bootstrap runs) |
+| Browser provision wizard (`lunarwing_mt_onboard_web`) | Checkbox: "Automatically configure WeeChat relay" | Checked (bootstrap runs) |
+| OpenRC bulk provisioner (`lunarwing-mt-provision-openrc.sh`) | `ENABLE_WEECHAT_BOOTSTRAP=true` | `true` (bootstrap runs) |
+| Kawarimi import (`import-tenant.sh`) | Not exposed | Normal bootstrap applies |
+
+The Python CLI prompts "Automatically configure the WeeChat relay?" (default yes) and shows the choice in its summary table. The browser wizard defaults the checkbox to checked; unchecking it sets `no_weechat_bootstrap: true` in the provision request. The OpenRC bulk provisioner forwards `--no-weechat-bootstrap` to `add-tenants` when `ENABLE_WEECHAT_BOOTSTRAP` is set to `false`.
+
+### Explicit recovery: `configure-weechat-relay`
+
+If the automatic bootstrap failed or was skipped before creating configuration, an operator can generate the missing relay configuration explicitly:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-weechat-relay <tenant>
+```
+
+This command:
+
+- Validates the tenant, environment file, and registry-derived WeeChat port.
+- **Refuses any existing non-empty `~/.config/weechat` content** without mutation. This is a safety guarantee — existing configurations are never overwritten.
+- Generates the relay configuration into a same-filesystem temporary directory beside the target, validates it, and atomically renames it into place.
+- Writes the dedicated `env/weechat.env` file with only `RELAY_PASSWORD`, owned by the tenant user with mode `0600`.
+- On success, reports `configured`; on conflict or failure, exits nonzero without modifying the target.
+
+Rerunning the command on an already-configured tenant is safe (it will refuse the existing config and report the conflict) but is not necessary.
+
+### Manual relay setup (recovery only)
+
+If both the automatic bootstrap and the explicit recovery command are unavailable or have failed, the relay can be configured manually inside WeeChat as a last resort. Attach to the tmux session and run:
+
+```bash
 /relay add api <weechat_port>
 /set relay.network.password "<RELAY_PASSWORD>"
 /set relay.network.bind_address "127.0.0.1"
-```
-
-Replace `<weechat_port>` with the tenant's allocated relay port (base+5) and `<RELAY_PASSWORD>` with the value from `lunarwing.env`.
-
-Save the configuration so it persists across restarts:
-
-```
 /save
 ```
+
+Replace `<weechat_port>` with the tenant's allocated relay port (base+5). The `RELAY_PASSWORD` value comes from `env/weechat.env` (or `lunarwing.env` on older tenants).
+
+> **Warning:** Manual relay setup bypasses the preserve-and-fail guarantee. Do not use it on a tenant that already has a configured relay unless you intend to overwrite the existing configuration.
+
+### Dedicated WeeChat environment file
+
+The WeeChat service reads `RELAY_PASSWORD` from a dedicated file at `<env_dir>/weechat.env` (mode `0600`, owned by the tenant user). This file contains only:
+
+```bash
+RELAY_PASSWORD=<generated-token>
+```
+
+Both the systemd user unit and the OpenRC init script load this file before starting WeeChat. The adapter and daemon continue to source their credentials from `lunarwing.env` through their existing paths.
+
+### Preflight checks
+
+`ic/scripts/lunarwing-weechat-preflight.sh` is a read-only diagnostic that checks the generated relay configuration and minimal env without sourcing either file. It validates:
+
+- `relay.conf` contains the literal `${env:RELAY_PASSWORD}` expression (never the resolved value), loopback bind, `[api]` section, and the registry-derived port.
+- `env/weechat.env` exists and contains the password assignment.
+- Adapter and capability checks are preserved from earlier versions.
+
+Preflight reports the password only as `set (<N> chars)` or `missing` — it never prints the value. Absent relay config or missing minimal env are classified as FAIL with explicit recovery guidance.
 
 ## Manual Operations
 
@@ -208,17 +329,17 @@ Systemd:
 ```bash
 # As root (for any tenant)
 sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
-  systemctl --user status weechat-<name>.service \
+  systemctl --user status lunarwing-weechat-<name>.service \
                           lunarwing-weechat-adapter-<name>.service
 
 # As the tenant user
-systemctl --user status weechat-<name>.service
+systemctl --user status lunarwing-weechat-<name>.service
 systemctl --user status lunarwing-weechat-adapter-<name>.service
 ```
 
 OpenRC:
 ```bash
-rc-service weechat-<name> status
+rc-service lunarwing-weechat-<name> status
 rc-service lunarwing-weechat-adapter-<name> status
 ```
 
@@ -227,7 +348,7 @@ rc-service lunarwing-weechat-adapter-<name> status
 Systemd:
 ```bash
 sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
-  journalctl --user -u weechat-<name>.service -f
+  journalctl --user -u lunarwing-weechat-<name>.service -f
 
 sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
   journalctl --user -u lunarwing-weechat-adapter-<name>.service -f
@@ -246,18 +367,18 @@ Restart WeeChat and the adapter together (the dependency chain handles ordering)
 Systemd:
 ```bash
 sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
-  systemctl --user restart weechat-<name>.service
+  systemctl --user restart lunarwing-weechat-<name>.service
 ```
 
 OpenRC:
 ```bash
-rc-service weechat-<name> restart
+rc-service lunarwing-weechat-<name> restart
 rc-service lunarwing-weechat-adapter-<name> restart
 ```
 
 ## Adding WeeChat to an Existing Tenant
 
-If a tenant was created before WeeChat services were added, re-render units and add the environment variables manually.
+If a tenant was created before WeeChat services were added, re-render units and add the environment variables. The relay configuration can then be generated with `configure-weechat-relay`.
 
 ### 1. Add env vars to `lunarwing.env`
 
@@ -306,7 +427,13 @@ sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <name>
 
 ### 4. Configure the WeeChat relay
 
-Attach to the tmux session and run the relay setup commands (see [WeeChat Relay Setup](#weechat-relay-setup)).
+Run the explicit recovery command to generate the relay configuration:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-weechat-relay <name>
+```
+
+This uses the supported WeeChat command interface, preserves any existing config (refusing non-empty targets), and stores the password as the literal `${env:RELAY_PASSWORD}` expression. See [Explicit recovery: `configure-weechat-relay`](#explicit-recovery-configure-weechat-relay) for details.
 
 ## Troubleshooting
 
@@ -323,7 +450,13 @@ Attach to the tmux session and run the relay setup commands (see [WeeChat Relay 
 
 **Symptom**: WeeChat is running but the adapter cannot authenticate.
 
-The relay must be set up manually inside WeeChat on first start. Attach to the tmux session and run the `/relay add api <port>` commands described in [WeeChat Relay Setup](#weechat-relay-setup).
+On fresh tenants the relay is configured automatically during `add-tenant`. If the automatic bootstrap failed or was skipped, run the recovery command:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-weechat-relay <name>
+```
+
+If that also fails, fall back to manual relay setup inside WeeChat (see [Manual relay setup (recovery only)](#manual-relay-setup-recovery-only)).
 
 ### tmux session died
 
@@ -334,10 +467,10 @@ Restart the WeeChat service:
 ```bash
 # Systemd
 sudo -u <name> XDG_RUNTIME_DIR=/run/user/$(id -u <name>) \
-  systemctl --user restart weechat-<name>.service
+  systemctl --user restart lunarwing-weechat-<name>.service
 
 # OpenRC
-rc-service weechat-<name> restart
+rc-service lunarwing-weechat-<name> restart
 ```
 
 If the tmux socket file is stale (exists but no server), remove it first:
@@ -397,4 +530,3 @@ curl -sf -X POST http://127.0.0.1:<gateway_port>/api/pairing/weechat/approve \
   -H "Content-Type: application/json" \
   -d '{"code":"<CODE>"}'
 ```
-

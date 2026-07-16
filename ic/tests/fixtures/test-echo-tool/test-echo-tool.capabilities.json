@@ -1,0 +1,6 @@
+{
+  "description": "Engine V2 compatibility test tool. No capabilities granted — echo works locally, denied_http_probe must be rejected by the host.",
+  "http": {
+    "allowlist": []
+  }
+}

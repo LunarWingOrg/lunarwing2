@@ -233,6 +233,30 @@ else
   echo "  PASS: all new flags (incl. --with-nanocode/pebble/opencode) parsed"
 fi
 
+# Verify --no-weechat-bootstrap is accepted by add-tenant dispatch.
+dispatch_output="$(bash "$ADMIN_SCRIPT" add-tenant \
+  --no-weechat-bootstrap \
+  2>&1 || true)"
+if echo "$dispatch_output" | grep -q 'unknown flag: --no-weechat-bootstrap'; then
+  echo "  FAIL: add-tenant rejected --no-weechat-bootstrap"
+  echo "        $dispatch_output"
+  failures=$((failures + 1))
+else
+  echo "  PASS: add-tenant accepts --no-weechat-bootstrap"
+fi
+
+# Verify --no-weechat-bootstrap is accepted by add-tenants dispatch.
+batch_dispatch_output="$(bash "$ADMIN_SCRIPT" add-tenants \
+  --no-weechat-bootstrap \
+  2>&1 || true)"
+if echo "$batch_dispatch_output" | grep -q 'unknown flag: --no-weechat-bootstrap'; then
+  echo "  FAIL: add-tenants rejected --no-weechat-bootstrap"
+  echo "        $batch_dispatch_output"
+  failures=$((failures + 1))
+else
+  echo "  PASS: add-tenants accepts --no-weechat-bootstrap"
+fi
+
 echo ""
 if [[ "$failures" -eq 0 ]]; then
   echo "ALL TESTS PASSED"

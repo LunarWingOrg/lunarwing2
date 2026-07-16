@@ -5088,14 +5088,14 @@ function renderCatalogSkillCard(entry, installedNames) {
     var installBtn = document.createElement('button');
     installBtn.className = 'btn-ext install';
     installBtn.textContent = I18n.t('extensions.install');
-    installBtn.addEventListener('click', (function(s, btn) {
+    installBtn.addEventListener('click', (function(s, version, owner, btn) {
       return function() {
         if (!confirm('Install skill "' + s + '" from ClawHub?')) return;
         btn.disabled = true;
         btn.textContent = I18n.t('extensions.installing');
-        installSkill(s, null, btn);
+        installSkill(s, null, btn, version, owner);
       };
-    })(slug, installBtn));
+    })(slug, entry.version, entry.owner, installBtn));
     actions.appendChild(installBtn);
   }
 
@@ -5124,9 +5124,11 @@ function formatTimeAgo(epochMs) {
   return Math.floor(months / 12) + 'y ago';
 }
 
-function installSkill(nameOrSlug, url, btn) {
+function installSkill(nameOrSlug, url, btn, version, publisher) {
   var body = { name: nameOrSlug, slug: nameOrSlug };
   if (url) body.url = url;
+  if (version) body.version = version;
+  if (publisher) body.publisher = publisher;
 
   apiFetch('/api/skills/install', {
     method: 'POST',

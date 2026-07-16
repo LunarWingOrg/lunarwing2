@@ -34,6 +34,16 @@ pub fn skill_self_improvement_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Quarantine elapsed after automatic demotion before a skill may be proposed
+/// for pruning. Configured in whole days via `SKILL_PRUNE_QUARANTINE_DAYS`.
+pub fn skill_prune_quarantine_period() -> std::time::Duration {
+    let days = std::env::var("SKILL_PRUNE_QUARANTINE_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(lunarwing_skills::v2::DEFAULT_PRUNE_QUARANTINE_DAYS);
+    std::time::Duration::from_secs(days.saturating_mul(24 * 60 * 60))
+}
+
 // ── Re-exports: types ───────────────────────────────────────
 
 pub use types::capability::{

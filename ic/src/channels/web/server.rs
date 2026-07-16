@@ -854,6 +854,21 @@ async fn oauth_callback_handler(
     State(state): State<Arc<GatewayState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    oauth_callback_impl(
+        state.extension_manager.as_ref(),
+        state.session_manager.as_ref(),
+        &state.owner_id,
+        params,
+    )
+    .await
+}
+
+async fn oauth_callback_impl(
+    extension_manager: Option<&Arc<ExtensionManager>>,
+    session_manager: Option<&Arc<SessionManager>>,
+    owner_id: &str,
+    params: std::collections::HashMap<String, String>,
+) -> axum::response::Response {
     use crate::cli::oauth_defaults;
 
     // Check for error from OAuth provider (e.g., user denied consent)
@@ -880,7 +895,7 @@ async fn oauth_callback_handler(
     };
 
     // Look up the pending flow by CSRF state (atomic remove prevents replay)
-    let ext_mgr = match state.extension_manager.as_ref() {
+    let ext_mgr = match extension_manager {
         Some(mgr) => mgr,
         None => {
             return oauth_error_page("LunarWing");
@@ -896,7 +911,7 @@ async fn oauth_callback_handler(
                 error = %error,
                 "OAuth callback received with malformed state"
             );
-            clear_auth_mode(&state, &state.owner_id).await;
+            clear_session_auth_mode(session_manager, owner_id).await;
             return oauth_error_page("LunarWing");
         }
     };
@@ -939,7 +954,7 @@ async fn oauth_callback_handler(
                 },
             );
         }
-        clear_auth_mode(&state, &flow.user_id).await;
+        clear_session_auth_mode(session_manager, &flow.user_id).await;
         return oauth_error_page(&flow.display_name);
     }
 
@@ -1045,30 +1060,53 @@ async fn oauth_callback_handler(
 
     // Clear auth mode regardless of outcome so the next user message goes
     // through to the LLM instead of being intercepted as a token.
-    clear_auth_mode(&state, &flow.user_id).await;
+    clear_session_auth_mode(session_manager, &flow.user_id).await;
 
     // After successful OAuth, auto-activate the extension so it moves
     // from "Installed (Authenticate)" → "Active" without a second click.
     // OAuth success is independent of activation — tokens are already stored.
     // Report auth as successful and attempt activation as a bonus step.
-    let final_message = if success {
+    let (final_message, activation_succeeded) = if success {
         match ext_mgr.activate(&flow.extension_name, &flow.user_id).await {
-            Ok(result) => result.message,
+            Ok(result) => (result.message, true),
             Err(e) => {
                 tracing::warn!(
                     extension = %flow.extension_name,
                     error = %e,
                     "Auto-activation after OAuth failed"
                 );
-                format!(
-                    "{} authenticated successfully. Activation failed: {}. Try activating manually.",
-                    flow.display_name, e
+                (
+                    format!(
+                        "{} authenticated successfully. Activation failed: {}. Try activating manually.",
+                        flow.display_name, e
+                    ),
+                    false,
                 )
             }
         }
     } else {
-        message
+        (message, false)
     };
+
+    if activation_succeeded {
+        let resume_result =
+            match crate::bridge::resolve_engine_auth_callback(&flow.user_id, &flow.secret_name)
+                .await
+            {
+                Ok(false) if flow.extension_name != flow.secret_name => {
+                    crate::bridge::resolve_engine_auth_callback(&flow.user_id, &flow.extension_name)
+                        .await
+                }
+                result => result,
+            };
+        if let Err(error) = resume_result {
+            tracing::warn!(
+                extension = %flow.extension_name,
+                error = %error,
+                "Failed to resume Engine V2 thread after OAuth callback"
+            );
+        }
+    }
 
     // Broadcast SSE event to notify the web UI
     if let Some(ref sse) = flow.sse_manager {
@@ -1084,6 +1122,14 @@ async fn oauth_callback_handler(
 
     let html = oauth_defaults::landing_html(&flow.display_name, success);
     axum::response::Html(html).into_response()
+}
+
+#[cfg(feature = "integration")]
+pub async fn oauth_callback_for_test(
+    extension_manager: &Arc<ExtensionManager>,
+    params: std::collections::HashMap<String, String>,
+) -> axum::response::Response {
+    oauth_callback_impl(Some(extension_manager), None, "integration-test", params).await
 }
 
 // --- Chat handlers ---
@@ -1300,9 +1346,10 @@ async fn chat_approval_handler(
     ))
 }
 
-/// Submit an auth token directly to the extension manager, bypassing the message pipeline.
+/// Submit an auth token to the extension manager and resume a matching engine gate.
 ///
-/// The token never touches the LLM, chat history, or SSE stream.
+/// For Engine V2, the token enters the gate-control path on the exact pending
+/// thread. That path consumes it before normal chat history or LLM handling.
 async fn chat_auth_token_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
@@ -1328,6 +1375,13 @@ async fn chat_auth_token_handler(
             resp.verification = result.verification.clone();
             resp.instructions = result.verification.as_ref().map(|v| v.instructions.clone());
 
+            let engine_resume_queued = if result.activated {
+                queue_engine_auth_resume(&state, &user.user_id, &req.extension_name, &req.token)
+                    .await?
+            } else {
+                false
+            };
+
             if result.verification.is_some() {
                 state.sse.broadcast_for_user(
                     &user.user_id,
@@ -1342,14 +1396,16 @@ async fn chat_auth_token_handler(
                 // Clear auth mode on the active thread
                 clear_auth_mode(&state, &user.user_id).await;
 
-                state.sse.broadcast_for_user(
-                    &user.user_id,
-                    SseEvent::AuthCompleted {
-                        extension_name: req.extension_name.clone(),
-                        success: true,
-                        message: result.message,
-                    },
-                );
+                if !engine_resume_queued {
+                    state.sse.broadcast_for_user(
+                        &user.user_id,
+                        SseEvent::AuthCompleted {
+                            extension_name: req.extension_name.clone(),
+                            success: true,
+                            message: result.message,
+                        },
+                    );
+                }
             } else {
                 state.sse.broadcast_for_user(
                     &user.user_id,
@@ -1382,6 +1438,75 @@ async fn chat_auth_token_handler(
     }
 }
 
+fn matching_engine_auth_thread<'a>(
+    pending: Option<&'a crate::gate::pending::PendingGateView>,
+    extension_name: &str,
+) -> Option<&'a str> {
+    let pending = pending?;
+    match &pending.resume_kind {
+        lunarwing_engine::ResumeKind::Authentication {
+            credential_name, ..
+        } if credential_name == extension_name => Some(pending.thread_id.as_str()),
+        lunarwing_engine::ResumeKind::Approval { .. }
+        | lunarwing_engine::ResumeKind::Authentication { .. }
+        | lunarwing_engine::ResumeKind::External { .. } => None,
+    }
+}
+
+async fn queue_engine_auth_resume(
+    state: &GatewayState,
+    user_id: &str,
+    extension_name: &str,
+    token: &str,
+) -> Result<bool, (StatusCode, String)> {
+    let pending = crate::bridge::get_engine_pending_gate(user_id, None)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                user_id = %user_id,
+                extension = %extension_name,
+                error = %error,
+                "Failed to inspect pending Engine V2 auth gate"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to inspect pending authentication state".to_string(),
+            )
+        })?;
+    let Some(thread_id) = matching_engine_auth_thread(pending.as_ref(), extension_name) else {
+        return Ok(false);
+    };
+
+    let mut message = IncomingMessage::new("gateway", user_id, token)
+        .with_thread(thread_id)
+        .with_metadata(serde_json::json!({
+            "thread_id": thread_id,
+            "user_id": user_id,
+        }));
+    if state.owner_id != state.default_sender_id && user_id == state.owner_id {
+        message = message.with_sender_id(&state.default_sender_id);
+    }
+
+    let tx = {
+        let tx_guard = state.msg_tx.read().await;
+        tx_guard
+            .as_ref()
+            .ok_or((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Channel not started".to_string(),
+            ))?
+            .clone()
+    };
+    tx.send(message).await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Channel closed".to_string(),
+        )
+    })?;
+
+    Ok(true)
+}
+
 /// Cancel an in-progress auth flow.
 async fn chat_auth_cancel_handler(
     State(state): State<Arc<GatewayState>>,
@@ -1394,7 +1519,11 @@ async fn chat_auth_cancel_handler(
 
 /// Clear pending auth mode on the active thread.
 pub async fn clear_auth_mode(state: &GatewayState, user_id: &str) {
-    if let Some(ref sm) = state.session_manager {
+    clear_session_auth_mode(state.session_manager.as_ref(), user_id).await;
+}
+
+async fn clear_session_auth_mode(session_manager: Option<&Arc<SessionManager>>, user_id: &str) {
+    if let Some(sm) = session_manager {
         let session = sm.get_or_create_session(user_id).await;
         let mut sess = session.lock().await;
         if let Some(thread_id) = sess.active_thread
@@ -2735,6 +2864,50 @@ mod tests {
     use crate::cli::oauth_defaults;
     use crate::extensions::{ExtensionKind, InstalledExtension};
     use crate::testing::credentials::TEST_GATEWAY_CRYPTO_KEY;
+
+    fn pending_gate_view(
+        resume_kind: lunarwing_engine::ResumeKind,
+    ) -> crate::gate::pending::PendingGateView {
+        crate::gate::pending::PendingGateView {
+            request_id: Uuid::new_v4().to_string(),
+            thread_id: Uuid::new_v4().to_string(),
+            gate_name: resume_kind.kind_name().to_string(),
+            tool_name: "test-tool".to_string(),
+            description: "test gate".to_string(),
+            parameters: "{}".to_string(),
+            resume_kind,
+        }
+    }
+
+    #[test]
+    fn matching_engine_auth_thread_requires_matching_credential() {
+        let pending = pending_gate_view(lunarwing_engine::ResumeKind::Authentication {
+            credential_name: "engine-v2-auth".to_string(),
+            instructions: "Provide a token".to_string(),
+            auth_url: None,
+        });
+
+        assert_eq!(
+            matching_engine_auth_thread(Some(&pending), "engine-v2-auth"),
+            Some(pending.thread_id.as_str())
+        );
+        assert_eq!(
+            matching_engine_auth_thread(Some(&pending), "different-extension"),
+            None
+        );
+    }
+
+    #[test]
+    fn matching_engine_auth_thread_rejects_non_auth_gate() {
+        let pending = pending_gate_view(lunarwing_engine::ResumeKind::Approval {
+            allow_always: false,
+        });
+
+        assert_eq!(
+            matching_engine_auth_thread(Some(&pending), "engine-v2-auth"),
+            None
+        );
+    }
 
     #[test]
     fn test_build_turns_from_db_messages_complete() {

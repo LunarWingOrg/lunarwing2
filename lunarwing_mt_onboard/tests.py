@@ -97,6 +97,24 @@ class TestConfigSerialization(unittest.TestCase):
             self.assertIn("name", data)
             self.assertEqual(data["name"], "json-check")
 
+    def test_weechat_bootstrap_defaults_false(self):
+        config = TenantConfig(name="alpha")
+        self.assertFalse(config.no_weechat_bootstrap)
+
+    def test_weechat_bootstrap_opt_out_round_trips(self):
+        config = TenantConfig(name="alpha", no_weechat_bootstrap=True)
+        restored = TenantConfig.from_dict(config.to_dict())
+        self.assertTrue(restored.no_weechat_bootstrap)
+
+    def test_old_json_without_weechat_field_defaults_false(self):
+        old_data = {
+            "name": "legacy",
+            "no_ssh": False,
+            "no_health": False,
+        }
+        config = TenantConfig.from_dict(old_data)
+        self.assertFalse(config.no_weechat_bootstrap)
+
 
 class TestProvisionerArgs(unittest.TestCase):
     def test_custom_gateway_host_is_forwarded_to_mt_admin(self):
@@ -243,6 +261,26 @@ class TestProvisionerArgs(unittest.TestCase):
 
         for flag in ("--with-nanocode", "--with-pebble", "--with-opencode"):
             self.assertNotIn(flag, add_args)
+
+    def test_weechat_bootstrap_opt_out_is_forwarded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "lunarwing-mt-admin.sh")
+            with open(script, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(script, 0o700)
+            previous = provisioner.MT_ADMIN_SCRIPT
+            provisioner.MT_ADMIN_SCRIPT = script
+            try:
+                opted_out = provisioner.build_add_tenant_args(
+                    TenantConfig(name="alpha", no_weechat_bootstrap=True)
+                )
+                default = provisioner.build_add_tenant_args(
+                    TenantConfig(name="beta")
+                )
+            finally:
+                provisioner.MT_ADMIN_SCRIPT = previous
+        self.assertIn("--no-weechat-bootstrap", opted_out)
+        self.assertNotIn("--no-weechat-bootstrap", default)
 
 
 class TestSecretsHelpers(unittest.TestCase):

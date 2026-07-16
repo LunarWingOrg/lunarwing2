@@ -18,6 +18,8 @@ use lunarwing::db::Database;
 use lunarwing::hooks::Hook;
 use lunarwing::llm::{LlmProvider, SessionConfig, SessionManager};
 use lunarwing::tools::Tool;
+use lunarwing::tools::mcp::config::save_mcp_servers_to_db;
+use lunarwing::tools::mcp::config::{McpServerConfig, McpServersFile};
 
 use crate::support::instrumented_llm::InstrumentedLlm;
 use crate::support::metrics::{ToolInvocation, TraceMetrics};
@@ -395,6 +397,8 @@ pub struct TestRigBuilder {
     keep_bootstrap: bool,
     channel_name: String,
     handle_message_timeout: Option<Duration>,
+    mcp_server_configs: Vec<McpServerConfig>,
+    skills_to_seed: Vec<(String, String)>,
 }
 
 impl TestRigBuilder {
@@ -415,6 +419,8 @@ impl TestRigBuilder {
             keep_bootstrap: false,
             channel_name: "test".to_string(),
             handle_message_timeout: None,
+            mcp_server_configs: Vec::new(),
+            skills_to_seed: Vec::new(),
         }
     }
 
@@ -505,6 +511,16 @@ impl TestRigBuilder {
         self
     }
 
+    /// Seed a `SKILL.md` fixture into the test rig's real skills directory.
+    pub fn with_seeded_skill(
+        mut self,
+        filename: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        self.skills_to_seed.push((filename.into(), content.into()));
+        self
+    }
+
     /// Enable the routines system so the scheduler is wired with a `RoutineEngine`,
     /// allowing routine jobs to actually execute. Routine tools are always registered
     /// but require the engine to dispatch jobs.
@@ -525,6 +541,19 @@ impl TestRigBuilder {
     /// instead of making real network requests.
     pub fn with_http_exchanges(mut self, exchanges: Vec<HttpExchange>) -> Self {
         self.http_exchanges = exchanges;
+        self
+    }
+
+    /// Seed an MCP server configuration that the real `ExtensionManager`
+    /// will discover during `AppBuilder::build_all()`.
+    ///
+    /// During `build()`, each seeded config is upserted into a
+    /// `McpServersFile` and persisted to the test database via
+    /// `save_mcp_servers_to_db`. This lets the real `tool_activate` path
+    /// discover the server and produce an authentication gate when the
+    /// server requires OAuth.
+    pub fn with_mcp_server_config(mut self, config: McpServerConfig) -> Self {
+        self.mcp_server_configs.push(config);
         self
     }
 
@@ -555,10 +584,31 @@ impl TestRigBuilder {
             keep_bootstrap,
             channel_name,
             handle_message_timeout,
+            mcp_server_configs,
+            skills_to_seed,
         } = self;
 
-        // 1. Create temp dir + libSQL database + run migrations.
+        // 1. Create temp dir and seed skill fixtures before AppBuilder discovery.
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let skills_dir = temp_dir.path().join("skills");
+        let installed_skills_dir = temp_dir.path().join("installed_skills");
+        let _ = std::fs::create_dir_all(&skills_dir);
+        let _ = std::fs::create_dir_all(&installed_skills_dir);
+        for (filename, content) in skills_to_seed {
+            let path = std::path::Path::new(&filename);
+            let mut components = path.components();
+            let is_single_component = matches!(
+                (components.next(), components.next()),
+                (Some(std::path::Component::Normal(_)), None)
+            );
+            if !is_single_component || filename.contains(['/', '\\']) {
+                panic!("invalid seeded skill filename: {filename}");
+            }
+            std::fs::write(skills_dir.join(&filename), content)
+                .unwrap_or_else(|error| panic!("failed to seed skill {filename}: {error}"));
+        }
+
+        // 2. Create the libSQL database and run migrations.
         let db_path = temp_dir.path().join("test_rig.db");
         let backend = LibSqlBackend::new_local(&db_path)
             .await
@@ -569,17 +619,25 @@ impl TestRigBuilder {
             .expect("failed to run migrations");
         let db: Arc<dyn lunarwing::db::Database> = Arc::new(backend);
 
-        // 2. Build Config::for_testing().
-        let skills_dir = temp_dir.path().join("skills");
-        let installed_skills_dir = temp_dir.path().join("installed_skills");
-        let _ = std::fs::create_dir_all(&skills_dir);
-        let _ = std::fs::create_dir_all(&installed_skills_dir);
+        // 2a. Build Config::for_testing().
         let mut config = Config::for_testing(db_path, skills_dir, installed_skills_dir);
         config.agent.max_tool_iterations = max_tool_iterations;
         config.safety.injection_check_enabled = injection_check;
         config.skills.enabled = enable_skills;
         if let Some(v) = auto_approve_tools {
             config.agent.auto_approve_tools = v;
+        }
+
+        // 2b. Seed MCP server configurations into the test database so the
+        // real ExtensionManager discovers them during AppBuilder::build_all().
+        if !mcp_server_configs.is_empty() {
+            let mut servers = McpServersFile::default();
+            for cfg in &mcp_server_configs {
+                servers.upsert(cfg.clone());
+            }
+            save_mcp_servers_to_db(db.as_ref(), &config.owner_id, &servers)
+                .await
+                .expect("failed to seed MCP server configs");
         }
 
         // 3. Create SessionManager + LogBroadcaster.
@@ -711,14 +769,19 @@ impl TestRigBuilder {
                     .register_routine_tools(Arc::clone(db_arc), engine);
             }
 
-            // Skills tools: ensure tests use temp skill dirs (sandbox-safe) even if
-            // AppBuilder did not wire them for this environment.
+            // Skills tools: preserve AppBuilder's discovered registry. Only use an
+            // empty temp registry as a fallback when AppBuilder did not wire one.
             if enable_skills {
-                let registry = Arc::new(std::sync::RwLock::new(
-                    lunarwing::skills::SkillRegistry::new(temp_dir.path().join("skills"))
-                        .with_installed_dir(temp_dir.path().join("installed_skills")),
-                ));
-                let catalog = lunarwing::skills::catalog::shared_catalog();
+                let registry = components.skill_registry.clone().unwrap_or_else(|| {
+                    Arc::new(std::sync::RwLock::new(
+                        lunarwing::skills::SkillRegistry::new(temp_dir.path().join("skills"))
+                            .with_installed_dir(temp_dir.path().join("installed_skills")),
+                    ))
+                });
+                let catalog = components
+                    .skill_catalog
+                    .clone()
+                    .unwrap_or_else(lunarwing::skills::catalog::shared_catalog);
                 components
                     .tools
                     .register_skill_tools(Arc::clone(&registry), Arc::clone(&catalog));

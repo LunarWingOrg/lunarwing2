@@ -81,7 +81,7 @@
       tensorzero_url: 'http://192.168.1.157:3000/openai/v1',
       model_choice: 'lunarwing', model_custom: '',
       llm_api_key: '', secrets_master_key: '',
-      ssh_harness: true, health_pipeline: true,
+      ssh_harness: true, health_pipeline: true, weechat_bootstrap: true,
       skip_build: false, skip_start: false,
     };
 
@@ -194,6 +194,7 @@
       }));
       b.appendChild(checkField(data, 'ssh_harness', 'Provision SSH harness for tenant'));
       b.appendChild(checkField(data, 'health_pipeline', 'Enable host health pipeline'));
+      b.appendChild(checkField(data, 'weechat_bootstrap', 'Automatically configure WeeChat relay'));
     }
 
     function stepReview(b) {
@@ -209,6 +210,7 @@
         ['Model', data.model_choice === 'custom' ? data.model_custom : data.model_choice],
         ['Master key', data.secrets_master_key ? '(provided)' : 'auto-generate'],
         ['SSH / Health', data.ssh_harness + ' / ' + data.health_pipeline],
+        ['WeeChat relay bootstrap', String(data.weechat_bootstrap)],
       ];
       const dl = h('dl', { class: 'summary-grid' });
       rows.forEach((r) => { dl.appendChild(h('dt', {}, [r[0]])); dl.appendChild(h('dd', {}, [String(r[1])])); });
@@ -247,6 +249,7 @@
         secrets_master_key: data.secrets_master_key.trim(),
         no_ssh: !data.ssh_harness,
         no_health: !data.health_pipeline,
+        no_weechat_bootstrap: !data.weechat_bootstrap,
         skip_build: data.skip_build,
         skip_start: data.skip_start,
       };

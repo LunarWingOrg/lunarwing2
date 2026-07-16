@@ -12,6 +12,7 @@ Each tenant's configuration lives under their home directory:
 │   ├── lunarwing.env       # Main daemon environment (LLM, DB, XMPP, gateway, WASM)
 │   ├── xmpp-bridge.env     # XMPP bridge service environment
 │   ├── proxy.env           # TensorZero proxy environment
+│   ├── weechat.env         # WeeChat relay credential only (RELAY_PASSWORD, mode 0600)
 │   └── gotify.json         # Gotify notification settings (optional)
 ├── state/
 │   ├── config.toml         # Daemon settings (auto-seeded on first start)
@@ -208,6 +209,18 @@ WASM_CHANNELS_DIR=/home/<tenant>/lunarwing/state/channels
 ```
 
 WASM tools and channels are installed into the tenant's state directory. Disable WASM entirely by setting `WASM_ENABLED=false`.
+
+## WeeChat Relay Configuration
+
+During `add-tenant`, the WeeChat relay is configured automatically. The relay password is generated and stored as the literal expression `${env:RELAY_PASSWORD}` in `relay.conf`. The resolved value is provided through a dedicated `env/weechat.env` file (mode `0600`, owned by the tenant user) that contains only `RELAY_PASSWORD`. The full `lunarwing.env` is never loaded into the WeeChat process.
+
+If the automatic bootstrap failed or was skipped before creating configuration, generate it with:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-weechat-relay <tenant>
+```
+
+This command refuses to overwrite any existing non-empty WeeChat configuration (preserve-and-fail). On a fresh or empty target it generates a complete loopback-only relay config and writes the minimal `env/weechat.env`. See [`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md) for full details.
 
 ## Gotify Notifications
 

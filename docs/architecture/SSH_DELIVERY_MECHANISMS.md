@@ -23,7 +23,7 @@ and how to enable it.
 
 | | **Worker mode** (Option 1) | **`ssh` / `ssh_git` tools** (Option 2) | **WASM `ssh` tool** (Option 3) |
 |---|---|---|---|
-| How the agent invokes it | `create_job(mode="nanocode"…)` with SSH commands | the `ssh` / `ssh_git` built-in tools | the `ssh` WASM tool |
+| How the agent invokes it | `create_job(mode="nanocode"/"pebble"/"opencode"…)` with SSH commands | the `ssh` / `ssh_git` built-in tools | the `ssh` WASM tool |
 | Runs where | worker **container** | **gateway process** (in-process) | gateway process (host fn) |
 | Transport | worker's own `git`/`ssh` via `SSH_AUTH_SOCK` | `ssh`: in-process russh; `ssh_git`: shell-out `git` | host fn reuses the in-process russh client |
 | Isolation of the SSH op | **High** (container) | Low (gateway process) | Low (russh runs host-side) |
@@ -46,7 +46,7 @@ and how to enable it.
 ## Mechanism 1 — Worker mode (Option 1)
 
 **What it is.** The agent creates a background job on an external worker
-(nanocode/pebble) with `create_job(mode="nanocode", …)`. The worker
+(nanocode/pebble/opencode) with `create_job(mode="nanocode", …)`. The worker
 container has the harness's ssh-agent socket bind-mounted and `SSH_AUTH_SOCK`
 set, so ordinary `git`/`ssh` inside the container authenticate through the
 daemon's agent. Keys stay in the daemon; the worker only gets signing capability
@@ -86,9 +86,9 @@ and `ic/src/tools/builtin/ssh_git.rs` (the tools).
 
 ### 2a. The `ssh` tool — run a remote command
 
-Runs a single command on a configured host using the in-process **russh 0.45**
+Runs a single command on a configured host using the in-process **russh 0.62**
 client (the first live use of the client half — the harness otherwise only used
-`russh-keys`' agent server).
+`russh::keys` agent server).
 
 ```jsonc
 // parameters
@@ -98,12 +98,12 @@ client (the first live use of the client half — the harness otherwise only use
 ```
 
 - **Auth:** loads the key from the secrets store (`SSHBridge::load_key`) and
-  decodes it (`russh_keys::decode_secret_key`) — **credential path (a)**.
+  decodes it (`russh::keys::decode_secret_key`) — **credential path (a)**.
 - **Host-key verification:** wired into russh's `Handler::check_server_key`,
   delegating to `HostKeyVerifier::verify_from_config` (Strict / AcceptFirst,
   byte-exact comparison of the wire key).
 - **Key algorithms:** **Ed25519 and ECDSA only.** RSA is rejected up front
-  (russh 0.45 signs `ssh-rsa` with SHA-1, which modern servers reject).
+  (RSA key support is not implemented; only Ed25519 and ECDSA are accepted).
 - **Limits:** connect/operation timeouts from the host config; stdout/stderr
   capped at 1 MiB each (`truncated` flag).
 

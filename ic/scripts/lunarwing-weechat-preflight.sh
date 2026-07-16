@@ -19,6 +19,8 @@
 #   ADAPTER_PORT          == registry `weechat_adapter`  (Python adapter binds this)
 #   WEECHAT_ADAPTER_PORT  == registry `weechat_adapter`
 #   RELAY_PASSWORD        present (value never printed)
+#   relay.conf            literal ${env:RELAY_PASSWORD}, bind 127.0.0.1, [api], correct port
+#   weechat.env           minimal credential env with RELAY_PASSWORD present
 #   installed weechat.capabilities.json declares the `env` sources
 #   (best-effort) adapter /api/health
 #
@@ -76,6 +78,96 @@ env_get() {
   line="${line%$'\r'}"
   line="${line%\"}"; line="${line#\"}"
   printf '%s' "$line"
+}
+
+# Validate generated relay.conf without sourcing it.
+# Checks for: literal ${env:RELAY_PASSWORD}, loopback bind, [api] section,
+# correct API port, and absence of plaintext password.
+_verify_relay_config() {  # <conf_file> <expected_port> <plaintext_ref>
+  local conf="$1" expected_port="$2" plaintext="$3"
+  local rc=0
+
+  if [[ ! -f "$conf" ]]; then
+    mark FAIL "relay.conf" "missing generated relay.conf"
+    mark INFO "recovery"   "run: sudo $0 configure-weechat-relay <tenant>"
+    return 1
+  fi
+  if [[ ! -r "$conf" ]]; then
+    mark WARN "relay.conf" "not readable — run with sudo: $conf"
+    return 1
+  fi
+
+  local content
+  content="$(cat "$conf")"
+
+  if [[ -n "$plaintext" ]] && grep -qF "$plaintext" <<<"$content" 2>/dev/null; then
+    mark FAIL "relay.conf" "plaintext password found — security risk; literal \${env:RELAY_PASSWORD} required"
+    mark INFO "recovery"   "run: sudo $0 configure-weechat-relay <tenant>"
+    rc=1
+  fi
+
+  if ! grep -qF 'password = "${env:RELAY_PASSWORD}"' <<<"$content"; then
+    mark FAIL "relay.conf" 'literal password expression missing; expected password = "${env:RELAY_PASSWORD}"'
+    mark INFO "recovery"   "run: sudo $0 configure-weechat-relay <tenant>"
+    rc=1
+  fi
+
+  if ! grep -qF 'bind_address = "127.0.0.1"' <<<"$content"; then
+    mark FAIL "relay.conf" "bind_address is not loopback (127.0.0.1); expected 127.0.0.1"
+    mark INFO "recovery"   "run: sudo $0 configure-weechat-relay <tenant>"
+    rc=1
+  fi
+
+  if ! grep -qF '[api]' <<<"$content"; then
+    mark FAIL "relay.conf" "missing [api] section"
+    mark INFO "recovery"   "run: sudo $0 configure-weechat-relay <tenant>"
+    rc=1
+  fi
+
+  if ! grep -qF "api = ${expected_port}" <<<"$content"; then
+    mark FAIL "relay.conf" "api port mismatch (expected $expected_port)"
+    mark INFO "recovery"   "run: sudo $0 configure-weechat-relay <tenant>"
+    rc=1
+  fi
+
+  if [[ $rc -eq 0 ]]; then
+    mark OK "relay.conf" 'password=${env:RELAY_PASSWORD}, bind_address = "127.0.0.1", api = '"$expected_port"
+  fi
+
+  return $rc
+}
+
+# Validate minimal weechat.env without sourcing it.
+# Checks for: file existence, RELAY_PASSWORD key present and non-empty.
+# Never prints the value — only reports set (<N> chars) or missing.
+_verify_minimal_env() {  # <env_file> <plaintext_ref>
+  local envfile="$1" plaintext="$2"
+
+  if [[ ! -f "$envfile" ]]; then
+    mark FAIL "weechat.env" "missing minimal credential env"
+    mark INFO "recovery"    "run: sudo $0 configure-weechat-relay <tenant>"
+    return 1
+  fi
+  if [[ ! -r "$envfile" ]]; then
+    mark WARN "weechat.env" "not readable — run with sudo: $envfile"
+    return 1
+  fi
+
+  local pw
+  pw="$(env_get "$envfile" RELAY_PASSWORD)"
+
+  if [[ -z "$pw" ]]; then
+    mark FAIL "weechat.env" "RELAY_PASSWORD missing or empty"
+    mark INFO "recovery"    "run: sudo $0 configure-weechat-relay <tenant>"
+    return 1
+  fi
+
+  if [[ "$pw" == "$plaintext" ]]; then
+    mark OK "weechat.env" "RELAY_PASSWORD set (${#pw} chars)"
+  else
+    mark FAIL "weechat.env" "RELAY_PASSWORD set (${#pw} chars) but does not match lunarwing.env"
+  fi
+  return 0
 }
 
 mark() { # $1=OK|WARN|FAIL|INFO  $2=label  $3=detail
@@ -163,6 +255,17 @@ check_tenant() {
   else
     mark INFO "RELAY_PASSWORD" "empty/unset — adapter accepts unauthenticated local requests"
   fi
+
+  local tenant_home="$TENANT_HOME_BASE/$name"
+  local weechat_home="$tenant_home/.config/weechat"
+  local relay_conf="$weechat_home/relay.conf"
+  local minimal_env="$lw/env/weechat.env"
+
+  if [[ -n "$rec_weechat" ]]; then
+    _verify_relay_config "$relay_conf" "$rec_weechat" "$relay_pw" || true
+  fi
+
+  _verify_minimal_env "$minimal_env" "$relay_pw" || true
 
   # Installed capabilities: do they declare the `env` sources yet?
   if [[ -e "$caps_file" ]]; then

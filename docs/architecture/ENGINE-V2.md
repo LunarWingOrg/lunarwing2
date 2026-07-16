@@ -28,7 +28,7 @@ ic/crates/lunarwing_engine/src/
     capability.rs         Capability, ActionDef, EffectType, CapabilityLease, PolicyRule
     memory.rs             MemoryDoc, DocId, DocType (Summary/Lesson/Skill/Issue/Spec/Note/Plan)
     project.rs            Project, ProjectId
-    event.rs              ThreadEvent, EventKind (18 variants for event sourcing)
+    event.rs              ThreadEvent, EventKind (20 variants for event sourcing)
     message.rs            ThreadMessage, MessageRole
     provenance.rs         Provenance enum (User/System/ToolOutput/LlmGenerated/etc.)
     conversation.rs       ConversationSurface, ConversationEntry, EntrySender
@@ -36,12 +36,18 @@ ic/crates/lunarwing_engine/src/
     error.rs              EngineError, ThreadError, StepError, CapabilityError
   traits/                 External dependency abstractions (host implements these)
     llm.rs                LlmBackend trait
-    store.rs              Store trait (20 CRUD methods)
+    store.rs              Store trait (31 CRUD methods)
     effect.rs             EffectExecutor trait
   capability/             Capability management
     registry.rs           CapabilityRegistry (register/get/list capabilities)
     lease.rs              LeaseManager (grant/check/consume/revoke/expire leases)
     policy.rs             PolicyEngine (deterministic allow/deny/approve + provenance taint)
+    planner.rs            Capability planning logic
+  gate/                   Execution gates (approval, auth, rate limits)
+    pipeline.rs           GatePipeline (composes gates in sequence)
+    mod.rs                GateDecision, GateResolution, ExecutionMode, ResumeKind
+    tool_tier.rs          Tool-tier gate logic
+    lease.rs              Lease-gated approval
   runtime/                Thread lifecycle management
     manager.rs            ThreadManager (spawn, stop, inject messages, join threads)
     conversation.rs       ConversationManager (routes UI messages to threads)
@@ -56,6 +62,8 @@ ic/crates/lunarwing_engine/src/
     compaction.rs         Context compaction when approaching model context limit
     prompt.rs             System prompt construction (CodeAct preamble/postamble)
     trace.rs              Execution trace recording and retrospective analysis
+    llm_stream.rs         LLM streaming support
+    orchestrator.rs       Self-modifiable Python execution layer (CodeAct orchestrator)
   memory/                 Memory document system
     store.rs              MemoryStore (project-scoped doc CRUD)
     retrieval.rs          RetrievalEngine (keyword-based context retrieval from project docs)
@@ -76,9 +84,9 @@ All transitions are validated by `ThreadState::can_transition_to()`. Terminal st
 
 ### Thread Types
 
-- **Interactive** -- user-initiated conversational threads
-- **Background** -- scheduled/routine-spawned threads
-- **SubThread** -- child threads spawned by a parent thread
+- **Foreground** -- user-initiated conversational threads
+- **Research** -- research/analysis threads
+- **Mission** -- mission-driven threads spawned by the mission system
 
 Threads form a tree via `ThreadTree`. Parent threads can spawn children, and child completion propagates events up to the parent.
 
@@ -182,7 +190,7 @@ GateResolution:
   Approved | Denied | CredentialProvided | Cancelled | ExternalCallback
 
 ExecutionMode:
-  Interactive | InteractiveWithAutoApprove | Unattended | Autonomous
+  Interactive | InteractiveAutoApprove | Autonomous | Container
 ```
 
 **Gate pipeline** (`GatePipeline`): composes multiple gates in sequence. The first `Pause` or `Deny` wins.
@@ -264,7 +272,7 @@ Wraps tool execution and safety layer as `EffectExecutor`:
 ### HybridStore (`src/bridge/store_adapter.rs`)
 
 Wraps `Database` + `Workspace` as the engine's `Store` trait:
-- 20 CRUD methods for threads, steps, events, projects, docs, leases, missions, conversations
+- 31 CRUD methods for threads, steps, events, projects, docs, leases, missions, conversations
 - In-memory HashMap cache backed by the database
 - Fallback to database on cache miss (never deletes LLM output)
 
@@ -290,6 +298,19 @@ non-UUID DarkIRC and WeeChat scope keys. Approval and auth prompts are statuses;
 gate pauses, auth pauses, and stopped turns return an empty no-reply sentinel so
 the outer handler does not send or persist a duplicate terminal response.
 
+### Local Compatibility Proof
+
+The hermetic local compatibility matrix exercises production boundaries rather
+than source-only stand-ins: real MCP HTTP transport and OAuth resume, Wasmtime
+execution and capability denial, v1-to-v2 skill migration and deterministic
+selection, TensorZero-shaped RigAdapter SSE streams, channel routing, and the
+browser gateway. Gateway text is incremental through SSE; the current WASM
+channel contract remains final-response-only and ignores stream chunks.
+
+These tests do not prove a deployed XMPP, DarkIRC, or WeeChat protocol bridge.
+Those channels remain gateway-first and exact-opt-in, with live validation kept
+in the separate disposable-tenant rollout.
+
 ## External Trait Boundaries
 
 The engine defines three traits that the host crate implements. This boundary ensures the engine has no dependency on the main daemon crate and is testable in isolation.
@@ -297,7 +318,7 @@ The engine defines three traits that the host crate implements. This boundary en
 | Trait | Signature | Host wraps |
 |-------|-----------|------------|
 | `LlmBackend` | `complete(messages, actions, config) -> LlmOutput` | `LlmProvider` |
-| `Store` | 20 CRUD methods for all engine types | `Database` (PostgreSQL + libSQL) |
+| `Store` | 31 CRUD methods for all engine types | `Database` (PostgreSQL + libSQL) |
 | `EffectExecutor` | `execute_action(name, params, lease, ctx) -> ActionResult` | `ToolRegistry` + `SafetyLayer` |
 
 ## Data Retention Policy
@@ -308,7 +329,7 @@ Thread messages, steps, and events are **never deleted** from the database. This
 
 ## Event Sourcing
 
-Every thread records a complete event log via `ThreadEvent`. The `EventKind` enum has 18 variants covering the full lifecycle: thread creation, state transitions, message receipt, LLM calls, action execution, gate decisions, mission triggers, and more.
+Every thread records a complete event log via `ThreadEvent`. The `EventKind` enum has 20 variants covering the full lifecycle: thread creation, state transitions, message receipt, LLM calls, action execution, gate decisions, mission triggers, and more.
 
 This enables:
 - Full replay of any thread's execution history
@@ -330,9 +351,9 @@ The engine inherits most configuration from the host daemon (LLM provider settin
 ## Build & Test
 
 ```bash
-cargo check -p lunarwing_engine
-cargo clippy -p lunarwing_engine --all-targets -- -D warnings
-cargo test -p lunarwing_engine
+taskset -c 0-5 cargo check -j6 -p lunarwing_engine
+taskset -c 0-5 cargo clippy -j6 -p lunarwing_engine --all-targets -- -D warnings
+taskset -c 0-5 cargo test -j6 -p lunarwing_engine -- --test-threads=6
 ```
 
 ## Key Design Decisions

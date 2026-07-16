@@ -10,6 +10,11 @@ pub mod messaging;
 pub mod mission;
 pub mod tree;
 
+pub(crate) mod skill_feedback;
+
+#[cfg(test)]
+mod skill_feedback_tests;
+
 pub use conversation::ConversationManager;
 pub use manager::ThreadManager;
 pub use messaging::ThreadOutcome;

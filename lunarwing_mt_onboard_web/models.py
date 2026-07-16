@@ -40,6 +40,7 @@ class ProvisionRequest(BaseModel):
     secrets_master_key: str = ""
     no_ssh: bool = False
     no_health: bool = False
+    no_weechat_bootstrap: bool = False
     skip_build: bool = False
     skip_start: bool = False
 
@@ -65,6 +66,7 @@ class ProvisionRequest(BaseModel):
             secrets_master_key=self.secrets_master_key.strip(),
             no_ssh=self.no_ssh,
             no_health=self.no_health,
+            no_weechat_bootstrap=self.no_weechat_bootstrap,
         )
 
 

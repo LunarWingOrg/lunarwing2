@@ -41,7 +41,7 @@ use crate::types::event::{EventKind, ThreadEvent, summarize_params};
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
 use crate::types::shared_owner_id;
-use crate::types::step::{LlmResponse, StepId, TokenUsage};
+use crate::types::step::{ActionCall, LlmResponse, StepId, TokenUsage};
 use crate::types::thread::{Thread, ThreadState};
 
 use super::llm_stream::collect_llm_stream;
@@ -479,16 +479,36 @@ pub async fn execute_orchestrator(
                     "__list_skills__" => handle_list_skills(args, thread, store).await,
 
                     // __record_skill_usage__(doc_id, success)
-                    "__record_skill_usage__" => handle_record_skill_usage(args, store).await,
+                    "__record_skill_usage__" => {
+                        handle_record_skill_usage(
+                            args,
+                            thread,
+                            store,
+                            crate::skill_self_improvement_enabled(),
+                        )
+                        .await
+                    }
 
                     // __propose_skill_patch__(doc_id, proposed_content, diff, reason)
                     "__propose_skill_patch__" => {
-                        handle_propose_skill_patch(args, thread, store).await
+                        handle_propose_skill_patch(
+                            args,
+                            thread,
+                            store,
+                            crate::skill_self_improvement_enabled(),
+                        )
+                        .await
                     }
 
                     // __propose_skill_prune__(doc_id, reason)
                     "__propose_skill_prune__" => {
-                        handle_propose_skill_prune(args, thread, store).await
+                        handle_propose_skill_prune(
+                            args,
+                            thread,
+                            store,
+                            crate::skill_self_improvement_enabled(),
+                        )
+                        .await
                     }
 
                     // Unknown — let Monty resolve it (user-defined functions, builtins)
@@ -1592,6 +1612,21 @@ fn handle_emit_event(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
+            let skill_doc_ids: Vec<String> = extract_string_kwarg(kwargs, "skill_doc_ids")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            if !skill_doc_ids.is_empty()
+                && let Some(metadata) = thread.metadata.as_object_mut()
+            {
+                metadata.insert(
+                    crate::runtime::skill_feedback::ACTIVE_SKILL_DOC_IDS_METADATA_KEY.into(),
+                    serde_json::json!(skill_doc_ids),
+                );
+            }
             EventKind::SkillActivated { skill_names }
         }
         _ => {
@@ -1842,9 +1877,11 @@ async fn handle_list_skills(
 /// orchestrator after skill-assisted execution completes.
 async fn handle_record_skill_usage(
     args: &[MontyObject],
+    thread: &Thread,
     store: Option<&Arc<dyn Store>>,
+    enabled: bool,
 ) -> ExtFunctionResult {
-    if !crate::skill_self_improvement_enabled() {
+    if !enabled {
         return ExtFunctionResult::Return(MontyObject::None);
     }
 
@@ -1863,11 +1900,14 @@ async fn handle_record_skill_usage(
         return ExtFunctionResult::Return(MontyObject::None);
     };
 
+    let doc_id = crate::types::memory::DocId(uuid);
+
+    if !skill_doc_is_visible_to_thread(store, thread, doc_id, "__record_skill_usage__").await {
+        return ExtFunctionResult::Return(MontyObject::None);
+    }
+
     let tracker = crate::memory::SkillTracker::new(Arc::clone(store));
-    if let Err(e) = tracker
-        .record_usage(crate::types::memory::DocId(uuid), success)
-        .await
-    {
+    if let Err(e) = tracker.record_usage(doc_id, success).await {
         debug!("__record_skill_usage__: failed: {e}");
     }
 
@@ -1886,8 +1926,9 @@ async fn handle_propose_skill_patch(
     args: &[MontyObject],
     thread: &Thread,
     store: Option<&Arc<dyn Store>>,
+    enabled: bool,
 ) -> ExtFunctionResult {
-    if !crate::skill_self_improvement_enabled() {
+    if !enabled {
         return ExtFunctionResult::Return(MontyObject::Bool(false));
     }
 
@@ -1909,10 +1950,15 @@ async fn handle_propose_skill_patch(
         return ExtFunctionResult::Return(MontyObject::Bool(false));
     }
 
+    let doc_id = crate::types::memory::DocId(uuid);
+    if !skill_doc_is_visible_to_thread(store, thread, doc_id, "__propose_skill_patch__").await {
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    }
+
     let tracker = crate::memory::SkillTracker::new(Arc::clone(store));
     match tracker
         .propose_patch(
-            crate::types::memory::DocId(uuid),
+            doc_id,
             proposed_content,
             diff,
             reason,
@@ -1941,7 +1987,12 @@ async fn handle_propose_skill_prune(
     args: &[MontyObject],
     thread: &Thread,
     store: Option<&Arc<dyn Store>>,
+    enabled: bool,
 ) -> ExtFunctionResult {
+    if !enabled {
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    }
+
     let Some(store) = store else {
         return ExtFunctionResult::Return(MontyObject::Bool(false));
     };
@@ -1958,13 +2009,14 @@ async fn handle_propose_skill_prune(
         return ExtFunctionResult::Return(MontyObject::Bool(false));
     }
 
+    let doc_id = crate::types::memory::DocId(uuid);
+    if !skill_doc_is_visible_to_thread(store, thread, doc_id, "__propose_skill_prune__").await {
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    }
+
     let tracker = crate::memory::SkillTracker::new(Arc::clone(store));
     match tracker
-        .propose_prune(
-            crate::types::memory::DocId(uuid),
-            reason,
-            Some(thread.id.0.to_string()),
-        )
+        .propose_prune(doc_id, reason, Some(thread.id.0.to_string()))
         .await
     {
         Ok(()) => ExtFunctionResult::Return(MontyObject::Bool(true)),
@@ -1973,6 +2025,33 @@ async fn handle_propose_skill_prune(
             ExtFunctionResult::Return(MontyObject::Bool(false))
         }
     }
+}
+
+async fn skill_doc_is_visible_to_thread(
+    store: &Arc<dyn Store>,
+    thread: &Thread,
+    doc_id: crate::types::memory::DocId,
+    host_function: &str,
+) -> bool {
+    let Some(visible_ids) = crate::runtime::skill_feedback::visible_skill_ids(
+        store,
+        thread.project_id,
+        &thread.user_id,
+    )
+    .await
+    else {
+        debug!(
+            host_function,
+            "failing closed: skill visibility lookup failed"
+        );
+        return false;
+    };
+
+    if !visible_ids.contains(&doc_id) {
+        debug!(host_function, skill_doc = %doc_id.0, "skill is outside thread scope");
+        return false;
+    }
+    true
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -2049,9 +2128,7 @@ fn json_to_thread_messages(value: &serde_json::Value) -> Option<Vec<ThreadMessag
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let action_calls = item
-            .get("action_calls")
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let action_calls = item.get("action_calls").and_then(json_to_action_calls);
 
         let message = match role {
             "System" | "system" => ThreadMessage::system(content),
@@ -2077,6 +2154,24 @@ fn json_to_thread_messages(value: &serde_json::Value) -> Option<Vec<ThreadMessag
     }
 
     Some(messages)
+}
+
+fn json_to_action_calls(value: &serde_json::Value) -> Option<Vec<ActionCall>> {
+    if let Ok(calls) = serde_json::from_value(value.clone()) {
+        return Some(calls);
+    }
+
+    value
+        .as_array()?
+        .iter()
+        .map(|item| {
+            Some(ActionCall {
+                id: item.get("call_id")?.as_str()?.to_string(),
+                action_name: item.get("name")?.as_str()?.to_string(),
+                parameters: item.get("params").cloned().unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 fn sync_runtime_state(thread: &mut Thread, state: Option<&serde_json::Value>) {
@@ -2292,6 +2387,41 @@ mod tests {
                 _ => panic!("Unexpected RunProgress variant in test"),
             }
         }
+    }
+
+    #[test]
+    fn orchestrator_action_call_wire_shape_round_trips_to_thread_messages() {
+        let value = serde_json::json!([
+            {
+                "role": "Assistant",
+                "content": "",
+                "action_calls": [{
+                    "call_id": "provider-call-1",
+                    "name": "echo",
+                    "params": {"message": "hello"}
+                }]
+            },
+            {
+                "role": "ActionResult",
+                "content": "echoed",
+                "action_name": "echo",
+                "action_call_id": "provider-call-1"
+            }
+        ]);
+
+        let messages = json_to_thread_messages(&value).expect("wire messages should decode");
+        let call = messages[0]
+            .action_calls
+            .as_ref()
+            .and_then(|calls| calls.first())
+            .expect("assistant call should be retained");
+        assert_eq!(call.id, "provider-call-1");
+        assert_eq!(call.action_name, "echo");
+        assert_eq!(call.parameters, serde_json::json!({"message": "hello"}));
+        assert_eq!(
+            messages[1].action_call_id.as_deref(),
+            Some("provider-call-1")
+        );
     }
 
     // ── True positives (should trigger nudge) ───────────────────
@@ -2858,6 +2988,328 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.role == MessageRole::Assistant)
+        );
+    }
+
+    // ── __record_skill_usage__ scoped visibility tests ────────────
+
+    use lunarwing_skills::SkillTrust;
+    use lunarwing_skills::v2::{SkillMetrics, V2SkillMetadata, V2SkillSource};
+
+    fn make_scoped_skill_doc(project_id: ProjectId, user_id: &str) -> MemoryDoc {
+        let metadata = V2SkillMetadata {
+            name: "host-fn-skill".into(),
+            source: V2SkillSource::Extracted,
+            trust: SkillTrust::Trusted,
+            metrics: SkillMetrics::default(),
+            ..serde_json::from_str::<V2SkillMetadata>("{}").unwrap()
+        };
+        let mut doc = MemoryDoc::new(
+            project_id,
+            user_id,
+            DocType::Skill,
+            "skill:host-fn",
+            "content",
+        );
+        doc.metadata = serde_json::to_value(metadata).unwrap();
+        doc
+    }
+
+    fn doc_id_arg(doc_id: uuid::Uuid) -> Vec<MontyObject> {
+        vec![
+            MontyObject::String(doc_id.to_string()),
+            MontyObject::Bool(true),
+        ]
+    }
+
+    fn patch_args(doc_id: uuid::Uuid) -> Vec<MontyObject> {
+        vec![
+            MontyObject::String(doc_id.to_string()),
+            MontyObject::String("patched content".to_string()),
+            MontyObject::String("@@ diff @@".to_string()),
+            MontyObject::String("repair failed behavior".to_string()),
+        ]
+    }
+
+    fn prune_args(doc_id: uuid::Uuid) -> Vec<MontyObject> {
+        vec![
+            MontyObject::String(doc_id.to_string()),
+            MontyObject::String("quarantine expired".to_string()),
+        ]
+    }
+
+    async fn read_skill_meta(
+        store: &Arc<dyn Store>,
+        doc_id: crate::types::memory::DocId,
+    ) -> V2SkillMetadata {
+        let doc = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        serde_json::from_value(doc.metadata).unwrap()
+    }
+
+    async fn read_metrics(
+        store: &Arc<dyn Store>,
+        doc_id: crate::types::memory::DocId,
+    ) -> SkillMetrics {
+        read_skill_meta(store, doc_id).await.metrics
+    }
+
+    #[tokio::test]
+    async fn host_record_skill_usage_wrong_project_rejected() {
+        let thread_project = ProjectId::new();
+        let other_project = ProjectId::new();
+
+        let doc = make_scoped_skill_doc(other_project, "test-user");
+        let doc_id = doc.id;
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            thread_project,
+            "test-user",
+            ThreadConfig::default(),
+        );
+
+        handle_record_skill_usage(&doc_id_arg(doc_id.0), &thread, Some(&store), true).await;
+
+        let m = read_metrics(&store, doc_id).await;
+        assert_eq!(
+            (m.usage_count, m.success_count, m.failure_count),
+            (0, 0, 0),
+            "wrong-project skill must not be mutated"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_record_skill_usage_wrong_user_same_project_rejected() {
+        let project_id = ProjectId::new();
+
+        let doc = make_scoped_skill_doc(project_id, "attacker-user");
+        let doc_id = doc.id;
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+
+        handle_record_skill_usage(&doc_id_arg(doc_id.0), &thread, Some(&store), true).await;
+
+        let m = read_metrics(&store, doc_id).await;
+        assert_eq!(
+            (m.usage_count, m.success_count, m.failure_count),
+            (0, 0, 0),
+            "wrong-user skill must not be mutated"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_record_skill_usage_same_user_allowed() {
+        let project_id = ProjectId::new();
+
+        let doc = make_scoped_skill_doc(project_id, "test-user");
+        let doc_id = doc.id;
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+
+        handle_record_skill_usage(&doc_id_arg(doc_id.0), &thread, Some(&store), true).await;
+
+        let m = read_metrics(&store, doc_id).await;
+        assert_eq!(
+            (m.usage_count, m.success_count, m.failure_count),
+            (1, 1, 0),
+            "same-user skill must be mutated"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_record_skill_usage_shared_owner_allowed() {
+        let project_id = ProjectId::new();
+
+        let doc = make_scoped_skill_doc(project_id, "__shared__");
+        let doc_id = doc.id;
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+
+        handle_record_skill_usage(&doc_id_arg(doc_id.0), &thread, Some(&store), true).await;
+
+        let m = read_metrics(&store, doc_id).await;
+        assert_eq!(
+            (m.usage_count, m.success_count, m.failure_count),
+            (1, 1, 0),
+            "shared-owner skill must be mutated"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_record_skill_usage_disabled_does_nothing() {
+        let project_id = ProjectId::new();
+
+        let doc = make_scoped_skill_doc(project_id, "test-user");
+        let doc_id = doc.id;
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+
+        handle_record_skill_usage(&doc_id_arg(doc_id.0), &thread, Some(&store), false).await;
+
+        let m = read_metrics(&store, doc_id).await;
+        assert_eq!(
+            (m.usage_count, m.success_count, m.failure_count),
+            (0, 0, 0),
+            "disabled must not mutate"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_propose_skill_patch_rejects_out_of_scope_doc() {
+        let thread_project = ProjectId::new();
+        let doc = make_scoped_skill_doc(ProjectId::new(), "test-user");
+        let doc_id = doc.id;
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            thread_project,
+            "test-user",
+            ThreadConfig::default(),
+        );
+
+        let result =
+            handle_propose_skill_patch(&patch_args(doc_id.0), &thread, Some(&store), true).await;
+
+        assert!(matches!(
+            result,
+            ExtFunctionResult::Return(MontyObject::Bool(false))
+        ));
+        assert!(
+            read_skill_meta(&store, doc_id)
+                .await
+                .pending_patch
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn host_propose_skill_prune_rejects_out_of_scope_doc() {
+        let project_id = ProjectId::new();
+        let doc = make_scoped_skill_doc(project_id, "other-user");
+        let doc_id = doc.id;
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+
+        let result =
+            handle_propose_skill_prune(&prune_args(doc_id.0), &thread, Some(&store), true).await;
+
+        assert!(matches!(
+            result,
+            ExtFunctionResult::Return(MontyObject::Bool(false))
+        ));
+        assert!(
+            read_skill_meta(&store, doc_id)
+                .await
+                .pending_prune
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn host_skill_proposals_stage_for_in_scope_docs() {
+        let project_id = ProjectId::new();
+        let patch_doc = make_scoped_skill_doc(project_id, "test-user");
+        let patch_doc_id = patch_doc.id;
+        let prune_doc = make_scoped_skill_doc(project_id, "test-user");
+        let prune_doc_id = prune_doc.id;
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::with_docs(vec![
+            patch_doc, prune_doc,
+        ]));
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+
+        let patch_result =
+            handle_propose_skill_patch(&patch_args(patch_doc_id.0), &thread, Some(&store), true)
+                .await;
+        let prune_result =
+            handle_propose_skill_prune(&prune_args(prune_doc_id.0), &thread, Some(&store), true)
+                .await;
+
+        assert!(matches!(
+            patch_result,
+            ExtFunctionResult::Return(MontyObject::Bool(true))
+        ));
+        assert!(matches!(
+            prune_result,
+            ExtFunctionResult::Return(MontyObject::Bool(true))
+        ));
+        assert!(
+            read_skill_meta(&store, patch_doc_id)
+                .await
+                .pending_patch
+                .is_some()
+        );
+        assert!(
+            read_skill_meta(&store, prune_doc_id)
+                .await
+                .pending_prune
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn host_propose_skill_prune_disabled_does_not_stage() {
+        let project_id = ProjectId::new();
+        let doc = make_scoped_skill_doc(project_id, "test-user");
+        let doc_id = doc.id;
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+
+        let result =
+            handle_propose_skill_prune(&prune_args(doc_id.0), &thread, Some(&store), false).await;
+
+        assert!(matches!(
+            result,
+            ExtFunctionResult::Return(MontyObject::Bool(false))
+        ));
+        assert!(
+            read_skill_meta(&store, doc_id)
+                .await
+                .pending_prune
+                .is_none()
         );
     }
 }
