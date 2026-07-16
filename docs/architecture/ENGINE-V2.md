@@ -298,6 +298,19 @@ non-UUID DarkIRC and WeeChat scope keys. Approval and auth prompts are statuses;
 gate pauses, auth pauses, and stopped turns return an empty no-reply sentinel so
 the outer handler does not send or persist a duplicate terminal response.
 
+### Local Compatibility Proof
+
+The hermetic local compatibility matrix exercises production boundaries rather
+than source-only stand-ins: real MCP HTTP transport and OAuth resume, Wasmtime
+execution and capability denial, v1-to-v2 skill migration and deterministic
+selection, TensorZero-shaped RigAdapter SSE streams, channel routing, and the
+browser gateway. Gateway text is incremental through SSE; the current WASM
+channel contract remains final-response-only and ignores stream chunks.
+
+These tests do not prove a deployed XMPP, DarkIRC, or WeeChat protocol bridge.
+Those channels remain gateway-first and exact-opt-in, with live validation kept
+in the separate disposable-tenant rollout.
+
 ## External Trait Boundaries
 
 The engine defines three traits that the host crate implements. This boundary ensures the engine has no dependency on the main daemon crate and is testable in isolation.
@@ -338,9 +351,9 @@ The engine inherits most configuration from the host daemon (LLM provider settin
 ## Build & Test
 
 ```bash
-cargo check -p lunarwing_engine
-cargo clippy -p lunarwing_engine --all-targets -- -D warnings
-cargo test -p lunarwing_engine
+taskset -c 0-5 cargo check -j6 -p lunarwing_engine
+taskset -c 0-5 cargo clippy -j6 -p lunarwing_engine --all-targets -- -D warnings
+taskset -c 0-5 cargo test -j6 -p lunarwing_engine -- --test-threads=6
 ```
 
 ## Key Design Decisions

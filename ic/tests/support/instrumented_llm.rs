@@ -5,17 +5,18 @@
 //! and `complete_with_tools()` to record timing, token counts, and call metadata.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 
 use lunarwing::error::LlmError;
 use lunarwing::llm::{
-    CompletionRequest, CompletionResponse, LlmProvider, ModelMetadata, ToolCompletionRequest,
-    ToolCompletionResponse,
+    CompletionRequest, CompletionResponse, LlmProvider, LlmStream, LlmStreamChunk, ModelMetadata,
+    ToolCompletionRequest, ToolCompletionResponse,
 };
 
 /// Metrics captured for a single LLM call.
@@ -117,6 +118,27 @@ impl LlmProvider for InstrumentedLlm {
         result
     }
 
+    async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
+        let start = Instant::now();
+        let stream = self.inner.complete_stream(request).await?;
+
+        Ok(stream
+            .then(move |item| async move {
+                if let Ok(LlmStreamChunk::Done { usage, .. }) = &item {
+                    let usage = (*usage).unwrap_or_default();
+                    self.record_call(
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        start.elapsed().as_millis() as u64,
+                        false,
+                    )
+                    .await;
+                }
+                item
+            })
+            .boxed())
+    }
+
     async fn complete_with_tools(
         &self,
         request: ToolCompletionRequest,
@@ -137,6 +159,40 @@ impl LlmProvider for InstrumentedLlm {
         }
 
         result
+    }
+
+    async fn complete_with_tools_stream(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<LlmStream<'_>, LlmError> {
+        let start = Instant::now();
+        let stream = self.inner.complete_with_tools_stream(request).await?;
+        let saw_tool_call = Arc::new(AtomicBool::new(false));
+
+        Ok(stream
+            .then(move |item| {
+                let saw_tool_call = Arc::clone(&saw_tool_call);
+                async move {
+                    match &item {
+                        Ok(LlmStreamChunk::ToolCallDelta { .. }) => {
+                            saw_tool_call.store(true, Ordering::Relaxed);
+                        }
+                        Ok(LlmStreamChunk::Done { usage, .. }) => {
+                            let usage = (*usage).unwrap_or_default();
+                            self.record_call(
+                                usage.input_tokens,
+                                usage.output_tokens,
+                                start.elapsed().as_millis() as u64,
+                                saw_tool_call.load(Ordering::Relaxed),
+                            )
+                            .await;
+                        }
+                        Ok(LlmStreamChunk::TextDelta(_)) | Err(_) => {}
+                    }
+                    item
+                }
+            })
+            .boxed())
     }
 
     async fn list_models(&self) -> Result<Vec<String>, LlmError> {

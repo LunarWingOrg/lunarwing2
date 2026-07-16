@@ -517,7 +517,8 @@ def run_loop(context, goal, actions, state, config):
                 append_system_append(working_messages, skill_text)
                 # Emit skill activation event for CLI/gateway display
                 skill_names = ",".join(s.get("metadata", {}).get("name", "?") for s in active_skills)
-                __emit_event__("skill_activated", skill_names=skill_names)
+                skill_doc_ids = ",".join(s.get("doc_id", "") for s in active_skills if s.get("doc_id", ""))
+                __emit_event__("skill_activated", skill_names=skill_names, skill_doc_ids=skill_doc_ids)
                 # Store active skill IDs in state for tracking
                 state["active_skill_ids"] = [s.get("doc_id", "") for s in active_skills]
                 state["skill_snippet_names"] = []
@@ -630,6 +631,7 @@ def run_loop(context, goal, actions, state, config):
                     "call_id": gate.get("call_id", ""),
                     "parameters": gate.get("parameters", {}),
                     "resume_kind": gate.get("resume_kind", {}),
+                    "resume_output": gate.get("resume_output"),
                 }
 
             # Check for approval or authentication needed (legacy path)
@@ -739,6 +741,7 @@ def run_loop(context, goal, actions, state, config):
                         "call_id": orig_call.get("call_id", ""),
                         "parameters": orig_call.get("params", {}),
                         "resume_kind": gate.get("resume_kind", {}),
+                        "resume_output": gate.get("resume_output"),
                     }
 
                 if r.get("need_authentication"):

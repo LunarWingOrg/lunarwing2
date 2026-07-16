@@ -522,6 +522,8 @@ impl MissionManager {
                                     mgr.store.as_ref(),
                                     thread.project_id,
                                     &thread.user_id,
+                                    &chrono::Utc::now(),
+                                    crate::skill_prune_quarantine_period(),
                                 )
                                 .await
                             } else {
@@ -746,10 +748,22 @@ impl MissionManager {
         project_id: ProjectId,
         user_id: &str,
     ) -> Result<(), EngineError> {
+        self.ensure_learning_missions_with_gate(
+            project_id,
+            user_id,
+            crate::skill_self_improvement_enabled(),
+        )
+        .await
+    }
+
+    async fn ensure_learning_missions_with_gate(
+        &self,
+        project_id: ProjectId,
+        user_id: &str,
+        self_improvement_on: bool,
+    ) -> Result<(), EngineError> {
         // 0. Seed compiled-in orchestrator v0 so it's visible in workspace
         self.seed_orchestrator_v0(project_id).await?;
-
-        let self_improvement_on = crate::skill_self_improvement_enabled();
 
         // 1. Error diagnosis (self-improvement) — per-user
         if self_improvement_on {
@@ -807,10 +821,10 @@ impl MissionManager {
 
         // 5. Skill maintenance (B-2 prune sweep) — fires on the same
         // thread-completed-with-issues event as self-improvement. The sweep
-        // stages prune proposals for confidently-dead skills (0.0 confidence
-        // over ≥ prune min-usage); the user approves archival via the proposals
-        // surface. Inline demotion (in record_usage) handles the immediate
-        // below-floor case; this sweep catches stale, never-succeeding skills.
+        // stages prune proposals for confidently-dead skills or automatically
+        // demoted skills whose quarantine has elapsed; the user approves
+        // archival via the proposals surface. Inline demotion (in record_usage)
+        // handles the immediate below-floor case.
         if self_improvement_on {
             self.ensure_mission_by_metadata(
                 project_id,
@@ -1072,18 +1086,21 @@ async fn collect_patch_candidate_skills(
     out
 }
 
-/// Enumerate all skills visible to `user_id` that are confidently dead and
-/// therefore candidates for user-approved pruning (archival), B-2.
+/// Enumerate all skills visible to `user_id` that are confidently dead or have
+/// completed automatic-demotion quarantine and are therefore candidates for
+/// user-approved pruning (archival), B-2.
 ///
 /// Unlike [`collect_patch_candidate_skills`], this scans the entire library
 /// (not just skills activated in a specific thread) and uses the stricter
-/// `is_prune_candidate` gate (0.0 confidence over the prune minimum usage).
-/// Authored and `Installed` skills are excluded by the predicate. The result
-/// feeds the skill-maintenance sweep mission's `candidates` payload.
+/// Authored, `Installed`, manually demoted, and actively patching skills are
+/// excluded by the predicates. The result feeds the skill-maintenance sweep
+/// mission's `candidates` payload.
 async fn collect_prune_candidate_skills(
     store: &dyn Store,
     project_id: crate::types::project::ProjectId,
     user_id: &str,
+    now: &chrono::DateTime<chrono::Utc>,
+    quarantine: std::time::Duration,
 ) -> Vec<serde_json::Value> {
     use lunarwing_skills::v2::{
         DEFAULT_PRUNE_CONFIDENCE, DEFAULT_PRUNE_MIN_USAGE, V2SkillMetadata,
@@ -1112,7 +1129,10 @@ async fn collect_prune_candidate_skills(
         let Ok(meta) = serde_json::from_value::<V2SkillMetadata>(doc.metadata.clone()) else {
             continue;
         };
-        if !meta.is_prune_candidate(DEFAULT_PRUNE_CONFIDENCE, DEFAULT_PRUNE_MIN_USAGE) {
+        let dead_without_demotion =
+            meta.is_prune_candidate(DEFAULT_PRUNE_CONFIDENCE, DEFAULT_PRUNE_MIN_USAGE);
+        let completed_quarantine = meta.is_quarantine_prune_candidate(now, quarantine);
+        if !dead_without_demotion && !completed_quarantine {
             continue;
         }
         out.push(serde_json::json!({
@@ -1121,6 +1141,8 @@ async fn collect_prune_candidate_skills(
             "version": meta.version,
             "confidence": meta.metrics.confidence(),
             "usage_count": meta.metrics.usage_count,
+            "deprecated_at": meta.deprecated_at,
+            "deprecation_reason": meta.deprecation_reason,
         }));
     }
     out
@@ -2618,16 +2640,15 @@ mod tests {
 
     #[tokio::test]
     async fn user_cannot_pause_another_users_learning_mission() {
-        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();
 
         // Bootstrap per-user learning missions
-        mgr.ensure_learning_missions(project_id, "alice")
+        mgr.ensure_learning_missions_with_gate(project_id, "alice", true)
             .await
             .unwrap();
-        mgr.ensure_learning_missions(project_id, "bob")
+        mgr.ensure_learning_missions_with_gate(project_id, "bob", true)
             .await
             .unwrap();
 
@@ -2782,16 +2803,15 @@ mod tests {
 
     #[tokio::test]
     async fn fire_on_system_event_scoped_to_user() {
-        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();
 
         // Bootstrap per-user learning missions
-        mgr.ensure_learning_missions(project_id, "alice")
+        mgr.ensure_learning_missions_with_gate(project_id, "alice", true)
             .await
             .unwrap();
-        mgr.ensure_learning_missions(project_id, "bob")
+        mgr.ensure_learning_missions_with_gate(project_id, "bob", true)
             .await
             .unwrap();
 
@@ -2854,16 +2874,15 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_learning_missions_idempotent_per_user() {
-        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();
 
         // Call twice for the same user
-        mgr.ensure_learning_missions(project_id, "alice")
+        mgr.ensure_learning_missions_with_gate(project_id, "alice", true)
             .await
             .unwrap();
-        mgr.ensure_learning_missions(project_id, "alice")
+        mgr.ensure_learning_missions_with_gate(project_id, "alice", true)
             .await
             .unwrap();
 
@@ -3226,7 +3245,14 @@ mod tests {
             .await
             .unwrap();
 
-        let out = collect_prune_candidate_skills(&store, project_id, "alice").await;
+        let out = collect_prune_candidate_skills(
+            &store,
+            project_id,
+            "alice",
+            &chrono::Utc::now(),
+            std::time::Duration::from_secs(30 * 24 * 60 * 60),
+        )
+        .await;
         assert_eq!(out.len(), 1, "only the dead skill qualifies, got {out:?}");
         assert_eq!(out[0]["name"], "dead");
     }
@@ -3266,7 +3292,61 @@ mod tests {
         }
         store.save_memory_doc(&authored).await.unwrap();
 
-        let out = collect_prune_candidate_skills(&store, project_id, "alice").await;
+        let out = collect_prune_candidate_skills(
+            &store,
+            project_id,
+            "alice",
+            &chrono::Utc::now(),
+            std::time::Duration::from_secs(30 * 24 * 60 * 60),
+        )
+        .await;
         assert!(out.is_empty(), "protected skills never pruned, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn test_collect_prune_candidates_honors_auto_demotion_quarantine() {
+        let project_id = ProjectId::new();
+        let store = TestStore::new();
+        let now = chrono::Utc::now();
+        let quarantine = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+        let mut expired = seed_skill(
+            project_id,
+            "alice",
+            "expired-auto-demotion",
+            lunarwing_skills::SkillTrust::Trusted,
+            5,
+            0,
+            5,
+        );
+        let mut expired_meta: lunarwing_skills::v2::V2SkillMetadata =
+            serde_json::from_value(expired.metadata.clone()).unwrap();
+        expired_meta.deprecated_at = Some(now - chrono::Duration::days(31));
+        expired_meta.deprecation_reason = "auto-demoted: confidence below floor".to_string();
+        expired_meta.automatic_demotion = true;
+        expired.metadata = serde_json::to_value(expired_meta).unwrap();
+        store.save_memory_doc(&expired).await.unwrap();
+
+        let mut recent = seed_skill(
+            project_id,
+            "alice",
+            "recent-auto-demotion",
+            lunarwing_skills::SkillTrust::Trusted,
+            5,
+            0,
+            5,
+        );
+        let mut recent_meta: lunarwing_skills::v2::V2SkillMetadata =
+            serde_json::from_value(recent.metadata.clone()).unwrap();
+        recent_meta.deprecated_at = Some(now - chrono::Duration::days(29));
+        recent_meta.deprecation_reason = "auto-demoted: confidence below floor".to_string();
+        recent_meta.automatic_demotion = true;
+        recent.metadata = serde_json::to_value(recent_meta).unwrap();
+        store.save_memory_doc(&recent).await.unwrap();
+
+        let out =
+            collect_prune_candidate_skills(&store, project_id, "alice", &now, quarantine).await;
+        assert_eq!(out.len(), 1, "only expired quarantine qualifies: {out:?}");
+        assert_eq!(out[0]["name"], "expired-auto-demotion");
     }
 }

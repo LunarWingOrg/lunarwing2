@@ -17,6 +17,7 @@ use crate::runtime::tree::ThreadTree;
 use crate::traits::effect::EffectExecutor;
 use crate::traits::llm::LlmBackend;
 use crate::traits::store::Store;
+use crate::types::capability::Capability;
 use crate::types::error::EngineError;
 use crate::types::event::{EventKind, ThreadEvent};
 use crate::types::message::{MessageRole, ThreadMessage};
@@ -52,6 +53,9 @@ pub struct ThreadManager {
     /// AGENTS.md + MEMORY.md), supplied by the host and prepended to each
     /// thread's system prompt so the agent keeps its own voice and memory.
     identity_preamble: Option<String>,
+    /// Whether terminal skill feedback is active. Captured at construction
+    /// so the background task does not re-read the environment mid-flight.
+    skill_feedback_enabled: bool,
 }
 
 impl ThreadManager {
@@ -77,6 +81,7 @@ impl ThreadManager {
             completed: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             identity_preamble: None,
+            skill_feedback_enabled: crate::skill_self_improvement_enabled(),
         }
     }
 
@@ -84,6 +89,12 @@ impl ThreadManager {
     /// Host-supplied (the engine crate has no workspace/filesystem access).
     pub fn set_identity_preamble(&mut self, identity: Option<String>) {
         self.identity_preamble = identity.filter(|s| !s.trim().is_empty());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_skill_feedback_enabled(mut self, enabled: bool) -> Self {
+        self.skill_feedback_enabled = enabled;
+        self
     }
 
     /// Subscribe to thread events for live status updates.
@@ -263,6 +274,8 @@ impl ThreadManager {
             });
         }
 
+        self.refresh_resumed_thread_leases(&mut thread).await?;
+
         if let Some((call_id, approved)) = approval_event {
             let event = crate::types::event::ThreadEvent::new(
                 thread_id,
@@ -307,6 +320,52 @@ impl ThreadManager {
         Ok(())
     }
 
+    async fn refresh_resumed_thread_leases(&self, thread: &mut Thread) -> Result<(), EngineError> {
+        let active_leases = self.leases.active_for_thread(thread.id).await;
+        let available_actions = self.effects.available_actions(&active_leases).await?;
+        let mut missing_actions = Vec::new();
+        for action in available_actions {
+            if self
+                .leases
+                .find_lease_for_action(thread.id, &action.name)
+                .await
+                .is_none()
+            {
+                missing_actions.push(action);
+            }
+        }
+        if missing_actions.is_empty() {
+            return Ok(());
+        }
+
+        let mut resumed_capabilities = CapabilityRegistry::new();
+        resumed_capabilities.register(Capability {
+            name: "resumed_tools".into(),
+            description: "Tools activated while the thread was waiting".into(),
+            actions: missing_actions,
+            knowledge: Vec::new(),
+            policies: Vec::new(),
+        });
+        for grant in self
+            .lease_planner
+            .plan_for_thread(thread.thread_type, &resumed_capabilities)
+        {
+            let lease = self
+                .leases
+                .grant(
+                    thread.id,
+                    grant.capability_name,
+                    grant.granted_actions,
+                    None,
+                    None,
+                )
+                .await?;
+            self.store.save_lease(&lease).await?;
+            thread.capability_leases.push(lease.id);
+        }
+        Ok(())
+    }
+
     async fn start_thread(
         &self,
         thread: Thread,
@@ -347,6 +406,7 @@ impl ThreadManager {
         let store_for_task = Arc::clone(&self.store);
         let running = Arc::clone(&self.running);
         let completed = Arc::clone(&self.completed);
+        let skill_feedback_enabled = self.skill_feedback_enabled;
         let handle = tokio::spawn(async move {
             let mut exec = exec_loop;
             let result = exec.run().await;
@@ -374,6 +434,21 @@ impl ThreadManager {
                 crate::executor::trace::write_trace(&trace);
             }
 
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(error) => ThreadOutcome::Failed {
+                    error: error.to_string(),
+                },
+            };
+
+            crate::runtime::skill_feedback::record_terminal_skill_usage(
+                &mut exec.thread,
+                &outcome,
+                &store_for_task,
+                skill_feedback_enabled,
+            )
+            .await;
+
             if let Err(e) = store_for_task.append_events(&exec.thread.events).await {
                 tracing::debug!(
                     thread_id = %thread_id,
@@ -389,12 +464,6 @@ impl ThreadManager {
                 );
             }
 
-            let outcome = match result {
-                Ok(outcome) => outcome,
-                Err(error) => ThreadOutcome::Failed {
-                    error: error.to_string(),
-                },
-            };
             completed.write().await.insert(thread_id, outcome.clone());
             running.write().await.remove(&thread_id);
             Ok(outcome)
@@ -1878,4 +1947,94 @@ mod tests {
 
     // Skill selection and injection tests are in tests/engine_v2_skill_codeact.rs
     // (skill selection happens in the Python orchestrator, not in Rust).
+
+    // ── Skill feedback integration tests ──────────────────────
+
+    fn make_manager_with_dyn_store(
+        llm: Arc<dyn LlmBackend>,
+        store: Arc<dyn Store>,
+    ) -> ThreadManager {
+        let mut caps = CapabilityRegistry::new();
+        caps.register(Capability {
+            name: "test".into(),
+            description: "Test capability".into(),
+            actions: vec![],
+            knowledge: vec![],
+            policies: vec![],
+        });
+        ThreadManager::new(
+            llm,
+            Arc::new(MockEffects),
+            store,
+            Arc::new(caps),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        )
+        .with_skill_feedback_enabled(true)
+    }
+
+    fn make_feedback_skill_doc(project_id: ProjectId) -> MemoryDoc {
+        use lunarwing_skills::SkillTrust;
+        use lunarwing_skills::types::ActivationCriteria;
+        use lunarwing_skills::v2::{SkillMetrics, V2SkillMetadata, V2SkillSource};
+
+        let metadata = V2SkillMetadata {
+            name: "feedback-skill".into(),
+            activation: ActivationCriteria {
+                keywords: vec!["feedback".into()],
+                ..Default::default()
+            },
+            source: V2SkillSource::Extracted,
+            trust: SkillTrust::Trusted,
+            metrics: SkillMetrics::default(),
+            ..serde_json::from_str::<V2SkillMetadata>("{}").unwrap()
+        };
+        let mut doc = MemoryDoc::new(
+            project_id,
+            "test-user",
+            crate::types::memory::DocType::Skill,
+            "skill:feedback-skill",
+            "Use this deterministic feedback skill.",
+        );
+        doc.metadata = serde_json::to_value(metadata).unwrap();
+        doc
+    }
+
+    #[tokio::test]
+    async fn completed_thread_records_selected_skill_once() {
+        let project_id = ProjectId::new();
+        let skill = make_feedback_skill_doc(project_id);
+        let skill_id = skill.id;
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::with_docs(vec![skill]));
+        let manager =
+            make_manager_with_dyn_store(MockLlm::text("FINAL('done')"), Arc::clone(&store));
+
+        let thread_id = manager
+            .spawn_thread(
+                "feedback task",
+                ThreadType::Foreground,
+                project_id,
+                ThreadConfig::default(),
+                None,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        let outcome = manager.join_thread(thread_id).await.unwrap();
+
+        assert!(matches!(outcome, ThreadOutcome::Completed { .. }));
+        let skill = store.load_memory_doc(skill_id).await.unwrap().unwrap();
+        let metadata: lunarwing_skills::v2::V2SkillMetadata =
+            serde_json::from_value(skill.metadata).unwrap();
+        assert_eq!(metadata.metrics.usage_count, 1);
+        assert_eq!(metadata.metrics.success_count, 1);
+        assert_eq!(metadata.metrics.failure_count, 0);
+        let thread = store.load_thread(thread_id).await.unwrap().unwrap();
+        assert!(
+            thread
+                .metadata
+                .get(crate::runtime::skill_feedback::ACTIVE_SKILL_DOC_IDS_METADATA_KEY)
+                .is_none()
+        );
+    }
 }

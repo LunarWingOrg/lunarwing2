@@ -6,12 +6,12 @@
 
 use std::sync::Arc;
 
-use lunarwing_skills::SkillTrust;
 use lunarwing_skills::v2::{
-    DEFAULT_DEMOTE_CONFIDENCE, DEFAULT_DEMOTE_MIN_USAGE, MAX_PATCH_HISTORY, PendingSkillPatch,
-    PendingSkillPrune, PendingSkillUpdate, SkillPatch, V2SkillMetadata, V2SkillSource,
-    compute_content_hash,
+    AUTOMATIC_DEMOTION_REASON_PREFIX, CodeSnippet, DEFAULT_DEMOTE_CONFIDENCE,
+    DEFAULT_DEMOTE_MIN_USAGE, MAX_PATCH_HISTORY, PendingSkillPatch, PendingSkillPrune,
+    PendingSkillUpdate, SkillPatch, V2SkillMetadata, V2SkillSource, compute_content_hash,
 };
+use lunarwing_skills::{ActivationCriteria, SkillTrust};
 
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
@@ -33,6 +33,16 @@ impl SkillTracker {
     /// and saves it back. If the doc is not found or has invalid metadata,
     /// the error is logged and the operation is skipped.
     pub async fn record_usage(&self, doc_id: DocId, success: bool) -> Result<(), EngineError> {
+        self.record_usage_with_gate(doc_id, success, crate::skill_self_improvement_enabled())
+            .await
+    }
+
+    async fn record_usage_with_gate(
+        &self,
+        doc_id: DocId,
+        success: bool,
+        self_improvement_enabled: bool,
+    ) -> Result<(), EngineError> {
         let doc = self
             .store
             .load_memory_doc(doc_id)
@@ -66,15 +76,16 @@ impl SkillTracker {
         // demotion — it excludes the skill from auto-activation going forward.
         // Pruning (archival) stays propose→approve (never auto-destructive).
         // Authored and Installed skills are exempt (is_demote_candidate checks).
-        if crate::skill_self_improvement_enabled()
+        if self_improvement_enabled
             && meta.deprecated_at.is_none()
             && meta.is_demote_candidate(DEFAULT_DEMOTE_CONFIDENCE, DEFAULT_DEMOTE_MIN_USAGE)
         {
             let conf = meta.metrics.confidence();
             meta.deprecated_at = Some(chrono::Utc::now());
+            meta.automatic_demotion = true;
             meta.deprecation_reason = format!(
-                "auto-demoted: confidence {:.2} below demotion floor {:.2} over {} uses",
-                conf, DEFAULT_DEMOTE_CONFIDENCE, meta.metrics.usage_count
+                "{AUTOMATIC_DEMOTION_REASON_PREFIX} confidence {:.2} below demotion floor {:.2} over {} uses",
+                conf, DEFAULT_DEMOTE_CONFIDENCE, meta.metrics.usage_count,
             );
             tracing::info!(
                 skill_doc = %doc_id.0,
@@ -195,7 +206,9 @@ impl SkillTracker {
             ..doc
         };
 
-        self.store.save_memory_doc(&updated_doc).await
+        self.store.save_memory_doc(&updated_doc).await?;
+        tracing::info!(skill_doc = %doc_id.0, "skill patch proposal staged");
+        Ok(())
     }
 
     /// Apply a skill's pending patch on user approval (B-1).
@@ -258,6 +271,9 @@ impl SkillTracker {
         // ratio below threshold forever, immediately re-tripping the patch
         // trigger and masking whether the patch actually helped. The old
         // counts live on in `metrics_before` above (full audit trail).
+        // A patch starts a new evaluation epoch, so recover skills demoted by
+        // the automatic confidence floor. Explicit operator demotions remain.
+        meta.clear_automatic_demotion();
         meta.metrics.usage_count = 0;
         meta.metrics.success_count = 0;
         meta.metrics.failure_count = 0;
@@ -328,6 +344,7 @@ impl SkillTracker {
         }
         meta.deprecated_at = Some(chrono::Utc::now());
         meta.deprecation_reason = reason;
+        meta.automatic_demotion = false;
         self.save_skill_meta(doc_id, doc, meta).await
     }
 
@@ -339,6 +356,7 @@ impl SkillTracker {
         let mut meta = self.meta_from_doc(doc_id, &doc)?;
         meta.deprecated_at = None;
         meta.deprecation_reason = String::new();
+        meta.automatic_demotion = false;
         self.save_skill_meta(doc_id, doc, meta).await
     }
 
@@ -375,7 +393,9 @@ impl SkillTracker {
             source_thread_id,
             staged_at: chrono::Utc::now(),
         });
-        self.save_skill_meta(doc_id, doc, meta).await
+        self.save_skill_meta(doc_id, doc, meta).await?;
+        tracing::info!(skill_doc = %doc_id.0, "skill prune proposal staged");
+        Ok(())
     }
 
     /// Apply a skill's pending prune on user approval (B-2): archives the skill
@@ -416,6 +436,7 @@ impl SkillTracker {
         &self,
         doc_id: DocId,
         registry_version_available: String,
+        registry_slug: String,
         registry_url: String,
         new_content_hash: String,
     ) -> Result<(), EngineError> {
@@ -423,34 +444,53 @@ impl SkillTracker {
         let mut meta = self.meta_from_doc(doc_id, &doc)?;
         meta.pending_update = Some(PendingSkillUpdate {
             registry_version_available,
+            registry_slug,
             registry_url,
             new_content_hash,
             staged_at: chrono::Utc::now(),
         });
-        self.save_skill_meta(doc_id, doc, meta).await
+        self.save_skill_meta(doc_id, doc, meta).await?;
+        tracing::info!(skill_doc = %doc_id.0, "skill registry update proposal staged");
+        Ok(())
     }
 
-    /// Apply a registry update on user approval (B-3): record the new registry
-    /// version + content hash as provenance, clear the pending update. The
-    /// actual pull + content swap is performed by the caller (the bridge
-    /// re-installs the skill from the registry before calling this to stamp
-    /// provenance). Bumps the skill version (a content change occurred).
+    /// Apply downloaded registry content on user approval (B-3). The staged
+    /// content hash is checked before prompt, activation, and snippets are
+    /// replaced together. Bumps the version and resets the evaluation epoch.
     pub async fn apply_update(
         &self,
         doc_id: DocId,
-        new_registry_version: String,
-        new_content_hash: String,
+        new_content: String,
+        new_description: String,
+        new_activation: ActivationCriteria,
+        new_code_snippets: Vec<CodeSnippet>,
     ) -> Result<(), EngineError> {
         let doc = self.load_skill_doc(doc_id).await?;
         let mut meta = self.meta_from_doc(doc_id, &doc)?;
-        if meta.pending_update.take().is_none() {
-            return Err(EngineError::Skill {
+        let pending = meta
+            .pending_update
+            .take()
+            .ok_or_else(|| EngineError::Skill {
                 reason: format!("skill {} has no pending update to apply", doc_id.0),
+            })?;
+        let new_content_hash = compute_content_hash(&new_content);
+        if !pending.new_content_hash.is_empty() && pending.new_content_hash != new_content_hash {
+            return Err(EngineError::Skill {
+                reason: format!(
+                    "registry content for skill {} changed after the update was staged",
+                    doc_id.0
+                ),
             });
         }
         meta.parent_version = Some(meta.version);
         meta.version += 1;
-        meta.registry_version = Some(new_registry_version);
+        meta.description = new_description;
+        meta.activation = new_activation;
+        meta.code_snippets = new_code_snippets;
+        meta.content_hash = new_content_hash.clone();
+        meta.registry_url = Some(pending.registry_url);
+        meta.registry_slug = Some(pending.registry_slug);
+        meta.registry_version = Some(pending.registry_version_available);
         meta.registry_content_hash = Some(new_content_hash);
         meta.pulled_at = Some(chrono::Utc::now());
         // Epoch-reset metrics: a freshly-updated skill earns a new evaluation
@@ -459,7 +499,17 @@ impl SkillTracker {
         meta.metrics.success_count = 0;
         meta.metrics.failure_count = 0;
         meta.metrics.last_used = None;
-        self.save_skill_meta(doc_id, doc, meta).await
+        meta.clear_automatic_demotion();
+
+        let updated_doc = MemoryDoc {
+            content: new_content,
+            metadata: serde_json::to_value(&meta).map_err(|e| EngineError::Skill {
+                reason: format!("failed to serialize skill metadata: {e}"),
+            })?,
+            updated_at: chrono::Utc::now(),
+            ..doc
+        };
+        self.store.save_memory_doc(&updated_doc).await
     }
 
     /// Discard a pending registry update on user rejection (B-3). Leaves the
@@ -472,6 +522,27 @@ impl SkillTracker {
                 reason: format!("skill {} has no pending update to discard", doc_id.0),
             });
         }
+        self.save_skill_meta(doc_id, doc, meta).await
+    }
+
+    /// Record registry provenance after a successful explicit publish (B-3).
+    pub async fn stamp_published_provenance(
+        &self,
+        doc_id: DocId,
+        registry_url: String,
+        registry_slug: String,
+        registry_version: String,
+    ) -> Result<(), EngineError> {
+        let doc = self.load_skill_doc(doc_id).await?;
+        let mut meta = self.meta_from_doc(doc_id, &doc)?;
+        meta.registry_url = Some(registry_url);
+        meta.registry_publisher = registry_slug
+            .split_once('/')
+            .map(|(publisher, _)| publisher.to_string());
+        meta.registry_slug = Some(registry_slug);
+        meta.registry_version = Some(registry_version);
+        meta.registry_content_hash = Some(compute_content_hash(&doc.content));
+        meta.published_at = Some(chrono::Utc::now());
         self.save_skill_meta(doc_id, doc, meta).await
     }
 
@@ -800,6 +871,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_apply_pending_patch_reactivates_auto_demoted_skill() {
+        let project_id = ProjectId::new();
+        let mut doc = make_skill_doc_trust(project_id, SkillTrust::Trusted);
+        let mut meta: V2SkillMetadata = serde_json::from_value(doc.metadata.clone()).unwrap();
+        meta.deprecated_at = Some(chrono::Utc::now());
+        meta.deprecation_reason =
+            format!("{AUTOMATIC_DEMOTION_REASON_PREFIX} confidence below floor");
+        meta.automatic_demotion = true;
+        doc.metadata = serde_json::to_value(meta).unwrap();
+
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+        tracker
+            .propose_patch(
+                doc_id,
+                "patched body".to_string(),
+                String::new(),
+                "recover".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        tracker.apply_pending_patch(doc_id).await.unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert!(meta.deprecated_at.is_none());
+        assert!(meta.deprecation_reason.is_empty());
+        assert!(!meta.automatic_demotion);
+    }
+
+    #[tokio::test]
+    async fn test_apply_pending_patch_preserves_operator_demotion() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc_trust(project_id, SkillTrust::Trusted);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+        tracker
+            .demote_skill(doc_id, "operator hold".to_string())
+            .await
+            .unwrap();
+        tracker
+            .propose_patch(
+                doc_id,
+                "patched body".to_string(),
+                String::new(),
+                "maintenance".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        tracker.apply_pending_patch(doc_id).await.unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert!(meta.deprecated_at.is_some());
+        assert_eq!(meta.deprecation_reason, "operator hold");
+        assert!(!meta.automatic_demotion);
+    }
+
+    #[tokio::test]
     async fn test_apply_pending_patch_refuses_on_content_drift() {
         let project_id = ProjectId::new();
         let doc = make_skill_doc_trust(project_id, SkillTrust::Trusted);
@@ -882,6 +1016,7 @@ mod tests {
         let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
         assert!(meta.deprecated_at.is_some());
         assert_eq!(meta.deprecation_reason, "low confidence");
+        assert!(!meta.automatic_demotion);
     }
 
     #[tokio::test]
@@ -923,6 +1058,7 @@ mod tests {
         let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
         assert!(meta.deprecated_at.is_none());
         assert!(meta.deprecation_reason.is_empty());
+        assert!(!meta.automatic_demotion);
     }
 
     #[tokio::test]
@@ -1039,7 +1175,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_usage_inline_demotes_below_floor() {
-        unsafe { std::env::set_var("SKILL_SELF_IMPROVEMENT", "true"); }
         // Start with a Trusted Extracted skill at 1 success / 8 failures over 9
         // uses (confidence ~0.11, below the 0.3 demotion floor). record_usage
         // with a further failure should trip inline demotion.
@@ -1057,7 +1192,10 @@ mod tests {
         let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
         let tracker = SkillTracker::new(store.clone());
 
-        tracker.record_usage(doc_id, false).await.unwrap();
+        tracker
+            .record_usage_with_gate(doc_id, false, true)
+            .await
+            .unwrap();
 
         let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
         let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
@@ -1066,6 +1204,7 @@ mod tests {
             "should be auto-demoted below floor"
         );
         assert!(!meta.deprecation_reason.is_empty());
+        assert!(meta.automatic_demotion);
     }
 
     #[tokio::test]
@@ -1114,5 +1253,127 @@ mod tests {
             meta.deprecated_at.is_none(),
             "authored skills are exempt from demotion"
         );
+    }
+
+    #[tokio::test]
+    async fn test_apply_update_replaces_registry_content_and_metadata() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+        let new_content = "Updated prompt".to_string();
+        tracker
+            .propose_update(
+                doc_id,
+                "2.0.0".to_string(),
+                "owner/test-skill".to_string(),
+                "https://registry.example".to_string(),
+                compute_content_hash(&new_content),
+            )
+            .await
+            .unwrap();
+
+        let activation = ActivationCriteria {
+            keywords: vec!["updated".to_string()],
+            ..Default::default()
+        };
+        let snippets = vec![CodeSnippet {
+            name: "helper".to_string(),
+            code: "def helper(): return 2".to_string(),
+            description: String::new(),
+        }];
+        tracker
+            .apply_update(
+                doc_id,
+                new_content.clone(),
+                "Updated description".to_string(),
+                activation,
+                snippets,
+            )
+            .await
+            .unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert_eq!(updated.content, new_content);
+        assert_eq!(meta.version, 2);
+        assert_eq!(meta.description, "Updated description");
+        assert_eq!(meta.activation.keywords, vec!["updated"]);
+        assert_eq!(meta.code_snippets.len(), 1);
+        assert_eq!(meta.registry_slug.as_deref(), Some("owner/test-skill"));
+        assert_eq!(meta.registry_version.as_deref(), Some("2.0.0"));
+        assert!(meta.pending_update.is_none());
+        assert_eq!(meta.metrics.usage_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_apply_update_rejects_registry_content_drift() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+        tracker
+            .propose_update(
+                doc_id,
+                "2.0.0".to_string(),
+                "owner/test-skill".to_string(),
+                "https://registry.example".to_string(),
+                compute_content_hash("staged prompt"),
+            )
+            .await
+            .unwrap();
+
+        let result = tracker
+            .apply_update(
+                doc_id,
+                "different prompt".to_string(),
+                String::new(),
+                ActivationCriteria::default(),
+                Vec::new(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        let unchanged = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(unchanged.metadata).unwrap();
+        assert_eq!(unchanged.content, "Test skill prompt");
+        assert!(meta.pending_update.is_some());
+        assert_eq!(meta.version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_stamp_published_provenance_records_registry_identity() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id);
+        let doc_id = doc.id;
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        tracker
+            .stamp_published_provenance(
+                doc_id,
+                "https://registry.example".to_string(),
+                "alice/test-skill".to_string(),
+                "1.2.3".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert_eq!(
+            meta.registry_url.as_deref(),
+            Some("https://registry.example")
+        );
+        assert_eq!(meta.registry_publisher.as_deref(), Some("alice"));
+        assert_eq!(meta.registry_slug.as_deref(), Some("alice/test-skill"));
+        assert_eq!(meta.registry_version.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            meta.registry_content_hash.as_deref(),
+            Some(compute_content_hash("Test skill prompt").as_str())
+        );
+        assert!(meta.published_at.is_some());
     }
 }

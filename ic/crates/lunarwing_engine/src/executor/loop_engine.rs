@@ -1750,4 +1750,61 @@ mod tests {
         // A user stop must not clear orchestrator failure history.
         assert_eq!(failure_count(&store, project_id).await, 2);
     }
+
+    // ── Skill-feedback ID transport tests ──────────────────────
+
+    /// Build a MemoryDoc whose V2 metadata keywords match the default test
+    /// goal `"test goal"` so the Python orchestrator's `select_skills`
+    /// deterministically selects it.
+    fn make_selectable_skill(project_id: ProjectId) -> crate::types::memory::MemoryDoc {
+        use lunarwing_skills::SkillTrust;
+        use lunarwing_skills::types::ActivationCriteria;
+        use lunarwing_skills::v2::{SkillMetrics, V2SkillMetadata, V2SkillSource};
+
+        let metadata = V2SkillMetadata {
+            name: "feedback-skill".into(),
+            activation: ActivationCriteria {
+                keywords: vec!["test".into()],
+                ..Default::default()
+            },
+            source: V2SkillSource::Extracted,
+            trust: SkillTrust::Trusted,
+            metrics: SkillMetrics::default(),
+            ..serde_json::from_str::<V2SkillMetadata>("{}").unwrap()
+        };
+        let mut doc = crate::types::memory::MemoryDoc::new(
+            project_id,
+            "test-user",
+            crate::types::memory::DocType::Skill,
+            "skill:feedback-skill",
+            "Use this deterministic test skill.",
+        );
+        doc.metadata = serde_json::to_value(metadata).unwrap();
+        doc
+    }
+
+    #[tokio::test]
+    async fn default_orchestrator_persists_activated_skill_doc_ids() {
+        let llm = Arc::new(MockLlm::new(vec![text_response("FINAL('done')")]));
+        let (exec, _signal_tx) = make_loop_with_llm(llm, Vec::new(), ThreadConfig::default()).await;
+        let project_id = exec.thread.project_id;
+        let skill = make_selectable_skill(project_id);
+        let skill_id = skill.id.0.to_string();
+        let store: Arc<dyn crate::traits::store::Store> =
+            Arc::new(crate::tests::InMemoryStore::with_docs(vec![skill]));
+        let mut exec = exec.with_store(store);
+
+        let outcome = exec
+            .run()
+            .await
+            .expect("default orchestrator should complete");
+
+        assert!(matches!(outcome, ThreadOutcome::Completed { .. }));
+        assert_eq!(
+            exec.thread
+                .metadata
+                .get(crate::runtime::skill_feedback::ACTIVE_SKILL_DOC_IDS_METADATA_KEY),
+            Some(&serde_json::json!([skill_id]))
+        );
+    }
 }

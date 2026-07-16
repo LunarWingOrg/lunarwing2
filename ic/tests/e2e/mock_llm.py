@@ -90,6 +90,39 @@ TOOL_CALL_PATTERNS = [
     ),
 ]
 
+ENGINE_V2_STREAM_TEXT = "e2e-engine-v2-stream-text"
+ENGINE_V2_APPROVAL = "e2e-engine-v2-approval"
+ENGINE_V2_AUTH = "e2e-engine-v2-auth"
+ENGINE_V2_LONG_STREAM = "e2e-engine-v2-long-stream"
+ENGINE_V2_RECOVERY = "e2e-engine-v2-recovery"
+
+
+def _new_engine_v2_state() -> dict:
+    return {
+        "calls": {
+            "stream_text": 0,
+            "approval": 0,
+            "auth": 0,
+            "long_stream": 0,
+            "recovery": 0,
+        }
+    }
+
+
+def _engine_v2_path(messages: list[dict]) -> str | None:
+    content = _last_user_content(messages)
+    sentinels = (
+        (ENGINE_V2_STREAM_TEXT, "stream_text"),
+        (ENGINE_V2_APPROVAL, "approval"),
+        (ENGINE_V2_AUTH, "auth"),
+        (ENGINE_V2_LONG_STREAM, "long_stream"),
+        (ENGINE_V2_RECOVERY, "recovery"),
+    )
+    for sentinel, path in sentinels:
+        if sentinel in content:
+            return path
+    return None
+
 
 def _new_oauth_state() -> dict:
     return {
@@ -184,6 +217,18 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     has_tools = bool(body.get("tools"))
     cid = f"mock-{uuid.uuid4().hex[:8]}"
 
+    engine_v2_path = _engine_v2_path(messages)
+    if engine_v2_path is not None:
+        request.app["engine_v2_state"]["calls"][engine_v2_path] += 1
+        return await _engine_v2_completion(
+            request,
+            messages,
+            stream,
+            has_tools,
+            cid,
+            engine_v2_path,
+        )
+
     # Tool result in messages -> text summary
     tr = _find_tool_result(messages)
     if tr:
@@ -204,6 +249,77 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     if not stream:
         return _text_response(cid, text)
     return await _stream_text(request, cid, text)
+
+
+async def _engine_v2_completion(
+    request: web.Request,
+    messages: list[dict],
+    stream: bool,
+    has_tools: bool,
+    cid: str,
+    path: str,
+) -> web.StreamResponse:
+    tool_result = _find_tool_result(messages)
+
+    if path == "stream_text":
+        text = "engine-v2 partial streaming complete"
+        if not stream:
+            return _text_response(cid, text)
+        return await _stream_scripted_text(
+            request,
+            cid,
+            ["engine-v2 partial ", "streaming complete"],
+            delay_after_first=0.4,
+        )
+
+    if path == "approval":
+        if tool_result is not None:
+            text = "engine-v2 approval complete"
+            if not stream:
+                return _text_response(cid, text)
+            return await _stream_scripted_text(request, cid, [text])
+        tool_call = {
+            "tool_name": "tool_install",
+            "arguments": {
+                "name": "engine-v2-approved-tool",
+                "kind": "mcp_server",
+                "transport": "stdio",
+                "command": "/bin/true",
+                "args": [],
+                "env": {},
+            },
+        }
+        if not has_tools:
+            return _text_response(cid, "approval tool was unavailable")
+        if not stream:
+            return _tool_call_response(cid, tool_call)
+        return await _stream_tool_call(request, cid, tool_call)
+
+    if path == "auth":
+        if tool_result is not None:
+            text = "engine-v2 authentication complete"
+            if not stream:
+                return _text_response(cid, text)
+            return await _stream_scripted_text(request, cid, [text])
+        tool_call = {
+            "tool_name": "tool_activate",
+            "arguments": {"name": "engine-v2-auth"},
+        }
+        if not has_tools:
+            return _text_response(cid, "authentication tool was unavailable")
+        if not stream:
+            return _tool_call_response(cid, tool_call)
+        return await _stream_tool_call(request, cid, tool_call)
+
+    if path == "long_stream":
+        if not stream:
+            return _text_response(cid, "engine-v2 long terminal should not arrive")
+        return await _stream_long_response(request, cid)
+
+    text = "engine-v2 recovery complete"
+    if not stream:
+        return _text_response(cid, text)
+    return await _stream_scripted_text(request, cid, [text])
 
 
 def _text_response(cid: str, text: str) -> web.Response:
@@ -245,6 +361,84 @@ async def _stream_text(request: web.Request, cid: str, text: str) -> web.StreamR
     chunk["choices"][0]["finish_reason"] = "stop"
     await _send_sse(resp, chunk)
     await resp.write(b"data: [DONE]\n\n")
+    return resp
+
+
+async def _stream_scripted_text(
+    request: web.Request,
+    cid: str,
+    chunks: list[str],
+    delay_after_first: float = 0,
+) -> web.StreamResponse:
+    resp = web.StreamResponse(
+        status=200,
+        headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+    )
+    await resp.prepare(request)
+    base = _make_base(cid)
+    for index, text in enumerate(chunks):
+        chunk = {
+            **base,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": text},
+                "finish_reason": None,
+            }],
+            "usage": None,
+        }
+        await _send_sse(resp, chunk)
+        if index == 0 and delay_after_first > 0:
+            await asyncio.sleep(delay_after_first)
+
+    await _send_sse(resp, {
+        **base,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "usage": None,
+    })
+    output_tokens = sum(len(chunk.split()) for chunk in chunks)
+    await _send_sse(resp, {
+        **base,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": output_tokens,
+            "total_tokens": 10 + output_tokens,
+        },
+    })
+    await resp.write(b"data: [DONE]\n\n")
+    return resp
+
+
+async def _stream_long_response(request: web.Request, cid: str) -> web.StreamResponse:
+    resp = web.StreamResponse(
+        status=200,
+        headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+    )
+    await resp.prepare(request)
+    base = _make_base(cid)
+    await _send_sse(resp, {
+        **base,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": "engine-v2 long partial"},
+            "finish_reason": None,
+        }],
+        "usage": None,
+    })
+    await asyncio.sleep(5)
+    try:
+        await _send_sse(resp, {
+            **base,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": " terminal should not arrive"},
+                "finish_reason": "stop",
+            }],
+            "usage": None,
+        })
+        await resp.write(b"data: [DONE]\n\n")
+    except (ConnectionResetError, RuntimeError):
+        pass
     return resp
 
 
@@ -335,6 +529,15 @@ async def oauth_state_handler(request: web.Request) -> web.Response:
 
 async def oauth_reset(request: web.Request) -> web.Response:
     request.app["oauth_state"] = _new_oauth_state()
+    return web.json_response({"ok": True})
+
+
+async def engine_v2_state_handler(request: web.Request) -> web.Response:
+    return web.json_response(request.app["engine_v2_state"])
+
+
+async def engine_v2_reset(request: web.Request) -> web.Response:
+    request.app["engine_v2_state"] = _new_engine_v2_state()
     return web.json_response({"ok": True})
 
 
@@ -473,6 +676,7 @@ def main():
     args = parser.parse_args()
     app = web.Application()
     app["oauth_state"] = _new_oauth_state()
+    app["engine_v2_state"] = _new_engine_v2_state()
     # Register both /v1/ and non-/v1/ paths (rig-core omits the /v1/ prefix)
     app.router.add_post("/v1/chat/completions", chat_completions)
     app.router.add_post("/chat/completions", chat_completions)
@@ -482,6 +686,8 @@ def main():
     app.router.add_post("/oauth/refresh", oauth_refresh)
     app.router.add_get("/__mock/oauth/state", oauth_state_handler)
     app.router.add_post("/__mock/oauth/reset", oauth_reset)
+    app.router.add_get("/__mock/engine-v2/state", engine_v2_state_handler)
+    app.router.add_post("/__mock/engine-v2/reset", engine_v2_reset)
     # Mock MCP server endpoints
     app.router.add_post("/mcp", mcp_endpoint)
     app.router.add_post("/mcp-400", mcp_endpoint_400)

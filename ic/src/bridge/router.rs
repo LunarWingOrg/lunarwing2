@@ -661,6 +661,8 @@ struct EngineState {
     effect_adapter: Arc<EffectBridgeAdapter>,
     store: Arc<dyn Store>,
     default_project_id: lunarwing_engine::ProjectId,
+    owner_user_id: String,
+    skill_catalog: Arc<lunarwing_skills::catalog::SkillCatalog>,
     /// Unified pending gate store — keyed by (user_id, thread_id).
     pending_gates: Arc<crate::gate::store::PendingGateStore>,
     /// SSE manager for broadcasting AppEvents to the web gateway.
@@ -1203,18 +1205,36 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         debug!("engine v2: pending gate reconciliation failed: {e}");
     }
 
+    let skill_catalog = agent
+        .deps
+        .skill_catalog
+        .as_ref()
+        .map(|catalog| {
+            Arc::new(lunarwing_skills::catalog::SkillCatalog::with_url(
+                catalog.registry_url(),
+            ))
+        })
+        .unwrap_or_else(lunarwing_skills::catalog::shared_catalog);
+
     *guard = Some(EngineState {
         thread_manager,
         conversation_manager,
         effect_adapter,
         store: store.clone(),
         default_project_id: project_id,
+        owner_user_id: owner_id.clone(),
+        skill_catalog,
         pending_gates,
         sse: agent.deps.sse_tx.clone(),
         db: agent.deps.store.clone(),
         secrets_store: agent.tools().secrets_store().cloned(),
         auth_manager,
     });
+    drop(guard);
+
+    if lunarwing_engine::skill_self_improvement_enabled() {
+        start_skill_update_sweep(owner_id.clone());
+    }
 
     Ok(())
 }
@@ -1850,38 +1870,27 @@ pub async fn resolve_gate(
                     ss.create(&message.user_id, params)
                         .await
                         .map_err(|e| engine_err("secrets", e))?;
-
-                    let _ = agent
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::AuthCompleted {
-                                extension_name: credential_name.clone(),
-                                success: true,
-                                message: format!(
-                                    "Credential '{}' stored. Resuming...",
-                                    credential_name
-                                ),
-                            },
-                            &message.metadata,
-                        )
-                        .await;
-
-                    if let Some(ref sse) = state.sse {
-                        sse.broadcast_for_user(
-                            &message.user_id,
-                            AppEvent::AuthCompleted {
-                                extension_name: credential_name.clone(),
-                                success: true,
-                                message: format!(
-                                    "Credential '{}' stored. Resuming...",
-                                    credential_name
-                                ),
-                                thread_id: Some(pending.thread_id.to_string()),
-                            },
-                        );
-                    }
                 }
+
+                // Route completion through the originating channel exactly once.
+                // HTTP auth may already have stored the token before entering this
+                // control path, so completion must not depend on this registry's
+                // optional secrets-store handle.
+                let _ = agent
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::AuthCompleted {
+                            extension_name: credential_name.clone(),
+                            success: true,
+                            message: format!(
+                                "Credential '{}' stored. Resuming...",
+                                credential_name
+                            ),
+                        },
+                        &message.metadata,
+                    )
+                    .await;
 
                 if pending.action_name == "authentication_fallback"
                     && let Some(retry_content) = pending.original_message.clone()
@@ -3886,8 +3895,14 @@ async fn resolve_owned_skill(
     if doc.doc_type != lunarwing_engine::DocType::Skill {
         return Err(engine_err("skill", "doc is not a skill"));
     }
-    // Only the owner (or shared skills) may act on the proposal.
-    if doc.user_id != user_id && !is_shared_owner(&doc.user_id) {
+    // User-owned skills are mutable only by their owner. Shared skills are
+    // instance-wide state and require the configured instance owner.
+    let authorized = if is_shared_owner(&doc.user_id) {
+        user_id == state.owner_user_id
+    } else {
+        doc.user_id == user_id
+    };
+    if !authorized {
         return Err(engine_err("skill", "not authorized for this skill"));
     }
     Ok(did)
@@ -3926,13 +3941,31 @@ pub async fn approve_skill_proposal(
                 .map_err(|e| engine_err("apply skill prune", e))?;
         }
         lunarwing_skills::v2::ProposalKind::Update => {
-            // Update application: the pending proposal carries the version +
-            // hash; applying stamps provenance + bumps version + epoch-resets
-            // metrics. (The actual content pull is a separate on-demand
-            // operation; here we record that the user accepted the update.)
-            let (version, hash) = load_pending_update_info(state, did).await?;
+            let pending = load_pending_update_info(state, did).await?;
+            if pending.registry_url.trim_end_matches('/')
+                != state.skill_catalog.registry_url().trim_end_matches('/')
+            {
+                return Err(engine_err(
+                    "apply skill update",
+                    "pending update registry does not match the configured registry",
+                ));
+            }
+            let replacement = download_registry_replacement(
+                state.skill_catalog.as_ref(),
+                &pending.registry_slug,
+                &pending.skill_name,
+                &pending.registry_version,
+                &pending.existing_snippets,
+            )
+            .await?;
             tracker
-                .apply_update(did, version, hash)
+                .apply_update(
+                    did,
+                    replacement.content,
+                    replacement.description,
+                    replacement.activation,
+                    replacement.code_snippets,
+                )
                 .await
                 .map_err(|e| engine_err("apply skill update", e))?;
         }
@@ -3998,12 +4031,28 @@ async fn load_pending_prune_reason(
         .ok_or_else(|| engine_err("skill", "no pending prune to apply"))
 }
 
-/// Load the staged update (version + hash) for a skill (B-3). Errors if no
-/// update is pending.
+struct PendingRegistryUpdate {
+    skill_name: String,
+    registry_version: String,
+    registry_slug: String,
+    registry_url: String,
+    existing_snippets: Vec<lunarwing_skills::v2::CodeSnippet>,
+}
+
+struct RegistrySkillReplacement {
+    content: String,
+    description: String,
+    activation: lunarwing_skills::ActivationCriteria,
+    code_snippets: Vec<lunarwing_skills::v2::CodeSnippet>,
+    content_hash: String,
+}
+
+/// Load the staged update and current skill identity (B-3). Errors if no update
+/// is pending.
 async fn load_pending_update_info(
     state: &EngineState,
     did: lunarwing_engine::DocId,
-) -> Result<(String, String), Error> {
+) -> Result<PendingRegistryUpdate, Error> {
     let doc = state
         .store
         .load_memory_doc(did)
@@ -4012,9 +4061,104 @@ async fn load_pending_update_info(
         .ok_or_else(|| engine_err("skill", "skill not found"))?;
     let meta: lunarwing_skills::v2::V2SkillMetadata =
         serde_json::from_value(doc.metadata).map_err(|e| engine_err("parse skill meta", e))?;
-    meta.pending_update
-        .map(|u| (u.registry_version_available, u.new_content_hash))
-        .ok_or_else(|| engine_err("skill", "no pending update to apply"))
+    let pending = meta
+        .pending_update
+        .ok_or_else(|| engine_err("skill", "no pending update to apply"))?;
+    Ok(PendingRegistryUpdate {
+        skill_name: meta.name,
+        registry_version: pending.registry_version_available,
+        registry_slug: pending.registry_slug,
+        registry_url: pending.registry_url,
+        existing_snippets: meta.code_snippets,
+    })
+}
+
+async fn download_registry_replacement(
+    catalog: &lunarwing_skills::catalog::SkillCatalog,
+    slug: &str,
+    expected_name: &str,
+    expected_version: &str,
+    existing_snippets: &[lunarwing_skills::v2::CodeSnippet],
+) -> Result<RegistrySkillReplacement, Error> {
+    let downloaded = catalog
+        .download(slug)
+        .await
+        .map_err(|e| engine_err("download skill update", e))?;
+    lunarwing_skills::catalog::SkillCatalog::leak_scan(&downloaded.skill_md_content)
+        .map_err(|e| engine_err("validate skill update", e))?;
+    let parsed = lunarwing_skills::parse_skill_md(&downloaded.skill_md_content)
+        .map_err(|e| engine_err("parse skill update", e))?;
+    if parsed.manifest.name != expected_name {
+        return Err(engine_err(
+            "validate skill update",
+            format!(
+                "registry skill name changed from {expected_name} to {}",
+                parsed.manifest.name
+            ),
+        ));
+    }
+    if parsed.manifest.version != "0.0.0" && parsed.manifest.version != expected_version {
+        return Err(engine_err(
+            "validate skill update",
+            format!(
+                "registry manifest version {} does not match staged version {expected_version}",
+                parsed.manifest.version
+            ),
+        ));
+    }
+
+    let mut descriptions = std::collections::HashMap::new();
+    for snippet in existing_snippets {
+        descriptions.insert(snippet.name.as_str(), snippet.description.as_str());
+    }
+    let mut code_snippets = Vec::new();
+    let mut snippet_names = std::collections::HashSet::new();
+    for (file_name, code) in downloaded.code_snippet_files {
+        lunarwing_skills::catalog::SkillCatalog::leak_scan(&code)
+            .map_err(|e| engine_err("validate skill update snippet", e))?;
+        let name = file_name
+            .strip_suffix(".py")
+            .ok_or_else(|| engine_err("validate skill update", "snippet file must end in .py"))?;
+        if !is_python_identifier(name) {
+            return Err(engine_err(
+                "validate skill update",
+                format!("snippet file name is not a Python identifier: {file_name}"),
+            ));
+        }
+        if !snippet_names.insert(name.to_string()) {
+            return Err(engine_err(
+                "validate skill update",
+                format!("duplicate snippet identifier in registry archive: {name}"),
+            ));
+        }
+        code_snippets.push(lunarwing_skills::v2::CodeSnippet {
+            name: name.to_string(),
+            code,
+            description: descriptions
+                .get(name)
+                .copied()
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+
+    let content_hash = lunarwing_skills::v2::compute_content_hash(&parsed.prompt_content);
+    Ok(RegistrySkillReplacement {
+        content: parsed.prompt_content,
+        description: parsed.manifest.description,
+        activation: parsed.manifest.activation,
+        code_snippets,
+        content_hash,
+    })
+}
+
+fn is_python_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 // ── B-1 back-compat wrappers (keep the old patch-only names working) ──────
@@ -4141,7 +4285,7 @@ pub async fn publish_skill(
         version: version.to_string(),
         changelog: changelog.to_string(),
         tags,
-        skill_md_content: doc.content.clone(),
+        skill_md_content: render_registry_skill_md(&meta, version, &doc.content)?,
         code_snippet_files: meta
             .code_snippets
             .iter()
@@ -4149,16 +4293,27 @@ pub async fn publish_skill(
             .collect(),
     };
 
-    let catalog = lunarwing_skills::catalog::shared_catalog();
-    match catalog.publish(&req, &token).await {
-        Ok(resp) => Ok(SkillPublishResult {
-            ok: true,
-            slug: slug.to_string(),
-            version: version.to_string(),
-            skill_id: Some(resp.skill_id),
-            version_id: Some(resp.version_id),
-            error: None,
-        }),
+    match state.skill_catalog.publish(&req, &token).await {
+        Ok(resp) => {
+            let tracker = lunarwing_engine::memory::SkillTracker::new(Arc::clone(&state.store));
+            tracker
+                .stamp_published_provenance(
+                    did,
+                    state.skill_catalog.registry_url().to_string(),
+                    slug.to_string(),
+                    version.to_string(),
+                )
+                .await
+                .map_err(|e| engine_err("record published skill provenance", e))?;
+            Ok(SkillPublishResult {
+                ok: true,
+                slug: slug.to_string(),
+                version: version.to_string(),
+                skill_id: Some(resp.skill_id),
+                version_id: Some(resp.version_id),
+                error: None,
+            })
+        }
         Err(e) => Ok(SkillPublishResult {
             ok: false,
             slug: slug.to_string(),
@@ -4168,6 +4323,151 @@ pub async fn publish_skill(
             error: Some(e.to_string()),
         }),
     }
+}
+
+fn render_registry_skill_md(
+    meta: &lunarwing_skills::v2::V2SkillMetadata,
+    version: &str,
+    prompt_content: &str,
+) -> Result<String, Error> {
+    let manifest = lunarwing_skills::SkillManifest {
+        name: meta.name.clone(),
+        version: version.to_string(),
+        description: meta.description.clone(),
+        activation: meta.activation.clone(),
+        credentials: Vec::new(),
+        metadata: None,
+    };
+    let yaml = serde_norway::to_string(&manifest)
+        .map_err(|e| engine_err("render registry skill manifest", e))?;
+    Ok(format!("---\n{yaml}---\n\n{prompt_content}"))
+}
+
+const SKILL_UPDATE_SWEEP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+const MAX_SKILL_UPDATE_CHECKS_PER_SWEEP: usize = 64;
+
+fn start_skill_update_sweep(user_id: String) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(SKILL_UPDATE_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if !lunarwing_engine::skill_self_improvement_enabled() {
+                continue;
+            }
+            match stage_registry_updates_for_user(&user_id).await {
+                Ok(count) if count > 0 => {
+                    tracing::info!(count, "staged registry skill update proposals");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "registry skill update sweep failed");
+                }
+            }
+        }
+    });
+}
+
+async fn stage_registry_updates_for_user(user_id: &str) -> Result<usize, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Ok(0);
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Ok(0);
+    };
+    let store = Arc::clone(&state.store);
+    let catalog = Arc::clone(&state.skill_catalog);
+    let project_id = state.default_project_id;
+    drop(guard);
+
+    stage_registry_updates(store, catalog.as_ref(), project_id, user_id).await
+}
+
+async fn stage_registry_updates(
+    store: Arc<dyn Store>,
+    catalog: &lunarwing_skills::catalog::SkillCatalog,
+    project_id: lunarwing_engine::ProjectId,
+    user_id: &str,
+) -> Result<usize, Error> {
+    let docs = store
+        .list_memory_docs_with_shared(project_id, user_id)
+        .await
+        .map_err(|e| engine_err("list registry skills", e))?;
+    let tracker = lunarwing_engine::memory::SkillTracker::new(Arc::clone(&store));
+    let mut seen = std::collections::HashSet::new();
+    let mut checked = 0;
+    let mut staged = 0;
+
+    for doc in docs {
+        if checked >= MAX_SKILL_UPDATE_CHECKS_PER_SWEEP {
+            break;
+        }
+        if doc.doc_type != lunarwing_engine::DocType::Skill || !seen.insert(doc.id.0) {
+            continue;
+        }
+        let Ok(meta) =
+            serde_json::from_value::<lunarwing_skills::v2::V2SkillMetadata>(doc.metadata.clone())
+        else {
+            continue;
+        };
+        if meta.trust != lunarwing_skills::SkillTrust::Installed
+            || meta.archived_at.is_some()
+            || meta.pending_update.is_some()
+        {
+            continue;
+        }
+        let (Some(slug), Some(current_version)) = (
+            meta.registry_slug.as_deref(),
+            meta.registry_version.as_deref(),
+        ) else {
+            continue;
+        };
+        checked += 1;
+
+        let update = match catalog
+            .check_for_update(slug, current_version, meta.registry_content_hash.as_deref())
+            .await
+        {
+            Ok(Some(update)) if !update.version.trim().is_empty() => update,
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::debug!(skill = %meta.name, %error, "skill update check failed");
+                continue;
+            }
+        };
+        let replacement = match download_registry_replacement(
+            catalog,
+            slug,
+            &meta.name,
+            &update.version,
+            &meta.code_snippets,
+        )
+        .await
+        {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                tracing::debug!(skill = %meta.name, %error, "skill update validation failed");
+                continue;
+            }
+        };
+        if let Err(error) = tracker
+            .propose_update(
+                doc.id,
+                update.version,
+                slug.to_string(),
+                update.registry_url,
+                replacement.content_hash,
+            )
+            .await
+        {
+            tracing::debug!(skill = %meta.name, %error, "failed to stage skill update");
+            continue;
+        }
+        staged += 1;
+    }
+    Ok(staged)
 }
 
 /// Pause a mission.
@@ -4335,6 +4635,7 @@ mod tests {
     struct TestStore {
         conversations: TokioRwLock<Vec<lunarwing_engine::ConversationSurface>>,
         threads: TokioRwLock<HashMap<lunarwing_engine::ThreadId, lunarwing_engine::Thread>>,
+        docs: TokioRwLock<HashMap<lunarwing_engine::DocId, lunarwing_engine::MemoryDoc>>,
     }
 
     impl TestStore {
@@ -4342,6 +4643,7 @@ mod tests {
             Self {
                 conversations: TokioRwLock::new(Vec::new()),
                 threads: TokioRwLock::new(HashMap::new()),
+                docs: TokioRwLock::new(HashMap::new()),
             }
         }
     }
@@ -4460,22 +4762,30 @@ mod tests {
         }
         async fn save_memory_doc(
             &self,
-            _: &lunarwing_engine::MemoryDoc,
+            doc: &lunarwing_engine::MemoryDoc,
         ) -> Result<(), lunarwing_engine::EngineError> {
+            self.docs.write().await.insert(doc.id, doc.clone());
             Ok(())
         }
         async fn load_memory_doc(
             &self,
-            _: lunarwing_engine::DocId,
+            id: lunarwing_engine::DocId,
         ) -> Result<Option<lunarwing_engine::MemoryDoc>, lunarwing_engine::EngineError> {
-            Ok(None)
+            Ok(self.docs.read().await.get(&id).cloned())
         }
         async fn list_memory_docs(
             &self,
-            _: lunarwing_engine::ProjectId,
-            _user_id: &str,
+            project_id: lunarwing_engine::ProjectId,
+            user_id: &str,
         ) -> Result<Vec<lunarwing_engine::MemoryDoc>, lunarwing_engine::EngineError> {
-            Ok(vec![])
+            Ok(self
+                .docs
+                .read()
+                .await
+                .values()
+                .filter(|doc| doc.project_id == project_id && doc.user_id == user_id)
+                .cloned()
+                .collect())
         }
         async fn save_lease(
             &self,
@@ -4809,12 +5119,152 @@ mod tests {
             effect_adapter,
             store: store_dyn,
             default_project_id: lunarwing_engine::ProjectId::new(),
+            owner_user_id: "alice".to_string(),
+            skill_catalog: lunarwing_skills::catalog::shared_catalog(),
             pending_gates: Arc::new(crate::gate::store::PendingGateStore::in_memory()),
             sse: None,
             db: None,
             secrets_store: None,
             auth_manager: None,
         }
+    }
+
+    async fn serve_registry_responses(responses: Vec<(&'static str, Vec<u8>)>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind registry test server");
+        let address = listener.local_addr().expect("registry test address");
+        tokio::spawn(async move {
+            for (content_type, body) in responses {
+                let (mut socket, _) = listener.accept().await.expect("accept registry request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket
+                        .read(&mut buffer)
+                        .await
+                        .expect("read registry request");
+                    assert!(read > 0, "registry request ended before headers");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("write registry response headers");
+                socket
+                    .write_all(&body)
+                    .await
+                    .expect("write registry response body");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[test]
+    fn b3_published_skill_manifest_round_trips_through_parser() {
+        let meta = lunarwing_skills::v2::V2SkillMetadata {
+            name: "publishable-skill".to_string(),
+            description: "A publishable skill".to_string(),
+            activation: lunarwing_skills::ActivationCriteria {
+                keywords: vec!["publish".to_string()],
+                ..Default::default()
+            },
+            ..serde_json::from_str("{}").unwrap()
+        };
+
+        let rendered = render_registry_skill_md(&meta, "1.2.3", "Follow these instructions.\n")
+            .expect("render skill");
+        let parsed = lunarwing_skills::parse_skill_md(&rendered).expect("parse rendered skill");
+
+        assert_eq!(parsed.manifest.name, "publishable-skill");
+        assert_eq!(parsed.manifest.version, "1.2.3");
+        assert_eq!(parsed.manifest.description, "A publishable skill");
+        assert_eq!(parsed.manifest.activation.keywords, vec!["publish"]);
+        assert_eq!(parsed.prompt_content, "Follow these instructions.\n");
+    }
+
+    #[tokio::test]
+    async fn b3_shared_skill_mutation_requires_instance_owner() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(Arc::clone(&store));
+        let doc = lunarwing_engine::MemoryDoc::new(
+            state.default_project_id,
+            shared_owner_id(),
+            lunarwing_engine::DocType::Skill,
+            "skill:shared",
+            "shared prompt",
+        );
+        let doc_id = doc.id;
+        store.save_memory_doc(&doc).await.unwrap();
+
+        assert!(
+            resolve_owned_skill(&state, &doc_id.0.to_string(), "bob")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            resolve_owned_skill(&state, &doc_id.0.to_string(), "alice")
+                .await
+                .unwrap(),
+            doc_id
+        );
+    }
+
+    #[tokio::test]
+    async fn b3_registry_update_sweep_stages_valid_downloaded_content() {
+        let resolve = br#"{"latestVersion":{"version":"2.0.0"}}"#.to_vec();
+        let skill_md = b"---\nname: registry-skill\nversion: 2.0.0\ndescription: Updated\n---\n\nUpdated prompt.\n".to_vec();
+        let registry_url = serve_registry_responses(vec![
+            ("application/json", resolve),
+            ("text/markdown", skill_md),
+        ])
+        .await;
+        let catalog = lunarwing_skills::catalog::SkillCatalog::with_url(&registry_url);
+        let project_id = lunarwing_engine::ProjectId::new();
+        let store = Arc::new(TestStore::new());
+        let meta = lunarwing_skills::v2::V2SkillMetadata {
+            name: "registry-skill".to_string(),
+            source: lunarwing_skills::v2::V2SkillSource::Migrated,
+            trust: lunarwing_skills::SkillTrust::Installed,
+            registry_url: Some(registry_url),
+            registry_slug: Some("owner/registry-skill".to_string()),
+            registry_version: Some("1.0.0".to_string()),
+            registry_content_hash: Some(lunarwing_skills::v2::compute_content_hash("Old prompt.")),
+            ..serde_json::from_str("{}").unwrap()
+        };
+        let mut doc = lunarwing_engine::MemoryDoc::new(
+            project_id,
+            "alice",
+            lunarwing_engine::DocType::Skill,
+            "skill:registry-skill",
+            "Old prompt.",
+        );
+        let doc_id = doc.id;
+        doc.metadata = serde_json::to_value(meta).unwrap();
+        store.save_memory_doc(&doc).await.unwrap();
+        let store_dyn: Arc<dyn Store> = store.clone();
+
+        let staged = stage_registry_updates(store_dyn, &catalog, project_id, "alice")
+            .await
+            .unwrap();
+
+        assert_eq!(staged, 1);
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: lunarwing_skills::v2::V2SkillMetadata =
+            serde_json::from_value(updated.metadata).unwrap();
+        let pending = meta.pending_update.expect("update proposal staged");
+        assert_eq!(pending.registry_version_available, "2.0.0");
+        assert_eq!(pending.registry_slug, "owner/registry-skill");
+        assert_eq!(
+            pending.new_content_hash,
+            lunarwing_skills::v2::compute_content_hash("Updated prompt.\n")
+        );
     }
 
     /// find_most_recent_thread returns the active thread when one exists.
@@ -5756,6 +6206,8 @@ mod tests {
             effect_adapter,
             store: store_dyn,
             default_project_id: lunarwing_engine::ProjectId::new(),
+            owner_user_id: "alice".to_string(),
+            skill_catalog: lunarwing_skills::catalog::shared_catalog(),
             pending_gates: Arc::new(crate::gate::store::PendingGateStore::in_memory()),
             sse: None,
             db: None,
@@ -5852,5 +6304,471 @@ mod tests {
             state.thread_manager.join_thread(tid_b),
         )
         .await;
+    }
+
+    // ── Phase 5: explicit DarkIRC / WeeChat scope isolation ─────
+
+    #[tokio::test]
+    async fn darkirc_dm_scopes_do_not_cross_match_controls() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+
+        let scope_a = "darkirc:dm:user-a";
+        let scope_b = "darkirc:dm:user-b";
+
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation(
+                &engine_conversation_key(
+                    &IncomingMessage::new("darkirc", "alice", "hi")
+                        .with_conversation_scope(scope_a),
+                ),
+                "alice",
+            )
+            .await
+            .unwrap();
+        let conv_b = state
+            .conversation_manager
+            .get_or_create_conversation(
+                &engine_conversation_key(
+                    &IncomingMessage::new("darkirc", "alice", "hi")
+                        .with_conversation_scope(scope_b),
+                ),
+                "alice",
+            )
+            .await
+            .unwrap();
+
+        let approval_a = gate_in_conversation(
+            "alice",
+            "darkirc",
+            conv_a,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let tid_a = approval_a.thread_id;
+        let req_a = approval_a.request_id;
+        state.pending_gates.insert(approval_a).await.unwrap();
+
+        state
+            .pending_gates
+            .insert(gate_in_conversation(
+                "alice",
+                "darkirc",
+                conv_b,
+                lunarwing_engine::ResumeKind::Approval { allow_always: true },
+            ))
+            .await
+            .unwrap();
+
+        state
+            .pending_gates
+            .insert(gate_in_conversation(
+                "alice",
+                "darkirc",
+                conv_a,
+                lunarwing_engine::ResumeKind::Authentication {
+                    credential_name: "github".into(),
+                    instructions: "paste token".into(),
+                    auth_url: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        // An approval scoped to scope_a with an explicit request_id must not
+        // resolve the gate in scope_b.
+        let msg_a =
+            IncomingMessage::new("darkirc", "alice", "yes").with_conversation_scope(scope_a);
+        let matched = matching_engine_approval_gate(&state, &msg_a, Some(req_a)).await;
+        assert_eq!(
+            matched.map(|gate| gate.thread_id),
+            Some(tid_a),
+            "exact request_id from scope_a must match only scope_a's gate"
+        );
+
+        let msg_b =
+            IncomingMessage::new("darkirc", "alice", "yes").with_conversation_scope(scope_b);
+        let matched_b = matching_engine_approval_gate(&state, &msg_b, Some(req_a)).await;
+        assert!(
+            matched_b.is_none(),
+            "request_id from scope_a must not resolve a gate in scope_b"
+        );
+
+        // An auth token from scope_a must leave scope_b's pending auth gate
+        // unresolved.
+        let auth_resolution_a = matching_engine_auth_gate(&state, &msg_a).await;
+        assert!(
+            matches!(auth_resolution_a, PendingGateResolution::Resolved(_)),
+            "scope_a should find its own auth gate"
+        );
+
+        // scope_b has no auth gate, so it should resolve to None.
+        let auth_resolution_b = matching_engine_auth_gate(&state, &msg_b).await;
+        assert!(
+            matches!(auth_resolution_b, PendingGateResolution::None),
+            "scope_b should not resolve scope_a's auth gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn weechat_dm_and_group_scopes_do_not_cross_match_controls() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+
+        let scope_dm = "weechat:dm:buddy";
+        let scope_group = "weechat:group:#room";
+
+        let conv_dm = state
+            .conversation_manager
+            .get_or_create_conversation(
+                &engine_conversation_key(
+                    &IncomingMessage::new("weechat", "alice", "hi")
+                        .with_conversation_scope(scope_dm),
+                ),
+                "alice",
+            )
+            .await
+            .unwrap();
+        let conv_group = state
+            .conversation_manager
+            .get_or_create_conversation(
+                &engine_conversation_key(
+                    &IncomingMessage::new("weechat", "alice", "hi")
+                        .with_conversation_scope(scope_group),
+                ),
+                "alice",
+            )
+            .await
+            .unwrap();
+
+        let approval_dm = gate_in_conversation(
+            "alice",
+            "weechat",
+            conv_dm,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let tid_dm = approval_dm.thread_id;
+        let req_dm = approval_dm.request_id;
+        state.pending_gates.insert(approval_dm).await.unwrap();
+
+        state
+            .pending_gates
+            .insert(gate_in_conversation(
+                "alice",
+                "weechat",
+                conv_group,
+                lunarwing_engine::ResumeKind::Approval { allow_always: true },
+            ))
+            .await
+            .unwrap();
+
+        state
+            .pending_gates
+            .insert(gate_in_conversation(
+                "alice",
+                "weechat",
+                conv_group,
+                lunarwing_engine::ResumeKind::Authentication {
+                    credential_name: "linear".into(),
+                    instructions: "paste token".into(),
+                    auth_url: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        // An approval from the DM scope must not resolve the group scope's gate.
+        let msg_dm =
+            IncomingMessage::new("weechat", "alice", "yes").with_conversation_scope(scope_dm);
+        let matched_dm = matching_engine_approval_gate(&state, &msg_dm, Some(req_dm)).await;
+        assert_eq!(
+            matched_dm.map(|gate| gate.thread_id),
+            Some(tid_dm),
+            "DM scope approval must match only the DM gate"
+        );
+
+        let msg_group =
+            IncomingMessage::new("weechat", "alice", "yes").with_conversation_scope(scope_group);
+        let matched_group = matching_engine_approval_gate(&state, &msg_group, Some(req_dm)).await;
+        assert!(
+            matched_group.is_none(),
+            "DM scope request_id must not resolve a group scope gate"
+        );
+
+        // An auth token from the group scope must leave the DM scope without
+        // a resolvable auth gate (the DM scope has no auth gate of its own).
+        let auth_dm = matching_engine_auth_gate(&state, &msg_dm).await;
+        assert!(
+            matches!(auth_dm, PendingGateResolution::None),
+            "DM scope has no auth gate and must not resolve the group scope's"
+        );
+
+        let auth_group = matching_engine_auth_gate(&state, &msg_group).await;
+        assert!(
+            matches!(auth_group, PendingGateResolution::Resolved(_)),
+            "group scope should find its own auth gate"
+        );
+    }
+
+    // ── Phase 5: DarkIRC / WeeChat live thread scope isolation ──
+
+    #[tokio::test]
+    async fn darkirc_active_thread_is_scoped_to_dm() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let project_id = state.default_project_id;
+
+        let scope_a = "darkirc:dm:user-a";
+        let scope_b = "darkirc:dm:user-b";
+
+        let key_a = engine_conversation_key(
+            &IncomingMessage::new("darkirc", "alice", "hi").with_conversation_scope(scope_a),
+        );
+        let key_b = engine_conversation_key(
+            &IncomingMessage::new("darkirc", "alice", "hi").with_conversation_scope(scope_b),
+        );
+
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation(&key_a, "alice")
+            .await
+            .unwrap();
+        let conv_b = state
+            .conversation_manager
+            .get_or_create_conversation(&key_b, "alice")
+            .await
+            .unwrap();
+
+        let mut events = state.thread_manager.subscribe_events();
+
+        let tid_a = state
+            .conversation_manager
+            .handle_user_message(
+                conv_a,
+                "hi a",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let tid_b = state
+            .conversation_manager
+            .handle_user_message(
+                conv_b,
+                "hi b",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let wait_two = async {
+            let mut seen = 0;
+            while let Ok(evt) = events.recv().await {
+                if matches!(evt.kind, lunarwing_engine::EventKind::ResponseDelta { .. }) {
+                    seen += 1;
+                    if seen >= 2 {
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait_two)
+            .await
+            .expect("both darkirc streams should start");
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let msg_a =
+            IncomingMessage::new("darkirc", "alice", "/interrupt").with_conversation_scope(scope_a);
+        let msg_b =
+            IncomingMessage::new("darkirc", "alice", "/interrupt").with_conversation_scope(scope_b);
+
+        assert!(
+            has_active_engine_thread(&msg_a).await,
+            "scope_a should report an active thread"
+        );
+        assert!(
+            has_active_engine_thread(&msg_b).await,
+            "scope_b should report an active thread"
+        );
+
+        let result_a = {
+            let guard = lock.read().await;
+            interrupt_engine_conversation(guard.as_ref().unwrap(), &msg_a)
+                .await
+                .expect("interrupt should succeed")
+        };
+        assert_eq!(result_a, Some("Interrupted.".to_string()));
+
+        let outcome_a = {
+            let guard = lock.read().await;
+            let state = guard.as_ref().unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.thread_manager.join_thread(tid_a),
+            )
+            .await
+            .expect("thread A should stop promptly")
+            .expect("thread A should join")
+        };
+        assert!(matches!(outcome_a, ThreadOutcome::Stopped));
+
+        assert!(
+            !has_active_engine_thread(&msg_a).await,
+            "scope_a thread should be stopped after interrupt"
+        );
+        assert!(
+            has_active_engine_thread(&msg_b).await,
+            "scope_b thread must remain active after interrupting scope_a"
+        );
+
+        {
+            let guard = lock.read().await;
+            let state = guard.as_ref().unwrap();
+            let _ = state.thread_manager.stop_thread(tid_b, "alice").await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.thread_manager.join_thread(tid_b),
+            )
+            .await;
+        }
+        *lock.write().await = None;
+    }
+
+    #[tokio::test]
+    async fn weechat_active_thread_is_scoped_between_dm_and_group() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let project_id = state.default_project_id;
+
+        let scope_dm = "weechat:dm:buddy";
+        let scope_group = "weechat:group:#room";
+
+        let key_dm = engine_conversation_key(
+            &IncomingMessage::new("weechat", "alice", "hi").with_conversation_scope(scope_dm),
+        );
+        let key_group = engine_conversation_key(
+            &IncomingMessage::new("weechat", "alice", "hi").with_conversation_scope(scope_group),
+        );
+
+        let conv_dm = state
+            .conversation_manager
+            .get_or_create_conversation(&key_dm, "alice")
+            .await
+            .unwrap();
+        let conv_group = state
+            .conversation_manager
+            .get_or_create_conversation(&key_group, "alice")
+            .await
+            .unwrap();
+
+        let mut events = state.thread_manager.subscribe_events();
+
+        let tid_dm = state
+            .conversation_manager
+            .handle_user_message(
+                conv_dm,
+                "hi dm",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let tid_group = state
+            .conversation_manager
+            .handle_user_message(
+                conv_group,
+                "hi group",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let wait_two = async {
+            let mut seen = 0;
+            while let Ok(evt) = events.recv().await {
+                if matches!(evt.kind, lunarwing_engine::EventKind::ResponseDelta { .. }) {
+                    seen += 1;
+                    if seen >= 2 {
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait_two)
+            .await
+            .expect("both weechat streams should start");
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let msg_dm = IncomingMessage::new("weechat", "alice", "/interrupt")
+            .with_conversation_scope(scope_dm);
+        let msg_group = IncomingMessage::new("weechat", "alice", "/interrupt")
+            .with_conversation_scope(scope_group);
+
+        assert!(
+            has_active_engine_thread(&msg_dm).await,
+            "DM scope should report an active thread"
+        );
+        assert!(
+            has_active_engine_thread(&msg_group).await,
+            "group scope should report an active thread"
+        );
+
+        let result_dm = {
+            let guard = lock.read().await;
+            interrupt_engine_conversation(guard.as_ref().unwrap(), &msg_dm)
+                .await
+                .expect("interrupt should succeed")
+        };
+        assert_eq!(result_dm, Some("Interrupted.".to_string()));
+
+        let outcome_dm = {
+            let guard = lock.read().await;
+            let state = guard.as_ref().unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.thread_manager.join_thread(tid_dm),
+            )
+            .await
+            .expect("DM thread should stop promptly")
+            .expect("DM thread should join")
+        };
+        assert!(matches!(outcome_dm, ThreadOutcome::Stopped));
+
+        assert!(
+            !has_active_engine_thread(&msg_dm).await,
+            "DM scope thread should be stopped after interrupt"
+        );
+        assert!(
+            has_active_engine_thread(&msg_group).await,
+            "group scope thread must remain active after interrupting DM scope"
+        );
+
+        {
+            let guard = lock.read().await;
+            let state = guard.as_ref().unwrap();
+            let _ = state.thread_manager.stop_thread(tid_group, "alice").await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.thread_manager.join_thread(tid_group),
+            )
+            .await;
+        }
+        *lock.write().await = None;
     }
 }
