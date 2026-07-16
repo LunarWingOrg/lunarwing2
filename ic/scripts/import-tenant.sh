@@ -165,10 +165,15 @@ reconcile_owner_scope() {
   note "owner-scope continuity verified for '$TENANT'"
 }
 
-[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.tar> [--name <t>] [--start] [--old-stopped] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-toolchains] [--with-vision] [--docker-group] [--tensorzero-url <url>] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
+[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-toolchains] [--with-vision] [--docker-group] [--tensorzero-url <url>] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
 [[ -f "$BUNDLE" ]] || die "bundle not found: $BUNDLE"
 [[ "$(id -u)" -eq 0 ]] || die "run as root (sudo) — mt-admin needs root"
 command -v jq  >/dev/null 2>&1 || die "jq required"
+
+# Check for 7z if importing an encrypted bundle
+if [[ "$BUNDLE" == *.7z ]]; then
+  command -v 7z >/dev/null 2>&1 || die "7z (p7zip) required to unpack encrypted bundle"
+fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MT="$SCRIPT_DIR/lunarwing-mt-admin.sh"
@@ -176,12 +181,35 @@ WEECHAT_PREFLIGHT="$SCRIPT_DIR/lunarwing-weechat-preflight.sh"
 PORTS_REGISTRY="${LUNARWING_PORTS_REGISTRY:-/etc/lunarwing/ports.json}"
 [[ -x "$MT" ]] || die "mt-admin not found/executable at $MT"
 [[ -x "$WEECHAT_PREFLIGHT" ]] || die "WeeChat preflight not found/executable at $WEECHAT_PREFLIGHT"
-grep -qE '^\s*restore-tenant\)' "$MT" || die "mt-admin at $MT predates restore-tenant (need a v1.1.4-class host)"
-grep -qE '^\s*owner-scopes\)' "$MT" || die "mt-admin at $MT predates owner-scopes (need current Kawarimi owner-scope checks)"
+grep -qE '^\s*restore-tenant)' "$MT" || die "mt-admin at $MT predates restore-tenant (need a v1.1.4-class host)"
+grep -qE '^\s*owner-scopes)' "$MT" || die "mt-admin at $MT predates owner-scopes (need current Kawarimi owner-scope checks)"
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 chmod 0700 "$WORK"
-tar xf "$BUNDLE" -C "$WORK" || die "failed to unpack bundle $BUNDLE"
+
+# Unpack bundle — detect format
+if [[ "$BUNDLE" == *.7z ]]; then
+  # Encrypted 7z bundle — need passphrase
+  if [[ -z "${KAWARIMI_PASS:-}" ]]; then
+    if [[ -n "${KAWARIMI_PASS_FILE:-}" ]]; then
+      [[ -f "$KAWARIMI_PASS_FILE" ]] || die "passphrase file not found: $KAWARIMI_PASS_FILE"
+      KAWARIMI_PASS=$(<"$KAWARIMI_PASS_FILE")
+    else
+      read -s -p "Enter bundle passphrase: " KAWARIMI_PASS
+      echo
+    fi
+  fi
+  7z x -p"$KAWARIMI_PASS" -o"$WORK" "$BUNDLE" -y >/dev/null 2>&1 \
+    || die "failed to decrypt/unpack bundle (wrong passphrase or corrupted archive?)"
+  unset KAWARIMI_PASS
+elif [[ "$BUNDLE" == *.tar ]]; then
+  # Legacy plaintext bundle — backward compat
+  echo "WARNING: importing UNENCRYPTED legacy .tar bundle" >&2
+  tar xf "$BUNDLE" -C "$WORK" || die "failed to unpack bundle $BUNDLE"
+else
+  die "unknown bundle format: $BUNDLE (expected .7z or .tar)"
+fi
+
 [[ -f "$WORK/meta.txt" ]] || die "bundle missing meta.txt — not an export-tenant.sh bundle?"
 
 meta() { sed -n "s/^$1=//p" "$WORK/meta.txt" | head -1; }
