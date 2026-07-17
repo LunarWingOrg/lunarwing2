@@ -14,6 +14,7 @@ Automatically provision a working WeeChat HTTP API relay for newly created Lunar
 2. Bootstrap uses WeeChat's supported repeated `--run-command` interface and configures:
    - `relay.network.password` as the literal expression `${env:RELAY_PASSWORD}`.
    - `relay.network.allow_empty_password=off`.
+   - `relay.network.ipv6=off` before applying the IPv4 loopback bind.
    - `relay.network.bind_address=127.0.0.1`.
    - `/relay add api <registry weechat port>`.
    - `/save`, followed by `/quit`.
@@ -24,7 +25,7 @@ Automatically provision a working WeeChat HTTP API relay for newly created Lunar
 7. Generation occurs in a tenant-owned temporary sibling directory on the same filesystem. The complete generated directory is validated before atomic promotion. Every failure path removes temporary state.
 8. A dedicated tenant-owned `env/weechat.env`, mode `0600`, contains only `RELAY_PASSWORD`. The persistent systemd user unit and OpenRC service load this file before starting tmux/WeeChat.
 9. The persistent WeeChat process must not receive the complete `lunarwing.env` because it contains unrelated DB, LLM, XMPP, and gateway secrets.
-10. The generated configuration must contain the expected API section/port, loopback bind, and literal environment expression, and must not contain the resolved password.
+10. The generated configuration must contain the expected API section/port, loopback bind, `ipv6=off`, and literal environment expression, and must not contain the resolved password.
 11. New-tenant provisioning accepts `--no-weechat-bootstrap`. The flag skips
     WeeChat command execution and `relay.conf` generation, still writes the minimal
     `weechat.env` containing only `RELAY_PASSWORD`, still renders WeeChat services,

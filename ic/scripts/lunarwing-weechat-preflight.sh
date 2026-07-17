@@ -81,8 +81,8 @@ env_get() {
 }
 
 # Validate generated relay.conf without sourcing it.
-# Checks for: literal ${env:RELAY_PASSWORD}, loopback bind, [api] section,
-# correct API port, and absence of plaintext password.
+# Checks for: literal ${env:RELAY_PASSWORD}, loopback bind, IPv6 disabled,
+# [api] section, correct API port, and absence of plaintext password.
 _verify_relay_config() {  # <conf_file> <expected_port> <plaintext_ref>
   local conf="$1" expected_port="$2" plaintext="$3"
   local rc=0
@@ -118,6 +118,12 @@ _verify_relay_config() {  # <conf_file> <expected_port> <plaintext_ref>
     rc=1
   fi
 
+  if ! grep -qE '^[[:space:]]*ipv6[[:space:]]*=[[:space:]]*off[[:space:]]*$' <<<"$content"; then
+    mark FAIL "relay.conf" "ipv6 must be off for the IPv4 loopback bind (127.0.0.1)"
+    mark INFO "recovery"   "inside the existing WeeChat session: /set relay.network.ipv6 off, then /save"
+    rc=1
+  fi
+
   if ! grep -qF '[api]' <<<"$content"; then
     mark FAIL "relay.conf" "missing [api] section"
     mark INFO "recovery"   "run: sudo $0 configure-weechat-relay <tenant>"
@@ -131,7 +137,7 @@ _verify_relay_config() {  # <conf_file> <expected_port> <plaintext_ref>
   fi
 
   if [[ $rc -eq 0 ]]; then
-    mark OK "relay.conf" 'password=${env:RELAY_PASSWORD}, bind_address = "127.0.0.1", api = '"$expected_port"
+    mark OK "relay.conf" 'password=${env:RELAY_PASSWORD}, bind_address = "127.0.0.1", ipv6 = off, api = '"$expected_port"
   fi
 
   return $rc

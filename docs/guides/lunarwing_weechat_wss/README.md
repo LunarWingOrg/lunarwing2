@@ -29,9 +29,12 @@ LunarWing ◄─► WeeChat Relay WASM ◄─► WeeChat ◄─► IRC Networks
 In WeeChat, enable the API relay:
 
 ```
-/relay add api 9001
 /set relay.network.password "your-secret-password"
+/set relay.network.allow_empty_password off
+/set relay.network.ipv6 off
 /set relay.network.bind_address "127.0.0.1"
+/relay add api 9001
+/save
 ```
 
 Verify relay is running:
