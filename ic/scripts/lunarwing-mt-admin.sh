@@ -3126,6 +3126,62 @@ upload_tenant_ssh_key() {
   fi
 }
 
+# Upload the DarkIRC adapter secret to the secrets store via the gateway's
+# extension setup API. Called AFTER the daemon starts (the API is served by the
+# gateway on the HTTP port). The secret is optional — if absent from the tenant
+# env, this is a no-op. Idempotent: ExtensionManager::configure overwrites an
+# existing secret and refreshes/activates the WASM channel, so re-running
+# start_tenant is safe and no daemon restart is required (the credential is read
+# live per-request from the secrets store). Init-system-agnostic — uses HTTP,
+# works on both systemd and OpenRC. Best-effort: a failed upload warns and
+# continues; the daemon keeps running.
+upload_tenant_darkirc_secret() {
+  local name="$1"
+  local env_path http_port gateway_token darkirc_adapter_secret upload_result
+
+  # Only tenants provisioned with DarkIRC carry this secret.
+  tenant_darkirc_enabled "$name" || return 0
+
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+
+  darkirc_adapter_secret="$(grep -s '^DARKIRC_ADAPTER_SECRET=' "$env_path" | cut -d= -f2- || true)"
+  # The secret is optional — nothing to upload if it is not set.
+  [[ -n "$darkirc_adapter_secret" ]] || return 0
+
+  gateway_token="$(grep -s '^GATEWAY_AUTH_TOKEN=' "$env_path" | cut -d= -f2- || true)"
+  if [[ -z "$gateway_token" ]]; then
+    say "WARNING: GATEWAY_AUTH_TOKEN not found in $env_path; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2
+    return 1
+  fi
+
+  http_port="$(ports_get "$name" http)"
+
+  # Wait for the gateway to be reachable (it may still be starting up).
+  if ! _wait_tenant_gateway "$name"; then
+    say "WARNING: gateway not reachable on port $http_port; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2
+    return 1
+  fi
+
+  # Upload the secret via the extension setup API. The secret is sent on stdin
+  # (never on argv) so it never appears in /proc/<pid>/cmdline or shell history.
+  upload_result="$(jq -n --arg secret "$darkirc_adapter_secret" \
+    '{secrets:{darkirc_adapter_secret:$secret},fields:{}}' | \
+    curl -sf -X POST "http://127.0.0.1:${http_port}/api/extensions/darkirc/setup" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $gateway_token" \
+      -d @- 2>&1)" || true
+
+  if echo "$upload_result" | jq -e '.success == true' >/dev/null 2>&1; then
+    say "DarkIRC adapter secret uploaded to secrets store"
+    return 0
+  else
+    # Do NOT echo $upload_result: the gateway or adapter may echo the secret
+    # back in the error message. Emit a generic warning instead.
+    say "WARNING: DarkIRC adapter secret upload failed (upload manually via the API)" >&2
+    return 1
+  fi
+}
+
 patch_tenant_env() {
   local name="$1"
   name="$(sanitize_name "$name")"
@@ -6492,6 +6548,12 @@ start_tenant() {
       fi
     fi
   fi
+
+  # Seed the optional DarkIRC adapter secret into the encrypted secrets store
+  # so the WASM channel authenticates outbound adapter requests. Best-effort:
+  # a failed upload warns and continues; the WASM channel refreshes the credential
+  # live from the store, so no daemon restart is required.
+  upload_tenant_darkirc_secret "$name" || true
 
   # Workers start AFTER the daemon (and after any SSH-key bounce) so the SSH
   # agent socket is already a real, current Unix socket when podman bind-mounts it.
