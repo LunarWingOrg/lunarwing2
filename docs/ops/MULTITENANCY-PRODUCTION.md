@@ -402,6 +402,18 @@ Each tenant gets 3 init scripts in `/etc/init.d/` with corresponding `/etc/conf.
 
 All use `supervise-daemon` with `command_user` set to the tenant. Dependency wiring ensures proxy and bridge start before the main daemon.
 
+The main daemon, XMPP bridge, proxy, WeeChat client, and WeeChat/DarkIRC adapters
+do not source tenant-owned environment files from root-side OpenRC hooks. Unit
+rendering installs a root-owned launcher at
+`/usr/local/libexec/lunarwing-openrc-env-exec`; the service manager drops to the
+tenant before the launcher validates and literally parses the tenant's
+`KEY=value` file. The launcher fails closed unless the tenant env directory is
+owned by that tenant with mode `0700` and the env file is a non-symlink,
+single-link, tenant-owned regular file with mode `0600`.
+
+Existing OpenRC tenants adopt this boundary after `render-units <name>` followed
+by `restart-tenant <name>`. Check the env ownership and modes before restarting.
+
 ```bash
 rc-service lunarwing-<name> start
 rc-service lunarwing-<name> status

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Standalone test harness for WeeChat service rendering (Todo 2).
 # Verifies: dedicated weechat.env (RELAY_PASSWORD only, mode 0600),
-# systemd EnvironmentFile= path, OpenRC load_env() ordering, tmux command
+# systemd EnvironmentFile= path, OpenRC post-drop env loading, tmux command
 # preservation, and renderer helper extraction.
 set -euo pipefail
 
@@ -224,42 +224,43 @@ else
   echo "  PASS: OpenRC weechat_env_file does not point at lunarwing.env"
 fi
 
-# Has load_env() function
-if grep -q 'load_env()' "$rc_file"; then
-  echo "  PASS: OpenRC has load_env() function"
+# Uses the root-owned launcher as the executable that start-stop-daemon drops to
+# the tenant before it can open weechat.env.
+if grep -q 'weechat_openrc_env_exec' "$rc_file"; then
+  echo "  PASS: OpenRC sets the post-drop env launcher"
 else
-  echo "  FAIL: OpenRC missing load_env() function"
+  echo "  FAIL: OpenRC missing post-drop env launcher"
   failures=$((failures + 1))
 fi
 
-# load_env() parses only RELAY_PASSWORD; tenant-controlled env content is never sourced as root.
-if grep -q "sed -n 's/\^RELAY_PASSWORD=//p'" "$rc_file" && grep -q 'export RELAY_PASSWORD' "$rc_file"; then
-  echo "  PASS: OpenRC load_env parses only RELAY_PASSWORD"
+if grep -qF -- '--exec "${weechat_openrc_env_exec}"' "$rc_file" \
+  && grep -qF -- '--env-file "${weechat_env_file}" --' "$rc_file"; then
+  echo "  PASS: OpenRC starts WeeChat through the post-drop env launcher"
 else
-  echo "  FAIL: OpenRC missing selective RELAY_PASSWORD parsing"
+  echo "  FAIL: OpenRC does not start WeeChat through the post-drop env launcher"
   failures=$((failures + 1))
 fi
 
-if grep -q 'set -a' "$rc_file" || grep -qF '. "${weechat_env_file}"' "$rc_file"; then
-  echo "  FAIL: OpenRC sources tenant-controlled env content"
+if grep -q 'load_env()' "$rc_file" \
+  || grep -Eq '(sed|cat|head|tail).*weechat_env_file' "$rc_file" \
+  || grep -Eq '(^|[[:space:]])(\.|source)[[:space:]].*weechat_env_file' "$rc_file"; then
+  echo "  FAIL: OpenRC reads tenant-controlled WeeChat env content as root"
   failures=$((failures + 1))
 else
-  echo "  PASS: OpenRC does not source tenant-controlled env content"
+  echo "  PASS: OpenRC does not read tenant-controlled WeeChat env content as root"
 fi
 
-# load_env is called before start-stop-daemon in start()
-load_env_line=$(grep -n 'load_env' "$rc_file" | head -1 | cut -d: -f1)
-start_daemon_line=$(grep -n 'start-stop-daemon' "$rc_file" | head -1 | cut -d: -f1)
-if [[ -n "$load_env_line" && -n "$start_daemon_line" && "$load_env_line" -lt "$start_daemon_line" ]]; then
-  echo "  PASS: load_env called before start-stop-daemon"
+if grep -qF 'command_user="${weechat_user}:${weechat_group}"' "$rc_file" \
+  && grep -qF -- '--user "${weechat_user}"' "$rc_file"; then
+  echo "  PASS: OpenRC retains tenant privilege-drop configuration"
 else
-  echo "  FAIL: load_env not called before start-stop-daemon"
-  echo "        load_env line: $load_env_line, start-stop-daemon line: $start_daemon_line"
+  echo "  FAIL: OpenRC missing tenant privilege-drop configuration"
   failures=$((failures + 1))
 fi
 
 # Preserves tmux command for starting weechat (same tmux invocation as systemd)
-if grep -q 'tmux.*new-session.*weechat.*--dir' "$rc_file"; then
+if grep -q 'weechat_command:=.*tmux' "$rc_file" \
+  && grep -q 'new-session.*weechat.*--dir' "$rc_file"; then
   echo "  PASS: OpenRC preserves tmux + weechat --dir start"
 else
   echo "  FAIL: OpenRC missing tmux weechat start"

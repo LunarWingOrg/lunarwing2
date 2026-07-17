@@ -307,7 +307,12 @@ The WeeChat service reads `RELAY_PASSWORD` from a dedicated file at `<env_dir>/w
 RELAY_PASSWORD=<generated-token>
 ```
 
-Both the systemd user unit and the OpenRC init script load this file before starting WeeChat. The adapter and daemon continue to source their credentials from `lunarwing.env` through their existing paths.
+The systemd user unit loads this file with `EnvironmentFile=`. OpenRC starts
+WeeChat through the root-owned env launcher after `start-stop-daemon --user`
+drops privileges, so no root hook opens the tenant-controlled file. The adapter
+and daemon continue to receive credentials from `lunarwing.env`; OpenRC loads
+those files through the same post-drop launcher rather than shell-sourcing them
+as root.
 
 ### Preflight checks
 
