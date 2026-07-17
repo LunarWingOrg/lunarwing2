@@ -21,6 +21,8 @@
 #                             report a plaintext password leak
 #  10. mismatch-pw          — non-empty weechat.env RELAY_PASSWORD that differs
 #                             from lunarwing.env; must FAIL and exit 1
+#  11. ipv6-on              — IPv4 loopback with IPv6 enabled; must FAIL
+#  12. missing-ipv6-option  — missing explicit IPv6-off invariant; must FAIL
 #
 set -euo pipefail
 
@@ -153,6 +155,7 @@ JSON
       printf '%s\n' \
         'password = "${env:RELAY_PASSWORD}"' \
         'bind_address = "127.0.0.1"' \
+        'ipv6 = off' \
         '' \
         '[api]' \
         'api = 8888' \
@@ -162,6 +165,7 @@ JSON
       printf '%s\n' \
         'password = "${env:RELAY_PASSWORD}"' \
         'bind_address = "0.0.0.0"' \
+        'ipv6 = off' \
         '' \
         '[api]' \
         "api = $WEECHAT_PORT" \
@@ -169,7 +173,28 @@ JSON
       ;;
     password-leak)
       printf '%s\n' \
-        "password = \"$FIXTURE_SECRET\"" \
+        'password = "${env:RELAY_PASSWORD}"' \
+        "leaked_value = \"$FIXTURE_SECRET\"" \
+        'bind_address = "127.0.0.1"' \
+        'ipv6 = off' \
+        '' \
+        '[api]' \
+        "api = $WEECHAT_PORT" \
+        > "$rc"
+      ;;
+    ipv6-on)
+      printf '%s\n' \
+        'password = "${env:RELAY_PASSWORD}"' \
+        'bind_address = "127.0.0.1"' \
+        'ipv6 = on' \
+        '' \
+        '[api]' \
+        "api = $WEECHAT_PORT" \
+        > "$rc"
+      ;;
+    missing-ipv6-option)
+      printf '%s\n' \
+        'password = "${env:RELAY_PASSWORD}"' \
         'bind_address = "127.0.0.1"' \
         '' \
         '[api]' \
@@ -181,6 +206,7 @@ JSON
       printf '%s\n' \
         'password = "${env:RELAY_PASSWORD}"' \
         'bind_address = "127.0.0.1"' \
+        'ipv6 = off' \
         '' \
         '[api]' \
         "api = $WEECHAT_PORT" \
@@ -348,6 +374,38 @@ assert_in  "mismatch detail" "$PREFLIGHT_OUT" 'does not match'
 assert_not_in "no WARN for weechat.env" "$PREFLIGHT_OUT" '[WARN] weechat.env'
 assert_not_in "no fixture secret in output" "$PREFLIGHT_OUT" "$FIXTURE_SECRET"
 assert_not_in "no mismatch secret in output" "$PREFLIGHT_OUT" "$MISMATCH_SECRET"
+
+# ============================================================
+# 11. IPv6 enabled with IPv4 loopback bind
+#     WeeChat 4.7.x refuses to bind: "invalid bind address '127.0.0.1' for IPv6".
+#     A valid IPv4-only config MUST disable IPv6.
+# ============================================================
+echo "=== 11. ipv6-on (IPv4 loopback with ipv6 = on) ==="
+create_fixture ipv6-on
+run_preflight
+assert_exit "ipv6-on → exit 1" 1 "$PREFLIGHT_EXIT"
+assert_in  "relay.conf FAIL" "$PREFLIGHT_OUT" '[FAIL] relay.conf'
+assert_in  "ipv6 detail" "$PREFLIGHT_OUT" 'ipv6'
+assert_in  "ipv6 recovery" "$PREFLIGHT_OUT" '/set relay.network.ipv6 off'
+assert_not_in "no secret in output" "$PREFLIGHT_OUT" "$FIXTURE_SECRET"
+cleanup_fixture
+trap - EXIT
+
+# ============================================================
+# 12. Missing ipv6 option
+#     The generator must always emit relay.network.ipv6; a missing entry
+#     means the config was not produced by the current bootstrap path.
+# ============================================================
+echo "=== 12. missing-ipv6-option ==="
+create_fixture missing-ipv6-option
+run_preflight
+assert_exit "missing-ipv6 → exit 1" 1 "$PREFLIGHT_EXIT"
+assert_in  "relay.conf FAIL" "$PREFLIGHT_OUT" '[FAIL] relay.conf'
+assert_in  "ipv6 detail" "$PREFLIGHT_OUT" 'ipv6'
+assert_in  "ipv6 recovery" "$PREFLIGHT_OUT" '/set relay.network.ipv6 off'
+assert_not_in "no secret in output" "$PREFLIGHT_OUT" "$FIXTURE_SECRET"
+cleanup_fixture
+trap - EXIT
 
 # ============================================================
 # Summary

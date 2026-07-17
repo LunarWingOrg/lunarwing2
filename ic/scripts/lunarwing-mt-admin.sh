@@ -2247,8 +2247,8 @@ _weechat_config_dir_has_entries() {  # <dir>
 
 # Validate a generated WeeChat relay config directory.
 # Requires relay.conf with the literal ${env:RELAY_PASSWORD} expression,
-# bind_address=127.0.0.1, allow_empty_password=off, [api] section with api=<port>,
-# and rejects any occurrence of the plaintext password.
+# bind_address=127.0.0.1, ipv6=off, allow_empty_password=off, [api] section with
+# api=<port>, and rejects any occurrence of the plaintext password.
 _weechat_validate_relay_config() {  # <dir> <port> <plaintext_password>
   local dir="$1" port="$2" plaintext="$3"
   local conf="$dir/relay.conf"
@@ -2263,6 +2263,8 @@ _weechat_validate_relay_config() {  # <dir> <port> <plaintext_password>
   grep -q 'bind_address.*127\.0\.0\.1' "$conf" || return 1
   # Require allow_empty_password = off
   grep -q 'allow_empty_password.*off' "$conf" || return 1
+  # An IPv4 loopback bind is invalid while WeeChat's relay IPv6 mode is enabled.
+  grep -q '^[[:space:]]*ipv6[[:space:]]*=[[:space:]]*off[[:space:]]*$' "$conf" || return 1
   # Require [api] section
   grep -q '\[api\]' "$conf" || return 1
   # Require api = <port>
@@ -2290,6 +2292,7 @@ _weechat_generate_relay_config() {  # <tenant> <temp_dir> <port> <lunarwing_env>
     "$weechat_bin" --dir "$temp_dir" \
     --run-command '/set relay.network.password "\${env:RELAY_PASSWORD}"' \
     --run-command '/set relay.network.allow_empty_password off' \
+    --run-command '/set relay.network.ipv6 off' \
     --run-command '/set relay.network.bind_address "127.0.0.1"' \
     --run-command "/relay add api ${relay_port}" \
     --run-command '/save' \

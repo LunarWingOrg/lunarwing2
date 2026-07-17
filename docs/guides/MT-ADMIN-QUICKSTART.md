@@ -230,9 +230,12 @@ directly to WeeChat's REST API.
 In WeeChat, run these commands to enable the API relay:
 
 ```
-/relay add api 10005
 /set relay.network.password "your-relay-password"
+/set relay.network.allow_empty_password off
+/set relay.network.ipv6 off
 /set relay.network.bind_address "127.0.0.1"
+/relay add api 10005
+/save
 ```
 
 The port (`10005` in this example) is the tenant's `weechat` port -- offset
@@ -593,4 +596,3 @@ low-RAM hosts (Rust compilation is memory-intensive). Options:
   development/testing without production isolation
 - [Multi-Tenant Test Harness](../ops/MULTITENANCY-HARNESS.md) -- ephemeral
   multi-tenant testing environment
-

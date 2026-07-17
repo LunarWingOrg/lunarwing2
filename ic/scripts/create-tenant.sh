@@ -277,6 +277,8 @@ in-process WASM channel polls the adapter on :$adapter_port.
 
 3) Inside WeeChat, enable the api relay the adapter expects:
      /set relay.network.password "<RELAY_PASSWORD from step 1>"
+     /set relay.network.allow_empty_password off
+     /set relay.network.ipv6 off
      /set relay.network.bind_address "127.0.0.1"
      /relay add api $weechat_port
      /relay list

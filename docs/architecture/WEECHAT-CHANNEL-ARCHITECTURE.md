@@ -51,7 +51,8 @@ The WeeChat relay configuration (`~/.config/weechat/relay.conf`) is generated au
 `add-tenant` via the supported WeeChat command interface. The password is stored as the literal
 expression `${env:RELAY_PASSWORD}` in `relay.conf`; the resolved value is provided to the WeeChat
 process through a dedicated, tenant-owned `env/weechat.env` file (mode `0600`) containing only
-`RELAY_PASSWORD`. The full tenant `lunarwing.env` is never loaded into the WeeChat process.
+`RELAY_PASSWORD`. Relay IPv6 mode is disabled before the listener is bound to the IPv4 loopback
+address `127.0.0.1`. The full tenant `lunarwing.env` is never loaded into the WeeChat process.
 
 The adapter and daemon continue to source `RELAY_PASSWORD` from `lunarwing.env` through their
 existing paths (capabilities-env bridge for the WASM channel, direct env for the adapter). The

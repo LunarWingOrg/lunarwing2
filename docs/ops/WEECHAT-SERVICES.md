@@ -178,6 +178,7 @@ During `add-tenant`, after tenant environment files are written but before servi
 ```bash
 --run-command '/set relay.network.password "\${env:RELAY_PASSWORD}"'
 --run-command '/set relay.network.allow_empty_password off'
+--run-command '/set relay.network.ipv6 off'
 --run-command '/set relay.network.bind_address "127.0.0.1"'
 --run-command '/relay add api <registry_weechat_port>'
 --run-command '/save'
@@ -187,7 +188,7 @@ During `add-tenant`, after tenant environment files are written but before servi
 Key properties of the automatic bootstrap:
 
 - **Secret-safe:** The relay password is stored as the literal expression `${env:RELAY_PASSWORD}` in `relay.conf`. The resolved password is passed only via environment inheritance — never as a positional argument, in a command string, in a systemd unit value, in log output, or in the generated WeeChat configuration.
-- **Loopback-only:** The relay binds to `127.0.0.1`.
+- **Loopback-only:** IPv6 relay mode is disabled before binding to `127.0.0.1`, avoiding WeeChat's invalid-IPv6-bind rejection without widening the listener.
 - **Preserve-and-fail:** If the target `~/.config/weechat` directory already contains any content, the bootstrap fails without modifying the existing configuration. The explicit recovery command also refuses to overwrite existing content.
 - **Non-fatal:** If the automatic bootstrap fails for any reason, base tenant provisioning continues. A prominent warning is printed showing the exact recovery command.
 - **Dedicated minimal env:** The WeeChat process receives only `RELAY_PASSWORD` through a dedicated, tenant-owned `env/weechat.env` file (mode `0600`). The full tenant `lunarwing.env` is never loaded into the WeeChat process, preventing unrelated DB, LLM, XMPP, and gateway secrets from being exposed.
@@ -272,14 +273,25 @@ This command:
 
 Rerunning the command on an already-configured tenant is safe (it will refuse the existing config and report the conflict) but is not necessary.
 
+If preflight reports that an existing non-empty configuration has IPv6 enabled or missing, preserve the configuration and repair it inside the tenant's running WeeChat session:
+
+```text
+/set relay.network.ipv6 off
+/save
+```
+
+The option change rebinds configured relays immediately; rerun `lunarwing-weechat-preflight.sh <tenant>` afterward.
+
 ### Manual relay setup (recovery only)
 
 If both the automatic bootstrap and the explicit recovery command are unavailable or have failed, the relay can be configured manually inside WeeChat as a last resort. Attach to the tmux session and run:
 
 ```bash
-/relay add api <weechat_port>
 /set relay.network.password "<RELAY_PASSWORD>"
+/set relay.network.allow_empty_password off
+/set relay.network.ipv6 off
 /set relay.network.bind_address "127.0.0.1"
+/relay add api <weechat_port>
 /save
 ```
 

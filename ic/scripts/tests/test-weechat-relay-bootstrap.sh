@@ -94,6 +94,7 @@ api = $relay_port
 password = "\${env:RELAY_PASSWORD}"
 allow_empty_password = off
 bind_address = "127.0.0.1"
+ipv6 = off
 REOF
 touch "$weechat_home/weechat.conf"
 touch "$weechat_home/sec.conf"
@@ -175,6 +176,7 @@ api = 18000
 password = "\${env:RELAY_PASSWORD}"
 allow_empty_password = off
 bind_address = "127.0.0.1"
+ipv6 = off
 CONF
 
 assert_ok "valid config accepted" \
@@ -191,6 +193,7 @@ api = 19999
 password = "\${env:RELAY_PASSWORD}"
 allow_empty_password = off
 bind_address = "127.0.0.1"
+ipv6 = off
 CONF
 assert_fail "wrong port rejected" \
   _weechat_validate_relay_config "$wrong_port_dir" 18000 "$FIXTURE_PASSWORD"
@@ -203,9 +206,11 @@ cat >"$leak_dir/relay.conf" <<CONF
 api = 18000
 
 [network]
-password = "$FIXTURE_PASSWORD"
+password = "\${env:RELAY_PASSWORD}"
+leaked_value = "$FIXTURE_PASSWORD"
 allow_empty_password = off
 bind_address = "127.0.0.1"
+ipv6 = off
 CONF
 assert_fail "plaintext password leak rejected" \
   _weechat_validate_relay_config "$leak_dir" 18000 "$FIXTURE_PASSWORD"
@@ -221,6 +226,7 @@ api = 18000
 password = "\${env:RELAY_PASSWORD}"
 allow_empty_password = off
 bind_address = "0.0.0.0"
+ipv6 = off
 CONF
 assert_fail "non-loopback bind rejected" \
   _weechat_validate_relay_config "$nonloop_dir" 18000 "$FIXTURE_PASSWORD"
@@ -239,6 +245,7 @@ cat >"$no_api_dir/relay.conf" <<CONF
 password = "\${env:RELAY_PASSWORD}"
 allow_empty_password = off
 bind_address = "127.0.0.1"
+ipv6 = off
 CONF
 assert_fail "missing [api] rejected" \
   _weechat_validate_relay_config "$no_api_dir" 18000 "$FIXTURE_PASSWORD"
@@ -254,6 +261,7 @@ api = 18000
 password = "some-other-value"
 allow_empty_password = off
 bind_address = "127.0.0.1"
+ipv6 = off
 CONF
 assert_fail "missing env expression rejected" \
   _weechat_validate_relay_config "$no_env_dir" 18000 "$FIXTURE_PASSWORD"
@@ -268,9 +276,43 @@ api = 18000
 [network]
 password = "\${env:RELAY_PASSWORD}"
 bind_address = "127.0.0.1"
+ipv6 = off
 CONF
 assert_fail "missing allow_empty_password=off rejected" \
   _weechat_validate_relay_config "$no_empty_off_dir" 18000 "$FIXTURE_PASSWORD"
+
+# IPv6 enabled with IPv4 loopback bind is INVALID for WeeChat — the relay fails
+# to bind with "invalid bind address '127.0.0.1' for IPv6". A valid IPv4-only
+# config MUST disable IPv6.
+ipv6_on_dir="$MT_FIXTURE/ipv6-on"
+mkdir -p "$ipv6_on_dir"
+cat >"$ipv6_on_dir/relay.conf" <<CONF
+[api]
+api = 18000
+
+[network]
+password = "\${env:RELAY_PASSWORD}"
+allow_empty_password = off
+bind_address = "127.0.0.1"
+ipv6 = on
+CONF
+assert_fail "ipv6 = on with IPv4 bind rejected" \
+  _weechat_validate_relay_config "$ipv6_on_dir" 18000 "$FIXTURE_PASSWORD"
+
+# Missing IPv6 option is also invalid — the generator must always emit it.
+no_ipv6_dir="$MT_FIXTURE/no-ipv6-option"
+mkdir -p "$no_ipv6_dir"
+cat >"$no_ipv6_dir/relay.conf" <<CONF
+[api]
+api = 18000
+
+[network]
+password = "\${env:RELAY_PASSWORD}"
+allow_empty_password = off
+bind_address = "127.0.0.1"
+CONF
+assert_fail "missing ipv6 option rejected" \
+  _weechat_validate_relay_config "$no_ipv6_dir" 18000 "$FIXTURE_PASSWORD"
 
 echo "=== _weechat_generate_relay_config tests ==="
 
@@ -328,6 +370,24 @@ if grep -q 'allow_empty_password off' "$call_log"; then
   echo "  PASS: allow_empty_password off in call args"
 else
   echo "  FAIL: missing allow_empty_password off"
+  failures=$((failures + 1))
+fi
+
+# Check relay.network.ipv6 off — WeeChat 4.7.x requires IPv6 disabled when
+# binding an IPv4 loopback address; otherwise the relay fails to start.
+if grep -q 'relay.network.ipv6 off' "$call_log"; then
+  echo "  PASS: relay.network.ipv6 off in call args"
+else
+  echo "  FAIL: missing relay.network.ipv6 off"
+  failures=$((failures + 1))
+fi
+
+call_args="$(cat "$call_log")"
+after_ipv6="${call_args#*relay.network.ipv6 off}"
+if [[ "$after_ipv6" == *"relay.network.bind_address"*"/relay add api "* ]]; then
+  echo "  PASS: ipv6 off precedes bind and relay creation"
+else
+  echo "  FAIL: ipv6 off must precede bind and relay creation"
   failures=$((failures + 1))
 fi
 
@@ -875,6 +935,7 @@ if [[ "${RUN_LIVE_WEECHAT:-0}" == "1" ]]; then
       RELAY_PASSWORD="$smoke_password" TERM=xterm "$live_weechat_bin" --dir "$smoke_dir" \
         --run-command '/set relay.network.password "\${env:RELAY_PASSWORD}"' \
         --run-command '/set relay.network.allow_empty_password off' \
+        --run-command '/set relay.network.ipv6 off' \
         --run-command '/set relay.network.bind_address "127.0.0.1"' \
         --run-command "/relay add api ${smoke_port}" \
         --run-command '/save' \
