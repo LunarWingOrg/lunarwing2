@@ -45,18 +45,30 @@ tenant_darkirc_enabled() { [[ "${DARKIRC_ENABLED:-false}" == "true" ]]; }
 
 tenant_env_dir() { printf '%s/env' "$stub_dir"; }
 
-ports_get() { printf '%s' "$FIXTURE_PORT"; }
+ports_get() { printf '%s' "$FIXTURE_PORT"; printf '%s' "$2" >"${stub_dir}/ports_get_last_key_called.txt"; }
 
 _wait_tenant_gateway() { return 0; }
 
 say() { printf '%s\n' "$*" >>"${stub_dir}/say.log"; }
 
 curl() {
-  local this_n
+  local this_n arg_fd
   this_n="$(ls "${stub_dir}"/curl_body.*.txt 2>/dev/null | wc -l)"
   this_n=$((this_n + 1))
   printf '%s\n' "$*" >"${stub_dir}/curl_args.${this_n}.txt"
   cat >"${stub_dir}/curl_body.${this_n}.txt"
+  arg_fd=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "-K" ]]; then
+      arg_fd="$2"
+      shift 2
+      continue
+    fi
+    shift
+  done
+  if [[ -n "$arg_fd" ]] && [[ -e "$arg_fd" ]]; then
+    cat "$arg_fd" >"${stub_dir}/curl_auth.${this_n}.txt" 2>/dev/null || true
+  fi
   printf '%s' "${CURL_RESPONSE}"
   return "${CURL_CURL_RV}"
 }
@@ -66,7 +78,7 @@ curl_call_count() {
 }
 
 reset_curl_recordings() {
-  rm -f "${stub_dir}"/curl_args.*.txt "${stub_dir}"/curl_body.*.txt
+  rm -f "${stub_dir}"/curl_args.*.txt "${stub_dir}"/curl_body.*.txt "${stub_dir}"/curl_auth.*.txt "${stub_dir}"/ports_get_last_key_called.txt
 }
 
 # Writes a tenant lunarwing.env with the requested DarkIRC secret + token.
@@ -102,6 +114,17 @@ assert_contains() { # <label> <haystack> <needle>
     echo "        haystack: [$2]"
     echo "        needle:   [$3]"
     failures=$((failures + 1))
+  fi
+}
+
+assert_not_contains() { # <label> <haystack> <needle>
+  if [[ "$2" == *"$3"* ]]; then
+    echo "  FAIL: $1 (needle unexpectedly found)"
+    echo "        haystack: [$2]"
+    echo "        needle:   [$3]"
+    failures=$((failures + 1))
+  else
+    echo "  PASS: $1"
   fi
 }
 
@@ -206,8 +229,27 @@ args_file="${stub_dir}/curl_args.$(curl_call_count).txt"
 args="$(cat "$args_file")"
 assert_contains "uses POST method" "$args" "-X POST"
 assert_contains "sets Content-Type: application/json" "$args" "Content-Type: application/json"
-assert_contains "sends Authorization: Bearer header" "$args" "Authorization: Bearer"
+assert_not_contains "argv contains no fixture token" "$args" "$FIXTURE_TOKEN"
+assert_not_contains "argv contains no fixture secret" "$args" "$FIXTURE_SECRET"
+
+auth_file="${stub_dir}/curl_auth.$(curl_call_count).txt"
+if [[ -s "$auth_file" ]]; then
+  auth_content="$(cat "$auth_file")"
+  if [[ "$auth_content" == *"$FIXTURE_TOKEN"* ]]; then
+    echo "  PASS: Authorization header carries fixture token (value redacted)"
+  else
+    echo "  FAIL: Authorization header does not carry fixture token (value redacted)"
+    failures=$((failures + 1))
+  fi
+  assert_contains "auth FD sets Bearer scheme" "$auth_content" "Authorization: Bearer"
+else
+  echo "  FAIL: no curl auth config captured via -K /dev/fd/N"
+  failures=$((failures + 1))
+fi
 assert_url_path "posts to /api/extensions/darkirc/setup" "$args_file" "/api/extensions/darkirc/setup"
+
+last_key="$(cat "${stub_dir}/ports_get_last_key_called.txt" 2>/dev/null || true)"
+assert_eq "requests the gateway port (not http)" "$last_key" "gateway"
 
 # --- Test 5: failure handling — warn + continue, never echo response -------
 echo ""

@@ -3128,7 +3128,7 @@ upload_tenant_ssh_key() {
 
 # Upload the DarkIRC adapter secret to the secrets store via the gateway's
 # extension setup API. Called AFTER the daemon starts (the API is served by the
-# gateway on the HTTP port). The secret is optional — if absent from the tenant
+# gateway on the tenant gateway port). The secret is optional — if absent from the tenant
 # env, this is a no-op. Idempotent: ExtensionManager::configure overwrites an
 # existing secret and refreshes/activates the WASM channel, so re-running
 # start_tenant is safe and no daemon restart is required (the credential is read
@@ -3137,7 +3137,7 @@ upload_tenant_ssh_key() {
 # continues; the daemon keeps running.
 upload_tenant_darkirc_secret() {
   local name="$1"
-  local env_path http_port gateway_token darkirc_adapter_secret upload_result
+  local env_path gateway_port gateway_token darkirc_adapter_secret upload_result
 
   # Only tenants provisioned with DarkIRC carry this secret.
   tenant_darkirc_enabled "$name" || return 0
@@ -3154,21 +3154,24 @@ upload_tenant_darkirc_secret() {
     return 1
   fi
 
-  http_port="$(ports_get "$name" http)"
+  gateway_port="$(ports_get "$name" gateway)"
 
   # Wait for the gateway to be reachable (it may still be starting up).
   if ! _wait_tenant_gateway "$name"; then
-    say "WARNING: gateway not reachable on port $http_port; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2
+    say "WARNING: gateway not reachable on port $gateway_port; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2
     return 1
   fi
 
-  # Upload the secret via the extension setup API. The secret is sent on stdin
-  # (never on argv) so it never appears in /proc/<pid>/cmdline or shell history.
+  # Upload the secret via the extension setup API. The adapter secret is sent
+  # on stdin (never argv), and the gateway auth token is sent via curl -K
+  # reading an anonymous process-substitution FD (never argv) so neither
+  # credential appears in /proc/<pid>/cmdline or shell history.
+  local auth_header="Authorization: Bearer ${gateway_token}"
   upload_result="$(jq -n --arg secret "$darkirc_adapter_secret" \
     '{secrets:{darkirc_adapter_secret:$secret},fields:{}}' | \
-    curl -sf -X POST "http://127.0.0.1:${http_port}/api/extensions/darkirc/setup" \
+    curl -sf -X POST "http://127.0.0.1:${gateway_port}/api/extensions/darkirc/setup" \
       -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $gateway_token" \
+      -K <(printf 'header = \"%s\"\\n' "$auth_header") \
       -d @- 2>&1)" || true
 
   if echo "$upload_result" | jq -e '.success == true' >/dev/null 2>&1; then
