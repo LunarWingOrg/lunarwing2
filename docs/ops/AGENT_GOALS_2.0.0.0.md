@@ -41,7 +41,7 @@
     Verdict: The deferred crates (rand, base64, tower-http) are intentionally held back for 2.0.0+. The patch-level cargo update should be verified. Genuinely open — deferred to 2.0.0+.
     </details>
 7. [ ] Fix any remaining broken cargo tests and ensure updated documentation. Create (or rewrite) new tests if necessary. then re-run cargo tests to ensure
-8. MCP additions: ( please reference the following branch for a hint on getting started, old failed implementations from previous opencode/codex workers: faility/failed-partial-old-item-3-20260711-0601 AND slopmcp1/codex/upgrade/v2.0.0.0 ) - There are two sections below. You must read BOTH of them (as well as reference the old failed implementation from previous failed opencode worker). Once you have, follow the following instructions: One of the sections is `Recommended List — Pick ONE, implement it, check off item 18` Pick ONE from the `Recommended List — Pick ONE, implement it, check off item 18` list below, implement it, check off this box. Two Informational Sections following this sentence:
+8. [x] MCP additions: ( please reference the following branch for a hint on getting started, old failed implementations from previous opencode/codex workers: faility/failed-partial-old-item-3-20260711-0601 AND slopmcp1/codex/upgrade/v2.0.0.0 ) - There are two sections below. You must read BOTH of them (as well as reference the old failed implementation from previous failed opencode worker). Once you have, follow the following instructions: One of the sections is `Recommended List — Pick ONE, implement it, check off item 18` Pick ONE from the `Recommended List — Pick ONE, implement it, check off item 18` list below, implement it, check off this box. Two Informational Sections following this sentence:
     <details>
     <summary><b>DONE — First-class host-local stdio MCP installation</b></summary>
     Implemented first-class host-local stdio MCP installation across LunarWing:
@@ -72,7 +72,7 @@
        - Validate absolute commands or resolve commands through PATH.
        - Report spawn and negotiation failures in the installed-extension response.
        - Do not execute anything during installation.
-       Registry validation
+       Registry validation — DONE
        - Add a validation test or registry validate command covering:
          - exactly one of url or transport
          - valid stdio command/args/env

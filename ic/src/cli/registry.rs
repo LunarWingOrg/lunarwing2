@@ -6,6 +6,7 @@ use crate::extensions::ExtensionSource;
 use crate::registry::catalog::RegistryCatalog;
 use crate::registry::installer::RegistryInstaller;
 use crate::registry::manifest::{ExtensionManifest, ManifestKind, McpManifestTransport};
+use crate::registry::validation::validate_registry_dir;
 use crate::tools::mcp::McpServerConfig;
 
 #[derive(Subcommand, Debug, Clone)]
@@ -55,10 +56,39 @@ pub enum RegistryCommand {
         #[arg(long)]
         build: bool,
     },
+
+    /// Validate source registry manifests without installing them
+    Validate,
 }
 
 /// Run a registry command.
 pub async fn run_registry_command(cmd: RegistryCommand) -> anyhow::Result<()> {
+    match cmd {
+        RegistryCommand::List { kind, tag, verbose } => {
+            let (catalog, _) = load_catalog()?;
+            cmd_list(&catalog, kind.as_deref(), tag.as_deref(), verbose)
+        }
+        RegistryCommand::Info { name } => {
+            let (catalog, _) = load_catalog()?;
+            cmd_info(&catalog, &name)
+        }
+        RegistryCommand::Install { name, force, build } => {
+            let (catalog, repo_root) = load_catalog()?;
+            cmd_install(&catalog, &repo_root, &name, force, build).await
+        }
+        RegistryCommand::InstallDefaults { force, build } => {
+            let (catalog, repo_root) = load_catalog()?;
+            cmd_install(&catalog, &repo_root, "lunarwing", force, build).await
+        }
+        RegistryCommand::Validate => {
+            let registry_dir = RegistryCatalog::find_dir()
+                .ok_or_else(|| anyhow::anyhow!("Source registry directory not found"))?;
+            cmd_validate(&registry_dir)
+        }
+    }
+}
+
+fn load_catalog() -> anyhow::Result<(RegistryCatalog, std::path::PathBuf)> {
     // For install commands that need to build from source, a disk registry is required.
     // For list/info, embedded manifests suffice.
     let registry_dir = RegistryCatalog::find_dir();
@@ -74,18 +104,32 @@ pub async fn run_registry_command(cmd: RegistryCommand) -> anyhow::Result<()> {
         .and_then(|d| d.parent().map(|p| p.to_path_buf()))
         .unwrap_or_default();
 
-    match cmd {
-        RegistryCommand::List { kind, tag, verbose } => {
-            cmd_list(&catalog, kind.as_deref(), tag.as_deref(), verbose)
-        }
-        RegistryCommand::Info { name } => cmd_info(&catalog, &name),
-        RegistryCommand::Install { name, force, build } => {
-            cmd_install(&catalog, &repo_root, &name, force, build).await
-        }
-        RegistryCommand::InstallDefaults { force, build } => {
-            cmd_install(&catalog, &repo_root, "lunarwing", force, build).await
-        }
+    Ok((catalog, repo_root))
+}
+
+fn cmd_validate(registry_dir: &std::path::Path) -> anyhow::Result<()> {
+    let report = validate_registry_dir(registry_dir);
+    if report.is_clean() {
+        println!("Registry validation passed: 0 findings.");
+        return Ok(());
     }
+
+    println!(
+        "Registry validation found {} finding(s):",
+        report.findings.len()
+    );
+    for finding in &report.findings {
+        println!(
+            "  [{}] {}: {}",
+            finding.code.as_str(),
+            finding.file,
+            finding.message
+        );
+    }
+    anyhow::bail!(
+        "Registry validation failed with {} finding(s)",
+        report.findings.len()
+    )
 }
 
 fn cmd_list(
@@ -343,7 +387,10 @@ async fn cmd_install(
                         println!("  Args: {}", args.join(" "));
                     }
                 }
-                _ => unreachable!("validated registry MCP transport"),
+                _ => anyhow::bail!(
+                    "MCP registry entry '{}' must declare exactly one supported transport",
+                    manifest.name
+                ),
             }
             println!(
                 "\nNext step: restart LunarWing, or activate '{}' through the web UI or conversation, to connect and load its tools.",
@@ -403,6 +450,8 @@ fn mcp_config_from_manifest(manifest: &ExtensionManifest) -> anyhow::Result<McpS
 mod tests {
     use std::collections::HashMap;
 
+    use clap::Parser;
+
     use super::*;
     use crate::registry::manifest::McpManifestTransport;
     use crate::tools::mcp::config::EffectiveTransport;
@@ -461,5 +510,34 @@ mod tests {
             }
             other => panic!("expected stdio transport, got {other:?}"),
         }
+    }
+
+    #[derive(Debug, Parser)]
+    struct RegistryCli {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    }
+
+    #[test]
+    fn test_validate_command_parses() {
+        let parsed = RegistryCli::try_parse_from(["registry", "validate"]).expect("valid command");
+        assert!(matches!(parsed.command, RegistryCommand::Validate));
+    }
+
+    #[test]
+    fn test_validate_command_reports_invalid_registry() {
+        let directory = tempfile::tempdir().expect("temporary registry");
+        let tools = directory.path().join("tools");
+        std::fs::create_dir(&tools).expect("tools directory");
+        std::fs::write(tools.join("broken.json"), "{not json").expect("manifest fixture");
+
+        let error = cmd_validate(directory.path()).expect_err("invalid registry must fail");
+        assert!(error.to_string().contains("1 finding"));
+    }
+
+    #[test]
+    fn test_validate_command_accepts_source_registry() {
+        let registry_dir = RegistryCatalog::find_dir().expect("source registry directory");
+        cmd_validate(&registry_dir).expect("source registry should validate");
     }
 }
