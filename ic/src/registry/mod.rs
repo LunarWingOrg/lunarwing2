@@ -16,6 +16,7 @@ pub mod catalog;
 pub mod embedded;
 pub mod installer;
 pub mod manifest;
+pub mod validation;
 
 pub use catalog::{RegistryCatalog, RegistryError};
 pub use installer::RegistryInstaller;
@@ -23,3 +24,4 @@ pub use manifest::{
     ArtifactSpec, AuthSummary, BundleDefinition, BundlesFile, ExtensionManifest, ManifestKind,
     SourceSpec,
 };
+pub use validation::{FindingCode, ValidationFinding, ValidationReport, validate_registry_dir};
