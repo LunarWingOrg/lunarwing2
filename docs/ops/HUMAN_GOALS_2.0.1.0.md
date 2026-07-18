@@ -15,7 +15,7 @@ lunarwing.env, Added configure-weechat-relay <tenant> recovery command, kawarimi
 5. [ ] Ensure phase 5 compatibility with all tools, mcp, skills, channels. ensure streaming. ensure gateway ui functionality. ensure tool compatibility in tensorzero. multiple phases. record progress. lot of tests needed
 6. [ ] verify self improve skill
 7. [ ] more doc updates
-8. [ ] bump crate versions
+8. [x] bump crate versions
 9. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.1.0 explaining all relevant changes since v2.0.0.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/release for reference as to how to write up this document. The codename for this release is: `Unknown` — The file you write will be RELEASE-v2.0.0.0.md and should be written to the ROOT of the repo.
 10. [ ] Improve accuracy of RELEASE-v2.0.1.0.md
 
