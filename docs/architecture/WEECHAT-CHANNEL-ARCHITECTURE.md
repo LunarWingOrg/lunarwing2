@@ -226,6 +226,12 @@ For each capability `required_field`, the effective value is resolved **highest-
 Resolved overrides are merged on top of the caps `config` block and handed to `on_start`,
 which persists them to channel workspace state (`state/relay_url`, `state/dm_policy`, …).
 
+The shipped caps default for `dm_policy` is `pairing`: an unpaired sender gets pairing
+instructions and does not execute under owner scope. Operators who want open DMs must set
+`"dm_policy":"open"` explicitly in the adapter config (`weechat_local_config.json`),
+the DB `setup_fields` row, or the setup wizard. Unknown `dm_policy` strings fail closed
+(reject the sender with a warning) rather than treating them as `open`.
+
 ### At runtime (`refresh_policy_config` → `/api/config`)
 
 On each poll cycle, `refresh_policy_config` fetches `GET /api/config` from the adapter (served from
@@ -259,9 +265,11 @@ sudo env PGSSLMODE=disable psql "$PGURL" -c \
 sudo env PGSSLMODE=disable psql "$PGURL" -c \
   "DELETE FROM settings WHERE key='extensions.weechat.setup_fields';"
 sudo env PGSSLMODE=disable psql "$PGURL" -c \
-  "UPDATE settings SET value = value || '{\"dm_policy\":\"open\"}'::jsonb \
+  "UPDATE settings SET value = value || '{\"dm_policy\":\"pairing\"}'::jsonb \
    WHERE key='extensions.weechat.setup_fields';"
 ```
+
+> **Note:** WeeChat's new-install `dm_policy` default is now `pairing` (previously `pairing` was the documented safe default while the implementation defaulted to `open`; see rationale in this section). Operators who intentionally want open DMs should set `"dm_policy":"open"` explicitly in their adapter config or `setup_fields` row.
 
 Then restart the daemon so `on_start` re-resolves.
 

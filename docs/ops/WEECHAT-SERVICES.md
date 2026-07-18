@@ -324,6 +324,40 @@ as root.
 
 Preflight reports the password only as `set (<N> chars)` or `missing` — it never prints the value. Absent relay config or missing minimal env are classified as FAIL with explicit recovery guidance.
 
+## DM Access Control (`dm_policy`)
+
+WeeChat's `dm_policy` defaults to `pairing`: an unpaired IRC sender receives pairing instructions and does **not** execute under owner scope. This matches the capabilities/setup prompt and the audit-corrected code default.
+
+| `dm_policy` | Behavior |
+|-------------|----------|
+| `pairing` (default) | Only senders approved via `lunarwing pairing approve weechat <CODE>` or the gateway API may DM the agent. Each new sender gets pairing instructions on their first message. |
+| `allowlist` | Only nicks/hostmasks in the configured `allow_from` list (plus any approved pairing codes) may DM. |
+| `open` | Any IRC sender may DM the agent. **Caution:** with no configured owner actor, accepted senders execute under the instance owner's scope and inherit owner workspace/secrets. |
+
+An unknown `dm_policy` string (typo, stale value) **fails closed** — the sender is rejected with a warning rather than treated as `open`. This prevents an accidental typo from granting open DMs.
+
+To intentionally enable open DMs, set `"dm_policy":"open"` explicitly in the adapter config (`weechat_local_config.json`) or the DB `setup_fields` row. Existing persisted operator choices are preserved on upgrade — the new `pairing` default only applies when no stored value exists.
+
+To approve a sender manually:
+
+```bash
+# Via CLI (source env first on MT hosts)
+sudo -u <name> bash -c '
+  set -a
+  source /home/<name>/lunarwing/env/lunarwing.env
+  set +a
+  lunarwing pairing approve weechat <CODE>
+'
+
+# Or via gateway API
+curl -sf -X POST http://127.0.0.1:<gateway_port>/api/pairing/weechat/approve \
+  -H "Authorization: Bearer <GATEWAY_AUTH_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"code":"<CODE>"}'
+```
+
+Note: With `ENGINE_V2=false`, the legacy path also honors `dm_policy`, so this setting protects both routing modes uniformly.
+
 ## Manual Operations
 
 ### Attach to WeeChat

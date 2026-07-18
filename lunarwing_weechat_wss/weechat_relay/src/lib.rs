@@ -1288,8 +1288,8 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
 
     // Apply DM/group policy
     if is_dm {
-        let dm_policy = channel_host::workspace_read(DM_POLICY_PATH)
-            .unwrap_or_else(default_dm_policy);
+        let dm_policy =
+            channel_host::workspace_read(DM_POLICY_PATH).unwrap_or_else(default_dm_policy);
 
         if !check_sender_allowed(nick, &hostmask, &dm_policy) {
             drop_log(
@@ -2238,8 +2238,7 @@ mod tests {
         // the code default. This guards against the original audit finding
         // where the code said `open` but the docs said `pairing`.
         let raw = include_str!("../weechat.capabilities.json");
-        let v: serde_json::Value =
-            serde_json::from_str(raw).expect("capabilities JSON must parse");
+        let v: serde_json::Value = serde_json::from_str(raw).expect("capabilities JSON must parse");
         assert_eq!(
             v["config"]["dm_policy"].as_str(),
             Some("pairing"),
