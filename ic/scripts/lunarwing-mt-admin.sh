@@ -27,6 +27,8 @@ DARKIRC_BIN="${LUNARWING_MT_DARKIRC_BIN:-/usr/local/bin/darkirc}"
 # the user's own rust toolchain is used. Override for a pinned rev or local mirror.
 DARKIRC_REPO="${LUNARWING_MT_DARKIRC_REPO:-https://github.com/darkrenaissance/darkfi}"
 DARKIRC_REV="${LUNARWING_MT_DARKIRC_REV:-a05956d412a091e8b54c1cd4f4264c33b941203d}"
+OPENRC_ENV_EXEC_SRC="$SCRIPT_DIR/lunarwing-openrc-env-exec.sh"
+OPENRC_ENV_EXEC="/usr/local/libexec/lunarwing-openrc-env-exec"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 DEFAULT_TENSORZERO_URL="${LUNARWING_MT_TENSORZERO_URL:-http://192.168.1.157:3000/openai/v1}"
 # Fleet-wide default VL (vision-language) backend URL the OCR sidecar proxies to.
@@ -2768,6 +2770,7 @@ ADAPTER_LOG_LEVEL=INFO
 ENVEOF
     )
   fi
+  chmod 0600 "$path"
   chown "$name:$name" "$path"
   say "wrote: $path"
 }
@@ -3120,6 +3123,65 @@ upload_tenant_ssh_key() {
   else
     say "WARNING: SSH key upload failed: $upload_result" >&2
     say "         staged key remains at $staged_key (upload manually or re-run)" >&2
+  fi
+}
+
+# Upload the DarkIRC adapter secret to the secrets store via the gateway's
+# extension setup API. Called AFTER the daemon starts (the API is served by the
+# gateway on the tenant gateway port). The secret is optional — if absent from the tenant
+# env, this is a no-op. Idempotent: ExtensionManager::configure overwrites an
+# existing secret and refreshes/activates the WASM channel, so re-running
+# start_tenant is safe and no daemon restart is required (the credential is read
+# live per-request from the secrets store). Init-system-agnostic — uses HTTP,
+# works on both systemd and OpenRC. Best-effort: a failed upload warns and
+# continues; the daemon keeps running.
+upload_tenant_darkirc_secret() {
+  local name="$1"
+  local env_path gateway_port gateway_token darkirc_adapter_secret upload_result
+
+  # Only tenants provisioned with DarkIRC carry this secret.
+  tenant_darkirc_enabled "$name" || return 0
+
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+
+  darkirc_adapter_secret="$(grep -s '^DARKIRC_ADAPTER_SECRET=' "$env_path" | cut -d= -f2- || true)"
+  # The secret is optional — nothing to upload if it is not set.
+  [[ -n "$darkirc_adapter_secret" ]] || return 0
+
+  gateway_token="$(grep -s '^GATEWAY_AUTH_TOKEN=' "$env_path" | cut -d= -f2- || true)"
+  if [[ -z "$gateway_token" ]]; then
+    say "WARNING: GATEWAY_AUTH_TOKEN not found in $env_path; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2
+    return 1
+  fi
+
+  gateway_port="$(ports_get "$name" gateway)"
+
+  # Wait for the gateway to be reachable (it may still be starting up).
+  if ! _wait_tenant_gateway "$name"; then
+    say "WARNING: gateway not reachable on port $gateway_port; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2
+    return 1
+  fi
+
+  # Upload the secret via the extension setup API. The adapter secret is sent
+  # on stdin (never argv), and the gateway auth token is sent via curl -K
+  # reading an anonymous process-substitution FD (never argv) so neither
+  # credential appears in /proc/<pid>/cmdline or shell history.
+  local auth_header="Authorization: Bearer ${gateway_token}"
+  upload_result="$(jq -n --arg secret "$darkirc_adapter_secret" \
+    '{secrets:{darkirc_adapter_secret:$secret},fields:{}}' | \
+    curl -sf -X POST "http://127.0.0.1:${gateway_port}/api/extensions/darkirc/setup" \
+      -H "Content-Type: application/json" \
+      -K <(printf 'header = \"%s\"\\n' "$auth_header") \
+      -d @- 2>&1)" || true
+
+  if echo "$upload_result" | jq -e '.success == true' >/dev/null 2>&1; then
+    say "DarkIRC adapter secret uploaded to secrets store"
+    return 0
+  else
+    # Do NOT echo $upload_result: the gateway or adapter may echo the secret
+    # back in the error message. Emit a generic warning instead.
+    say "WARNING: DarkIRC adapter secret upload failed (upload manually via the API)" >&2
+    return 1
   fi
 }
 
@@ -5230,8 +5292,6 @@ uninstall_tenant_systemd() {
 }
 
 # Render the WeeChat OpenRC init script into <out_file>.
-# Includes a load_env() that parses only RELAY_PASSWORD from weechat.env;
-# tenant-controlled env content is never sourced by OpenRC as root.
 _render_weechat_openrc_unit() {  # <tenant> <out_file>
   local name="$1" out_file="$2"
   local weechat_home env_dir run_dir log_dir
@@ -5254,10 +5314,14 @@ description="WeeChat IRC client ($name)"
 : "\${weechat_error_log:=\${weechat_log_dir}/weechat.err}"
 : "\${weechat_retry:=SIGTERM/30/KILL/5}"
 : "\${weechat_env_file:=$env_dir/weechat.env}"
+: "\${weechat_openrc_env_exec:=$OPENRC_ENV_EXEC}"
+: "\${weechat_command:=$(command -v tmux)}"
+: "\${weechat_binary:=$(command -v weechat)}"
 
-command="$(command -v tmux)"
-command_args="-L weechat-${name} new-session -d -s weechat '$(command -v weechat) --dir \${weechat_home}'"
+command="\${weechat_openrc_env_exec}"
+command_args="--env-file \${weechat_env_file} -- \${weechat_command} -L weechat-${name} new-session -d -s weechat '\${weechat_binary} --dir \${weechat_home}'"
 command_user="\${weechat_user}:\${weechat_group}"
+required_files="\${weechat_openrc_env_exec} \${weechat_command} \${weechat_binary} \${weechat_env_file}"
 
 depend() {
     need net
@@ -5266,20 +5330,14 @@ depend() {
     before lunarwing-weechat-adapter-${name} lunarwing-${name}
 }
 
-load_env() {
-    [ -n "\${weechat_env_file}" ] && [ -r "\${weechat_env_file}" ] || return 1
-    RELAY_PASSWORD="\$(sed -n 's/^RELAY_PASSWORD=//p' "\${weechat_env_file}" | tail -n 1)"
-    [ -n "\${RELAY_PASSWORD}" ] || return 1
-    export RELAY_PASSWORD
-}
-
 start() {
     ebegin "Starting WeeChat ($name)"
-    load_env || return 1
     checkpath -d -m 0750 -o "\${weechat_user}:\${weechat_group}" "\${weechat_home}"
     checkpath -d -m 0750 -o "\${weechat_user}:\${weechat_group}" "\${weechat_runtime_dir}"
     start-stop-daemon --start --background --user "\${weechat_user}" \\
-        --exec $(command -v tmux) -- -L weechat-${name} new-session -d -s weechat "$(command -v weechat) --dir \${weechat_home}"
+        --exec "\${weechat_openrc_env_exec}" -- \\
+        --env-file "\${weechat_env_file}" -- "\${weechat_command}" \\
+        -L weechat-${name} new-session -d -s weechat "\${weechat_binary} --dir \${weechat_home}"
     eend \$?
 }
 
@@ -5294,6 +5352,34 @@ INITEOF
 
 # ── OpenRC service units ─────────────────────────────────────────────────────
 
+install_openrc_env_exec() {
+  local install_dir owner group mode links
+  [[ -f "$OPENRC_ENV_EXEC_SRC" && ! -L "$OPENRC_ENV_EXEC_SRC" ]] \
+    || die "OpenRC tenant env launcher is missing: $OPENRC_ENV_EXEC_SRC"
+
+  install_dir="$(dirname "$OPENRC_ENV_EXEC")"
+  install -d -o root -g root -m 0755 "$install_dir" \
+    || die "failed to prepare OpenRC tenant env launcher directory"
+  [[ -d "$install_dir" && ! -L "$install_dir" ]] \
+    || die "unsafe OpenRC tenant env launcher directory: $install_dir"
+  owner="$(stat -c '%u' "$install_dir" 2>/dev/null || true)"
+  group="$(stat -c '%g' "$install_dir" 2>/dev/null || true)"
+  mode="$(stat -c '%a' "$install_dir" 2>/dev/null || true)"
+  [[ "$owner" == 0 && "$group" == 0 && "$mode" == 755 ]] \
+    || die "OpenRC tenant env launcher directory must be root:root mode 0755"
+
+  install -o root -g root -m 0755 "$OPENRC_ENV_EXEC_SRC" "$OPENRC_ENV_EXEC" \
+    || die "failed to install OpenRC tenant env launcher"
+  [[ -f "$OPENRC_ENV_EXEC" && ! -L "$OPENRC_ENV_EXEC" && -x "$OPENRC_ENV_EXEC" ]] \
+    || die "unsafe OpenRC tenant env launcher: $OPENRC_ENV_EXEC"
+  owner="$(stat -c '%u' "$OPENRC_ENV_EXEC" 2>/dev/null || true)"
+  group="$(stat -c '%g' "$OPENRC_ENV_EXEC" 2>/dev/null || true)"
+  mode="$(stat -c '%a' "$OPENRC_ENV_EXEC" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$OPENRC_ENV_EXEC" 2>/dev/null || true)"
+  [[ "$owner" == 0 && "$group" == 0 && "$mode" == 755 && "$links" == 1 ]] \
+    || die "OpenRC tenant env launcher must be root:root, single-link mode 0755"
+}
+
 render_tenant_openrc_units() {
   local name="$1"
   local repo env_dir state_dir log_dir run_dir
@@ -5302,6 +5388,7 @@ render_tenant_openrc_units() {
   state_dir="$(tenant_state_dir "$name")"
   log_dir="$(tenant_log_dir "$name")"
   run_dir="$(tenant_run_dir "$name")"
+  install_openrc_env_exec
 
   local proxy_port bridge_port weechat_port
   proxy_port="$(ports_get "$name" proxy)"
@@ -5433,14 +5520,15 @@ description="LunarWing AI assistant ($name)"
 : "\${lunarwing_output_log:=\${lunarwing_log_dir}/lunarwing.log}"
 : "\${lunarwing_error_log:=\${lunarwing_log_dir}/lunarwing.err}"
 : "\${lunarwing_env_file:=$env_dir/lunarwing.env}"
+: "\${lunarwing_openrc_env_exec:=$OPENRC_ENV_EXEC}"
 : "\${lunarwing_umask:=0077}"
 : "\${lunarwing_respawn_delay:=5}"
 : "\${lunarwing_respawn_max:=5}"
 : "\${lunarwing_respawn_period:=60}"
 : "\${lunarwing_retry:=SIGTERM/30/KILL/5}"
 
-command="\${lunarwing_command}"
-command_args="\${lunarwing_args}"
+command="\${lunarwing_openrc_env_exec}"
+command_args="--env-file \${lunarwing_env_file} -- \${lunarwing_command} \${lunarwing_args}"
 command_user="\${lunarwing_user}:\${lunarwing_group}"
 directory="\${lunarwing_workdir}"
 pidfile="\${lunarwing_pidfile}"
@@ -5451,20 +5539,12 @@ respawn_max="\${lunarwing_respawn_max}"
 respawn_period="\${lunarwing_respawn_period}"
 output_log="\${lunarwing_output_log}"
 error_log="\${lunarwing_error_log}"
-required_files="\${command}"
+required_files="\${lunarwing_openrc_env_exec} \${lunarwing_command} \${lunarwing_env_file}"
 
 depend() {
     need net localmount lunarwing-pg-${name}
     use dns logger
     after firewall lunarwing-pg-${name} xmpp-bridge-${name}${proxy_rc_after} weechat-${name} lunarwing-weechat-adapter-${name}${darkirc_rc_after}
-}
-
-load_env() {
-    if [ -n "\${lunarwing_env_file}" ] && [ -r "\${lunarwing_env_file}" ]; then
-        set -a
-        . "\${lunarwing_env_file}"
-        set +a
-    fi
 }
 
 start_pre() {
@@ -5473,7 +5553,6 @@ start_pre() {
     checkpath -d -m 0750 -o "\${lunarwing_user}:\${lunarwing_group}" "\${lunarwing_runtime_dir}"
     checkpath -f -m 0640 -o "\${lunarwing_user}:\${lunarwing_group}" "\${output_log}"
     checkpath -f -m 0640 -o "\${lunarwing_user}:\${lunarwing_group}" "\${error_log}"
-    load_env || return 1
     # Postgres is brought up by the dedicated lunarwing-pg-${name} service, which
     # this unit declares as a hard dependency (need), so the DB is already up.
     umask "\${lunarwing_umask}"
@@ -5498,13 +5577,15 @@ description="LunarWing XMPP bridge ($name)"
 : "\${xmpp_bridge_output_log:=\${xmpp_bridge_log_dir}/xmpp-bridge.log}"
 : "\${xmpp_bridge_error_log:=\${xmpp_bridge_log_dir}/xmpp-bridge.err}"
 : "\${xmpp_bridge_env_file:=$env_dir/xmpp-bridge.env}"
+: "\${xmpp_bridge_openrc_env_exec:=$OPENRC_ENV_EXEC}"
 : "\${xmpp_bridge_umask:=0077}"
 : "\${xmpp_bridge_respawn_delay:=5}"
 : "\${xmpp_bridge_respawn_max:=5}"
 : "\${xmpp_bridge_respawn_period:=60}"
 : "\${xmpp_bridge_retry:=SIGTERM/30/KILL/5}"
 
-command="\${xmpp_bridge_command}"
+command="\${xmpp_bridge_openrc_env_exec}"
+command_args="--env-file \${xmpp_bridge_env_file} -- \${xmpp_bridge_command}"
 command_user="\${xmpp_bridge_user}:\${xmpp_bridge_group}"
 directory="\${xmpp_bridge_workdir}"
 pidfile="\${xmpp_bridge_pidfile}"
@@ -5515,7 +5596,7 @@ respawn_max="\${xmpp_bridge_respawn_max}"
 respawn_period="\${xmpp_bridge_respawn_period}"
 output_log="\${xmpp_bridge_output_log}"
 error_log="\${xmpp_bridge_error_log}"
-required_files="\${command}"
+required_files="\${xmpp_bridge_openrc_env_exec} \${xmpp_bridge_command} \${xmpp_bridge_env_file}"
 
 depend() {
     need net localmount
@@ -5524,21 +5605,12 @@ depend() {
     before lunarwing-${name}
 }
 
-load_env() {
-    if [ -n "\${xmpp_bridge_env_file}" ] && [ -r "\${xmpp_bridge_env_file}" ]; then
-        set -a
-        . "\${xmpp_bridge_env_file}"
-        set +a
-    fi
-}
-
 start_pre() {
     checkpath -d -m 0750 -o "\${xmpp_bridge_user}:\${xmpp_bridge_group}" "\${xmpp_bridge_state_dir}"
     checkpath -d -m 0750 -o "\${xmpp_bridge_user}:\${xmpp_bridge_group}" "\${xmpp_bridge_log_dir}"
     checkpath -d -m 0750 -o "\${xmpp_bridge_user}:\${xmpp_bridge_group}" "\${xmpp_bridge_runtime_dir}"
     checkpath -f -m 0640 -o "\${xmpp_bridge_user}:\${xmpp_bridge_group}" "\${output_log}"
     checkpath -f -m 0640 -o "\${xmpp_bridge_user}:\${xmpp_bridge_group}" "\${error_log}"
-    load_env || return 1
     umask "\${xmpp_bridge_umask}"
 }
 INITEOF
@@ -5618,14 +5690,15 @@ description="LunarWing TensorZero proxy ($name)"
 : "\${proxy_output_log:=\${proxy_log_dir}/proxy.log}"
 : "\${proxy_error_log:=\${proxy_log_dir}/proxy.err}"
 : "\${proxy_env_file:=$env_dir/proxy.env}"
+: "\${proxy_openrc_env_exec:=$OPENRC_ENV_EXEC}"
 : "\${proxy_umask:=0077}"
 : "\${proxy_respawn_delay:=5}"
 : "\${proxy_respawn_max:=5}"
 : "\${proxy_respawn_period:=60}"
 : "\${proxy_retry:=SIGTERM/30/KILL/5}"
 
-command="\${proxy_command}"
-command_args="\${proxy_args}"
+command="\${proxy_openrc_env_exec}"
+command_args="--env-file \${proxy_env_file} -- \${proxy_command} \${proxy_args}"
 command_user="\${proxy_user}:\${proxy_group}"
 pidfile="\${proxy_pidfile}"
 supervisor="supervise-daemon"
@@ -5635,6 +5708,7 @@ respawn_max="\${proxy_respawn_max}"
 respawn_period="\${proxy_respawn_period}"
 output_log="\${proxy_output_log}"
 error_log="\${proxy_error_log}"
+required_files="\${proxy_openrc_env_exec} \${proxy_command} \${proxy_env_file}"
 
 depend() {
     need net
@@ -5643,20 +5717,11 @@ depend() {
     before lunarwing-${name}
 }
 
-load_env() {
-    if [ -n "\${proxy_env_file}" ] && [ -r "\${proxy_env_file}" ]; then
-        set -a
-        . "\${proxy_env_file}"
-        set +a
-    fi
-}
-
 start_pre() {
     checkpath -d -m 0750 -o "\${proxy_user}:\${proxy_group}" "\${proxy_runtime_dir}"
     checkpath -d -m 0750 -o "\${proxy_user}:\${proxy_group}" "\${proxy_log_dir}"
     checkpath -f -m 0640 -o "\${proxy_user}:\${proxy_group}" "\${output_log}"
     checkpath -f -m 0640 -o "\${proxy_user}:\${proxy_group}" "\${error_log}"
-    load_env || return 1
     umask "\${proxy_umask}"
 }
 INITEOF
@@ -5682,14 +5747,15 @@ description="LunarWing WeeChat WS adapter ($name)"
 : "\${adapter_output_log:=\${adapter_log_dir}/weechat-adapter.log}"
 : "\${adapter_error_log:=\${adapter_log_dir}/weechat-adapter.err}"
 : "\${adapter_env_file:=$env_dir/lunarwing.env}"
+: "\${adapter_openrc_env_exec:=$OPENRC_ENV_EXEC}"
 : "\${adapter_umask:=0077}"
 : "\${adapter_respawn_delay:=5}"
 : "\${adapter_respawn_max:=5}"
 : "\${adapter_respawn_period:=60}"
 : "\${adapter_retry:=SIGTERM/30/KILL/5}"
 
-command="\${adapter_command}"
-command_args="\${adapter_args}"
+command="\${adapter_openrc_env_exec}"
+command_args="--env-file \${adapter_env_file} -- \${adapter_command} \${adapter_args}"
 command_user="\${adapter_user}:\${adapter_group}"
 directory="$ws_adapter_dir"
 pidfile="\${adapter_pidfile}"
@@ -5700,6 +5766,7 @@ respawn_max="\${adapter_respawn_max}"
 respawn_period="\${adapter_respawn_period}"
 output_log="\${adapter_output_log}"
 error_log="\${adapter_error_log}"
+required_files="\${adapter_openrc_env_exec} \${adapter_command} \${adapter_env_file}"
 
 depend() {
     need net lunarwing-weechat-${name}
@@ -5708,20 +5775,11 @@ depend() {
     before lunarwing-${name}
 }
 
-load_env() {
-    if [ -n "\${adapter_env_file}" ] && [ -r "\${adapter_env_file}" ]; then
-        set -a
-        . "\${adapter_env_file}"
-        set +a
-    fi
-}
-
 start_pre() {
     checkpath -d -m 0750 -o "\${adapter_user}:\${adapter_group}" "\${adapter_runtime_dir}"
     checkpath -d -m 0750 -o "\${adapter_user}:\${adapter_group}" "\${adapter_log_dir}"
     checkpath -f -m 0640 -o "\${adapter_user}:\${adapter_group}" "\${output_log}"
     checkpath -f -m 0640 -o "\${adapter_user}:\${adapter_group}" "\${error_log}"
-    load_env || return 1
     umask "\${adapter_umask}"
 }
 INITEOF
@@ -5748,14 +5806,15 @@ description="LunarWing DarkIRC adapter ($name)"
 : "\${darkirc_adapter_output_log:=\${darkirc_adapter_log_dir}/darkirc-adapter.log}"
 : "\${darkirc_adapter_error_log:=\${darkirc_adapter_log_dir}/darkirc-adapter.err}"
 : "\${darkirc_adapter_env_file:=$env_dir/darkirc-adapter.env}"
+: "\${darkirc_adapter_openrc_env_exec:=$OPENRC_ENV_EXEC}"
 : "\${darkirc_adapter_umask:=0077}"
 : "\${darkirc_adapter_respawn_delay:=5}"
 : "\${darkirc_adapter_respawn_max:=5}"
 : "\${darkirc_adapter_respawn_period:=60}"
 : "\${darkirc_adapter_retry:=SIGTERM/30/KILL/5}"
 
-command="\${darkirc_adapter_command}"
-command_args="\${darkirc_adapter_args}"
+command="\${darkirc_adapter_openrc_env_exec}"
+command_args="--env-file \${darkirc_adapter_env_file} -- \${darkirc_adapter_command} \${darkirc_adapter_args}"
 command_user="\${darkirc_adapter_user}:\${darkirc_adapter_group}"
 directory="$darkirc_adapter_dir"
 pidfile="\${darkirc_adapter_pidfile}"
@@ -5766,6 +5825,7 @@ respawn_max="\${darkirc_adapter_respawn_max}"
 respawn_period="\${darkirc_adapter_respawn_period}"
 output_log="\${darkirc_adapter_output_log}"
 error_log="\${darkirc_adapter_error_log}"
+required_files="\${darkirc_adapter_openrc_env_exec} \${darkirc_adapter_command} \${darkirc_adapter_env_file}"
 
 depend() {
     need net
@@ -5774,20 +5834,11 @@ depend() {
     before lunarwing-${name}
 }
 
-load_env() {
-    if [ -n "\${darkirc_adapter_env_file}" ] && [ -r "\${darkirc_adapter_env_file}" ]; then
-        set -a
-        . "\${darkirc_adapter_env_file}"
-        set +a
-    fi
-}
-
 start_pre() {
     checkpath -d -m 0750 -o "\${darkirc_adapter_user}:\${darkirc_adapter_group}" "\${darkirc_adapter_runtime_dir}"
     checkpath -d -m 0750 -o "\${darkirc_adapter_user}:\${darkirc_adapter_group}" "\${darkirc_adapter_log_dir}"
     checkpath -f -m 0640 -o "\${darkirc_adapter_user}:\${darkirc_adapter_group}" "\${output_log}"
     checkpath -f -m 0640 -o "\${darkirc_adapter_user}:\${darkirc_adapter_group}" "\${error_log}"
-    load_env || return 1
     umask "\${darkirc_adapter_umask}"
 }
 INITEOF
@@ -6500,6 +6551,12 @@ start_tenant() {
       fi
     fi
   fi
+
+  # Seed the optional DarkIRC adapter secret into the encrypted secrets store
+  # so the WASM channel authenticates outbound adapter requests. Best-effort:
+  # a failed upload warns and continues; the WASM channel refreshes the credential
+  # live from the store, so no daemon restart is required.
+  upload_tenant_darkirc_secret "$name" || true
 
   # Workers start AFTER the daemon (and after any SSH-key bounce) so the SSH
   # agent socket is already a real, current Unix socket when podman bind-mounts it.

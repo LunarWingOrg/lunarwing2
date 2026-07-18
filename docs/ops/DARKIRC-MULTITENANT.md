@@ -215,6 +215,13 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <TENANT>
 sudo ic/scripts/lunarwing-mt-admin.sh stop-tenant <TENANT>
 ```
 
+### Automatic Adapter-Secret Seeding
+
+When `start-tenant` runs for a DarkIRC-enabled tenant, it reads `DARKIRC_ADAPTER_SECRET` from the tenant's `lunarwing.env` and submits it through the authenticated loopback gateway setup API into the encrypted SecretsStore. The secret is never written to plaintext database files and is never passed as a command-line argument. This keeps the adapter credential available to the WASM channel at runtime without exposing it in process arguments or logs.
+
+- **Best-effort:** failures during seeding emit a warning but do **not** abort tenant startup. The main daemon and adapter may still come up; only the credential path to the WASM channel is affected.
+- **Idempotent:** re-running `start-tenant` re-reads `DARKIRC_ADAPTER_SECRET` and refreshes the active WASM credentials. This is the supported way to rotate the secret post-start without manual database edits.
+
 ### systemd
 
 Per-tenant user units:
@@ -451,7 +458,17 @@ sudo ic/scripts/lunarwing-mt-admin.sh patch-env <TENANT>
 sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <TENANT>
 ```
 
+**Safe rotation:** when the WASM channel and adapter must share a new secret, keep `DARKIRC_ADAPTER_SECRET` (in `lunarwing.env`) and the adapter's `ADAPTER_SECRET` (in `darkirc-adapter.env`) synchronized through the `patch-env` / rendered env flow, then run `restart-tenant`. The rendered templates ensure both sides receive the same value without manual copying. Never print or log secret values during this process; verify by length or fingerprint if needed.
+
 If manual repair is unavoidable, ensure the adapter service receives `ADAPTER_SECRET` and the main daemon receives `DARKIRC_ADAPTER_SECRET` with the same value. Do not print the value while comparing; use fingerprints or length checks.
+
+> **Manual regression test:** there is no shell-test aggregator that runs automatically in CI. To validate the secret-seeding *contract* after code changes, run the dedicated test script manually:
+>
+> ```bash
+> bash ic/scripts/tests/test-darkirc-adapter-secret-upload.sh
+> ```
+>
+> This script sources mt-admin and stubs `curl`, port discovery, env paths, and the gateway wait, then asserts the seeding code path: guards and payload shape, selection of the gateway port, idempotent repeated invocation, and that the credential stays off `argv` and out of logs. It is a unit-level check of the seeding logic, not a live integration run. Proving real gateway, encrypted SecretsStore, and runtime behaviour requires a live `start-tenant` followed by post-refresh log checks (no 401s) and adapter-health verification.
 
 ### Port collision warning during migration
 
@@ -522,4 +539,5 @@ For each production tenant:
 - [ ] `start-tenant <TENANT>` starts daemon, adapter, and main LunarWing service.
 - [ ] Adapter `/health` returns `status: ok` and `irc_connected: true`.
 - [ ] Gateway status reports DarkIRC channel health.
+- [ ] Automatic secret seeding succeeded for the tenant (no post-start 401 from WASM channel to adapter; rerun `start-tenant` to refresh if needed).
 - [ ] Tor/hidden-service plan is documented if onion connectivity is required.
