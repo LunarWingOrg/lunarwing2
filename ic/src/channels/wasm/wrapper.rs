@@ -912,9 +912,16 @@ impl WasmChannel {
         // Serialize back
         *config_guard = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
+        // Log a sanitized summary only. The merged config frequently contains
+        // host-injected secrets (xmpp_password, relay_password, adapter tokens),
+        // so never log the raw JSON — even at debug level. Report only key names
+        // and a few safe booleans/counts so operators can still confirm an update
+        // landed without exposing credential values.
+        let safe_keys: Vec<&str> = config.keys().map(String::as_str).collect();
         tracing::debug!(
             channel = %self.name,
-            config = %*config_guard,
+            key_count = config.len(),
+            keys = ?safe_keys,
             "Updated channel config"
         );
     }

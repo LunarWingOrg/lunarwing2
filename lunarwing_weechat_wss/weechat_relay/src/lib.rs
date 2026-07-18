@@ -209,7 +209,13 @@ fn default_ws_adapter_url() -> String {
 }
 
 fn default_dm_policy() -> String {
-    "open".to_string()
+    // New installs default to `pairing`: an unpaired sender gets pairing
+    // instructions and does not execute under owner scope. This matches the
+    // documented setup prompt and capabilities default. Existing deployments
+    // with an explicit `open`/`allowlist`/`pairing` value keep that value
+    // because the adapter config and persisted workspace state are honored
+    // before this default is used.
+    "pairing".to_string()
 }
 
 fn default_group_policy() -> String {
@@ -283,10 +289,8 @@ impl Guest for WeechatRelayChannel {
     }
     /// Initialize the channel. Persist config to workspace and verify connectivity.
     fn on_start(config_json: String) -> Result<ChannelConfig, String> {
-        channel_host::log(
-            channel_host::LogLevel::Debug,
-            &format!("WeeChat Relay channel config: {}", config_json),
-        );
+        // Do NOT log raw config_json: it contains host-injected secrets
+        // (e.g. relay_password). Log a sanitized summary instead.
 
         let config: WeechatConfig = serde_json::from_str(&config_json)
             .map_err(|e| format!("Failed to parse config: {}", e))?;
@@ -558,16 +562,43 @@ impl Guest for WeechatRelayChannel {
                         Err(_) => return,
                     };
 
+                // Suppress auth-status delivery in group buffers. These
+                // messages can carry setup instructions and OAuth URLs that
+                // must not leak into shared channels. Approval prompts and
+                // job-started notices are unaffected and remain allowed in
+                // groups. Do not log the auth URL itself.
+                if !metadata.is_dm {
+                    match update.status {
+                        StatusType::AuthRequired => {
+                            channel_host::log(
+                                channel_host::LogLevel::Debug,
+                                &format!(
+                                    "Suppressing auth-required status in group buffer '{}'",
+                                    metadata.buffer
+                                ),
+                            );
+                            return;
+                        }
+                        StatusType::AuthCompleted => {
+                            channel_host::log(
+                                channel_host::LogLevel::Debug,
+                                &format!(
+                                    "Suppressing auth-completed status in group buffer '{}'",
+                                    metadata.buffer
+                                ),
+                            );
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 let relay_url =
                     channel_host::workspace_read(RELAY_URL_PATH).unwrap_or_else(default_relay_url);
                 let relay_password =
                     channel_host::workspace_read(RELAY_PASSWORD_PATH).unwrap_or_default();
 
-                let truncated = if message.len() > 400 {
-                    format!("{}...", &message[..397])
-                } else {
-                    message.to_string()
-                };
+                let truncated = truncate_for_status(message);
 
                 let status_text = format!("[status] {}", truncated);
 
@@ -1257,8 +1288,8 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
 
     // Apply DM/group policy
     if is_dm {
-        let dm_policy =
-            channel_host::workspace_read(DM_POLICY_PATH).unwrap_or_else(|| "open".to_string());
+        let dm_policy = channel_host::workspace_read(DM_POLICY_PATH)
+            .unwrap_or_else(default_dm_policy);
 
         if !check_sender_allowed(nick, &hostmask, &dm_policy) {
             drop_log(
@@ -1345,31 +1376,51 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
 }
 
 /// Check if sender is allowed based on policy.
+///
+/// Unknown policy strings fail closed (reject the sender) rather than
+/// defaulting to `open`, so a typo or stale config never grants unintended
+/// access.
 fn check_sender_allowed(nick: &str, hostmask: &str, policy: &str) -> bool {
-    if policy == "open" {
-        return true;
-    }
-
-    let allow_from: Vec<String> = channel_host::workspace_read(ALLOW_FROM_PATH)
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-
-    // Also check pairing store
-    let pairing_allowed = channel_host::pairing_read_allow_from(CHANNEL_NAME).unwrap_or_default();
-
-    let in_allow_from = allow_from.iter().any(|a| {
-        if a == "*" {
-            true
-        } else if a.contains('!') {
-            // Full hostmask entry — match against nick!user@host
-            a.eq_ignore_ascii_case(hostmask)
-        } else {
-            // Nick-only entry
-            a.eq_ignore_ascii_case(nick)
+    match policy {
+        "open" => true,
+        "pairing" => {
+            // Only the shared pairing store governs access.
+            channel_host::pairing_read_allow_from(CHANNEL_NAME)
+                .unwrap_or_default()
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(nick))
         }
-    });
+        "allowlist" => {
+            let allow_from: Vec<String> = channel_host::workspace_read(ALLOW_FROM_PATH)
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
 
-    in_allow_from || pairing_allowed.iter().any(|a| a.eq_ignore_ascii_case(nick))
+            let in_allow_from = allow_from.iter().any(|a| {
+                if a == "*" {
+                    true
+                } else if a.contains('!') {
+                    a.eq_ignore_ascii_case(hostmask)
+                } else {
+                    a.eq_ignore_ascii_case(nick)
+                }
+            });
+
+            let pairing_allowed =
+                channel_host::pairing_read_allow_from(CHANNEL_NAME).unwrap_or_default();
+
+            in_allow_from || pairing_allowed.iter().any(|a| a.eq_ignore_ascii_case(nick))
+        }
+        unknown => {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                &format!(
+                    "Unknown dm_policy '{}'; rejecting sender '{}' (fail closed)",
+                    unknown, nick
+                ),
+            );
+            false
+        }
+    }
 }
 
 /// Handle pairing request for unknown sender.
@@ -1694,6 +1745,39 @@ fn strip_irc_formatting(text: &str) -> String {
     }
 
     result
+}
+
+/// Maximum total byte budget for a status line sent to IRC, including the
+/// `[status] ` prefix and the `...` ellipsis (when truncation is needed).
+/// Matches the DarkIRC adapter's byte budget.
+const MAX_STATUS_BYTES: usize = 400;
+
+/// Truncate a status message to fit within the IRC byte budget, preserving the
+/// `[status] ` prefix and leaving room for the `...` ellipsis.
+///
+/// Truncation happens on UTF-8 character boundaries, so multibyte content
+/// (emoji, CJK, etc.) never traps the WASM callback. The retained text is a
+/// valid prefix of the original followed by `...` when truncated.
+fn truncate_for_status(message: &str) -> String {
+    if message.is_empty() {
+        return String::new();
+    }
+    // Budget for the message body inside `[status] <body>`:
+    // total budget minus the `[status] ` prefix (9 bytes) minus `...` (3 bytes,
+    // reserved only when we actually truncate).
+    const PREFIX_LEN: usize = 9; // "[status] "
+    const ELLIPSIS_LEN: usize = 3; // "..."
+    let body_budget = MAX_STATUS_BYTES
+        .saturating_sub(PREFIX_LEN)
+        .saturating_sub(ELLIPSIS_LEN);
+
+    if message.len() <= body_budget {
+        return message.to_string();
+    }
+
+    // Walk back to the nearest UTF-8 character boundary at or below the budget.
+    let cut = message.floor_char_boundary(body_budget);
+    format!("{}...", &message[..cut])
 }
 
 /// Split message into chunks at word boundaries.
@@ -2050,5 +2134,131 @@ mod tests {
     fn test_base64_encode() {
         assert_eq!(base64_encode("hello"), "aGVsbG8=");
         assert_eq!(base64_encode("plain:password"), "cGxhaW46cGFzc3dvcmQ=");
+    }
+
+    // ---- CHPAR-003: UTF-8-safe status truncation ----
+
+    #[test]
+    fn test_truncate_for_status_short_passthrough() {
+        // Short text is returned unchanged.
+        assert_eq!(truncate_for_status("hello"), "hello");
+        assert_eq!(truncate_for_status(""), "");
+    }
+
+    #[test]
+    fn test_truncate_for_status_ascii_long() {
+        // ASCII at and above the limit is truncated with an ellipsis and the
+        // full `[status] <body>` form fits the IRC byte budget.
+        let long = "a".repeat(500);
+        let truncated = truncate_for_status(&long);
+        assert!(truncated.ends_with("..."));
+        let full = format!("[status] {}", truncated);
+        assert!(
+            full.len() <= MAX_STATUS_BYTES,
+            "full status line {} bytes exceeds budget {}",
+            full.len(),
+            MAX_STATUS_BYTES
+        );
+    }
+
+    #[test]
+    fn test_truncate_for_status_multibyte_boundary_safe() {
+        // Build a string whose byte 389 (= body_budget = 400 - 8 - 3) falls
+        // inside a multibyte character. Two-byte UTF-8: fill with ASCII up to
+        // byte 388, then append a two-byte char ('é' = c3 a9), then more text.
+        let mut input = "a".repeat(388);
+        input.push('\u{00E9}'); // é — 2 bytes: c3 a9, byte 389/390
+        input.push_str("tail");
+        // The old `&message[..397]` byte slice would land inside a multibyte
+        // char for many inputs; the new helper must never panic and must return
+        // a valid UTF-8 string prefix + ellipsis.
+        let truncated = truncate_for_status(&input);
+        let full = format!("[status] {}", truncated);
+        assert!(
+            full.len() <= MAX_STATUS_BYTES,
+            "multibyte truncated line exceeds budget: {} bytes",
+            full.len()
+        );
+        // No partial char: the retained body is a valid prefix of the input.
+        if let Some(body) = truncated.strip_suffix("...") {
+            assert!(input.starts_with(body), "body must be a prefix of input");
+        }
+    }
+
+    #[test]
+    fn test_truncate_for_status_emoji_safe() {
+        // Four-byte emoji: '🦆' = f0 9f a6 86. Repeating it pushes byte 389
+        // into the middle of a code point. This must not panic.
+        let input = "🦆".repeat(200); // 800 bytes
+        let truncated = truncate_for_status(&input);
+        let full = format!("[status] {}", truncated);
+        assert!(full.len() <= MAX_STATUS_BYTES);
+        if truncated.ends_with("...") {
+            let body = &truncated[..truncated.len() - 3];
+            assert!(input.starts_with(body));
+        }
+    }
+
+    #[test]
+    fn test_truncate_for_status_cjk_safe() {
+        // Three-byte CJK ('漢' = e6 bc a2). Byte 389 splits a code point.
+        let input = "漢".repeat(200); // 600 bytes
+        let truncated = truncate_for_status(&input);
+        let full = format!("[status] {}", truncated);
+        assert!(full.len() <= MAX_STATUS_BYTES);
+        if truncated.ends_with("...") {
+            let body = &truncated[..truncated.len() - 3];
+            assert!(input.starts_with(body));
+        }
+    }
+
+    #[test]
+    fn test_truncate_for_status_preserves_prefix_content() {
+        // The retained prefix must keep the leading characters intact.
+        let input = format!("{}Z", "a".repeat(500));
+        let truncated = truncate_for_status(&input);
+        assert!(truncated.starts_with("aaaa"));
+        assert!(truncated.ends_with("..."));
+    }
+
+    // ---- CHPAR-005: new-install DM default and fail-closed policy ----
+
+    #[test]
+    fn test_default_dm_policy_is_pairing() {
+        // New installs must default to `pairing`, not `open`. This is the
+        // security posture described in the capabilities/setup prompt and
+        // enforced by the audit. An unpaired sender must not execute under
+        // owner scope by default.
+        assert_eq!(default_dm_policy(), "pairing");
+    }
+
+    #[test]
+    fn test_capabilities_json_default_dm_policy_is_pairing() {
+        // The capabilities config that ships with the channel must agree with
+        // the code default. This guards against the original audit finding
+        // where the code said `open` but the docs said `pairing`.
+        let raw = include_str!("../weechat.capabilities.json");
+        let v: serde_json::Value =
+            serde_json::from_str(raw).expect("capabilities JSON must parse");
+        assert_eq!(
+            v["config"]["dm_policy"].as_str(),
+            Some("pairing"),
+            "capabilities default dm_policy must be pairing"
+        );
+    }
+
+    #[test]
+    fn test_example_local_config_uses_pairing_default() {
+        // The example adapter config is what operators copy from. It must
+        // demonstrate the safe default unless it explicitly documents an open
+        // override.
+        let raw = include_str!("../weechat_local_config.json.example");
+        let v: serde_json::Value =
+            serde_json::from_str(raw).expect("example config JSON must parse");
+        assert_eq!(
+            v["dm_policy"].as_str(),
+            Some("pairing"),
+            "example local config must default to pairing"
+        );
     }
 }

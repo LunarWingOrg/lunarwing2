@@ -176,10 +176,10 @@ impl Guest for DarkircChannel {
     // Initialize the channel. Persist config to workspace so on_poll/on_response
     // can read it (each callback gets a fresh WASM instance with no shared state).
     fn on_start(config_json: String) -> Result<ChannelConfig, String> {
-        channel_host::log(
-            channel_host::LogLevel::Debug,
-            &format!("DarkIRC channel config: {}", config_json),
-        );
+        // Do NOT log raw config_json. While the current DarkircConfig has no
+        // direct secret fields, logging the full JSON is a credential-leak
+        // hazard if future config additions (e.g. adapter tokens) are added.
+        // Parse and log a safe summary instead.
 
         let config: DarkircConfig = serde_json::from_str(&config_json)
             .map_err(|e| format!("Failed to parse config: {}", e))?;
