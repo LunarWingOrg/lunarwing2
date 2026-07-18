@@ -249,6 +249,59 @@ struct WeechatMessageMetadata {
     is_dm: bool,
 }
 
+/// Validated network-qualified target for proactive WeeChat delivery.
+#[derive(Debug, PartialEq, Eq)]
+struct WeechatProactiveTarget {
+    buffer: String,
+    network: String,
+    target: String,
+    is_dm: bool,
+}
+
+fn parse_proactive_target(value: &str) -> Result<WeechatProactiveTarget, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("WeeChat proactive target is empty".to_string());
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err(
+            "WeeChat proactive target must not contain whitespace or control characters"
+                .to_string(),
+        );
+    }
+
+    let mut parts = value.splitn(3, '.');
+    let prefix = parts.next();
+    let network = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    if prefix != Some("irc") || network.is_empty() || target.is_empty() || network == "server" {
+        return Err(
+            "WeeChat proactive target must use irc.<network>.<nick-or-channel>".to_string(),
+        );
+    }
+    if !network
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err("WeeChat proactive target contains an invalid network name".to_string());
+    }
+
+    let is_dm = is_dm_target(target);
+    if is_dm && (target.starts_with('-') || target.starts_with('/') || target.contains(',')) {
+        return Err("WeeChat proactive DM target contains unsafe command syntax".to_string());
+    }
+
+    Ok(WeechatProactiveTarget {
+        buffer: value.to_string(),
+        network: network.to_string(),
+        target: target.to_string(),
+        is_dm,
+    })
+}
+
 // ============================================================================
 // Workspace Paths
 // ============================================================================
@@ -284,8 +337,64 @@ const WAIT_HTTP_TIMEOUT_MS: u32 = 25_000;
 struct WeechatRelayChannel;
 
 impl Guest for WeechatRelayChannel {
-    fn on_broadcast(_user_id: String, _response: AgentResponse) -> Result<(), String> {
-        Ok(())
+    fn on_broadcast(user_id: String, response: AgentResponse) -> Result<(), String> {
+        if !response.attachments.is_empty() {
+            return Err(
+                "WeeChat proactive delivery does not support attachments; none were sent"
+                    .to_string(),
+            );
+        }
+        if response.content.is_empty() {
+            return Err("WeeChat proactive message is empty; nothing was sent".to_string());
+        }
+
+        let route = parse_proactive_target(&user_id)?;
+        let relay_url =
+            channel_host::workspace_read(RELAY_URL_PATH).unwrap_or_else(default_relay_url);
+        let relay_password = channel_host::workspace_read(RELAY_PASSWORD_PATH).unwrap_or_default();
+        let max_chunk = channel_host::workspace_read(MAX_CHUNK_LENGTH_PATH)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(default_max_chunk_length);
+        let chunks = split_message(&response.content, max_chunk);
+
+        let mut successful_chunks = 0;
+        let mut last_error = None;
+        for chunk in &chunks {
+            let result = if route.is_dm {
+                send_dm(
+                    &relay_url,
+                    &relay_password,
+                    &route.buffer,
+                    &route.network,
+                    &route.target,
+                    chunk,
+                )
+            } else {
+                send_input(&relay_url, &relay_password, &route.buffer, chunk)
+            };
+
+            match result {
+                Ok(()) => successful_chunks += 1,
+                Err(error) => {
+                    channel_host::log(
+                        channel_host::LogLevel::Warn,
+                        &format!(
+                            "Failed to proactively send chunk {} to '{}': {}",
+                            successful_chunks + 1,
+                            route.buffer,
+                            error
+                        ),
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        if successful_chunks > 0 {
+            Ok(())
+        } else {
+            Err(last_error.unwrap_or_else(|| "Failed to send any proactive chunks".to_string()))
+        }
     }
     /// Initialize the channel. Persist config to workspace and verify connectivity.
     fn on_start(config_json: String) -> Result<ChannelConfig, String> {
@@ -1949,6 +2058,89 @@ mod tests {
         assert_eq!(decoded.target, "#lunarwing");
         assert_eq!(decoded.nick, "alice");
         assert!(!decoded.is_dm);
+    }
+
+    #[test]
+    fn test_parse_proactive_group_target() {
+        let target = parse_proactive_target("irc.libera.#lunarwing")
+            .expect("network-qualified group target should parse");
+        assert_eq!(target.buffer, "irc.libera.#lunarwing");
+        assert_eq!(target.network, "libera");
+        assert_eq!(target.target, "#lunarwing");
+        assert!(!target.is_dm);
+    }
+
+    #[test]
+    fn test_parse_proactive_dm_target() {
+        let target = parse_proactive_target("irc.darkirc.alice")
+            .expect("network-qualified DM target should parse");
+        assert_eq!(target.buffer, "irc.darkirc.alice");
+        assert_eq!(target.network, "darkirc");
+        assert_eq!(target.target, "alice");
+        assert!(target.is_dm);
+    }
+
+    #[test]
+    fn test_parse_proactive_target_preserves_dots_in_recipient() {
+        let target = parse_proactive_target("irc.libera.alice.example")
+            .expect("dots after the network belong to the recipient");
+        assert_eq!(target.target, "alice.example");
+        assert!(target.is_dm);
+    }
+
+    #[test]
+    fn test_parse_proactive_target_rejects_ambiguous_or_malformed_values() {
+        for value in [
+            "",
+            "alice",
+            "#lunarwing",
+            "irc.libera",
+            "irc..alice",
+            "irc.server.libera",
+            "irc.libera.alice bob",
+            "irc.libera.alice\n/msg bob leaked",
+            "irc.libera!.alice",
+            "irc.libera.-server",
+            "irc.libera./join",
+            "irc.libera.alice,bob",
+        ] {
+            assert!(
+                parse_proactive_target(value).is_err(),
+                "target should be rejected: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_on_broadcast_rejects_empty_content_before_network_access() {
+        let response = AgentResponse {
+            message_id: "test-message".to_string(),
+            content: String::new(),
+            thread_id: None,
+            metadata_json: "{}".to_string(),
+            attachments: vec![],
+        };
+        let error = WeechatRelayChannel::on_broadcast("irc.libera.alice".to_string(), response)
+            .expect_err("empty proactive content must be rejected");
+        assert!(error.contains("empty"));
+    }
+
+    #[test]
+    fn test_on_broadcast_rejects_attachments_before_network_access() {
+        let response = AgentResponse {
+            message_id: "test-message".to_string(),
+            content: "hello".to_string(),
+            thread_id: None,
+            metadata_json: "{}".to_string(),
+            attachments: vec![exports::lunarwing::agent::channel::Attachment {
+                filename: "test.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                data: b"test".to_vec(),
+            }],
+        };
+        let error = WeechatRelayChannel::on_broadcast("irc.libera.alice".to_string(), response)
+            .expect_err("unsupported proactive attachments must be rejected");
+        assert!(error.contains("attachments"));
     }
 
     #[test]

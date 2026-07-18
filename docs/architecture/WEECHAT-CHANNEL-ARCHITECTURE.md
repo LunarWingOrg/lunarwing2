@@ -95,6 +95,17 @@ configuration is never overwritten.
 to `max_chunk_length` (default 420), and `POST`s each chunk to the WeeChat **relay** `/api/input`
 (via `relay_url`, not the adapter). Replies therefore go straight to WeeChat.
 
+Proactive `on_broadcast` delivery requires an explicit, network-qualified full buffer name:
+`irc.<network>.<target>` (for example, `irc.libera.#lunarwing` or `irc.libera.alice`). Bare
+nicks and channel names are rejected because they are ambiguous across networks. Group targets
+use the full buffer with `/api/input`; DM targets retain the server-buffer `/msg` fallback used
+by reactive replies. Proactive attachments are rejected explicitly rather than silently dropped.
+
+Owner-scoped automatic target discovery remains separate from explicit delivery. The
+`wasm_channel_owner_ids` numeric settings contract is intentionally unchanged for compatibility
+with persisted 1.1.2 tenant settings. Until a compatible owner-target migration is designed,
+operators and tools should pass the full WeeChat target explicitly.
+
 ### Watermarks & new buffers (poll mode only)
 
 In the polling fallback, `do_poll` seeds a per-buffer watermark the **first time** it sees a

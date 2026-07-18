@@ -358,6 +358,24 @@ curl -sf -X POST http://127.0.0.1:<gateway_port>/api/pairing/weechat/approve \
 
 Note: With `ENGINE_V2=false`, the legacy path also honors `dm_policy`, so this setting protects both routing modes uniformly.
 
+## Proactive Message Targets
+
+The message tool and other direct proactive calls must use WeeChat's full, network-qualified
+buffer name as the target:
+
+```text
+irc.libera.#lunarwing  # group channel
+irc.libera.alice       # DM/query
+```
+
+Bare values such as `alice` or `#lunarwing` are rejected because the same nick or channel can
+exist on multiple IRC networks. Proactive WeeChat attachments are currently unsupported and
+return an error without sending partial content.
+
+This explicit-target behavior does not change the persisted 1.1.2 owner-ID model. Automated
+owner-scoped mission routing remains deferred; configure direct calls with a full target instead
+of relying on the most recent IRC sender.
+
 ## Manual Operations
 
 ### Attach to WeeChat
