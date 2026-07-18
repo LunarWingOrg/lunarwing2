@@ -912,9 +912,16 @@ impl WasmChannel {
         // Serialize back
         *config_guard = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
+        // Log a sanitized summary only. The merged config frequently contains
+        // host-injected secrets (xmpp_password, relay_password, adapter tokens),
+        // so never log the raw JSON — even at debug level. Report only key names
+        // and a few safe booleans/counts so operators can still confirm an update
+        // landed without exposing credential values.
+        let safe_keys: Vec<&str> = config.keys().map(String::as_str).collect();
         tracing::debug!(
             channel = %self.name,
-            config = %*config_guard,
+            key_count = config.len(),
+            keys = ?safe_keys,
             "Updated channel config"
         );
     }
@@ -3475,7 +3482,13 @@ fn read_attachments(paths: &[String]) -> Result<Vec<wit_channel::Attachment>, St
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
 
     use crate::channels::Channel;
     use crate::channels::OutgoingResponse;
@@ -3483,6 +3496,7 @@ mod tests {
     use crate::channels::wasm::runtime::{
         PreparedChannelModule, WasmChannelRuntime, WasmChannelRuntimeConfig,
     };
+    use crate::channels::wasm::schema::ChannelCapabilitiesFile;
     use crate::channels::wasm::wrapper::{
         EmitDispatchContext, HttpResponse, WasmChannel, uses_owner_broadcast_target,
     };
@@ -3534,6 +3548,22 @@ mod tests {
         };
     }
 
+    macro_rules! require_weechat_wasm {
+        () => {
+            if !weechat_wasm_path().exists() {
+                let msg = format!(
+                    "WeeChat WASM module not found at {:?}. Build with: cd ../lunarwing_weechat_wss/weechat_relay && ./build.sh",
+                    weechat_wasm_path()
+                );
+                if std::env::var("CI").is_ok() {
+                    panic!("{}", msg);
+                }
+                eprintln!("Skipping test: {}", msg);
+                return;
+            }
+        };
+    }
+
     fn xmpp_wasm_path() -> std::path::PathBuf {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let bundled = manifest_dir.join("channels-src/xmpp/xmpp.wasm");
@@ -3563,6 +3593,26 @@ mod tests {
         bundled
     }
 
+    fn weechat_source_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../lunarwing_weechat_wss/weechat_relay")
+    }
+
+    fn weechat_wasm_path() -> std::path::PathBuf {
+        let source_dir = weechat_source_dir();
+        let target = source_dir.join("target/wasm32-wasip2/release/weechat_relay_channel.wasm");
+        if target.exists() {
+            return target;
+        }
+
+        let installed = crate::bootstrap::lunarwing_base_dir().join("channels/weechat.wasm");
+        if installed.exists() {
+            return installed;
+        }
+
+        target
+    }
+
     async fn create_real_xmpp_channel(config_json: &str) -> WasmChannel {
         let runtime =
             Arc::new(WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing()).unwrap());
@@ -3581,6 +3631,102 @@ mod tests {
             Arc::new(PairingStore::new()),
             None,
         )
+    }
+
+    async fn create_real_weechat_channel(config_json: &str) -> WasmChannel {
+        let runtime =
+            Arc::new(WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing()).unwrap());
+        let wasm_bytes =
+            std::fs::read(weechat_wasm_path()).expect("Failed to read WeeChat WASM module");
+        let prepared = runtime
+            .prepare("weechat", &wasm_bytes, None, Some("WeeChat".to_string()))
+            .await
+            .expect("Failed to prepare WeeChat WASM module");
+        let capabilities = ChannelCapabilitiesFile::from_bytes(
+            &std::fs::read(weechat_source_dir().join("weechat.capabilities.json"))
+                .expect("Failed to read WeeChat capabilities"),
+        )
+        .expect("Failed to parse WeeChat capabilities")
+        .to_capabilities();
+
+        WasmChannel::new(
+            runtime,
+            prepared,
+            capabilities,
+            "default",
+            config_json.to_string(),
+            Arc::new(PairingStore::new()),
+            None,
+        )
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedWeechatInput {
+        authorization: Option<String>,
+        payload: serde_json::Value,
+    }
+
+    async fn start_mock_weechat_relay() -> (
+        String,
+        Arc<Mutex<Vec<RecordedWeechatInput>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/api/version",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "weechat_version": "test",
+                        "relay_api_version": "2"
+                    }))
+                }),
+            )
+            .route(
+                "/api/buffers",
+                get(|| async { Json(serde_json::json!([])) }),
+            )
+            .route(
+                "/api/input",
+                post(
+                    |State(requests): State<Arc<Mutex<Vec<RecordedWeechatInput>>>>,
+                     headers: HeaderMap,
+                     body: Bytes| async move {
+                        let payload: serde_json::Value = serde_json::from_slice(&body)
+                            .expect("WeeChat input payload should be valid JSON");
+                        let authorization = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(ToOwned::to_owned);
+                        let missing_dm_buffer =
+                            payload["buffer_name"].as_str() == Some("irc.libera.alice");
+                        requests
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(RecordedWeechatInput {
+                                authorization,
+                                payload,
+                            });
+                        if missing_dm_buffer {
+                            StatusCode::NOT_FOUND
+                        } else {
+                            StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&requests));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock WeeChat relay");
+        let address = listener.local_addr().expect("Missing mock relay address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Mock WeeChat relay failed");
+        });
+        (format!("http://{address}"), requests, task)
     }
 
     #[test]
@@ -3710,6 +3856,87 @@ mod tests {
         );
 
         channel.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_real_weechat_broadcast_sends_explicit_group_and_dm_targets() {
+        require_weechat_wasm!();
+
+        let (relay_url, requests, relay_task) = start_mock_weechat_relay().await;
+        let channel = create_real_weechat_channel(
+            &serde_json::json!({
+                "display_name": "WeeChat",
+                "relay_url": relay_url,
+                "relay_password": "not-a-real-secret",
+                "connection_mode": "http",
+                "ws_adapter_url": "",
+                "dm_policy": "pairing",
+                "group_policy": "allowlist",
+                "max_chunk_length": 420,
+                "poll_interval_seconds": 3
+            })
+            .to_string(),
+        )
+        .await;
+        channel
+            .call_on_start()
+            .await
+            .expect("WeeChat channel should initialize against mock relay");
+
+        channel
+            .broadcast(
+                "irc.libera.#lunarwing",
+                OutgoingResponse::text("group hello"),
+            )
+            .await
+            .expect("explicit WeeChat group broadcast should succeed");
+        channel
+            .broadcast("irc.libera.alice", OutgoingResponse::text("direct hello"))
+            .await
+            .expect("explicit WeeChat DM broadcast should use server-buffer fallback");
+
+        let invalid = channel
+            .broadcast("alice", OutgoingResponse::text("must not send"))
+            .await
+            .expect_err("ambiguous WeeChat target should fail through Channel::broadcast");
+        assert!(invalid.to_string().contains("irc.<network>"));
+
+        let captured = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(captured.len(), 3, "unexpected WeeChat input requests");
+        assert_eq!(
+            captured[0].payload,
+            serde_json::json!({
+                "buffer_name": "irc.libera.#lunarwing",
+                "command": "group hello"
+            })
+        );
+        assert_eq!(
+            captured[1].payload,
+            serde_json::json!({
+                "buffer_name": "irc.libera.alice",
+                "command": "direct hello"
+            })
+        );
+        assert_eq!(
+            captured[2].payload,
+            serde_json::json!({
+                "buffer_name": "irc.server.libera",
+                "command": "/msg alice direct hello"
+            })
+        );
+        for request in &captured {
+            let authorization = request
+                .authorization
+                .as_deref()
+                .expect("WeeChat relay request should include Basic authorization");
+            assert!(authorization.starts_with("Basic "));
+            assert!(!authorization.contains("not-a-real-secret"));
+        }
+
+        relay_task.abort();
     }
 
     #[tokio::test]

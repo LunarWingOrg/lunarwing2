@@ -188,7 +188,8 @@ impl Tool for MessageTool {
          the file path in the attachments array. Images are sent as photos on XMPP. \
          - Signal: target accepts E.164 (+1234567890) or group ID \
          - XMPP: target accepts username or chat ID \
-         - XMPP: target accepts bare JID (user@domain.tld)"
+         - XMPP: target accepts bare JID (user@domain.tld) \
+         - WeeChat: target must be a full buffer name (irc.<network>.<nick-or-channel>)"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -205,7 +206,7 @@ impl Tool for MessageTool {
                 },
                 "target": {
                     "type": "string",
-                    "description": "Recipient: E.164 phone, group ID, chat ID (defaults to current sender/group if omitted)"
+                    "description": "Recipient: E.164 phone, group ID, chat ID, or WeeChat full buffer name irc.<network>.<nick-or-channel> (defaults to current sender/group if omitted)"
                 },
                 "attachments": {
                     "type": "array",

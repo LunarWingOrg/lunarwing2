@@ -1,5 +1,5 @@
 {
-  "dm_policy": "open",
+  "dm_policy": "pairing",
   "group_policy": "allowlist",
   "allow_from": ["~anon@darkirc","baud!~u@phg5shwxiay3i.sobe", "sweetiebot!~u@phg5shwxiay3i.sobe", "sun!~u@pxe3aqqxc9c9a.sobe"],
   "networks": [],

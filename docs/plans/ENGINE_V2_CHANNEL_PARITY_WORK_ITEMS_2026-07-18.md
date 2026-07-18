@@ -1,7 +1,7 @@
 ---
 plan name: ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS
 plan description: Actionable remediation backlog for XMPP, DarkIRC, and WeeChat Engine V2 parity
-plan status: proposed
+plan status: in progress
 source audit: docs/reviews/ENGINE_V2_CHANNEL_PARITY_AUDIT_2026-07-18.md
 ---
 
@@ -36,7 +36,7 @@ Source changes without verification do not qualify as complete.
 | ID | Priority | Work item | Primary area | Depends on |
 |----|----------|-----------|--------------|------------|
 | CHPAR-001 | P0 | Remove secret-bearing config logging | Shared WASM host, WeeChat | None |
-| CHPAR-002 | P0 | Implement real WeeChat proactive delivery | WeeChat, shared target routing | CHPAR-008 design decision |
+| CHPAR-002 | P0 | Implement real WeeChat proactive delivery | WeeChat, shared target routing | None for explicit targets; CHPAR-008 for owner-scoped missions |
 | CHPAR-003 | P0 | Make WeeChat status truncation UTF-8 safe | WeeChat | None |
 | CHPAR-004 | P0 | Prevent auth status from leaking into WeeChat groups | WeeChat | None |
 | CHPAR-005 | P0 | Change the WeeChat new-install DM default to pairing | WeeChat config and docs | Operator compatibility decision |
@@ -52,12 +52,50 @@ Source changes without verification do not qualify as complete.
 
 1. Complete CHPAR-001, CHPAR-003, and CHPAR-004 first because they are isolated
    security/correctness fixes.
-2. Decide CHPAR-005 and CHPAR-008 before implementing proactive delivery. Do not
-   infer an owner from arbitrary IRC traffic.
-3. Implement CHPAR-002 with its real-component coverage in CHPAR-010.
+2. Apply the approved CHPAR-005 new-install default. Keep CHPAR-008 deferred and
+   do not infer an owner from arbitrary IRC traffic.
+3. Implement CHPAR-002 explicit-target delivery with its real-component coverage
+   in CHPAR-010. Do not claim owner-scoped mission delivery.
 4. Implement shared Engine V2 completeness work in CHPAR-006 and CHPAR-007.
 5. Complete real-component tests in CHPAR-009 and CHPAR-010.
 6. Perform CHPAR-012 only after all applicable local gates pass.
+
+---
+
+## Current Status (2026-07-18)
+
+Only **CHPAR-003** currently qualifies as completed and verified under this
+plan's item-level acceptance criteria. Several other items have implementation
+changes but still lack required verification; they must not be reported as
+complete.
+
+| ID | Status | Current finding / remaining gate |
+|----|--------|----------------------------------|
+| CHPAR-001 | [-] In progress | Raw config logging was removed from the shared wrapper and channel guests. Required tracing-capture tests proving sentinel XMPP and WeeChat passwords never appear are still missing. |
+| CHPAR-002 | [-] In progress | Explicit `irc.<network>.<target>` WeeChat delivery, validation, chunking, DM fallback, and attachment rejection are implemented. Native unit tests pass. The real-WASM loopback test exists but has not executed locally because the required WASM target/artifact is unavailable. Owner-scoped mission routing is excluded. |
+| CHPAR-003 | [x] Completed | UTF-8-safe byte-budget truncation is implemented and covered for ASCII, two-byte, three-byte, and four-byte input. The WeeChat adapter suite passes. |
+| CHPAR-004 | [-] In progress | Group `AuthRequired` and `AuthCompleted` suppression is implemented. Required mock-relay assertions for DM delivery and zero group sends are missing. |
+| CHPAR-005 | [-] In progress | New-install defaults, capabilities, example config, fail-closed policy handling, and docs use `pairing`. Config tests pass. Pairing approval and persisted-upgrade fixtures are missing. |
+| CHPAR-006 | [!] Decision required | No implementation started. The Engine V2 multimodal input contract remains undecided. |
+| CHPAR-007 | [ ] Not started | No implementation or tests. |
+| CHPAR-008 | [!] Deferred | Numeric `wasm_channel_owner_ids` and existing 1.1.2 persistence/identity behavior are intentionally unchanged. Requires a separate migration and rollback design. |
+| CHPAR-009 | [ ] Not started | No real DarkIRC WASM + Engine V2 fixture exists. |
+| CHPAR-010 | [-] In progress | A real-WeeChat wrapper test and loopback `/api/input` fixture were added for explicit proactive group/DM delivery, fallback, auth, and invalid targets. The component could not be built/executed locally; all other required scenarios remain. |
+| CHPAR-011 | [!] Decision required | No identity migration policy has been approved; no implementation started. |
+| CHPAR-012 | [!] Blocked | Live protocol validation remains blocked by incomplete P0/P1 verification. |
+
+### Verification recorded in this worktree
+
+- WeeChat adapter unit suite: **28 passed, 0 failed**.
+- Core message-tool unit suite: **25 passed, 0 failed**.
+- Targeted core `cargo check` with `libsql integration`: passed.
+- Core and WeeChat formatting checks: passed.
+- Real WeeChat WASM execution: **not run**. The build attempt failed because
+  this VM does not have the `wasm32-wasip1` standard library and does not have
+  `rustup`; consequently no `weechat_relay_channel.wasm` artifact was produced.
+- The real-WASM test fails in CI when the required artifact is absent, matching
+  CHPAR-010's non-skip CI requirement. Locally it reports the missing artifact
+  and returns without claiming protocol proof.
 
 ---
 
@@ -65,7 +103,7 @@ Source changes without verification do not qualify as complete.
 
 ## CHPAR-001: Remove Secret-Bearing Config Logging
 
-**Status:** [ ] Not started
+**Status:** [-] Implementation complete; captured-log regression pending
 
 **Problem:** Raw channel secrets are injected into runtime config for XMPP and
 WeeChat. The shared WASM wrapper logs the merged config at debug level, and the
@@ -95,8 +133,8 @@ can expose `xmpp_password` or `relay_password`.
 
 - [ ] A sentinel XMPP password never appears in captured debug logs.
 - [ ] A sentinel WeeChat relay password never appears in captured debug logs.
-- [ ] Safe log output still identifies which channel received runtime updates.
-- [ ] Default info-level and opt-in debug-level startup both work.
+- [x] Safe log output still identifies which channel received runtime updates.
+- [x] Default info-level and opt-in debug-level startup both work in targeted tests.
 - [ ] No secret value is added to snapshots or assertion failure messages.
 
 **Required tests:**
@@ -106,11 +144,16 @@ can expose `xmpp_password` or `relay_password`.
   the sanitized summary.
 - Run targeted WASM wrapper and setup tests.
 
+**Current finding:** The host now logs only the channel name, key count, and key
+names when runtime config changes. WeeChat and DarkIRC no longer log raw
+`config_json` during startup. This closes the source-level leak, but the two
+sentinel log-capture acceptance tests above are still required before completion.
+
 ---
 
 ## CHPAR-002: Implement Real WeeChat Proactive Delivery
 
-**Status:** [ ] Not started
+**Status:** [-] Explicit-target delivery implemented; real-WASM proof pending
 
 **Problem:** WeeChat `on_broadcast` returns `Ok(())` without sending. Mission
 notifications and built-in message-tool calls can report success while silently
@@ -176,11 +219,23 @@ field.
 **Dependency:** Complete the target-source decision in CHPAR-008 before using
 owner-scoped mission notifications.
 
+**Compatibility note (2026-07-18):** The implementation accepts only explicit full WeeChat
+buffer targets and does not change the owner-ID model. Owner-scoped mission notification routing
+remains deferred with CHPAR-008. This removes the silent-success behavior for direct calls while
+preserving persisted 1.1.2 tenant settings.
+
+**Current finding:** Six new native tests cover group and DM parsing, dotted
+recipients, malformed/ambiguous targets, empty content, and explicit attachment
+rejection. A host-wrapper loopback test also asserts exact group and DM
+`/api/input` requests, Basic authorization presence, DM server-buffer fallback,
+and `ChannelError::SendFailed` for ambiguous targets. That test compiled but
+returned early locally because the WeeChat WASM artifact could not be built.
+
 ---
 
 ## CHPAR-003: Make WeeChat Status Truncation UTF-8 Safe
 
-**Status:** [ ] Not started
+**Status:** [x] Completed and verified
 
 **Problem:** WeeChat slices status text at byte index 397. A multibyte character
 crossing that offset traps the WASM callback.
@@ -200,10 +255,10 @@ crossing that offset traps the WASM callback.
 
 **Acceptance criteria:**
 
-- [ ] ASCII text at and above the limit is handled correctly.
-- [ ] Two-byte, three-byte, and four-byte UTF-8 text never panics.
-- [ ] Output plus prefix stays within the configured byte budget.
-- [ ] The retained text is a valid prefix of the original followed by `...` when
+- [x] ASCII text at and above the limit is handled correctly.
+- [x] Two-byte, three-byte, and four-byte UTF-8 text never panics.
+- [x] Output plus prefix stays within the configured byte budget.
+- [x] The retained text is a valid prefix of the original followed by `...` when
   truncated.
 
 **Required tests:**
@@ -212,11 +267,16 @@ crossing that offset traps the WASM callback.
 - Add a test whose byte 397 lies inside a multibyte character.
 - Run the WeeChat adapter unit suite.
 
+**Verification:** The helper budgets the complete `[status] ` prefix and
+ellipsis, uses `floor_char_boundary`, and passes ASCII, two-byte, CJK
+three-byte, and emoji four-byte regressions as part of the 28-test WeeChat
+adapter suite.
+
 ---
 
 ## CHPAR-004: Prevent Auth Status from Leaking into WeeChat Groups
 
-**Status:** [ ] Not started
+**Status:** [-] Implementation complete; mock-relay privacy verification pending
 
 **Problem:** WeeChat sends `AuthRequired` and `AuthCompleted` status messages to
 group buffers. These messages can contain setup instructions and OAuth URLs.
@@ -249,11 +309,17 @@ XMPP suppresses status delivery in group chats.
 - DM/group metadata tests for both auth status variants.
 - A mock-relay assertion that no group request was emitted.
 
+**Current finding:** The source now returns before relay access for
+`AuthRequired` and `AuthCompleted` when `metadata.is_dm == false`, and logs only
+the status type and buffer name. DM behavior and `JobStarted` remain on the
+existing path. No real-component or mock-relay test has yet demonstrated DM
+delivery and zero group requests, so this item is not complete.
+
 ---
 
 ## CHPAR-005: Change the WeeChat New-Install DM Default to Pairing
 
-**Status:** [!] Decision required before implementation
+**Status:** [-] Implementation complete; pairing and upgrade fixtures pending
 
 **Problem:** Source comments and setup text describe `pairing` as the default,
 but the implementation, capabilities config, and example adapter config use
@@ -299,13 +365,20 @@ not be silently rewritten during upgrade.
 - Pairing request/approval integration coverage.
 - Upgrade fixture proving explicit persisted values are preserved.
 
+**Current finding:** `default_dm_policy()`, the capabilities config, and the
+example adapter config now use `pairing`; unknown policy strings reject the
+sender with a warning. Three tests verify those shipped defaults. Existing
+explicit values still flow through the existing precedence paths, but an actual
+persisted `open` upgrade fixture and end-to-end pairing approval test have not
+been added.
+
 ---
 
 ## P1: Engine V2 Completeness and Integration Proof
 
 ## CHPAR-006: Pass Attachments into Engine V2
 
-**Status:** [!] Input-contract design required
+**Status:** [!] Not started; input-contract design required
 
 **Problem:** Engine V2 routing occurs before legacy attachment augmentation.
 XMPP can emit attachments, but Engine V2 receives only original text. Image-only
@@ -411,7 +484,7 @@ so the user can see a turn stop without an explanation.
 
 ## CHPAR-008: Define Secure Proactive Owner-Target Routing
 
-**Status:** [!] Design decision required
+**Status:** [!] Deferred for 1.1.2 owner-model compatibility
 
 **Problem:** Owner-scoped broadcasts rely on stored last-routing metadata. That
 metadata is updated only when the wrapper can identify the configured owner
@@ -429,7 +502,16 @@ guest to overwrite the proactive target.
 5. Prevent a guest sender from replacing the owner's target.
 6. Provide an operator-visible error when no safe target is configured.
 
-**Recommended design:**
+**Compatibility decision (2026-07-18):**
+
+- Keep `wasm_channel_owner_ids` numeric and preserve its existing DB keys, config shape,
+  deserialization, and activation behavior.
+- Do not change message scope, conversation identity, or owner fallback as part of proactive
+  WeeChat delivery.
+- Support explicit network-qualified WeeChat targets independently in CHPAR-002.
+- Revisit automatic owner-scoped targets only with a dedicated migration and rollback plan.
+
+**Previously recommended design (not approved for implementation):**
 
 - Generalize channel owner actor IDs from numeric-only values to a string-backed
   representation while preserving existing numeric config deserialization.
@@ -516,7 +598,7 @@ component or prove adapter communication through Engine V2.
 
 ## CHPAR-010: Add Real WeeChat WASM + Engine V2 Integration Tests
 
-**Status:** [ ] Not started
+**Status:** [-] Real-WASM proactive fixture added; local execution blocked
 
 **Problem:** Current WeeChat tests cover parsing and host/router scope but do not
 instantiate the real component or prove relay requests.
@@ -561,13 +643,23 @@ used by startup, long-poll, policy refresh, and send, including:
 - [ ] CI fails when the required component is absent rather than silently
   skipping parity coverage.
 
+**Current finding:** A host-wrapper test now starts a loopback relay fixture and
+is written to load the real WeeChat component, initialize it, broadcast to a
+group, exercise DM server-buffer fallback, verify exact `/api/input` payloads
+and Basic authorization, and reject an ambiguous target. CI panics if the
+component artifact is absent. Local execution remains unproven because this VM
+could not build the component (`wasm32-wasip1` standard library missing and no
+`rustup`). Ingestion, reactive replies, scopes, controls, group-auth
+suppression, and multibyte status scenarios remain to be implemented in this
+fixture.
+
 ---
 
 ## P2: Identity and Live Rollout
 
 ## CHPAR-011: Document and Harden IRC Sender Identity
 
-**Status:** [!] Persistence compatibility decision required
+**Status:** [!] Deferred pending persistence compatibility decision
 
 **Problem:** DarkIRC pairing and DM scope are nick-based. WeeChat preserves a
 hostmask as `sender_id`, but DM conversation scope remains nick-based and can be
@@ -607,7 +699,7 @@ split or transfer conversation continuity.
 
 ## CHPAR-012: Run Disposable-Tenant Live Protocol Validation
 
-**Status:** [ ] Blocked until applicable P0/P1 items pass
+**Status:** [!] Blocked until applicable P0/P1 items pass
 
 **Problem:** Local tests do not prove deployed DarkIRC, WeeChat, or XMPP protocol
 bridges. Prior `darktest2` evidence proves startup/authentication but not a real
