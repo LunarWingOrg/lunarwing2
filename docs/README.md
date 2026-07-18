@@ -130,6 +130,23 @@ Architecture and code reviews.
 |------|-------------|
 | [`SWEETIE-ARCH-REVIEW.md`](reviews/SWEETIE-ARCH-REVIEW.md) | Full codebase architecture review by SweetieBot |
 | [`SELF_IMPROVING_SKILLS_AUDIT_2026-07-15.md`](reviews/SELF_IMPROVING_SKILLS_AUDIT_2026-07-15.md) | Self-improving skills audit: B-1/B-2/B-3 tracks and Engine V2 feedback foundation, live E2E evidence, confirmed defects, corrected stale findings, P0/P1/P2 recommendations, default-disabled decision |
+| [`ENGINE_V2_CHANNEL_PARITY_AUDIT_2026-07-18.md`](reviews/ENGINE_V2_CHANNEL_PARITY_AUDIT_2026-07-18.md) | Engine V2 channel parity audit for XMPP, DarkIRC, and WeeChat: routing, controls, statuses, proactive delivery, attachments, security findings, test evidence, and rollout decisions |
+
+---
+
+### [`plans/`](plans/)
+
+Active implementation plans, execution backlogs, and delivery-status records.
+
+| File | Description |
+|------|-------------|
+| [`ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md`](plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md) | Prioritized implementation backlog derived from the Engine V2 XMPP/DarkIRC/WeeChat parity audit, with acceptance criteria, tests, dependencies, and rollout gates |
+| [`e2e-skill-feedback.md`](plans/e2e-skill-feedback.md) | Live-tenant Engine V2 skill-feedback validation plan |
+| [`SELF_IMPROVING_SKILLS_B2_B3.md`](plans/SELF_IMPROVING_SKILLS_B2_B3.md) | B-2/B-3 self-improving skills implementation plan and delivered status |
+| [`WeeChat-Bootstrap.md`](plans/WeeChat-Bootstrap.md) | Secure tenant WeeChat relay provisioning plan |
+| [`Near-Removal.md`](plans/Near-Removal.md) | Provider and WIT ABI naming migration plan |
+| [`PHASE5PLANSTATUSTODAYWED.md`](plans/PHASE5PLANSTATUSTODAYWED.md) | Engine V2 local compatibility phase status record |
+| [`SKILLb1b2b3STATUSTODAYWED.md`](plans/SKILLb1b2b3STATUSTODAYWED.md) | Self-improving skills implementation and verification status record |
 
 ---
 
@@ -222,6 +239,7 @@ Third-party and internal architecture reviews of the LunarWing codebase.
 |------|-------------|
 | [`SWEETIE-ARCH-REVIEW.md`](reviews/SWEETIE-ARCH-REVIEW.md) | Full codebase architecture review by SweetieBot (system overview, agent loop, session/thread model, tool system, channels, orchestration, workspace/memory) |
 | [`SELF_IMPROVING_SKILLS_AUDIT_2026-07-15.md`](reviews/SELF_IMPROVING_SKILLS_AUDIT_2026-07-15.md) | Self-improving skills audit: B-1/B-2/B-3 tracks and Engine V2 feedback foundation, live E2E evidence, confirmed defects, corrected stale findings, P0/P1/P2 recommendations, default-disabled decision |
+| [`ENGINE_V2_CHANNEL_PARITY_AUDIT_2026-07-18.md`](reviews/ENGINE_V2_CHANNEL_PARITY_AUDIT_2026-07-18.md) | Engine V2 channel parity audit for XMPP, DarkIRC, and WeeChat: routing, controls, statuses, proactive delivery, attachments, security findings, test evidence, and rollout decisions |
 
 ---
 
@@ -326,9 +344,10 @@ When adding new documentation, place it in the appropriate subdirectory:
 3. **`ops/`** — if it covers *deployment or operations*
 4. **`reference/`** — if it's a *protocol spec, contract, or API doc*
 5. **`specs/`** — if it's a *standalone feature specification*
-6. **`proposals/`** — if it's a *proposal or design for not-yet-shipped work*
-7. **`bugs/`** — if it's a *bug report* (and add it to [`bugs/README.md`](bugs/README.md))
-8. **`reviews/`** — if it's a *codebase or architecture review*
-9. **`internal/`** — if it's a *draft, note, or working document*
+6. **`plans/`** — if it's an *implementation plan, execution backlog, or delivery-status record*
+7. **`proposals/`** — if it's a *proposal or design for not-yet-shipped work*
+8. **`bugs/`** — if it's a *bug report* (and add it to [`bugs/README.md`](bugs/README.md))
+9. **`reviews/`** — if it's a *codebase or architecture review*
+10. **`internal/`** — if it's a *draft, note, or working document*
 
 Superseded or shipped docs are archived under `internal/history/` (LunarWing-authored). Update this index when adding or moving files.
