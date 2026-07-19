@@ -633,6 +633,33 @@ mod tests {
     }
 
     #[test]
+    fn test_weechat_pairing_request_approval_flow() {
+        let (store, _) = test_store();
+        assert!(!store.is_sender_allowed("weechat", "alice", None).unwrap());
+
+        let first = store
+            .upsert_request(
+                "weechat",
+                "alice",
+                Some(serde_json::json!({"buffer": "irc.libera.alice"})),
+            )
+            .unwrap();
+        assert!(first.created, "first request should trigger instructions");
+
+        let repeated = store.upsert_request("weechat", "alice", None).unwrap();
+        assert!(
+            !repeated.created,
+            "repeat request must not resend instructions"
+        );
+        assert_eq!(repeated.code, first.code);
+
+        let approved = store.approve("weechat", &first.code).unwrap().unwrap();
+        assert_eq!(approved.id, "alice");
+        assert!(store.list_pending("weechat").unwrap().is_empty());
+        assert!(store.is_sender_allowed("weechat", "alice", None).unwrap());
+    }
+
+    #[test]
     fn test_approve_case_insensitive_code() {
         let (store, _) = test_store();
         let r = store.upsert_request("xmpp", "user789", None).unwrap();
