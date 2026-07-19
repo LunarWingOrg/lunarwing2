@@ -104,8 +104,12 @@
     Defer For Now:
     Worker-local MCP, automatic npm/pip installation, secret injection through process environment, a general runtime-adapter refactor, gateway integration, and automatic crash restart all increase the security or lifecycle surface materially. Recommended: implement deactivate/re-enable, diagnostics, registry validation, and integration tests as one contained follow-up. That provides a complete and inspectable host-local lifecycle before introducing another execution placement.
     </details>
-18. [ ] dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md
-19. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.1.0 explaining all relevant changes since v2.0.0.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/release for reference as to how to write up this document. The codename for this release is: `Togishi` — The file you write will be RELEASE-v2.0.1.0.md and should be written to the ROOT of the repo.
-20. [ ] Improve accuracy of RELEASE-v2.0.1.0.md
+18. [x] dark irc key exchange (checked off cuz wanna get back to this in future release). automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md
+19. [ ] update onboard ui to correspond with changes in codebase since v2.0.0.0
+20. [ ] update any architecture docs in docs/
+21. [ ] update any bugs docs in bugs/
+22. [ ] update README.md at repo root
+23. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.1.0 explaining all relevant changes since v2.0.0.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/release for reference as to how to write up this document. The codename for this release is: `Togishi` — The file you write will be RELEASE-v2.0.1.0.md and should be written to the ROOT of the repo.
+24. [ ] Improve accuracy of RELEASE-v2.0.1.0.md
 
 ---
