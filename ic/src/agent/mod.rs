@@ -12,7 +12,7 @@
 
 mod agent_loop;
 pub mod agentic_loop;
-mod attachments;
+pub(crate) mod attachments;
 mod commands;
 pub mod compaction;
 pub mod context_monitor;

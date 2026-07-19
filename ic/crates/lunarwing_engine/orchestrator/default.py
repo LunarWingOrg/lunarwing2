@@ -408,7 +408,8 @@ def ensure_working_messages(state, context):
     return state["working_messages"]
 
 
-def append_message(messages, role, content, action_name=None, action_call_id=None, action_calls=None):
+def append_message(messages, role, content, action_name=None, action_call_id=None,
+                   action_calls=None, transient_content_id=None):
     """Append a normalized message to the working transcript."""
     msg = {"role": role, "content": content}
     if action_name is not None:
@@ -417,6 +418,8 @@ def append_message(messages, role, content, action_name=None, action_call_id=Non
         msg["action_call_id"] = action_call_id
     if action_calls is not None:
         msg["action_calls"] = action_calls
+    if transient_content_id is not None:
+        msg["__transient_content_id"] = transient_content_id
     messages.append(msg)
 
 
@@ -484,7 +487,12 @@ def run_loop(context, goal, actions, state, config):
             return complete_result(state, "stopped")
         if signal and isinstance(signal, dict) and "inject" in signal:
             injected_text = signal["inject"]
-            append_message(working_messages, "User", injected_text)
+            append_message(
+                working_messages,
+                "User",
+                injected_text,
+                transient_content_id=signal.get("__transient_content_id"),
+            )
             if signals_execution_intent(injected_text):
                 obligation_enabled = True
                 state["_obligation_resolved"] = False

@@ -179,8 +179,47 @@ impl ThreadManager {
         initial_messages: Vec<crate::types::message::ThreadMessage>,
         preferred_thread_id: Option<ThreadId>,
     ) -> Result<ThreadId, EngineError> {
+        let current_message = ThreadMessage::user(goal.into());
+        self.spawn_thread_with_history_and_message(
+            current_message,
+            thread_type,
+            project_id,
+            config,
+            parent_id,
+            user_id,
+            initial_messages,
+            preferred_thread_id,
+        )
+        .await
+    }
+
+    /// Spawn a thread with history and a fully constructed current user message.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_thread_with_history_and_message(
+        &self,
+        current_message: ThreadMessage,
+        thread_type: ThreadType,
+        project_id: ProjectId,
+        config: ThreadConfig,
+        parent_id: Option<ThreadId>,
+        user_id: impl Into<String>,
+        initial_messages: Vec<crate::types::message::ThreadMessage>,
+        preferred_thread_id: Option<ThreadId>,
+    ) -> Result<ThreadId, EngineError> {
+        if current_message.role != MessageRole::User {
+            return Err(EngineError::Store {
+                reason: "initial thread message must have the user role".to_string(),
+            });
+        }
+
         let user_id = user_id.into();
-        let mut thread = Thread::new(goal, thread_type, project_id, &user_id, config);
+        let mut thread = Thread::new(
+            current_message.content.clone(),
+            thread_type,
+            project_id,
+            &user_id,
+            config,
+        );
         if let Some(pid) = parent_id {
             thread = thread.with_parent(pid);
         }
@@ -222,8 +261,8 @@ impl ThreadManager {
             thread.messages.push(msg);
         }
 
-        // Add the goal as the current user message so the LLM has context
-        thread.add_message(crate::types::message::ThreadMessage::user(&thread.goal));
+        // Add the goal as the current user message so the LLM has context.
+        thread.add_message(current_message);
 
         // Persist
         self.store.save_thread(&thread).await?;

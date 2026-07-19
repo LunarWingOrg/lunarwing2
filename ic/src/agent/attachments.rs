@@ -23,19 +23,11 @@ pub fn augment_with_attachments(
     content: &str,
     attachments: &[IncomingAttachment],
 ) -> Option<AugmentResult> {
-    if attachments.is_empty() {
-        return None;
-    }
-
-    let mut text = content.to_string();
-    text.push_str("\n\n<attachments>");
+    let text = augment_text_with_attachments(content, attachments)?;
 
     let mut image_parts = Vec::new();
 
-    for (i, att) in attachments.iter().enumerate() {
-        text.push('\n');
-        text.push_str(&format_attachment(i + 1, att));
-
+    for att in attachments {
         // Build multimodal image part when image data is available
         if att.kind == AttachmentKind::Image && !att.data.is_empty() {
             let b64 = base64::engine::general_purpose::STANDARD.encode(&att.data);
@@ -49,8 +41,45 @@ pub fn augment_with_attachments(
         }
     }
 
-    text.push_str("\n</attachments>");
     Some(AugmentResult { text, image_parts })
+}
+
+/// Add sanitized attachment metadata and extracted text without encoding image
+/// bytes. Engine V2 uses this before safety checks and defers image encoding to
+/// the provider adapter.
+pub fn augment_text_with_attachments(
+    content: &str,
+    attachments: &[IncomingAttachment],
+) -> Option<String> {
+    if attachments.is_empty() {
+        return None;
+    }
+
+    let mut text = content.to_string();
+    text.push_str("\n\n<attachments>");
+    for (index, attachment) in attachments.iter().enumerate() {
+        text.push('\n');
+        text.push_str(&format_attachment(index + 1, attachment));
+    }
+    text.push_str("\n</attachments>");
+    Some(text)
+}
+
+/// Build provider-bound Engine V2 image parts without encoding or persisting
+/// the raw bytes in engine text/history.
+pub fn engine_transient_content_parts(
+    attachments: &[IncomingAttachment],
+) -> Vec<lunarwing_engine::TransientContentPart> {
+    attachments
+        .iter()
+        .filter(|attachment| {
+            attachment.kind == AttachmentKind::Image && !attachment.data.is_empty()
+        })
+        .map(|attachment| lunarwing_engine::TransientContentPart::Image {
+            mime_type: attachment.mime_type.clone(),
+            data: attachment.data.clone(),
+        })
+        .collect()
 }
 
 /// Escape a string for use as an XML attribute value.
@@ -303,5 +332,28 @@ mod tests {
 
         let result = augment_with_attachments(original, &[att]).unwrap();
         assert!(result.text.starts_with(original));
+    }
+
+    #[test]
+    fn engine_parts_keep_image_bytes_out_of_augmented_text() {
+        let mut att = make_attachment(AttachmentKind::Image);
+        att.mime_type = "image/png".to_string();
+        att.source_url = Some("https://example.test/private-image".to_string());
+        att.storage_key = Some("/srv/lunarwing/private-image".to_string());
+        att.data = vec![1, 2, 3];
+
+        let text = augment_text_with_attachments("", std::slice::from_ref(&att)).unwrap();
+        let parts = engine_transient_content_parts(&[att]);
+
+        assert!(!text.trim().is_empty());
+        assert!(!text.contains("private-image"));
+        assert!(!text.contains("AQID"));
+        assert_eq!(
+            parts,
+            vec![lunarwing_engine::TransientContentPart::Image {
+                mime_type: "image/png".to_string(),
+                data: vec![1, 2, 3],
+            }]
+        );
     }
 }
