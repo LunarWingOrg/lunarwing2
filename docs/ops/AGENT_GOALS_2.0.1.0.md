@@ -108,8 +108,9 @@
 19. [ ] update onboard ui to correspond with changes in codebase since v2.0.0.0
 20. [ ] update any architecture docs in docs/
 21. [ ] update any bugs docs in bugs/
-22. [ ] update README.md at repo root
-23. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.1.0 explaining all relevant changes since v2.0.0.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/release for reference as to how to write up this document. The codename for this release is: `Togishi` — The file you write will be RELEASE-v2.0.1.0.md and should be written to the ROOT of the repo.
-24. [ ] Improve accuracy of RELEASE-v2.0.1.0.md
+22. [ ] ensure kawarimi can work for 1.1.2 to 2.0.1.0
+23. [ ] update README.md at repo root
+24. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.1.0 explaining all relevant changes since v2.0.0.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/release for reference as to how to write up this document. The codename for this release is: `Togishi` — The file you write will be RELEASE-v2.0.1.0.md and should be written to the ROOT of the repo.
+25. [ ] Improve accuracy of RELEASE-v2.0.1.0.md
 
 ---
