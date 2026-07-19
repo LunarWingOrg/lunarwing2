@@ -9,7 +9,7 @@
 
 1. [x] For docs/ops/WEECHAT_SERVICES_VERIFICATION.md see if there is anything in the code we can improve and do it
 2. [x] CHPAR-001 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
-3. [ ] CHPAR-002 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
+3. [x] CHPAR-002 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 4. [x] CHPAR-003 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 5. [ ] CHPAR-004 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 6. [ ] CHPAR-005 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md

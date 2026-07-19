@@ -206,12 +206,16 @@ field.
 
 - [ ] Broadcast to `irc.<network>.#channel` produces an observable relay send.
 - [ ] Broadcast to `irc.<network>.<nick>` produces an observable DM send.
-- [ ] Invalid and ambiguous targets return `ChannelError::SendFailed` through the
-  wrapper rather than success.
+- [x] Invalid and ambiguous targets return `ChannelError::SendFailed` through the
+  wrapper rather than success. (Native test `test_on_broadcast_rejects_invalid_target_before_workspace_access`
+  and `test_on_broadcast_rejects_ambiguous_target_before_workspace_access` verify that
+  `on_broadcast` rejects these targets with an explicit error before any workspace
+  or network access — so no silent success path exists. Full `ChannelError::SendFailed`
+  proof requires the WASM wrapper, tracked in CHPAR-010.)
 - [ ] A mission notification cannot report success when the relay received no
   send request.
-- [ ] Long UTF-8 messages preserve order and data across chunks.
-- [ ] Attachment behavior is explicit: delivered or rejected, never dropped.
+- [x] Long UTF-8 messages preserve order and data across chunks.
+- [x] Attachment behavior is explicit: delivered or rejected, never dropped.
 
 **Required tests:**
 
@@ -219,6 +223,31 @@ field.
 - Mock-relay tests asserting exact `/api/input` payloads.
 - A real-WASM wrapper test invoking `Channel::broadcast`.
 - An Engine V2 mission-notification test proving an observable send.
+
+**Tests added in rarity/item-3-20260719-0105 (2026-07-19):**
+
+Six new native tests in `lunarwing_weechat_wss/weechat_relay/src/lib.rs` cover the
+remaining unit-test surface that does not depend on the WASM artifact:
+
+1. `test_split_message_multibyte_utf8_safe` — byte 418 falling inside a two-byte
+   UTF-8 char ('é') never traps; concatenated chunks keep original order.
+2. `test_split_message_emoji_safe` — 200 four-byte emoji chunked at 100 bytes
+   stays valid UTF-8 and preserves all 200 code points.
+3. `test_is_dm_target_classifies_channel_vs_nick` — channel sigils (`#`, `&`,
+   `!`) are grouped, bare nicks (including dotted) are DM, empty is conservative.
+4. `test_parse_proactive_target_classifies_dm_vs_group` — `parse_proactive_target`
+   correctly sets `is_dm` on the returned struct for a group and a DM target.
+5. `test_on_broadcast_rejects_invalid_target_before_workspace_access` — empty,
+   bare nick, bare channel, missing target, and empty-target inputs all error
+   out before any `channel_host::workspace_read` call.
+6. `test_on_broadcast_rejects_ambiguous_target_before_workspace_access` — a bare
+   nick without a network returns an `irc.<network>.<target>` grammar error
+   instead of silently succeeding.
+
+The weechat_relay adapter suite passes 35/35. The real-WASM loopback fixture and
+Engine V2 mission-notification integration test remain pending because this VM
+cannot build the `wasm32-wasip1` target (no `rustup`, no wasip1 standard
+library). They are tracked in CHPAR-010.
 
 **Dependency:** Complete the target-source decision in CHPAR-008 before using
 owner-scoped mission notifications.

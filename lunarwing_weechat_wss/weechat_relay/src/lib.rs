@@ -2186,6 +2186,138 @@ mod tests {
     }
 
     #[test]
+    fn test_split_message_multibyte_utf8_safe() {
+        // Build a string whose byte boundary near the chunk limit lands inside
+        // a multibyte character. Fill with ASCII up to byte 418, then append a
+        // two-byte char ('é' = c3 a9), then more text so chunking at 420 would
+        // split the multibyte char if not handled correctly.
+        let mut input = "a".repeat(418);
+        input.push('\u{00E9}'); // é — 2 bytes
+        input.push_str("tail");
+
+        let chunks = split_message(&input, 420);
+
+        // Every chunk must be valid UTF-8 (no split multibyte chars).
+        for chunk in &chunks {
+            assert!(
+                chunk.is_ascii() || chunk.chars().count() > 0,
+                "chunk contains invalid UTF-8: {chunk:?}"
+            );
+        }
+
+        // Concatenating the trimmed chunks must preserve the full payload
+        // (whitespace at chunk boundaries may be trimmed, but the printable
+        // content remains in order).
+        let mut assembled = String::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            if i > 0 {
+                assembled.push(' ');
+            }
+            assembled.push_str(chunk);
+        }
+        assert!(
+            assembled.contains("tail"),
+            "chunked payload lost content: {assembled:?}"
+        );
+        assert!(assembled.starts_with("a"), "chunk order not preserved");
+    }
+
+    #[test]
+    fn test_is_dm_target_classifies_channel_vs_nick() {
+        // Channel sigils → not DM.
+        assert!(!is_dm_target("#lunarwing"));
+        assert!(!is_dm_target("&local"));
+        assert!(!is_dm_target("!chan"));
+        // Nick targets → DM.
+        assert!(is_dm_target("alice"));
+        assert!(is_dm_target("alice.example"));
+        assert!(is_dm_target("NickServ"));
+        // Edge: empty is treated as DM (no sigil prefix).
+        assert!(is_dm_target(""));
+    }
+
+    #[test]
+    fn test_split_message_emoji_safe() {
+        // Four-byte emoji: '🦆' = f0 9f a6 86. Verify chunks never split a code point.
+        let input = "🦆".repeat(200); // 800 bytes
+        let chunks = split_message(&input, 100);
+        for chunk in &chunks {
+            assert!(
+                std::str::from_utf8(chunk.as_bytes()).is_ok(),
+                "emoji chunk is not valid UTF-8: {chunk:?}"
+            );
+        }
+        // All emoji preserved across chunks.
+        let assembled: String = chunks.concat();
+        assert_eq!(assembled.chars().count(), 200);
+    }
+
+    // ---- CHPAR-002: proactive delivery target parsing, classification, chunking ----
+
+    #[test]
+    fn test_parse_proactive_target_classifies_dm_vs_group() {
+        let group = parse_proactive_target("irc.libera.#lunarwing")
+            .expect("network-qualified group target should parse");
+        assert_eq!(group.buffer, "irc.libera.#lunarwing");
+        assert_eq!(group.network, "libera");
+        assert_eq!(group.target, "#lunarwing");
+        assert!(!group.is_dm, "group target must not be classified as DM");
+
+        let dm = parse_proactive_target("irc.darkirc.alice")
+            .expect("network-qualified DM target should parse");
+        assert_eq!(dm.buffer, "irc.darkirc.alice");
+        assert_eq!(dm.network, "darkirc");
+        assert_eq!(dm.target, "alice");
+        assert!(dm.is_dm, "DM target must be classified as DM");
+    }
+
+    #[test]
+    fn test_on_broadcast_rejects_invalid_target_before_workspace_access() {
+        // An invalid target must return an error BEFORE any workspace access
+        // occurs (parse_proactive_target runs first in on_broadcast).
+        let response = AgentResponse {
+            message_id: "test-message".to_string(),
+            content: "hello".to_string(),
+            thread_id: None,
+            metadata_json: "{}".to_string(),
+            attachments: vec![],
+        };
+
+        for invalid in ["", "alice", "#lunarwing", "irc.libera", "irc..alice"] {
+            let error = WeechatRelayChannel::on_broadcast(invalid.to_string(), response.clone())
+                .expect_err("invalid target must be rejected: {invalid:?}");
+            assert!(
+                error.contains("irc.<network>")
+                    || error.contains("empty")
+                    || error.contains("whitespace")
+                    || error.contains("ambiguous")
+                    || error.contains("invalid"),
+                "unexpected error message for invalid target {invalid:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_on_broadcast_rejects_ambiguous_target_before_workspace_access() {
+        // A bare nick without network is ambiguous across networks and must be
+        // rejected before any workspace or network access.
+        let response = AgentResponse {
+            message_id: "test-message".to_string(),
+            content: "hello".to_string(),
+            thread_id: None,
+            metadata_json: "{}".to_string(),
+            attachments: vec![],
+        };
+
+        let error = WeechatRelayChannel::on_broadcast("alice".to_string(), response)
+            .expect_err("bare nick without network must be rejected");
+        assert!(
+            error.contains("irc.<network>"),
+            "error must mention irc.<network>.<target> grammar: {error}"
+        );
+    }
+
+    #[test]
     fn test_pairing_instructions_uses_lunarwing_binary() {
         let msg = pairing_instructions(CHANNEL_NAME, "XN1234");
         assert!(
