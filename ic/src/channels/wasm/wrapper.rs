@@ -3482,6 +3482,7 @@ fn read_attachments(paths: &[String]) -> Result<Vec<wit_channel::Attachment>, St
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use axum::body::Bytes;
@@ -3489,6 +3490,7 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::{get, post};
     use axum::{Json, Router};
+    use tracing_test::traced_test;
 
     use crate::channels::Channel;
     use crate::channels::OutgoingResponse;
@@ -3530,6 +3532,39 @@ mod tests {
             Arc::new(PairingStore::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn update_config_logs_secret_keys_but_not_values() {
+        const XMPP_SENTINEL: &str = "chpar-001-xmpp-password-sentinel";
+        const WEECHAT_SENTINEL: &str = "chpar-001-weechat-password-sentinel";
+
+        let channel = create_test_channel();
+        channel
+            .update_config(HashMap::from([
+                (
+                    "xmpp_password".to_string(),
+                    serde_json::Value::String(XMPP_SENTINEL.to_string()),
+                ),
+                (
+                    "relay_password".to_string(),
+                    serde_json::Value::String(WEECHAT_SENTINEL.to_string()),
+                ),
+            ]))
+            .await;
+
+        assert!(logs_contain("Updated channel config"));
+        assert!(logs_contain("xmpp_password"));
+        assert!(logs_contain("relay_password"));
+        assert!(
+            !logs_contain(XMPP_SENTINEL),
+            "XMPP secret value appeared in captured logs"
+        );
+        assert!(
+            !logs_contain(WEECHAT_SENTINEL),
+            "WeeChat secret value appeared in captured logs"
+        );
     }
 
     macro_rules! require_xmpp_wasm {

@@ -218,6 +218,22 @@ fn default_dm_policy() -> String {
     "pairing".to_string()
 }
 
+fn startup_log_summary(config: &WeechatConfig) -> String {
+    let connection_mode = match config.connection_mode.as_str() {
+        "auto" => "auto",
+        "http" => "http",
+        "websocket" => "websocket",
+        _ => "invalid",
+    };
+
+    format!(
+        "WeeChat Relay channel starting (relay configured: {}, ws adapter configured: {}, connection mode: {})",
+        !config.relay_url.trim().is_empty(),
+        !config.ws_adapter_url.trim().is_empty(),
+        connection_mode
+    )
+}
+
 fn default_group_policy() -> String {
     "allowlist".to_string()
 }
@@ -404,13 +420,7 @@ impl Guest for WeechatRelayChannel {
         let config: WeechatConfig = serde_json::from_str(&config_json)
             .map_err(|e| format!("Failed to parse config: {}", e))?;
 
-        channel_host::log(
-            channel_host::LogLevel::Info,
-            &format!(
-                "WeeChat Relay channel starting, relay at {}",
-                config.relay_url
-            ),
-        );
+        channel_host::log(channel_host::LogLevel::Info, &startup_log_summary(&config));
 
         // Normalize relay URL (strip trailing slashes, /api suffix)
         let relay_url = normalize_relay_url(&config.relay_url);
@@ -524,10 +534,7 @@ impl Guest for WeechatRelayChannel {
 
         channel_host::log(
             channel_host::LogLevel::Info,
-            &format!(
-                "Connection mode: {} (ws_adapter: {}, poll interval: {}ms)",
-                config.connection_mode, config.ws_adapter_url, interval_ms
-            ),
+            &format!("Polling interval: {}ms", interval_ms),
         );
 
         Ok(ChannelConfig {
@@ -792,7 +799,7 @@ fn resolve_poll_url(mode: &str, relay_url: &str, adapter_url: &str, password: &s
                 if !is_adapter_healthy(adapter_url, password) {
                     channel_host::log(
                         channel_host::LogLevel::Warn,
-                        &format!("WebSocket adapter at {} is not reachable (mode=websocket, no fallback)", adapter_url),
+                        "WebSocket adapter is not reachable (mode=websocket, no fallback)",
                     );
                 }
                 adapter_url.to_string()
@@ -803,16 +810,13 @@ fn resolve_poll_url(mode: &str, relay_url: &str, adapter_url: &str, password: &s
             if !adapter_url.is_empty() && is_adapter_healthy(adapter_url, password) {
                 channel_host::log(
                     channel_host::LogLevel::Debug,
-                    &format!("auto mode: adapter healthy at {}, using it", adapter_url),
+                    "auto mode: adapter healthy, using it",
                 );
                 adapter_url.to_string()
             } else {
                 channel_host::log(
                     channel_host::LogLevel::Debug,
-                    &format!(
-                        "auto mode: adapter health check failed for {}, using relay_url directly",
-                        adapter_url
-                    ),
+                    "auto mode: adapter health check failed, using relay_url directly",
                 );
                 relay_url.to_string()
             }
@@ -918,7 +922,7 @@ fn do_poll(poll_url: &str, relay_url: &str, relay_password: &str) {
 
     channel_host::log(
         channel_host::LogLevel::Debug,
-        &format!("Polling {} buffers via {}", buffers.len(), poll_url),
+        &format!("Polling {} buffers", buffers.len()),
     );
 
     // Load watermarks (line-ID based)
@@ -2039,6 +2043,44 @@ fn pairing_instructions(channel: &str, code: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_startup_log_summary_excludes_secret_bearing_values() {
+        const RELAY_PASSWORD_SENTINEL: &str = "chpar-001-relay-password-sentinel";
+        const RELAY_URL_SENTINEL: &str = "chpar-001-relay-url-sentinel";
+        const ADAPTER_URL_SENTINEL: &str = "chpar-001-adapter-url-sentinel";
+
+        let config_json = serde_json::json!({
+            "relay_url": format!("http://127.0.0.1:9001/{RELAY_URL_SENTINEL}"),
+            "relay_password": RELAY_PASSWORD_SENTINEL,
+            "connection_mode": "websocket",
+            "ws_adapter_url": format!("http://127.0.0.1:6681/{ADAPTER_URL_SENTINEL}")
+        })
+        .to_string();
+        let mut config: WeechatConfig =
+            serde_json::from_str(&config_json).expect("sentinel config should parse");
+
+        let summary = startup_log_summary(&config);
+        assert_eq!(
+            summary,
+            "WeeChat Relay channel starting (relay configured: true, ws adapter configured: true, connection mode: websocket)"
+        );
+        for sentinel in [
+            RELAY_PASSWORD_SENTINEL,
+            RELAY_URL_SENTINEL,
+            ADAPTER_URL_SENTINEL,
+        ] {
+            assert!(
+                !summary.contains(sentinel),
+                "startup summary exposed a secret-bearing config value"
+            );
+        }
+
+        config.connection_mode = RELAY_PASSWORD_SENTINEL.to_string();
+        let invalid_mode_summary = startup_log_summary(&config);
+        assert!(invalid_mode_summary.contains("connection mode: invalid"));
+        assert!(!invalid_mode_summary.contains(RELAY_PASSWORD_SENTINEL));
+    }
 
     #[test]
     fn test_response_routing_metadata_roundtrip() {
