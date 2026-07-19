@@ -71,15 +71,15 @@ the external owner actor instead of the runtime owner scope, bypassing persisted
 owner routing metadata. Both implementation gaps are fixed and revalidated on
 the equipped machine. The expanded real-WASM target passes all eight tests,
 CHPAR-002 explicit delivery is revalidated, and CHPAR-008 through CHPAR-010 are
-completed again. CHPAR-012 is now ready for separate disposable-tenant live
-validation.
+completed again. CHPAR-012 is in progress: its disposable-tenant WeeChat slice
+passes, while DarkIRC, XMPP, and authorized tenant teardown remain pending.
 
 | ID | Status | Current finding / remaining gate |
 |----|--------|----------------------------------|
 | CHPAR-001 | [x] Completed | Raw config logging was removed from the shared wrapper and channel guests. Captured host logs exclude sentinel XMPP and WeeChat passwords, and the WeeChat startup summary excludes password and endpoint values. |
 | CHPAR-002 | [x] Completed | Explicit `irc.<network>.<target>` group and DM delivery, validation, UTF-8 chunking, DM fallback, attachment rejection, exact relay requests, invalid-target errors, and relay failure propagation were revalidated natively and through the expanded real-WASM run. The mission notification host path also passes. Persisted owner-scope routing is tracked under CHPAR-008. |
 | CHPAR-003 | [x] Completed | UTF-8-safe byte-budget truncation is implemented and covered for ASCII, two-byte, three-byte, and four-byte input. The WeeChat adapter suite passes. |
-| CHPAR-004 | [x] Completed | Group `AuthRequired` and `AuthCompleted` suppression is extracted into pure host-binding-free helpers (`should_suppress_auth_status`, `auth_status_suppression_log`) and covered by 9 native unit tests proving group suppress, DM deliver, approval/job-started deliver, and URL/state absence from logs. The weechat_relay adapter suite passes 55/55. |
+| CHPAR-004 | [x] Completed | Group `AuthRequired` and `AuthCompleted` suppression is extracted into pure host-binding-free helpers (`should_suppress_auth_status`, `auth_status_suppression_log`) and covered by 9 native unit tests proving group suppress, DM deliver, approval/job-started deliver, and URL/state absence from logs. The weechat_relay adapter suite passes 56/56. |
 | CHPAR-005 | [x] Completed | Fresh installs default to `pairing`; persisted policy is preserved unless setup supplies an explicit override. Unknown policies fail closed. Default, precedence, sender-policy, setup-marker, and pairing request/repeat/approval fixtures pass. |
 | CHPAR-006 | [x] Completed | Engine V2 now augments only ordinary user input after auth/control parsing, carries raw images as redacted non-serializing engine parts, maps them to provider-native content at the LLM boundary, and persists sanitized effective text without binary payloads. Image-only, mixed document/audio/image, secret-scan, control, auth, history, limit, spawn/inject/resume, and provider-adapter tests pass. |
 | CHPAR-007 | [x] Completed | The bridge and WIT use a dedicated `ExternalWaiting` type. DarkIRC delivers it in DMs; WeeChat delivers it only in DMs. Unknown generic, reasoning, and stream statuses remain excluded. Native and real-component tests pass. |
@@ -87,7 +87,7 @@ validation.
 | CHPAR-009 | [x] Completed | The real DarkIRC fixture passes approved-pairing ingress, normalized history scope, malformed/failed poll no-ack cases, persisted-owner delivery, approval/auth continuation with credential-history exclusion, and scoped interrupt cancellation with no late final. |
 | CHPAR-010 | [x] Completed | The real WeeChat fixture passes exact Basic authorization, proactive DM and persisted-owner delivery, relay failure propagation, owner/guest history isolation, approval/auth continuation with credential-history exclusion, and scoped interrupt cancellation with no late final. |
 | CHPAR-011 | [x] Completed | Versioned network/account-or-nick principals, RFC1459/strict/ascii case mapping, pairing alignment, threat boundaries, and the retain-without-auto-merge migration policy are implemented and documented. |
-| CHPAR-012 | [!] Ready for live validation | Applicable local gates and the expanded equipped-machine real-WASM suite pass; disposable-tenant DarkIRC, WeeChat, and XMPP round trips remain required. |
+| CHPAR-012 | [-] In progress | The disposable OpenRC tenant passes WeeChat reactive DM, group auth suppression, completed-gate interrupt/clear, post-control recovery, proactive DM/group delivery, exact-once wire checks, and scope separation. DarkIRC, XMPP, and authorized tenant teardown remain pending. |
 
 ### Verification recorded in this worktree
 
@@ -95,7 +95,7 @@ validation.
   Its six real-component tests cover normal routing, approval/auth continuation,
   and interrupt cancellation for DarkIRC and WeeChat; the control fixture and
   shared environment guard also pass.
-- WeeChat adapter suite: **55 passed, 0 failed**. DarkIRC adapter suite:
+- WeeChat adapter suite: **56 passed, 0 failed**. DarkIRC adapter suite:
   **28 passed, 0 failed**.
 - Broad owner-routing filter: **42 passed, 0 failed**. This includes
   numeric/string bindings, settings fallback, persisted-target restart, guest
@@ -852,7 +852,7 @@ split or transfer conversation continuity.
 
 ## CHPAR-012: Run Disposable-Tenant Live Protocol Validation
 
-**Status:** [!] Ready for disposable-tenant live validation
+**Status:** [-] WeeChat live slice passed; DarkIRC/XMPP and teardown pending
 
 **Problem:** Local tests do not prove deployed DarkIRC, WeeChat, or XMPP protocol
 bridges. Prior `darktest2` evidence proves startup/authentication but not a real
@@ -899,7 +899,15 @@ chat round trip.
 - [ ] No secret appears in service logs or captured evidence.
 - [ ] No external worker is created or started.
 - [ ] Disposable resources are removed and port registry state is clean.
-- [ ] A dated result is added to the source audit or a linked validation report.
+- [x] A dated result is added to the source audit or a linked validation report.
+
+**2026-07-19 result:** The WeeChat live slice passed on disposable OpenRC
+tenant `chparlive`, including reactive DM, group auth suppression, completed-gate
+`/interrupt` and `/clear`, post-control recovery, proactive DM/group delivery,
+scope separation, exact-once wire observations, and synthetic-secret cleanup.
+See
+[`ENGINE_V2_CHANNEL_PARITY_LIVE_VALIDATION_2026-07-19.md`](../reviews/ENGINE_V2_CHANNEL_PARITY_LIVE_VALIDATION_2026-07-19.md).
+DarkIRC, XMPP, and authorized tenant teardown remain pending.
 
 ---
 
