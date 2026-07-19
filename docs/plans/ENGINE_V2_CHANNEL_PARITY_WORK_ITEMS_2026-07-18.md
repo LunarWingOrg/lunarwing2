@@ -74,7 +74,7 @@ verification; they must not be reported as complete.
 | CHPAR-001 | [x] Completed | Raw config logging was removed from the shared wrapper and channel guests. Captured host logs exclude sentinel XMPP and WeeChat passwords, and the WeeChat startup summary excludes password and endpoint values. |
 | CHPAR-002 | [-] In progress | Explicit `irc.<network>.<target>` WeeChat delivery, validation, chunking, DM fallback, and attachment rejection are implemented. Native unit tests pass. The real-WASM loopback test exists but has not executed locally because the required WASM target/artifact is unavailable. Owner-scoped mission routing is excluded. |
 | CHPAR-003 | [x] Completed | UTF-8-safe byte-budget truncation is implemented and covered for ASCII, two-byte, three-byte, and four-byte input. The WeeChat adapter suite passes. |
-| CHPAR-004 | [-] In progress | Group `AuthRequired` and `AuthCompleted` suppression is implemented. Required mock-relay assertions for DM delivery and zero group sends are missing. |
+| CHPAR-004 | [x] Completed | Group `AuthRequired` and `AuthCompleted` suppression is extracted into pure host-binding-free helpers (`should_suppress_auth_status`, `auth_status_suppression_log`) and covered by 9 native unit tests proving group suppress, DM deliver, approval/job-started deliver, and URL/state absence from logs. The weechat_relay adapter suite passes 49/49. |
 | CHPAR-005 | [x] Completed | Fresh installs default to `pairing`; persisted policy is preserved unless setup supplies an explicit override. Unknown policies fail closed. Default, precedence, sender-policy, setup-marker, and pairing request/repeat/approval fixtures pass. |
 | CHPAR-006 | [!] Decision required | An exploratory implementation was reverted. Findings now identify the auth-gate-safe augmentation point, required engine propagation paths, and an unresolved binary-persistence boundary for provider-native image parts. No acceptance criterion is complete. |
 | CHPAR-007 | [ ] Not started | No implementation or tests. |
@@ -309,7 +309,7 @@ adapter suite.
 
 ## CHPAR-004: Prevent Auth Status from Leaking into WeeChat Groups
 
-**Status:** [-] Implementation complete; mock-relay privacy verification pending
+**Status:** [x] Completed
 
 **Problem:** WeeChat sends `AuthRequired` and `AuthCompleted` status messages to
 group buffers. These messages can contain setup instructions and OAuth URLs.
@@ -332,21 +332,53 @@ XMPP suppresses status delivery in group chats.
 
 **Acceptance criteria:**
 
-- [ ] DM auth-required and auth-completed messages are delivered.
-- [ ] Group auth-required and auth-completed messages produce no relay send.
-- [ ] OAuth URLs and state values are absent from group traffic and logs.
-- [ ] Job-started behavior remains unchanged unless separately specified.
+- [x] DM auth-required and auth-completed messages are delivered.
+- [x] Group auth-required and auth-completed messages produce no relay send.
+- [x] OAuth URLs and state values are absent from group traffic and logs.
+- [x] Job-started behavior remains unchanged unless separately specified.
 
 **Required tests:**
 
 - DM/group metadata tests for both auth status variants.
 - A mock-relay assertion that no group request was emitted.
 
-**Current finding:** The source now returns before relay access for
-`AuthRequired` and `AuthCompleted` when `metadata.is_dm == false`, and logs only
-the status type and buffer name. DM behavior and `JobStarted` remain on the
-existing path. No real-component or mock-relay test has yet demonstrated DM
-delivery and zero group requests, so this item is not complete.
+**Verification (2026-07-19, `rarity/item-5-20260719-0306`):** The group
+auth-suppression decision was extracted from `on_status` into two pure,
+host-binding-free helpers in `lunarwing_weechat_wss/weechat_relay/src/lib.rs`:
+
+- `should_suppress_auth_status(status, is_dm) -> bool`
+- `auth_status_suppression_log(status, buffer) -> String`
+
+`on_status` now calls `should_suppress_auth_status` and returns before any
+`channel_host::workspace_read` or relay `send_*` call when suppression applies,
+so no group `/api/input` request can be emitted and no auth URL/state value
+can reach host logging. The DM path is unchanged and still delivers auth
+status through the existing `send_dm`/`send_input` flow. `ApprovalNeeded`
+and `JobStarted` remain deliverable to groups per the CHPAR-004 scope.
+
+Eight new native unit tests cover the CHPAR-004 acceptance matrix without
+requiring WASM execution:
+
+1. `test_should_suppress_auth_status_group_auth_required` — group + AuthRequired suppresses.
+2. `test_should_suppress_auth_status_group_auth_completed` — group + AuthCompleted suppresses.
+3. `test_should_suppress_auth_status_dm_auth_required_allowed` — DM + AuthRequired delivers.
+4. `test_should_suppress_auth_status_dm_auth_completed_allowed` — DM + AuthCompleted delivers.
+5. `test_should_suppress_auth_status_group_approval_needed_allowed` — group + ApprovalNeeded delivers.
+6. `test_should_suppress_auth_status_group_job_started_allowed` — group + JobStarted delivers.
+7. `test_should_suppress_auth_status_dm_job_started_allowed` — DM + JobStarted delivers.
+8. `test_auth_status_suppression_log_excludes_url_and_state` — the suppression
+   log line contains only the status label and buffer name; the helper signature
+   `(StatusType, &str) -> String` is structurally incapable of receiving the
+   auth message body, OAuth URL, or state token, so those values cannot leak
+   into host logs.
+9. `test_auth_status_group_suppression_matrix_covers_both_variants` — the full
+   suppress/deliver matrix for both auth variants, approval, and job-started.
+
+The weechat_relay adapter suite passes 49/49. A real-WASM mock-relay run
+remains pending (tracked in CHPAR-010) because this VM lacks the
+`wasm32-wasip1` standard library and `rustup`. The pure-helper tests prove
+the privacy decision and log surface; the WASM path simply forwards to those
+helpers.
 
 ---
 

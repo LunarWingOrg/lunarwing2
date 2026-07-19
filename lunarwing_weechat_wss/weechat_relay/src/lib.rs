@@ -752,30 +752,12 @@ impl Guest for WeechatRelayChannel {
                 // must not leak into shared channels. Approval prompts and
                 // job-started notices are unaffected and remain allowed in
                 // groups. Do not log the auth URL itself.
-                if !metadata.is_dm {
-                    match update.status {
-                        StatusType::AuthRequired => {
-                            channel_host::log(
-                                channel_host::LogLevel::Debug,
-                                &format!(
-                                    "Suppressing auth-required status in group buffer '{}'",
-                                    metadata.buffer
-                                ),
-                            );
-                            return;
-                        }
-                        StatusType::AuthCompleted => {
-                            channel_host::log(
-                                channel_host::LogLevel::Debug,
-                                &format!(
-                                    "Suppressing auth-completed status in group buffer '{}'",
-                                    metadata.buffer
-                                ),
-                            );
-                            return;
-                        }
-                        _ => {}
-                    }
+                if should_suppress_auth_status(update.status, metadata.is_dm) {
+                    channel_host::log(
+                        channel_host::LogLevel::Debug,
+                        &auth_status_suppression_log(update.status, &metadata.buffer),
+                    );
+                    return;
                 }
 
                 let relay_url =
@@ -1362,6 +1344,33 @@ fn is_dm_buffer(full_name: &str) -> bool {
         return false;
     }
     is_dm_target(&parts[2..].join("."))
+}
+
+/// Whether a status update must be suppressed before any relay send or
+/// URL-bearing log emission because it carries auth secrets into a group
+/// buffer. `AuthRequired` and `AuthCompleted` carry setup instructions and
+/// OAuth URLs that must never leak into shared channels. Approval prompts
+/// and job-started notices remain deliverable to groups.
+///
+/// Pure (no host bindings) so it can be unit-tested without WASM.
+fn should_suppress_auth_status(status: StatusType, is_dm: bool) -> bool {
+    if is_dm {
+        return false;
+    }
+    matches!(status, StatusType::AuthRequired | StatusType::AuthCompleted)
+}
+
+/// Safe debug log line emitted when a group auth status is suppressed.
+/// Contains only the status variant and buffer name — never the message
+/// body, OAuth URL, or state token. Pure string format so it can be
+/// asserted on in unit tests without host log capture.
+fn auth_status_suppression_log(status: StatusType, buffer: &str) -> String {
+    let label = match status {
+        StatusType::AuthRequired => "auth-required",
+        StatusType::AuthCompleted => "auth-completed",
+        _ => "auth",
+    };
+    format!("Suppressing {label} status in group buffer '{buffer}'")
 }
 
 /// Whether a line's tags permit ingestion. The line must be a real PRIVMSG and
@@ -2635,6 +2644,162 @@ mod tests {
         let truncated = truncate_for_status(&input);
         assert!(truncated.starts_with("aaaa"));
         assert!(truncated.ends_with("..."));
+    }
+
+    // ---- CHPAR-004: prevent auth status leaking into WeeChat groups ----
+
+    #[test]
+    fn test_should_suppress_auth_status_group_auth_required() {
+        // Group + AuthRequired must suppress: setup instructions and OAuth
+        // URLs cannot leak into shared channels.
+        assert!(should_suppress_auth_status(StatusType::AuthRequired, false));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_group_auth_completed() {
+        // Group + AuthCompleted must suppress: completion notices may echo
+        // back credential state and URLs.
+        assert!(should_suppress_auth_status(
+            StatusType::AuthCompleted,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_dm_auth_required_allowed() {
+        // DM + AuthRequired must NOT suppress: the user needs the auth prompt
+        // delivered to their private buffer to complete the flow.
+        assert!(!should_suppress_auth_status(StatusType::AuthRequired, true));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_dm_auth_completed_allowed() {
+        // DM + AuthCompleted must NOT suppress: the user should see the
+        // completion confirmation in their private buffer.
+        assert!(!should_suppress_auth_status(
+            StatusType::AuthCompleted,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_group_approval_needed_allowed() {
+        // Approval prompts remain deliverable to groups per CHPAR-004 scope.
+        // Only auth-status variants are suppressed in groups.
+        assert!(!should_suppress_auth_status(
+            StatusType::ApprovalNeeded,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_group_job_started_allowed() {
+        // Job-started notices remain deliverable to groups per CHPAR-004 scope.
+        assert!(!should_suppress_auth_status(StatusType::JobStarted, false));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_dm_job_started_allowed() {
+        // DM + JobStarted remains deliverable.
+        assert!(!should_suppress_auth_status(StatusType::JobStarted, true));
+    }
+
+    #[test]
+    fn test_auth_status_suppression_log_excludes_url_and_state() {
+        // CHPAR-004 group-privacy log invariant: the suppression log line
+        // must never echo the auth message body, OAuth URL, or state token.
+        // By construction `auth_status_suppression_log` only receives the
+        // status variant and the WeeChat buffer name (e.g.
+        // `irc.libera.#lunarwing`) — never the auth message body that
+        // carries the URL. This test pins that contract: even when the
+        // auth message itself contains a URL+state, the helper's output
+        // contains only the fixed status label and the supplied buffer.
+        const OAUTH_URL_SENTINEL: &str = "https://oauth.example/authorize";
+        const STATE_TOKEN_SENTINEL: &str = "chpar-004-state-token-sentinel";
+
+        // A realistic group buffer name (what production actually passes in
+        // — taken from `WeechatMessageMetadata.buffer`, set at ingest from
+        // the WeeChat buffer full name, never from the auth payload).
+        let buffer = "irc.libera.#lunarwing";
+        let log_line = auth_status_suppression_log(StatusType::AuthRequired, buffer);
+
+        // The helper signature takes only (status, buffer). It never sees
+        // the auth message body. The line must contain the label and the
+        // buffer name, and must not contain any auth-payload sentinels.
+        assert!(
+            log_line.contains("auth-required"),
+            "suppression log must identify the variant: {log_line}"
+        );
+        assert!(
+            log_line.contains(buffer),
+            "suppression log must name the destination buffer: {log_line}"
+        );
+        assert!(
+            !log_line.contains(OAUTH_URL_SENTINEL),
+            "OAuth URL leaked into suppression log: {log_line}"
+        );
+        assert!(
+            !log_line.contains(STATE_TOKEN_SENTINEL),
+            "state token leaked into suppression log: {log_line}"
+        );
+
+        // Deterministic format pinned so any future change that
+        // accidentally widens the log surface (e.g. logging the message
+        // body) breaks this test.
+        assert_eq!(
+            log_line,
+            "Suppressing auth-required status in group buffer 'irc.libera.#lunarwing'"
+        );
+        let completed_log = auth_status_suppression_log(StatusType::AuthCompleted, buffer);
+        assert_eq!(
+            completed_log,
+            "Suppressing auth-completed status in group buffer 'irc.libera.#lunarwing'"
+        );
+
+        // The auth-payload privacy contract is structural: the helper
+        // signature receives only the status variant and buffer name, so
+        // the auth message body cannot flow into the log line even if a
+        // future caller misuses the function. This compile-time property
+        // is the load-bearing guarantee.
+        let _: fn(StatusType, &str) -> String = auth_status_suppression_log;
+    }
+
+    #[test]
+    fn test_auth_status_group_suppression_matrix_covers_both_variants() {
+        // Matrix test covering CHPAR-004 acceptance: both auth status
+        // variants are suppressed in groups and delivered in DMs, while
+        // approval and job-started always pass through.
+        for (status, dm, expected_suppress, label) in [
+            (StatusType::AuthRequired, false, true, "group+auth-required"),
+            (StatusType::AuthRequired, true, false, "dm+auth-required"),
+            (
+                StatusType::AuthCompleted,
+                false,
+                true,
+                "group+auth-completed",
+            ),
+            (StatusType::AuthCompleted, true, false, "dm+auth-completed"),
+            (
+                StatusType::ApprovalNeeded,
+                false,
+                false,
+                "group+approval-needed",
+            ),
+            (
+                StatusType::ApprovalNeeded,
+                true,
+                false,
+                "dm+approval-needed",
+            ),
+            (StatusType::JobStarted, false, false, "group+job-started"),
+            (StatusType::JobStarted, true, false, "dm+job-started"),
+        ] {
+            assert_eq!(
+                should_suppress_auth_status(status, dm),
+                expected_suppress,
+                "{label}: expected suppress={expected_suppress}"
+            );
+        }
     }
 
     // ---- CHPAR-005: new-install DM default and fail-closed policy ----
