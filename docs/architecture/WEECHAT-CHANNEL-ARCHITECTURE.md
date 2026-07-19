@@ -106,8 +106,10 @@ numeric `wasm_channel_owner_ids` setting remains supported, while IRC deployment
 string `wasm_channel_owner_actor_ids` setting with a network-qualified account/nick principal.
 Only matching owner traffic may update the persisted route, and WeeChat validates and stores the
 complete `irc.<network>.<target>` buffer. Explicit delivery continues to require that same full
-target. See [`IRC-SENDER-IDENTITY.md`](IRC-SENDER-IDENTITY.md) for principal formats, threat
-boundaries, and migration behavior.
+target. Autonomous notifications address the LunarWing owner scope, not the external actor
+principal; the WASM wrapper then resolves that scope through the persisted full buffer. See
+[`IRC-SENDER-IDENTITY.md`](IRC-SENDER-IDENTITY.md) for principal formats, threat boundaries, and
+migration behavior.
 
 ### Watermarks & new buffers (poll mode only)
 

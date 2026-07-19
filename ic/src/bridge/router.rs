@@ -5526,6 +5526,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mission_notification_broadcasts_once_to_the_owner_scope() {
+        use crate::testing::RecordingBroadcastChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (channel, captures) = RecordingBroadcastChannel::new("weechat");
+        manager.add(Box::new(channel)).await;
+        let notification = lunarwing_engine::MissionNotification {
+            mission_id: lunarwing_engine::MissionId::new(),
+            mission_name: "daily-review".to_string(),
+            thread_id: lunarwing_engine::ThreadId::new(),
+            user_id: "owner-scope".to_string(),
+            notify_channels: vec!["weechat".to_string()],
+            response: Some("mission complete".to_string()),
+            is_error: false,
+        };
+
+        handle_mission_notification(&notification, &manager, None, None).await;
+
+        let captured = captures.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, "owner-scope");
+        assert_eq!(captured[0].1.content, "**[daily-review]** mission complete");
+    }
+
+    #[tokio::test]
     async fn response_delta_reaches_gateway_and_other_channels_via_status() {
         use crate::testing::StubChannel;
 

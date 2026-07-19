@@ -488,8 +488,12 @@ impl ExtensionManager {
         self.current_channel_owner_actor_id(name).await.is_some()
     }
 
+    /// Return the durable owner scope for a channel with an external owner binding.
+    /// The WASM wrapper resolves that scope through its persisted protocol target.
     pub(crate) async fn notification_target_for_channel(&self, name: &str) -> Option<String> {
-        self.current_channel_owner_actor_id(name).await
+        self.has_wasm_channel_owner_binding(name)
+            .await
+            .then(|| self.user_id.clone())
     }
 
     /// Access the secrets store (used by OAuth callback handlers).
@@ -5617,6 +5621,17 @@ mod tests {
         if manager.current_channel_owner_id("weechat").await.is_some() {
             return Err("expected no owner id for weechat".to_string());
         }
+        if manager
+            .notification_target_for_channel("xmpp")
+            .await
+            .as_deref()
+            != Some("test")
+        {
+            return Err(
+                "legacy numeric bindings should route notifications through the owner scope"
+                    .to_string(),
+            );
+        }
 
         Ok(())
     }
@@ -5655,6 +5670,23 @@ mod tests {
             != Some("account:libera:alice")
         {
             return Err("string owner actor ID should override the legacy numeric ID".to_string());
+        }
+        if manager
+            .notification_target_for_channel("weechat")
+            .await
+            .as_deref()
+            != Some("test")
+        {
+            return Err(
+                "bound channel notifications should route through the owner scope".to_string(),
+            );
+        }
+        if manager
+            .notification_target_for_channel("unbound")
+            .await
+            .is_some()
+        {
+            return Err("unbound channels must not synthesize a notification target".to_string());
         }
         Ok(())
     }
