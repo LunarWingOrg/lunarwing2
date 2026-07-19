@@ -31,8 +31,8 @@ wit_bindgen::generate!({
 use serde::{Deserialize, Serialize};
 
 use exports::lunarwing::agent::channel::{
-    AgentResponse, ChannelConfig, Guest, IncomingHttpRequest,
-    OutgoingHttpResponse, PollConfig, StatusType, StatusUpdate,
+    AgentResponse, ChannelConfig, Guest, IncomingHttpRequest, OutgoingHttpResponse, PollConfig,
+    StatusType, StatusUpdate,
 };
 use lunarwing::agent::channel_host::{self, EmittedMessage};
 
@@ -139,6 +139,27 @@ where
 struct DarkircMessageMetadata {
     // DarkIRC nick of the sender.
     nick: String,
+    // Stable, case-folded principal used for pairing and conversation scope.
+    #[serde(default)]
+    principal: Option<String>,
+}
+
+fn rfc1459_casefold(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            'A'..='Z' => character.to_ascii_lowercase(),
+            '[' => '{',
+            ']' => '}',
+            '\\' => '|',
+            '^' => '~',
+            other => other,
+        })
+        .collect()
+}
+
+fn darkirc_principal(nick: &str) -> String {
+    format!("darkirc:nick:{}", rfc1459_casefold(nick))
 }
 
 // === Workspace Paths (Tenant-Aware) ===
@@ -176,10 +197,10 @@ impl Guest for DarkircChannel {
     // Initialize the channel. Persist config to workspace so on_poll/on_response
     // can read it (each callback gets a fresh WASM instance with no shared state).
     fn on_start(config_json: String) -> Result<ChannelConfig, String> {
-        channel_host::log(
-            channel_host::LogLevel::Debug,
-            &format!("DarkIRC channel config: {}", config_json),
-        );
+        // Do NOT log raw config_json. While the current DarkircConfig has no
+        // direct secret fields, logging the full JSON is a credential-leak
+        // hazard if future config additions (e.g. adapter tokens) are added.
+        // Parse and log a safe summary instead.
 
         let config: DarkircConfig = serde_json::from_str(&config_json)
             .map_err(|e| format!("Failed to parse config: {}", e))?;
@@ -209,7 +230,8 @@ impl Guest for DarkircChannel {
         }
         let _ = channel_host::workspace_write(&dm_policy_path, &config.dm_policy);
 
-        let allow_from_json = serde_json::to_string(&config.allow_from).unwrap_or_else(|_| "[]".to_string());
+        let allow_from_json =
+            serde_json::to_string(&config.allow_from).unwrap_or_else(|_| "[]".to_string());
         let _ = channel_host::workspace_write(&allow_from_path, &allow_from_json);
 
         // Validate adapter connectivity (non-fatal ─ adapter may start later)
@@ -320,10 +342,15 @@ impl Guest for DarkircChannel {
         // Ack the batch so the adapter can drop it (M4: at-least-once delivery —
         // if we crash before this ack, the next /poll re-serves the same batch).
         let ack_url = format!("{}/ack", adapter_url);
-        if let Err(e) = channel_host::http_request("POST", &ack_url, &headers_json, None, Some(5_000)) {
+        if let Err(e) =
+            channel_host::http_request("POST", &ack_url, &headers_json, None, Some(5_000))
+        {
             channel_host::log(
                 channel_host::LogLevel::Warn,
-                &format!("Adapter /ack failed (batch will be re-delivered next poll): {}", e),
+                &format!(
+                    "Adapter /ack failed (batch will be re-delivered next poll): {}",
+                    e
+                ),
             );
         }
     }
@@ -344,10 +371,7 @@ impl Guest for DarkircChannel {
     // IRC has no typing indicators, so we only send real status messages.
     fn on_status(update: StatusUpdate) {
         match update.status {
-            StatusType::ApprovalNeeded
-            | StatusType::AuthRequired
-            | StatusType::AuthCompleted
-            | StatusType::JobStarted => {
+            status if is_actionable_irc_status(status) => {
                 let message = update.message.trim();
                 if message.is_empty() {
                     return;
@@ -389,6 +413,17 @@ impl Guest for DarkircChannel {
     }
 }
 
+fn is_actionable_irc_status(status: StatusType) -> bool {
+    matches!(
+        status,
+        StatusType::ApprovalNeeded
+            | StatusType::AuthRequired
+            | StatusType::AuthCompleted
+            | StatusType::ExternalWaiting
+            | StatusType::JobStarted
+    )
+}
+
 // === Inbound Message Handling ===
 
 // Process a single inbound DM from DarkIRC. Applies DM policy (open/allowlist/
@@ -402,12 +437,13 @@ fn handle_inbound_dm(msg: &AdapterMessage) {
 
     // --- DM policy enforcement ---
     // Read tenant_id first so all state paths resolve to the tenant-scoped keys.
-    let tenant_id = channel_host::workspace_read(&tenant_id_path()).unwrap_or_else(|| "default".to_string());
+    let tenant_id =
+        channel_host::workspace_read(&tenant_id_path()).unwrap_or_else(|| "default".to_string());
     let allow_from_path = allow_from_path(&tenant_id);
     let dm_policy_path = dm_policy_path(&tenant_id);
 
-    let dm_policy = channel_host::workspace_read(&dm_policy_path)
-        .unwrap_or_else(|| "pairing".to_string());
+    let dm_policy =
+        channel_host::workspace_read(&dm_policy_path).unwrap_or_else(|| "pairing".to_string());
 
     if dm_policy != "open" {
         // Build effective allow list: config allow_from + pairing-approved
@@ -419,14 +455,17 @@ fn handle_inbound_dm(msg: &AdapterMessage) {
             allowed.extend(store_allowed);
         }
 
-        let is_allowed = allowed.contains(&"*".to_string())
-            || allowed.iter().any(|a| a.eq_ignore_ascii_case(nick));
+        let normalized_nick = rfc1459_casefold(nick);
+        let principal = darkirc_principal(nick);
+        let is_allowed = allowed.iter().any(|entry| {
+            entry == "*" || entry == &principal || rfc1459_casefold(entry) == normalized_nick
+        });
 
         if !is_allowed {
             if dm_policy == "pairing" {
-                let meta = serde_json::json!({ "nick": nick }).to_string();
+                let meta = serde_json::json!({ "nick": nick, "principal": principal }).to_string();
 
-                match channel_host::pairing_upsert_request(CHANNEL_NAME, nick, &meta) {
+                match channel_host::pairing_upsert_request(CHANNEL_NAME, &principal, &meta) {
                     Ok(result) => {
                         channel_host::log(
                             channel_host::LogLevel::Info,
@@ -434,9 +473,10 @@ fn handle_inbound_dm(msg: &AdapterMessage) {
                         );
 
                         if result.created {
-                            let adapter_url = channel_host::workspace_read(&adapter_url_path(&tenant_id))
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or_default();
+                            let adapter_url =
+                                channel_host::workspace_read(&adapter_url_path(&tenant_id))
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_default();
 
                             let reply = format!(
                                 "To pair with this agent, run: lunarwing pairing approve darkirc {}",
@@ -469,15 +509,19 @@ fn handle_inbound_dm(msg: &AdapterMessage) {
     }
 
     // --- Emit to agent ---
-    let metadata = DarkircMessageMetadata { nick: nick.clone() };
+    let principal = darkirc_principal(&nick);
+    let metadata = DarkircMessageMetadata {
+        nick: nick.clone(),
+        principal: Some(principal.clone()),
+    };
 
     let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
 
     channel_host::emit_message(&EmittedMessage {
-        user_id: nick.clone(),
+        user_id: principal.clone(),
         user_name: Some(nick.clone()),
         content: msg.text.clone(),
-        thread_id: Some(format!("darkirc:dm:{}", nick)),
+        thread_id: Some(format!("darkirc:dm:v2:{}", principal)),
         metadata_json,
         attachments: Vec::new(),
     });
@@ -513,8 +557,8 @@ fn adapter_health(adapter_url: &str) -> Result<bool, String> {
 }
 
 fn send_response_to_nick(nick: &str, content: &str) -> Result<(), String> {
-    let tenant_id = channel_host::workspace_read(&tenant_id_path())
-        .unwrap_or_else(|| "default".to_string());
+    let tenant_id =
+        channel_host::workspace_read(&tenant_id_path()).unwrap_or_else(|| "default".to_string());
     let adapter_url = channel_host::workspace_read(&adapter_url_path(&tenant_id))
         .filter(|s| !s.is_empty())
         .unwrap_or_default();
@@ -697,6 +741,14 @@ export!(DarkircChannel);
 mod tests {
     use super::*;
 
+    #[test]
+    fn external_waiting_is_the_only_generic_status_delivered() {
+        assert!(is_actionable_irc_status(StatusType::ExternalWaiting));
+        assert!(!is_actionable_irc_status(StatusType::Status));
+        assert!(!is_actionable_irc_status(StatusType::Thinking));
+        assert!(!is_actionable_irc_status(StatusType::ToolResult));
+    }
+
     // Shared invariants that EVERY test case must satisfy.
     // These are the contracts that make sense for IRC message splitting ─
     // they don't depend on how we choose split points, only that the output
@@ -709,16 +761,25 @@ mod tests {
             // A chunk may exceed max_bytes only if it's a single character
             let single_char = chunk.len() == 1;
             assert!(
-                byte_len <= max_bytes || (single_char && chunk.chars().next().map(|c| c.len_utf8()).unwrap_or(1) > max_bytes),
+                byte_len <= max_bytes
+                    || (single_char
+                        && chunk.chars().next().map(|c| c.len_utf8()).unwrap_or(1) > max_bytes),
                 "chunk {} too long: {} bytes (max={}), chunk={:?}",
-                i, byte_len, max_bytes, chunk
+                i,
+                byte_len,
+                max_bytes,
+                chunk
             );
         }
 
         // 2. No empty chunks (empty input may produce one empty chunk ─ handled separately)
         if !text.is_empty() {
             for (i, chunk) in chunks.iter().enumerate() {
-                assert!(!chunk.is_empty(), "empty chunk at index {} (text was non-empty)", i);
+                assert!(
+                    !chunk.is_empty(),
+                    "empty chunk at index {} (text was non-empty)",
+                    i
+                );
             }
         }
 
@@ -728,7 +789,8 @@ mod tests {
                 assert!(
                     chunk.is_char_boundary(byte_idx),
                     "mid-codepoint split at byte {} in chunk {:?}",
-                    byte_idx, chunk
+                    byte_idx,
+                    chunk
                 );
             }
         }
@@ -740,17 +802,15 @@ mod tests {
 
         // 5. No data loss: all non-whitespace chars from input appear in output, in order
         //    (whitespace consumed at split points may be lost ─ that's fine)
-        let filtered_original: String = text
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
+        let filtered_original: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         let filtered_joined: String = chunks
             .concat()
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
         assert_eq!(
-            filtered_joined, filtered_original,
+            filtered_joined,
+            filtered_original,
             "data loss or reordering: original has {} non-ws chars, output has {}",
             filtered_original.chars().count(),
             filtered_joined.chars().count()
@@ -771,7 +831,11 @@ mod tests {
     fn test_split_message_no_break() {
         let text = "a".repeat(500);
         let chunks = split_message(&text, 400);
-        assert!(chunks.len() >= 2, "expected hard split, got {} chunks", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "expected hard split, got {} chunks",
+            chunks.len()
+        );
         assert_split_invariants(&chunks, &text, 400);
     }
 
@@ -795,7 +859,11 @@ mod tests {
     fn test_split_message_at_space() {
         let text = "hello world this is a test";
         let chunks = split_message(text, 15);
-        assert!(chunks.len() >= 2, "expected at least 2 chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "expected at least 2 chunks, got {}",
+            chunks.len()
+        );
         assert_split_invariants(&chunks, text, 15);
     }
 
@@ -857,13 +925,13 @@ mod tests {
     #[test]
     fn test_split_message_unicode_no_split_mid_char() {
         let test_strings = vec![
-            "日本語",                    // Japanese
-            "Привет мир",                // Cyrillic
-            "안녕하세요 세계",                // Korean
-            "مرحبا بالعالم",                // Arabic
-            "🐴 🐴 🐴 🐴",                    // Emoji
-            "café résumé naïve",        // Latin with accents
-            "🦄 🌙 🗡️ ⚔️ 🐴 🏯🌸",        // More emoji
+            "日本語",              // Japanese
+            "Привет мир",          // Cyrillic
+            "안녕하세요 세계",     // Korean
+            "مرحبا بالعالم",       // Arabic
+            "🐴 🐴 🐴 🐴",         // Emoji
+            "café résumé naïve",   // Latin with accents
+            "🦄 🌙 🗡️ ⚔️ 🐴 🏯🌸", // More emoji
         ];
         for text in test_strings {
             let chunks = split_message(text, 10);
@@ -883,7 +951,11 @@ mod tests {
             ("mixed whitespace", "  \t  \n  ", 10),
             ("ascii punctuation", "!#$%&()*+,-./:;<=>?@[\\]{}|", 20),
             ("long no-break string", &long_no_break, 400),
-            ("alternating spaces", "a b c d e f g h i j k l m n o p q r s t u v w x y z", 10),
+            (
+                "alternating spaces",
+                "a b c d e f g h i j k l m n o p q r s t u v w x y z",
+                10,
+            ),
         ];
         for (_name, text, max_bytes) in cases {
             let chunks = split_message(text, max_bytes);
@@ -1032,10 +1104,30 @@ mod tests {
     fn test_metadata_roundtrip() {
         let meta = DarkircMessageMetadata {
             nick: "sun".to_string(),
+            principal: Some("darkirc:nick:sun".to_string()),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: DarkircMessageMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.nick, "sun");
+        assert_eq!(parsed.principal.as_deref(), Some("darkirc:nick:sun"));
+    }
+
+    #[test]
+    fn rfc1459_principal_is_deterministic_across_case_variants() {
+        assert_eq!(darkirc_principal("Alice"), darkirc_principal("aLICE"));
+        assert_eq!(
+            darkirc_principal("Nick[One]"),
+            darkirc_principal("nick{one}")
+        );
+        assert_ne!(darkirc_principal("alice"), darkirc_principal("bob"));
+    }
+
+    #[test]
+    fn legacy_metadata_without_principal_still_deserializes() {
+        let parsed: DarkircMessageMetadata = serde_json::from_str(r#"{"nick":"sun"}"#)
+            .expect("legacy response metadata must remain readable");
+        assert_eq!(parsed.nick, "sun");
+        assert!(parsed.principal.is_none());
     }
 
     #[test]

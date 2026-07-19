@@ -235,6 +235,12 @@ lunarwing pairing approve darkirc CODE123
 
 Pairing approvals survive restarts (stored in database). They do NOT survive `lunarwing onboard` (which can wipe the database).
 
+Pairing and conversation scope use an RFC1459 case-folded, versioned nick
+principal. This is not cryptographic identity, and nick reuse can transfer
+continuity. See
+[`IRC-SENDER-IDENTITY.md`](../../architecture/IRC-SENDER-IDENTITY.md) for the
+exact format and migration policy.
+
 ## Message Splitting
 
 Long agent responses are split into IRC-sized chunks. The limit is in `src/lib.rs`:
@@ -302,4 +308,3 @@ EOF
 ```
 
 The agent cannot write to protected paths like `SOUL.md` directly (security policy). Use the CLI.
-

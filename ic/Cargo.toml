@@ -257,6 +257,10 @@ name = "engine_v2_channel_delivery"
 required-features = ["libsql", "integration"]
 
 [[test]]
+name = "engine_v2_irc_wasm"
+required-features = ["libsql", "integration"]
+
+[[test]]
 name = "engine_v2_mcp_compatibility"
 required-features = ["libsql", "integration"]
 

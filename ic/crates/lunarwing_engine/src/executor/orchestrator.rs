@@ -50,6 +50,9 @@ use super::scripting::{execute_code, json_to_monty, monty_to_json, monty_to_stri
 /// The compiled-in default orchestrator (v0).
 pub(crate) const DEFAULT_ORCHESTRATOR: &str = include_str!("../../orchestrator/default.py");
 
+/// Opaque in-memory lookup key carried through the Python transcript.
+const TRANSIENT_CONTENT_ID_FIELD: &str = "__transient_content_id";
+
 /// Well-known title for orchestrator code in the Store.
 pub const ORCHESTRATOR_TITLE: &str = "orchestrator:main";
 
@@ -615,7 +618,7 @@ async fn handle_llm_complete(
     let explicit_config = args.get(2).map(monty_to_json).filter(|v| !v.is_null());
     let messages = explicit_messages
         .as_ref()
-        .and_then(json_to_thread_messages)
+        .and_then(|value| json_to_thread_messages_with_transient(value, Some(thread)))
         .unwrap_or_else(|| thread.messages.clone());
 
     let active_leases = leases.active_for_thread(thread.id).await;
@@ -1538,8 +1541,12 @@ fn handle_check_signals(signal_rx: &mut SignalReceiver, thread: &mut Thread) -> 
             ExtFunctionResult::Return(MontyObject::String("stop".into()))
         }
         Ok(ThreadSignal::InjectMessage(msg)) => {
+            let transient_content_id = msg.transient_content_id;
             thread.add_message(msg.clone());
-            let result = serde_json::json!({"inject": msg.content});
+            let mut result = serde_json::json!({"inject": msg.content});
+            if let Some(id) = transient_content_id {
+                result[TRANSIENT_CONTENT_ID_FIELD] = serde_json::json!(id.to_string());
+            }
             ExtFunctionResult::Return(json_to_monty(&result))
         }
         Ok(ThreadSignal::Resume) | Ok(ThreadSignal::ChildCompleted { .. }) => {
@@ -2071,21 +2078,21 @@ fn build_orchestrator_inputs(
 
     // Build orchestrator bootstrap context. Prefer the internal execution
     // transcript when present, otherwise fall back to the user-visible transcript.
-    let bootstrap_messages = if thread.internal_messages.is_empty() {
-        &thread.messages
-    } else {
-        &thread.internal_messages
-    };
+    let bootstrap_messages = inference_messages(thread);
     let context: Vec<serde_json::Value> = bootstrap_messages
         .iter()
         .map(|m| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "role": format!("{:?}", m.role),
                 "content": m.content,
                 "action_name": m.action_name,
                 "action_call_id": m.action_call_id,
                 "action_calls": m.action_calls,
-            })
+            });
+            if let Some(id) = m.transient_content_id {
+                value[TRANSIENT_CONTENT_ID_FIELD] = serde_json::json!(id.to_string());
+            }
+            value
         })
         .collect();
 
@@ -2118,7 +2125,23 @@ fn build_orchestrator_inputs(
     (names, values)
 }
 
+fn inference_messages(thread: &Thread) -> &[ThreadMessage] {
+    if thread.internal_messages.is_empty() {
+        &thread.messages
+    } else {
+        &thread.internal_messages
+    }
+}
+
+#[cfg(test)]
 fn json_to_thread_messages(value: &serde_json::Value) -> Option<Vec<ThreadMessage>> {
+    json_to_thread_messages_with_transient(value, None)
+}
+
+fn json_to_thread_messages_with_transient(
+    value: &serde_json::Value,
+    transient_source: Option<&Thread>,
+) -> Option<Vec<ThreadMessage>> {
     let arr = value.as_array()?;
     let mut messages = Vec::with_capacity(arr.len());
 
@@ -2130,7 +2153,7 @@ fn json_to_thread_messages(value: &serde_json::Value) -> Option<Vec<ThreadMessag
             .unwrap_or_default();
         let action_calls = item.get("action_calls").and_then(json_to_action_calls);
 
-        let message = match role {
+        let mut message = match role {
             "System" | "system" => ThreadMessage::system(content),
             "Assistant" | "assistant" => {
                 if let Some(calls) = action_calls {
@@ -2150,6 +2173,24 @@ fn json_to_thread_messages(value: &serde_json::Value) -> Option<Vec<ThreadMessag
             ),
             _ => ThreadMessage::user(content),
         };
+        if message.role == crate::types::message::MessageRole::User
+            && let Some(id) = item
+                .get(TRANSIENT_CONTENT_ID_FIELD)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            && let Some(source) = transient_source.and_then(|thread| {
+                thread
+                    .internal_messages
+                    .iter()
+                    .chain(thread.messages.iter())
+                    .find(|source| source.transient_content_id == Some(id))
+            })
+            && source.role == crate::types::message::MessageRole::User
+            && source.content == message.content
+        {
+            message.transient_content_parts = source.transient_content_parts.clone();
+            message.transient_content_id = source.transient_content_id;
+        }
         messages.push(message);
     }
 
@@ -2178,10 +2219,10 @@ fn sync_runtime_state(thread: &mut Thread, state: Option<&serde_json::Value>) {
     let Some(state) = state else {
         return;
     };
-    if let Some(messages) = state
+    let messages = state
         .get("working_messages")
-        .and_then(json_to_thread_messages)
-    {
+        .and_then(|value| json_to_thread_messages_with_transient(value, Some(thread)));
+    if let Some(messages) = messages {
         thread.internal_messages = messages;
         thread.updated_at = chrono::Utc::now();
     }
@@ -2309,11 +2350,11 @@ fn extract_u64_kwarg(kwargs: &[(MontyObject, MontyObject)], name: &str) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::messaging::signal_channel;
+    use crate::runtime::messaging::{ThreadSignal, signal_channel};
     use crate::traits::llm::{LlmStream, LlmStreamChunk};
     use crate::types::capability::CapabilityLease;
     use crate::types::memory::{DocType, MemoryDoc};
-    use crate::types::message::MessageRole;
+    use crate::types::message::{MessageRole, TransientContentPart};
     use crate::types::project::ProjectId;
     use crate::types::step::ActionResult;
     use crate::types::thread::{ThreadConfig, ThreadType};
@@ -2421,6 +2462,92 @@ mod tests {
         assert_eq!(
             messages[1].action_call_id.as_deref(),
             Some("provider-call-1")
+        );
+    }
+
+    #[test]
+    fn orchestrator_wire_reattaches_transient_parts_without_serializing_bytes() {
+        let mut thread = Thread::new(
+            "inspect image",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread.add_message(ThreadMessage::user_with_transient_parts(
+            "inspect image",
+            vec![TransientContentPart::Image {
+                mime_type: "image/png".to_string(),
+                data: vec![1, 2, 3],
+            }],
+        ));
+
+        let (_, values) = build_orchestrator_inputs(&thread, &serde_json::json!({}));
+        let context = monty_to_json(&values[0]);
+        assert_eq!(
+            context[0][TRANSIENT_CONTENT_ID_FIELD],
+            serde_json::json!(
+                thread.messages[0]
+                    .transient_content_id
+                    .expect("transient id should exist")
+                    .to_string()
+            )
+        );
+        let wire_json = serde_json::to_string(&context).expect("context should serialize");
+        assert!(!wire_json.contains("image/png"));
+        assert!(!wire_json.contains("AQID"));
+
+        let restored = json_to_thread_messages_with_transient(&context, Some(&thread))
+            .expect("wire messages should decode");
+        assert_eq!(
+            restored[0].transient_content_parts,
+            thread.messages[0].transient_content_parts
+        );
+
+        let mut altered = context;
+        altered[0]["content"] = serde_json::json!("different text");
+        let restored = json_to_thread_messages_with_transient(&altered, Some(&thread))
+            .expect("altered wire messages should decode");
+        assert!(restored[0].transient_content_parts.is_empty());
+    }
+
+    #[test]
+    fn injected_message_reattaches_transient_parts_by_stable_id() {
+        let mut thread = Thread::new(
+            "running",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "alice",
+            ThreadConfig::default(),
+        );
+        let message = ThreadMessage::user_with_transient_parts(
+            "injected image",
+            vec![TransientContentPart::Image {
+                mime_type: "image/png".to_string(),
+                data: vec![4, 5, 6],
+            }],
+        );
+        let (signal_tx, mut signal_rx) = signal_channel(1);
+        signal_tx
+            .try_send(ThreadSignal::InjectMessage(message))
+            .expect("injection should queue");
+
+        let signal = match handle_check_signals(&mut signal_rx, &mut thread) {
+            ExtFunctionResult::Return(value) => monty_to_json(&value),
+            other => panic!("expected returned injection signal, got {other:?}"),
+        };
+        let mut wire = serde_json::json!([{
+            "role": "User",
+            "content": signal["inject"],
+        }]);
+        wire[0][TRANSIENT_CONTENT_ID_FIELD] = signal[TRANSIENT_CONTENT_ID_FIELD].clone();
+        let restored = json_to_thread_messages_with_transient(&wire, Some(&thread))
+            .expect("injected wire message should decode");
+
+        assert_eq!(restored[0].transient_content_parts.len(), 1);
+        assert_eq!(
+            restored[0].transient_content_parts,
+            thread.messages[0].transient_content_parts
         );
     }
 

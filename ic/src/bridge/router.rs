@@ -297,10 +297,9 @@ async fn insert_and_notify_pending_gate(
             let _ = channels
                 .send_status(
                     &message.channel,
-                    StatusUpdate::Status(format!(
-                        "Waiting for external confirmation (gate: {})...",
-                        pending.gate_name
-                    )),
+                    StatusUpdate::ExternalWaiting {
+                        gate_name: pending.gate_name.clone(),
+                    },
                     &message.metadata,
                 )
                 .await;
@@ -1408,6 +1407,41 @@ async fn find_engine_conversation_for_message(
         .find(|conversation| conversation.channel == key)
 }
 
+async fn scoped_pending_gates(
+    state: &EngineState,
+    message: &IncomingMessage,
+    conversation_id: lunarwing_engine::ConversationId,
+) -> Vec<PendingGate> {
+    state
+        .pending_gates
+        .list_for_user(&message.user_id)
+        .await
+        .into_iter()
+        .filter(|gate| {
+            gate.conversation_id == conversation_id && gate_channel_matches(gate, &message.channel)
+        })
+        .collect()
+}
+
+async fn discard_scoped_pending_gates(
+    state: &EngineState,
+    message: &IncomingMessage,
+    conversation_id: lunarwing_engine::ConversationId,
+) -> usize {
+    let gates = scoped_pending_gates(state, message, conversation_id).await;
+    let count = gates.len();
+    for gate in gates {
+        if let Err(error) = state.pending_gates.discard(&gate.key()).await {
+            debug!(
+                thread_id = %gate.thread_id,
+                %error,
+                "engine v2: failed to discard scoped pending gate"
+            );
+        }
+    }
+    count
+}
+
 /// Find the single pending approval gate for the message's scoped conversation.
 ///
 /// Returns `None` for zero or ambiguous (2+) matches so callers fall back to the
@@ -1545,6 +1579,29 @@ pub async fn has_active_engine_thread(message: &IncomingMessage) -> bool {
         }
     }
     false
+}
+
+/// Read-only predicate: can `/interrupt` stop a running thread or cancel a
+/// pending gate in the message's scoped engine conversation?
+pub async fn has_interruptible_engine_state(message: &IncomingMessage) -> bool {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return false;
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return false;
+    };
+    let Some(conversation) = find_engine_conversation_for_message(state, message).await else {
+        return false;
+    };
+    for tid in &conversation.active_threads {
+        if state.thread_manager.is_running(*tid).await {
+            return true;
+        }
+    }
+    !scoped_pending_gates(state, message, conversation.id)
+        .await
+        .is_empty()
 }
 
 /// Handle an approval response (yes/no/always) for engine v2.
@@ -1900,6 +1957,10 @@ pub async fn resolve_gate(
                         channel: pending.source_channel.clone(),
                         user_id: pending.user_id.clone(),
                         metadata: message.metadata.clone(),
+                        // The current message is a credential response. Its
+                        // attachments are control-path input and must not be
+                        // grafted onto the original user request during retry.
+                        attachments: Vec::new(),
                         ..message.clone()
                     };
                     drop(guard);
@@ -2050,8 +2111,10 @@ async fn interrupt_engine_conversation(
         }
     }
 
-    if stopped > 0 {
-        debug!(stopped, "engine v2: interrupted running threads");
+    let discarded = discard_scoped_pending_gates(state, message, conv_id).await;
+
+    if stopped > 0 || discarded > 0 {
+        debug!(stopped, discarded, "engine v2: interrupted scoped state");
         Ok(Some("Interrupted.".into()))
     } else {
         Ok(Some("Nothing to interrupt.".into()))
@@ -2251,7 +2314,7 @@ async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> 
         .await
         .map_err(|e| engine_err("conversation error", e))?;
 
-    // Stop all active threads first
+    // Stop all active threads first.
     if let Some(conv) = state.conversation_manager.get_conversation(conv_id).await {
         for tid in &conv.active_threads {
             if state.thread_manager.is_running(*tid).await {
@@ -2260,15 +2323,13 @@ async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> 
                     .stop_thread(*tid, &message.user_id)
                     .await;
             }
-            let _ = state
-                .pending_gates
-                .discard(&PendingGateKey {
-                    user_id: message.user_id.clone(),
-                    thread_id: *tid,
-                })
-                .await;
         }
     }
+
+    // Fallback authentication can finish its thread before leaving a gate.
+    // Clear by conversation identity so those completed-thread gates cannot
+    // consume the next ordinary message as a credential.
+    discard_scoped_pending_gates(state, message, conv_id).await;
 
     // Clear the conversation entries and active thread list
     state
@@ -2465,7 +2526,14 @@ async fn handle_with_engine_inner(
         ));
     }
 
-    let validation = agent.safety().validate_input(content);
+    // Submission parsing and pending-auth handling use the original text above.
+    // Only ordinary user input reaches this point, where attachment context can
+    // safely become part of the model-visible text.
+    let augmented_content =
+        crate::agent::attachments::augment_text_with_attachments(content, &message.attachments);
+    let effective_content = augmented_content.as_deref().unwrap_or(content);
+
+    let validation = agent.safety().validate_input(effective_content);
     if !validation.is_valid {
         let details = validation
             .errors
@@ -2478,7 +2546,7 @@ async fn handle_with_engine_inner(
         )));
     }
 
-    let violations = agent.safety().check_policy(content);
+    let violations = agent.safety().check_policy(effective_content);
     if violations
         .iter()
         .any(|rule| rule.action == crate::safety::PolicyAction::Block)
@@ -2486,7 +2554,7 @@ async fn handle_with_engine_inner(
         return Ok(Some("Input rejected by safety policy.".into()));
     }
 
-    if let Some(warning) = agent.safety().scan_inbound_for_secrets(content) {
+    if let Some(warning) = agent.safety().scan_inbound_for_secrets(effective_content) {
         tracing::warn!(
             user_id = %message.user_id,
             channel = %message.channel,
@@ -2552,14 +2620,19 @@ async fn handle_with_engine_inner(
 
     // Subscribe before execution starts: broadcast receivers do not replay
     // deltas that were sent before they were created.
+    let transient_content_parts =
+        crate::agent::attachments::engine_transient_content_parts(&message.attachments);
     let (thread_id, event_rx) = handle_user_message_with_event_receiver(
         state,
-        conv_id,
-        content,
-        project_id,
-        &message.user_id,
-        thread_config,
-        preferred_thread_id,
+        EngineMessageRequest {
+            conversation_id: conv_id,
+            content: effective_content,
+            transient_content_parts,
+            project_id,
+            user_id: &message.user_id,
+            thread_config,
+            preferred_thread_id,
+        },
     )
     .await?;
 
@@ -2567,21 +2640,28 @@ async fn handle_with_engine_inner(
     if let Some(ref db) = state.db
         && let Some(cid) = resolve_v1_conversation_for_message(db.as_ref(), message).await
     {
-        let _ = db.add_conversation_message(cid, "user", content).await;
+        let _ = db
+            .add_conversation_message(cid, "user", effective_content)
+            .await;
     }
 
     debug!(thread_id = %thread_id, "engine v2: thread spawned");
     await_thread_outcome(agent, state, message, conv_id, thread_id, event_rx).await
 }
 
-async fn handle_user_message_with_event_receiver(
-    state: &EngineState,
+struct EngineMessageRequest<'a> {
     conversation_id: lunarwing_engine::ConversationId,
-    content: &str,
+    content: &'a str,
+    transient_content_parts: Vec<lunarwing_engine::TransientContentPart>,
     project_id: lunarwing_engine::ProjectId,
-    user_id: &str,
+    user_id: &'a str,
     thread_config: ThreadConfig,
     preferred_thread_id: Option<lunarwing_engine::ThreadId>,
+}
+
+async fn handle_user_message_with_event_receiver(
+    state: &EngineState,
+    request: EngineMessageRequest<'_>,
 ) -> Result<
     (
         lunarwing_engine::ThreadId,
@@ -2592,13 +2672,14 @@ async fn handle_user_message_with_event_receiver(
     let event_rx = state.thread_manager.subscribe_events();
     let thread_id = state
         .conversation_manager
-        .handle_user_message(
-            conversation_id,
-            content,
-            project_id,
-            user_id,
-            thread_config,
-            preferred_thread_id,
+        .handle_user_message_with_parts(
+            request.conversation_id,
+            request.content,
+            request.transient_content_parts,
+            request.project_id,
+            request.user_id,
+            request.thread_config,
+            request.preferred_thread_id,
         )
         .await
         .map_err(|error| engine_err("thread error", error))?;
@@ -5423,12 +5504,15 @@ mod tests {
 
         let (thread_id, mut event_rx) = handle_user_message_with_event_receiver(
             &state,
-            conversation_id,
-            "reply immediately",
-            state.default_project_id,
-            "alice",
-            lunarwing_engine::ThreadConfig::default(),
-            None,
+            EngineMessageRequest {
+                conversation_id,
+                content: "reply immediately",
+                transient_content_parts: Vec::new(),
+                project_id: state.default_project_id,
+                user_id: "alice",
+                thread_config: lunarwing_engine::ThreadConfig::default(),
+                preferred_thread_id: None,
+            },
         )
         .await
         .expect("thread should start");
@@ -5497,6 +5581,31 @@ mod tests {
             },
         );
         assert!(thread_event_to_app_events(&event, "thread-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn mission_notification_broadcasts_once_to_the_owner_scope() {
+        use crate::testing::RecordingBroadcastChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (channel, captures) = RecordingBroadcastChannel::new("weechat");
+        manager.add(Box::new(channel)).await;
+        let notification = lunarwing_engine::MissionNotification {
+            mission_id: lunarwing_engine::MissionId::new(),
+            mission_name: "daily-review".to_string(),
+            thread_id: lunarwing_engine::ThreadId::new(),
+            user_id: "owner-scope".to_string(),
+            notify_channels: vec!["weechat".to_string()],
+            response: Some("mission complete".to_string()),
+            is_error: false,
+        };
+
+        handle_mission_notification(&notification, &manager, None, None).await;
+
+        let captured = captures.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, "owner-scope");
+        assert_eq!(captured[0].1.content, "**[daily-review]** mission complete");
     }
 
     #[tokio::test]
@@ -6040,6 +6149,45 @@ mod tests {
         *lock.write().await = None;
     }
 
+    #[tokio::test]
+    async fn completed_thread_gate_makes_scoped_engine_state_interruptible() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        state
+            .pending_gates
+            .insert(gate_in_conversation(
+                "alice",
+                "gateway",
+                conv_a,
+                lunarwing_engine::ResumeKind::Authentication {
+                    credential_name: "fixture".into(),
+                    instructions: "paste token".into(),
+                    auth_url: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let scoped_a = IncomingMessage::new("gateway", "alice", "/interrupt")
+            .with_conversation_scope("thread-a");
+        let scoped_b = IncomingMessage::new("gateway", "alice", "/interrupt")
+            .with_conversation_scope("thread-b");
+        assert!(!has_active_engine_thread(&scoped_a).await);
+        assert!(has_interruptible_engine_state(&scoped_a).await);
+        assert!(!has_interruptible_engine_state(&scoped_b).await);
+
+        *lock.write().await = None;
+    }
+
     // ── Phase 4: scoped interrupt + outcome mapping ──────────────
 
     #[test]
@@ -6304,6 +6452,104 @@ mod tests {
             state.thread_manager.join_thread(tid_b),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_discards_completed_thread_gate_in_scoped_conversation() {
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        let conv_b = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-b", "alice")
+            .await
+            .unwrap();
+        let gate_a = gate_in_conversation(
+            "alice",
+            "gateway",
+            conv_a,
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "fixture-a".into(),
+                instructions: "paste token".into(),
+                auth_url: None,
+            },
+        );
+        let gate_b = gate_in_conversation(
+            "alice",
+            "gateway",
+            conv_b,
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "fixture-b".into(),
+                instructions: "paste token".into(),
+                auth_url: None,
+            },
+        );
+        let thread_b = gate_b.thread_id;
+        state.pending_gates.insert(gate_a).await.unwrap();
+        state.pending_gates.insert(gate_b).await.unwrap();
+
+        let message = IncomingMessage::new("gateway", "alice", "/interrupt")
+            .with_conversation_scope("thread-a");
+        let response = interrupt_engine_conversation(&state, &message)
+            .await
+            .unwrap();
+
+        assert_eq!(response, Some("Interrupted.".into()));
+        let remaining = state.pending_gates.list_for_user("alice").await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].thread_id, thread_b);
+    }
+
+    #[tokio::test]
+    async fn clear_discards_completed_thread_gate_and_preserves_other_scopes() {
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation("weechat:weechat:group:chpar:#a", "alice")
+            .await
+            .unwrap();
+        let conv_b = state
+            .conversation_manager
+            .get_or_create_conversation("weechat:weechat:group:chpar:#b", "alice")
+            .await
+            .unwrap();
+        let gate_a = gate_in_conversation(
+            "alice",
+            "weechat",
+            conv_a,
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "fixture-a".into(),
+                instructions: "paste token".into(),
+                auth_url: None,
+            },
+        );
+        let gate_b = gate_in_conversation(
+            "alice",
+            "weechat",
+            conv_b,
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "fixture-b".into(),
+                instructions: "paste token".into(),
+                auth_url: None,
+            },
+        );
+        let thread_b = gate_b.thread_id;
+        state.pending_gates.insert(gate_a).await.unwrap();
+        state.pending_gates.insert(gate_b).await.unwrap();
+
+        let message = IncomingMessage::new("weechat", "alice", "/clear")
+            .with_conversation_scope("weechat:group:chpar:#a");
+        let discarded = discard_scoped_pending_gates(&state, &message, conv_a).await;
+
+        assert_eq!(discarded, 1);
+        let remaining = state.pending_gates.list_for_user("alice").await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].thread_id, thread_b);
     }
 
     // ── Phase 5: explicit DarkIRC / WeeChat scope isolation ─────

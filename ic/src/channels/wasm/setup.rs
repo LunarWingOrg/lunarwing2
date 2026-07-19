@@ -119,9 +119,7 @@ async fn register_channel(
     tracing::debug!("Loaded WASM channel: {}", channel_name);
     let owner_actor_id = config
         .channels
-        .wasm_channel_owner_ids
-        .get(channel_name.as_str())
-        .map(ToString::to_string);
+        .wasm_channel_owner_actor_id(channel_name.as_str());
 
     let secret_name = loaded.webhook_secret_name();
     let sig_key_secret_name = loaded.signature_key_secret_name();
@@ -448,6 +446,13 @@ async fn load_channel_setup_field_overrides(
         }
     }
 
+    if channel_name == "weechat" && overrides.contains_key("dm_policy") {
+        overrides.insert(
+            "dm_policy_explicit".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+
     overrides
 }
 
@@ -590,6 +595,40 @@ mod tests {
         );
         // Fields without an `env` declaration are not touched.
         assert!(!overrides.contains_key("connection_mode"));
+    }
+
+    #[tokio::test]
+    async fn weechat_dm_policy_override_is_marked_explicit() {
+        unsafe {
+            std::env::set_var("LW_TEST_DM_POLICY", "open");
+        }
+        let caps = ChannelCapabilitiesFile::from_json(
+            r#"{
+                "name": "weechat",
+                "setup": {
+                    "required_fields": [
+                        { "name": "dm_policy", "prompt": "DM policy", "optional": true, "env": "LW_TEST_DM_POLICY" }
+                    ]
+                }
+            }"#,
+        )
+        .expect("valid capabilities JSON");
+
+        let overrides =
+            load_channel_setup_field_overrides(None, "test-owner", "weechat", Some(&caps)).await;
+
+        unsafe {
+            std::env::remove_var("LW_TEST_DM_POLICY");
+        }
+
+        assert_eq!(
+            overrides.get("dm_policy"),
+            Some(&serde_json::Value::String("open".to_string()))
+        );
+        assert_eq!(
+            overrides.get("dm_policy_explicit"),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 
     #[tokio::test]

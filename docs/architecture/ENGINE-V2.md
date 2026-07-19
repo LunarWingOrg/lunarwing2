@@ -298,6 +298,30 @@ non-UUID DarkIRC and WeeChat scope keys. Approval and auth prompts are statuses;
 gate pauses, auth pauses, and stopped turns return an empty no-reply sentinel so
 the outer handler does not send or persist a duplicate terminal response.
 
+### Attachment Input
+
+Engine V2 parses submissions and resolves pending authentication against the
+original message text. Only an ordinary user-input turn is then augmented with
+the host's sanitized `<attachments>` representation. The effective text includes
+document extraction and audio transcription, excludes source URLs and host
+storage paths, and passes through input validation, policy checks, and inbound
+secret scanning before the engine starts.
+
+Images with bounded channel-provided bytes become engine
+`TransientContentPart::Image` values. These parts and their opaque lookup IDs
+are skipped by serde and use redacted debug output. The Python orchestrator
+carries only the opaque ID through its working transcript; `LlmBridgeAdapter`
+converts bytes to provider-native data-URL content at the final provider
+boundary. Durable engine state, traces, and V1 compatibility history retain the
+sanitized effective text but never image bytes or data URLs. Consequently, a
+process restart preserves attachment descriptions and extracted text but not
+visual bytes; an image must be resent if visual analysis is needed afterward.
+
+Attachment count, MIME, per-file, and aggregate limits remain owned by the
+ingress channel/host implementations. Attachments on approval, interrupt, and
+credential replies stay on those control paths and are not added to model
+history or copied into authentication retries.
+
 ### Local Compatibility Proof
 
 The hermetic local compatibility matrix exercises production boundaries rather
@@ -323,7 +347,7 @@ The engine defines three traits that the host crate implements. This boundary en
 
 ## Data Retention Policy
 
-Thread messages, steps, and events are **never deleted** from the database. This data (context fed to the model, reasoning, tool calls, results) is the most valuable information in the system.
+Thread messages, steps, and events are **never deleted** from the database. This data (context fed to the model, reasoning, tool calls, results) is the most valuable information in the system. Raw attachment bytes are the deliberate exception: only sanitized attachment text is durable, while provider-bound image parts remain transient.
 
 "Cleanup" of terminal threads means evicting from in-memory caches to bound RAM -- the database rows always stay. `load_thread()`, `load_steps()`, and `load_events()` fall back to the database on a cache miss.
 

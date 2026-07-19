@@ -430,6 +430,13 @@ pub struct ChannelSettings {
     #[serde(default)]
     pub wasm_channel_owner_ids: std::collections::HashMap<String, i64>,
 
+    /// Per-channel string actor IDs that identify the instance owner.
+    ///
+    /// This supplements the legacy numeric map for protocols whose stable actor
+    /// identifiers are nicks, hostmasks, accounts, or JIDs.
+    #[serde(default)]
+    pub wasm_channel_owner_actor_ids: std::collections::HashMap<String, String>,
+
     /// Enabled WASM channels by name.
     /// Channels not in this list but present in the channels directory will still load.
     /// This is primarily used by the setup wizard to track which channels were configured.
@@ -475,6 +482,7 @@ impl Default for ChannelSettings {
             xmpp_allow_plaintext_fallback: None,
             xmpp_max_messages_per_hour: None,
             wasm_channel_owner_ids: std::collections::HashMap::new(),
+            wasm_channel_owner_actor_ids: std::collections::HashMap::new(),
             wasm_channels: Vec::new(),
             wasm_channels_enabled: true,
             wasm_channels_dir: None,
@@ -1614,6 +1622,42 @@ mod tests {
         assert_eq!(
             restored.channels.wasm_channel_owner_ids.get("xmpp"),
             Some(&123456789)
+        );
+    }
+
+    #[test]
+    fn test_wasm_channel_owner_actor_ids_db_round_trip() {
+        let mut settings = Settings::default();
+        settings
+            .channels
+            .wasm_channel_owner_actor_ids
+            .insert("weechat".to_string(), "id:alice!user@example".to_string());
+
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
+        assert_eq!(
+            restored
+                .channels
+                .wasm_channel_owner_actor_ids
+                .get("weechat")
+                .map(String::as_str),
+            Some("id:alice!user@example")
+        );
+    }
+
+    #[test]
+    fn test_wasm_channel_owner_actor_ids_via_set() {
+        let mut settings = Settings::default();
+        settings
+            .set("channels.wasm_channel_owner_actor_ids.darkirc", "OwnerNick")
+            .expect("string owner actor ID should be accepted");
+        assert_eq!(
+            settings
+                .channels
+                .wasm_channel_owner_actor_ids
+                .get("darkirc")
+                .map(String::as_str),
+            Some("OwnerNick")
         );
     }
 

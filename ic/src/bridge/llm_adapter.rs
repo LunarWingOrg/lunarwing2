@@ -2,15 +2,16 @@
 
 use std::sync::Arc;
 
+use base64::Engine;
 use futures::StreamExt;
 use lunarwing_engine::{
     ActionDef, EngineError, LlmBackend, LlmCallConfig, LlmOutput, LlmResponse, ThreadMessage,
-    TokenUsage,
+    TokenUsage, TransientContentPart,
 };
 
 use crate::llm::{
-    ChatMessage, CompletionRequest, CompletionResponse, LlmError, LlmProvider, Role, ToolCall,
-    ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
+    ChatMessage, CompletionRequest, CompletionResponse, ContentPart, ImageUrl, LlmError,
+    LlmProvider, Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
 };
 
 /// Wraps an existing `LlmProvider` to implement the engine's `LlmBackend` trait.
@@ -235,10 +236,29 @@ fn thread_msg_to_chat(msg: &ThreadMessage) -> ChatMessage {
         MessageRole::ActionResult => Role::Tool,
     };
 
+    let content_parts = if role == Role::User {
+        msg.transient_content_parts
+            .iter()
+            .map(|part| match part {
+                TransientContentPart::Image { mime_type, data } => ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: format!(
+                            "data:{mime_type};base64,{}",
+                            base64::engine::general_purpose::STANDARD.encode(data)
+                        ),
+                        detail: None,
+                    },
+                },
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut chat = ChatMessage {
         role,
         content: msg.content.clone(),
-        content_parts: Vec::new(),
+        content_parts,
         tool_call_id: msg.action_call_id.clone(),
         name: msg.action_name.clone(),
         tool_calls: None,
@@ -292,6 +312,28 @@ mod tests {
             parameters_schema: serde_json::json!({"type": "object"}),
             effects: Vec::new(),
             requires_approval: false,
+        }
+    }
+
+    #[test]
+    fn thread_message_maps_transient_image_at_provider_boundary() {
+        let message = ThreadMessage::user_with_transient_parts(
+            "inspect image",
+            vec![TransientContentPart::Image {
+                mime_type: "image/png".to_string(),
+                data: vec![1, 2, 3],
+            }],
+        );
+
+        let chat = thread_msg_to_chat(&message);
+        assert_eq!(chat.content, "inspect image");
+        assert_eq!(chat.content_parts.len(), 1);
+        match &chat.content_parts[0] {
+            ContentPart::ImageUrl { image_url } => {
+                assert_eq!(image_url.url, "data:image/png;base64,AQID");
+                assert_eq!(image_url.detail, None);
+            }
+            other => panic!("expected image URL content, got {other:?}"),
         }
     }
 

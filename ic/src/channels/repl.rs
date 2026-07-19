@@ -763,6 +763,11 @@ impl Channel for ReplChannel {
                     eprintln!("  {}{display}{}", fmt::dim(), fmt::reset());
                 }
             }
+            StatusUpdate::ExternalWaiting { gate_name } => {
+                let message = StatusUpdate::external_waiting_message(&gate_name);
+                let display = truncate_for_preview(&message, CLI_STATUS_MAX);
+                eprintln!("  {}{display}{}", fmt::dim(), fmt::reset());
+            }
             StatusUpdate::ApprovalNeeded {
                 request_id: _,
                 tool_name,

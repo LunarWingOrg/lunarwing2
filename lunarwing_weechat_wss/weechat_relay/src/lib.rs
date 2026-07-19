@@ -142,6 +142,10 @@ struct WeechatConfig {
     #[serde(default = "default_dm_policy")]
     dm_policy: String,
 
+    /// Whether the host supplied `dm_policy` as an explicit setup override.
+    #[serde(default)]
+    dm_policy_explicit: bool,
+
     /// Group policy: "open", "allowlist", or "deny" (default "allowlist")
     #[serde(default = "default_group_policy")]
     group_policy: String,
@@ -209,7 +213,94 @@ fn default_ws_adapter_url() -> String {
 }
 
 fn default_dm_policy() -> String {
-    "open".to_string()
+    // New installs default to `pairing`: an unpaired sender gets pairing
+    // instructions and does not execute under owner scope. This matches the
+    // documented setup prompt and capabilities default. Existing deployments
+    // with an explicit `open`/`allowlist`/`pairing` value keep that value
+    // because the adapter config and persisted workspace state are honored
+    // before this default is used.
+    "pairing".to_string()
+}
+
+fn is_known_dm_policy(policy: &str) -> bool {
+    matches!(policy, "open" | "pairing" | "allowlist")
+}
+
+fn resolve_initial_dm_policy(
+    configured_policy: &str,
+    configured_explicitly: bool,
+    persisted_policy: Option<&str>,
+) -> String {
+    if configured_explicitly {
+        return configured_policy.to_string();
+    }
+
+    persisted_policy
+        .filter(|policy| !policy.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| configured_policy.to_string())
+}
+
+fn log_invalid_dm_policy(policy: &str) {
+    channel_host::log(
+        channel_host::LogLevel::Warn,
+        &format!(
+            "Unknown dm_policy '{}'; valid values are open, pairing, or allowlist. Rejecting DMs until configuration is fixed",
+            policy
+        ),
+    );
+}
+
+fn sender_allowed_by_policy(
+    nick: &str,
+    hostmask: &str,
+    identity: &WeechatSenderIdentity,
+    policy: &str,
+    allow_from: &[String],
+    pairing_allowed: &[String],
+) -> Option<bool> {
+    let normalized_nick = irc_casefold(nick, identity.case_mapping);
+    let normalized_hostmask = irc_casefold(hostmask, identity.case_mapping);
+    let paired = pairing_allowed.iter().any(|entry| {
+        entry == &identity.principal
+            || irc_casefold(entry, identity.case_mapping) == normalized_nick
+    });
+    let allowlisted = allow_from.iter().any(|entry| {
+        entry == "*"
+            || entry == &identity.principal
+            || identity.account.as_deref().is_some_and(|account| {
+                irc_casefold(entry, identity.case_mapping)
+                    == irc_casefold(account, identity.case_mapping)
+            })
+            || if entry.contains('!') {
+                irc_casefold(entry, identity.case_mapping) == normalized_hostmask
+            } else {
+                irc_casefold(entry, identity.case_mapping) == normalized_nick
+            }
+    });
+
+    match policy {
+        "open" => Some(true),
+        "pairing" => Some(paired),
+        "allowlist" => Some(allowlisted || paired),
+        _ => None,
+    }
+}
+
+fn startup_log_summary(config: &WeechatConfig) -> String {
+    let connection_mode = match config.connection_mode.as_str() {
+        "auto" => "auto",
+        "http" => "http",
+        "websocket" => "websocket",
+        _ => "invalid",
+    };
+
+    format!(
+        "WeeChat Relay channel starting (relay configured: {}, ws adapter configured: {}, connection mode: {})",
+        !config.relay_url.trim().is_empty(),
+        !config.ws_adapter_url.trim().is_empty(),
+        connection_mode
+    )
 }
 
 fn default_group_policy() -> String {
@@ -241,6 +332,149 @@ struct WeechatMessageMetadata {
     nick: String,
     /// Is this a DM or group channel?
     is_dm: bool,
+    /// Versioned sender principal used for pairing and conversation scope.
+    #[serde(default)]
+    sender_principal: Option<String>,
+    /// Authenticated IRC account when supplied by the relay tags.
+    #[serde(default)]
+    account: Option<String>,
+    /// IRC case mapping used to normalize the principal.
+    #[serde(default)]
+    case_mapping: Option<String>,
+}
+
+/// Validated network-qualified target for proactive WeeChat delivery.
+#[derive(Debug, PartialEq, Eq)]
+struct WeechatProactiveTarget {
+    buffer: String,
+    network: String,
+    target: String,
+    is_dm: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IrcCaseMapping {
+    Ascii,
+    Rfc1459,
+    StrictRfc1459,
+}
+
+impl IrcCaseMapping {
+    fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "ascii" => Some(Self::Ascii),
+            "rfc1459" => Some(Self::Rfc1459),
+            "strict-rfc1459" => Some(Self::StrictRfc1459),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ascii => "ascii",
+            Self::Rfc1459 => "rfc1459",
+            Self::StrictRfc1459 => "strict-rfc1459",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WeechatSenderIdentity {
+    principal: String,
+    account: Option<String>,
+    case_mapping: IrcCaseMapping,
+}
+
+fn irc_casefold(value: &str, mapping: IrcCaseMapping) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            'A'..='Z' => character.to_ascii_lowercase(),
+            '[' if mapping != IrcCaseMapping::Ascii => '{',
+            ']' if mapping != IrcCaseMapping::Ascii => '}',
+            '\\' if mapping != IrcCaseMapping::Ascii => '|',
+            '^' if mapping == IrcCaseMapping::Rfc1459 => '~',
+            other => other,
+        })
+        .collect()
+}
+
+fn case_mapping_from_tags(tags: &[String]) -> IrcCaseMapping {
+    tags.iter()
+        .find_map(|tag| tag.strip_prefix("casemapping_"))
+        .and_then(IrcCaseMapping::from_name)
+        .unwrap_or(IrcCaseMapping::Rfc1459)
+}
+
+fn extract_account_from_tags(tags: &[String]) -> Option<&str> {
+    tags.iter()
+        .find_map(|tag| {
+            tag.strip_prefix("account_")
+                .or_else(|| tag.strip_prefix("account="))
+                .or_else(|| tag.strip_prefix("irc_account_"))
+        })
+        .filter(|account| !account.is_empty() && *account != "*")
+}
+
+fn weechat_sender_identity(network: &str, nick: &str, tags: &[String]) -> WeechatSenderIdentity {
+    let case_mapping = case_mapping_from_tags(tags);
+    let network = network.to_ascii_lowercase();
+    let account = extract_account_from_tags(tags).map(str::to_string);
+    let principal = if let Some(account) = account.as_deref() {
+        format!("account:{network}:{}", irc_casefold(account, case_mapping))
+    } else {
+        format!("nick:{network}:{}", irc_casefold(nick, case_mapping))
+    };
+
+    WeechatSenderIdentity {
+        principal,
+        account,
+        case_mapping,
+    }
+}
+
+fn parse_proactive_target(value: &str) -> Result<WeechatProactiveTarget, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("WeeChat proactive target is empty".to_string());
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err(
+            "WeeChat proactive target must not contain whitespace or control characters"
+                .to_string(),
+        );
+    }
+
+    let mut parts = value.splitn(3, '.');
+    let prefix = parts.next();
+    let network = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    if prefix != Some("irc") || network.is_empty() || target.is_empty() || network == "server" {
+        return Err(
+            "WeeChat proactive target must use irc.<network>.<nick-or-channel>".to_string(),
+        );
+    }
+    if !network
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err("WeeChat proactive target contains an invalid network name".to_string());
+    }
+
+    let is_dm = is_dm_target(target);
+    if is_dm && (target.starts_with('-') || target.starts_with('/') || target.contains(',')) {
+        return Err("WeeChat proactive DM target contains unsafe command syntax".to_string());
+    }
+
+    Ok(WeechatProactiveTarget {
+        buffer: value.to_string(),
+        network: network.to_string(),
+        target: target.to_string(),
+        is_dm,
+    })
 }
 
 // ============================================================================
@@ -278,26 +512,83 @@ const WAIT_HTTP_TIMEOUT_MS: u32 = 25_000;
 struct WeechatRelayChannel;
 
 impl Guest for WeechatRelayChannel {
-    fn on_broadcast(_user_id: String, _response: AgentResponse) -> Result<(), String> {
-        Ok(())
+    fn on_broadcast(user_id: String, response: AgentResponse) -> Result<(), String> {
+        if !response.attachments.is_empty() {
+            return Err(
+                "WeeChat proactive delivery does not support attachments; none were sent"
+                    .to_string(),
+            );
+        }
+        if response.content.is_empty() {
+            return Err("WeeChat proactive message is empty; nothing was sent".to_string());
+        }
+
+        let route = parse_proactive_target(&user_id)?;
+        let relay_url =
+            channel_host::workspace_read(RELAY_URL_PATH).unwrap_or_else(default_relay_url);
+        let relay_password = channel_host::workspace_read(RELAY_PASSWORD_PATH).unwrap_or_default();
+        let max_chunk = channel_host::workspace_read(MAX_CHUNK_LENGTH_PATH)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(default_max_chunk_length);
+        let chunks = split_message(&response.content, max_chunk);
+
+        let mut successful_chunks = 0;
+        let mut last_error = None;
+        for chunk in &chunks {
+            let result = if route.is_dm {
+                send_dm(
+                    &relay_url,
+                    &relay_password,
+                    &route.buffer,
+                    &route.network,
+                    &route.target,
+                    chunk,
+                )
+            } else {
+                send_input(&relay_url, &relay_password, &route.buffer, chunk)
+            };
+
+            match result {
+                Ok(()) => successful_chunks += 1,
+                Err(error) => {
+                    channel_host::log(
+                        channel_host::LogLevel::Warn,
+                        &format!(
+                            "Failed to proactively send chunk {} to '{}': {}",
+                            successful_chunks + 1,
+                            route.buffer,
+                            error
+                        ),
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        if successful_chunks > 0 {
+            Ok(())
+        } else {
+            Err(last_error.unwrap_or_else(|| "Failed to send any proactive chunks".to_string()))
+        }
     }
     /// Initialize the channel. Persist config to workspace and verify connectivity.
     fn on_start(config_json: String) -> Result<ChannelConfig, String> {
-        channel_host::log(
-            channel_host::LogLevel::Debug,
-            &format!("WeeChat Relay channel config: {}", config_json),
-        );
+        // Do NOT log raw config_json: it contains host-injected secrets
+        // (e.g. relay_password). Log a sanitized summary instead.
 
         let config: WeechatConfig = serde_json::from_str(&config_json)
             .map_err(|e| format!("Failed to parse config: {}", e))?;
-
-        channel_host::log(
-            channel_host::LogLevel::Info,
-            &format!(
-                "WeeChat Relay channel starting, relay at {}",
-                config.relay_url
-            ),
+        let persisted_dm_policy = channel_host::workspace_read(DM_POLICY_PATH);
+        let dm_policy = resolve_initial_dm_policy(
+            &config.dm_policy,
+            config.dm_policy_explicit,
+            persisted_dm_policy.as_deref(),
         );
+        if !is_known_dm_policy(&dm_policy) {
+            log_invalid_dm_policy(&dm_policy);
+        }
+
+        channel_host::log(channel_host::LogLevel::Info, &startup_log_summary(&config));
 
         // Normalize relay URL (strip trailing slashes, /api suffix)
         let relay_url = normalize_relay_url(&config.relay_url);
@@ -310,7 +601,7 @@ impl Guest for WeechatRelayChannel {
         let _ = channel_host::workspace_write(RELAY_PASSWORD_PATH, &config.relay_password);
         let _ = channel_host::workspace_write(CONNECTION_MODE_PATH, &config.connection_mode);
         let _ = channel_host::workspace_write(WS_ADAPTER_URL_PATH, &config.ws_adapter_url);
-        let _ = channel_host::workspace_write(DM_POLICY_PATH, &config.dm_policy);
+        let _ = channel_host::workspace_write(DM_POLICY_PATH, &dm_policy);
         let _ = channel_host::workspace_write(GROUP_POLICY_PATH, &config.group_policy);
         let _ = channel_host::workspace_write(
             MAX_CHUNK_LENGTH_PATH,
@@ -411,10 +702,7 @@ impl Guest for WeechatRelayChannel {
 
         channel_host::log(
             channel_host::LogLevel::Info,
-            &format!(
-                "Connection mode: {} (ws_adapter: {}, poll interval: {}ms)",
-                config.connection_mode, config.ws_adapter_url, interval_ms
-            ),
+            &format!("Polling interval: {}ms", interval_ms),
         );
 
         Ok(ChannelConfig {
@@ -543,10 +831,7 @@ impl Guest for WeechatRelayChannel {
     /// Forward actionable status updates to IRC.
     fn on_status(update: StatusUpdate) {
         match update.status {
-            StatusType::ApprovalNeeded
-            | StatusType::AuthRequired
-            | StatusType::AuthCompleted
-            | StatusType::JobStarted => {
+            status if is_actionable_irc_status(status) => {
                 let message = update.message.trim();
                 if message.is_empty() {
                     return;
@@ -558,16 +843,35 @@ impl Guest for WeechatRelayChannel {
                         Err(_) => return,
                     };
 
+                // Suppress auth-status delivery in group buffers. These
+                // messages can carry setup instructions and OAuth URLs that
+                // must not leak into shared channels. Approval prompts and
+                // job-started notices are unaffected and remain allowed in
+                // groups. Do not log the auth URL itself.
+                if should_suppress_auth_status(update.status, metadata.is_dm) {
+                    channel_host::log(
+                        channel_host::LogLevel::Debug,
+                        &auth_status_suppression_log(update.status, &metadata.buffer),
+                    );
+                    return;
+                }
+                if should_suppress_external_waiting(update.status, metadata.is_dm) {
+                    channel_host::log(
+                        channel_host::LogLevel::Debug,
+                        &format!(
+                            "Suppressing external-waiting status in group buffer '{}'",
+                            metadata.buffer
+                        ),
+                    );
+                    return;
+                }
+
                 let relay_url =
                     channel_host::workspace_read(RELAY_URL_PATH).unwrap_or_else(default_relay_url);
                 let relay_password =
                     channel_host::workspace_read(RELAY_PASSWORD_PATH).unwrap_or_default();
 
-                let truncated = if message.len() > 400 {
-                    format!("{}...", &message[..397])
-                } else {
-                    message.to_string()
-                };
+                let truncated = truncate_for_status(message);
 
                 let status_text = format!("[status] {}", truncated);
 
@@ -652,7 +956,7 @@ fn resolve_poll_url(mode: &str, relay_url: &str, adapter_url: &str, password: &s
                 if !is_adapter_healthy(adapter_url, password) {
                     channel_host::log(
                         channel_host::LogLevel::Warn,
-                        &format!("WebSocket adapter at {} is not reachable (mode=websocket, no fallback)", adapter_url),
+                        "WebSocket adapter is not reachable (mode=websocket, no fallback)",
                     );
                 }
                 adapter_url.to_string()
@@ -663,16 +967,13 @@ fn resolve_poll_url(mode: &str, relay_url: &str, adapter_url: &str, password: &s
             if !adapter_url.is_empty() && is_adapter_healthy(adapter_url, password) {
                 channel_host::log(
                     channel_host::LogLevel::Debug,
-                    &format!("auto mode: adapter healthy at {}, using it", adapter_url),
+                    "auto mode: adapter healthy, using it",
                 );
                 adapter_url.to_string()
             } else {
                 channel_host::log(
                     channel_host::LogLevel::Debug,
-                    &format!(
-                        "auto mode: adapter health check failed for {}, using relay_url directly",
-                        adapter_url
-                    ),
+                    "auto mode: adapter health check failed, using relay_url directly",
                 );
                 relay_url.to_string()
             }
@@ -709,6 +1010,9 @@ fn refresh_policy_config() {
         if resp.status == 200 {
             if let Ok(cfg) = serde_json::from_slice::<serde_json::Value>(&resp.body) {
                 if let Some(v) = cfg["dm_policy"].as_str() {
+                    if !is_known_dm_policy(v) {
+                        log_invalid_dm_policy(v);
+                    }
                     let _ = channel_host::workspace_write(DM_POLICY_PATH, v);
                 }
                 if let Some(v) = cfg["group_policy"].as_str() {
@@ -778,7 +1082,7 @@ fn do_poll(poll_url: &str, relay_url: &str, relay_password: &str) {
 
     channel_host::log(
         channel_host::LogLevel::Debug,
-        &format!("Polling {} buffers via {}", buffers.len(), poll_url),
+        &format!("Polling {} buffers", buffers.len()),
     );
 
     // Load watermarks (line-ID based)
@@ -1148,6 +1452,48 @@ fn is_dm_buffer(full_name: &str) -> bool {
     is_dm_target(&parts[2..].join("."))
 }
 
+/// Whether a status update must be suppressed before any relay send or
+/// URL-bearing log emission because it carries auth secrets into a group
+/// buffer. `AuthRequired` and `AuthCompleted` carry setup instructions and
+/// OAuth URLs that must never leak into shared channels. Approval prompts
+/// and job-started notices remain deliverable to groups.
+///
+/// Pure (no host bindings) so it can be unit-tested without WASM.
+fn should_suppress_auth_status(status: StatusType, is_dm: bool) -> bool {
+    if is_dm {
+        return false;
+    }
+    matches!(status, StatusType::AuthRequired | StatusType::AuthCompleted)
+}
+
+fn is_actionable_irc_status(status: StatusType) -> bool {
+    matches!(
+        status,
+        StatusType::ApprovalNeeded
+            | StatusType::AuthRequired
+            | StatusType::AuthCompleted
+            | StatusType::ExternalWaiting
+            | StatusType::JobStarted
+    )
+}
+
+fn should_suppress_external_waiting(status: StatusType, is_dm: bool) -> bool {
+    !is_dm && matches!(status, StatusType::ExternalWaiting)
+}
+
+/// Safe debug log line emitted when a group auth status is suppressed.
+/// Contains only the status variant and buffer name — never the message
+/// body, OAuth URL, or state token. Pure string format so it can be
+/// asserted on in unit tests without host log capture.
+fn auth_status_suppression_log(status: StatusType, buffer: &str) -> String {
+    let label = match status {
+        StatusType::AuthRequired => "auth-required",
+        StatusType::AuthCompleted => "auth-completed",
+        _ => "auth",
+    };
+    format!("Suppressing {label} status in group buffer '{buffer}'")
+}
+
 /// Whether a line's tags permit ingestion. The line must be a real PRIVMSG and
 /// must not be our own (`self_msg`) or a `no_log` line. Lines with no tags are
 /// permitted (lenient — matches historical poll behavior). Centralized so the
@@ -1238,6 +1584,7 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
     } else {
         nick.to_string()
     };
+    let identity = weechat_sender_identity(network, nick, tags);
 
     let message = line.message.as_ref().map(|s| s.as_str()).unwrap_or("");
     let text = strip_irc_formatting(message);
@@ -1258,9 +1605,9 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
     // Apply DM/group policy
     if is_dm {
         let dm_policy =
-            channel_host::workspace_read(DM_POLICY_PATH).unwrap_or_else(|| "open".to_string());
+            channel_host::workspace_read(DM_POLICY_PATH).unwrap_or_else(default_dm_policy);
 
-        if !check_sender_allowed(nick, &hostmask, &dm_policy) {
+        if !check_sender_allowed(nick, &hostmask, &identity, &dm_policy) {
             drop_log(
                 verbose,
                 &format!(
@@ -1268,7 +1615,7 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
                     nick
                 ),
             );
-            handle_pairing_request(buffer_name, nick);
+            handle_pairing_request(buffer_name, nick, &identity.principal);
             return;
         }
     } else {
@@ -1287,7 +1634,9 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
-        if group_policy == "allowlist" && !check_sender_allowed(nick, &hostmask, "allowlist") {
+        if group_policy == "allowlist"
+            && !check_sender_allowed(nick, &hostmask, &identity, "allowlist")
+        {
             drop_log(
                 verbose,
                 &format!(
@@ -1313,13 +1662,16 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
         target: target.clone(),
         nick: nick.to_string(),
         is_dm,
+        sender_principal: Some(identity.principal.clone()),
+        account: identity.account.clone(),
+        case_mapping: Some(identity.case_mapping.name().to_string()),
     };
 
     let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
 
-    let user_id = format!("id:{}", hostmask);
+    let user_id = identity.principal.clone();
     let thread_id = if is_dm {
-        format!("weechat:dm:{}:{}", network, nick)
+        format!("weechat:dm:v2:{}", identity.principal)
     } else {
         format!("weechat:group:{}:{}", network, target)
     };
@@ -1345,42 +1697,54 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
 }
 
 /// Check if sender is allowed based on policy.
-fn check_sender_allowed(nick: &str, hostmask: &str, policy: &str) -> bool {
+///
+/// Unknown policy strings fail closed (reject the sender) rather than
+/// defaulting to `open`, so a typo or stale config never grants unintended
+/// access.
+fn check_sender_allowed(
+    nick: &str,
+    hostmask: &str,
+    identity: &WeechatSenderIdentity,
+    policy: &str,
+) -> bool {
     if policy == "open" {
         return true;
     }
+    if !is_known_dm_policy(policy) {
+        log_invalid_dm_policy(policy);
+        return false;
+    }
 
-    let allow_from: Vec<String> = channel_host::workspace_read(ALLOW_FROM_PATH)
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-
-    // Also check pairing store
     let pairing_allowed = channel_host::pairing_read_allow_from(CHANNEL_NAME).unwrap_or_default();
+    let allow_from = if policy == "allowlist" {
+        channel_host::workspace_read(ALLOW_FROM_PATH)
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
-    let in_allow_from = allow_from.iter().any(|a| {
-        if a == "*" {
-            true
-        } else if a.contains('!') {
-            // Full hostmask entry — match against nick!user@host
-            a.eq_ignore_ascii_case(hostmask)
-        } else {
-            // Nick-only entry
-            a.eq_ignore_ascii_case(nick)
-        }
-    });
-
-    in_allow_from || pairing_allowed.iter().any(|a| a.eq_ignore_ascii_case(nick))
+    sender_allowed_by_policy(
+        nick,
+        hostmask,
+        identity,
+        policy,
+        &allow_from,
+        &pairing_allowed,
+    )
+    .unwrap_or(false)
 }
 
 /// Handle pairing request for unknown sender.
-fn handle_pairing_request(buffer_name: &str, nick: &str) {
+fn handle_pairing_request(buffer_name: &str, nick: &str, principal: &str) {
     let meta = serde_json::json!({
         "buffer": buffer_name,
         "nick": nick,
+        "principal": principal,
     })
     .to_string();
 
-    match channel_host::pairing_upsert_request(CHANNEL_NAME, nick, &meta) {
+    match channel_host::pairing_upsert_request(CHANNEL_NAME, principal, &meta) {
         Ok(result) => {
             channel_host::log(
                 channel_host::LogLevel::Info,
@@ -1696,8 +2060,46 @@ fn strip_irc_formatting(text: &str) -> String {
     result
 }
 
+/// Maximum total byte budget for a status line sent to IRC, including the
+/// `[status] ` prefix and the `...` ellipsis (when truncation is needed).
+/// Matches the DarkIRC adapter's byte budget.
+const MAX_STATUS_BYTES: usize = 400;
+
+/// Truncate a status message to fit within the IRC byte budget, preserving the
+/// `[status] ` prefix and leaving room for the `...` ellipsis.
+///
+/// Truncation happens on UTF-8 character boundaries, so multibyte content
+/// (emoji, CJK, etc.) never traps the WASM callback. The retained text is a
+/// valid prefix of the original followed by `...` when truncated.
+fn truncate_for_status(message: &str) -> String {
+    if message.is_empty() {
+        return String::new();
+    }
+    // Budget for the message body inside `[status] <body>`:
+    // total budget minus the `[status] ` prefix (9 bytes) minus `...` (3 bytes,
+    // reserved only when we actually truncate).
+    const PREFIX_LEN: usize = 9; // "[status] "
+    const ELLIPSIS_LEN: usize = 3; // "..."
+    let body_budget = MAX_STATUS_BYTES
+        .saturating_sub(PREFIX_LEN)
+        .saturating_sub(ELLIPSIS_LEN);
+
+    if message.len() <= body_budget {
+        return message.to_string();
+    }
+
+    // Walk back to the nearest UTF-8 character boundary at or below the budget.
+    let cut = message.floor_char_boundary(body_budget);
+    format!("{}...", &message[..cut])
+}
+
 /// Split message into chunks at word boundaries.
 fn split_message(text: &str, max_len: usize) -> Vec<String> {
+    let text = text.trim_matches(|character| matches!(character, '\r' | '\n'));
+    if text.is_empty() {
+        return Vec::new();
+    }
+
     if text.len() <= max_len {
         return vec![text.to_string()];
     }
@@ -1848,6 +2250,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_startup_log_summary_excludes_secret_bearing_values() {
+        const RELAY_PASSWORD_SENTINEL: &str = "chpar-001-relay-password-sentinel";
+        const RELAY_URL_SENTINEL: &str = "chpar-001-relay-url-sentinel";
+        const ADAPTER_URL_SENTINEL: &str = "chpar-001-adapter-url-sentinel";
+
+        let config_json = serde_json::json!({
+            "relay_url": format!("http://127.0.0.1:9001/{RELAY_URL_SENTINEL}"),
+            "relay_password": RELAY_PASSWORD_SENTINEL,
+            "connection_mode": "websocket",
+            "ws_adapter_url": format!("http://127.0.0.1:6681/{ADAPTER_URL_SENTINEL}")
+        })
+        .to_string();
+        let mut config: WeechatConfig =
+            serde_json::from_str(&config_json).expect("sentinel config should parse");
+
+        let summary = startup_log_summary(&config);
+        assert_eq!(
+            summary,
+            "WeeChat Relay channel starting (relay configured: true, ws adapter configured: true, connection mode: websocket)"
+        );
+        for sentinel in [
+            RELAY_PASSWORD_SENTINEL,
+            RELAY_URL_SENTINEL,
+            ADAPTER_URL_SENTINEL,
+        ] {
+            assert!(
+                !summary.contains(sentinel),
+                "startup summary exposed a secret-bearing config value"
+            );
+        }
+
+        config.connection_mode = RELAY_PASSWORD_SENTINEL.to_string();
+        let invalid_mode_summary = startup_log_summary(&config);
+        assert!(invalid_mode_summary.contains("connection mode: invalid"));
+        assert!(!invalid_mode_summary.contains(RELAY_PASSWORD_SENTINEL));
+    }
+
+    #[test]
     fn test_response_routing_metadata_roundtrip() {
         let metadata = WeechatMessageMetadata {
             buffer: "irc.libera.#lunarwing".to_string(),
@@ -1855,6 +2295,9 @@ mod tests {
             target: "#lunarwing".to_string(),
             nick: "alice".to_string(),
             is_dm: false,
+            sender_principal: Some("nick:libera:alice".to_string()),
+            account: None,
+            case_mapping: Some("rfc1459".to_string()),
         };
         let encoded = serde_json::to_string(&metadata).expect("metadata should serialize");
         let decoded: WeechatMessageMetadata =
@@ -1865,6 +2308,221 @@ mod tests {
         assert_eq!(decoded.target, "#lunarwing");
         assert_eq!(decoded.nick, "alice");
         assert!(!decoded.is_dm);
+    }
+
+    #[test]
+    fn test_parse_proactive_group_target() {
+        let target = parse_proactive_target("irc.libera.#lunarwing")
+            .expect("network-qualified group target should parse");
+        assert_eq!(target.buffer, "irc.libera.#lunarwing");
+        assert_eq!(target.network, "libera");
+        assert_eq!(target.target, "#lunarwing");
+        assert!(!target.is_dm);
+    }
+
+    #[test]
+    fn test_parse_proactive_dm_target() {
+        let target = parse_proactive_target("irc.darkirc.alice")
+            .expect("network-qualified DM target should parse");
+        assert_eq!(target.buffer, "irc.darkirc.alice");
+        assert_eq!(target.network, "darkirc");
+        assert_eq!(target.target, "alice");
+        assert!(target.is_dm);
+    }
+
+    #[test]
+    fn test_parse_proactive_target_preserves_dots_in_recipient() {
+        let target = parse_proactive_target("irc.libera.alice.example")
+            .expect("dots after the network belong to the recipient");
+        assert_eq!(target.target, "alice.example");
+        assert!(target.is_dm);
+    }
+
+    #[test]
+    fn test_parse_proactive_target_rejects_ambiguous_or_malformed_values() {
+        for value in [
+            "",
+            "alice",
+            "#lunarwing",
+            "irc.libera",
+            "irc..alice",
+            "irc.server.libera",
+            "irc.libera.alice bob",
+            "irc.libera.alice\n/msg bob leaked",
+            "irc.libera!.alice",
+            "irc.libera.-server",
+            "irc.libera./join",
+            "irc.libera.alice,bob",
+        ] {
+            assert!(
+                parse_proactive_target(value).is_err(),
+                "target should be rejected: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_on_broadcast_rejects_empty_content_before_network_access() {
+        let response = AgentResponse {
+            message_id: "test-message".to_string(),
+            content: String::new(),
+            thread_id: None,
+            metadata_json: "{}".to_string(),
+            attachments: vec![],
+        };
+        let error = WeechatRelayChannel::on_broadcast("irc.libera.alice".to_string(), response)
+            .expect_err("empty proactive content must be rejected");
+        assert!(error.contains("empty"));
+    }
+
+    #[test]
+    fn test_on_broadcast_rejects_attachments_before_network_access() {
+        let response = AgentResponse {
+            message_id: "test-message".to_string(),
+            content: "hello".to_string(),
+            thread_id: None,
+            metadata_json: "{}".to_string(),
+            attachments: vec![exports::lunarwing::agent::channel::Attachment {
+                filename: "test.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                data: b"test".to_vec(),
+            }],
+        };
+        let error = WeechatRelayChannel::on_broadcast("irc.libera.alice".to_string(), response)
+            .expect_err("unsupported proactive attachments must be rejected");
+        assert!(error.contains("attachments"));
+    }
+
+    #[test]
+    fn test_split_message_multibyte_utf8_safe() {
+        // Build a string whose byte boundary near the chunk limit lands inside
+        // a multibyte character. Fill with ASCII up to byte 418, then append a
+        // two-byte char ('é' = c3 a9), then more text so chunking at 420 would
+        // split the multibyte char if not handled correctly.
+        let mut input = "a".repeat(418);
+        input.push('\u{00E9}'); // é — 2 bytes
+        input.push_str("tail");
+
+        let chunks = split_message(&input, 420);
+
+        // Every chunk must be valid UTF-8 (no split multibyte chars).
+        for chunk in &chunks {
+            assert!(
+                chunk.is_ascii() || chunk.chars().count() > 0,
+                "chunk contains invalid UTF-8: {chunk:?}"
+            );
+        }
+
+        // Concatenating the trimmed chunks must preserve the full payload
+        // (whitespace at chunk boundaries may be trimmed, but the printable
+        // content remains in order).
+        let mut assembled = String::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            if i > 0 {
+                assembled.push(' ');
+            }
+            assembled.push_str(chunk);
+        }
+        assert!(
+            assembled.contains("tail"),
+            "chunked payload lost content: {assembled:?}"
+        );
+        assert!(assembled.starts_with("a"), "chunk order not preserved");
+    }
+
+    #[test]
+    fn test_is_dm_target_classifies_channel_vs_nick() {
+        // Channel sigils → not DM.
+        assert!(!is_dm_target("#lunarwing"));
+        assert!(!is_dm_target("&local"));
+        assert!(!is_dm_target("!chan"));
+        // Nick targets → DM.
+        assert!(is_dm_target("alice"));
+        assert!(is_dm_target("alice.example"));
+        assert!(is_dm_target("NickServ"));
+        // Edge: empty is treated as DM (no sigil prefix).
+        assert!(is_dm_target(""));
+    }
+
+    #[test]
+    fn test_split_message_emoji_safe() {
+        // Four-byte emoji: '🦆' = f0 9f a6 86. Verify chunks never split a code point.
+        let input = "🦆".repeat(200); // 800 bytes
+        let chunks = split_message(&input, 100);
+        for chunk in &chunks {
+            assert!(
+                std::str::from_utf8(chunk.as_bytes()).is_ok(),
+                "emoji chunk is not valid UTF-8: {chunk:?}"
+            );
+        }
+        // All emoji preserved across chunks.
+        let assembled: String = chunks.concat();
+        assert_eq!(assembled.chars().count(), 200);
+    }
+
+    // ---- CHPAR-002: proactive delivery target parsing, classification, chunking ----
+
+    #[test]
+    fn test_parse_proactive_target_classifies_dm_vs_group() {
+        let group = parse_proactive_target("irc.libera.#lunarwing")
+            .expect("network-qualified group target should parse");
+        assert_eq!(group.buffer, "irc.libera.#lunarwing");
+        assert_eq!(group.network, "libera");
+        assert_eq!(group.target, "#lunarwing");
+        assert!(!group.is_dm, "group target must not be classified as DM");
+
+        let dm = parse_proactive_target("irc.darkirc.alice")
+            .expect("network-qualified DM target should parse");
+        assert_eq!(dm.buffer, "irc.darkirc.alice");
+        assert_eq!(dm.network, "darkirc");
+        assert_eq!(dm.target, "alice");
+        assert!(dm.is_dm, "DM target must be classified as DM");
+    }
+
+    #[test]
+    fn test_on_broadcast_rejects_invalid_target_before_workspace_access() {
+        // An invalid target must return an error BEFORE any workspace access
+        // occurs (parse_proactive_target runs first in on_broadcast).
+        let response = AgentResponse {
+            message_id: "test-message".to_string(),
+            content: "hello".to_string(),
+            thread_id: None,
+            metadata_json: "{}".to_string(),
+            attachments: vec![],
+        };
+
+        for invalid in ["", "alice", "#lunarwing", "irc.libera", "irc..alice"] {
+            let error = WeechatRelayChannel::on_broadcast(invalid.to_string(), response.clone())
+                .expect_err("invalid target must be rejected: {invalid:?}");
+            assert!(
+                error.contains("irc.<network>")
+                    || error.contains("empty")
+                    || error.contains("whitespace")
+                    || error.contains("ambiguous")
+                    || error.contains("invalid"),
+                "unexpected error message for invalid target {invalid:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_on_broadcast_rejects_ambiguous_target_before_workspace_access() {
+        // A bare nick without network is ambiguous across networks and must be
+        // rejected before any workspace or network access.
+        let response = AgentResponse {
+            message_id: "test-message".to_string(),
+            content: "hello".to_string(),
+            thread_id: None,
+            metadata_json: "{}".to_string(),
+            attachments: vec![],
+        };
+
+        let error = WeechatRelayChannel::on_broadcast("alice".to_string(), response)
+            .expect_err("bare nick without network must be rejected");
+        assert!(
+            error.contains("irc.<network>"),
+            "error must mention irc.<network>.<target> grammar: {error}"
+        );
     }
 
     #[test]
@@ -1887,6 +2545,12 @@ mod tests {
     fn test_split_message_short() {
         let chunks = split_message("hello", 420);
         assert_eq!(chunks, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_split_message_trims_protocol_line_boundaries() {
+        assert_eq!(split_message("\r\nhello\r\n", 420), vec!["hello"]);
+        assert!(split_message("\r\n", 420).is_empty());
     }
 
     #[test]
@@ -2050,5 +2714,412 @@ mod tests {
     fn test_base64_encode() {
         assert_eq!(base64_encode("hello"), "aGVsbG8=");
         assert_eq!(base64_encode("plain:password"), "cGxhaW46cGFzc3dvcmQ=");
+    }
+
+    // ---- CHPAR-003: UTF-8-safe status truncation ----
+
+    #[test]
+    fn test_truncate_for_status_short_passthrough() {
+        // Short text is returned unchanged.
+        assert_eq!(truncate_for_status("hello"), "hello");
+        assert_eq!(truncate_for_status(""), "");
+    }
+
+    #[test]
+    fn test_truncate_for_status_ascii_long() {
+        // ASCII at and above the limit is truncated with an ellipsis and the
+        // full `[status] <body>` form fits the IRC byte budget.
+        let long = "a".repeat(500);
+        let truncated = truncate_for_status(&long);
+        assert!(truncated.ends_with("..."));
+        let full = format!("[status] {}", truncated);
+        assert!(
+            full.len() <= MAX_STATUS_BYTES,
+            "full status line {} bytes exceeds budget {}",
+            full.len(),
+            MAX_STATUS_BYTES
+        );
+    }
+
+    #[test]
+    fn test_truncate_for_status_multibyte_boundary_safe() {
+        // Build a string whose byte 389 (= body_budget = 400 - 8 - 3) falls
+        // inside a multibyte character. Two-byte UTF-8: fill with ASCII up to
+        // byte 388, then append a two-byte char ('é' = c3 a9), then more text.
+        let mut input = "a".repeat(388);
+        input.push('\u{00E9}'); // é — 2 bytes: c3 a9, byte 389/390
+        input.push_str("tail");
+        // The old `&message[..397]` byte slice would land inside a multibyte
+        // char for many inputs; the new helper must never panic and must return
+        // a valid UTF-8 string prefix + ellipsis.
+        let truncated = truncate_for_status(&input);
+        let full = format!("[status] {}", truncated);
+        assert!(
+            full.len() <= MAX_STATUS_BYTES,
+            "multibyte truncated line exceeds budget: {} bytes",
+            full.len()
+        );
+        // No partial char: the retained body is a valid prefix of the input.
+        if let Some(body) = truncated.strip_suffix("...") {
+            assert!(input.starts_with(body), "body must be a prefix of input");
+        }
+    }
+
+    #[test]
+    fn test_truncate_for_status_emoji_safe() {
+        // Four-byte emoji: '🦆' = f0 9f a6 86. Repeating it pushes byte 389
+        // into the middle of a code point. This must not panic.
+        let input = "🦆".repeat(200); // 800 bytes
+        let truncated = truncate_for_status(&input);
+        let full = format!("[status] {}", truncated);
+        assert!(full.len() <= MAX_STATUS_BYTES);
+        if truncated.ends_with("...") {
+            let body = &truncated[..truncated.len() - 3];
+            assert!(input.starts_with(body));
+        }
+    }
+
+    #[test]
+    fn test_truncate_for_status_cjk_safe() {
+        // Three-byte CJK ('漢' = e6 bc a2). Byte 389 splits a code point.
+        let input = "漢".repeat(200); // 600 bytes
+        let truncated = truncate_for_status(&input);
+        let full = format!("[status] {}", truncated);
+        assert!(full.len() <= MAX_STATUS_BYTES);
+        if truncated.ends_with("...") {
+            let body = &truncated[..truncated.len() - 3];
+            assert!(input.starts_with(body));
+        }
+    }
+
+    #[test]
+    fn test_truncate_for_status_preserves_prefix_content() {
+        // The retained prefix must keep the leading characters intact.
+        let input = format!("{}Z", "a".repeat(500));
+        let truncated = truncate_for_status(&input);
+        assert!(truncated.starts_with("aaaa"));
+        assert!(truncated.ends_with("..."));
+    }
+
+    // ---- CHPAR-004: prevent auth status leaking into WeeChat groups ----
+
+    #[test]
+    fn external_waiting_is_actionable_but_dm_only() {
+        assert!(is_actionable_irc_status(StatusType::ExternalWaiting));
+        assert!(!should_suppress_external_waiting(
+            StatusType::ExternalWaiting,
+            true
+        ));
+        assert!(should_suppress_external_waiting(
+            StatusType::ExternalWaiting,
+            false
+        ));
+    }
+
+    #[test]
+    fn unknown_generic_and_stream_statuses_remain_ignored() {
+        assert!(!is_actionable_irc_status(StatusType::Status));
+        assert!(!is_actionable_irc_status(StatusType::Thinking));
+        assert!(!is_actionable_irc_status(StatusType::ToolResult));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_group_auth_required() {
+        // Group + AuthRequired must suppress: setup instructions and OAuth
+        // URLs cannot leak into shared channels.
+        assert!(should_suppress_auth_status(StatusType::AuthRequired, false));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_group_auth_completed() {
+        // Group + AuthCompleted must suppress: completion notices may echo
+        // back credential state and URLs.
+        assert!(should_suppress_auth_status(
+            StatusType::AuthCompleted,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_dm_auth_required_allowed() {
+        // DM + AuthRequired must NOT suppress: the user needs the auth prompt
+        // delivered to their private buffer to complete the flow.
+        assert!(!should_suppress_auth_status(StatusType::AuthRequired, true));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_dm_auth_completed_allowed() {
+        // DM + AuthCompleted must NOT suppress: the user should see the
+        // completion confirmation in their private buffer.
+        assert!(!should_suppress_auth_status(
+            StatusType::AuthCompleted,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_group_approval_needed_allowed() {
+        // Approval prompts remain deliverable to groups per CHPAR-004 scope.
+        // Only auth-status variants are suppressed in groups.
+        assert!(!should_suppress_auth_status(
+            StatusType::ApprovalNeeded,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_group_job_started_allowed() {
+        // Job-started notices remain deliverable to groups per CHPAR-004 scope.
+        assert!(!should_suppress_auth_status(StatusType::JobStarted, false));
+    }
+
+    #[test]
+    fn test_should_suppress_auth_status_dm_job_started_allowed() {
+        // DM + JobStarted remains deliverable.
+        assert!(!should_suppress_auth_status(StatusType::JobStarted, true));
+    }
+
+    #[test]
+    fn test_auth_status_suppression_log_excludes_url_and_state() {
+        // CHPAR-004 group-privacy log invariant: the suppression log line
+        // must never echo the auth message body, OAuth URL, or state token.
+        // By construction `auth_status_suppression_log` only receives the
+        // status variant and the WeeChat buffer name (e.g.
+        // `irc.libera.#lunarwing`) — never the auth message body that
+        // carries the URL. This test pins that contract: even when the
+        // auth message itself contains a URL+state, the helper's output
+        // contains only the fixed status label and the supplied buffer.
+        const OAUTH_URL_SENTINEL: &str = "https://oauth.example/authorize";
+        const STATE_TOKEN_SENTINEL: &str = "chpar-004-state-token-sentinel";
+
+        // A realistic group buffer name (what production actually passes in
+        // — taken from `WeechatMessageMetadata.buffer`, set at ingest from
+        // the WeeChat buffer full name, never from the auth payload).
+        let buffer = "irc.libera.#lunarwing";
+        let log_line = auth_status_suppression_log(StatusType::AuthRequired, buffer);
+
+        // The helper signature takes only (status, buffer). It never sees
+        // the auth message body. The line must contain the label and the
+        // buffer name, and must not contain any auth-payload sentinels.
+        assert!(
+            log_line.contains("auth-required"),
+            "suppression log must identify the variant: {log_line}"
+        );
+        assert!(
+            log_line.contains(buffer),
+            "suppression log must name the destination buffer: {log_line}"
+        );
+        assert!(
+            !log_line.contains(OAUTH_URL_SENTINEL),
+            "OAuth URL leaked into suppression log: {log_line}"
+        );
+        assert!(
+            !log_line.contains(STATE_TOKEN_SENTINEL),
+            "state token leaked into suppression log: {log_line}"
+        );
+
+        // Deterministic format pinned so any future change that
+        // accidentally widens the log surface (e.g. logging the message
+        // body) breaks this test.
+        assert_eq!(
+            log_line,
+            "Suppressing auth-required status in group buffer 'irc.libera.#lunarwing'"
+        );
+        let completed_log = auth_status_suppression_log(StatusType::AuthCompleted, buffer);
+        assert_eq!(
+            completed_log,
+            "Suppressing auth-completed status in group buffer 'irc.libera.#lunarwing'"
+        );
+
+        // The auth-payload privacy contract is structural: the helper
+        // signature receives only the status variant and buffer name, so
+        // the auth message body cannot flow into the log line even if a
+        // future caller misuses the function. This compile-time property
+        // is the load-bearing guarantee.
+        let _: fn(StatusType, &str) -> String = auth_status_suppression_log;
+    }
+
+    #[test]
+    fn test_auth_status_group_suppression_matrix_covers_both_variants() {
+        // Matrix test covering CHPAR-004 acceptance: both auth status
+        // variants are suppressed in groups and delivered in DMs, while
+        // approval and job-started always pass through.
+        for (status, dm, expected_suppress, label) in [
+            (StatusType::AuthRequired, false, true, "group+auth-required"),
+            (StatusType::AuthRequired, true, false, "dm+auth-required"),
+            (
+                StatusType::AuthCompleted,
+                false,
+                true,
+                "group+auth-completed",
+            ),
+            (StatusType::AuthCompleted, true, false, "dm+auth-completed"),
+            (
+                StatusType::ApprovalNeeded,
+                false,
+                false,
+                "group+approval-needed",
+            ),
+            (
+                StatusType::ApprovalNeeded,
+                true,
+                false,
+                "dm+approval-needed",
+            ),
+            (StatusType::JobStarted, false, false, "group+job-started"),
+            (StatusType::JobStarted, true, false, "dm+job-started"),
+        ] {
+            assert_eq!(
+                should_suppress_auth_status(status, dm),
+                expected_suppress,
+                "{label}: expected suppress={expected_suppress}"
+            );
+        }
+    }
+
+    // ---- CHPAR-005: new-install DM default and fail-closed policy ----
+
+    #[test]
+    fn test_default_dm_policy_is_pairing() {
+        // New installs must default to `pairing`, not `open`. This is the
+        // security posture described in the capabilities/setup prompt and
+        // enforced by the audit. An unpaired sender must not execute under
+        // owner scope by default.
+        assert_eq!(default_dm_policy(), "pairing");
+    }
+
+    #[test]
+    fn test_capabilities_json_default_dm_policy_is_pairing() {
+        // The capabilities config that ships with the channel must agree with
+        // the code default. This guards against the original audit finding
+        // where the code said `open` but the docs said `pairing`.
+        let raw = include_str!("../weechat.capabilities.json");
+        let v: serde_json::Value = serde_json::from_str(raw).expect("capabilities JSON must parse");
+        assert_eq!(
+            v["config"]["dm_policy"].as_str(),
+            Some("pairing"),
+            "capabilities default dm_policy must be pairing"
+        );
+    }
+
+    #[test]
+    fn test_example_local_config_uses_pairing_default() {
+        // The example adapter config is what operators copy from. It must
+        // demonstrate the safe default unless it explicitly documents an open
+        // override.
+        let raw = include_str!("../weechat_local_config.json.example");
+        let v: serde_json::Value =
+            serde_json::from_str(raw).expect("example config JSON must parse");
+        assert_eq!(
+            v["dm_policy"].as_str(),
+            Some("pairing"),
+            "example local config must default to pairing"
+        );
+    }
+
+    #[test]
+    fn test_initial_dm_policy_preserves_persisted_open_on_upgrade() {
+        let policy = resolve_initial_dm_policy(&default_dm_policy(), false, Some("open"));
+        assert_eq!(policy, "open");
+    }
+
+    #[test]
+    fn test_initial_dm_policy_defaults_to_pairing_without_persisted_value() {
+        let policy = resolve_initial_dm_policy(&default_dm_policy(), false, None);
+        assert_eq!(policy, "pairing");
+    }
+
+    #[test]
+    fn test_explicit_dm_policy_takes_precedence_over_persisted_value() {
+        let policy = resolve_initial_dm_policy("pairing", true, Some("open"));
+        assert_eq!(policy, "pairing");
+    }
+
+    #[test]
+    fn test_dm_policy_pairing_allows_only_approved_senders() {
+        let identity = weechat_sender_identity("libera", "alice", &[]);
+        let no_approved_senders = Vec::new();
+        assert_eq!(
+            sender_allowed_by_policy(
+                "alice",
+                "alice!user@example.com",
+                &identity,
+                "pairing",
+                &[],
+                &no_approved_senders,
+            ),
+            Some(false)
+        );
+
+        let approved_senders = vec!["Alice".to_string()];
+        assert_eq!(
+            sender_allowed_by_policy(
+                "alice",
+                "alice!user@example.com",
+                &identity,
+                "pairing",
+                &[],
+                &approved_senders,
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_unknown_dm_policy_fails_closed() {
+        let identity = weechat_sender_identity("libera", "alice", &[]);
+        assert!(!is_known_dm_policy("typo"));
+        assert_eq!(
+            sender_allowed_by_policy("alice", "alice!host", &identity, "typo", &[], &[],),
+            None
+        );
+    }
+
+    #[test]
+    fn authenticated_account_is_preferred_for_weechat_principal() {
+        let tags = vec![
+            "nick_Alice".to_string(),
+            "account_TrustedUser".to_string(),
+            "casemapping_rfc1459".to_string(),
+        ];
+        let identity = weechat_sender_identity("Libera", "Alice", &tags);
+        assert_eq!(identity.principal, "account:libera:trusteduser");
+        assert_eq!(identity.account.as_deref(), Some("TrustedUser"));
+    }
+
+    #[test]
+    fn same_nick_on_two_networks_has_distinct_principals() {
+        let libera = weechat_sender_identity("libera", "Alice", &[]);
+        let oftc = weechat_sender_identity("oftc", "Alice", &[]);
+        assert_eq!(libera.principal, "nick:libera:alice");
+        assert_eq!(oftc.principal, "nick:oftc:alice");
+        assert_ne!(libera.principal, oftc.principal);
+    }
+
+    #[test]
+    fn irc_case_mapping_controls_nick_normalization() {
+        assert_eq!(
+            irc_casefold("Nick[One]^", IrcCaseMapping::Rfc1459),
+            "nick{one}~"
+        );
+        assert_eq!(
+            irc_casefold("Nick[One]^", IrcCaseMapping::StrictRfc1459),
+            "nick{one}^"
+        );
+        assert_eq!(
+            irc_casefold("Nick[One]^", IrcCaseMapping::Ascii),
+            "nick[one]^"
+        );
+    }
+
+    #[test]
+    fn legacy_weechat_metadata_without_identity_fields_still_deserializes() {
+        let metadata: WeechatMessageMetadata = serde_json::from_str(
+            r#"{"buffer":"irc.libera.alice","network":"libera","target":"alice","nick":"Alice","is_dm":true}"#,
+        )
+        .expect("legacy WeeChat response metadata must remain readable");
+        assert!(metadata.sender_principal.is_none());
+        assert!(metadata.account.is_none());
+        assert!(metadata.case_mapping.is_none());
     }
 }

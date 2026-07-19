@@ -95,6 +95,22 @@ configuration is never overwritten.
 to `max_chunk_length` (default 420), and `POST`s each chunk to the WeeChat **relay** `/api/input`
 (via `relay_url`, not the adapter). Replies therefore go straight to WeeChat.
 
+Proactive `on_broadcast` delivery requires an explicit, network-qualified full buffer name:
+`irc.<network>.<target>` (for example, `irc.libera.#lunarwing` or `irc.libera.alice`). Bare
+nicks and channel names are rejected because they are ambiguous across networks. Group targets
+use the full buffer with `/api/input`; DM targets retain the server-buffer `/msg` fallback used
+by reactive replies. Proactive attachments are rejected explicitly rather than silently dropped.
+
+Owner-scoped automatic target discovery is restricted to a configured owner actor. The legacy
+numeric `wasm_channel_owner_ids` setting remains supported, while IRC deployments can use the
+string `wasm_channel_owner_actor_ids` setting with a network-qualified account/nick principal.
+Only matching owner traffic may update the persisted route, and WeeChat validates and stores the
+complete `irc.<network>.<target>` buffer. Explicit delivery continues to require that same full
+target. Autonomous notifications address the LunarWing owner scope, not the external actor
+principal; the WASM wrapper then resolves that scope through the persisted full buffer. See
+[`IRC-SENDER-IDENTITY.md`](IRC-SENDER-IDENTITY.md) for principal formats, threat boundaries, and
+migration behavior.
+
 ### Watermarks & new buffers (poll mode only)
 
 In the polling fallback, `do_poll` seeds a per-buffer watermark the **first time** it sees a
@@ -226,6 +242,12 @@ For each capability `required_field`, the effective value is resolved **highest-
 Resolved overrides are merged on top of the caps `config` block and handed to `on_start`,
 which persists them to channel workspace state (`state/relay_url`, `state/dm_policy`, …).
 
+The shipped caps default for `dm_policy` is `pairing`: an unpaired sender gets pairing
+instructions and does not execute under owner scope. Operators who want open DMs must set
+`"dm_policy":"open"` explicitly in the adapter config (`weechat_local_config.json`),
+the DB `setup_fields` row, or the setup wizard. Unknown `dm_policy` strings fail closed
+(reject the sender with a warning) rather than treating them as `open`.
+
 ### At runtime (`refresh_policy_config` → `/api/config`)
 
 On each poll cycle, `refresh_policy_config` fetches `GET /api/config` from the adapter (served from
@@ -259,9 +281,11 @@ sudo env PGSSLMODE=disable psql "$PGURL" -c \
 sudo env PGSSLMODE=disable psql "$PGURL" -c \
   "DELETE FROM settings WHERE key='extensions.weechat.setup_fields';"
 sudo env PGSSLMODE=disable psql "$PGURL" -c \
-  "UPDATE settings SET value = value || '{\"dm_policy\":\"open\"}'::jsonb \
+  "UPDATE settings SET value = value || '{\"dm_policy\":\"pairing\"}'::jsonb \
    WHERE key='extensions.weechat.setup_fields';"
 ```
+
+> **Note:** WeeChat's new-install `dm_policy` default is now `pairing` (previously `pairing` was the documented safe default while the implementation defaulted to `open`; see rationale in this section). Operators who intentionally want open DMs should set `"dm_policy":"open"` explicitly in their adapter config or `setup_fields` row.
 
 Then restart the daemon so `on_start` re-resolves.
 

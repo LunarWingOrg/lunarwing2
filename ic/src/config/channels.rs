@@ -24,6 +24,8 @@ pub struct ChannelsConfig {
     /// Per-channel owner user IDs. When set, the channel only responds to this user.
     /// Key: channel name (e.g., "xmpp"), Value: owner user ID.
     pub wasm_channel_owner_ids: HashMap<String, i64>,
+    /// Per-channel string actor IDs. Takes precedence over the legacy numeric map.
+    pub wasm_channel_owner_actor_ids: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -460,7 +462,20 @@ impl ChannelsConfig {
                 cs.wasm_channels_enabled,
             )?,
             wasm_channel_owner_ids: cs.wasm_channel_owner_ids.clone(),
+            wasm_channel_owner_actor_ids: cs.wasm_channel_owner_actor_ids.clone(),
         })
+    }
+
+    /// Resolve the configured external actor that maps to the instance owner.
+    pub fn wasm_channel_owner_actor_id(&self, channel_name: &str) -> Option<String> {
+        self.wasm_channel_owner_actor_ids
+            .get(channel_name)
+            .cloned()
+            .or_else(|| {
+                self.wasm_channel_owner_ids
+                    .get(channel_name)
+                    .map(ToString::to_string)
+            })
     }
 }
 
@@ -605,6 +620,7 @@ mod tests {
             wasm_channels_dir: PathBuf::from("/tmp/channels"),
             wasm_channels_enabled: true,
             wasm_channel_owner_ids: HashMap::new(),
+            wasm_channel_owner_actor_ids: HashMap::new(),
         };
         assert!(cfg.cli.enabled);
         assert!(cfg.http.is_none());
@@ -630,10 +646,50 @@ mod tests {
             wasm_channels_dir: PathBuf::from("/opt/channels"),
             wasm_channels_enabled: false,
             wasm_channel_owner_ids: ids,
+            wasm_channel_owner_actor_ids: HashMap::new(),
         };
         assert_eq!(cfg.wasm_channel_owner_ids.get("xmpp"), Some(&12345));
         assert_eq!(cfg.wasm_channel_owner_ids.get("weechat"), Some(&67890));
         assert!(!cfg.wasm_channels_enabled);
+    }
+
+    #[test]
+    fn string_owner_actor_id_takes_precedence_over_legacy_numeric_id() {
+        let cfg = ChannelsConfig {
+            cli: CliConfig { enabled: false },
+            http: None,
+            gateway: None,
+            signal: None,
+            xmpp: None,
+            wasm_channels_dir: PathBuf::from("/opt/channels"),
+            wasm_channels_enabled: true,
+            wasm_channel_owner_ids: HashMap::from([("weechat".to_string(), 12345)]),
+            wasm_channel_owner_actor_ids: HashMap::from([(
+                "weechat".to_string(),
+                "id:alice!user@example".to_string(),
+            )]),
+        };
+
+        assert_eq!(
+            cfg.wasm_channel_owner_actor_id("weechat").as_deref(),
+            Some("id:alice!user@example")
+        );
+    }
+
+    #[test]
+    fn numeric_owner_id_remains_a_supported_actor_binding() {
+        let mut settings = Settings::default();
+        settings
+            .channels
+            .wasm_channel_owner_ids
+            .insert("xmpp".to_string(), 12345);
+        let cfg = ChannelsConfig::resolve(&settings, "owner")
+            .expect("legacy numeric channel owner config should resolve");
+
+        assert_eq!(
+            cfg.wasm_channel_owner_actor_id("xmpp").as_deref(),
+            Some("12345")
+        );
     }
 
     #[test]

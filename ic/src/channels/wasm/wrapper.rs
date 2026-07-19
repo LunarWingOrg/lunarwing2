@@ -739,6 +739,15 @@ async fn do_update_broadcast_metadata(
     last_broadcast_metadata: &tokio::sync::RwLock<Option<String>>,
     settings_store: Option<&Arc<dyn crate::db::SettingsStore>>,
 ) {
+    if let Err(error) = resolve_owner_broadcast_target(channel_name, metadata) {
+        tracing::warn!(
+            channel = %channel_name,
+            %error,
+            "Refusing to persist invalid owner routing metadata"
+        );
+        return;
+    }
+
     let mut guard = last_broadcast_metadata.write().await;
     let changed = guard.as_deref() != Some(metadata);
     *guard = Some(metadata.to_string());
@@ -794,7 +803,7 @@ fn resolve_owner_broadcast_target(
         )
     })?;
 
-    crate::channels::routing_target_from_metadata(&metadata).ok_or_else(|| {
+    let target = owner_routing_target_from_metadata(channel_name, &metadata).ok_or_else(|| {
         missing_routing_target_error(
             channel_name,
             format!(
@@ -802,7 +811,78 @@ fn resolve_owner_broadcast_target(
                 channel_name
             ),
         )
-    })
+    })?;
+
+    validate_owner_routing_target(channel_name, &target)
+        .map_err(|reason| missing_routing_target_error(channel_name, reason))?;
+    Ok(target)
+}
+
+fn owner_routing_target_from_metadata(
+    channel_name: &str,
+    metadata: &serde_json::Value,
+) -> Option<String> {
+    let channel_specific_key = match channel_name {
+        "weechat" => Some("buffer"),
+        "darkirc" => Some("nick"),
+        _ => None,
+    };
+
+    channel_specific_key
+        .and_then(|key| metadata.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| crate::channels::routing_target_from_metadata(metadata))
+}
+
+fn validate_owner_routing_target(channel_name: &str, target: &str) -> Result<(), String> {
+    if target.is_empty() || target.chars().any(char::is_control) {
+        return Err(format!(
+            "Stored owner routing target for channel '{channel_name}' is empty or contains control characters."
+        ));
+    }
+
+    match channel_name {
+        "weechat" => validate_weechat_owner_target(target),
+        "darkirc" => validate_darkirc_owner_target(target),
+        _ => Ok(()),
+    }
+}
+
+fn validate_weechat_owner_target(target: &str) -> Result<(), String> {
+    let mut parts = target.splitn(3, '.');
+    let prefix = parts.next();
+    let network = parts.next().unwrap_or_default();
+    let recipient = parts.next().unwrap_or_default();
+    let valid_network = !network.is_empty()
+        && network != "server"
+        && network
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
+    let valid_recipient = !recipient.is_empty()
+        && !recipient.starts_with('/')
+        && !recipient.contains(',')
+        && !recipient.chars().any(char::is_whitespace);
+
+    if prefix == Some("irc") && valid_network && valid_recipient {
+        Ok(())
+    } else {
+        Err(
+            "Stored WeeChat owner target must use the full irc.<network>.<target> buffer name."
+                .to_string(),
+        )
+    }
+}
+
+fn validate_darkirc_owner_target(target: &str) -> Result<(), String> {
+    let valid = !target.chars().any(char::is_whitespace)
+        && !target.contains(',')
+        && !matches!(target.chars().next(), Some('#' | '&' | '!' | '/'));
+    if valid {
+        Ok(())
+    } else {
+        Err("Stored DarkIRC owner target must be one unambiguous DM nick.".to_string())
+    }
 }
 
 fn apply_emitted_metadata(mut msg: IncomingMessage, metadata_json: &str) -> IncomingMessage {
@@ -912,9 +992,16 @@ impl WasmChannel {
         // Serialize back
         *config_guard = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
+        // Log a sanitized summary only. The merged config frequently contains
+        // host-injected secrets (xmpp_password, relay_password, adapter tokens),
+        // so never log the raw JSON — even at debug level. Report only key names
+        // and a few safe booleans/counts so operators can still confirm an update
+        // landed without exposing credential values.
+        let safe_keys: Vec<&str> = config.keys().map(String::as_str).collect();
         tracing::debug!(
             channel = %self.name,
-            config = %*config_guard,
+            key_count = config.len(),
+            keys = ?safe_keys,
             "Updated channel config"
         );
     }
@@ -2789,7 +2876,11 @@ impl Channel for WasmChannel {
         let metadata_json = serde_json::to_string(&msg.metadata).unwrap_or_default();
         // Store for owner-target routing (chat_id etc.) only when the configured
         // owner is the actor in this conversation.
-        if msg.user_id == self.owner_scope_id {
+        if self
+            .owner_actor_id
+            .as_deref()
+            .is_some_and(|owner_actor_id| owner_actor_id == msg.sender_id)
+        {
             self.update_broadcast_metadata(&metadata_json).await;
         }
         self.call_on_respond(
@@ -3120,6 +3211,11 @@ fn status_to_wit(
                 metadata_json,
             }
         }
+        StatusUpdate::ExternalWaiting { gate_name } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::ExternalWaiting,
+            message: StatusUpdate::external_waiting_message(gate_name),
+            metadata_json,
+        },
         StatusUpdate::ApprovalNeeded {
             request_id,
             tool_name,
@@ -3228,6 +3324,7 @@ fn clone_wit_status_update(update: &wit_channel::StatusUpdate) -> wit_channel::S
             wit_channel::StatusType::ToolCompleted => wit_channel::StatusType::ToolCompleted,
             wit_channel::StatusType::ToolResult => wit_channel::StatusType::ToolResult,
             wit_channel::StatusType::ApprovalNeeded => wit_channel::StatusType::ApprovalNeeded,
+            wit_channel::StatusType::ExternalWaiting => wit_channel::StatusType::ExternalWaiting,
             wit_channel::StatusType::Status => wit_channel::StatusType::Status,
             wit_channel::StatusType::JobStarted => wit_channel::StatusType::JobStarted,
             wit_channel::StatusType::AuthRequired => wit_channel::StatusType::AuthRequired,
@@ -3475,7 +3572,15 @@ fn read_attachments(paths: &[String]) -> Result<Vec<wit_channel::Attachment>, St
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use tracing_test::traced_test;
 
     use crate::channels::Channel;
     use crate::channels::OutgoingResponse;
@@ -3483,8 +3588,10 @@ mod tests {
     use crate::channels::wasm::runtime::{
         PreparedChannelModule, WasmChannelRuntime, WasmChannelRuntimeConfig,
     };
+    use crate::channels::wasm::schema::ChannelCapabilitiesFile;
     use crate::channels::wasm::wrapper::{
-        EmitDispatchContext, HttpResponse, WasmChannel, uses_owner_broadcast_target,
+        EmitDispatchContext, HttpResponse, WasmChannel, resolve_owner_broadcast_target,
+        status_to_wit, uses_owner_broadcast_target,
     };
     use crate::pairing::PairingStore;
     use crate::testing::credentials::TEST_COLON_FORMAT_TOKEN;
@@ -3518,12 +3625,61 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    #[traced_test]
+    async fn update_config_logs_secret_keys_but_not_values() {
+        const XMPP_SENTINEL: &str = "chpar-001-xmpp-password-sentinel";
+        const WEECHAT_SENTINEL: &str = "chpar-001-weechat-password-sentinel";
+
+        let channel = create_test_channel();
+        channel
+            .update_config(HashMap::from([
+                (
+                    "xmpp_password".to_string(),
+                    serde_json::Value::String(XMPP_SENTINEL.to_string()),
+                ),
+                (
+                    "relay_password".to_string(),
+                    serde_json::Value::String(WEECHAT_SENTINEL.to_string()),
+                ),
+            ]))
+            .await;
+
+        assert!(logs_contain("Updated channel config"));
+        assert!(logs_contain("xmpp_password"));
+        assert!(logs_contain("relay_password"));
+        assert!(
+            !logs_contain(XMPP_SENTINEL),
+            "XMPP secret value appeared in captured logs"
+        );
+        assert!(
+            !logs_contain(WEECHAT_SENTINEL),
+            "WeeChat secret value appeared in captured logs"
+        );
+    }
+
     macro_rules! require_xmpp_wasm {
         () => {
             if !xmpp_wasm_path().exists() {
                 let msg = format!(
                     "XMPP WASM module not found at {:?}. Build with: cd channels-src/xmpp && ./build.sh",
                     xmpp_wasm_path()
+                );
+                if std::env::var("CI").is_ok() {
+                    panic!("{}", msg);
+                }
+                eprintln!("Skipping test: {}", msg);
+                return;
+            }
+        };
+    }
+
+    macro_rules! require_weechat_wasm {
+        () => {
+            if !weechat_wasm_path().exists() {
+                let msg = format!(
+                    "WeeChat WASM module not found at {:?}. Build with: cd ../lunarwing_weechat_wss/weechat_relay && ./build.sh",
+                    weechat_wasm_path()
                 );
                 if std::env::var("CI").is_ok() {
                     panic!("{}", msg);
@@ -3563,6 +3719,26 @@ mod tests {
         bundled
     }
 
+    fn weechat_source_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../lunarwing_weechat_wss/weechat_relay")
+    }
+
+    fn weechat_wasm_path() -> std::path::PathBuf {
+        let source_dir = weechat_source_dir();
+        let target = source_dir.join("target/wasm32-wasip2/release/weechat_relay_channel.wasm");
+        if target.exists() {
+            return target;
+        }
+
+        let installed = crate::bootstrap::lunarwing_base_dir().join("channels/weechat.wasm");
+        if installed.exists() {
+            return installed;
+        }
+
+        target
+    }
+
     async fn create_real_xmpp_channel(config_json: &str) -> WasmChannel {
         let runtime =
             Arc::new(WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing()).unwrap());
@@ -3581,6 +3757,102 @@ mod tests {
             Arc::new(PairingStore::new()),
             None,
         )
+    }
+
+    async fn create_real_weechat_channel(config_json: &str) -> WasmChannel {
+        let runtime =
+            Arc::new(WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing()).unwrap());
+        let wasm_bytes =
+            std::fs::read(weechat_wasm_path()).expect("Failed to read WeeChat WASM module");
+        let prepared = runtime
+            .prepare("weechat", &wasm_bytes, None, Some("WeeChat".to_string()))
+            .await
+            .expect("Failed to prepare WeeChat WASM module");
+        let capabilities = ChannelCapabilitiesFile::from_bytes(
+            &std::fs::read(weechat_source_dir().join("weechat.capabilities.json"))
+                .expect("Failed to read WeeChat capabilities"),
+        )
+        .expect("Failed to parse WeeChat capabilities")
+        .to_capabilities();
+
+        WasmChannel::new(
+            runtime,
+            prepared,
+            capabilities,
+            "default",
+            config_json.to_string(),
+            Arc::new(PairingStore::new()),
+            None,
+        )
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedWeechatInput {
+        authorization: Option<String>,
+        payload: serde_json::Value,
+    }
+
+    async fn start_mock_weechat_relay() -> (
+        String,
+        Arc<Mutex<Vec<RecordedWeechatInput>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/api/version",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "weechat_version": "test",
+                        "relay_api_version": "2"
+                    }))
+                }),
+            )
+            .route(
+                "/api/buffers",
+                get(|| async { Json(serde_json::json!([])) }),
+            )
+            .route(
+                "/api/input",
+                post(
+                    |State(requests): State<Arc<Mutex<Vec<RecordedWeechatInput>>>>,
+                     headers: HeaderMap,
+                     body: Bytes| async move {
+                        let payload: serde_json::Value = serde_json::from_slice(&body)
+                            .expect("WeeChat input payload should be valid JSON");
+                        let authorization = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(ToOwned::to_owned);
+                        let missing_dm_buffer =
+                            payload["buffer_name"].as_str() == Some("irc.libera.alice");
+                        requests
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(RecordedWeechatInput {
+                                authorization,
+                                payload,
+                            });
+                        if missing_dm_buffer {
+                            StatusCode::NOT_FOUND
+                        } else {
+                            StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&requests));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock WeeChat relay");
+        let address = listener.local_addr().expect("Missing mock relay address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Mock WeeChat relay failed");
+        });
+        (format!("http://{address}"), requests, task)
     }
 
     #[test]
@@ -3710,6 +3982,87 @@ mod tests {
         );
 
         channel.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_real_weechat_broadcast_sends_explicit_group_and_dm_targets() {
+        require_weechat_wasm!();
+
+        let (relay_url, requests, relay_task) = start_mock_weechat_relay().await;
+        let channel = create_real_weechat_channel(
+            &serde_json::json!({
+                "display_name": "WeeChat",
+                "relay_url": relay_url,
+                "relay_password": "not-a-real-secret",
+                "connection_mode": "http",
+                "ws_adapter_url": "",
+                "dm_policy": "pairing",
+                "group_policy": "allowlist",
+                "max_chunk_length": 420,
+                "poll_interval_seconds": 3
+            })
+            .to_string(),
+        )
+        .await;
+        channel
+            .call_on_start()
+            .await
+            .expect("WeeChat channel should initialize against mock relay");
+
+        channel
+            .broadcast(
+                "irc.libera.#lunarwing",
+                OutgoingResponse::text("group hello"),
+            )
+            .await
+            .expect("explicit WeeChat group broadcast should succeed");
+        channel
+            .broadcast("irc.libera.alice", OutgoingResponse::text("direct hello"))
+            .await
+            .expect("explicit WeeChat DM broadcast should use server-buffer fallback");
+
+        let invalid = channel
+            .broadcast("alice", OutgoingResponse::text("must not send"))
+            .await
+            .expect_err("ambiguous WeeChat target should fail through Channel::broadcast");
+        assert!(invalid.to_string().contains("irc.<network>"));
+
+        let captured = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(captured.len(), 3, "unexpected WeeChat input requests");
+        assert_eq!(
+            captured[0].payload,
+            serde_json::json!({
+                "buffer_name": "irc.libera.#lunarwing",
+                "command": "group hello"
+            })
+        );
+        assert_eq!(
+            captured[1].payload,
+            serde_json::json!({
+                "buffer_name": "irc.libera.alice",
+                "command": "direct hello"
+            })
+        );
+        assert_eq!(
+            captured[2].payload,
+            serde_json::json!({
+                "buffer_name": "irc.server.libera",
+                "command": "/msg alice direct hello"
+            })
+        );
+        for request in &captured {
+            let authorization = request
+                .authorization
+                .as_deref()
+                .expect("WeeChat relay request should include Basic authorization");
+            assert!(authorization.starts_with("Basic "));
+            assert!(!authorization.contains("not-a-real-secret"));
+        }
+
+        relay_task.abort();
     }
 
     #[tokio::test]
@@ -4292,6 +4645,26 @@ mod tests {
 
         assert!(matches!(wit.status, super::wit_channel::StatusType::Status));
         assert_eq!(wit.message, "Awaiting approval");
+    }
+
+    #[test]
+    fn test_status_to_wit_external_waiting_is_typed() {
+        let wit = status_to_wit(
+            &crate::channels::StatusUpdate::ExternalWaiting {
+                gate_name: "deployment".to_string(),
+            },
+            &serde_json::json!({"nick": "alice"}),
+        )
+        .expect("external waiting should be delivered to WASM channels");
+
+        assert!(matches!(
+            wit.status,
+            super::wit_channel::StatusType::ExternalWaiting
+        ));
+        assert_eq!(
+            wit.message,
+            "Waiting for external confirmation (gate: deployment)..."
+        );
     }
 
     #[test]
@@ -5088,6 +5461,89 @@ mod tests {
     }
 
     #[test]
+    fn owner_routing_uses_full_weechat_buffer_and_darkirc_nick() {
+        assert_eq!(
+            resolve_owner_broadcast_target(
+                "weechat",
+                r#"{"buffer":"irc.libera.alice","target":"alice"}"#,
+            )
+            .expect("full WeeChat buffer should be a valid owner target"),
+            "irc.libera.alice"
+        );
+        assert_eq!(
+            resolve_owner_broadcast_target("darkirc", r#"{"nick":"Alice"}"#)
+                .expect("DarkIRC nick should be a valid owner target"),
+            "Alice"
+        );
+    }
+
+    #[test]
+    fn owner_routing_rejects_ambiguous_irc_targets() {
+        let weechat =
+            resolve_owner_broadcast_target("weechat", r#"{"buffer":"alice","target":"alice"}"#)
+                .expect_err("bare WeeChat nick must not be persisted as an owner target");
+        assert!(weechat.to_string().contains("irc.<network>.<target>"));
+
+        let darkirc = resolve_owner_broadcast_target("darkirc", r##"{"nick":"#shared"}"##)
+            .expect_err("DarkIRC owner target must remain DM-only");
+        assert!(darkirc.to_string().contains("DM nick"));
+    }
+
+    #[tokio::test]
+    async fn invalid_owner_routing_metadata_is_not_cached() {
+        let mut channel = create_test_channel();
+        channel.name = "weechat".to_string();
+        channel
+            .update_broadcast_metadata(r#"{"buffer":"alice","target":"alice"}"#)
+            .await;
+        assert!(channel.last_broadcast_metadata.read().await.is_none());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn owner_target_persists_and_restores_after_restart() {
+        use crate::db::{Database, SettingsStore};
+
+        let dir = tempfile::tempdir().expect("owner route tempdir should be created");
+        let backend = Arc::new(
+            crate::db::libsql::LibSqlBackend::new_local(&dir.path().join("owner-route.db"))
+                .await
+                .expect("owner route database should initialize"),
+        );
+        backend
+            .run_migrations()
+            .await
+            .expect("owner route migrations should run");
+        let settings_store: Arc<dyn SettingsStore> = backend;
+
+        let mut first = create_test_channel_with_owner_scope("owner-scope");
+        first.name = "weechat".to_string();
+        first.settings_store = Some(Arc::clone(&settings_store));
+        first
+            .update_broadcast_metadata(
+                r#"{"buffer":"irc.libera.alice","network":"libera","target":"alice"}"#,
+            )
+            .await;
+
+        let mut restarted = create_test_channel_with_owner_scope("owner-scope");
+        restarted.name = "weechat".to_string();
+        restarted.settings_store = Some(settings_store);
+        restarted.load_broadcast_metadata().await;
+
+        let restored = restarted
+            .last_broadcast_metadata
+            .read()
+            .await
+            .clone()
+            .expect("owner route should restore after restart");
+        assert_eq!(
+            resolve_owner_broadcast_target("weechat", &restored)
+                .expect("restored WeeChat route should remain valid"),
+            "irc.libera.alice"
+        );
+    }
+
+    #[test]
     fn test_default_target_is_not_treated_as_owner_scope() {
         assert!(!uses_owner_broadcast_target("default", "owner-scope")); // safety: test-only assertion
         assert!(uses_owner_broadcast_target("default", "default")); // safety: test-only assertion
@@ -5219,7 +5675,7 @@ mod tests {
     async fn test_respond_uses_original_incoming_metadata() {
         use crate::channels::{IncomingMessage, OutgoingResponse};
 
-        let channel = create_test_channel();
+        let channel = create_test_channel().with_owner_actor_id(Some("default".to_string()));
         let _stream = channel.start().await.expect("Channel should start");
 
         let incoming_metadata = serde_json::json!({
@@ -5254,6 +5710,32 @@ mod tests {
         );
 
         channel.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_respond_does_not_cache_guest_owner_route() {
+        use crate::channels::{IncomingMessage, OutgoingResponse};
+
+        let mut channel = create_test_channel_with_owner_scope("owner-scope")
+            .with_owner_actor_id(Some("owner-actor".to_string()));
+        channel.name = "weechat".to_string();
+        let message = IncomingMessage::new("weechat", "guest-actor", "hello")
+            .with_owner_id("owner-scope")
+            .with_sender_id("guest-actor")
+            .with_metadata(serde_json::json!({
+                "buffer": "irc.libera.guest",
+                "network": "libera",
+                "target": "guest"
+            }));
+
+        channel
+            .respond(&message, OutgoingResponse::text("reply"))
+            .await
+            .expect("guest response delivery should still succeed");
+        assert!(
+            channel.last_broadcast_metadata.read().await.is_none(),
+            "guest response metadata must not replace the owner's proactive route"
+        );
     }
 
     #[test]

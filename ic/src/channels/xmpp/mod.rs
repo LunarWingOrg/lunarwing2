@@ -1200,6 +1200,9 @@ impl Channel for XmppChannel {
                     Some(message)
                 }
             }
+            StatusUpdate::ExternalWaiting { gate_name } => {
+                Some(StatusUpdate::external_waiting_message(&gate_name))
+            }
             _ => None,
         };
 
