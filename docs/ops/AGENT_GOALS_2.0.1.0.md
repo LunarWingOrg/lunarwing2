@@ -108,7 +108,7 @@
 19. [ ] update onboard ui to correspond with changes in codebase since v2.0.0.0 - surely some things have been broken at this point
 20. [ ] update any architecture docs in docs/
 21. [ ] update any bugs docs in docs/bugs
-22. [ ] ensure kawarimi can work for 1.1.2 to 2.0.1.0 - if not, identify potential issues
+22. [ ] ensure kawarimi can work for 1.1.2 to 2.0.1.0 - if not, identify potential issues - verify with tag for 1.1.2 on v1 repo. use kawarimi export/import from v2 repo
 23. [ ] update README.md at repo root
 24. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.1.0 explaining all relevant changes since v2.0.0.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/release for reference as to how to write up this document. The codename for this release is: `Togishi` — The file you write will be RELEASE-v2.0.1.0.md and should be written to the ROOT of the repo.
 25. [ ] Improve accuracy of RELEASE-v2.0.1.0.md
