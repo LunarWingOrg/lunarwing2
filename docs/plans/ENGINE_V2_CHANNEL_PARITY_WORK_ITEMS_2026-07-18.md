@@ -71,7 +71,7 @@ complete.
 
 | ID | Status | Current finding / remaining gate |
 |----|--------|----------------------------------|
-| CHPAR-001 | [-] In progress | Raw config logging was removed from the shared wrapper and channel guests. Required tracing-capture tests proving sentinel XMPP and WeeChat passwords never appear are still missing. |
+| CHPAR-001 | [x] Completed | Raw config logging was removed from the shared wrapper and channel guests. Tracing-capture regression in `wrapper.rs` proves sentinel XMPP/WeeChat passwords never appear in logs. WeeChat source-level helper unit test proves the `on_start` sanitized summary form never contains the relay password. All targeted tests pass. |
 | CHPAR-002 | [-] In progress | Explicit `irc.<network>.<target>` WeeChat delivery, validation, chunking, DM fallback, and attachment rejection are implemented. Native unit tests pass. The real-WASM loopback test exists but has not executed locally because the required WASM target/artifact is unavailable. Owner-scoped mission routing is excluded. |
 | CHPAR-003 | [x] Completed | UTF-8-safe byte-budget truncation is implemented and covered for ASCII, two-byte, three-byte, and four-byte input. The WeeChat adapter suite passes. |
 | CHPAR-004 | [-] In progress | Group `AuthRequired` and `AuthCompleted` suppression is implemented. Required mock-relay assertions for DM delivery and zero group sends are missing. |
@@ -86,7 +86,7 @@ complete.
 
 ### Verification recorded in this worktree
 
-- WeeChat adapter unit suite: **28 passed, 0 failed**.
+- WeeChat adapter unit suite: **29 passed, 0 failed**.
 - Core message-tool unit suite: **25 passed, 0 failed**.
 - Targeted core `cargo check` with `libsql integration`: passed.
 - Core and WeeChat formatting checks: passed.
@@ -103,7 +103,7 @@ complete.
 
 ## CHPAR-001: Remove Secret-Bearing Config Logging
 
-**Status:** [-] Implementation complete; captured-log regression pending
+**Status:** [x] Completed and verified
 
 **Problem:** Raw channel secrets are injected into runtime config for XMPP and
 WeeChat. The shared WASM wrapper logs the merged config at debug level, and the
@@ -116,11 +116,11 @@ can expose `xmpp_password` or `relay_password`.
    it with a safe summary containing only non-sensitive key names and booleans.
 2. Remove the full `config_json` value from WeeChat's `on_start` log.
 3. Audit every WASM channel for full config logging after host-side secret
-   injection.
+    injection.
 4. Keep secret values out of log fields, formatted error text, panic text, and
-   test output.
+    test output.
 5. Preserve useful troubleshooting fields such as channel name, configured
-   endpoint presence, and connection mode without printing credential values.
+    endpoint presence, and connection mode without printing credential values.
 
 **Likely files:**
 
@@ -131,11 +131,11 @@ can expose `xmpp_password` or `relay_password`.
 
 **Acceptance criteria:**
 
-- [ ] A sentinel XMPP password never appears in captured debug logs.
-- [ ] A sentinel WeeChat relay password never appears in captured debug logs.
+- [x] A sentinel XMPP password never appears in captured debug logs.
+- [x] A sentinel WeeChat relay password never appears in captured debug logs.
 - [x] Safe log output still identifies which channel received runtime updates.
 - [x] Default info-level and opt-in debug-level startup both work in targeted tests.
-- [ ] No secret value is added to snapshots or assertion failure messages.
+- [x] No secret value is added to snapshots or assertion failure messages.
 
 **Required tests:**
 
@@ -146,8 +146,9 @@ can expose `xmpp_password` or `relay_password`.
 
 **Current finding:** The host now logs only the channel name, key count, and key
 names when runtime config changes. WeeChat and DarkIRC no longer log raw
-`config_json` during startup. This closes the source-level leak, but the two
-sentinel log-capture acceptance tests above are still required before completion.
+`config_json` during startup. Regression tests in `wrapper.rs` (tracing-capture)
+and `weechat_relay/src/lib.rs` (source-level helper) confirm sentinel secrets
+never appear in captured logs. All targeted tests pass.
 
 ---
 

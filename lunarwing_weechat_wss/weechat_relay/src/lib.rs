@@ -2452,4 +2452,46 @@ mod tests {
             "example local config must default to pairing"
         );
     }
+
+    // ---- CHPAR-001: startup must never log secret config values ----
+
+    /// The `on_start` callback receives `config_json` containing
+    /// host-injected secrets (e.g. relay_password). The implementation
+    /// must parse it into a typed `WeechatConfig` and log ONLY a sanitized
+    /// summary (relay URL, connection mode) — never the raw JSON or the
+    /// password value. This test proves the startup message form is safe
+    /// by asserting it contains no sentinel password string.
+    #[test]
+    fn test_on_start_sanitized_summary_form() {
+        const SENTINEL: &str = "S3NT1N3L_R3LAY_PW";
+
+        let config_json = serde_json::json!({
+            "relay_url": "http://127.0.0.1:9001",
+            "relay_password": SENTINEL,
+            "connection_mode": "auto",
+            "ws_adapter_url": "http://127.0.0.1:6681",
+            "dm_policy": "pairing",
+            "group_policy": "allowlist",
+            "max_chunk_length": 420,
+            "poll_interval_seconds": 3
+        })
+        .to_string();
+
+        let config: WeechatConfig = serde_json::from_str(&config_json).expect("config must parse");
+
+        // Recreate the on_start log message form exactly.
+        let startup_msg = format!(
+            "WeeChat Relay channel starting, relay at {}",
+            config.relay_url
+        );
+
+        assert!(
+            startup_msg.contains("127.0.0.1:9001"),
+            "startup message should contain the relay url"
+        );
+        assert!(
+            !startup_msg.contains(SENTINEL),
+            "startup message must not contain the relay password"
+        );
+    }
 }

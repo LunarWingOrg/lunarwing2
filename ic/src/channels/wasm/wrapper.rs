@@ -3504,6 +3504,9 @@ mod tests {
     use crate::testing::credentials::TEST_COLON_FORMAT_TOKEN;
     use crate::tools::wasm::ResourceLimits;
 
+    #[cfg(test)]
+    use tracing_test::traced_test;
+
     fn create_test_channel() -> WasmChannel {
         create_test_channel_with_owner_scope("default")
     }
@@ -5501,6 +5504,48 @@ mod tests {
         assert_eq!(
             mime_from_extension("/home/user/.lunarwing/screenshot.png"),
             "image/png"
+        );
+    }
+
+    // ---- CHPAR-001: secret-bearing config must never be logged ----
+
+    /// Regression: `update_config` must not leak sentinel secrets into debug
+    /// logs. The merged config carries host-injected credentials
+    /// (xmpp_password, relay_password); the sanitized summary must log only
+    /// key names and counts — never the values.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_update_config_never_logs_secret_values() {
+        let channel = create_test_channel();
+
+        let mut updates = std::collections::HashMap::new();
+        updates.insert(
+            "xmpp_password".to_string(),
+            serde_json::Value::String("SENTINEL_XMPP_PASSWORD".to_string()),
+        );
+        updates.insert(
+            "relay_password".to_string(),
+            serde_json::Value::String("SENTINEL_RELAY_PASSWORD".to_string()),
+        );
+        updates.insert(
+            "display_name".to_string(),
+            serde_json::Value::String("Test Channel".to_string()),
+        );
+
+        channel.update_config(updates).await;
+
+        assert!(
+            !logs_contain("SENTINEL_XMPP_PASSWORD"),
+            "xmpp_password must never appear in logs"
+        );
+        assert!(
+            !logs_contain("SENTINEL_RELAY_PASSWORD"),
+            "relay_password must never appear in logs"
+        );
+        // Sanitized log output still identifies the channel and the key names.
+        assert!(
+            logs_contain("Updated channel config"),
+            "update_config should still log the sanitized summary"
         );
     }
 }
