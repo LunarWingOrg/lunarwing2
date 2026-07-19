@@ -739,6 +739,15 @@ async fn do_update_broadcast_metadata(
     last_broadcast_metadata: &tokio::sync::RwLock<Option<String>>,
     settings_store: Option<&Arc<dyn crate::db::SettingsStore>>,
 ) {
+    if let Err(error) = resolve_owner_broadcast_target(channel_name, metadata) {
+        tracing::warn!(
+            channel = %channel_name,
+            %error,
+            "Refusing to persist invalid owner routing metadata"
+        );
+        return;
+    }
+
     let mut guard = last_broadcast_metadata.write().await;
     let changed = guard.as_deref() != Some(metadata);
     *guard = Some(metadata.to_string());
@@ -794,7 +803,7 @@ fn resolve_owner_broadcast_target(
         )
     })?;
 
-    crate::channels::routing_target_from_metadata(&metadata).ok_or_else(|| {
+    let target = owner_routing_target_from_metadata(channel_name, &metadata).ok_or_else(|| {
         missing_routing_target_error(
             channel_name,
             format!(
@@ -802,7 +811,78 @@ fn resolve_owner_broadcast_target(
                 channel_name
             ),
         )
-    })
+    })?;
+
+    validate_owner_routing_target(channel_name, &target)
+        .map_err(|reason| missing_routing_target_error(channel_name, reason))?;
+    Ok(target)
+}
+
+fn owner_routing_target_from_metadata(
+    channel_name: &str,
+    metadata: &serde_json::Value,
+) -> Option<String> {
+    let channel_specific_key = match channel_name {
+        "weechat" => Some("buffer"),
+        "darkirc" => Some("nick"),
+        _ => None,
+    };
+
+    channel_specific_key
+        .and_then(|key| metadata.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| crate::channels::routing_target_from_metadata(metadata))
+}
+
+fn validate_owner_routing_target(channel_name: &str, target: &str) -> Result<(), String> {
+    if target.is_empty() || target.chars().any(char::is_control) {
+        return Err(format!(
+            "Stored owner routing target for channel '{channel_name}' is empty or contains control characters."
+        ));
+    }
+
+    match channel_name {
+        "weechat" => validate_weechat_owner_target(target),
+        "darkirc" => validate_darkirc_owner_target(target),
+        _ => Ok(()),
+    }
+}
+
+fn validate_weechat_owner_target(target: &str) -> Result<(), String> {
+    let mut parts = target.splitn(3, '.');
+    let prefix = parts.next();
+    let network = parts.next().unwrap_or_default();
+    let recipient = parts.next().unwrap_or_default();
+    let valid_network = !network.is_empty()
+        && network != "server"
+        && network
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
+    let valid_recipient = !recipient.is_empty()
+        && !recipient.starts_with('/')
+        && !recipient.contains(',')
+        && !recipient.chars().any(char::is_whitespace);
+
+    if prefix == Some("irc") && valid_network && valid_recipient {
+        Ok(())
+    } else {
+        Err(
+            "Stored WeeChat owner target must use the full irc.<network>.<target> buffer name."
+                .to_string(),
+        )
+    }
+}
+
+fn validate_darkirc_owner_target(target: &str) -> Result<(), String> {
+    let valid = !target.chars().any(char::is_whitespace)
+        && !target.contains(',')
+        && !matches!(target.chars().next(), Some('#' | '&' | '!' | '/'));
+    if valid {
+        Ok(())
+    } else {
+        Err("Stored DarkIRC owner target must be one unambiguous DM nick.".to_string())
+    }
 }
 
 fn apply_emitted_metadata(mut msg: IncomingMessage, metadata_json: &str) -> IncomingMessage {
@@ -2796,7 +2876,11 @@ impl Channel for WasmChannel {
         let metadata_json = serde_json::to_string(&msg.metadata).unwrap_or_default();
         // Store for owner-target routing (chat_id etc.) only when the configured
         // owner is the actor in this conversation.
-        if msg.user_id == self.owner_scope_id {
+        if self
+            .owner_actor_id
+            .as_deref()
+            .is_some_and(|owner_actor_id| owner_actor_id == msg.sender_id)
+        {
             self.update_broadcast_metadata(&metadata_json).await;
         }
         self.call_on_respond(
@@ -3127,6 +3211,11 @@ fn status_to_wit(
                 metadata_json,
             }
         }
+        StatusUpdate::ExternalWaiting { gate_name } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::ExternalWaiting,
+            message: StatusUpdate::external_waiting_message(gate_name),
+            metadata_json,
+        },
         StatusUpdate::ApprovalNeeded {
             request_id,
             tool_name,
@@ -3235,6 +3324,7 @@ fn clone_wit_status_update(update: &wit_channel::StatusUpdate) -> wit_channel::S
             wit_channel::StatusType::ToolCompleted => wit_channel::StatusType::ToolCompleted,
             wit_channel::StatusType::ToolResult => wit_channel::StatusType::ToolResult,
             wit_channel::StatusType::ApprovalNeeded => wit_channel::StatusType::ApprovalNeeded,
+            wit_channel::StatusType::ExternalWaiting => wit_channel::StatusType::ExternalWaiting,
             wit_channel::StatusType::Status => wit_channel::StatusType::Status,
             wit_channel::StatusType::JobStarted => wit_channel::StatusType::JobStarted,
             wit_channel::StatusType::AuthRequired => wit_channel::StatusType::AuthRequired,
@@ -3500,7 +3590,8 @@ mod tests {
     };
     use crate::channels::wasm::schema::ChannelCapabilitiesFile;
     use crate::channels::wasm::wrapper::{
-        EmitDispatchContext, HttpResponse, WasmChannel, uses_owner_broadcast_target,
+        EmitDispatchContext, HttpResponse, WasmChannel, resolve_owner_broadcast_target,
+        status_to_wit, uses_owner_broadcast_target,
     };
     use crate::pairing::PairingStore;
     use crate::testing::credentials::TEST_COLON_FORMAT_TOKEN;
@@ -4557,6 +4648,26 @@ mod tests {
     }
 
     #[test]
+    fn test_status_to_wit_external_waiting_is_typed() {
+        let wit = status_to_wit(
+            &crate::channels::StatusUpdate::ExternalWaiting {
+                gate_name: "deployment".to_string(),
+            },
+            &serde_json::json!({"nick": "alice"}),
+        )
+        .expect("external waiting should be delivered to WASM channels");
+
+        assert!(matches!(
+            wit.status,
+            super::wit_channel::StatusType::ExternalWaiting
+        ));
+        assert_eq!(
+            wit.message,
+            "Waiting for external confirmation (gate: deployment)..."
+        );
+    }
+
+    #[test]
     fn test_status_to_wit_auth_required() {
         use super::status_to_wit;
 
@@ -5350,6 +5461,89 @@ mod tests {
     }
 
     #[test]
+    fn owner_routing_uses_full_weechat_buffer_and_darkirc_nick() {
+        assert_eq!(
+            resolve_owner_broadcast_target(
+                "weechat",
+                r#"{"buffer":"irc.libera.alice","target":"alice"}"#,
+            )
+            .expect("full WeeChat buffer should be a valid owner target"),
+            "irc.libera.alice"
+        );
+        assert_eq!(
+            resolve_owner_broadcast_target("darkirc", r#"{"nick":"Alice"}"#)
+                .expect("DarkIRC nick should be a valid owner target"),
+            "Alice"
+        );
+    }
+
+    #[test]
+    fn owner_routing_rejects_ambiguous_irc_targets() {
+        let weechat =
+            resolve_owner_broadcast_target("weechat", r#"{"buffer":"alice","target":"alice"}"#)
+                .expect_err("bare WeeChat nick must not be persisted as an owner target");
+        assert!(weechat.to_string().contains("irc.<network>.<target>"));
+
+        let darkirc = resolve_owner_broadcast_target("darkirc", r##"{"nick":"#shared"}"##)
+            .expect_err("DarkIRC owner target must remain DM-only");
+        assert!(darkirc.to_string().contains("DM nick"));
+    }
+
+    #[tokio::test]
+    async fn invalid_owner_routing_metadata_is_not_cached() {
+        let mut channel = create_test_channel();
+        channel.name = "weechat".to_string();
+        channel
+            .update_broadcast_metadata(r#"{"buffer":"alice","target":"alice"}"#)
+            .await;
+        assert!(channel.last_broadcast_metadata.read().await.is_none());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn owner_target_persists_and_restores_after_restart() {
+        use crate::db::{Database, SettingsStore};
+
+        let dir = tempfile::tempdir().expect("owner route tempdir should be created");
+        let backend = Arc::new(
+            crate::db::libsql::LibSqlBackend::new_local(&dir.path().join("owner-route.db"))
+                .await
+                .expect("owner route database should initialize"),
+        );
+        backend
+            .run_migrations()
+            .await
+            .expect("owner route migrations should run");
+        let settings_store: Arc<dyn SettingsStore> = backend;
+
+        let mut first = create_test_channel_with_owner_scope("owner-scope");
+        first.name = "weechat".to_string();
+        first.settings_store = Some(Arc::clone(&settings_store));
+        first
+            .update_broadcast_metadata(
+                r#"{"buffer":"irc.libera.alice","network":"libera","target":"alice"}"#,
+            )
+            .await;
+
+        let mut restarted = create_test_channel_with_owner_scope("owner-scope");
+        restarted.name = "weechat".to_string();
+        restarted.settings_store = Some(settings_store);
+        restarted.load_broadcast_metadata().await;
+
+        let restored = restarted
+            .last_broadcast_metadata
+            .read()
+            .await
+            .clone()
+            .expect("owner route should restore after restart");
+        assert_eq!(
+            resolve_owner_broadcast_target("weechat", &restored)
+                .expect("restored WeeChat route should remain valid"),
+            "irc.libera.alice"
+        );
+    }
+
+    #[test]
     fn test_default_target_is_not_treated_as_owner_scope() {
         assert!(!uses_owner_broadcast_target("default", "owner-scope")); // safety: test-only assertion
         assert!(uses_owner_broadcast_target("default", "default")); // safety: test-only assertion
@@ -5481,7 +5675,7 @@ mod tests {
     async fn test_respond_uses_original_incoming_metadata() {
         use crate::channels::{IncomingMessage, OutgoingResponse};
 
-        let channel = create_test_channel();
+        let channel = create_test_channel().with_owner_actor_id(Some("default".to_string()));
         let _stream = channel.start().await.expect("Channel should start");
 
         let incoming_metadata = serde_json::json!({
@@ -5516,6 +5710,32 @@ mod tests {
         );
 
         channel.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_respond_does_not_cache_guest_owner_route() {
+        use crate::channels::{IncomingMessage, OutgoingResponse};
+
+        let mut channel = create_test_channel_with_owner_scope("owner-scope")
+            .with_owner_actor_id(Some("owner-actor".to_string()));
+        channel.name = "weechat".to_string();
+        let message = IncomingMessage::new("weechat", "guest-actor", "hello")
+            .with_owner_id("owner-scope")
+            .with_sender_id("guest-actor")
+            .with_metadata(serde_json::json!({
+                "buffer": "irc.libera.guest",
+                "network": "libera",
+                "target": "guest"
+            }));
+
+        channel
+            .respond(&message, OutgoingResponse::text("reply"))
+            .await
+            .expect("guest response delivery should still succeed");
+        assert!(
+            channel.last_broadcast_metadata.read().await.is_none(),
+            "guest response metadata must not replace the owner's proactive route"
+        );
     }
 
     #[test]

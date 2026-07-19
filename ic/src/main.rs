@@ -878,6 +878,7 @@ async fn async_main() -> anyhow::Result<()> {
                 ps,
                 router,
                 config.channels.wasm_channel_owner_ids.clone(),
+                config.channels.wasm_channel_owner_actor_ids.clone(),
             )
             .await;
         tracing::debug!("Channel runtime wired into extension manager for hot-activation");

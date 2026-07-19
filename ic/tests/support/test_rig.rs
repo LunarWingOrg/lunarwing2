@@ -399,6 +399,7 @@ pub struct TestRigBuilder {
     handle_message_timeout: Option<Duration>,
     mcp_server_configs: Vec<McpServerConfig>,
     skills_to_seed: Vec<(String, String)>,
+    extra_channels: Vec<Box<dyn lunarwing::channels::Channel>>,
 }
 
 impl TestRigBuilder {
@@ -421,6 +422,7 @@ impl TestRigBuilder {
             handle_message_timeout: None,
             mcp_server_configs: Vec::new(),
             skills_to_seed: Vec::new(),
+            extra_channels: Vec::new(),
         }
     }
 
@@ -462,6 +464,12 @@ impl TestRigBuilder {
     /// Override the in-process channel name.
     pub fn with_channel_name(mut self, channel_name: impl Into<String>) -> Self {
         self.channel_name = channel_name.into();
+        self
+    }
+
+    /// Add a real channel alongside the in-process capture channel.
+    pub fn with_channel(mut self, channel: Box<dyn lunarwing::channels::Channel>) -> Self {
+        self.extra_channels.push(channel);
         self
     }
 
@@ -586,6 +594,7 @@ impl TestRigBuilder {
             handle_message_timeout,
             mcp_server_configs,
             skills_to_seed,
+            extra_channels,
         } = self;
 
         // 1. Create temp dir and seed skill fixtures before AppBuilder discovery.
@@ -894,6 +903,9 @@ impl TestRigBuilder {
         let handle = TestChannelHandle::new(Arc::clone(&test_channel));
         let channel_manager = ChannelManager::new();
         channel_manager.add(Box::new(handle)).await;
+        for channel in extra_channels {
+            channel_manager.add(channel).await;
+        }
         let channels = Arc::new(channel_manager);
 
         // 7b. Register message tool so routines can send messages to channels.

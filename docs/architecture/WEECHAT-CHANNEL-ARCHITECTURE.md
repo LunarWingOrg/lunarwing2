@@ -101,10 +101,13 @@ nicks and channel names are rejected because they are ambiguous across networks.
 use the full buffer with `/api/input`; DM targets retain the server-buffer `/msg` fallback used
 by reactive replies. Proactive attachments are rejected explicitly rather than silently dropped.
 
-Owner-scoped automatic target discovery remains separate from explicit delivery. The
-`wasm_channel_owner_ids` numeric settings contract is intentionally unchanged for compatibility
-with persisted 1.1.2 tenant settings. Until a compatible owner-target migration is designed,
-operators and tools should pass the full WeeChat target explicitly.
+Owner-scoped automatic target discovery is restricted to a configured owner actor. The legacy
+numeric `wasm_channel_owner_ids` setting remains supported, while IRC deployments can use the
+string `wasm_channel_owner_actor_ids` setting with a network-qualified account/nick principal.
+Only matching owner traffic may update the persisted route, and WeeChat validates and stores the
+complete `irc.<network>.<target>` buffer. Explicit delivery continues to require that same full
+target. See [`IRC-SENDER-IDENTITY.md`](IRC-SENDER-IDENTITY.md) for principal formats, threat
+boundaries, and migration behavior.
 
 ### Watermarks & new buffers (poll mode only)
 

@@ -314,6 +314,8 @@ pub enum StatusUpdate {
     StreamChunk(String),
     /// General status message.
     Status(String),
+    /// Engine execution is paused pending an external callback.
+    ExternalWaiting { gate_name: String },
     /// A sandbox job has started (shown as a clickable card in the UI).
     JobStarted {
         job_id: String,
@@ -372,6 +374,11 @@ pub enum StatusUpdate {
 }
 
 impl StatusUpdate {
+    /// User-facing text for an external gate pause.
+    pub fn external_waiting_message(gate_name: &str) -> String {
+        format!("Waiting for external confirmation (gate: {gate_name})...")
+    }
+
     /// Build a `ToolCompleted` status with redacted parameters.
     ///
     /// On failure, serializes the tool's input parameters as pretty JSON after

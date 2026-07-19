@@ -297,10 +297,9 @@ async fn insert_and_notify_pending_gate(
             let _ = channels
                 .send_status(
                     &message.channel,
-                    StatusUpdate::Status(format!(
-                        "Waiting for external confirmation (gate: {})...",
-                        pending.gate_name
-                    )),
+                    StatusUpdate::ExternalWaiting {
+                        gate_name: pending.gate_name.clone(),
+                    },
                     &message.metadata,
                 )
                 .await;
@@ -2567,13 +2566,15 @@ async fn handle_with_engine_inner(
         crate::agent::attachments::engine_transient_content_parts(&message.attachments);
     let (thread_id, event_rx) = handle_user_message_with_event_receiver(
         state,
-        conv_id,
-        effective_content,
-        transient_content_parts,
-        project_id,
-        &message.user_id,
-        thread_config,
-        preferred_thread_id,
+        EngineMessageRequest {
+            conversation_id: conv_id,
+            content: effective_content,
+            transient_content_parts,
+            project_id,
+            user_id: &message.user_id,
+            thread_config,
+            preferred_thread_id,
+        },
     )
     .await?;
 
@@ -2590,15 +2591,19 @@ async fn handle_with_engine_inner(
     await_thread_outcome(agent, state, message, conv_id, thread_id, event_rx).await
 }
 
-async fn handle_user_message_with_event_receiver(
-    state: &EngineState,
+struct EngineMessageRequest<'a> {
     conversation_id: lunarwing_engine::ConversationId,
-    content: &str,
+    content: &'a str,
     transient_content_parts: Vec<lunarwing_engine::TransientContentPart>,
     project_id: lunarwing_engine::ProjectId,
-    user_id: &str,
+    user_id: &'a str,
     thread_config: ThreadConfig,
     preferred_thread_id: Option<lunarwing_engine::ThreadId>,
+}
+
+async fn handle_user_message_with_event_receiver(
+    state: &EngineState,
+    request: EngineMessageRequest<'_>,
 ) -> Result<
     (
         lunarwing_engine::ThreadId,
@@ -2610,13 +2615,13 @@ async fn handle_user_message_with_event_receiver(
     let thread_id = state
         .conversation_manager
         .handle_user_message_with_parts(
-            conversation_id,
-            content,
-            transient_content_parts,
-            project_id,
-            user_id,
-            thread_config,
-            preferred_thread_id,
+            request.conversation_id,
+            request.content,
+            request.transient_content_parts,
+            request.project_id,
+            request.user_id,
+            request.thread_config,
+            request.preferred_thread_id,
         )
         .await
         .map_err(|error| engine_err("thread error", error))?;
@@ -5441,13 +5446,15 @@ mod tests {
 
         let (thread_id, mut event_rx) = handle_user_message_with_event_receiver(
             &state,
-            conversation_id,
-            "reply immediately",
-            Vec::new(),
-            state.default_project_id,
-            "alice",
-            lunarwing_engine::ThreadConfig::default(),
-            None,
+            EngineMessageRequest {
+                conversation_id,
+                content: "reply immediately",
+                transient_content_parts: Vec::new(),
+                project_id: state.default_project_id,
+                user_id: "alice",
+                thread_config: lunarwing_engine::ThreadConfig::default(),
+                preferred_thread_id: None,
+            },
         )
         .await
         .expect("thread should start");

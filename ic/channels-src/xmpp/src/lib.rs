@@ -214,7 +214,12 @@ impl Guest for XmppChannel {
     fn on_respond(response: AgentResponse) -> Result<(), String> {
         let config = load_runtime_config()?;
         let attachments = convert_attachments(&response.attachments);
-        send_message_via_bridge(&config, response.metadata_json, response.content, attachments)
+        send_message_via_bridge(
+            &config,
+            response.metadata_json,
+            response.content,
+            attachments,
+        )
     }
 
     fn on_broadcast(user_id: String, response: AgentResponse) -> Result<(), String> {
@@ -457,6 +462,7 @@ fn render_status_message(update: &StatusUpdate) -> Option<String> {
         StatusType::ApprovalNeeded
         | StatusType::AuthRequired
         | StatusType::AuthCompleted
+        | StatusType::ExternalWaiting
         | StatusType::JobStarted => Some(update.message.clone()),
         StatusType::Status => {
             let trimmed = update.message.trim();

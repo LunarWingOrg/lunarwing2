@@ -433,6 +433,10 @@ impl Channel for GatewayChannel {
                 message: msg,
                 thread_id: thread_id.clone(),
             },
+            StatusUpdate::ExternalWaiting { gate_name } => AppEvent::Status {
+                message: StatusUpdate::external_waiting_message(&gate_name),
+                thread_id: thread_id.clone(),
+            },
             StatusUpdate::JobStarted {
                 job_id,
                 title,

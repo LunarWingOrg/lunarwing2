@@ -89,6 +89,7 @@ struct ChannelRuntimeState {
     pairing_store: Arc<PairingStore>,
     wasm_channel_router: Arc<WasmChannelRouter>,
     wasm_channel_owner_ids: std::collections::HashMap<String, i64>,
+    wasm_channel_owner_actor_ids: std::collections::HashMap<String, String>,
 }
 
 /// Setup schema returned to web UI for extension configuration.
@@ -382,6 +383,7 @@ impl ExtensionManager {
         pairing_store: Arc<PairingStore>,
         wasm_channel_router: Arc<WasmChannelRouter>,
         wasm_channel_owner_ids: std::collections::HashMap<String, i64>,
+        wasm_channel_owner_actor_ids: std::collections::HashMap<String, String>,
     ) {
         *self.channel_runtime.write().await = Some(ChannelRuntimeState {
             channel_manager,
@@ -389,7 +391,41 @@ impl ExtensionManager {
             pairing_store,
             wasm_channel_router,
             wasm_channel_owner_ids,
+            wasm_channel_owner_actor_ids,
         });
+    }
+
+    async fn current_channel_owner_actor_id(&self, name: &str) -> Option<String> {
+        {
+            let rt_guard = self.channel_runtime.read().await;
+            if let Some(actor_id) = rt_guard
+                .as_ref()
+                .and_then(|rt| rt.wasm_channel_owner_actor_ids.get(name).cloned())
+            {
+                return Some(actor_id);
+            }
+        }
+
+        if let Some(store) = self.store.as_ref() {
+            let key = format!("channels.wasm_channel_owner_actor_ids.{name}");
+            match store.get_setting(&self.user_id, &key).await {
+                Ok(Some(serde_json::Value::String(actor_id))) if !actor_id.trim().is_empty() => {
+                    return Some(actor_id);
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        channel = %name,
+                        %error,
+                        "Failed to read persisted WASM channel owner actor ID"
+                    );
+                }
+            }
+        }
+
+        self.current_channel_owner_id(name)
+            .await
+            .map(|owner_id| owner_id.to_string())
     }
 
     async fn current_channel_owner_id(&self, name: &str) -> Option<i64> {
@@ -449,13 +485,11 @@ impl ExtensionManager {
     }
 
     pub async fn has_wasm_channel_owner_binding(&self, name: &str) -> bool {
-        self.current_channel_owner_id(name).await.is_some()
+        self.current_channel_owner_actor_id(name).await.is_some()
     }
 
     pub(crate) async fn notification_target_for_channel(&self, name: &str) -> Option<String> {
-        self.current_channel_owner_id(name)
-            .await
-            .map(|owner_id| owner_id.to_string())
+        self.current_channel_owner_actor_id(name).await
     }
 
     /// Access the secrets store (used by OAuth callback handlers).
@@ -3323,6 +3357,7 @@ impl ExtensionManager {
             pairing_store,
             wasm_channel_router,
             wasm_channel_owner_ids,
+            wasm_channel_owner_actor_ids,
         ) = {
             let rt_guard = self.channel_runtime.read().await;
             let rt = rt_guard.as_ref().ok_or_else(|| {
@@ -3334,6 +3369,7 @@ impl ExtensionManager {
                 Arc::clone(&rt.pairing_store),
                 Arc::clone(&rt.wasm_channel_router),
                 rt.wasm_channel_owner_ids.clone(),
+                rt.wasm_channel_owner_actor_ids.clone(),
             )
         };
 
@@ -3378,6 +3414,10 @@ impl ExtensionManager {
             loaded,
             &channel_manager,
             &wasm_channel_router,
+            wasm_channel_owner_actor_ids
+                .get(name)
+                .cloned()
+                .or_else(|| wasm_channel_owner_ids.get(name).map(ToString::to_string)),
             wasm_channel_owner_ids.get(name).copied(),
         )
         .await
@@ -3389,10 +3429,10 @@ impl ExtensionManager {
         loaded: LoadedChannel,
         channel_manager: &Arc<ChannelManager>,
         wasm_channel_router: &Arc<WasmChannelRouter>,
+        owner_actor_id: Option<String>,
         owner_id: Option<i64>,
     ) -> Result<ActivateResult, ExtensionError> {
         let channel_name = loaded.name().to_string();
-        let owner_actor_id = owner_id.map(|id| id.to_string());
         let webhook_secret_name = loaded.webhook_secret_name();
         let secret_header = loaded.webhook_secret_header().map(|s| s.to_string());
         let sig_key_secret_name = loaded.signature_key_secret_name();
@@ -4782,6 +4822,7 @@ fn combine_install_errors(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fmt::Debug;
     use std::sync::Arc;
 
@@ -5476,6 +5517,14 @@ mod tests {
         tools_dir: std::path::PathBuf,
         channels_dir: std::path::PathBuf,
     ) -> ExtensionManager {
+        make_manager_custom_dirs_and_db(tools_dir, channels_dir, None)
+    }
+
+    fn make_manager_custom_dirs_and_db(
+        tools_dir: std::path::PathBuf,
+        channels_dir: std::path::PathBuf,
+        db: Option<Arc<dyn crate::db::Database>>,
+    ) -> ExtensionManager {
         use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
         use crate::testing::credentials::TEST_CRYPTO_KEY;
         use crate::tools::ToolRegistry;
@@ -5502,7 +5551,7 @@ mod tests {
             channels_dir,
             None,
             "test".to_string(),
-            None,
+            db,
             Vec::new(),
         )
     }
@@ -5552,7 +5601,14 @@ mod tests {
         owner_ids.insert("xmpp".to_string(), 12345_i64);
 
         manager
-            .set_channel_runtime(channels, runtime, pairing_store, router, owner_ids)
+            .set_channel_runtime(
+                channels,
+                runtime,
+                pairing_store,
+                router,
+                owner_ids,
+                HashMap::new(),
+            )
             .await;
 
         if manager.current_channel_owner_id("xmpp").await != Some(12345_i64) {
@@ -5562,6 +5618,44 @@ mod tests {
             return Err("expected no owner id for weechat".to_string());
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_string_owner_actor_id_takes_runtime_precedence() -> Result<(), String> {
+        let manager = make_manager_with_temp_dirs();
+        let channels = Arc::new(crate::channels::ChannelManager::new());
+        let runtime = Arc::new(
+            crate::channels::wasm::WasmChannelRuntime::new(
+                crate::channels::wasm::WasmChannelRuntimeConfig::default(),
+            )
+            .map_err(|error| format!("runtime init failed: {error}"))?,
+        );
+        let pairing_store = Arc::new(crate::pairing::PairingStore::new());
+        let router = Arc::new(crate::channels::wasm::WasmChannelRouter::new());
+        let numeric_ids = HashMap::from([("weechat".to_string(), 12345_i64)]);
+        let actor_ids =
+            HashMap::from([("weechat".to_string(), "account:libera:alice".to_string())]);
+
+        manager
+            .set_channel_runtime(
+                channels,
+                runtime,
+                pairing_store,
+                router,
+                numeric_ids,
+                actor_ids,
+            )
+            .await;
+
+        if manager
+            .current_channel_owner_actor_id("weechat")
+            .await
+            .as_deref()
+            != Some("account:libera:alice")
+        {
+            return Err("string owner actor ID should override the legacy numeric ID".to_string());
+        }
         Ok(())
     }
 
@@ -5642,13 +5736,59 @@ mod tests {
         let mut owner_ids = std::collections::HashMap::new();
         owner_ids.insert("xmpp".to_string(), 12345_i64);
         manager
-            .set_channel_runtime(channels, runtime, pairing_store, router, owner_ids)
+            .set_channel_runtime(
+                channels,
+                runtime,
+                pairing_store,
+                router,
+                owner_ids,
+                HashMap::new(),
+            )
             .await;
 
         if manager.current_channel_owner_id("xmpp").await != Some(12345_i64) {
             return Err("expected runtime fast-path owner id precedence".to_string());
         }
 
+        Ok(())
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_string_owner_actor_id_uses_store_fallback() -> Result<(), String> {
+        use crate::db::{Database, SettingsStore};
+
+        let dir = tempfile::tempdir().map_err(|error| format!("tempdir failed: {error}"))?;
+        let db = Arc::new(
+            crate::db::libsql::LibSqlBackend::new_local(&dir.path().join("owner-actor.db"))
+                .await
+                .map_err(|error| format!("create backend failed: {error}"))?,
+        );
+        db.run_migrations()
+            .await
+            .map_err(|error| format!("migration failed: {error}"))?;
+        let manager = make_manager_custom_dirs_and_db(
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(db.clone()),
+        );
+
+        db.set_setting(
+            "test",
+            "channels.wasm_channel_owner_actor_ids.weechat",
+            &serde_json::json!("account:libera:alice"),
+        )
+        .await
+        .map_err(|error| format!("persist actor ID failed: {error}"))?;
+
+        if manager
+            .current_channel_owner_actor_id("weechat")
+            .await
+            .as_deref()
+            != Some("account:libera:alice")
+        {
+            return Err("expected persisted string owner actor ID".to_string());
+        }
         Ok(())
     }
 
