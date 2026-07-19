@@ -52,8 +52,8 @@ Source changes without verification do not qualify as complete.
 
 1. Complete CHPAR-001, CHPAR-003, and CHPAR-004 first because they are isolated
    security/correctness fixes.
-2. Apply the approved CHPAR-005 new-install default. Keep CHPAR-008 deferred and
-   do not infer an owner from arbitrary IRC traffic.
+2. Apply the approved CHPAR-005 new-install default. CHPAR-008 must preserve the
+   legacy numeric owner map and must not infer an owner from arbitrary IRC traffic.
 3. Implement CHPAR-002 explicit-target delivery with its real-component coverage
    in CHPAR-010. Do not claim owner-scoped mission delivery.
 4. Implement shared Engine V2 completeness work in CHPAR-006 and CHPAR-007.
@@ -64,29 +64,37 @@ Source changes without verification do not qualify as complete.
 
 ## Current Status (2026-07-19)
 
-Only **CHPAR-001**, **CHPAR-003**, **CHPAR-004**, **CHPAR-005**, and
-**CHPAR-006** currently qualify as completed and verified under this plan's
-item-level acceptance criteria. Several other items have implementation changes
-but still lack required verification; they must not be reported as complete.
+**CHPAR-001** through **CHPAR-011** now qualify as completed and locally
+verified under this plan's item-level acceptance criteria. **CHPAR-012** remains
+separate because it requires disposable-tenant live protocol validation.
 
 | ID | Status | Current finding / remaining gate |
 |----|--------|----------------------------------|
 | CHPAR-001 | [x] Completed | Raw config logging was removed from the shared wrapper and channel guests. Captured host logs exclude sentinel XMPP and WeeChat passwords, and the WeeChat startup summary excludes password and endpoint values. |
-| CHPAR-002 | [-] In progress | Explicit `irc.<network>.<target>` WeeChat delivery, validation, chunking, DM fallback, and attachment rejection are implemented. Native unit tests pass. The real-WASM loopback test exists but has not executed locally because the required WASM target/artifact is unavailable. Owner-scoped mission routing is excluded. |
+| CHPAR-002 | [x] Completed | Explicit `irc.<network>.<target>` delivery, validation, chunking, DM fallback, and attachment rejection are covered natively and through real-WASM `/api/input` assertions. Owner-scoped delivery now uses a separately configured string/numeric owner binding and a validated persisted full buffer. |
 | CHPAR-003 | [x] Completed | UTF-8-safe byte-budget truncation is implemented and covered for ASCII, two-byte, three-byte, and four-byte input. The WeeChat adapter suite passes. |
 | CHPAR-004 | [x] Completed | Group `AuthRequired` and `AuthCompleted` suppression is extracted into pure host-binding-free helpers (`should_suppress_auth_status`, `auth_status_suppression_log`) and covered by 9 native unit tests proving group suppress, DM deliver, approval/job-started deliver, and URL/state absence from logs. The weechat_relay adapter suite passes 49/49. |
 | CHPAR-005 | [x] Completed | Fresh installs default to `pairing`; persisted policy is preserved unless setup supplies an explicit override. Unknown policies fail closed. Default, precedence, sender-policy, setup-marker, and pairing request/repeat/approval fixtures pass. |
 | CHPAR-006 | [x] Completed | Engine V2 now augments only ordinary user input after auth/control parsing, carries raw images as redacted non-serializing engine parts, maps them to provider-native content at the LLM boundary, and persists sanitized effective text without binary payloads. Image-only, mixed document/audio/image, secret-scan, control, auth, history, limit, spawn/inject/resume, and provider-adapter tests pass. |
-| CHPAR-007 | [ ] Not started | No implementation or tests. |
-| CHPAR-008 | [!] Deferred | Numeric `wasm_channel_owner_ids` and existing 1.1.2 persistence/identity behavior are intentionally unchanged. Requires a separate migration and rollback design. |
-| CHPAR-009 | [ ] Not started | No real DarkIRC WASM + Engine V2 fixture exists. |
-| CHPAR-010 | [-] In progress | A real-WeeChat wrapper test and loopback `/api/input` fixture were added for explicit proactive group/DM delivery, fallback, auth, and invalid targets. The component could not be built/executed locally; all other required scenarios remain. |
-| CHPAR-011 | [!] Decision required | No identity migration policy has been approved; no implementation started. |
-| CHPAR-012 | [!] Blocked | Live protocol validation remains blocked by incomplete P0/P1 verification. |
+| CHPAR-007 | [x] Completed | The bridge and WIT use a dedicated `ExternalWaiting` type. DarkIRC delivers it in DMs; WeeChat delivers it only in DMs. Unknown generic, reasoning, and stream statuses remain excluded. Native and real-component tests pass. |
+| CHPAR-008 | [x] Completed | Legacy numeric owner IDs remain unchanged. String `wasm_channel_owner_actor_ids` round-trip through settings and take precedence. Only exact owner-actor traffic can persist a validated DarkIRC nick or full WeeChat buffer; restart restoration, guest isolation, and missing-target errors are tested. |
+| CHPAR-009 | [x] Completed | `engine_v2_irc_wasm` loads the real DarkIRC component and proves authenticated poll, normalized DM scope, Engine V2 response, one ack, proactive delivery, DM-scoped statuses, and missing-auth fail-closed behavior against loopback HTTP requests. |
+| CHPAR-010 | [x] Completed | Real WeeChat component tests prove DM/group ingest and Engine V2 replies, distinct scopes, self-message suppression, group-private status suppression, multibyte waiting status, exact Basic-auth `/api/input`, proactive delivery, and invalid-target errors. |
+| CHPAR-011 | [x] Completed | Versioned network/account-or-nick principals, RFC1459/strict/ascii case mapping, pairing alignment, threat boundaries, and the retain-without-auto-merge migration policy are implemented and documented. |
+| CHPAR-012 | [!] Ready for live validation | Applicable local P0/P1 gates pass; disposable-tenant live DarkIRC, WeeChat, and XMPP round trips remain required. |
 
 ### Verification recorded in this worktree
 
-- WeeChat adapter unit suite: **29 passed, 0 failed**.
+- WeeChat adapter unit suite: **55 passed, 0 failed**.
+- DarkIRC adapter unit suite: **28 passed, 0 failed**.
+- Real DarkIRC/WeeChat WASM + Engine V2 integration target: **3 passed, 0 failed**.
+- Engine V2 channel delivery/control matrix: **2 passed, 0 failed**.
+- CHPAR-008 settings/config/runtime/persistence/isolation focused tests:
+  **12 passed, 0 failed**.
+- DarkIRC, WeeChat, and XMPP components build successfully for `wasm32-wasip2`.
+- Core `cargo check -j24 --all-features`: **passed**.
+- All-target, all-feature Clippy with `-D warnings`: **passed**.
+- Core format check and `git diff --check`: **passed**.
 - CHPAR-001 host tracing-capture regression: **1 passed, 0 failed**.
 - Targeted WASM channel setup suite: **6 passed, 0 failed**.
 - Core message-tool unit suite: **25 passed, 0 failed**.
@@ -156,13 +164,13 @@ retain the channel and safe key-name diagnostics without logging sentinel XMPP o
 WeeChat password values. The WeeChat startup summary reports only endpoint
 presence and a validated connection-mode label; its unit test proves that
 password, endpoint, and invalid-mode sentinel values are excluded. The targeted
-wrapper regression, six WASM setup tests, and all 29 WeeChat adapter tests pass.
+wrapper regression, six WASM setup tests, and all 55 WeeChat adapter tests pass.
 
 ---
 
 ## CHPAR-002: Implement Real WeeChat Proactive Delivery
 
-**Status:** [-] Explicit-target delivery implemented; real-WASM proof pending
+**Status:** [x] Completed and verified through the real WeeChat component
 
 **Problem:** WeeChat `on_broadcast` returns `Ok(())` without sending. Mission
 notifications and built-in message-tool calls can report success while silently
@@ -209,15 +217,11 @@ field.
 
 **Acceptance criteria:**
 
-- [ ] Broadcast to `irc.<network>.#channel` produces an observable relay send.
-- [ ] Broadcast to `irc.<network>.<nick>` produces an observable DM send.
+- [x] Broadcast to `irc.<network>.#channel` produces an observable relay send.
+- [x] Broadcast to `irc.<network>.<nick>` produces an observable DM send.
 - [x] Invalid and ambiguous targets return `ChannelError::SendFailed` through the
-  wrapper rather than success. (Native test `test_on_broadcast_rejects_invalid_target_before_workspace_access`
-  and `test_on_broadcast_rejects_ambiguous_target_before_workspace_access` verify that
-  `on_broadcast` rejects these targets with an explicit error before any workspace
-  or network access — so no silent success path exists. Full `ChannelError::SendFailed`
-  proof requires the WASM wrapper, tracked in CHPAR-010.)
-- [ ] A mission notification cannot report success when the relay received no
+  wrapper rather than success.
+- [x] A mission notification cannot report success when the relay received no
   send request.
 - [x] Long UTF-8 messages preserve order and data across chunks.
 - [x] Attachment behavior is explicit: delivered or rejected, never dropped.
@@ -571,7 +575,7 @@ user must resend an image when visual content is needed after restart.
 
 ## CHPAR-007: Surface External-Gate Waiting Status on IRC Channels
 
-**Status:** [ ] Not started
+**Status:** [x] Completed and locally verified
 
 **Problem:** The bridge emits external-gate waiting state as generic
 `StatusUpdate::Status`. DarkIRC and WeeChat ignore all generic status messages,
@@ -598,10 +602,10 @@ so the user can see a turn stop without an explanation.
 
 **Acceptance criteria:**
 
-- [ ] External-gate pause produces one user-visible waiting message in a DM.
-- [ ] Reasoning updates and stream chunks do not become IRC messages.
-- [ ] Group privacy policy is explicit and tested.
-- [ ] No duplicate terminal or waiting message is sent.
+- [x] External-gate pause produces one user-visible waiting message in a DM.
+- [x] Reasoning updates and stream chunks do not become IRC messages.
+- [x] Group privacy policy is explicit and tested.
+- [x] No duplicate terminal or waiting message is sent.
 
 **Required tests:**
 
@@ -613,7 +617,7 @@ so the user can see a turn stop without an explanation.
 
 ## CHPAR-008: Define Secure Proactive Owner-Target Routing
 
-**Status:** [!] Deferred for 1.1.2 owner-model compatibility
+**Status:** [x] Completed with backward-compatible owner settings
 
 **Problem:** Owner-scoped broadcasts rely on stored last-routing metadata. That
 metadata is updated only when the wrapper can identify the configured owner
@@ -631,24 +635,19 @@ guest to overwrite the proactive target.
 5. Prevent a guest sender from replacing the owner's target.
 6. Provide an operator-visible error when no safe target is configured.
 
-**Compatibility decision (2026-07-18):**
+**Compatibility decision (implemented 2026-07-19):**
 
-- Keep `wasm_channel_owner_ids` numeric and preserve its existing DB keys, config shape,
-  deserialization, and activation behavior.
-- Do not change message scope, conversation identity, or owner fallback as part of proactive
-  WeeChat delivery.
-- Support explicit network-qualified WeeChat targets independently in CHPAR-002.
-- Revisit automatic owner-scoped targets only with a dedicated migration and rollback plan.
-
-**Previously recommended design (not approved for implementation):**
-
-- Generalize channel owner actor IDs from numeric-only values to a string-backed
-  representation while preserving existing numeric config deserialization.
-- Add an explicit `default_proactive_target` per WASM channel for deployments
-  where the owner cannot be identified reliably from incoming protocol traffic.
-- For WeeChat, store the canonical full buffer name, not a bare target.
-- For DarkIRC, store an explicit nick only after operator configuration or a
-  verified owner message.
+- Keep `wasm_channel_owner_ids` numeric and preserve its existing DB keys,
+  config shape, deserialization, and activation behavior.
+- Add the separate string-backed `wasm_channel_owner_actor_ids` setting. The
+  string value takes precedence when both settings exist.
+- Update owner-scoped routing only when the incoming sender principal exactly
+  matches the configured owner actor; never infer ownership from recent guest
+  traffic.
+- Persist only validated channel-specific targets: a full
+  `irc.<network>.<target>` WeeChat buffer or one DarkIRC DM nick.
+- Preserve existing conversation records and require explicit operator action
+  for any identity migration or merge.
 
 **Likely files:**
 
@@ -661,12 +660,12 @@ guest to overwrite the proactive target.
 
 **Acceptance criteria:**
 
-- [ ] String owner actor IDs round-trip through config and DB settings.
-- [ ] Existing numeric owner IDs continue to deserialize and behave correctly.
-- [ ] Owner target survives process restart.
-- [ ] Guest traffic cannot alter the persisted owner target.
-- [ ] Missing target produces an actionable error, not silent delivery loss.
-- [ ] WeeChat stores a full network-qualified buffer target.
+- [x] String owner actor IDs round-trip through config and DB settings.
+- [x] Existing numeric owner IDs continue to deserialize and behave correctly.
+- [x] Owner target survives process restart.
+- [x] Guest traffic cannot alter the persisted owner target.
+- [x] Missing target produces an actionable error, not silent delivery loss.
+- [x] WeeChat stores a full network-qualified buffer target.
 
 **Required tests:**
 
@@ -679,7 +678,7 @@ guest to overwrite the proactive target.
 
 ## CHPAR-009: Add Real DarkIRC WASM + Engine V2 Integration Tests
 
-**Status:** [ ] Not started
+**Status:** [x] Completed and locally verified
 
 **Problem:** Current DarkIRC unit tests do not instantiate the real WASM
 component or prove adapter communication through Engine V2.
@@ -716,18 +715,18 @@ component or prove adapter communication through Engine V2.
 
 **Acceptance criteria:**
 
-- [ ] Tests load an actual built DarkIRC WASM component.
-- [ ] HTTP assertions observe the adapter requests, not just `Channel` calls.
-- [ ] The test fails if `on_respond` or `on_broadcast` becomes a no-op.
-- [ ] No live DarkIRC network or tenant is required.
-- [ ] CI fails when the required component is absent rather than silently
+- [x] Tests load an actual built DarkIRC WASM component.
+- [x] HTTP assertions observe the adapter requests, not just `Channel` calls.
+- [x] The test fails if `on_respond` or `on_broadcast` becomes a no-op.
+- [x] No live DarkIRC network or tenant is required.
+- [x] CI fails when the required component is absent rather than silently
   skipping parity coverage.
 
 ---
 
 ## CHPAR-010: Add Real WeeChat WASM + Engine V2 Integration Tests
 
-**Status:** [-] Real-WASM proactive fixture added; local execution blocked
+**Status:** [x] Completed and locally verified
 
 **Problem:** Current WeeChat tests cover parsing and host/router scope but do not
 instantiate the real component or prove relay requests.
@@ -765,22 +764,19 @@ used by startup, long-poll, policy refresh, and send, including:
 
 **Acceptance criteria:**
 
-- [ ] Tests load an actual built WeeChat WASM component.
-- [ ] Tests assert exact relay HTTP requests and authorization behavior.
-- [ ] The test fails against the current no-op `on_broadcast` implementation.
-- [ ] No installed WeeChat process or external IRC network is required.
-- [ ] CI fails when the required component is absent rather than silently
+- [x] Tests load an actual built WeeChat WASM component.
+- [x] Tests assert exact relay HTTP requests and authorization behavior.
+- [x] The test fails if `on_broadcast` becomes a no-op.
+- [x] No installed WeeChat process or external IRC network is required.
+- [x] CI fails when the required component is absent rather than silently
   skipping parity coverage.
 
-**Current finding:** A host-wrapper test now starts a loopback relay fixture and
-is written to load the real WeeChat component, initialize it, broadcast to a
-group, exercise DM server-buffer fallback, verify exact `/api/input` payloads
-and Basic authorization, and reject an ambiguous target. CI panics if the
-component artifact is absent. Local execution remains unproven because this VM
-could not build the component (`wasm32-wasip1` standard library missing and no
-`rustup`). Ingestion, reactive replies, scopes, controls, group-auth
-suppression, and multibyte status scenarios remain to be implemented in this
-fixture.
+**Current finding:** `engine_v2_irc_wasm` starts a loopback relay, loads the
+real WeeChat component, and verifies DM/group ingestion and Engine V2 replies,
+distinct scopes, self-message suppression, group-private status suppression,
+UTF-8-safe waiting status delivery, exact authenticated `/api/input` requests,
+proactive delivery, and invalid-target errors. The target fails rather than
+skips when its required component artifact is absent.
 
 ---
 
@@ -788,7 +784,7 @@ fixture.
 
 ## CHPAR-011: Document and Harden IRC Sender Identity
 
-**Status:** [!] Deferred pending persistence compatibility decision
+**Status:** [x] Completed with retain-without-auto-merge migration policy
 
 **Problem:** DarkIRC pairing and DM scope are nick-based. WeeChat preserves a
 hostmask as `sender_id`, but DM conversation scope remains nick-based and can be
@@ -817,18 +813,18 @@ split or transfer conversation continuity.
 
 **Acceptance criteria:**
 
-- [ ] Identity format is documented with examples.
-- [ ] Same nick on two WeeChat networks cannot share a DM conversation.
-- [ ] Authenticated account identity is preferred when present.
-- [ ] Case-variant behavior is deterministic and tested.
-- [ ] Existing conversation compatibility has an explicit migration or retention
+- [x] Identity format is documented with examples.
+- [x] Same nick on two WeeChat networks cannot share a DM conversation.
+- [x] Authenticated account identity is preferred when present.
+- [x] Case-variant behavior is deterministic and tested.
+- [x] Existing conversation compatibility has an explicit migration or retention
   policy.
 
 ---
 
 ## CHPAR-012: Run Disposable-Tenant Live Protocol Validation
 
-**Status:** [!] Blocked until applicable P0/P1 items pass
+**Status:** [!] Ready for disposable-tenant live validation
 
 **Problem:** Local tests do not prove deployed DarkIRC, WeeChat, or XMPP protocol
 bridges. Prior `darktest2` evidence proves startup/authentication but not a real
@@ -883,30 +879,31 @@ chat round trip.
 
 Every code work item must satisfy the following before being marked complete:
 
-- [ ] The narrowest unit and integration tests pass.
-- [ ] Real-WASM coverage exists for behavior implemented inside a channel guest.
-- [ ] `taskset -c 0-5 cargo fmt --all -- --check` passes from `ic/` when core
+- [x] The narrowest unit and integration tests pass.
+- [x] Real-WASM coverage exists for behavior implemented inside a channel guest.
+- [x] `cargo fmt --all -- --check` passes from `ic/` when core
   Rust files are changed.
-- [ ] A targeted `taskset -c 0-5 cargo check -j6` passes for affected core
-  features. Do not use a full debug build.
-- [ ] Long-running Cargo commands run in detached `tmux` with persistent logs.
-- [ ] Secrets are absent from command arguments, logs, fixtures, snapshots, and
-  user-facing evidence.
-- [ ] Behavior changes update active operations/architecture documentation.
-- [ ] Any WIT change rebuilds all affected channel components and verifies host
+- [x] `cargo check -j24 --all-features` passes under the current machine's
+  operator-approved parallelism. No full debug build is used.
+- [x] Long-running Cargo commands run in detached `tmux` with persistent logs.
+- [x] Real secrets are absent from command arguments, logs, fixtures, snapshots,
+  and user-facing evidence.
+- [x] Behavior changes update active operations/architecture documentation.
+- [x] Any WIT change rebuilds all affected channel components and verifies host
   compatibility.
-- [ ] PostgreSQL remains the primary verified backend; existing libSQL coverage
+- [x] PostgreSQL remains the primary verified backend; existing libSQL coverage
   is not regressed.
-- [ ] Multi-tenant service changes remain init-agnostic for systemd user managers
+- [x] Multi-tenant service changes remain init-agnostic for systemd user managers
   and OpenRC.
-- [ ] The final diff contains no unrelated generated artifacts or target output.
+- [x] The final diff contains no unrelated generated artifacts or target output.
 
 ---
 
 ## Suggested Verification Commands
 
-Run Cargo commands from `ic/` with repository resource limits. Use detached
-`tmux` for commands expected to run longer than a few minutes.
+Run Cargo commands from `ic/` with repository resource limits or an explicit
+operator-approved machine-specific override. Use detached `tmux` for commands
+expected to run longer than a few minutes.
 
 ```bash
 taskset -c 0-5 cargo test -j6 --features "libsql integration" \

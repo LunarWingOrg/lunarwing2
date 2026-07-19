@@ -119,9 +119,7 @@ async fn register_channel(
     tracing::debug!("Loaded WASM channel: {}", channel_name);
     let owner_actor_id = config
         .channels
-        .wasm_channel_owner_ids
-        .get(channel_name.as_str())
-        .map(ToString::to_string);
+        .wasm_channel_owner_actor_id(channel_name.as_str());
 
     let secret_name = loaded.webhook_secret_name();
     let sig_key_secret_name = loaded.signature_key_secret_name();

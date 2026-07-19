@@ -265,6 +265,8 @@ interface channel {
         tool-result,
         /// A tool call is waiting for user approval.
         approval-needed,
+        /// Engine execution is paused pending an external callback.
+        external-waiting,
         /// Generic status text that should be shown to the user.
         status,
         /// A background/sandbox job was started.

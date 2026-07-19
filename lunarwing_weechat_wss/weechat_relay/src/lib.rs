@@ -254,19 +254,28 @@ fn log_invalid_dm_policy(policy: &str) {
 fn sender_allowed_by_policy(
     nick: &str,
     hostmask: &str,
+    identity: &WeechatSenderIdentity,
     policy: &str,
     allow_from: &[String],
     pairing_allowed: &[String],
 ) -> Option<bool> {
-    let paired = pairing_allowed
-        .iter()
-        .any(|entry| entry.eq_ignore_ascii_case(nick));
+    let normalized_nick = irc_casefold(nick, identity.case_mapping);
+    let normalized_hostmask = irc_casefold(hostmask, identity.case_mapping);
+    let paired = pairing_allowed.iter().any(|entry| {
+        entry == &identity.principal
+            || irc_casefold(entry, identity.case_mapping) == normalized_nick
+    });
     let allowlisted = allow_from.iter().any(|entry| {
         entry == "*"
+            || entry == &identity.principal
+            || identity.account.as_deref().is_some_and(|account| {
+                irc_casefold(entry, identity.case_mapping)
+                    == irc_casefold(account, identity.case_mapping)
+            })
             || if entry.contains('!') {
-                entry.eq_ignore_ascii_case(hostmask)
+                irc_casefold(entry, identity.case_mapping) == normalized_hostmask
             } else {
-                entry.eq_ignore_ascii_case(nick)
+                irc_casefold(entry, identity.case_mapping) == normalized_nick
             }
     });
 
@@ -323,6 +332,15 @@ struct WeechatMessageMetadata {
     nick: String,
     /// Is this a DM or group channel?
     is_dm: bool,
+    /// Versioned sender principal used for pairing and conversation scope.
+    #[serde(default)]
+    sender_principal: Option<String>,
+    /// Authenticated IRC account when supplied by the relay tags.
+    #[serde(default)]
+    account: Option<String>,
+    /// IRC case mapping used to normalize the principal.
+    #[serde(default)]
+    case_mapping: Option<String>,
 }
 
 /// Validated network-qualified target for proactive WeeChat delivery.
@@ -332,6 +350,87 @@ struct WeechatProactiveTarget {
     network: String,
     target: String,
     is_dm: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IrcCaseMapping {
+    Ascii,
+    Rfc1459,
+    StrictRfc1459,
+}
+
+impl IrcCaseMapping {
+    fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "ascii" => Some(Self::Ascii),
+            "rfc1459" => Some(Self::Rfc1459),
+            "strict-rfc1459" => Some(Self::StrictRfc1459),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ascii => "ascii",
+            Self::Rfc1459 => "rfc1459",
+            Self::StrictRfc1459 => "strict-rfc1459",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WeechatSenderIdentity {
+    principal: String,
+    account: Option<String>,
+    case_mapping: IrcCaseMapping,
+}
+
+fn irc_casefold(value: &str, mapping: IrcCaseMapping) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            'A'..='Z' => character.to_ascii_lowercase(),
+            '[' if mapping != IrcCaseMapping::Ascii => '{',
+            ']' if mapping != IrcCaseMapping::Ascii => '}',
+            '\\' if mapping != IrcCaseMapping::Ascii => '|',
+            '^' if mapping == IrcCaseMapping::Rfc1459 => '~',
+            other => other,
+        })
+        .collect()
+}
+
+fn case_mapping_from_tags(tags: &[String]) -> IrcCaseMapping {
+    tags.iter()
+        .find_map(|tag| tag.strip_prefix("casemapping_"))
+        .and_then(IrcCaseMapping::from_name)
+        .unwrap_or(IrcCaseMapping::Rfc1459)
+}
+
+fn extract_account_from_tags(tags: &[String]) -> Option<&str> {
+    tags.iter()
+        .find_map(|tag| {
+            tag.strip_prefix("account_")
+                .or_else(|| tag.strip_prefix("account="))
+                .or_else(|| tag.strip_prefix("irc_account_"))
+        })
+        .filter(|account| !account.is_empty() && *account != "*")
+}
+
+fn weechat_sender_identity(network: &str, nick: &str, tags: &[String]) -> WeechatSenderIdentity {
+    let case_mapping = case_mapping_from_tags(tags);
+    let network = network.to_ascii_lowercase();
+    let account = extract_account_from_tags(tags).map(str::to_string);
+    let principal = if let Some(account) = account.as_deref() {
+        format!("account:{network}:{}", irc_casefold(account, case_mapping))
+    } else {
+        format!("nick:{network}:{}", irc_casefold(nick, case_mapping))
+    };
+
+    WeechatSenderIdentity {
+        principal,
+        account,
+        case_mapping,
+    }
 }
 
 fn parse_proactive_target(value: &str) -> Result<WeechatProactiveTarget, String> {
@@ -732,10 +831,7 @@ impl Guest for WeechatRelayChannel {
     /// Forward actionable status updates to IRC.
     fn on_status(update: StatusUpdate) {
         match update.status {
-            StatusType::ApprovalNeeded
-            | StatusType::AuthRequired
-            | StatusType::AuthCompleted
-            | StatusType::JobStarted => {
+            status if is_actionable_irc_status(status) => {
                 let message = update.message.trim();
                 if message.is_empty() {
                     return;
@@ -756,6 +852,16 @@ impl Guest for WeechatRelayChannel {
                     channel_host::log(
                         channel_host::LogLevel::Debug,
                         &auth_status_suppression_log(update.status, &metadata.buffer),
+                    );
+                    return;
+                }
+                if should_suppress_external_waiting(update.status, metadata.is_dm) {
+                    channel_host::log(
+                        channel_host::LogLevel::Debug,
+                        &format!(
+                            "Suppressing external-waiting status in group buffer '{}'",
+                            metadata.buffer
+                        ),
                     );
                     return;
                 }
@@ -1360,6 +1466,21 @@ fn should_suppress_auth_status(status: StatusType, is_dm: bool) -> bool {
     matches!(status, StatusType::AuthRequired | StatusType::AuthCompleted)
 }
 
+fn is_actionable_irc_status(status: StatusType) -> bool {
+    matches!(
+        status,
+        StatusType::ApprovalNeeded
+            | StatusType::AuthRequired
+            | StatusType::AuthCompleted
+            | StatusType::ExternalWaiting
+            | StatusType::JobStarted
+    )
+}
+
+fn should_suppress_external_waiting(status: StatusType, is_dm: bool) -> bool {
+    !is_dm && matches!(status, StatusType::ExternalWaiting)
+}
+
 /// Safe debug log line emitted when a group auth status is suppressed.
 /// Contains only the status variant and buffer name — never the message
 /// body, OAuth URL, or state token. Pure string format so it can be
@@ -1463,6 +1584,7 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
     } else {
         nick.to_string()
     };
+    let identity = weechat_sender_identity(network, nick, tags);
 
     let message = line.message.as_ref().map(|s| s.as_str()).unwrap_or("");
     let text = strip_irc_formatting(message);
@@ -1485,7 +1607,7 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
         let dm_policy =
             channel_host::workspace_read(DM_POLICY_PATH).unwrap_or_else(default_dm_policy);
 
-        if !check_sender_allowed(nick, &hostmask, &dm_policy) {
+        if !check_sender_allowed(nick, &hostmask, &identity, &dm_policy) {
             drop_log(
                 verbose,
                 &format!(
@@ -1493,7 +1615,7 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
                     nick
                 ),
             );
-            handle_pairing_request(buffer_name, nick);
+            handle_pairing_request(buffer_name, nick, &identity.principal);
             return;
         }
     } else {
@@ -1512,7 +1634,9 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
-        if group_policy == "allowlist" && !check_sender_allowed(nick, &hostmask, "allowlist") {
+        if group_policy == "allowlist"
+            && !check_sender_allowed(nick, &hostmask, &identity, "allowlist")
+        {
             drop_log(
                 verbose,
                 &format!(
@@ -1538,13 +1662,16 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
         target: target.clone(),
         nick: nick.to_string(),
         is_dm,
+        sender_principal: Some(identity.principal.clone()),
+        account: identity.account.clone(),
+        case_mapping: Some(identity.case_mapping.name().to_string()),
     };
 
     let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
 
-    let user_id = format!("id:{}", hostmask);
+    let user_id = identity.principal.clone();
     let thread_id = if is_dm {
-        format!("weechat:dm:{}:{}", network, nick)
+        format!("weechat:dm:v2:{}", identity.principal)
     } else {
         format!("weechat:group:{}:{}", network, target)
     };
@@ -1574,7 +1701,12 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
 /// Unknown policy strings fail closed (reject the sender) rather than
 /// defaulting to `open`, so a typo or stale config never grants unintended
 /// access.
-fn check_sender_allowed(nick: &str, hostmask: &str, policy: &str) -> bool {
+fn check_sender_allowed(
+    nick: &str,
+    hostmask: &str,
+    identity: &WeechatSenderIdentity,
+    policy: &str,
+) -> bool {
     if policy == "open" {
         return true;
     }
@@ -1592,18 +1724,27 @@ fn check_sender_allowed(nick: &str, hostmask: &str, policy: &str) -> bool {
         Vec::new()
     };
 
-    sender_allowed_by_policy(nick, hostmask, policy, &allow_from, &pairing_allowed).unwrap_or(false)
+    sender_allowed_by_policy(
+        nick,
+        hostmask,
+        identity,
+        policy,
+        &allow_from,
+        &pairing_allowed,
+    )
+    .unwrap_or(false)
 }
 
 /// Handle pairing request for unknown sender.
-fn handle_pairing_request(buffer_name: &str, nick: &str) {
+fn handle_pairing_request(buffer_name: &str, nick: &str, principal: &str) {
     let meta = serde_json::json!({
         "buffer": buffer_name,
         "nick": nick,
+        "principal": principal,
     })
     .to_string();
 
-    match channel_host::pairing_upsert_request(CHANNEL_NAME, nick, &meta) {
+    match channel_host::pairing_upsert_request(CHANNEL_NAME, principal, &meta) {
         Ok(result) => {
             channel_host::log(
                 channel_host::LogLevel::Info,
@@ -2149,6 +2290,9 @@ mod tests {
             target: "#lunarwing".to_string(),
             nick: "alice".to_string(),
             is_dm: false,
+            sender_principal: Some("nick:libera:alice".to_string()),
+            account: None,
+            case_mapping: Some("rfc1459".to_string()),
         };
         let encoded = serde_json::to_string(&metadata).expect("metadata should serialize");
         let decoded: WeechatMessageMetadata =
@@ -2649,6 +2793,26 @@ mod tests {
     // ---- CHPAR-004: prevent auth status leaking into WeeChat groups ----
 
     #[test]
+    fn external_waiting_is_actionable_but_dm_only() {
+        assert!(is_actionable_irc_status(StatusType::ExternalWaiting));
+        assert!(!should_suppress_external_waiting(
+            StatusType::ExternalWaiting,
+            true
+        ));
+        assert!(should_suppress_external_waiting(
+            StatusType::ExternalWaiting,
+            false
+        ));
+    }
+
+    #[test]
+    fn unknown_generic_and_stream_statuses_remain_ignored() {
+        assert!(!is_actionable_irc_status(StatusType::Status));
+        assert!(!is_actionable_irc_status(StatusType::Thinking));
+        assert!(!is_actionable_irc_status(StatusType::ToolResult));
+    }
+
+    #[test]
     fn test_should_suppress_auth_status_group_auth_required() {
         // Group + AuthRequired must suppress: setup instructions and OAuth
         // URLs cannot leak into shared channels.
@@ -2862,11 +3026,13 @@ mod tests {
 
     #[test]
     fn test_dm_policy_pairing_allows_only_approved_senders() {
+        let identity = weechat_sender_identity("libera", "alice", &[]);
         let no_approved_senders = Vec::new();
         assert_eq!(
             sender_allowed_by_policy(
                 "alice",
                 "alice!user@example.com",
+                &identity,
                 "pairing",
                 &[],
                 &no_approved_senders,
@@ -2879,6 +3045,7 @@ mod tests {
             sender_allowed_by_policy(
                 "alice",
                 "alice!user@example.com",
+                &identity,
                 "pairing",
                 &[],
                 &approved_senders,
@@ -2889,10 +3056,59 @@ mod tests {
 
     #[test]
     fn test_unknown_dm_policy_fails_closed() {
+        let identity = weechat_sender_identity("libera", "alice", &[]);
         assert!(!is_known_dm_policy("typo"));
         assert_eq!(
-            sender_allowed_by_policy("alice", "alice!host", "typo", &[], &[]),
+            sender_allowed_by_policy("alice", "alice!host", &identity, "typo", &[], &[],),
             None
         );
+    }
+
+    #[test]
+    fn authenticated_account_is_preferred_for_weechat_principal() {
+        let tags = vec![
+            "nick_Alice".to_string(),
+            "account_TrustedUser".to_string(),
+            "casemapping_rfc1459".to_string(),
+        ];
+        let identity = weechat_sender_identity("Libera", "Alice", &tags);
+        assert_eq!(identity.principal, "account:libera:trusteduser");
+        assert_eq!(identity.account.as_deref(), Some("TrustedUser"));
+    }
+
+    #[test]
+    fn same_nick_on_two_networks_has_distinct_principals() {
+        let libera = weechat_sender_identity("libera", "Alice", &[]);
+        let oftc = weechat_sender_identity("oftc", "Alice", &[]);
+        assert_eq!(libera.principal, "nick:libera:alice");
+        assert_eq!(oftc.principal, "nick:oftc:alice");
+        assert_ne!(libera.principal, oftc.principal);
+    }
+
+    #[test]
+    fn irc_case_mapping_controls_nick_normalization() {
+        assert_eq!(
+            irc_casefold("Nick[One]^", IrcCaseMapping::Rfc1459),
+            "nick{one}~"
+        );
+        assert_eq!(
+            irc_casefold("Nick[One]^", IrcCaseMapping::StrictRfc1459),
+            "nick{one}^"
+        );
+        assert_eq!(
+            irc_casefold("Nick[One]^", IrcCaseMapping::Ascii),
+            "nick[one]^"
+        );
+    }
+
+    #[test]
+    fn legacy_weechat_metadata_without_identity_fields_still_deserializes() {
+        let metadata: WeechatMessageMetadata = serde_json::from_str(
+            r#"{"buffer":"irc.libera.alice","network":"libera","target":"alice","nick":"Alice","is_dm":true}"#,
+        )
+        .expect("legacy WeeChat response metadata must remain readable");
+        assert!(metadata.sender_principal.is_none());
+        assert!(metadata.account.is_none());
+        assert!(metadata.case_mapping.is_none());
     }
 }

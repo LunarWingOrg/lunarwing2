@@ -316,6 +316,7 @@ mod tests {
             wasm_channels_dir: PathBuf::from("/tmp/channels"),
             wasm_channels_enabled: true,
             wasm_channel_owner_ids: HashMap::new(),
+            wasm_channel_owner_actor_ids: HashMap::new(),
         };
 
         let channels = builtin_channels(&config);

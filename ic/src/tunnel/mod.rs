@@ -414,6 +414,7 @@ mod tests {
             wasm_channels_dir: std::env::temp_dir().join("lunarwing-test-channels"),
             wasm_channels_enabled: false,
             wasm_channel_owner_ids: std::collections::HashMap::new(),
+            wasm_channel_owner_actor_ids: std::collections::HashMap::new(),
         }
     }
 
