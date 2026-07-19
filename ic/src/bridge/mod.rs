@@ -47,6 +47,7 @@ pub use router::{
     handle_new_thread,
     handle_with_engine,
     has_active_engine_thread,
+    has_interruptible_engine_state,
     has_matching_engine_approval,
     has_pending_auth,
     // Initialization

@@ -2095,6 +2095,11 @@ fn truncate_for_status(message: &str) -> String {
 
 /// Split message into chunks at word boundaries.
 fn split_message(text: &str, max_len: usize) -> Vec<String> {
+    let text = text.trim_matches(|character| matches!(character, '\r' | '\n'));
+    if text.is_empty() {
+        return Vec::new();
+    }
+
     if text.len() <= max_len {
         return vec![text.to_string()];
     }
@@ -2540,6 +2545,12 @@ mod tests {
     fn test_split_message_short() {
         let chunks = split_message("hello", 420);
         assert_eq!(chunks, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_split_message_trims_protocol_line_boundaries() {
+        assert_eq!(split_message("\r\nhello\r\n", 420), vec!["hello"]);
+        assert!(split_message("\r\n", 420).is_empty());
     }
 
     #[test]
