@@ -62,16 +62,16 @@ Source changes without verification do not qualify as complete.
 
 ---
 
-## Current Status (2026-07-18)
+## Current Status (2026-07-19)
 
-Only **CHPAR-003** currently qualifies as completed and verified under this
-plan's item-level acceptance criteria. Several other items have implementation
-changes but still lack required verification; they must not be reported as
-complete.
+Only **CHPAR-001** and **CHPAR-003** currently qualify as completed and verified
+under this plan's item-level acceptance criteria. Several other items have
+implementation changes but still lack required verification; they must not be
+reported as complete.
 
 | ID | Status | Current finding / remaining gate |
 |----|--------|----------------------------------|
-| CHPAR-001 | [-] In progress | Raw config logging was removed from the shared wrapper and channel guests. Required tracing-capture tests proving sentinel XMPP and WeeChat passwords never appear are still missing. |
+| CHPAR-001 | [x] Completed | Raw config logging was removed from the shared wrapper and channel guests. Captured host logs exclude sentinel XMPP and WeeChat passwords, and the WeeChat startup summary excludes password and endpoint values. |
 | CHPAR-002 | [-] In progress | Explicit `irc.<network>.<target>` WeeChat delivery, validation, chunking, DM fallback, and attachment rejection are implemented. Native unit tests pass. The real-WASM loopback test exists but has not executed locally because the required WASM target/artifact is unavailable. Owner-scoped mission routing is excluded. |
 | CHPAR-003 | [x] Completed | UTF-8-safe byte-budget truncation is implemented and covered for ASCII, two-byte, three-byte, and four-byte input. The WeeChat adapter suite passes. |
 | CHPAR-004 | [-] In progress | Group `AuthRequired` and `AuthCompleted` suppression is implemented. Required mock-relay assertions for DM delivery and zero group sends are missing. |
@@ -86,7 +86,9 @@ complete.
 
 ### Verification recorded in this worktree
 
-- WeeChat adapter unit suite: **28 passed, 0 failed**.
+- WeeChat adapter unit suite: **29 passed, 0 failed**.
+- CHPAR-001 host tracing-capture regression: **1 passed, 0 failed**.
+- Targeted WASM channel setup suite: **6 passed, 0 failed**.
 - Core message-tool unit suite: **25 passed, 0 failed**.
 - Targeted core `cargo check` with `libsql integration`: passed.
 - Core and WeeChat formatting checks: passed.
@@ -103,7 +105,7 @@ complete.
 
 ## CHPAR-001: Remove Secret-Bearing Config Logging
 
-**Status:** [-] Implementation complete; captured-log regression pending
+**Status:** [x] Completed and verified
 
 **Problem:** Raw channel secrets are injected into runtime config for XMPP and
 WeeChat. The shared WASM wrapper logs the merged config at debug level, and the
@@ -131,11 +133,11 @@ can expose `xmpp_password` or `relay_password`.
 
 **Acceptance criteria:**
 
-- [ ] A sentinel XMPP password never appears in captured debug logs.
-- [ ] A sentinel WeeChat relay password never appears in captured debug logs.
+- [x] A sentinel XMPP password never appears in captured debug logs.
+- [x] A sentinel WeeChat relay password never appears in captured debug logs.
 - [x] Safe log output still identifies which channel received runtime updates.
 - [x] Default info-level and opt-in debug-level startup both work in targeted tests.
-- [ ] No secret value is added to snapshots or assertion failure messages.
+- [x] No secret value is added to snapshots or assertion failure messages.
 
 **Required tests:**
 
@@ -144,10 +146,12 @@ can expose `xmpp_password` or `relay_password`.
   the sanitized summary.
 - Run targeted WASM wrapper and setup tests.
 
-**Current finding:** The host now logs only the channel name, key count, and key
-names when runtime config changes. WeeChat and DarkIRC no longer log raw
-`config_json` during startup. This closes the source-level leak, but the two
-sentinel log-capture acceptance tests above are still required before completion.
+**Verification:** The host tracing-capture regression proves that runtime updates
+retain the channel and safe key-name diagnostics without logging sentinel XMPP or
+WeeChat password values. The WeeChat startup summary reports only endpoint
+presence and a validated connection-mode label; its unit test proves that
+password, endpoint, and invalid-mode sentinel values are excluded. The targeted
+wrapper regression, six WASM setup tests, and all 29 WeeChat adapter tests pass.
 
 ---
 
