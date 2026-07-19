@@ -1569,26 +1569,39 @@ async fn real_weechat_component_routes_engine_v2_status_and_proactive_delivery()
     .await
     .expect("Engine V2 should respond through the WeeChat relay");
 
-    for scope in [
-        "weechat:dm:v2:account:libera:trusteduser",
-        "weechat:group:libera:&lunarwing",
+    for (scope, user_id) in [
+        ("weechat:dm:v2:account:libera:trusteduser", "default"),
+        (
+            "weechat:group:libera:&lunarwing",
+            "account:libera:groupuser",
+        ),
     ] {
         let conversation_id = rig
             .database()
-            .get_or_create_scoped_conversation("weechat", "default", scope)
+            .get_or_create_scoped_conversation("weechat", user_id, scope)
             .await
             .expect("real WeeChat scope should resolve");
-        let messages = rig
-            .database()
-            .list_conversation_messages(conversation_id)
-            .await
-            .expect("real WeeChat conversation history should load");
+        let assistant_count = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let messages = rig
+                    .database()
+                    .list_conversation_messages(conversation_id)
+                    .await
+                    .expect("real WeeChat conversation history should load");
+                let assistant_count = messages
+                    .iter()
+                    .filter(|message| message.role == "assistant")
+                    .count();
+                if assistant_count > 0 {
+                    return assistant_count;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("real WeeChat assistant history should be persisted");
         assert_eq!(
-            messages
-                .iter()
-                .filter(|message| message.role == "assistant")
-                .count(),
-            1,
+            assistant_count, 1,
             "DM and group scopes must retain independent terminal responses: {scope}"
         );
     }
