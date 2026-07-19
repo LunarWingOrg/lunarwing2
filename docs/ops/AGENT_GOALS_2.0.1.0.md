@@ -19,7 +19,7 @@
 10. [x] CHPAR-009 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 11. [x] CHPAR-010 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 12. [x] CHPAR-011 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
-13. [ ] CHPAR-012 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
+13. [x] CHPAR-012 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 14. [ ] figure out a way for weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued
 15. [ ] Inspect status of cargo crates and create documented report of any crates that might still need to be updated. Verify if the info dump below is still correct, then write up a document in docs/ops detailing the status: is each piece verifiable? what outstanding issues remain? which points have already been addressed?
     <details>
@@ -105,10 +105,10 @@
     Worker-local MCP, automatic npm/pip installation, secret injection through process environment, a general runtime-adapter refactor, gateway integration, and automatic crash restart all increase the security or lifecycle surface materially. Recommended: implement deactivate/re-enable, diagnostics, registry validation, and integration tests as one contained follow-up. That provides a complete and inspectable host-local lifecycle before introducing another execution placement.
     </details>
 18. [x] dark irc key exchange (checked off cuz wanna get back to this in future release). automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md
-19. [ ] update onboard ui to correspond with changes in codebase since v2.0.0.0 - surely some things have been broken at this point
+19. [ ] update onboard ui to correspond with changes in codebase since v2.0.0.0 - surely some things have been broken at this point - in particular, kawarimi is likely broken now
 20. [ ] update any architecture docs in docs/
 21. [ ] update any bugs docs in docs/bugs
-22. [ ] ensure kawarimi can work for 1.1.2 to 2.0.1.0 - if not, identify potential issues - verify with tag for 1.1.2 on v1 repo. use kawarimi export/import from v2 repo
+22. [ ] ensure kawarimi can work for 1.1.2 to 2.0.1.0 - if not, identify potential issues - verify with tag for 1.1.2 on v1 repo. use kawarimi export/import from v2 repo - v1 repo can be found in user home directory under lunarwing/
 23. [ ] update README.md at repo root
 24. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.1.0 explaining all relevant changes since v2.0.0.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/release for reference as to how to write up this document. The codename for this release is: `Togishi` — The file you write will be RELEASE-v2.0.1.0.md and should be written to the ROOT of the repo.
 25. [ ] Improve accuracy of RELEASE-v2.0.1.0.md
