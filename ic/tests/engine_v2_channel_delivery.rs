@@ -1,8 +1,8 @@
 mod support;
 
 use std::future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,13 +11,14 @@ use rust_decimal::Decimal;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use lunarwing::channels::{IncomingMessage, StatusUpdate};
+use lunarwing::channels::{AttachmentKind, IncomingAttachment, IncomingMessage, StatusUpdate};
 use lunarwing::context::JobContext;
 use lunarwing::error::LlmError;
 use lunarwing::hooks::{Hook, HookContext, HookError, HookEvent, HookOutcome, HookPoint};
 use lunarwing::llm::{
-    CompletionRequest, CompletionResponse, FinishReason, LlmProvider, LlmStream, LlmStreamChunk,
-    Role, TokenUsage, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
+    ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, LlmProvider,
+    LlmStream, LlmStreamChunk, Role, TokenUsage, ToolCall, ToolCompletionRequest,
+    ToolCompletionResponse,
 };
 use lunarwing::tools::{ApprovalRequirement, Tool, ToolError, ToolOutput};
 
@@ -33,6 +34,27 @@ const APPROVAL_CONTEXT_MARKER: &str = "The user explicitly approved this action"
 const OUTBOUND_POINTS: [HookPoint; 1] = [HookPoint::BeforeOutbound];
 
 struct DeterministicStreamingLlm;
+
+#[derive(Default)]
+struct CapturingMultimodalLlm {
+    requests: Mutex<Vec<Vec<ChatMessage>>>,
+}
+
+impl CapturingMultimodalLlm {
+    fn record(&self, messages: &[ChatMessage]) {
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(messages.to_vec());
+    }
+
+    fn captured_requests(&self) -> Vec<Vec<ChatMessage>> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
 
 struct FailingLlm;
 
@@ -55,6 +77,27 @@ struct ApprovalLlm {
 
 struct AuthLlm {
     calls: AtomicUsize,
+}
+
+fn incoming_attachment(
+    kind: AttachmentKind,
+    mime_type: &str,
+    filename: &str,
+    data: Vec<u8>,
+    extracted_text: Option<&str>,
+) -> IncomingAttachment {
+    IncomingAttachment {
+        id: Uuid::new_v4().to_string(),
+        kind,
+        mime_type: mime_type.to_string(),
+        filename: Some(filename.to_string()),
+        size_bytes: Some(data.len() as u64),
+        source_url: Some(format!("https://private.example/{filename}")),
+        storage_key: Some(format!("/srv/lunarwing/private/{filename}")),
+        extracted_text: extracted_text.map(ToString::to_string),
+        data,
+        duration_secs: None,
+    }
 }
 
 impl ApprovalLlm {
@@ -301,6 +344,58 @@ impl LlmProvider for DeterministicStreamingLlm {
         _request: ToolCompletionRequest,
     ) -> Result<LlmStream<'_>, LlmError> {
         Ok(Self::stream())
+    }
+}
+
+#[async_trait]
+impl LlmProvider for CapturingMultimodalLlm {
+    fn model_name(&self) -> &str {
+        "phase6-multimodal-capture"
+    }
+
+    fn cost_per_token(&self) -> (Decimal, Decimal) {
+        (Decimal::ZERO, Decimal::ZERO)
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        self.record(&request.messages);
+        Ok(CompletionResponse {
+            content: DeterministicStreamingLlm::code_response(),
+            input_tokens: 3,
+            output_tokens: 2,
+            finish_reason: FinishReason::Stop,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })
+    }
+
+    async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
+        self.record(&request.messages);
+        Ok(DeterministicStreamingLlm::stream())
+    }
+
+    async fn complete_with_tools(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        self.record(&request.messages);
+        Ok(ToolCompletionResponse {
+            content: Some(DeterministicStreamingLlm::code_response()),
+            tool_calls: Vec::new(),
+            input_tokens: 3,
+            output_tokens: 2,
+            finish_reason: FinishReason::Stop,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })
+    }
+
+    async fn complete_with_tools_stream(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<LlmStream<'_>, LlmError> {
+        self.record(&request.messages);
+        Ok(DeterministicStreamingLlm::stream())
     }
 }
 
@@ -683,6 +778,196 @@ async fn wait_for_engine_completion() {
     .expect("engine thread should complete");
 }
 
+fn captured_user_message(provider: &CapturingMultimodalLlm, marker: &str) -> ChatMessage {
+    provider
+        .captured_requests()
+        .into_iter()
+        .flatten()
+        .find(|message| message.role == Role::User && message.content.contains(marker))
+        .unwrap_or_else(|| panic!("provider request should contain user marker {marker:?}"))
+}
+
+async fn assert_xmpp_image_only_attachment_case() {
+    lunarwing::bridge::reset_engine_state().await;
+
+    let provider = Arc::new(CapturingMultimodalLlm::default());
+    let llm: Arc<dyn LlmProvider> = provider.clone();
+    let rig = TestRigBuilder::new()
+        .with_channel_name("xmpp")
+        .with_llm(llm)
+        .build()
+        .await;
+    let scope = Uuid::new_v4().to_string();
+    let mut message = IncomingMessage::new("xmpp", "test-user", "")
+        .with_conversation_scope(scope.clone())
+        .with_metadata(serde_json::json!({"xmpp_target": "alice@example.org"}));
+    message.attachments.push(incoming_attachment(
+        AttachmentKind::Image,
+        "image/png",
+        "image-only.png",
+        vec![1, 2, 3],
+        None,
+    ));
+
+    rig.send_incoming(message).await;
+    let responses = rig.wait_for_responses(1, Duration::from_secs(10)).await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].content, TERMINAL_RESPONSE);
+
+    let provider_message = captured_user_message(&provider, "image-only.png");
+    assert!(!provider_message.content.trim().is_empty());
+    assert!(!provider_message.content.contains("private.example"));
+    assert!(!provider_message.content.contains("/srv/lunarwing/private/"));
+    assert_eq!(provider_message.content_parts.len(), 1);
+    match &provider_message.content_parts[0] {
+        ContentPart::ImageUrl { image_url } => {
+            assert_eq!(image_url.url, "data:image/png;base64,AQID");
+        }
+        other => panic!("expected provider-native image content, got {other:?}"),
+    }
+
+    let conversation_id = rig
+        .database()
+        .get_or_create_scoped_conversation("xmpp", "test-user", &scope)
+        .await
+        .expect("scoped conversation should resolve");
+    let history = rig
+        .database()
+        .list_conversation_messages(conversation_id)
+        .await
+        .expect("history should load");
+    let persisted = history
+        .iter()
+        .find(|entry| entry.role == "user")
+        .expect("compatibility history should contain the user message");
+    assert_eq!(persisted.content, provider_message.content);
+    assert!(!persisted.content.contains("data:image"));
+    assert!(!persisted.content.contains("AQID"));
+
+    rig.shutdown_and_wait().await;
+    lunarwing::bridge::reset_engine_state().await;
+}
+
+async fn assert_xmpp_mixed_attachment_case() {
+    lunarwing::bridge::reset_engine_state().await;
+
+    let provider = Arc::new(CapturingMultimodalLlm::default());
+    let llm: Arc<dyn LlmProvider> = provider.clone();
+    let rig = TestRigBuilder::new()
+        .with_channel_name("xmpp")
+        .with_llm(llm)
+        .build()
+        .await;
+    let scope = Uuid::new_v4().to_string();
+    let mut message = IncomingMessage::new("xmpp", "test-user", "review mixed attachments")
+        .with_conversation_scope(scope.clone())
+        .with_metadata(serde_json::json!({"xmpp_target": "alice@example.org"}));
+    message.attachments = vec![
+        incoming_attachment(
+            AttachmentKind::Document,
+            "application/pdf",
+            "report.pdf",
+            vec![9],
+            Some("DOCUMENT_SENTINEL"),
+        ),
+        incoming_attachment(
+            AttachmentKind::Audio,
+            "audio/ogg",
+            "voice.ogg",
+            vec![8],
+            Some("AUDIO_SENTINEL"),
+        ),
+        incoming_attachment(
+            AttachmentKind::Image,
+            "image/png",
+            "chart.png",
+            vec![4, 5, 6],
+            None,
+        ),
+    ];
+
+    rig.send_incoming(message).await;
+    let responses = rig.wait_for_responses(1, Duration::from_secs(10)).await;
+    assert_eq!(responses.len(), 1);
+
+    let provider_message = captured_user_message(&provider, "DOCUMENT_SENTINEL");
+    assert_eq!(
+        provider_message
+            .content
+            .matches("DOCUMENT_SENTINEL")
+            .count(),
+        1
+    );
+    assert_eq!(
+        provider_message.content.matches("AUDIO_SENTINEL").count(),
+        1
+    );
+    assert_eq!(provider_message.content_parts.len(), 1);
+    assert!(!provider_message.content.contains("private.example"));
+    assert!(!provider_message.content.contains("/srv/lunarwing/private/"));
+    match &provider_message.content_parts[0] {
+        ContentPart::ImageUrl { image_url } => {
+            assert_eq!(image_url.url, "data:image/png;base64,BAUG");
+        }
+        other => panic!("expected provider-native image content, got {other:?}"),
+    }
+
+    let conversation_id = rig
+        .database()
+        .get_or_create_scoped_conversation("xmpp", "test-user", &scope)
+        .await
+        .expect("scoped conversation should resolve");
+    let history = rig
+        .database()
+        .list_conversation_messages(conversation_id)
+        .await
+        .expect("history should load");
+    let persisted = history
+        .iter()
+        .find(|entry| entry.role == "user")
+        .expect("compatibility history should contain the user message");
+    assert_eq!(persisted.content, provider_message.content);
+    assert_eq!(persisted.content.matches("DOCUMENT_SENTINEL").count(), 1);
+    assert_eq!(persisted.content.matches("AUDIO_SENTINEL").count(), 1);
+    assert!(!persisted.content.contains("data:image"));
+    assert!(!persisted.content.contains("BAUG"));
+
+    rig.shutdown_and_wait().await;
+    lunarwing::bridge::reset_engine_state().await;
+}
+
+async fn assert_attachment_secret_scan_case() {
+    lunarwing::bridge::reset_engine_state().await;
+
+    let provider = Arc::new(CapturingMultimodalLlm::default());
+    let llm: Arc<dyn LlmProvider> = provider.clone();
+    let rig = TestRigBuilder::new()
+        .with_channel_name("xmpp")
+        .with_llm(llm)
+        .build()
+        .await;
+    let mut message = IncomingMessage::new("xmpp", "test-user", "review this document")
+        .with_conversation_scope(Uuid::new_v4().to_string())
+        .with_metadata(serde_json::json!({"xmpp_target": "alice@example.org"}));
+    message.attachments.push(incoming_attachment(
+        AttachmentKind::Document,
+        "text/plain",
+        "credentials.txt",
+        Vec::new(),
+        Some("AKIAIOSFODNN7EXAMPLE"),
+    ));
+
+    rig.send_incoming(message).await;
+    let responses = rig.wait_for_responses(1, Duration::from_secs(10)).await;
+    assert_eq!(responses.len(), 1);
+    assert!(responses[0].content.contains("appears to contain a secret"));
+    assert!(provider.captured_requests().is_empty());
+    assert!(engine_threads_for_user().await.is_empty());
+
+    rig.shutdown_and_wait().await;
+    lunarwing::bridge::reset_engine_state().await;
+}
+
 async fn assert_hook_case(behavior: HookBehavior, expected_response: Option<&str>) {
     lunarwing::bridge::reset_engine_state().await;
 
@@ -765,9 +1050,17 @@ async fn assert_stopped_case() {
     tokio::time::timeout(Duration::from_secs(2), pending.started.notified())
         .await
         .expect("provider stream should start");
-    let interrupt = IncomingMessage::new("xmpp", "test-user", "/interrupt")
+    let control_sentinel = "INTERRUPT_ATTACHMENT_MUST_NOT_ENTER_HISTORY";
+    let mut interrupt = IncomingMessage::new("xmpp", "test-user", "/interrupt")
         .with_conversation_scope(scope.clone())
         .with_metadata(metadata);
+    interrupt.attachments.push(incoming_attachment(
+        AttachmentKind::Document,
+        "text/plain",
+        "interrupt.txt",
+        Vec::new(),
+        Some(control_sentinel),
+    ));
     rig.send_incoming(interrupt).await;
 
     let responses = rig.wait_for_responses(1, Duration::from_secs(2)).await;
@@ -799,6 +1092,11 @@ async fn assert_stopped_case() {
             .filter(|message| message.role == "assistant")
             .count(),
         0
+    );
+    assert!(
+        messages
+            .iter()
+            .all(|message| !message.content.contains(control_sentinel))
     );
 
     rig.shutdown_and_wait().await;
@@ -922,9 +1220,17 @@ async fn assert_approval_case() {
         1
     );
 
-    let approval = IncomingMessage::new("xmpp", "test-user", "yes")
+    let control_sentinel = "APPROVAL_ATTACHMENT_MUST_NOT_ENTER_HISTORY";
+    let mut approval = IncomingMessage::new("xmpp", "test-user", "yes")
         .with_conversation_scope(scope.clone())
         .with_metadata(metadata);
+    approval.attachments.push(incoming_attachment(
+        AttachmentKind::Document,
+        "text/plain",
+        "approval.txt",
+        Vec::new(),
+        Some(control_sentinel),
+    ));
     rig.send_incoming(approval).await;
     wait_for_approval_completion_or_replay(&rig).await;
     assert_eq!(
@@ -957,6 +1263,11 @@ async fn assert_approval_case() {
             .filter(|message| message.role == "assistant")
             .count(),
         1
+    );
+    assert!(
+        messages
+            .iter()
+            .all(|message| !message.content.contains(control_sentinel))
     );
 
     rig.shutdown_and_wait().await;
@@ -1013,9 +1324,17 @@ async fn assert_auth_case() {
     );
 
     let sentinel = "phase5_auth_token_not_for_history";
-    let token = IncomingMessage::new("xmpp", "test-user", sentinel)
+    let attachment_sentinel = "AUTH_ATTACHMENT_MUST_NOT_ENTER_HISTORY";
+    let mut token = IncomingMessage::new("xmpp", "test-user", sentinel)
         .with_conversation_scope(scope_a)
         .with_metadata(metadata_a);
+    token.attachments.push(incoming_attachment(
+        AttachmentKind::Document,
+        "text/plain",
+        "auth.txt",
+        Vec::new(),
+        Some(attachment_sentinel),
+    ));
     rig.send_incoming(token).await;
     let responses = rig.wait_for_responses(1, Duration::from_secs(10)).await;
     assert_eq!(responses.len(), 1);
@@ -1046,7 +1365,8 @@ async fn assert_auth_case() {
         assert!(
             messages
                 .iter()
-                .all(|message| !message.content.contains(sentinel))
+                .all(|message| !message.content.contains(sentinel)
+                    && !message.content.contains(attachment_sentinel))
         );
         let assistant_count = messages
             .iter()
@@ -1064,7 +1384,9 @@ async fn assert_auth_case() {
             message
                 .get("content")
                 .and_then(serde_json::Value::as_str)
-                .is_none_or(|content| !content.contains(sentinel))
+                .is_none_or(|content| {
+                    !content.contains(sentinel) && !content.contains(attachment_sentinel)
+                })
         }));
     }
 
@@ -1132,6 +1454,9 @@ async fn engine_v2_channel_delivery_matrix() {
     assert_legacy_case("telegram", "telegram:dm:alice").await;
 
     env.set_channels(Some("xmpp"));
+    assert_xmpp_image_only_attachment_case().await;
+    assert_xmpp_mixed_attachment_case().await;
+    assert_attachment_secret_scan_case().await;
     assert_hook_case(HookBehavior::Modify, Some("modified-by-hook")).await;
     assert_hook_case(HookBehavior::Reject, None).await;
     assert_error_case().await;

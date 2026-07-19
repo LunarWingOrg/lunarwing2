@@ -64,10 +64,10 @@ Source changes without verification do not qualify as complete.
 
 ## Current Status (2026-07-19)
 
-Only **CHPAR-001**, **CHPAR-003**, and **CHPAR-005** currently qualify as
-completed and verified under this plan's item-level acceptance criteria.
-Several other items have implementation changes but still lack required
-verification; they must not be reported as complete.
+Only **CHPAR-001**, **CHPAR-003**, **CHPAR-004**, **CHPAR-005**, and
+**CHPAR-006** currently qualify as completed and verified under this plan's
+item-level acceptance criteria. Several other items have implementation changes
+but still lack required verification; they must not be reported as complete.
 
 | ID | Status | Current finding / remaining gate |
 |----|--------|----------------------------------|
@@ -76,7 +76,7 @@ verification; they must not be reported as complete.
 | CHPAR-003 | [x] Completed | UTF-8-safe byte-budget truncation is implemented and covered for ASCII, two-byte, three-byte, and four-byte input. The WeeChat adapter suite passes. |
 | CHPAR-004 | [x] Completed | Group `AuthRequired` and `AuthCompleted` suppression is extracted into pure host-binding-free helpers (`should_suppress_auth_status`, `auth_status_suppression_log`) and covered by 9 native unit tests proving group suppress, DM deliver, approval/job-started deliver, and URL/state absence from logs. The weechat_relay adapter suite passes 49/49. |
 | CHPAR-005 | [x] Completed | Fresh installs default to `pairing`; persisted policy is preserved unless setup supplies an explicit override. Unknown policies fail closed. Default, precedence, sender-policy, setup-marker, and pairing request/repeat/approval fixtures pass. |
-| CHPAR-006 | [!] Decision required | An exploratory implementation was reverted. Findings now identify the auth-gate-safe augmentation point, required engine propagation paths, and an unresolved binary-persistence boundary for provider-native image parts. No acceptance criterion is complete. |
+| CHPAR-006 | [x] Completed | Engine V2 now augments only ordinary user input after auth/control parsing, carries raw images as redacted non-serializing engine parts, maps them to provider-native content at the LLM boundary, and persists sanitized effective text without binary payloads. Image-only, mixed document/audio/image, secret-scan, control, auth, history, limit, spawn/inject/resume, and provider-adapter tests pass. |
 | CHPAR-007 | [ ] Not started | No implementation or tests. |
 | CHPAR-008 | [!] Deferred | Numeric `wasm_channel_owner_ids` and existing 1.1.2 persistence/identity behavior are intentionally unchanged. Requires a separate migration and rollback design. |
 | CHPAR-009 | [ ] Not started | No real DarkIRC WASM + Engine V2 fixture exists. |
@@ -90,6 +90,11 @@ verification; they must not be reported as complete.
 - CHPAR-001 host tracing-capture regression: **1 passed, 0 failed**.
 - Targeted WASM channel setup suite: **6 passed, 0 failed**.
 - Core message-tool unit suite: **25 passed, 0 failed**.
+- CHPAR-006 Engine transient/orchestrator path tests: **4 passed, 0 failed**.
+- CHPAR-006 attachment helper, provider adapter, and host-limit tests:
+  **15 passed, 0 failed**.
+- Engine V2 channel-delivery matrix with attachment and control cases:
+  **1 passed, 0 failed**.
 - Targeted core `cargo check` with `libsql integration`: passed.
 - Core and WeeChat formatting checks: passed.
 - Real WeeChat WASM execution: **not run**. The build attempt failed because
@@ -446,7 +451,7 @@ guest sends instructions only when the store reports a newly created request.
 
 ## CHPAR-006: Pass Attachments into Engine V2
 
-**Status:** [!] Not started; input-contract design required
+**Status:** [x] Completed and verified
 
 **Problem:** Engine V2 routing occurs before legacy attachment augmentation.
 XMPP can emit attachments, but Engine V2 receives only original text. Image-only
@@ -478,7 +483,14 @@ not attached to the current engine prompt.
 Option B is the complete design. Option A can deliver extracted text first but
 must not be called full attachment parity until image content is also supported.
 
-**Exploratory implementation findings (2026-07-19; code reverted):**
+**Implemented design:** Option B, with provider-bound transient storage.
+`ThreadMessage` carries typed `TransientContentPart::Image` values in memory.
+Both the bytes and their opaque lookup ID use `#[serde(skip)]`; debug output
+reports only MIME type and byte count. The orchestrator carries only the random
+lookup ID through its JSON working transcript, and `LlmBridgeAdapter` performs
+base64/data-URL conversion at the provider boundary.
+
+**Implementation findings (2026-07-19):**
 
 1. The current Engine V2 branch occurs after submission parsing and inbound
    hooks but before legacy `augment_with_attachments()`. Augmentation must remain
@@ -498,11 +510,10 @@ must not be called full attachment parity until image content is also supported.
    paths: new thread spawn, injection into a running thread, and resume of a
    suspended thread. Conversation history reconstruction is another separate
    text-only path and must have deliberate replay semantics.
-4. `ThreadMessage` and containing engine state are serializable. Adding data-URL
-   image parts directly to that type would make binary payload persistence a
-   default side effect. The design must decide how parts remain provider-bound,
-   bounded, and excluded from durable engine state and traces, rather than only
-   adding `#[serde(default)]` for compatibility.
+4. `ThreadMessage` and containing engine state are serializable. The implemented
+   transient fields are skipped by serde and use a redacted `Debug`
+   representation, so durable thread state, runtime checkpoints, and traces do
+   not gain image bytes or data URLs.
 5. Engine conversation entries and the V1 compatibility dual-write currently
    persist the original text. They should receive the sanitized effective text
    exactly once, while provider-only image data must not enter either history.
@@ -510,10 +521,10 @@ must not be called full attachment parity until image content is also supported.
    sanitized attachment representation can provide the non-empty effective text,
    but safety and secret scans must inspect that effective text after auth-gate
    handling so extracted content is checked without changing control parsing.
-7. A temporary capturing-provider integration fixture was prepared, but its run
-   was intentionally stopped when implementation scope changed and all spike
-   code was removed. These findings are design evidence only; none of the
-   CHPAR-006 acceptance criteria should be marked complete.
+7. A capturing-provider integration fixture now proves image-only and mixed
+   XMPP input through the full Engine V2 agent loop. Control-bearing attachments
+   also exposed and fixed an auth fallback bug where `..message.clone()` carried
+   credential-reply attachments into the retried user request.
 
 **Likely files:**
 
@@ -529,14 +540,14 @@ must not be called full attachment parity until image content is also supported.
 
 **Acceptance criteria:**
 
-- [ ] XMPP image-only input is not rejected as empty.
-- [ ] Extracted document text appears exactly once in the Engine V2 prompt.
-- [ ] Audio transcription appears exactly once in the Engine V2 prompt.
-- [ ] Image bytes or provider-native image content reach a multimodal-capable
+- [x] XMPP image-only input is not rejected as empty.
+- [x] Extracted document text appears exactly once in the Engine V2 prompt.
+- [x] Audio transcription appears exactly once in the Engine V2 prompt.
+- [x] Image bytes or provider-native image content reach a multimodal-capable
   provider.
-- [ ] Approval/auth/control submissions retain current parsing and secrecy.
-- [ ] Attachment limits and leak scans remain enforced.
-- [ ] V1 compatibility history contains no duplicated binary payload.
+- [x] Approval/auth/control submissions retain current parsing and secrecy.
+- [x] Attachment limits and leak scans remain enforced.
+- [x] V1 compatibility history contains no duplicated binary payload.
 
 **Required tests:**
 
@@ -545,6 +556,16 @@ must not be called full attachment parity until image content is also supported.
 - Mixed text plus multiple attachments test.
 - Approval/auth input with an attachment does not enter normal model history.
 - Provider adapter assertion for image content parts.
+
+**Current finding:** Sanitized `<attachments>` text is produced after original
+submission and pending-auth handling, then validated by the normal safety,
+policy, and inbound-secret checks. New threads, running-thread injection, and
+suspended-thread resume preserve transient image parts through the Python
+orchestrator by opaque ID. Compatibility and engine conversation history store
+the effective sanitized text exactly once. Source URLs, host storage paths, raw
+bytes, and provider data URLs are absent from durable history. A process restart
+cannot replay transient image bytes; sanitized attachment text remains and the
+user must resend an image when visual content is needed after restart.
 
 ---
 

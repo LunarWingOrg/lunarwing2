@@ -16,7 +16,7 @@ use crate::runtime::messaging::ThreadOutcome;
 use crate::traits::store::Store;
 use crate::types::conversation::{ConversationEntry, ConversationId, ConversationSurface};
 use crate::types::error::EngineError;
-use crate::types::message::ThreadMessage;
+use crate::types::message::{ThreadMessage, TransientContentPart};
 use crate::types::project::ProjectId;
 use crate::types::thread::{ThreadConfig, ThreadId, ThreadState, ThreadType};
 
@@ -127,6 +127,49 @@ impl ConversationManager {
         thread_config: ThreadConfig,
         preferred_thread_id: Option<ThreadId>,
     ) -> Result<ThreadId, EngineError> {
+        self.handle_user_thread_message(
+            conversation_id,
+            ThreadMessage::user(content),
+            project_id,
+            user_id,
+            thread_config,
+            preferred_thread_id,
+        )
+        .await
+    }
+
+    /// Handle user text with provider-bound multimodal content.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_user_message_with_parts(
+        &self,
+        conversation_id: ConversationId,
+        content: &str,
+        transient_content_parts: Vec<TransientContentPart>,
+        project_id: ProjectId,
+        user_id: &str,
+        thread_config: ThreadConfig,
+        preferred_thread_id: Option<ThreadId>,
+    ) -> Result<ThreadId, EngineError> {
+        self.handle_user_thread_message(
+            conversation_id,
+            ThreadMessage::user_with_transient_parts(content, transient_content_parts),
+            project_id,
+            user_id,
+            thread_config,
+            preferred_thread_id,
+        )
+        .await
+    }
+
+    async fn handle_user_thread_message(
+        &self,
+        conversation_id: ConversationId,
+        user_message: ThreadMessage,
+        project_id: ProjectId,
+        user_id: &str,
+        thread_config: ThreadConfig,
+        preferred_thread_id: Option<ThreadId>,
+    ) -> Result<ThreadId, EngineError> {
         let mut convs = self.conversations.write().await;
         let conv = convs.get_mut(&conversation_id).ok_or(EngineError::Store {
             reason: format!("conversation {conversation_id} not found"),
@@ -141,7 +184,7 @@ impl ConversationManager {
         }
 
         // Record the user entry
-        conv.add_entry(ConversationEntry::user(content));
+        conv.add_entry(ConversationEntry::user(&user_message.content));
 
         // Check for an active foreground thread
         let active_foreground = self.find_active_foreground(conv).await;
@@ -154,7 +197,7 @@ impl ConversationManager {
                     "injecting message into active thread"
                 );
                 self.thread_manager
-                    .inject_message(thread_id, user_id, ThreadMessage::user(content))
+                    .inject_message(thread_id, user_id, user_message)
                     .await?;
                 self.store.save_conversation(conv).await?;
                 Ok(thread_id)
@@ -166,13 +209,7 @@ impl ConversationManager {
                     "resuming suspended foreground thread"
                 );
                 self.thread_manager
-                    .resume_thread(
-                        thread_id,
-                        user_id,
-                        Some(ThreadMessage::user(content)),
-                        None,
-                        None,
-                    )
+                    .resume_thread(thread_id, user_id, Some(user_message), None, None)
                     .await?;
                 conv.add_entry(ConversationEntry::system_for_thread(
                     thread_id,
@@ -188,8 +225,8 @@ impl ConversationManager {
                 // Spawn new foreground thread with conversation history
                 let thread_id = self
                     .thread_manager
-                    .spawn_thread_with_history(
-                        content, // use message as goal
+                    .spawn_thread_with_history_and_message(
+                        user_message,
                         ThreadType::Foreground,
                         project_id,
                         thread_config,
@@ -722,9 +759,13 @@ mod tests {
         }
 
         let resumed = cm
-            .handle_user_message(
+            .handle_user_message_with_parts(
                 conv_id,
                 "continue from there",
+                vec![TransientContentPart::Image {
+                    mime_type: "image/png".to_string(),
+                    data: vec![1, 2, 3],
+                }],
                 project,
                 "user1",
                 ThreadConfig::default(),
@@ -736,6 +777,13 @@ mod tests {
         assert_eq!(resumed, thread.id);
         let outcome = tm.join_thread(thread.id).await.unwrap();
         assert!(matches!(outcome, ThreadOutcome::Completed { .. }));
+        let saved = store.load_thread(thread.id).await.unwrap().unwrap();
+        let resumed_message = saved
+            .messages
+            .iter()
+            .find(|message| message.content == "continue from there")
+            .expect("resumed message should be retained");
+        assert_eq!(resumed_message.transient_content_parts.len(), 1);
     }
 
     #[tokio::test]

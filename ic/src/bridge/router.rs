@@ -1900,6 +1900,10 @@ pub async fn resolve_gate(
                         channel: pending.source_channel.clone(),
                         user_id: pending.user_id.clone(),
                         metadata: message.metadata.clone(),
+                        // The current message is a credential response. Its
+                        // attachments are control-path input and must not be
+                        // grafted onto the original user request during retry.
+                        attachments: Vec::new(),
                         ..message.clone()
                     };
                     drop(guard);
@@ -2465,7 +2469,14 @@ async fn handle_with_engine_inner(
         ));
     }
 
-    let validation = agent.safety().validate_input(content);
+    // Submission parsing and pending-auth handling use the original text above.
+    // Only ordinary user input reaches this point, where attachment context can
+    // safely become part of the model-visible text.
+    let augmented_content =
+        crate::agent::attachments::augment_text_with_attachments(content, &message.attachments);
+    let effective_content = augmented_content.as_deref().unwrap_or(content);
+
+    let validation = agent.safety().validate_input(effective_content);
     if !validation.is_valid {
         let details = validation
             .errors
@@ -2478,7 +2489,7 @@ async fn handle_with_engine_inner(
         )));
     }
 
-    let violations = agent.safety().check_policy(content);
+    let violations = agent.safety().check_policy(effective_content);
     if violations
         .iter()
         .any(|rule| rule.action == crate::safety::PolicyAction::Block)
@@ -2486,7 +2497,7 @@ async fn handle_with_engine_inner(
         return Ok(Some("Input rejected by safety policy.".into()));
     }
 
-    if let Some(warning) = agent.safety().scan_inbound_for_secrets(content) {
+    if let Some(warning) = agent.safety().scan_inbound_for_secrets(effective_content) {
         tracing::warn!(
             user_id = %message.user_id,
             channel = %message.channel,
@@ -2552,10 +2563,13 @@ async fn handle_with_engine_inner(
 
     // Subscribe before execution starts: broadcast receivers do not replay
     // deltas that were sent before they were created.
+    let transient_content_parts =
+        crate::agent::attachments::engine_transient_content_parts(&message.attachments);
     let (thread_id, event_rx) = handle_user_message_with_event_receiver(
         state,
         conv_id,
-        content,
+        effective_content,
+        transient_content_parts,
         project_id,
         &message.user_id,
         thread_config,
@@ -2567,7 +2581,9 @@ async fn handle_with_engine_inner(
     if let Some(ref db) = state.db
         && let Some(cid) = resolve_v1_conversation_for_message(db.as_ref(), message).await
     {
-        let _ = db.add_conversation_message(cid, "user", content).await;
+        let _ = db
+            .add_conversation_message(cid, "user", effective_content)
+            .await;
     }
 
     debug!(thread_id = %thread_id, "engine v2: thread spawned");
@@ -2578,6 +2594,7 @@ async fn handle_user_message_with_event_receiver(
     state: &EngineState,
     conversation_id: lunarwing_engine::ConversationId,
     content: &str,
+    transient_content_parts: Vec<lunarwing_engine::TransientContentPart>,
     project_id: lunarwing_engine::ProjectId,
     user_id: &str,
     thread_config: ThreadConfig,
@@ -2592,9 +2609,10 @@ async fn handle_user_message_with_event_receiver(
     let event_rx = state.thread_manager.subscribe_events();
     let thread_id = state
         .conversation_manager
-        .handle_user_message(
+        .handle_user_message_with_parts(
             conversation_id,
             content,
+            transient_content_parts,
             project_id,
             user_id,
             thread_config,
@@ -5425,6 +5443,7 @@ mod tests {
             &state,
             conversation_id,
             "reply immediately",
+            Vec::new(),
             state.default_project_id,
             "alice",
             lunarwing_engine::ThreadConfig::default(),

@@ -558,6 +558,8 @@ mod tests {
         thread.add_message(ThreadMessage {
             role: crate::types::message::MessageRole::ActionResult,
             content: "result".into(),
+            transient_content_parts: Vec::new(),
+            transient_content_id: None,
             provenance: crate::types::provenance::Provenance::ToolOutput {
                 action_name: "shell".into(),
             },
