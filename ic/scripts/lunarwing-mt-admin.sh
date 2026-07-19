@@ -2464,12 +2464,15 @@ write_tenant_lunarwing_env() {
   # tenant's encrypted DB secrets (it is the AES-256-GCM vault key); rotating the
   # tokens would break live clients/workers; minting a fresh XMPP_PASSWORD would
   # break the already-registered XMPP account. Generate fresh ONLY on first write.
-  local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password
+  local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password darkirc_adapter_secret
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
   relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
   secrets_key="$(_env_existing "$path" SECRETS_MASTER_KEY)";     secrets_key="${secrets_key:-$(generate_token)}"
   webhook_secret="$(_env_existing "$path" HTTP_WEBHOOK_SECRET)"; webhook_secret="${webhook_secret:-$(generate_token)}"
+  if tenant_darkirc_enabled "$name"; then
+    darkirc_adapter_secret="$(_env_existing "$path" DARKIRC_ADAPTER_SECRET)"
+  fi
   # XMPP password: an explicit --xmpp-password wins; else preserve an existing one;
   # else mint a fresh one (first-time provision).
   [[ -n "$xmpp_password" ]] || { xmpp_password="$(_env_existing "$path" XMPP_PASSWORD)"; xmpp_password="${xmpp_password:-$(generate_token | cut -c1-32)}"; }
@@ -2620,9 +2623,8 @@ RUST_LOG=lunarwing=info
 ENVEOF
   )
   if tenant_darkirc_enabled "$name"; then
-    local darkirc_adapter_port darkirc_adapter_secret
+    local darkirc_adapter_port
     darkirc_adapter_port="$(ports_get "$name" darkirc_adapter)" || true
-    darkirc_adapter_secret="$(_env_existing "$path" DARKIRC_ADAPTER_SECRET)"
     darkirc_adapter_secret="${darkirc_adapter_secret:-$(generate_token | cut -c1-32)}"
     printf '\nDARKIRC_ADAPTER_URL=http://127.0.0.1:%s\nDARKIRC_ADAPTER_SECRET=%s\n' \
       "$darkirc_adapter_port" "$darkirc_adapter_secret" >> "$path"
@@ -6457,11 +6459,17 @@ _ssh_ready_summary() {
   say "  verify:       curl -s http://127.0.0.1:${http_port}/agent/status | jq"
 }
 
-# Poll the tenant gateway's /agent/status until reachable (up to ~30s).
+# Poll the authenticated tenant gateway until reachable (up to ~30s).
 _wait_tenant_gateway() {
-  local name="$1" http_port i=0
-  http_port="$(ports_get "$name" http)"
-  while ! curl -sf --max-time 2 "http://127.0.0.1:${http_port}/agent/status" >/dev/null 2>&1; do
+  local name="$1" env_path gateway_port gateway_token auth_header i=0
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  gateway_port="$(ports_get "$name" gateway)"
+  gateway_token="$(grep -s '^GATEWAY_AUTH_TOKEN=' "$env_path" | cut -d= -f2- || true)"
+  [[ -n "$gateway_token" ]] || return 1
+  auth_header="Authorization: Bearer ${gateway_token}"
+  while ! curl -sf --max-time 2 \
+    -K <(printf 'header = "%s"\n' "$auth_header") \
+    "http://127.0.0.1:${gateway_port}/api/gateway/status" >/dev/null 2>&1; do
     i=$((i + 1))
     [[ $i -lt 15 ]] || return 1
     sleep 2

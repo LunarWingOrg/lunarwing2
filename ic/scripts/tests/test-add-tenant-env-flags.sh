@@ -92,7 +92,8 @@ ports_get() {  # <name> <service>
 
 # Stub tenant_pg_password, tenant_darkirc_enabled, generate_token, say, chown.
 tenant_pg_password()      { echo "pgpass-fixture"; }
-tenant_darkirc_enabled()  { return 1; }   # darkirc disabled in fixture
+DARKIRC_FIXTURE_ENABLED=false
+tenant_darkirc_enabled()  { [[ "$DARKIRC_FIXTURE_ENABLED" == "true" ]]; }
 generate_token()          { echo "token-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; }
 say()                     { :; }          # silence
 chown()                   { :; }          # no-op (running as non-root in tests)
@@ -134,6 +135,14 @@ write_tenant_lunarwing_env fixture-tenant \
 assert_eq "rerun preserves LLM_MODEL" "$(envval LLM_MODEL)" "glm-5-air"
 assert_eq "rerun preserves GATEWAY_HOST" "$(envval GATEWAY_HOST)" "0.0.0.0"
 assert_eq "rerun preserves XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmpp.localhost,admin@xmpp.org"
+
+# Case 4: a DarkIRC-enabled re-render must preserve the existing adapter secret.
+DARKIRC_FIXTURE_ENABLED=true
+printf '\nDARKIRC_ADAPTER_SECRET=preserved-darkirc-fixture\n' >>"$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "rerun preserves DARKIRC_ADAPTER_SECRET" \
+  "$(envval DARKIRC_ADAPTER_SECRET)" "preserved-darkirc-fixture"
+DARKIRC_FIXTURE_ENABLED=false
 
 echo "=== write_tenant_bridge_env fixture tests ==="
 
