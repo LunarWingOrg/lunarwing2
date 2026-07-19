@@ -64,10 +64,10 @@ Source changes without verification do not qualify as complete.
 
 ## Current Status (2026-07-19)
 
-Only **CHPAR-001** and **CHPAR-003** currently qualify as completed and verified
-under this plan's item-level acceptance criteria. Several other items have
-implementation changes but still lack required verification; they must not be
-reported as complete.
+Only **CHPAR-001**, **CHPAR-003**, and **CHPAR-005** currently qualify as
+completed and verified under this plan's item-level acceptance criteria.
+Several other items have implementation changes but still lack required
+verification; they must not be reported as complete.
 
 | ID | Status | Current finding / remaining gate |
 |----|--------|----------------------------------|
@@ -75,8 +75,8 @@ reported as complete.
 | CHPAR-002 | [-] In progress | Explicit `irc.<network>.<target>` WeeChat delivery, validation, chunking, DM fallback, and attachment rejection are implemented. Native unit tests pass. The real-WASM loopback test exists but has not executed locally because the required WASM target/artifact is unavailable. Owner-scoped mission routing is excluded. |
 | CHPAR-003 | [x] Completed | UTF-8-safe byte-budget truncation is implemented and covered for ASCII, two-byte, three-byte, and four-byte input. The WeeChat adapter suite passes. |
 | CHPAR-004 | [-] In progress | Group `AuthRequired` and `AuthCompleted` suppression is implemented. Required mock-relay assertions for DM delivery and zero group sends are missing. |
-| CHPAR-005 | [-] In progress | New-install defaults, capabilities, example config, fail-closed policy handling, and docs use `pairing`. Config tests pass. Pairing approval and persisted-upgrade fixtures are missing. |
-| CHPAR-006 | [!] Decision required | No implementation started. The Engine V2 multimodal input contract remains undecided. |
+| CHPAR-005 | [x] Completed | Fresh installs default to `pairing`; persisted policy is preserved unless setup supplies an explicit override. Unknown policies fail closed. Default, precedence, sender-policy, setup-marker, and pairing request/repeat/approval fixtures pass. |
+| CHPAR-006 | [!] Decision required | An exploratory implementation was reverted. Findings now identify the auth-gate-safe augmentation point, required engine propagation paths, and an unresolved binary-persistence boundary for provider-native image parts. No acceptance criterion is complete. |
 | CHPAR-007 | [ ] Not started | No implementation or tests. |
 | CHPAR-008 | [!] Deferred | Numeric `wasm_channel_owner_ids` and existing 1.1.2 persistence/identity behavior are intentionally unchanged. Requires a separate migration and rollback design. |
 | CHPAR-009 | [ ] Not started | No real DarkIRC WASM + Engine V2 fixture exists. |
@@ -352,7 +352,7 @@ delivery and zero group requests, so this item is not complete.
 
 ## CHPAR-005: Change the WeeChat New-Install DM Default to Pairing
 
-**Status:** [-] Implementation complete; pairing and upgrade fixtures pending
+**Status:** [x] Completed
 
 **Problem:** Source comments and setup text describe `pairing` as the default,
 but the implementation, capabilities config, and example adapter config use
@@ -386,11 +386,11 @@ not be silently rewritten during upgrade.
 
 **Acceptance criteria:**
 
-- [ ] A fresh setup with no policy accepts no unpaired DM into the agent loop.
-- [ ] The sender receives pairing instructions once per new request.
-- [ ] Pairing approval allows subsequent messages.
-- [ ] An existing explicit `open` deployment remains open after upgrade.
-- [ ] An invalid policy value fails closed and emits an actionable warning.
+- [x] A fresh setup with no policy accepts no unpaired DM into the agent loop.
+- [x] The sender receives pairing instructions once per new request.
+- [x] Pairing approval allows subsequent messages.
+- [x] An existing explicit `open` deployment remains open after upgrade.
+- [x] An invalid policy value fails closed and emits an actionable warning.
 
 **Required tests:**
 
@@ -399,11 +399,14 @@ not be silently rewritten during upgrade.
 - Upgrade fixture proving explicit persisted values are preserved.
 
 **Current finding:** `default_dm_policy()`, the capabilities config, and the
-example adapter config now use `pairing`; unknown policy strings reject the
-sender with a warning. Three tests verify those shipped defaults. Existing
-explicit values still flow through the existing precedence paths, but an actual
-persisted `open` upgrade fixture and end-to-end pairing approval test have not
-been added.
+example adapter config use `pairing`; unknown policy strings reject the sender
+with an actionable warning. Startup preserves a persisted policy unless the host
+marks `dm_policy` as an explicit setup override, so an upgraded deployment with
+persisted `open` remains open while a fresh deployment resolves to `pairing`.
+Fixtures cover shipped defaults, fresh and persisted precedence, explicit
+override precedence, approved and unapproved sender policy, host setup-marker
+injection, and the shared pairing-store request/repeat/approval/allow flow. The
+guest sends instructions only when the store reports a newly created request.
 
 ---
 
@@ -443,13 +446,53 @@ not attached to the current engine prompt.
 Option B is the complete design. Option A can deliver extracted text first but
 must not be called full attachment parity until image content is also supported.
 
+**Exploratory implementation findings (2026-07-19; code reverted):**
+
+1. The current Engine V2 branch occurs after submission parsing and inbound
+   hooks but before legacy `augment_with_attachments()`. Augmentation must remain
+   after original-text submission parsing. It also cannot happen before
+   `handle_with_engine_inner()` resolves a pending authentication gate, because
+   an auth credential is intentionally represented as `Submission::UserInput`.
+   The safe location is the ordinary Engine V2 user-input path after auth-gate
+   resolution and before safety validation.
+2. The existing attachment helper already produces sanitized effective text and
+   provider-native image parts. Its text includes filenames, MIME/size metadata,
+   and extracted document/audio text, but excludes `source_url`, `storage_key`,
+   and raw bytes. The engine crate cannot directly depend on the main crate's
+   `llm::ContentPart`, so complete image support needs an engine-owned typed
+   content representation and an explicit mapping in `LlmBridgeAdapter`.
+3. `ThreadMessage` is currently text-only and `thread_msg_to_chat()` always sets
+   `content_parts` to an empty vector. Typed parts must survive all current-turn
+   paths: new thread spawn, injection into a running thread, and resume of a
+   suspended thread. Conversation history reconstruction is another separate
+   text-only path and must have deliberate replay semantics.
+4. `ThreadMessage` and containing engine state are serializable. Adding data-URL
+   image parts directly to that type would make binary payload persistence a
+   default side effect. The design must decide how parts remain provider-bound,
+   bounded, and excluded from durable engine state and traces, rather than only
+   adding `#[serde(default)]` for compatibility.
+5. Engine conversation entries and the V1 compatibility dual-write currently
+   persist the original text. They should receive the sanitized effective text
+   exactly once, while provider-only image data must not enter either history.
+6. Image-only input currently reaches safety validation as an empty string. The
+   sanitized attachment representation can provide the non-empty effective text,
+   but safety and secret scans must inspect that effective text after auth-gate
+   handling so extracted content is checked without changing control parsing.
+7. A temporary capturing-provider integration fixture was prepared, but its run
+   was intentionally stopped when implementation scope changed and all spike
+   code was removed. These findings are design evidence only; none of the
+   CHPAR-006 acceptance criteria should be marked complete.
+
 **Likely files:**
 
 - `ic/src/agent/agent_loop.rs`
 - `ic/src/agent/attachments.rs`
 - `ic/src/bridge/router.rs`
 - `ic/src/bridge/llm_adapter.rs`
-- `ic/crates/lunarwing_engine/src/types/*`
+- `ic/crates/lunarwing_engine/src/types/message.rs`
+- `ic/crates/lunarwing_engine/src/runtime/conversation.rs`
+- `ic/crates/lunarwing_engine/src/runtime/manager.rs`
+- Engine store/trace serialization boundaries
 - LLM request/message conversion code
 
 **Acceptance criteria:**

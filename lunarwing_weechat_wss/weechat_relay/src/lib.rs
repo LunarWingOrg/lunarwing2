@@ -142,6 +142,10 @@ struct WeechatConfig {
     #[serde(default = "default_dm_policy")]
     dm_policy: String,
 
+    /// Whether the host supplied `dm_policy` as an explicit setup override.
+    #[serde(default)]
+    dm_policy_explicit: bool,
+
     /// Group policy: "open", "allowlist", or "deny" (default "allowlist")
     #[serde(default = "default_group_policy")]
     group_policy: String,
@@ -216,6 +220,62 @@ fn default_dm_policy() -> String {
     // because the adapter config and persisted workspace state are honored
     // before this default is used.
     "pairing".to_string()
+}
+
+fn is_known_dm_policy(policy: &str) -> bool {
+    matches!(policy, "open" | "pairing" | "allowlist")
+}
+
+fn resolve_initial_dm_policy(
+    configured_policy: &str,
+    configured_explicitly: bool,
+    persisted_policy: Option<&str>,
+) -> String {
+    if configured_explicitly {
+        return configured_policy.to_string();
+    }
+
+    persisted_policy
+        .filter(|policy| !policy.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| configured_policy.to_string())
+}
+
+fn log_invalid_dm_policy(policy: &str) {
+    channel_host::log(
+        channel_host::LogLevel::Warn,
+        &format!(
+            "Unknown dm_policy '{}'; valid values are open, pairing, or allowlist. Rejecting DMs until configuration is fixed",
+            policy
+        ),
+    );
+}
+
+fn sender_allowed_by_policy(
+    nick: &str,
+    hostmask: &str,
+    policy: &str,
+    allow_from: &[String],
+    pairing_allowed: &[String],
+) -> Option<bool> {
+    let paired = pairing_allowed
+        .iter()
+        .any(|entry| entry.eq_ignore_ascii_case(nick));
+    let allowlisted = allow_from.iter().any(|entry| {
+        entry == "*"
+            || if entry.contains('!') {
+                entry.eq_ignore_ascii_case(hostmask)
+            } else {
+                entry.eq_ignore_ascii_case(nick)
+            }
+    });
+
+    match policy {
+        "open" => Some(true),
+        "pairing" => Some(paired),
+        "allowlist" => Some(allowlisted || paired),
+        _ => None,
+    }
 }
 
 fn startup_log_summary(config: &WeechatConfig) -> String {
@@ -419,6 +479,15 @@ impl Guest for WeechatRelayChannel {
 
         let config: WeechatConfig = serde_json::from_str(&config_json)
             .map_err(|e| format!("Failed to parse config: {}", e))?;
+        let persisted_dm_policy = channel_host::workspace_read(DM_POLICY_PATH);
+        let dm_policy = resolve_initial_dm_policy(
+            &config.dm_policy,
+            config.dm_policy_explicit,
+            persisted_dm_policy.as_deref(),
+        );
+        if !is_known_dm_policy(&dm_policy) {
+            log_invalid_dm_policy(&dm_policy);
+        }
 
         channel_host::log(channel_host::LogLevel::Info, &startup_log_summary(&config));
 
@@ -433,7 +502,7 @@ impl Guest for WeechatRelayChannel {
         let _ = channel_host::workspace_write(RELAY_PASSWORD_PATH, &config.relay_password);
         let _ = channel_host::workspace_write(CONNECTION_MODE_PATH, &config.connection_mode);
         let _ = channel_host::workspace_write(WS_ADAPTER_URL_PATH, &config.ws_adapter_url);
-        let _ = channel_host::workspace_write(DM_POLICY_PATH, &config.dm_policy);
+        let _ = channel_host::workspace_write(DM_POLICY_PATH, &dm_policy);
         let _ = channel_host::workspace_write(GROUP_POLICY_PATH, &config.group_policy);
         let _ = channel_host::workspace_write(
             MAX_CHUNK_LENGTH_PATH,
@@ -853,6 +922,9 @@ fn refresh_policy_config() {
         if resp.status == 200 {
             if let Ok(cfg) = serde_json::from_slice::<serde_json::Value>(&resp.body) {
                 if let Some(v) = cfg["dm_policy"].as_str() {
+                    if !is_known_dm_policy(v) {
+                        log_invalid_dm_policy(v);
+                    }
                     let _ = channel_host::workspace_write(DM_POLICY_PATH, v);
                 }
                 if let Some(v) = cfg["group_policy"].as_str() {
@@ -1494,46 +1566,24 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
 /// defaulting to `open`, so a typo or stale config never grants unintended
 /// access.
 fn check_sender_allowed(nick: &str, hostmask: &str, policy: &str) -> bool {
-    match policy {
-        "open" => true,
-        "pairing" => {
-            // Only the shared pairing store governs access.
-            channel_host::pairing_read_allow_from(CHANNEL_NAME)
-                .unwrap_or_default()
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case(nick))
-        }
-        "allowlist" => {
-            let allow_from: Vec<String> = channel_host::workspace_read(ALLOW_FROM_PATH)
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-
-            let in_allow_from = allow_from.iter().any(|a| {
-                if a == "*" {
-                    true
-                } else if a.contains('!') {
-                    a.eq_ignore_ascii_case(hostmask)
-                } else {
-                    a.eq_ignore_ascii_case(nick)
-                }
-            });
-
-            let pairing_allowed =
-                channel_host::pairing_read_allow_from(CHANNEL_NAME).unwrap_or_default();
-
-            in_allow_from || pairing_allowed.iter().any(|a| a.eq_ignore_ascii_case(nick))
-        }
-        unknown => {
-            channel_host::log(
-                channel_host::LogLevel::Warn,
-                &format!(
-                    "Unknown dm_policy '{}'; rejecting sender '{}' (fail closed)",
-                    unknown, nick
-                ),
-            );
-            false
-        }
+    if policy == "open" {
+        return true;
     }
+    if !is_known_dm_policy(policy) {
+        log_invalid_dm_policy(policy);
+        return false;
+    }
+
+    let pairing_allowed = channel_host::pairing_read_allow_from(CHANNEL_NAME).unwrap_or_default();
+    let allow_from = if policy == "allowlist" {
+        channel_host::workspace_read(ALLOW_FROM_PATH)
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    sender_allowed_by_policy(nick, hostmask, policy, &allow_from, &pairing_allowed).unwrap_or(false)
 }
 
 /// Handle pairing request for unknown sender.
@@ -2624,6 +2674,60 @@ mod tests {
             v["dm_policy"].as_str(),
             Some("pairing"),
             "example local config must default to pairing"
+        );
+    }
+
+    #[test]
+    fn test_initial_dm_policy_preserves_persisted_open_on_upgrade() {
+        let policy = resolve_initial_dm_policy(&default_dm_policy(), false, Some("open"));
+        assert_eq!(policy, "open");
+    }
+
+    #[test]
+    fn test_initial_dm_policy_defaults_to_pairing_without_persisted_value() {
+        let policy = resolve_initial_dm_policy(&default_dm_policy(), false, None);
+        assert_eq!(policy, "pairing");
+    }
+
+    #[test]
+    fn test_explicit_dm_policy_takes_precedence_over_persisted_value() {
+        let policy = resolve_initial_dm_policy("pairing", true, Some("open"));
+        assert_eq!(policy, "pairing");
+    }
+
+    #[test]
+    fn test_dm_policy_pairing_allows_only_approved_senders() {
+        let no_approved_senders = Vec::new();
+        assert_eq!(
+            sender_allowed_by_policy(
+                "alice",
+                "alice!user@example.com",
+                "pairing",
+                &[],
+                &no_approved_senders,
+            ),
+            Some(false)
+        );
+
+        let approved_senders = vec!["Alice".to_string()];
+        assert_eq!(
+            sender_allowed_by_policy(
+                "alice",
+                "alice!user@example.com",
+                "pairing",
+                &[],
+                &approved_senders,
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_unknown_dm_policy_fails_closed() {
+        assert!(!is_known_dm_policy("typo"));
+        assert_eq!(
+            sender_allowed_by_policy("alice", "alice!host", "typo", &[], &[]),
+            None
         );
     }
 }
