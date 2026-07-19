@@ -100,8 +100,8 @@ async fn resolve_channel_fallback_target(
     owner_scope_target: Option<&str>,
     ctx_user_id: &str,
 ) -> Option<String> {
-    // Prefer an explicit channel binding when the extension manager knows the
-    // durable delivery target (for example, a bound XMPP chat ID).
+    // Prefer the owner scope of a bound channel. The WASM wrapper translates
+    // that scope through the validated protocol target persisted for the owner.
     if let Some(channel_name) = channel
         && let Some(extension_manager) = extension_manager
         && let Some(target) = extension_manager

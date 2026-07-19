@@ -76,7 +76,10 @@ Only messages whose sender principal matches the configured owner actor may
 replace owner-scoped proactive routing metadata. WeeChat persists the complete
 `irc.<network>.<target>` buffer; DarkIRC persists one validated DM nick. Invalid
 or ambiguous targets are rejected before persistence. Stored owner routing is
-restored after restart.
+restored after restart. Heartbeat, routine, mission, and message-tool fallbacks
+address the LunarWing owner scope; they do not pass the actor principal as a
+protocol target. The channel wrapper translates the owner scope through the
+stored protocol metadata.
 
 ## Migration And Retention
 
@@ -90,4 +93,3 @@ account change. Operators that need old context should review and migrate it
 explicitly after confirming the old and new principals represent the same
 person. Legacy bare-nick pairing entries continue to authorize their normalized
 equivalent, but new approvals are stored under the v2 principal.
-

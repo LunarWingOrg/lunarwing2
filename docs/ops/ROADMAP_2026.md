@@ -11,6 +11,7 @@ Items are grouped to respect the release cadence (`docs/ops/RELEASE_CADENCE.md`)
 | Multi-arch CI/CD pipeline for development. Migrate to new dedicated LW v2 repo | v2.0.3 |
 | Better githooks for repo | v2.0.3 |
 | DarkIRC key exchange automation | v2.0.3 |
+| Gut proprietary tunnel providers and add support for netbird | v2.0.3 |
 | Lorebook support / Agent Profile enhancements / Workspace Seeding improvements / Agent Profile switching / User Profile switching (further planning required) | v2.0.4 |
 | Self-Healing Capability Expansion - deferred from 1.1.8 | v2.0.4 |
 | Self-Healing Capabilities analysis of any missing pieces from all the new components. Implementation of missing pieces to follow | v2.0.4 |

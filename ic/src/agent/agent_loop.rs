@@ -1472,7 +1472,9 @@ impl Agent {
                 {
                     return crate::bridge::handle_approval(self, message, *approved, *always).await;
                 }
-                Submission::Interrupt if crate::bridge::has_active_engine_thread(message).await => {
+                Submission::Interrupt
+                    if crate::bridge::has_interruptible_engine_state(message).await =>
+                {
                     return crate::bridge::handle_interrupt(self, message).await;
                 }
                 Submission::Clear => {
