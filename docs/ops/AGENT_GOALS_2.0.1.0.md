@@ -106,14 +106,14 @@
     </details>
 18. [x] dark irc key exchange (checked off cuz wanna get back to this in future release). automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md
 19. [x] (skip, get back to next rel) update onboard ui to correspond with changes in codebase since v2.0.0.0 - surely some things have been broken at this point - in particular, kawarimi is likely broken now
-20. [ ] update any architecture docs in docs/
-21. [ ] update any bugs docs in docs/bugs
+20. [x] update any architecture docs in docs/
+21. [x] update any bugs docs in docs/bugs
 22. [ ] update any ops docs in docs/ops  
-23. [ ] update any proposals docs in docs/proposals
-24. [ ] update docs/README.md
+23. [x] update any proposals docs in docs/proposals
+24. [x] update docs/README.md
 25. [x] (skip, get back to next rel) ensure kawarimi can work for 1.1.2 to 2.0.1.0 - if not, identify potential issues - verify with tag for 1.1.2 on v1 repo. use kawarimi export/import from v2 repo - v1 repo can be found in user home directory under lunarwing/
-26. [ ] update README.md at repo root
-27. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.1.0 explaining all relevant changes since v2.0.0.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `Togishi` — The file you write will be RELEASE-v2.0.1.0.md and should be written to the ROOT of the repo.
+26. [x] update README.md at repo root
+27. [x] Write up FIRST DRAFT release notes (at root of repo) for v2.0.1.0 explaining all relevant changes since v2.0.0.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `Togishi` — The file you write will be RELEASE-v2.0.1.0.md and should be written to the ROOT of the repo.
 28. [ ] Improve accuracy of RELEASE-v2.0.1.0.md
 
 ---
