@@ -1,10 +1,6 @@
 # Release Notes for LunarWing v2.0.1.0 - Codename `Togishi (研師)`
 
-**Release Date:** TBD
-
-**Status:** Draft
-
-**Git Comparison:** `v2.0.0.0` (`02cb832`) through `32c2940` on 2026-07-20
+**Release Date:** 2026-07-20
 
 > A *togishi* is a Japanese sword polisher. LunarWing v2.0.1.0 follows that
 > theme: it does not replace the v2 foundation, but sharpens its channel
