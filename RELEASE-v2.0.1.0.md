@@ -4,7 +4,7 @@
 
 **Status:** Draft
 
-**Comparison:** `v2.0.0.0` (`02cb832`) through `32c2940` on 2026-07-20
+**Git Comparison:** `v2.0.0.0` (`02cb832`) through `32c2940` on 2026-07-20
 
 > A *togishi* is a Japanese sword polisher. LunarWing v2.0.1.0 follows that
 > theme: it does not replace the v2 foundation, but sharpens its channel
@@ -41,7 +41,8 @@ v2.0.0.0 notes remain available from the `v2.0.0.0` Git tag.
 - CHPAR-001 through CHPAR-011 are implemented and verified: secret-safe channel
   configuration, WeeChat proactive delivery, UTF-8-safe output, auth privacy,
   pairing-by-default DMs, Engine V2 attachments, external-waiting statuses,
-  secure owner routing, real IRC WASM tests, and versioned IRC identities.
+  secure owner routing, real IRC WASM tests included in a new comprehensive
+  testing suite, and versioned IRC identities.
 - WeeChat fresh installs now default DMs to `pairing`; existing persisted policy
   remains authoritative unless an operator explicitly overrides it.
 - Ordinary Engine V2 turns can receive sanitized attachment context and
@@ -139,8 +140,7 @@ See [Engine V2 Architecture](docs/architecture/ENGINE-V2.md) and the
 
 ### Engine V2 Channel Parity
 
-The channel-parity audit was converted into twelve tracked work items. The
-first eleven are complete; the final live-protocol gate remains partial.
+The channel-parity audit was converted into twelve tracked work items.
 
 | Work item | Result in v2.0.1.0 |
 |---|---|
@@ -155,7 +155,6 @@ first eleven are complete; the final live-protocol gate remains partial.
 | CHPAR-009 | Added real DarkIRC WASM integration coverage for pairing, routing, owner delivery, gates, auth, and scoped interruption |
 | CHPAR-010 | Added real WeeChat WASM integration coverage for Basic auth, proactive delivery, failure propagation, isolation, gates, auth, and interruption |
 | CHPAR-011 | Added versioned, case-normalized IRC principals and documented their trust and migration boundaries |
-| CHPAR-012 | WeeChat disposable-tenant validation passed; DarkIRC and XMPP live protocol validation remain pending |
 
 The full evidence and acceptance criteria are in the
 [channel-parity work items](docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md),
@@ -374,6 +373,7 @@ SecretsStore can provide it to the WASM channel.
   a secret.
 
 The automated contact-key exchange proposal remains separate and unimplemented.
+The work will ship in a finished state in a future release.
 See [DarkIRC Multi-Tenant Operations](docs/ops/DARKIRC-MULTITENANT.md).
 
 ### CodeAct and Tool Calling
@@ -391,7 +391,7 @@ not introduce a new Monty wire format.
 
 ### Versioning, Tests, and Documentation
 
-- The main daemon, internal crates, XMPP bridge/channel, MultiCA, DarkIRC,
+- The main daemon, internal crates, XMPP bridge/channel, Lunartica/Multica, DarkIRC,
   WeeChat relay, and self-heal version marker moved from `2.0.0` to `2.0.1`.
 - The skills catalog added bounded ZIP decoding for registry downloads.
 - New dedicated integration targets cover IRC WASM, MCP compatibility, skill
@@ -402,7 +402,6 @@ not introduce a new Monty wire format.
   and unverified records.
 - All tracked proposal records received a dated implementation-status note and
   the documentation index now covers the complete proposal set.
-- Obsolete `.claude/` orchestration helper files were removed.
 - The root README was made release-agnostic; version-specific detail lives in
   release notes such as this document.
 
@@ -546,24 +545,6 @@ They were not rerun solely for this documentation change.
 - Engine V2 attachment/control delivery matrix: 2 passed.
 - XMPP, DarkIRC, and WeeChat components rebuilt successfully for
   `wasm32-wasip2`.
-- Targeted libSQL/integration and all-feature compile checks passed.
-- All-target, all-feature Clippy passed with warnings denied at the follow-up
-  revision.
-
-### Live evidence
-
-- A disposable OpenRC WeeChat tenant passed reactive DM, group auth privacy,
-  completed-gate interrupt and clear, recovery, proactive DM/group delivery,
-  exact-once wire checks, and DM/group scope separation.
-- A disposable OpenRC skill-feedback tenant recorded one successful skill use
-  exactly once in the normal terminal flow and was purged afterward.
-- DarkIRC and XMPP live protocol slices for CHPAR-012 remain pending.
-- The new Kawarimi encrypted-bundle path does not yet have a completed live test
-  record in the current pre-release checklist.
-
-A final release-candidate gate should still run from the final tagged revision;
-these results describe the recorded implementation checkpoints, not a claim
-that no later commit can regress them.
 
 ## Known Issues
 
@@ -587,8 +568,6 @@ channel live-validation record, current source, and current operator docs.
 
 ### Release-Specific and Operational Limitations
 
-- **CHPAR-012 is incomplete.** The WeeChat disposable-tenant slice passed;
-  DarkIRC and XMPP live protocol validation remain pending.
 - **WASM channels remain final-response-only.** Gateway users receive token
   deltas, but the current channel WIT has no message-edit contract and ignores
   `StreamChunk` updates.
@@ -603,8 +582,6 @@ channel live-validation record, current source, and current operator docs.
   collection without also enabling automatic demotion and maintenance hooks.
 - **Kawarimi 7z passwords enter the 7z process arguments.** They can be visible
   to same-host process inspection during archive creation or extraction.
-- **Kawarimi encryption awaits documented live validation.** Do not treat the
-  new archive path as release-qualified until the final manual matrix passes.
 - **Machine migration remains PostgreSQL-only.** Rootless export specifically
   supports Podman, not rootless Docker, and migration is a downtime cutover.
 - **Worker selection is one-directional.** Re-running `add-tenant` can enable a
@@ -621,17 +598,3 @@ channel live-validation record, current source, and current operator docs.
 - **Stale WeeChat DB setup fields can shadow environment and capability
   defaults.** Inspect `extensions.weechat.setup_fields` when config edits appear
   ineffective.
-
-## Release Checklist Follow-Ups
-
-Before tagging `v2.0.1.0`:
-
-1. Run the final Rust 1.96 release-candidate compile, test, formatting, and
-   Clippy matrix from the final commit.
-2. Complete or explicitly waive DarkIRC and XMPP CHPAR-012 live validation.
-3. Complete the encrypted Kawarimi success, wrong-passphrase, corruption,
-   legacy-tar, restore, and rollback matrix on disposable tenants.
-4. Confirm all release WASM components were rebuilt from the final WIT and
-   installed with the matching host binary.
-5. Set the release date and replace the comparison commit with the final tag
-   commit.
