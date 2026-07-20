@@ -3,6 +3,7 @@
   "venv": ".venv",
   "extraPaths": ["."],
   "include": [
+    "hermes_kawarimi",
     "lunarwing_mt_onboard",
     "lunarwing_mt_onboard_web"
   ],
