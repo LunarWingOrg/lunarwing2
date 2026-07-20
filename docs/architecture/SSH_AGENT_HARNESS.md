@@ -1,6 +1,6 @@
 # SSH Agent Harness
 
-**Status:** As-built (verified against source 2026-07-01; reviewed for 1.1.9)
+**Status:** As-built (revalidated against source 2026-07-20)
 **Code:** `ic/src/bridge/ssh*.rs`, `ic/src/config/ssh.rs`
 **Operator guide:** [`docs/ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 **Delivery mechanisms** (how the agent actually runs SSH work — worker mode, the `ssh`/`ssh_git` built-in tools, the WASM `ssh` tool): [`SSH_DELIVERY_MECHANISMS.md`](SSH_DELIVERY_MECHANISMS.md)
@@ -56,7 +56,8 @@ bytes never touch disk and never cross the container boundary.
 
 ## 2. Component map
 
-All paths are under `ic/src/`. Line numbers are indicative (verified 2026-07-01).
+All paths are under `ic/src/`. Symbol names are authoritative; line numbers are
+intentionally omitted because they drift as adjacent code changes.
 
 | File | Responsibility |
 |------|----------------|
@@ -73,7 +74,7 @@ gate); public types are re-exported from `lib.rs`.
 
 ## 3. Data model
 
-### `SSHHostConfig` (`ssh.rs:153`) — the runtime per-host record
+### `SSHHostConfig` (`bridge/ssh.rs`) — the runtime per-host record
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
@@ -88,26 +89,26 @@ gate); public types are re-exported from `lib.rs`.
 | `keepalive_interval_secs` | `u64` | `60` | `0` disables |
 | `keepalive_max_misses` | `u32` | `3` | |
 
-- **`SSHKeyType`** (`ssh.rs:199`) — `Ed25519 | Ecdsa | Rsa`, serde `rename_all = "lowercase"`.
-- **`HostKeyMode`** (`ssh.rs:218`) — `Strict` (default) or `AcceptFirst`. There
+- **`SSHKeyType`** (`bridge/ssh.rs`) — `Ed25519 | Ecdsa | Rsa`, serde `rename_all = "lowercase"`.
+- **`HostKeyMode`** (`bridge/ssh.rs`) — `Strict` (default) or `AcceptFirst`. There
   is deliberately **no `AcceptAny`** variant — it would be insecure.
-- **`SSHCredentials`** (`ssh.rs:240`) — the sensitive in-memory bundle:
+- **`SSHCredentials`** (`bridge/ssh.rs`) — the sensitive in-memory bundle:
   `key_data: Zeroizing<Vec<u8>>` and `passphrase: Option<SecretString>`. Both
   are zeroized on drop. Not `Serialize`/`Deserialize`.
 
-### `SshConfig` / `SshHostEntry` (`config/ssh.rs:38`, `:74`) — the TOML shape
+### `SshConfig` / `SshHostEntry` (`config/ssh.rs`) — the TOML shape
 
 `SshConfig` carries global defaults plus a `Vec<SshHostEntry>`. Each
 `SshHostEntry` has the mandatory `host` / `user` / `key_type` and **optional**
-per-host timeout overrides (`Option<u64>` etc.). `to_host_map()`
-(`config/ssh.rs:122`) resolves each entry into an `SSHHostConfig`, filling any
+per-host timeout overrides (`Option<u64>` etc.). `to_host_map()` resolves each
+entry into an `SSHHostConfig`, filling any
 absent per-host override from the global default.
 
 > `SshHostEntry` does **not** derive `Default`, so `host`, `user`, and
 > `key_type` are required for every host. There is **no `enabled` flag** —
 > enablement is simply "the `hosts` list is non-empty."
 
-### `SSHBridge` (`ssh.rs:313`) — the per-tenant coordinator
+### `SSHBridge` (`bridge/ssh.rs`) — the per-tenant coordinator
 
 Fields: `tenant_id: Uuid`, `tenant_name: String`, `hosts:
 Arc<RwLock<HashMap<String, SSHHostConfig>>>`, `secrets_store: Arc<dyn
@@ -115,50 +116,48 @@ SecretsStore>`, `audit_logger: Arc<dyn AuditLogger>`, `agent_server:
 Option<Arc<SshAgentServer>>` (None until started), `host_key_verifier:
 Arc<HostKeyVerifier>`.
 
-Key methods: `new` (`:338`), `validate` (`:363`), `get_host_config` (`:404`),
-`list_hosts` (`:413`), `add_host` (`:419`), `remove_host` (`:438`),
-`start_agent_server` (`:464`), `stop_agent_server` (`:546`),
-`get_agent_socket_path` (`:554`), `agent_server` (`:561`), `load_key`
-(`:577`), `host_key_verifier` (`:583`).
+Key methods: `new`, `validate`, `get_host_config`, `list_hosts`, `add_host`,
+`remove_host`, `start_agent_server`, `stop_agent_server`,
+`get_agent_socket_path`, `agent_server`, `load_key`, and `host_key_verifier`.
 
-### `SshEvent` / `AuditLogger` (`ssh.rs:253`, `:293`)
+### `SshEvent` / `AuditLogger` (`bridge/ssh.rs`)
 
 An audit event enum (`HostAdded`, `HostRemoved`, `ConnectionAttempt`,
 `CommandExecuted`, `KeyRotated`, `HostKeyChanged`, `AgentStarted`,
 `AgentStopped`) and a pluggable `AuditLogger` trait. **Only `NullAuditLogger`
-(`ssh.rs:299`) is wired in production today** — audit events are defined but not
+is wired in production today** — audit events are defined but not
 persisted anywhere. See §7.
 
 ## 4. Lifecycle & flows
 
-### 4.1 Config load → bridge construction (`app.rs:1054`)
+### 4.1 Config load → bridge construction (`app.rs`)
 
 1. `config.toml` `[ssh]` / `[[ssh.hosts]]` → `SshConfig` (`config/ssh.rs`),
-   carried on `Settings.ssh` (`settings.rs:196`, `#[serde(default)]`).
+   carried on `Settings.ssh` with `#[serde(default)]`.
 2. In `AppBuilder`, **only if** `!config.ssh.hosts.is_empty()` **and** a secrets
    store is present:
-   - `tenant_id = UUIDv5(NAMESPACE_DNS, owner_id)` (`app.rs:1059`) — stable
+   - `tenant_id = UUIDv5(NAMESPACE_DNS, owner_id)` — stable
      across restarts.
-   - `tenant_name = owner_id` (`app.rs:1060`).
+   - `tenant_name = owner_id`.
    - `host_map = config.ssh.to_host_map()`.
    - `audit_logger = NullAuditLogger`.
    - `SSHBridge::new(...)` → `validate()` → `start_agent_server()`.
 3. The result is stored as `AppComponents.ssh_bridge:
-   Option<Arc<RwLock<SSHBridge>>>` (`app.rs:64`).
+   Option<Arc<RwLock<SSHBridge>>>`.
 
 **Failure posture is deliberately soft.** `validate()` failure,
 `start_agent_server()` failure, and even `SSHBridge::new` failure all only
-`warn!` — a misconfigured `[ssh]` block never blocks daemon startup
-(`app.rs:1072-1101`). `validate()` (`ssh.rs:363`) returns `Ok` on an empty host
+`warn!` — a misconfigured `[ssh]` block never blocks daemon startup.
+`validate()` returns `Ok` on an empty host
 map, and checks only hostname validity, `port != 0`, and non-empty user — it
 does **not** check that a key secret exists (keys may be uploaded later).
 
-### 4.2 Agent startup — the load-bearing path (`ssh.rs:464` → `ssh_agent.rs:97`)
+### 4.2 Agent startup — the load-bearing path (`bridge/ssh.rs` → `bridge/ssh_agent.rs`)
 
 `start_agent_server()`:
 
 1. Computes the socket path
-   **`/home/<tenant_name>/lunarwing/run/ssh-agent.sock`** (`ssh.rs:466`).
+   **`/home/<tenant_name>/lunarwing/run/ssh-agent.sock`**.
    This is deliberately **not** in `/tmp`: the daemon runs with
    `PrivateTmp=true`, so a `/tmp` socket would be invisible to podman workers
    and could not be bind-mounted. The `mt-admin` script predicts this exact
@@ -168,26 +167,25 @@ does **not** check that a key secret exists (keys may be uploaded later).
    `secrets_store.get_decrypted(tenant_name, secret_name)`, copies the bytes
    into a `Zeroizing<Vec<u8>>`, optionally loads a `<name>_passphrase` secret,
    and builds an `SSHCredentials`. **Fail-soft:** a missing or unreadable key is
-   logged and skipped; the agent still starts for the remaining hosts
-   (`ssh.rs:506-522`).
-3. `SshAgentServer::start(socket_path, keys)` (`ssh_agent.rs:97`):
+   logged and skipped; the agent still starts for the remaining hosts.
+3. `SshAgentServer::start(socket_path, keys)`:
    - removes any stale socket, `UnixListener::bind`, then **chmods the socket
-     `0o666`** (`ssh_agent.rs:122`) so the worker's OS user (e.g. `nanocode`,
+     `0o666`** so the worker's OS user (e.g. `nanocode`,
      a different UID than the daemon) can read/write it;
    - parses each key with `russh::keys::decode_secret_key`;
    - spawns `russh::keys::agent::server::serve` over the `UnixListenerStream`;
    - **sleeps 100 ms**, then self-connects as an `AgentClient` and calls
-     `add_identity` for each key (`ssh_agent.rs:166-190`) — this is what
+     `add_identity` for each key — this is what
      populates russh's internal keystore, which actually answers
      `REQUEST_IDENTITIES` / `SIGN`.
 4. Returns `Arc<SshAgentServer>`, stored on the bridge; consumers read the path
    via `get_agent_socket_path()`.
 
 > **Two keystores.** russh's agent server maintains its **own** internal
-> `KeyStore`, separate from the `SshAgent`/`SshAgentServer` `keys` map
-> (`ssh_agent.rs:128-132`). The struct's `keys` map is **status-reporting
+> `KeyStore`, separate from the `SshAgent`/`SshAgentServer` `keys` map. The
+> struct's `keys` map is **status-reporting
 > only**. Consequently the public `SshAgentServer::add_key` / `remove_key`
-> methods (`ssh_agent.rs:203`, `:211`) update only the status map — they do
+> methods update only the status map — they do
 > **not** change what russh will sign with. Keys become signable **only** at
 > `start()` (via `add_identity`). See the runtime-upload note in §4.4 and the
 > known limitation in §7.
@@ -200,29 +198,31 @@ paths (`orchestrator/external_worker.rs`, `tools/builtin/job.rs`,
 Injection is done entirely by `ic/scripts/lunarwing-mt-admin.sh`:
 
 1. **Pre-create** the socket path as a touch-file before the daemon starts, so
-   podman doesn't materialize it as a directory (`mt-admin` ~`:5302`).
+   podman doesn't materialize it as a directory.
 2. **Start the daemon first** — it removes the touch-file and binds the real
-   socket (`mt-admin` ~`:5314`).
+   socket.
 3. **Start workers after**, each with the socket bind-mounted and
-   `SSH_AUTH_SOCK` set (`mt-admin` ~`:2975`, `:3117`, quadlets ~`:3888`):
+   `SSH_AUTH_SOCK` set (including generated container service definitions):
 
    ```
-   -v <run_dir>/ssh-agent.sock:/tmp/ssh-agent.sock -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock
+   -v <run_dir>/ssh-agent.sock:/tmp/ssh-agent.sock:z -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock
    ```
 
 Inside the container, ordinary `git` and `ssh` read `SSH_AUTH_SOCK` and talk the
 agent protocol back to the daemon. `<run_dir>` resolves to
-`/home/<tenant>/lunarwing/run` (`mt-admin` `tenant_run_dir`, `:118`).
+`/home/<tenant>/lunarwing/run` (`mt-admin` `tenant_run_dir`).
 
-> The daemon's own in-process routines/jobs only get SSH if the **daemon
-> process** inherited `SSH_AUTH_SOCK` from its environment — the bridge does not
-> export `SSH_AUTH_SOCK` into the daemon's own env. In practice SSH is consumed
-> by the bind-mounted worker containers, not by in-daemon shell/git.
+> The bridge does not export a process-wide `SSH_AUTH_SOCK` into the daemon's
+> environment. Generic in-daemon shell/git code therefore sees an agent only if
+> the daemon inherited one. The built-in `ssh_git` tool is the exception: it
+> explicitly sets `SSH_AUTH_SOCK` to `SSHBridge::get_agent_socket_path()` for its
+> scrubbed child process. The built-in `ssh` and WASM `ssh` paths use russh and
+> decrypted bridge credentials directly rather than an inherited environment.
 
-### 4.4 HTTP management API (`ssh_api.rs`, mounted in `main.rs:525`)
+### 4.4 HTTP management API (`ssh_api.rs`, mounted in `main.rs`)
 
 The API is mounted into the unified webhook server **only if** both `ssh_bridge`
-and `secrets_store` exist. Routes (`ssh_api.rs:29`):
+and `secrets_store` exist. `ssh_api::create_router()` registers these routes:
 
 | Method + path | Handler | Notes |
 |---|---|---|
@@ -258,9 +258,10 @@ PascalCase (`"Strict"`) — clients must match the casing.
   (bytes) and `SecretString` (passphrase), both zeroed on drop. Workers receive
   **signing capability only** through the bind-mounted socket; key bytes never
   cross the container boundary.
-- **Per-tenant isolation.** `tenant_id = UUIDv5(NAMESPACE_DNS, owner_id)` is
-  stable; secrets are scoped by `user_id = tenant_id`; the socket lives in the
-  tenant-owned run directory.
+- **Per-tenant isolation.** `tenant_id = UUIDv5(NAMESPACE_DNS, owner_id)` is a
+  stable internal bridge/audit identifier. Secret-store operations are scoped
+  by the string `owner_id` (`tenant_name` in the bridge), and the socket lives
+  in the tenant-owned run directory.
 - **Host-key trust.** `Strict` (default) or `AcceptFirst` (TOFU + pin). No
   `AcceptAny`. **Note:** the verifier is live for the in-process `ssh` and
   `ssh_git` tool paths (§7); the worker-mode path still relies on the worker's
@@ -268,18 +269,18 @@ PascalCase (`"Strict"`) — clients must match the casing.
 
 ### Hardening notes / current sharp edges
 
-- **Socket is `0o666` (world rw)** (`ssh_agent.rs:122`). Safety rests entirely
+- **Socket is `0o666` (world rw)**. Safety rests entirely
   on the parent run directory being tenant-owned and on rootless-podman UID
   mapping. If the run-dir permissions are ever wrong, any local user could sign
   with the tenant's keys. The `set_permissions` error is intentionally ignored.
 - **No per-signature confirmation.** `confirm` / `confirm_request` are hardcoded
-  to `true` (`ssh_agent.rs:68-73`) and `add_identity` is called with empty
+  to `true` and `add_identity` is called with empty
   constraints. Anyone who can open the socket can request arbitrary signatures.
 - **`parse_key` makes a non-zeroized copy** of the key bytes
-  (`String::from_utf8_lossy(...).to_string()`, `ssh_agent.rs:55`) that drops
+  (`String::from_utf8_lossy(...).to_string()`) that drops
   without wiping — a small window that partially defeats the `Zeroizing`
   wrapper.
-- **The HTTP API has no auth middleware** (`ssh_api.rs:29`). It is merged into
+- **The HTTP API has no auth middleware**. It is merged into
   the webhook server (which binds `0.0.0.0` by default), so exposure depends
   entirely on the surrounding network/deployment. In the `mt-admin` model it is
   reached only over `127.0.0.1:<tenant-http-port>`.
@@ -297,7 +298,8 @@ PascalCase (`"Strict"`) — clients must match the casing.
   `git`/`ssh` "just work" with zero SSH-specific code in the worker.
 - **`russh::keys` in-process agent, not the OpenSSH `ssh-agent` binary.** Avoids
   spawning/managing an external process and keeps key material inside the
-  daemon's address space. (`russh` 0.62, `ic/Cargo.toml:148`. `russh-keys` is now a module within the `russh` crate, not a separate dependency.)
+  daemon's address space. (`russh` 0.62; `russh-keys` is now a module within the
+  `russh` crate, not a separate dependency.)
 - **Run-dir socket, not `/tmp`.** Required because the daemon runs with
   `PrivateTmp=true`; a `/tmp` socket would be invisible to bind-mounted workers.
 - **No `AcceptAny` host-key mode.** Refuses to offer a footgun; the strictest
@@ -342,7 +344,7 @@ Known limitations / follow-ups:
   implementation to realize the "auditable access" goal.
 - **`DELETE /hosts/{host}` orphans the key secret** — it removes config but not
   `ssh_key_<host>`.
-- **`from_utf8_lossy` on key bytes** (`ssh_secrets.rs:83`, `ssh_agent.rs:55`)
+- **`from_utf8_lossy` on key bytes** (`ssh_secrets.rs`, `ssh_agent.rs`)
   assumes UTF-8 key material — fine for PEM/OpenSSH text, but binary key blobs
   would be corrupted.
 

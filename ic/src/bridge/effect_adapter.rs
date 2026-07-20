@@ -968,6 +968,27 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::HashMap;
 
+    struct StubEngineLlm;
+
+    #[async_trait]
+    impl lunarwing_engine::LlmBackend for StubEngineLlm {
+        fn model_name(&self) -> &str {
+            "stub"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[lunarwing_engine::ThreadMessage],
+            _actions: &[lunarwing_engine::ActionDef],
+            _config: &lunarwing_engine::LlmCallConfig,
+        ) -> Result<lunarwing_engine::LlmOutput, EngineError> {
+            Ok(lunarwing_engine::LlmOutput {
+                response: lunarwing_engine::LlmResponse::Text("stub".into()),
+                usage: lunarwing_engine::TokenUsage::default(),
+            })
+        }
+    }
+
     fn make_adapter() -> EffectBridgeAdapter {
         use lunarwing_safety::SafetyConfig;
         let config = SafetyConfig {
@@ -1018,6 +1039,86 @@ mod tests {
         assert!(!adapter.auto_approved.read().await.contains("shell"));
         adapter.auto_approve_tool("shell").await;
         assert!(adapter.auto_approved.read().await.contains("shell"));
+    }
+
+    #[tokio::test]
+    async fn codeact_kwargs_reach_execute_tool_with_safety() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register_builtin_tools();
+        let adapter = Arc::new(EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&lunarwing_safety::SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        ));
+        let effects: Arc<dyn EffectExecutor> = adapter;
+        let thread = lunarwing_engine::Thread::new(
+            "verify CodeAct kwargs",
+            lunarwing_engine::ThreadType::Foreground,
+            lunarwing_engine::ProjectId::new(),
+            "test-user",
+            lunarwing_engine::ThreadConfig::default(),
+        );
+        let leases = lunarwing_engine::LeaseManager::new();
+        leases
+            .grant(
+                thread.id,
+                "tools",
+                lunarwing_engine::GrantedActions::All,
+                None,
+                None,
+            )
+            .await
+            .expect("test lease should be granted");
+        let context = lunarwing_engine::ThreadExecutionContext {
+            thread_id: thread.id,
+            thread_type: thread.thread_type,
+            project_id: thread.project_id,
+            user_id: thread.user_id.clone(),
+            step_id: lunarwing_engine::StepId::new(),
+            current_call_id: None,
+            source_channel: None,
+            supervised_mode: false,
+            supervised_timeout_secs: 300,
+        };
+        let llm: Arc<dyn lunarwing_engine::LlmBackend> = Arc::new(StubEngineLlm);
+
+        let result = lunarwing_engine::executor::scripting::execute_code(
+            r#"echoed = await echo(message="kwargs-through-host")
+http_result = await http(url="not a valid URL")
+FINAL(echoed + "|" + http_result["error"])"#,
+            &thread,
+            &llm,
+            &effects,
+            &leases,
+            &lunarwing_engine::PolicyEngine::new(),
+            &context,
+            &[],
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("CodeAct execution should complete");
+
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        let answer = result
+            .final_answer
+            .as_deref()
+            .expect("script should produce a final answer");
+        assert!(
+            answer.starts_with("kwargs-through-host|"),
+            "answer: {answer}"
+        );
+        assert!(answer.contains("invalid URL"), "answer: {answer}");
+        assert_eq!(result.action_results.len(), 2);
+        assert_eq!(result.action_results[0].action_name, "echo");
+        assert_eq!(
+            result.action_results[0].output,
+            serde_json::json!("kwargs-through-host")
+        );
+        assert_eq!(result.action_results[1].action_name, "http");
+        assert!(result.action_results[1].is_error);
     }
 
     struct ApprovalTestTool;

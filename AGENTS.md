@@ -2,7 +2,9 @@
 
 ## Purpose and Precedence
 
-### some information may be outdated
+### Some information may be outdated
+
+#### Some crappy plugins modify this file without real reason and fill it with GARBAGE. They should STOP BEING USED
 
 - `AGENTS.md` is the quick-start contract for coding agents. It is not the full architecture spec.
 - Read the relevant subsystem spec before changing a complex area. When a repo spec exists, treat it as authoritative.
@@ -235,3 +237,5 @@ Exceptions: comments/docs forbidding the pattern; code inside `ic/scripts/lunarw
 - Run the most targeted tests/checks that cover the change.
 - Re-check security-sensitive paths when touching auth, secrets, network listeners, sandboxing, or approvals.
 - Keep the final diff scoped to the task.
+
+

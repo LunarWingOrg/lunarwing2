@@ -1,6 +1,6 @@
 # SSH Delivery Mechanisms
 
-**Status:** As-built (all three mechanisms shipped). Verified against source 2026-07-01.
+**Status:** As-built (all three mechanisms shipped). Revalidated against source 2026-07-20.
 **Core design:** [`SSH_AGENT_HARNESS.md`](SSH_AGENT_HARNESS.md) — the per-tenant bridge, agent socket, secrets, and host-key verifier that all three mechanisms share.
 **Operator setup:** [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 
@@ -54,7 +54,7 @@ via the socket.
 
 **How it's enabled.** `ic/scripts/lunarwing-mt-admin.sh` wires this: it
 pre-creates the socket path, starts the daemon (which binds the real socket),
-then starts workers with `-v <run_dir>/ssh-agent.sock:/tmp/ssh-agent.sock -e
+then starts workers with `-v <run_dir>/ssh-agent.sock:/tmp/ssh-agent.sock:z -e
 SSH_AUTH_SOCK=/tmp/ssh-agent.sock`. `<run_dir>` is
 `/home/<tenant>/lunarwing/run`. Nothing for the operator to do beyond
 provisioning the host + key (see the ops guide).
@@ -213,8 +213,9 @@ All three mechanisms sit on the same harness (see
 - **In-process ssh-agent** at `/home/<tenant>/lunarwing/run/ssh-agent.sock`.
 - **`HostKeyVerifier`** — used live by the `ssh` and WASM tools; the worker path
   uses the worker's own `known_hosts`.
-- **Per-tenant isolation** — `tenant_id = UUIDv5(NAMESPACE_DNS, owner_id)`;
-  secrets scoped per tenant; socket in the tenant-owned run dir.
+- **Per-tenant isolation** — the bridge derives an internal
+  `tenant_id = UUIDv5(NAMESPACE_DNS, owner_id)`; secret-store lookups are scoped
+  by the string `owner_id`, and the socket lives in the tenant-owned run dir.
 
 Security posture by mechanism:
 - **Worker mode** — best isolation (container), but host-key checking is the

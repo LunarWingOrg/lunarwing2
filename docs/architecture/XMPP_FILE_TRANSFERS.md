@@ -89,7 +89,7 @@ The last URL path segment is used, with any query/fragment stripped. A missing e
 
 ### Bridge transport
 
-`BridgeMessage` carries attachments as `Vec<BridgeAttachment>` with base64-encoded file data. The field uses `#[serde(default)]` for backward compatibility with older bridge/channel versions.
+`BridgeMessage` carries attachments as `Vec<BridgeAttachment>` with base64-encoded file data. The field uses `#[serde(default)]` for backward compatibility with older bridge/channel versions. `enqueue_message()` drops attachment records whose in-memory `data` is empty rather than forwarding unusable payloads.
 
 ### WASM channel processing
 
@@ -156,8 +156,9 @@ Encrypted file shares are handled end-to-end:
 
 ## Security Notes
 
-- Inbound downloads fetch sender-supplied URLs. There is currently **no SSRF guard** on these fetches (private/loopback/metadata IPs are not blocked); this is deferred. Deployments rely on the network boundary and the `ALLOW_PRIVATE_IPS` model. A future phase can reuse `config/helpers.rs::validate_base_url` (gated on `ALLOW_PRIVATE_IPS`, via `spawn_blocking`).
+- Inbound downloads fetch sender-supplied URLs. There is currently **no SSRF guard** on this path: private, loopback, link-local, and metadata addresses are not blocked, and `ALLOW_PRIVATE_IPS` does not change that because the downloader never calls the config URL validator. Deployments must enforce outbound network controls. A future phase can reuse `config/helpers.rs::validate_base_url`, whose strict mode rejects internal addresses and whose `ALLOW_PRIVATE_IPS=1` mode permits parseable HTTP(S) URLs; its blocking DNS resolution must run through `spawn_blocking` if called from this async hot path.
 - Size limits are enforced during streaming, and the per-stanza URL count and download concurrency are bounded, so a crafted stanza cannot exhaust memory or stall the connection.
+- The local bridge HTTP surface rejects non-loopback clients. When `XMPP_BRIDGE_TOKEN` is configured, it also requires Bearer authentication before configure, poll, and send operations.
 
 ## Implementation Status
 

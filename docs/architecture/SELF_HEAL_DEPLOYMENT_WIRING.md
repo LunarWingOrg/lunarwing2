@@ -1,6 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Date:** 2026-06-13 (updated 2026-07-09)
+**Date:** 2026-06-13 (revalidated 2026-07-20)
 **Status:** Reference (as-is) — documents current behavior, not a proposal
 **Related:** `ic-infrastructure-health-check/README.md`, `docs/ops/MULTITENANCY-PRODUCTION.md`, `docs/internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md`
 
@@ -123,8 +123,9 @@ installed per tenant:
 
 - **systemd:** `health-systemd.sh` probes per-tenant *user* units by reading the
   tenant registry (`ports.json`) and querying each tenant user's `--user` bus.
-- **OpenRC:** `health-openrc.sh` auto-discovers `lunarwing-*`, `xmpp-bridge-*`,
-  and `lunarwing-proxy-*` services by scanning `/etc/init.d/` — no config needed
+- **OpenRC:** `health-openrc.sh` scans `/etc/init.d/` for `lunarwing-*` (which
+  already includes `lunarwing-proxy-*`, `lunarwing-pg-*`, and other tenant
+  services) plus `xmpp-bridge-*` — no separate proxy glob or config is needed
   (`docs/ops/MULTITENANCY-PRODUCTION.md` § Health Checks).
 - **Remediation:** `lunarwing-self-heal.sh` maps each unhealthy unit back to its
   owning tenant via the registry and restarts it on that user's bus

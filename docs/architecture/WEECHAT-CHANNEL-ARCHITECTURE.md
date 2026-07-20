@@ -27,8 +27,8 @@ Line numbers below drift; treat them as hints, not contracts. Source of truth:
 ### The three hops — only one is a WebSocket
 
 ```
-        WebSocket (+ /api/sync push)        HTTP long-poll (/api/wait, near real-time;
-WeeChat  ⇇———————————————————————————⇉  ws_adapter.py   3s poll fallback on old adapters)
+        WebSocket (+ /api/sync push)        HTTP long-poll (/api/wait while active;
+WeeChat  ⇇———————————————————————————⇉  ws_adapter.py   host-clamped 30s callback schedule)
  relay   real-time, adapter-buffered      (:base+9)    ⇇——————————————————⇉  LunarWing daemon
 (:base+5)                                                request/response       (WASM channel)
 ```
@@ -37,13 +37,16 @@ The **adapter↔WeeChat** hop is a real WebSocket and is real-time; the adapter 
 `/api/sync` subscription (`buffers`, `lines`). The **daemon↔adapter** hop is **HTTP** — the
 sandboxed WASM can only make request/response calls (`channel_host::http_request`), so it cannot
 hold a socket open. Instead of fixed-interval polling it issues a **blocking long-poll**
-(`GET /api/wait`, §3) that returns the instant a line arrives, falling back to ~3s polling only
-against an adapter that lacks the endpoint. "ws-adapter" describes the *upstream* link, not the
-daemon's link.
+(`GET /api/wait`, §3) that returns the instant a line arrives, falling back to per-buffer polling
+against an adapter that lacks the endpoint. The guest requests a 3s interval, but the host clamps
+all WASM channel polling to at least 30s; §3 explains the resulting scheduling gap. "ws-adapter"
+describes the *upstream* link, not the daemon's link.
 
-**Implication:** IRC messages reach the adapter instantly and are buffered there; in long-poll
-mode the daemon picks them up within a network round-trip (~ms), so end-to-end inbound latency is
-near real-time. In the polling fallback, latency ≈ the poll cadence instead (see §3).
+**Implication:** IRC messages reach the adapter instantly and are buffered there. If a message
+arrives while `/api/wait` is in flight, the daemon receives it within a network round-trip. After
+an early return or a 20s heartbeat, however, the host's 30s interval can leave an idle window
+before the next callback. Current end-to-end latency therefore ranges from near-immediate to
+roughly one host poll interval; the fallback mode is likewise paced at 30s (see §3).
 
 ### Relay configuration ownership
 
@@ -126,7 +129,7 @@ neither replays history nor needs per-buffer discovery.
 The daemon consumes the adapter in one of two modes, chosen at `on_start` by probing
 `GET /api/health` for an `event_cursor` field (`detect_and_seed_ingest_mode` in `lib.rs`).
 
-### Long-poll mode (default when the adapter supports it) — near real-time
+### Long-poll mode (default when the adapter supports it)
 
 The adapter keeps a **global ordered event log** (`event_seq` + `event_log`) and records every
 `buffer_line_added` into it. A line names its buffer by `buffer_id`; for a **brand-new** query/DM
@@ -142,18 +145,18 @@ a line recorded right after a restart isn't skipped. `on_start` seeds the WASM's
 start.
 
 `on_poll → do_longpoll`: issue `GET /api/wait` (HTTP timeout 25s), feed each returned line to
-`handle_inbound_line`, advance the cursor, repeat. Because the call returns the instant a line is
-recorded, **inbound latency ≈ a network round-trip (~ms)**, not the poll interval — and because
-the adapter now captures a new buffer's first line, a brand-new DM/query buffer's first message
-arrives through the same stream with **no discovery delay**.
+`handle_inbound_line`, and advance the cursor. The request returns as soon as a line is recorded,
+so delivery is near-immediate **while that request is active**. The adapter captures a new
+buffer's first line, so there is no separate buffer-discovery delay, but the host may not start the
+next wait until its next 30s interval tick.
 
 **Timeout hierarchy (hard constraint):** `adapter wait ≤20s  <  WASM HTTP 25s  <  host
-callback_timeout 30s`. The host loop below is unchanged; each `on_poll` simply blocks in
-`/api/wait` up to ~20s and re-issues immediately on return. If `/api/wait` is missing (old
+callback_timeout 30s`. The host loop below is unchanged; each `on_poll` blocks in
+`/api/wait` up to ~20s, returns, and waits for the next host interval tick. If `/api/wait` is missing (old
 adapter) or returns an unparseable body, the WASM logs it and falls back to **poll mode** for the
 rest of the session.
 
-### Poll mode (fallback / old adapters) — ~3s
+### Poll mode (fallback / old adapters) — 30s effective floor
 
 Used when the adapter has no `/api/wait`. `on_poll → do_poll` fetches each buffer per cycle.
 
@@ -163,7 +166,7 @@ Each channel gets its own polling task:
 
 ```
 loop {
-    interval_timer.tick().await;     // poll_interval (3s), MissedTickBehavior::Skip
+    interval_timer.tick().await;     // effective interval >=30s, MissedTickBehavior::Skip
     execute_poll().await;            // runs the WASM on_poll to completion
 }
 ```
@@ -174,18 +177,23 @@ loop {
 effective cadence  =  max(poll_interval, cycle_duration)
 ```
 
-- **`poll_interval` = 3s**, hard floor (`default_poll_interval()=3`; `.max(3000)` in `lib.rs`;
-  host `min_poll_interval_ms: 3000`). It cannot go below 3s.
+- The WeeChat guest requests **3s** (`default_poll_interval()=3` and
+  `.max(3000)` in `lib.rs`), and its capabilities file also declares 3000ms.
+  The host ignores that lower floor: `MIN_POLL_INTERVAL_MS` is **30,000ms** in
+  `ic/src/channels/wasm/capabilities.rs`, and schema conversion plus
+  `validate_poll_interval()` clamp every channel to at least 30s.
 - **`cycle_duration`** is bounded above by **`callback_timeout` = 30s**
   (`ic/src/channels/wasm/runtime.rs`), the `tokio::time::timeout` wrapping the WASM call.
 
-So a slow cycle stretches the gap between polls all the way to ~30s. (Before the fixes below,
-`MissedTickBehavior` was the default `Burst`, which then fired a burst of catch-up polls.)
+The effective polling floor is therefore 30s. A callback that reaches the
+timeout can extend the gap further; `MissedTickBehavior::Skip` prevents a burst
+of catch-up calls afterward.
 
-This same host loop drives **both** modes. In long-poll mode `cycle_duration` is *intentionally*
-the ~20s `/api/wait` block, so `MissedTickBehavior::Skip` just re-issues the wait the instant it
-returns — there is no idle 3s gap, which is exactly what gives near-real-time delivery. In poll
-mode the cycle is short and the 3s tick paces it.
+This same host loop drives **both** modes. In long-poll mode `cycle_duration` is
+the up-to-20s `/api/wait` block. Once it returns, the task waits for the next
+30s interval tick; an early event can therefore be followed by a substantial
+idle window. In poll mode the cycle is usually short and the 30s host tick
+paces it.
 
 ### Per-cycle cost (poll mode)
 
@@ -200,8 +208,9 @@ WASM instance is also created per poll (`create_store` + `instantiate_component`
 | Per-buffer lines | `GET /api/buffers/<buf>/lines` | **2s** (was 5s) | every poll, ×N buffers |
 | Buffer-list refresh | `GET /api/buffers` | 5s | every ~30 polls, or when empty |
 
-Worst-case cycle ≈ `1.5 + 2 + 2·N` s (was `2 + 3 + 5·N`). In the normal case (responsive local
-adapter) each call returns in milliseconds and the cadence is ~3s.
+Worst-case cycle ≈ `1.5 + 2 + 2·N` s (was `2 + 3 + 5·N`). In the normal case
+(responsive local adapter) each call returns in milliseconds, but the host
+still paces callbacks at a minimum 30s interval.
 
 ### Seeing the real cadence (poll mode)
 
@@ -214,8 +223,9 @@ sudo -u <tenant> XDG_RUNTIME_DIR=/run/user/$(id -u <tenant>) \
 The gap between consecutive lines is the actual cadence. To measure how long a single cycle
 takes, compare `calling on_poll channel=weechat` → `on_poll completed channel=weechat`.
 
-In **long-poll mode** there is no fixed cadence to measure; liveness is the adapter's
-`event_cursor` climbing as lines arrive (`curl -s …/api/health`, §5) and `emitted_count` on the
+In **long-poll mode**, measure both the 30s host callback starts and the time
+spent inside each callback. Liveness is also visible through the adapter's
+`event_cursor` (`curl -s …/api/health`, §5) and `emitted_count` on the
 `on_poll completed` lines.
 
 > Channel debug logs are gated twice: by the `debug_logging` capability flag **and** by the
@@ -297,7 +307,7 @@ Then restart the daemon so `on_start` re-resolves.
 |-------|---------|------------|--------|
 | **`networks="all"` matched literally** | Every message dropped: `line dropped (network not in allowlist): network=…, allowed=["all"]` | The allowlist compared names literally; `"all"` matched no real network. Convention was *empty = all*, but `"all"` is the obvious thing to type. | **Fixed** — `network_allowed()` treats `all`/`*` as wildcards (empty still = all). |
 | **Channel debug logs invisible** | `debug_logging=true` produced nothing in the journal | The host forwarded all guest `Info/Debug/Trace` logs via `tracing::debug!`, dropped by the default `RUST_LOG=lunarwing=info`. | **Fixed** — faithful level mapping (`Info→info!`, `Trace→trace!`); `debug_logging` is now visible at `info`. |
-| **Poll cadence balloons to ~30s** | Long, irregular gaps between polls | `tick` + `poll` sequential ⇒ cadence = `max(3s, cycle)`; cycle could approach the 30s `callback_timeout`; default `Burst` then fired catch-up bursts. | **Fixed** — long-poll (`/api/wait`, §3) removes the per-cycle per-buffer fan-out entirely, so there is no cadence to balloon. The problem only survives on the polling fallback, where `MissedTickBehavior::Skip` + tightened per-call timeouts keep it bounded. |
+| **Guest 3s interval is clamped to 30s** | A message can wait after an early `/api/wait` return even though the adapter already buffered it | The guest and capabilities file request 3000ms, but host `MIN_POLL_INTERVAL_MS=30000` wins during schema conversion and startup validation. | **Open / documented** — long-poll is immediate only while a wait is active. `MissedTickBehavior::Skip` prevents catch-up bursts but does not remove the host floor. |
 | **`poll_interval_ms` ignored** | Configuring the interval did nothing | Caps `config` key was `poll_interval_ms` but the struct field is `poll_interval_seconds` — different name ⇒ value dropped, struct default (3) used. | **Fixed** — caps key renamed to `poll_interval_seconds`. |
 | **First DM in a new buffer swallowed** | First message after a query buffer is created never reaches the agent; the *second* does | A DM/query buffer is created *by* the first message. The **adapter** resolves a line's buffer by `buffer_id` against a cached `buffer_list` that doesn't include the new buffer yet, so it **dropped the first line entirely** — never recorded to `line_buffer` *or* the event log. Nothing downstream (neither the long-poll cursor nor the poll path) can deliver a line the adapter never recorded. (The poll path additionally seed-skipped a new buffer's first batch.) | **Fixed** — the adapter now refreshes its buffer list **synchronously and retries** before recording, so a new buffer's first line is captured (`record_event`); the long-poll global cursor then delivers it immediately (§3). `/api/wait` also replays the post-restart backlog so a DM right after an adapter restart isn't skipped. The poll fallback still emits the first batch for new **DM/query** buffers (`is_dm_buffer`). |
 | **Mirror loop (long-poll mode)** | Agent answers its own messages endlessly; `event_cursor` climbs steadily with no human input | The `irc_privmsg`/`self_msg`/`no_log` tag filter lived **only** in `poll_buffer`. `do_longpoll` feeds events straight to `handle_inbound_line`, which had no tag check — so in long-poll mode the agent's own `self_msg` replies were ingested and re-answered, each reply becoming the next event. Shipped in the original long-poll commit; not the adapter work. | **Fixed** — tag filter moved into `handle_inbound_line` (`tags_allow_ingest`), the single choke point **both** ingest paths share; `poll_buffer` keeps its pre-filter. Regression test `test_tags_allow_ingest`. |
@@ -320,16 +330,15 @@ Then restart the daemon so `on_start` re-resolves.
 
 **Applied in this change (P0/P1):**
 
-- **Near real-time ingestion (long-poll):** adapter global event log + blocking `GET /api/wait`;
+- **Long-poll ingestion:** adapter global event log + blocking `GET /api/wait`;
   WASM `do_longpoll` consuming it with a capability probe and automatic fallback to per-buffer
   polling against old adapters (`ws_adapter.py`, `lib.rs`, with a `parse_wait_response` test).
-  This is the former "P2 — real-time push" recommendation, delivered as a long-poll (which the
-  sandboxed WASM *can* do) rather than a held socket (which it cannot). Largest latency win, and
-  it subsumes the batched-lines idea below.
+  This replaces per-buffer fan-out with one blocking request. It provides immediate delivery while
+  the request is active, but the current 30s host schedule leaves gaps between callbacks (§3).
 - Faithful guest-log level mapping (`wrapper.rs`).
-- `MissedTickBehavior::Skip` + tightened per-call timeouts (`wrapper.rs`, `lib.rs`) — now govern
-  only the **polling fallback**: keep its cadence ≈ 3s and bound a stalled cycle well under the
-  30s `callback_timeout`.
+- `MissedTickBehavior::Skip` + tightened per-call timeouts (`wrapper.rs`, `lib.rs`) prevent
+  catch-up bursts and bound a stalled fallback cycle; the host still enforces a 30s minimum
+  interval.
 - `network_allowed()` wildcard for `all`/`*` (`lib.rs`, with a regression test).
 - `poll_interval_seconds` caps key fix (`weechat.capabilities.json`).
 - **First-DM delivery (real fix is at the adapter):** the adapter refreshes its buffer list
@@ -344,6 +353,9 @@ Then restart the daemon so `on_start` re-resolves.
 
 **Open / recommended next:**
 
+- **P1 — Reconcile long-poll scheduling with the host minimum.** Either give trusted bundled
+  long-poll channels a supervised continuous-wait loop or lower the minimum safely. Until then,
+  do not describe the daemon-to-adapter path as continuously near real-time.
 - **P2 — Batched "all new lines" endpoint for the fallback path.** `/api/wait` already returns all
   new lines across buffers in one call, so the long-poll path no longer fans out per buffer; only
   the polling fallback still issues N sequential `/lines` fetches. Low priority now.
