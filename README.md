@@ -12,8 +12,6 @@ LunarWing is a self-hosted, privacy-focused AI agent runtime and operations plat
 
 The v2 line introduces the new execution engine, a browser-based multi-tenant onboarding console, richer gateway interactions, and a refreshed foundation for skills, memory, workers, and tools.
 
-Read the [v2.0.0.0 release notes](RELEASE-v2.0.0.0.md) for the complete change list, compatibility notes, and known limitations.
-
 ## Quick links
 
 - [Website](https://lunarwing.org/)
@@ -40,7 +38,7 @@ Read the [v2.0.0.0 release notes](RELEASE-v2.0.0.0.md) for the complete change l
 
 Engine V2 provides the channel-neutral execution path used by the v2 gateway, including streaming events, interrupts, stop handling, approval gates, and richer tool-result presentation. New multi-tenant configurations enable Engine V2 by default; direct single-instance configurations must opt in explicitly.
 
-The gateway receives the full interactive experience. XMPP, DarkIRC, and WeeChat can opt in through `ENGINE_V2_CHANNELS`; other channels remain on the legacy path. Opted-in WASM channels currently receive terminal responses and status updates rather than live token edits. Review the caveats in the [release notes](RELEASE-v2.0.0.0.md) before enabling Engine V2 for group channels.
+The gateway receives the full interactive experience. XMPP, DarkIRC, and WeeChat can opt in through `ENGINE_V2_CHANNELS`; other channels remain on the legacy path. Opted-in WASM channels currently receive terminal responses and status updates rather than live token edits. Validate channel-specific behavior before enabling Engine V2 for group channels.
 
 Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 
@@ -152,7 +150,9 @@ The production scripts support rootless per-user Podman or a configured rootful 
 
 ## Upgrades and migration
 
-The GUI legacy-upgrade workflow wraps the PostgreSQL and rootful-Docker v1 upgrader. It runs preflight and dry-run by default, accepts three-part `vX.Y.Z` targets, and uses `v1.1.2` when the target is blank. It rejects `v2.0.0.0` and is not a supported v1-to-v2 upgrade path.
+The GUI legacy-upgrade workflow wraps the PostgreSQL and rootful-Docker v1
+upgrader. It runs preflight and dry-run by default, accepts supported three-part
+v1 target tags, and is not a supported v1-to-v2 upgrade path.
 
 For a v1 tenant moving to v2, prepare a separate v2 deployment and rehearse a staged Kawarimi export/import. Validate the restored tenant before cutover. Before selecting Start, the operator must stop the old tenant daemon and bridge when both tenants use the same XMPP identity; the GUI does not enforce this gate.
 
@@ -165,7 +165,7 @@ Kawarimi supports PostgreSQL tenants; libSQL bundles are refused. A real export 
 
 ## Development and testing
 
-The Rust workspace lives under `ic/`, uses Rust 1.96, and reports package version `2.0.0` for the v2 release line.
+The Rust workspace lives under `ic/` and uses Rust 1.96.
 
 ```bash
 cd ic
@@ -188,9 +188,7 @@ Additional test surfaces:
 | Architecture | [docs/architecture/](docs/architecture/) |
 | Operator guides | [docs/guides/](docs/guides/) |
 | Production operations | [docs/ops/](docs/ops/) |
-| Historical releases through v1.1.9.0 | [docs/releases/](docs/releases/) |
 | Known bugs and status | [docs/bugs/README.md](docs/bugs/README.md) |
-| v2.0.0.0 release | [RELEASE-v2.0.0.0.md](RELEASE-v2.0.0.0.md) |
 
 ## Project and community
 
