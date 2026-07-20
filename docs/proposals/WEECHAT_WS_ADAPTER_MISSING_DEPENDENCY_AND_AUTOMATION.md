@@ -1,10 +1,17 @@
 # Issues
 
-* When starting a weechat ws adapter service, it must be done manually in a tmux pane that persists and runs
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** systemd/OpenRC
+> service rendering, enablement, and registry-backed adapter ports are
+> implemented. Dependency handling remains warn-only; mt-admin does not install
+> `aiohttp` automatically.
+
+* Historical problem: starting the WeeChat WebSocket adapter required a manual,
+  persistent tmux pane.
 
 To make this WAY better, we can:
 
-1. Make the adapter into a systemd/openrc service
-2. Automate the installation of aiohttp using pip3 or uv during the mulit-tenant environment set up.
-3. Enable service from #1 for the user.
-4. additionally, we should automate more of this via mt admin, such as being able to set the ws_adpater local http port. see the other weechat issues for more information on this
+1. [x] Make the adapter into a systemd/OpenRC service.
+2. [ ] Automate installation of `aiohttp` during multi-tenant setup. Current
+   behavior warns when the dependency is missing.
+3. [x] Enable the service from item 1 for the tenant.
+4. [x] Manage the adapter's local HTTP port through mt-admin and the ports registry.

@@ -1,5 +1,10 @@
 # Agent HTTP Tool SSRF Protections Investigation
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED INVESTIGATION RECORD.**
+> HTTPS-only validation, private-address blocking, redirect
+> revalidation, approval gating, and DNS pinning remain active. The proposed
+> built-in-tool `ALLOW_PRIVATE_IPS` bypass was intentionally not added.
+
 ## Status
 
 - Investigation completed 2026-06-27

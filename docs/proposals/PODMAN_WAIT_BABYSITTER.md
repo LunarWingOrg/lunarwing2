@@ -1,5 +1,10 @@
 # Podman Wait Babysitter Pattern
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** The helper,
+> OpenRC unit renderer, register/deregister lifecycle, worker and PostgreSQL
+> wiring, and `pg_isready` status check are in current source. Helper ownership
+> now belongs to mt-admin rather than the watchdog installer.
+
 ## Overview
 
 The podman wait babysitter provides docker-parity crash recovery for rootless Podman containers on OpenRC by using OpenRC's `supervise-daemon` to supervise a foreground process that blocks on `podman wait <container>`. When the container exits, `podman wait` returns, the supervised process exits, and `supervise-daemon` respawns it (which starts the container again).
@@ -111,5 +116,6 @@ podman kill lunarwing-pg-<tenant>
 
 ## Files Modified
 
-- `ic/scripts/lunarwing-mt-admin.sh` — render_container_babysitter_unit, _register_babysitter, _deregister_babysitter, and lifecycle wiring
-- `ic/scripts/install-lunarwing-watchdog.sh` — helper installation and cleanup
+- `ic/scripts/lunarwing-mt-admin.sh` — helper installation/cleanup,
+  `render_container_babysitter_unit`, register/deregister helpers, and lifecycle
+  wiring

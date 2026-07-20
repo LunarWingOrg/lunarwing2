@@ -1,5 +1,10 @@
 # IronClaw Port-Analysis Backlog — Status Index
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL / VERIFICATION-PENDING.**
+> Implemented rows remain present, while the open backlog remains open. The
+> Wasmtime baseline is now 36.0.12 rather than 28.x, so advisory counts below
+> require a fresh `cargo deny check` before security prioritization.
+
 > **Note:** These are pre-fork IronClaw (upstream) port analyses, kept for reference.
 > LunarWing diverged from IronClaw in February 2026 and is not affiliated with NearAI.
 > Many items listed as "open/deferred" may have been independently implemented or
@@ -25,7 +30,7 @@ Per the v1.1.1 release decision, **all remaining code-level ports are deferred**
 
 | Item | Priority | Note |
 |------|---------|------|
-| 0.29.0 **P0-B** Wasmtime 28→44 sandbox upgrade | P0 | XL, multi-PR; ~12 of 19 advisories live in the wasmtime stack. Own release track. |
+| 0.29.0 **P0-B** Wasmtime 36→supported-release audit | P0 | XL, multi-PR; the old 28→44 target and advisory counts are stale. Run a fresh audit from 36.0.12. |
 | 0.29.0 **P0-A** Dependency advisory bumps | P0 | Run `cargo deny check advisories`; real blockers are libsql/tokio-xmpp/libsignal upgrades. |
 | 0.28.1 **P1-A** WASM selective channel activation (headless) | P1 | Don't load all channels unconditionally. |
 | 0.28.1 **P1-B** `scoped_to_user` workspace isolation | P1 | Per-request workspace clone for multi-tenant. |

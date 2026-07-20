@@ -1,8 +1,12 @@
 ---
 plan name: rootless-podman-babysitter
 plan description: Implement podman wait babysitter for OpenRC rootless container supervision
-plan status: finished (needs review of full implementation)
+plan status: implemented and reviewed
 ---
+
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** All listed
+> implementation items landed; the follow-up review and live OpenRC/rootless
+> fault-injection work are recorded in `PODMAN_WAIT_BABYSITTER_REVIEW.md`.
 
 ## Idea
 Implement the "podman wait" babysitter pattern (Option 1 from ROOTLESS_PODMAN_CONTAINER_SUPERVISION_GAP.md) to provide docker-parity crash recovery for rootless Podman containers on OpenRC. This adds supervised babysitter units alongside existing per-tenant container units (lunarwing-pg-<t>, lunarwing-nanocode-<t>, lunarwing-pebble-<t>) that block on `podman wait` and respawn on container exit via OpenRC's supervise-daemon. Also fixes the PG status() false-healthy bug by making it run pg_isready instead of just checking State.Running.

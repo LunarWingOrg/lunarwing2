@@ -1,6 +1,11 @@
 # Human Delay Mode - Phase 1 Test Checklist
 
-**Status**: Implementation complete (branch `human-delay-mode-phase-1-baud`), ready for verification.
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** Phase 1 shipped
+> and its supervised-mode regressions pass. Some paths and standalone `gate` or
+> `thread` CLI examples below are historical and do not exist in the current CLI;
+> approvals use the interactive channel/gateway flow.
+
+**Status**: Implemented and verified; retained as the Phase 1 checklist.
 
 ## Overview
 

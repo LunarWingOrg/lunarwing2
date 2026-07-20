@@ -1,5 +1,10 @@
 # Multica/Lunartica Integration Plan for LunarWing
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** The Phase 1 bridge,
+> registry entries, and polling skill shipped. Phase 2 landed as HTTP polling,
+> not the proposed persistent WebSocket path. Phase 3 has export/list/get support;
+> import, synchronization, artifact transport, and trust integration remain open.
+
 ## Problem
 
 LunarWing is WASM-native — capabilities are declared and sandboxed, not CLI-detected. Multica's daemon protocol assumes CLI runtimes discovered via stdio/TCP (OpenClaw, Claude Code, Codex, etc.). To make LunarWing a first-class Multica runtime, we need a bridge layer that speaks the Multica daemon protocol from within LunarWing's WASM tool/channel/routine architecture.
@@ -28,7 +33,7 @@ User-facing APIs (authenticated differently) provide issue CRUD (`/api/issues`),
 
 ---
 
-## Phase 1: WASM Tool — `multica-bridge`
+## Phase 1: WASM Tool — `multica-bridge` (implemented)
 
 **Goal:** LunarWing can poll a Multica board, claim tasks, report progress/completion, and post comments. Agent uses it via routines.
 
@@ -171,7 +176,7 @@ Or via the gateway UI's extension install flow. The auth step stores `multica_ap
 
 ---
 
-## Phase 2: WASM Channel — `multica-channel`
+## Phase 2: WASM Channel — `multica-channel` (partial: HTTP polling)
 
 **Goal:** Real-time bidirectional communication. Multica pushes events to LunarWing (new task available, issue updated, comment added). LunarWing responds immediately instead of waiting for the next poll interval.
 
@@ -227,7 +232,7 @@ Phase 1's polling routine remains as a fallback:
 
 ---
 
-## Phase 3: Skill Compounding
+## Phase 3: Skill Compounding (partial)
 
 **Goal:** LunarWing's WASM-compiled skills are registered in the Multica board and shared across agents/runtimes.
 

@@ -1,5 +1,9 @@
 # LunarWing Deep Exploration — Findings & Suggestions
 
+> **Current status (2026-07-20, rev `50c8f99`): HISTORICAL ROADMAP.** Supervised
+> mode (E-1), the infrastructure watchdog (D-1), and self-improving skill
+> patching (B-1) have shipped. Most other suggestions remain independent backlog.
+
 > Compiled by Kumogakure  
 > Based on a thorough read of the v1.0.8-dev STAGING codebase on 2026-05-27.
 > Written for sun and Baud.
@@ -328,4 +332,3 @@ If I were ranking what to build next:
 *salutes with a wing*
 
 — Kumogakure
-

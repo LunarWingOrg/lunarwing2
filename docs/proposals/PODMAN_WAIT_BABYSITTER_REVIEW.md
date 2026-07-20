@@ -1,6 +1,11 @@
 # Review — Podman-Wait Babysitter (`origin/1.1.6-babysitter`)
 
-**Status:** Read-only inspection notes — NOT cherry-picked. Captured for later.
+> **Current status (2026-07-20, rev `50c8f99`): HISTORICAL RECORD.** The review's
+> log-directory, helper-install, cleanup-order, and environment findings were
+> resolved in the landed implementation; fault-injection scripts are present.
+> The original branch verdict below is retained for provenance.
+
+**Status:** Historical inspection notes; reviewed fixes subsequently landed.
 **Date:** 2026-06-21
 **Branch reviewed:** `origin/1.1.6-babysitter` (3 commits on `staging`: `a767c726`, `2a637854`, `86f55aee` "finished a first attempt …").
 **Reviewed against:** `origin/staging`; the branch's own `docs/proposals/PODMAN_WAIT_BABYSITTER.md`, `docs/specs/podman-wait-babysitter.md`, `docs/plans/rootless-podman-babysitter.md`; and the original gap doc `docs/proposals/ROOTLESS_PODMAN_CONTAINER_SUPERVISION_GAP.md`.

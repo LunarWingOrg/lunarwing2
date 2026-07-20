@@ -1,5 +1,9 @@
 # Jingle / IBB File Transfer Feasibility Investigation
 
+> **Current status (2026-07-20, rev `50c8f99`): HISTORICAL RECORD.** The defer
+> decision still stands. LunarWing continues to use XEP-0363 and has no Jingle,
+> IBB, or SOCKS5 bytestream implementation.
+
 ## Status
 
 - Research completed 2026-06-27

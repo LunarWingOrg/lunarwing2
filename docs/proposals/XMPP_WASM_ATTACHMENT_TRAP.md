@@ -1,11 +1,17 @@
 # XMPP WASM Attachment Trap Investigation
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL / VERIFICATION-PENDING.**
+> Attachment decode-lifetime changes and a 128 MiB channel
+> limit landed. No dedicated large-attachment regression was found, and the live
+> PNG/cursor-advance gate remains incomplete; the historical 70-test count below
+> is not a current-tree test count.
+
 ## Status
 
-- **Fixed on 2026-06-27**
+- **Partially fixed on 2026-06-27; regression and live validation remain**
 - Files changed: `ic/channels-src/xmpp/src/lib.rs`, `ic/src/channels/wasm/runtime.rs`, `ic/src/channels/xmpp/mod.rs`
 - WASM channel rebuilt: `xmpp.wasm` (176K), validated with `wasm-tools validate`
-- All 70 XMPP tests passing (including OMEMO roundtrips, WASM wrapper integration, aesgcm URL leak regression)
+- Historical test snapshot: 70 XMPP tests passed on the implementation branch
 - **Live test still needed**: send a real PNG over XMPP and confirm cursor advances
 
 ## Problem Summary
@@ -59,8 +65,8 @@ If linear memory growth is denied by the limiter, Wasmtime can surface that as a
 ### Default WASM channel limits
 
 - `ic/src/channels/wasm/runtime.rs`
-  - default memory limit: 50 MB
-  - default fuel limit: 10,000,000
+- default memory limit: 128 MiB (raised from 50 MB by the partial fix)
+- default fuel limit: 10,000,000
 
 ### Bridge attachment schema
 
@@ -84,7 +90,8 @@ Even for a ~1 MB PNG, this creates multiple megabytes of in-flight allocations a
 
 The host-side attachment storage limit is not the first problem here; the problem is that the data appears to peak in **WASM memory before the host can fully own it**.
 
-If `memory_growing()` denies a growth request at the 50 MB channel ceiling, Wasmtime can surface that denial as a trap, which matches the observed daemon log.
+At the former 50 MB channel ceiling, a denied `memory_growing()` request could
+surface as a Wasmtime trap matching the observed daemon log.
 
 ## Why other explanations are less likely
 
@@ -106,7 +113,7 @@ Fuel exhaustion should surface differently from a generic trap. The observed err
 
 ## Proposed Fixes
 
-### Fix 1: Drop large temporary buffers earlier in the WASM XMPP channel
+### Fix 1: Drop large temporary buffers earlier in the WASM XMPP channel — implemented
 
 In `ic/channels-src/xmpp/src/lib.rs`:
 
@@ -116,7 +123,7 @@ In `ic/channels-src/xmpp/src/lib.rs`:
 
 Goal: reduce peak concurrent WASM memory usage during `on_poll()`.
 
-### Fix 2: Explicitly shorten attachment decode lifetime
+### Fix 2: Explicitly shorten attachment decode lifetime — implemented
 
 Inside `decode_inbound_attachments()`:
 
@@ -127,12 +134,10 @@ Inside `decode_inbound_attachments()`:
 
 Goal: avoid multiple large attachment copies surviving longer than necessary.
 
-### Fix 3: Increase XMPP channel WASM memory limit
+### Fix 3: Increase XMPP channel WASM memory limit — implemented
 
-As defense in depth, increase the XMPP channel memory limit above the current 50 MB default (for example to 128 MB), either:
-
-- in `ic/src/channels/wasm/runtime.rs` defaults, or
-- via a per-channel override if that is supported by the capabilities/runtime path
+As defense in depth, the XMPP channel memory limit was raised from 50 MB to
+128 MiB in `ic/src/channels/wasm/runtime.rs`.
 
 Goal: provide headroom for attachment-heavy poll responses.
 

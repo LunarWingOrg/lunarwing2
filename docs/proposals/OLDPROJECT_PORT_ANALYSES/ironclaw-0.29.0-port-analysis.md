@@ -1,5 +1,10 @@
 # Port IronClaw 0.29.0 Changes to LunarWing
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL / STALE SECURITY SNAPSHOT.**
+> The logs-download backend landed; CodeAct disablement and the other
+> selected ports remain open. Wasmtime is now 36.0.12, so the 28.0.1 baseline and
+> advisory counts in this analysis must not be used without a fresh audit.
+
 **Date:** 2026-05-27 (audited 2026-05-28, status audit 2026-06-05, updated 2026-06-05)
 **Status:** Analysis complete. Advisory audit run 2026-05-28 via `cargo deny check advisories` — see [Audit Findings](#audit-findings-2026-05-28). P0-A's named simple-bump path turned out to be empty in the current lockfile; the wasmtime exposure (P0-B) accounts for 12 of 19 current advisories. P2-A implemented 2026-06-05 on branch `1.1.1-333-security-improvements-3`. Remaining open: P0-B, P1-A, P2-B through P2-D.
 

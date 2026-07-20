@@ -1,5 +1,10 @@
 # V2 MCP and Extension Runtime Architecture Exploration
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL / EXPLORATORY.** Phase 0
+> host-local stdio installation is implemented. The runtime-neutral package
+> model, adapter boundary, worker-local MCP, marketplace provenance, and
+> MCP-over-WASM phases remain unimplemented design work.
+
 **Status:** Exploratory V2 architecture; host-local stdio installation surfaces
 implemented as the first near-term step on 2026-07-09  
 **Date:** 2026-07-09  

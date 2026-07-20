@@ -1,5 +1,10 @@
 # Self-Heal Repair Followups (triaged)
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** Notifier timeout,
+> truncated-state recovery, and systemd timer installation/removal have landed.
+> Escalation cooldown (6a) remains open; per-tenant application-level health
+> (10) remains deferred.
+
 Followups for the host-global health-check + self-heal pipeline
 (`ic-infrastructure-health-check/`: `infrastructure-health-check.sh` → `lunarwing-self-heal.sh`,
 paged by `send-notification.sh`, wired into `ic/scripts/lunarwing-mt-admin.sh`).
@@ -15,8 +20,8 @@ each item is directly actionable.
 | # | Item | Self-heal code? | Difficulty | Action |
 |---|------|:---:|---|---|
 | 6c | Notifier timeout | ✅ | trivial | **FIXED** `2b462f95` |
-| 6b | Truncated-state recovery | ✅ | easy | **FIXED** `(pending commit)` |
-| 2 | systemd `.timer/.service` scheduling | ✅ | moderate | **do now** |
+| 6b | Truncated-state recovery | ✅ | easy | **FIXED** |
+| 2 | systemd `.timer/.service` scheduling | ✅ | moderate | **FIXED** |
 | 6a | Escalation cooldown / rate-limit | ✅ | moderate | do now (one design choice) |
 | 10 | Per-tenant app-level health (Pattern C) | ✅ | involved | **defer** (own design pass) |
 | 1 | Propagate 4 fixes to staging/prod | ❌ ops | n/a | mostly done — redeploy only |
@@ -63,7 +68,9 @@ Recovery already half-exists: `load_state` falls back to `{}` on parse failure a
   corrupt bytes directly (not via `seed_state`, whose `jq -n` rejects malformed JSON to an empty file).
   Full self-heal suite green: **188 passed / 0 failed** (regression 28, matrix 124, chaos 36).
 
-#### 2. Wire systemd `.timer/.service` scheduling — *moderate, self-contained in one file*
+#### 2. Wire systemd `.timer/.service` scheduling — ✅ FIXED
+
+The implementation steps below are retained as the historical design record.
 `ensure_health_pipeline()` is OpenRC-only, so the prod systemd leg gets the hardened scripts but no
 auto-scheduling (G1/G2 stay open there). The launcher (`/usr/local/sbin/lunarwing-mt-health`) and all
 pipeline scripts are **already init-agnostic** — only the scheduling layer needs a systemd branch.

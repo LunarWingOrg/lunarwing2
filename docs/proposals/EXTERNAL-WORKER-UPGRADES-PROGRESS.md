@@ -1,5 +1,9 @@
 # External Worker Upgrades — Progress Checklist
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED / HISTORICAL RECORD.**
+> All waves remain present in current source. Test counts below are
+> point-in-time verification snapshots, and Codex references are historical.
+
 > Last updated: 2026-06-22. Tracks completed and remaining tasks for the external worker upgrades plan.
 
 ## Plan

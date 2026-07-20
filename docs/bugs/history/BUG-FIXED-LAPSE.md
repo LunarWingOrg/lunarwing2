@@ -1,6 +1,6 @@
 # BUG: Agent "lapse" — recurring "I'm not sure how to respond to that."
 
-> **STATUS: FIXED (current source verified 2026-07-12; originally fixed in v1.1.2)** — tool calls emitted in the
+> **STATUS: FIXED (current source at `51ae5a8` verified 2026-07-20; originally fixed in v1.1.2)** — tool calls emitted in the
 > `<function=NAME>...</function>` XML dialect are now recovered into structured calls before
 > response cleaning, so they no longer clean to empty and trip the empty-response fallback.
 > The historical fix was recorded as commit `7a9aca2c`; that pre-v2 commit is
@@ -69,8 +69,8 @@ the empty-response fallback is no longer triggered.
 ## Current verification
 
 The recovery and cleanup functions remain at
-`ic/src/llm/reasoning.rs:1486-1685`, with regression tests at
-`:2564-2626` and `:3348`. The old `:776`/`:823` references are historical.
+`ic/src/llm/reasoning.rs:1464-1676`, with regression tests at
+`:2542-2619` and `:3331-3362`. The old `:776`/`:823` references are historical.
 No Cargo command was run.
 
 ## Affected code

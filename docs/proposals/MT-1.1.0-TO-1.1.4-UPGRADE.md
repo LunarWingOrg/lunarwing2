@@ -1,5 +1,10 @@
 # Multi-Tenant Upgrade: v1.1.0 → v1.1.4 ("Phoenix") on systemd
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED TOOLING / VERIFICATION-PENDING.**
+> The preflight, upgrade, fleet-health enablement, and
+> rootless-flip guard shipped. This frozen v1.1.4 runbook was never live-validated
+> for the exact rootful-to-rootless production flip; current ports schema is v11.
+
 **Status:** Proposal / runbook for the **rootless-adopt v1.1.0 → v1.1.4 flip** — still **pending operator go-ahead / not yet live-validated**. (Separately, the *same-host* v1.0.9 → v1.1.2 upgrade via `ic/scripts/upgrade-tenant-version.sh` has been **live-validated on a production tenant** — that is a different mechanism from the rootful → rootless flip this proposal covers.) *(Note: as of v1.1.9, the port schema has advanced to v11; the v5→v6 migration described here was the state at v1.1.4.)*
 **Date:** 2026-06-18
 **Source version:** `v1.1.0` (`17d0feb1`)

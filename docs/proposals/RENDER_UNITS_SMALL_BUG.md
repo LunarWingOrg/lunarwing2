@@ -1,4 +1,10 @@
 # Explanation
+
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** The `render-units`
+> verb and PostgreSQL readiness fix landed. The optional-WeeChat footgun surfaced
+> here remains open: backend units are still rendered without a tenant-level
+> enablement gate and can be classified unhealthy when intentionally unused.
+
   Net result
 
   - render-units <name> verb added — re-renders a tenant's units from the current generator, no restart, no secret/env touching. The proper mechanism for
@@ -21,4 +27,3 @@
   optional unit that can't start.
   2. Generator: only render/enroll the weechat backend when weechat is actually enabled for the tenant (gate on a WEECHAT_ENABLED-type flag).
   3. Fix weechat itself (the tmux duplicate session start failure).
-

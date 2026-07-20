@@ -1,5 +1,10 @@
 # B-1: Skills as Self-Improving Procedural Memory
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** The complete
+> propose, review, approve/reject, version-history, metric-reset, API, and web UI
+> flow is in tree. B-2 demotion/pruning and B-3 cross-agent sharing remain
+> separate deferred work.
+
 Implement the Hermes-style "skill patching" loop: when a thread fails and the
 failure traces back to an active skill, diagnose it, patch the skill's
 prompt/code, bump its version, and track the patch — closing the loop

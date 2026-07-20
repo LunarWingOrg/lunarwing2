@@ -1,5 +1,9 @@
 # Routine Engine Improvements
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** Items 1-3 are
+> implemented. Items 4-8 remain unimplemented and intentionally deprioritized;
+> current CLI/history surfaces also make item 8's original wording partly stale.
+
 > **Last updated: 2026-07-09 (v1.1.9)**
 
 ## Overview

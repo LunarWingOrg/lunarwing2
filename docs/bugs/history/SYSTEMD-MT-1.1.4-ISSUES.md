@@ -1,8 +1,9 @@
 # Systemd Multi-Tenant / ICHC Issues — 1.1.4 First Real Pass
 
-**Context.** The systemd multi-tenant path (rootless-podman Quadlets + per-tenant user
-units + host-global ICHC/self-heal) has **not** been exercised as thoroughly as the
-Gentoo/OpenRC path. This doc records issues found during the 1.1.4 pre-release pass on the
+**Historical context.** During the 1.1.4 pass, the systemd multi-tenant path
+(rootless-podman Quadlets + per-tenant user units + host-global ICHC/self-heal)
+had **not** been exercised as thoroughly as the Gentoo/OpenRC path. This doc
+records issues found during that pre-release pass on the
 **Arch Linux** MT test VM (goals 5-8 in `docs/ops/history/GOALS_1.1.4.md`) and proposes fixes.
 
 **Test VM facts.** systemd; rootless podman; tenants `summer`/`autumn`/`winter` (created on a
@@ -13,8 +14,8 @@ systemd units). New tenant `springfeather` provisioned with
 
 **Status legend:** 🔴 open · 🟡 workaround applied, code fix pending · 🟢 fixed (code)
 
-**Current-document note (2026-07-12):** F1-F10 and F12 are historical resolved
-findings. F11 remains an active capacity issue and is tracked in
+**Current-document note (`51ae5a8`, 2026-07-20):** F1-F10 and F12 are
+historical resolved findings. F11 remains an active capacity issue and is tracked in
 [`../BUG-mt-nanocode-image-size.md`](../BUG-mt-nanocode-image-size.md); the
 discovery detail stays here for provenance.
 
@@ -314,18 +315,18 @@ telegram tool source was removed. Only the F11 image-size follow-up remains.
 4. Re-run ICHC: expect all springfeather units `healthy`, overall `healthy`.
 5. Confirm F3: between add and start, the new tenant no longer flips the report to `critical`.
 
-## Current source cross-check (2026-07-12)
+## Current source cross-check (`51ae5a8`, 2026-07-20)
 
 - `PG_IMAGE` is fully qualified and used by both imperative and Quadlet paths
-  (`ic/scripts/lunarwing-mt-admin.sh:81,4313,4546`).
+  (`ic/scripts/lunarwing-mt-admin.sh:85,4608,4841`).
 - Worker builds use host networking and Docker image format
-  (`lunarwing-mt-admin.sh:1932-2001`).
+  (`lunarwing-mt-admin.sh:1933-2021`).
 - Systemd health classification and tests are present in
-  `ic-infrastructure-health-check/health-systemd.sh` and
+  `ic-infrastructure-health-check/health-systemd.sh:93-197` and
   `ic-infrastructure-health-check/tests/test-health-systemd.sh`.
 - Tenant purge/resume logic is present in
-  `lunarwing-mt-admin.sh:1470-1685,5925-5957`.
-- The large-image `save|load` path remains at `lunarwing-mt-admin.sh:585-629`,
+  `lunarwing-mt-admin.sh:1220-1263,1488-1714,6202-6321`.
+- The large-image `save|load` path remains at `lunarwing-mt-admin.sh:606-649`,
   which is why F11 is not archived as fixed.
 
 No live systemd provisioning, image build, or Cargo command was run in this

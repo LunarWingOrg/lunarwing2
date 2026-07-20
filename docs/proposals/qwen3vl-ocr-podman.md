@@ -1,5 +1,10 @@
 # Qwen3-VL + Tesseract OCR on rootless Podman (quadlets)
 
+> **Current status (2026-07-20, rev `50c8f99`): OPEN / EXTERNAL OPS RUNBOOK.**
+> The described OCR service, Containerfile, and Quadlets are not in this repo.
+> LunarWing integrates with an independently deployed service through
+> `VISION_SERVICE_URL`.
+
 Two containers on a shared Podman network:
 
 - **`qwen3vl`** — `llama-server` (CUDA), GPU-attached, serves the OpenAI-compatible vision API.

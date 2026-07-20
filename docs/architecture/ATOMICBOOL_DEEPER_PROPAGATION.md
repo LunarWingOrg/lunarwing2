@@ -1,10 +1,10 @@
 # AtomicBool Deeper Propagation - Future Work
 
 **Date:** 2026-05-19  
-**Status:** Design Note - Not Implemented  
-**Related:** RESPONSE_SUPPRESSION_IMPLEMENTATION.md, HANDLE_MESSAGE_FIX.md (both archived under ../internal/history/architecture/)
+**Status:** Design Note - Not Implemented (revalidated 2026-07-20)
+**Related:** [RESPONSE_SUPPRESSION_IMPLEMENTATION.md](../internal/history/architecture/RESPONSE_SUPPRESSION_IMPLEMENTATION.md), [HANDLE_MESSAGE_FIX.md](../internal/history/architecture/HANDLE_MESSAGE_FIX.md)
 
-## Current State (as of 2026-05-18)
+## Current State (revalidated 2026-07-20)
 
 The `Arc<AtomicBool>` suppression flag is threaded from `agent_loop.rs::run()` down through:
 
@@ -147,9 +147,9 @@ If/when you do revisit, **Option C (Channel-Layer Token)** is probably the clean
 
 - `ic/src/channels/mod.rs` — turn token management
 - `ic/src/channels/web/sse.rs` — SSE event filtering
-- `ic/src/agent/dispatcher.rs` — pass turn token through agentic loop
+- `ic/src/agent/dispatcher.rs` — pass turn token through the agentic loop and
+  `ChatDelegate` emission paths
 - `ic/src/tools/mod.rs` — tool execution context
-- `ic/src/agent/dispatcher.rs` — ChatDelegate emission
 
 ## Decision Log
 
@@ -159,4 +159,4 @@ If/when you do revisit, **Option C (Channel-Layer Token)** is probably the clean
 
 ---
 
-*Documented during Lunarwing review session between Christopher and Baud.*
+*Documented during LunarWing review session between Christopher and Baud.*

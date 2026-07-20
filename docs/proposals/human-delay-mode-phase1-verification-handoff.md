@@ -1,5 +1,10 @@
 # Human Delay Mode — Phase 1 Verification Handoff
 
+> **Current status (2026-07-20, rev `50c8f99`): SUPERSEDED.** The verification
+> fixes and supervised-mode tests described here are present in current source.
+> Retained as a handoff record; Phase 2 and documentation cleanup are tracked
+> separately.
+
 **Purpose**: Capture the state of Phase 1 ("supervised mode") verification so it can be
 resumed later. Created mid-verification on branch `human-delay-mode-phase-1-baud`.
 

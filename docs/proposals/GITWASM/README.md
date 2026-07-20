@@ -1,5 +1,9 @@
 # Git WASM Tool Proposal (Gitoxide Version)
 
+> **Current status (2026-07-20, rev `50c8f99`): OPEN / PLANNED.** No Gitoxide
+> WASM tool or registry entry exists. The built-in `ssh_git` tool covers a
+> narrower Git-over-SSH use case but does not implement this proposal.
+
 > **Note:** This proposal uses the pre-fork crate name `ironclaw-md-git`.
 > If implemented, the crate should be renamed to `lunarwing-md-git` or
 > placed under `ic/tools-src/git/` following the current naming conventions.

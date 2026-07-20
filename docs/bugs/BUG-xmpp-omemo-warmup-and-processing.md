@@ -1,9 +1,10 @@
 # XMPP OMEMO fallback spam and processing stall
 
-> **Status: UNVERIFIED (checked against HEAD 2026-07-12).** The historical
-> fallback-spam symptom has not been reproduced against the current bridge and
-> no current source path proves that it is resolved. The separate stuck
-> `Processing`-thread failure has a current static fix and is recorded below.
+> **Status: UNVERIFIED (checked against `51ae5a8` on 2026-07-20).** The
+> historical fallback-spam symptom has not been reproduced against the current
+> bridge and no current source path proves that it is resolved. The separate
+> stuck `Processing`-thread failure has a current static fix and is recorded
+> below.
 
 This is the active form of `history/XMPP-OMEMO-BUG-TO-DO.md`. The two symptoms
 were reported together, but they have different evidence and should not share a
@@ -32,11 +33,11 @@ section is not present in this checkout.
 ### Current code checks
 
 - The WASM XMPP config accepts `allow_plaintext_fallback` and defaults it to
-  `true` (`ic/channels-src/xmpp/src/lib.rs:271-292`).
+  `true` (`ic/channels-src/xmpp/src/lib.rs:267-297`).
 - The setting is forwarded to the bridge configure request
-  (`ic/channels-src/xmpp/src/lib.rs:295-313`).
+  (`ic/channels-src/xmpp/src/lib.rs:300-318`).
 - Unit tests cover direct-message fallback when enabled and suppress it when
-  disabled (`ic/src/channels/xmpp/mod.rs:3261-3334`). These tests do not cover
+  disabled (`ic/src/channels/xmpp/mod.rs:3263-3337`). These tests do not cover
   encrypted MUC routing or repeated notices to a separate 1:1 JID.
 
 These checks show that the configuration knob and DM guard exist; they do not
@@ -61,9 +62,9 @@ turn` followed by no reply. The documented root cause was cancellation of
 (`docs/internal/history/architecture/HANDLE_MESSAGE_FIX.md:5-20`). The current
 agent loop runs `handle_message` in a spawned task, keeps it alive through the
 soft timeout, and uses a hard-kill recovery that calls `fail_turn` while
-preserving queued messages (`ic/src/agent/agent_loop.rs:934-1023`). The
+preserving queued messages (`ic/src/agent/agent_loop.rs:972-1034,1204-1284`). The
 regression tests cover resetting a stuck thread and draining its queued
-messages (`ic/src/agent/session.rs:1641-1670`).
+messages (`ic/src/agent/session.rs:1641-1705`).
 
 This fixes the generic processing-state failure; it does not establish that the
 historical OMEMO fallback spam was caused by that failure.

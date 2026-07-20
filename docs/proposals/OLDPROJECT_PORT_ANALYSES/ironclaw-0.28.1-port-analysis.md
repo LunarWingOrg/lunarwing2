@@ -1,5 +1,10 @@
 # Port IronClaw 0.28.1 Changes to LunarWing
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** Approval clamping is
+> implemented and mission auto-resume is only partial. Selective channel
+> activation, scoped workspaces, the broad LLM/common extraction, and remaining
+> boundary checks are still open.
+
 **Date:** 2026-05-12 (status updated 2026-06-05)
 **Status:** Analysis complete. P1-C partially implemented (fire_on_system_event only). P2-B implemented 2026-06-05 on branch `1.1.1-333-security-improvements-3`. All other items remain open.
 

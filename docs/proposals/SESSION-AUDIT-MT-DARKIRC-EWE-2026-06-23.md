@@ -1,5 +1,9 @@
 # Session Audit — MT Admin, DarkIRC, External Worker Enhancements (2026-06-23)
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** H1-H3, M3-M9,
+> T1/T2/T4/T5/T7, and the worker-health port work landed. M1/M2, L2/L4-L8,
+> T3, and T6 remain open as marked in the tracker below.
+
 > Tracking document for the dev session on branch `1.1.6-OCS-A-4DIRCandEWE`.
 > Covers three in-development feature areas. Use the Work Tracker below to record
 > progress as items are addressed. Headline bugs were verified directly in source.

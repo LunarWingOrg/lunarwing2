@@ -1,10 +1,14 @@
 # OMEMO aesgcm:// URL Leak Fix
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** The helper is in
+> the active inbound path and both embedded-URL and URL-only regressions are in
+> current source. A separate live OMEMO file-share exercise is not recorded here.
+
 ## Status
 
 - Fixed on 2026-06-27
 - Commit: `1fdcf362`
-- Not yet compile-verified or live-tested
+- Source and regression-test presence re-verified 2026-07-20; live file-share validation is not recorded
 
 ## Problem
 

@@ -1,5 +1,9 @@
 # MT Onboarding CLI — Interactive Multi-Tenant Provisioning
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED AND EXTENDED.** The
+> CLI shipped and now includes upgrade plus Kawarimi import/export command paths.
+> The Phase 2 web UI described below is not present in this checkout.
+
 **Date:** 2026-07-06
 **Status:** ✅ **Shipped in v1.1.9.** The `lunarwing_mt_onboard` CLI is live.
 See `README.md` → *Instance Setup* for the current usage guide.
@@ -274,7 +278,9 @@ This preserves backward compatibility for any existing scripts that source it, w
 
 ## Out-of-scope
 
-- Kawarimi import / export flows (handled by `export-tenant.sh` / `import-tenant.sh`).
+- Kawarimi import / export flows were excluded from the original scope but now
+  ship through `export_cli.py` and `import_tenant.py`, backed by the existing
+  shell tooling.
 - WASM tool / channel installation beyond the `--with-wasm` flag.
 - Cross-host migration of an existing tenant; upgrade mode covers same-host
   in-place upgrades only.

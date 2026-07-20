@@ -1,5 +1,10 @@
 # OpenRC Self-Heal + Health-Check + Rootless-Podman — Accurate Report (eris leg)
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL / HISTORICAL REPORT.**
+> The curative state-loading, restart-output, and escalation-rendering fixes plus
+> their core regression coverage landed. The report's listed OpenRC-specific
+> health, observability, and hardening items mostly remain open.
+
 *2026-06-16. Recalibrated from a 49-agent automated review against **read-only
 verification of the live host**. Companion to
 [`ROOTLESS_PODMAN_CONTAINER_SUPERVISION_GAP.md`](./ROOTLESS_PODMAN_CONTAINER_SUPERVISION_GAP.md)

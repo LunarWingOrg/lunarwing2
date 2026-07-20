@@ -1,5 +1,9 @@
 # SSH Operations for the LunarWing Agent — Options 2 & 3 Implementation Plans
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED / HISTORICAL DESIGN RECORD.**
+> Both options landed. Version-specific examples below target russh
+> 0.45 and old line numbers; current source uses russh 0.62 and is authoritative.
+
 **Date:** 2026-07-01 (implemented)
 **Status:** ✅ **Implemented.** Kept as the design record (written before
 implementation). The authoritative as-built overview is

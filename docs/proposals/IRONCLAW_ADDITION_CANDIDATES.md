@@ -1,5 +1,10 @@
 # IronClaw Addition Candidates for LunarWing
 
+> **Current status (2026-07-20, rev `50c8f99`): OPEN / PLANNED.** The
+> `serde_norway` baseline is implemented, but the six new candidates and the
+> carried backlog items remain unimplemented. This is the current filtered port
+> backlog, not a completion record.
+
 ## Status
 
 - Compiled as a follow-up to the IronClaw/LunarWing comparison pass.

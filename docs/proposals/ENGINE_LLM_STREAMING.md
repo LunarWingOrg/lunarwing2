@@ -1,5 +1,10 @@
 # Engine LLM Streaming
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** Phases 0-5,
+> in-flight cancellation, gateway streaming, and channel-neutral terminal
+> delivery are in tree. Per-channel live rollout validation remains an
+> operational gate, not missing implementation.
+
 Add true token-level streaming to the LLM stack so Engine V2 responses can
 eventually render incrementally in the gateway, support cancellation during
 generation, and expose progress during long agentic runs.

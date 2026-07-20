@@ -1524,6 +1524,7 @@ mod tests {
     struct MockEffects {
         results: Mutex<Vec<Result<ActionResult, EngineError>>>,
         actions: Vec<ActionDef>,
+        calls: Mutex<Vec<(String, serde_json::Value)>>,
     }
 
     impl MockEffects {
@@ -1531,7 +1532,12 @@ mod tests {
             Self {
                 results: Mutex::new(results),
                 actions,
+                calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn calls_snapshot(&self) -> Vec<(String, serde_json::Value)> {
+            self.calls.lock().unwrap().clone()
         }
     }
 
@@ -1540,10 +1546,11 @@ mod tests {
         async fn execute_action(
             &self,
             name: &str,
-            _params: serde_json::Value,
+            params: serde_json::Value,
             _lease: &CapabilityLease,
             _ctx: &ThreadExecutionContext,
         ) -> Result<ActionResult, EngineError> {
+            self.calls.lock().unwrap().push((name.into(), params));
             let mut results = self.results.lock().unwrap();
             if results.is_empty() {
                 Ok(ActionResult {
@@ -2417,6 +2424,83 @@ FINAL(str(x))
             result.stdout.contains("SyntaxError") || result.stdout.contains("Error"),
             "should contain SyntaxError, got: {}",
             result.stdout,
+        );
+    }
+
+    // ── Argument forwarding: parameter-recording tests ──────
+
+    /// Verify keyword arguments arrive as top-level fields in the JSON params.
+    #[tokio::test]
+    async fn forwarding_preserves_keyword_arguments() {
+        let thread = make_test_thread();
+        let effects = Arc::new(MockEffects::new(vec![test_action("echo")], vec![]));
+        let code = r#"result = await echo(message="hello", count=3)"#;
+        let result = run_code(code, effects.clone(), &thread).await.unwrap();
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+
+        let calls = effects.calls_snapshot();
+        assert_eq!(calls.len(), 1, "expected exactly one call");
+        let (name, params) = &calls[0];
+        assert_eq!(name, "echo");
+        assert_eq!(params["message"], "hello", "kwargs must be forwarded");
+        assert_eq!(params["count"], 3, "kwargs must be forwarded");
+        assert!(
+            !params
+                .as_object()
+                .is_some_and(|params| params.contains_key("_args")),
+            "pure kwargs call must not have _args: {params}"
+        );
+    }
+
+    /// Verify positional arguments are forwarded under `_args`.
+    #[tokio::test]
+    async fn forwarding_preserves_positional_arguments() {
+        let thread = make_test_thread();
+        let effects = Arc::new(MockEffects::new(vec![test_action("echo")], vec![]));
+        let code = r#"result = await echo("positional_val")"#;
+        let result = run_code(code, effects.clone(), &thread).await.unwrap();
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+
+        let calls = effects.calls_snapshot();
+        assert_eq!(calls.len(), 1);
+        let (_, params) = &calls[0];
+        assert_eq!(
+            params["_args"][0], "positional_val",
+            "positional args must be under _args: {params}"
+        );
+    }
+
+    /// Verify keyword arguments survive `asyncio.gather()`.
+    #[tokio::test]
+    async fn forwarding_preserves_kwargs_through_gather() {
+        let thread = make_test_thread();
+        let effects = Arc::new(MockEffects::new(
+            vec![test_action("web_search"), test_action("memory_search")],
+            vec![],
+        ));
+        let code = r#"
+import asyncio
+await asyncio.gather(
+    web_search(query="alpha"),
+    memory_search(query="beta"),
+)
+"#;
+        let result = run_code(code, effects.clone(), &thread).await.unwrap();
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+
+        let calls = effects.calls_snapshot();
+        assert_eq!(calls.len(), 2);
+        let by_name: std::collections::HashMap<&str, &serde_json::Value> =
+            calls.iter().map(|(n, p)| (n.as_str(), p)).collect();
+        assert_eq!(
+            by_name["web_search"]["query"], "alpha",
+            "web_search params: {}",
+            by_name["web_search"]
+        );
+        assert_eq!(
+            by_name["memory_search"]["query"], "beta",
+            "memory_search params: {}",
+            by_name["memory_search"]
         );
     }
 }

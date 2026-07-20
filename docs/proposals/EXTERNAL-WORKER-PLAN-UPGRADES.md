@@ -1,5 +1,10 @@
 # External Worker System Upgrades
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** All eleven plan
+> tasks landed for the surviving workers. The unchecked acceptance boxes below
+> are preserved as the original execution plan, not current incomplete work;
+> Codex was removed in v1.1.9.
+
 ## TL;DR
 
 ### really rough

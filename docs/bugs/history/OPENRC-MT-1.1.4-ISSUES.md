@@ -1,7 +1,8 @@
 # OpenRC Multi-Tenant / ICHC Issues — 1.1.4 First Real Fresh-Machine Pass
 
-**Context.** The OpenRC/Gentoo multi-tenant path (rootless-podman + per-tenant OpenRC init
-scripts + host-global ICHC/self-heal via fcron) is the **experimental leg** (see
+**Historical context.** During the 1.1.4 pass, the OpenRC/Gentoo multi-tenant
+path (rootless-podman + per-tenant OpenRC init scripts + host-global
+ICHC/self-heal via fcron) was treated as the **experimental leg** (see
 `docs/ops/MULTITENANCY-PRODUCTION.md`; the systemd leg was hardened first in
 `docs/bugs/history/SYSTEMD-MT-1.1.4-ISSUES.md`). This doc records the 1.1.4 pre-release pass on the
 **Gentoo/OpenRC/podman** host `eris` (goals 6 & 8 in `docs/ops/history/GOALS_1.1.4.md`): a **full
@@ -15,9 +16,10 @@ tenant `snapfeather` provisioned — and **reused creamheart's uid 1001**, which
 
 **Status legend:** 🔴 open · 🟡 workaround applied, code fix pending · 🟢 fixed (code)
 
-**Current-document note (2026-07-12):** the O1-O5 sections below preserve the
-original discovery narrative. Their "proposed fix" paragraphs are historical;
-the summary and current checks at the end are authoritative for this v2 tree.
+**Current-document note (`51ae5a8`, 2026-07-20):** the O1-O5 sections below
+preserve the original discovery narrative. Their "proposed fix" paragraphs are
+historical; the summary and current checks at the end are authoritative for
+this v2 tree. OpenRC and systemd are now both first-class deployment targets.
 
 ---
 
@@ -266,16 +268,17 @@ installed). Matches systemd F7 (telegram unsupported).
 is routed elsewhere); DB-connected + migrated is confirmed indirectly by the daemon serving
 authenticated `/api/gateway/status` with all channels healthy.
 
-### Current source cross-check (2026-07-12)
+### Current source cross-check (`51ae5a8`, 2026-07-20)
 
-- Stale UID cleanup remains in `ic/scripts/lunarwing-mt-admin.sh:1470-1520,1634-1685`.
+- Stale UID cleanup remains in
+  `ic/scripts/lunarwing-mt-admin.sh:1488-1545,1652-1714`.
 - Podman worker builds use `--network=host --format docker`
-  (`lunarwing-mt-admin.sh:1932-2001`).
+  (`lunarwing-mt-admin.sh:1933-2021`).
 - OpenRC started-state gating is present in
-  `ic-infrastructure-health-check/health-openrc.sh:98-181`, with regression
+  `ic-infrastructure-health-check/health-openrc.sh:98-204`, with regression
   coverage in `ic-infrastructure-health-check/tests/test-health-openrc.sh`.
 - The fully-qualified `PG_IMAGE` default is at
-  `ic/scripts/lunarwing-mt-admin.sh:81`.
+  `ic/scripts/lunarwing-mt-admin.sh:85`.
 
 No live OpenRC provisioning or Cargo command was run for this documentation
 audit; status is source-verified, with the historical 8/8 run retained as
