@@ -179,7 +179,10 @@ The `PolicyEngine` evaluates actions against leases deterministically:
 - **Effect types**: `ReadLocal`, `ReadExternal`, `WriteLocal`, `WriteExternal`, `CredentialedNetwork`, `Compute`, `Financial`
 - Every action declares its side effects via `EffectType`. The policy engine uses these for allow/deny decisions
 - **Provenance types**: origin labels exist for user, system, tool, LLM, and
-  memory-retrieval data. Taint-based policy enforcement is not implemented yet.
+  memory-retrieval data. `PolicyEngine::evaluate_with_provenance()` implements
+  targeted approval rules for LLM-generated or tool-sourced data, but the
+  production execution paths still call `evaluate()`, so provenance-aware
+  enforcement is not wired into runtime action dispatch yet.
 
 ## Execution Gates
 

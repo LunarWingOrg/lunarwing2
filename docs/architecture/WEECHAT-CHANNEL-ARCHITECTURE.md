@@ -171,10 +171,13 @@ loop {
 }
 ```
 
-`tick` and `execute_poll` are **sequential**, so:
+`tick` and `execute_poll` are **sequential**. The start-to-start cadence is at
+least the poll interval, but a slow callback can cross scheduled ticks and
+extend it further. `MissedTickBehavior::Skip` advances to a future tick instead
+of running missed ticks back-to-back.
 
 ```
-effective cadence  =  max(poll_interval, cycle_duration)
+effective cadence  >=  poll_interval
 ```
 
 - The WeeChat guest requests **3s** (`default_poll_interval()=3` and
@@ -371,8 +374,8 @@ Then restart the daemon so `on_start` re-resolves.
 These changes split across three artifacts:
 
 - **Host** (log mapping, `MissedTickBehavior`): `cargo build --release --bin lunarwing` → deploy binary.
-- **WASM channel** (long-poll consumer, **mirror-loop tag filter `tags_allow_ingest`**, timeouts,
-  `network_allowed`, caps key): `scripts/build-wasm-extensions.sh` →
+- **WASM channel** (long-poll consumer, **mirror-loop tag filter `tags_allow_ingest`**, per-call
+  HTTP timeouts, `network_allowed`, caps key): `scripts/build-wasm-extensions.sh` →
   `lunarwing-mt-admin.sh install-wasm <tenant>`.
 - **Adapter** (`ws_adapter.py`: `/api/wait`, global event log, `/api/health` cursor, **first-line
   capture for new buffers**, **post-restart replay**): a plain Python file that runs from the
