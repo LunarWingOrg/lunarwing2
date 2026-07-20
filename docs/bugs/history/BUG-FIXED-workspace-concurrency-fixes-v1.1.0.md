@@ -2,7 +2,7 @@
 
 **Severity:** High (4 bugs), Medium (2 bugs)
 **Found:** 2026-06-03 during v1.1.0 pre-release stress testing
-**Status:** Fixed (current source verified 2026-07-12)
+**Status:** Fixed (current source at `51ae5a8` verified 2026-07-20)
 **Affects:** `ic/src/workspace/`, `ic/src/db/` (both PostgreSQL and libSQL backends)
 **Found by:** Sunburst (test tenant, multi-tenant systemd deployment)
 **Testing environment:** PostgreSQL 16 (pgvector/pgvector:pg16)
@@ -368,13 +368,14 @@ connections).
 The current tree still contains the V21 migration and the atomic workspace
 operations described above:
 
-- `ic/migrations/V21__fix_null_agent_id_unique_constraint.sql:28-33` uses
+- `ic/migrations/V21__fix_null_agent_id_unique_constraint.sql:28-32` uses
   `UNIQUE NULLS NOT DISTINCT`.
-- `ic/src/workspace/repository.rs:120-126,157-177,363-425` contains the atomic
+- `ic/src/workspace/repository.rs:106-132,157-177,363-425` contains the atomic
   get-or-create, append, and document/chunk replacement paths.
 - `ic/src/workspace/mod.rs:680-709,803-844` calls the atomic update/append APIs,
   and the libSQL equivalents are in `ic/src/db/libsql/workspace.rs:421-455,765-870`.
-- The concurrency regression tests remain in `ic/src/workspace/mod.rs`.
+- The concurrency regression tests remain in
+  `ic/src/workspace/mod.rs:2167-2254`.
 
 No Cargo command was run in this documentation pass. Bug 6 is retained as an
 operational expectation, not counted as an unresolved defect.

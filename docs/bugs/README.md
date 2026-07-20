@@ -1,11 +1,10 @@
 # Bug tracker
 
-Reconciled against the v2 source snapshot at base revision `c835294` on
-**2026-07-12**.
-Every report formerly under `docs/bugs/` was read and checked against current
-source, scripts, tests, and reachable Git history. Closely related reports are
-now grouped; their original filenames and technical evidence are named in the
-canonical documents.
+Reconciled against source revision `51ae5a8` on **2026-07-20**. All 38 Markdown
+documents in this tracker (36 report/pointer files plus two README files) were
+checked against current source, scripts, tests, and reachable Git history.
+Closely related reports remain grouped; their original filenames and technical
+evidence are named in the canonical documents.
 
 **Status vocabulary:** `FIXED` means the current tree contains the stated fix;
 `OPEN` means the issue remains; `PARTIAL` means a fix covers only part of the
@@ -19,15 +18,15 @@ Some superseded files remain as compatibility pointers, including pointers in
 
 | Document | Status | Current finding | Verification |
 |---|---|---|---|
-| [BUG-agent-worker-lifecycle.md](BUG-agent-worker-lifecycle.md) | PARTIAL | Built-in and external `wait=true` jobs still hold the merged agent stream; the old completion race is fixed and the mpsc report is invalidated | `ic/src/tools/builtin/job.rs`, `agent_loop.rs`, `job_monitor.rs`, `orchestrator/api.rs`; source-only |
-| [BUG-e2e-test-bugs.md](BUG-e2e-test-bugs.md) | PARTIAL | Bootstrap/tool tests fixed; Gmail OAuth fixture retired; clipboard test remains unverified | `agent_loop.rs`, E2E scenarios, Pytest collection attempt (64 collected; Playwright import unavailable) |
-| [BUG-external-worker-config-persistence.md](BUG-external-worker-config-persistence.md) | PARTIAL | Provisioning blocks are generated; settings rewrites can drop worker bearer tokens | `lunarwing-mt-admin.sh`, `settings.rs`, `commands.rs`, `config/sandbox.rs` |
-| [BUG-mt-nanocode-image-size.md](BUG-mt-nanocode-image-size.md) | OPEN | Large Nanocode image is copied per tenant with `save|load` | `lunarwing-mt-admin.sh:585-629,3428-3433`, Dockerfile |
-| [BUG-kawarimi-import-flag-parity.md](BUG-kawarimi-import-flag-parity.md) | OPEN | Import rejects an explicit `--with-wasm` although it adds the flag internally | `ic/scripts/import-tenant.sh:51-69,254-260`; related flag harness |
+| [BUG-agent-worker-lifecycle.md](BUG-agent-worker-lifecycle.md) | PARTIAL | `wait=true` still occupies the originating turn; priority interrupts are handled and ordinary messages are deferred in a bounded FIFO; the old completion race is fixed | `job.rs`, `agent_loop.rs`, `dispatch.rs`, `job_monitor.rs`, interrupt regressions; source-only |
+| [BUG-e2e-test-bugs.md](BUG-e2e-test-bugs.md) | PARTIAL | Bootstrap/tool tests fixed; Gmail OAuth fixture retired; clipboard test remains unverified | `agent_loop.rs`, E2E scenarios; current environment lacks both Pytest and Playwright |
+| [BUG-external-worker-config-persistence.md](BUG-external-worker-config-persistence.md) | PARTIAL | Provisioning and in-memory token merges work; full TOML rewrites can still drop worker bearer tokens | `lunarwing-mt-admin.sh`, `settings.rs`, `commands.rs`, `config/sandbox.rs` |
+| [BUG-mt-nanocode-image-size.md](BUG-mt-nanocode-image-size.md) | OPEN | Large Nanocode image is copied per tenant with `save|load` | `lunarwing-mt-admin.sh:606-649,3709-3727`, Dockerfile |
+| [BUG-kawarimi-import-flag-parity.md](BUG-kawarimi-import-flag-parity.md) | OPEN | Import rejects an explicit `--with-wasm` although it adds the flag internally | `ic/scripts/import-tenant.sh:51-69,283-289`; fresh related flag harness |
 | [BUG-ssh-git-ref-and-remote-head.md](BUG-ssh-git-ref-and-remote-head.md) | PARTIAL | Null-like refs fixed; bare remote HEAD mismatch still reports success for an empty checkout, with only raw Git stderr | `ssh_git.rs`, null-ref tests, local bare-Git reproduction |
-| [BUG-weechat-relay-rand-check.md](BUG-weechat-relay-rand-check.md) | PARTIAL | Unused import fixed; `rand_check` still always returns false | `lunarwing_weechat_wss/weechat_relay/src/lib.rs:43-50,1761-1770` |
-| [BUG-worker-workspace-path-expansion.md](BUG-worker-workspace-path-expansion.md) | PARTIAL | Structured OpenCode/Nanocode project paths expand `~`; prompt-generated paths and Pebble remain open | worker TypeScript/Rust files and self-check |
-| [BUG-xmpp-polling-and-backpressure.md](BUG-xmpp-polling-and-backpressure.md) | PARTIAL | Poll-loop supervision/health is implemented; queue backpressure during a blocked turn remains a residual risk | WASM wrapper, channel manager, watchdog, XMPP bridge source |
+| [BUG-weechat-relay-rand-check.md](BUG-weechat-relay-rand-check.md) | PARTIAL | Unused import fixed; `rand_check` still always returns false | `lunarwing_weechat_wss/weechat_relay/src/lib.rs:46-50,2164-2172` |
+| [BUG-worker-workspace-path-expansion.md](BUG-worker-workspace-path-expansion.md) | PARTIAL | Structured OpenCode/Nanocode project paths expand `~`; prompt-generated paths and Pebble remain open | worker TypeScript/Rust files; Bun unavailable for a fresh self-check run |
+| [BUG-xmpp-polling-and-backpressure.md](BUG-xmpp-polling-and-backpressure.md) | PARTIAL | Poll-loop supervision/health is implemented; an unbounded send await on a full downstream queue remains a residual risk | WASM wrapper, active-turn dispatcher, channel manager, watchdog, XMPP bridge source |
 | [BUG-xmpp-omemo-warmup-and-processing.md](BUG-xmpp-omemo-warmup-and-processing.md) | UNVERIFIED | Historical MUC fallback-spam has no current live verification; generic stuck-`Processing` recovery is fixed | XMPP config/tests, release v1.0.7, agent timeout path; source-only |
 
 ## Open follow-ups
@@ -36,7 +35,7 @@ These are the unresolved pieces inside grouped reports:
 
 | Follow-up | Report |
 |---|---|
-| Async/session job registry for default `wait=true` calls | [agent/worker lifecycle](BUG-agent-worker-lifecycle.md#1-synchronous-worker-jobs-built-in-and-external) |
+| Concurrent ordinary-turn scheduling or an async/session registry for default `wait=true` calls | [agent/worker lifecycle](BUG-agent-worker-lifecycle.md#1-synchronous-worker-jobs-built-in-and-external) |
 | Clipboard test runtime behavior | [E2E test bugs](BUG-e2e-test-bugs.md#2-clipboard-copy-test) |
 | Preserve external-worker auth tokens across `Settings::save_toml` | [external-worker config](BUG-external-worker-config-persistence.md#2-auth-token-loss-on-settings-rewrites) |
 | Slim/share Nanocode image distribution | [MT image size](BUG-mt-nanocode-image-size.md) |
@@ -126,5 +125,5 @@ Counting the 23 original bug write-ups (15 root reports plus 8 historical
 reports, excluding both README files) by the primary/headline disposition in
 the table above: **14 FIXED/retired/invalidated, 2 OPEN, 5 PARTIAL, and 2
 UNVERIFIED**. Grouping exposes **10 current open follow-ups**, including the
-newly promoted OMEMO reproduction item; some live inside a `PARTIAL` canonical
+OMEMO reproduction item; some live inside a `PARTIAL` canonical
 document rather than having a separate file.

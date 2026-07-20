@@ -13,13 +13,13 @@ via root's PATH. But add-tenant installs wasm-tools into the tenant's ~/.cargo/b
 3. ic/build.rs — fixed a mislabeled warning: the old code printed wasm-tools not found but only on a fallback-copy I/O failure (never on a missing tool). It now stays quiet when the tool is simply absent (the raw wasip2 artifact is already a valid component) and reports the real error if the copy fails.
 4. RELEASE-v1.1.3.md — moved the item from Known Issues to Bug Fixes with the root-cause explanation.
 
-### Current verification (2026-07-12):
-- `bash -n` passes for `lunarwing-mt-admin.sh` and
+### Current verification (`51ae5a8`, 2026-07-20):
+- fresh `bash -n` checks pass for `lunarwing-mt-admin.sh` and
   `lunarwing-xmpp-test-env.sh`
 - `install_wasm_tenant` still prefers the tenant's `~/.cargo/bin/wasm-tools` and
-  falls back to the admin PATH (`ic/scripts/lunarwing-mt-admin.sh:2019-2075`)
+  falls back to the admin PATH (`ic/scripts/lunarwing-mt-admin.sh:2037-2122`)
 - the missing-tool message still installs raw components and skips only optional
-  stripping (`:2045-2049`)
+  stripping (`:2063-2066`)
 - the current `ic/build.rs` contains no stale wasm-tools warning path; that
   historical build-script subclaim is retired rather than re-tested
 

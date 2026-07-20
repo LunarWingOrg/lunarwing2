@@ -1,9 +1,9 @@
 # SSH Git ref handling and bare-remote HEAD diagnostics
 
-> **Overall status: PARTIALLY-FIXED (verified against HEAD 2026-07-12).**
-> Null-like `ref` values are normalized. A bare repository whose remote HEAD
-> points at a missing branch still produces an empty/unborn checkout that
-> `ssh_git` marks successful, with only Git's raw stderr warning.
+> **Overall status: PARTIALLY-FIXED (verified against `51ae5a8` on
+> 2026-07-20).** Null-like `ref` values are normalized. A bare repository whose
+> remote HEAD points at a missing branch still produces an empty/unborn checkout
+> that `ssh_git` marks successful, with only Git's raw stderr warning.
 
 This consolidates `BUG-ssh-git-bare-repo-head-mismatch.md` and
 `BUG-ssh-git-null-ref-serialization.md`.
@@ -22,7 +22,7 @@ Current normalization is centralized in
 JSON-null, empty, whitespace-only, and case-insensitive `"null"`. The execute
 path uses that result (`:138-157`), and argv construction adds `--branch` only
 when a real ref is present (`:363-375`). Regression cases and preservation of
-`main` are covered at `:639-660`.
+`main` are covered at `:640-661`.
 
 The fix commit `c8b277d` is contained in `HEAD` (`merge-base --is-ancestor`
 passed; the branch tip is an ancestor). The historical repro and workaround are

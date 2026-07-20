@@ -1,10 +1,10 @@
 # E2E test bugs and retired fixtures
 
 > **Overall status: PARTIALLY-FIXED / one item UNVERIFIED (verified against
-> HEAD 2026-07-12).** The bootstrap and tool-execution failures are resolved in
-> the current test/code paths. The old Gmail OAuth fixture was retired. The
-> clipboard test is still collected, but its former permission diagnosis is not
-> supported by the current test and has not been reproduced here.
+> `51ae5a8` on 2026-07-20).** The bootstrap and tool-execution failures are
+> resolved in the current test/code paths. The old Gmail OAuth fixture was
+> retired. The clipboard test remains in the suite, but its former permission
+> diagnosis is not supported by the current test and has not been reproduced.
 
 This consolidates the four `BUG-e2e-*` reports. Status is per section so a
 resolved test does not get reported as an active production failure.
@@ -29,14 +29,15 @@ race; the current explicit gateway broadcast resolves that divergence.
 ### Current path and evidence
 
 - `Agent::run` takes `Arc<Self>` and persists the greeting before channel start
-  (`ic/src/agent/agent_loop.rs:401-430`).
+  (`ic/src/agent/agent_loop.rs:462-490`).
 - After startup it registers the gateway thread, constructs an
   `OutgoingResponse`, sets `thread_id`, and broadcasts to the gateway
-  (`ic/src/agent/agent_loop.rs:850-871`).
+  (`ic/src/agent/agent_loop.rs:910-932`).
 - `TestRigBuilder::with_bootstrap()` preserves the pending flag and installs a
-  gateway-named test channel (`ic/tests/support/test_rig.rs:472-475,769-780`).
+  gateway-named test channel
+  (`ic/tests/support/test_rig.rs:540-543,705-709,895-905`).
 - The two tests now wait for and assert the static greeting at
-  `ic/tests/e2e_advanced_traces.rs:752-776` and `:786-805`; the source text is
+  `ic/tests/e2e_advanced_traces.rs:752-776` and `:786-859`; the source text is
   `ic/src/workspace/seeds/GREETING.md`.
 
 The old DB/SSE-only hypothesis and startup-ordering workaround are therefore
@@ -57,8 +58,9 @@ chat range and event clipboard data, then writes `text/plain`
 Consequently, the old claim that setup fails because headless Chromium lacks
 clipboard permissions is not supported by the current source. No skip marker or
 CI-specific permission configuration was found, and Playwright was not run in
-this pass. Keep this item visible until a browser run confirms whether the
-synthetic event is stable in the supported CI image.
+this pass because neither the Playwright nor Pytest Python package is installed.
+Keep this item visible until a browser run confirms whether the synthetic event
+is stable in the supported CI image.
 
 The original proposed remedies remain useful only if a browser failure returns:
 grant `clipboard-read`/`clipboard-write`, use `navigator.clipboard` after
@@ -89,7 +91,8 @@ For provenance, the retired test names were:
 
 Current OAuth coverage uses mock/MCP and UI fixtures instead:
 
-- `ic/tests/e2e/conftest.py:296-300,500-504` uses a mock OAuth exchange.
+- `ic/tests/e2e/conftest.py:150-192,471-526,627-630` wires a mock OAuth
+  exchange into the relevant server fixtures.
 - `ic/tests/e2e/scenarios/test_mcp_auth_flow.py` covers the current mocked auth
   flow.
 - `ic/tests/e2e/scenarios/test_extensions.py:633-663,743-750,1189-1215`
@@ -126,7 +129,7 @@ reproduced in the current suite.
 The named tests remain at
 `ic/tests/e2e/scenarios/test_tool_execution.py:76-115`. The mock LLM still
 recognizes `echo` and `time` (`ic/tests/e2e/mock_llm.py:26-37`) and returns a
-follow-up summary for a tool result (`mock_llm.py:187-206`). The contaminating
+follow-up summary for a tool result (`mock_llm.py:233-238`). The contaminating
 approval scenario now denies its pending approval during cleanup
 (`ic/tests/e2e/scenarios/test_tool_approval.py:190-195`), which releases the
 agent loop for subsequent tests. The old blank "Verify fix" section and its
@@ -144,9 +147,8 @@ follow-up path now supplies the expected fragment.
 
 ## Verification record
 
-Static source inspection was supplemented by a collection-only Pytest attempt
-for the current chat/MCP/extension/tool scenarios. Pytest enumerated 64 tests,
-but collection reported `ModuleNotFoundError: No module named 'playwright'` for
-`test_tool_execution.py`; no test body, browser, daemon, build, or Cargo
-command ran. The clipboard status remains unverified because the environment
-does not provide a Playwright runtime here.
+Static source inspection was supplemented by a collection-only attempt for the
+current chat/MCP/extension/tool scenarios. The current Python environment has
+neither importable `pytest` nor `playwright`, so collection did not begin and no
+test body, browser, daemon, build, or Cargo command ran. The clipboard status
+remains unverified because this environment does not provide the E2E runtime.

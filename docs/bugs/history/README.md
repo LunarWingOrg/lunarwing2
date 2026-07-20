@@ -5,6 +5,8 @@ Resolved reports and compatibility pointers kept for provenance. The active inde
 document directly under `docs/bugs/`. The two pointer rows marked below remain
 here only so old paths continue to resolve.
 
+Current-source cross-checks were refreshed against `51ae5a8` on 2026-07-20.
+
 | Document | Current status / resolution |
 |---|---|
 | [BUG-FIXED-LAPSE.md](BUG-FIXED-LAPSE.md) | FIXED: XML tool-call dialect recovery |

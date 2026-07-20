@@ -1,10 +1,11 @@
 # XMPP/WASM polling can stop delivering messages
 
-> **Status: PARTIALLY-FIXED (verified against HEAD 2026-07-12).** Poll-loop
-> crashes and stalls now have supervision and health reporting. A bounded queue
-> can still leave a poll task awaiting delivery when the agent is occupied by a
-> synchronous worker turn; that source-confirmed residual was not reproduced
-> here and is not automatically recovered by the inner supervisor.
+> **Status: PARTIALLY-FIXED (verified against `51ae5a8` on 2026-07-20).**
+> Poll-loop crashes and stalls now have supervision and health reporting. A
+> bounded queue can still leave a poll task awaiting delivery if downstream
+> consumption stalls or sustained ingress exceeds its drain rate; that
+> source-confirmed residual was not reproduced and is not automatically
+> recovered by the supervisor.
 
 This is the consolidated, current form of `BUG-daemon-stops-polling-xmpp-bridge.md`.
 
@@ -51,34 +52,40 @@ a failure criterion.
 
 - `WasmChannel::start_polling` creates an outer supervisor and respawns the inner
   poll loop with exponential backoff after an error or panic
-  (`ic/src/channels/wasm/wrapper.rs:2279-2441`).
+  (`ic/src/channels/wasm/wrapper.rs:2366-2527`).
 - Poll callbacks are bounded by the configured callback timeout
-  (`ic/src/channels/wasm/wrapper.rs:2477-2548`).
+  (`ic/src/channels/wasm/wrapper.rs:2536-2564`).
 - `health_check()` detects a dead supervisor and a stale
-  `last_poll_epoch_ms` (`ic/src/channels/wasm/wrapper.rs:2855-2897`).
+  `last_poll_epoch_ms` (`ic/src/channels/wasm/wrapper.rs:2946-2987`).
 - Dedicated tests cover dead and stalled poll tasks
-  (`ic/src/channels/wasm/wrapper.rs:5104-5151`).
+  (`ic/src/channels/wasm/wrapper.rs:5609-5655`).
 - Channel health is aggregated by `ChannelManager`
   (`ic/src/channels/manager.rs:210-220`) and exposed by the gateway
-  (`ic/src/channels/web/server.rs:2580-2654`).
+  (`ic/src/channels/web/server.rs:2746-2856`).
 - The watchdog has optional deep channel-health checks on systemd and OpenRC
-  (`ic/scripts/lunarwing-watchdog.sh:60-86` and its OpenRC counterpart).
+  (`ic/scripts/lunarwing-watchdog.sh:60-88` and
+  `ic/scripts/lunarwing-watchdog-openrc.sh:60-88`).
 
-These changes resolve the original silent-exit failure mode. The old line
-reference `wrapper.rs:2285` should be read as the `start_polling` block beginning
-at line 2279 in the current tree.
+These changes resolve the original silent-exit failure mode. Older references
+to the polling block near line 2285 no longer match the current wrapper layout.
 
 ## Residual backpressure path
 
 The channel's message queue is bounded. `dispatch_emitted_messages` awaits its
-`tx.send` (`ic/src/channels/wasm/wrapper.rs:2648-2697`). A synchronous
-`wait=true` worker turn can keep the consumer busy long enough for this queue to
-fill. In that case the poll task is pending in `send`, not exited, so the outer
-supervisor does not respawn it; health timestamps can remain fresh because the
-poll cycle updates `last_poll_epoch_ms` before dispatch
-(`wrapper.rs:2357-2366`). This is the remaining interaction with
-`BUG-agent-worker-lifecycle.md`, not evidence that the crash-supervision fix is
-absent.
+`tx.send` (`ic/src/channels/wasm/wrapper.rs:2642-2750`; the channel is created
+with capacity 256 at `:2783`). If downstream consumption stalls, or sustained
+ingress exceeds the consumer's drain rate, this queue can fill. The poll task is
+then pending in `send`, not exited, so the outer supervisor does not respawn it;
+health timestamps can remain fresh initially because the poll cycle updates
+`last_poll_epoch_ms` before dispatch (`wrapper.rs:2446-2468`).
+
+The earlier direct coupling to a synchronous worker turn is no longer current:
+the active-turn loop continues polling the merged channel stream, defers
+ordinary messages in a bounded FIFO, and rejects overflow explicitly
+(`ic/src/agent/agent_loop.rs:941-1016`, `ic/src/agent/dispatch.rs:6-51`). That
+prevents `wait=true` by itself from halting downstream reads. The residual is
+the unbounded queue-send await under an independently stalled or overloaded
+consumer, not evidence that crash supervision is absent.
 
 Possible follow-up: make delivery backpressure explicit in health metrics and/or
 schedule a bounded recovery when the queue remains full. Do not claim this
