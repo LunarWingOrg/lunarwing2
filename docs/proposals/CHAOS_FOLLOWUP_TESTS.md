@@ -1,5 +1,9 @@
 # Proposed Follow-up Tests for Self-Healing Test Suite
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** The truncated-state
+> recovery coverage corresponding to Section O landed. Most proposed concurrency,
+> state-shape, staleness, escalation, and flap-boundary cases remain open.
+
 *Drafted after P1/P2/P3 review items landed (commit `9c0c16ff` on `2026-06-14-chaos-baud`)*
 
 The current matrix (`test-self-heal-matrix.sh`, sections A–N) + chaos harness (`chaos-harness.sh`, CH1–CH13) cover ~107 dry-run assertions + 11 mock-init scenarios. These follow-ups target real-world failure modes those don't cover yet.

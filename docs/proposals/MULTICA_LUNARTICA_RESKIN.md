@@ -1,5 +1,10 @@
 # Reskin Multica → Lunartica (Lunarpunk)
 
+> **Current status (2026-07-20, rev `50c8f99`): OPEN / PLANNED IN AN EXTERNAL REPOSITORY.**
+> The referenced `Lunartica/` UI fork is not in this checkout, so
+> none of the visual changes can be verified here. The LunarWing protocol-interop
+> constraint remains valid and requires no bridge rename.
+
 **Status:** Plan, awaiting approval to implement.
 **Scope decision (locked):** *Visual reskin + display-name only.* Web + Desktop. No code-identifier or wire-protocol rename.
 **Repos:** UI work happens in the Lunartica fork (`Lunartica/`). The LunarWing bridge (`lunarwing/ic/`) is **not modified** — see "Interop guarantee".

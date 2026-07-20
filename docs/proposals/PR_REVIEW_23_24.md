@@ -1,5 +1,10 @@
 # Critical Review: PR #23 and PR #24
 
+> **Current status (2026-07-20, rev `50c8f99`): HISTORICAL RECORD.** This is a
+> point-in-time review of two unmerged PRs. The compatibility symlinks and
+> `ironclaw-agent-v1` legacy subprotocol remain in this checkout, so neither PR's
+> proposed removal should be treated as shipped.
+
 ## Scope and method
 
 This review compares each PR with the merge-base of the requested base branch,

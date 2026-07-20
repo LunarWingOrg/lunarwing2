@@ -1,13 +1,17 @@
 # Proposal: Close the rootless-podman container *supervision* gap (OpenRC leg)
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED / SUPERSEDED.**
+> Option 1 (`podman wait` babysitters) and Option 4 (`pg_isready` status) landed
+> for OpenRC/rootless. Quadlet supervision covers systemd/rootless, so the gap is
+> closed on both supported init paths.
+
 *Drafted 2026-06-16, on the experimental rootless-podman + OpenRC multi-tenant
 leg (the `eris` deploy). Companion to
 [`ROOTLESS_WORKER_OPENRC_UNITS.md`](../internal/history/proposals/ROOTLESS_WORKER_OPENRC_UNITS.md)
 and the self-healing series (archived under
 [`../internal/history/proposals/`](../internal/history/proposals/)).*
 
-> **Status:** proposal / analysis. **OpenRC leg: still open.** The systemd leg has
-> since closed the equivalent gap (see Status update below).
+> **Status:** closed by the landed OpenRC babysitter and systemd Quadlet paths.
 > **Scope:** rootless podman + OpenRC only. The rootful-docker leg is unaffected
 > (docker's `--restart unless-stopped` already covers it).
 > **TL;DR:** Per-tenant containers (`lunarwing-pg-<t>`, `lunarwing-nanocode-<t>`,

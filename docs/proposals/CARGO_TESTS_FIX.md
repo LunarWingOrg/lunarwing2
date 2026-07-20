@@ -1,5 +1,9 @@
 # Premise
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** Ten tests recorded
+> below were fixed. The two bootstrap-greeting tests and four multi-tenant
+> system-prompt tests remain deferred architectural work.
+
 * There are only a small handful of failing cargo tests related to changes in the last two releases. They do not affect anything of value, but at some point it would be nice to revisit Cargo tests and apply any rewrites needed
 
 ## Status (updated 2026-06-23)

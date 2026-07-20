@@ -1,5 +1,10 @@
 # Memory Maintenance Routines for LunarWing
 
+> **Current status (2026-07-20, rev `50c8f99`): OPEN / PLANNED.** The routine
+> pack importer, proposal-only capability profile, durable maintenance proposal
+> store, reviewed apply path, and three first-party routines described here do
+> not exist. Existing routine and workspace primitives are only prerequisites.
+
 > Status: first-pass planning stub. This document proposes architecture and delivery options only; it does not implement routines, a pack installer, or an apply path.
 
 ## Decision Summary
@@ -8,7 +13,9 @@ LunarWing should start with an importable, declarative routine-pack mechanism an
 
 The built-in option remains useful as a later promotion path for a small, reviewed default pack. In either model, maintenance routines must run in a read-only analysis profile and produce a durable proposal. A routine must never call `memory_write` (or an equivalent write path) to apply its own answer. Applying a proposal is a separate, authenticated user action with an optimistic content check.
 
-This is the design follow-up for issue #201, which the current goals and issue-status documents record as an open stub with no implementation or proposal at their report snapshot ([`docs/ops/AGENT_GOALS_2.0.0.0.md`](../ops/AGENT_GOALS_2.0.0.0.md#L77-L81), [`docs/ops/ISSUE_STATUS_REPORT.md`](../ops/ISSUE_STATUS_REPORT.md#L61-L66)).
+This is the design follow-up for issue #201, which the issue-status document
+records as an open stub with no implementation or proposal at its report
+snapshot ([`docs/ops/ISSUE_STATUS_REPORT.md`](../ops/ISSUE_STATUS_REPORT.md#L61-L66)).
 
 ## Context, Goals, and Non-Goals
 

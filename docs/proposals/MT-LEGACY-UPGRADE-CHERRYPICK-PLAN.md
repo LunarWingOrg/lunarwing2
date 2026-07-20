@@ -1,6 +1,11 @@
 # MT Legacy Upgrade — Cherry-Pick & Fix Plan (v1.0.3 → v1.1.2, in-place)
 
-**Status:** DRAFT — awaiting go-ahead before any code mutation.
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED / HISTORICAL RECORD.**
+> MF-1 through MF-7, the legacy harness, and the rehearsal path are in
+> current source. The real `ruffles` production run remained an operator task,
+> so this record does not establish live production validation.
+
+**Status:** Executed implementation plan; production run remained operator-gated.
 **Date:** 2026-06-21
 **Working branch:** `1.1.6-meta-v2` (changes land here; a copy is then placed on the target machine).
 **Source of work under review:** `origin/1.1.6-upgrade-harness-v2` (3 commits on top of `70c48059`).

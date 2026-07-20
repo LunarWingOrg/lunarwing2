@@ -1,3 +1,10 @@
+# XMPP to LunarVision Integration
+
+> **Current status (2026-07-20, rev `50c8f99`): OPEN / PLANNED.** XMPP images
+> reach multimodal LLM input, and the vision tool exists, but there is still no
+> inbound hook or agent-loop path that automatically sends attachments to
+> LunarVision for OCR/VL enrichment.
+
 Open gaps
 • XMPP → LunarVision gap: Agents can receive image files over XMPP (
 attachments.rs:40
@@ -18,4 +25,3 @@ What a fix would look like: Either (a) a BeforeInbound hook that detects image a
 
 
 Implementing the XMPP → LunarVision auto-routing
-

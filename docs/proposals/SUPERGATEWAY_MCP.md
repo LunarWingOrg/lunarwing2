@@ -1,5 +1,9 @@
 # Historical Finding: LunarWing MCP Installation Lacked stdio Surfaces
 
+> **Current status (2026-07-20, rev `50c8f99`): SUPERSEDED.** Native stdio,
+> Unix-socket, and HTTP MCP transports plus structured installation surfaces are
+> implemented. Supergateway remains optional operational infrastructure.
+
 Date: 2026-07-09
 
 Status: Superseded on 2026-07-09. LunarWing's core MCP runtime already supported

@@ -1,5 +1,10 @@
 # Secure Automated DarkIRC Key Exchange
 
+> **Current status (2026-07-20, rev `50c8f99`): OPEN / PLANNED.** No proposed
+> key-exchange commands, ledger, journal, or web surfaces exist. The Phase 0
+> prerequisite is also open: DarkIRC config regeneration can still replace the
+> whole TOML instead of preserving manually managed contacts.
+
 **Status:** Proposal only. None of the commands, state files, APIs, or web
 surfaces described here exist yet.
 

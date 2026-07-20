@@ -1,5 +1,10 @@
 # External Worker Security Audit (2026-06-23)
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED / HISTORICAL RECORD.**
+> Task context population, credential cleanup, load-balancer failover,
+> graceful pool draining, and integration coverage have landed. Full session
+> history plumbing remains separate future work.
+
 > **Last updated: 2026-07-09 (v1.1.9).** The Codex worker (`codex4lunarwing/`) was removed
 > in v1.1.9; this audit is retained for historical reference. The orchestrator-side fixes
 > (TaskContext population, credential cleanup audit) apply to the remaining workers
@@ -176,7 +181,7 @@ for (key, value) in &request.context.environment {
 
 ### Future
 1. **Thread history plumbing**: Pass actual conversation history via `SessionHandle` or `ContextManager`
-2. **Health checks**: Implement LoadBalancer circuit breaker with endpoint health monitoring
+2. **Health checks**: Connection-failure failover/circuit breaking landed; proactive endpoint health monitoring remains optional future work
 3. **Defensive cleanup**: ~~Add explicit env var deletion to Codex worker~~ *(N/A — Codex worker removed in v1.1.9)*
 4. **Integration tests**: Add chaos tests for credential cleanup scenarios
 
@@ -186,4 +191,4 @@ Problems #2 and #3 are **adequately addressed**:
 - **#2**: TaskContext now populated with available metadata/conversation history
 - **#3**: Credential cleanup mechanisms are functionally adequate with low risk
 
-Remaining work: LoadBalancer failover (problem #4) and full conversation history threading (requires architectural change).
+Remaining work: full conversation history threading (requires architectural change). Connection-failure load-balancer failover has landed.

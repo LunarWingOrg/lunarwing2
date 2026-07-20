@@ -1,6 +1,11 @@
 # Human Delay Mode - Phase 2 Plan
 
-**Status**: Planned, pending Phase 1 verification first. *(As of v1.1.9, Phase 1 supervised mode `--supervised` is shipped and live. Phase 2 remains planned.)*
+> **Current status (2026-07-20, rev `50c8f99`): OPEN / PLANNED.** Phase 1 is
+> verified, so the stated blocker is cleared. Timeout expiry, primary gate-pipeline
+> integration, parameter modification, supervision levels, and their tests have
+> not landed.
+
+**Status**: Planned; Phase 1 verification is complete. *(As of v1.1.9, Phase 1 supervised mode `--supervised` is shipped and live. Phase 2 remains planned.)*
 **Goal**: Complete the supervised mode experience with timeout integration, UI options, and robust testing.
 
 ## Phase 2 Scope
@@ -143,4 +148,4 @@ pub enum SupervisionLevel {
 ---
 
 **Priority Order**: 1 → 2 → 3 → 5 (Task 4 optional)
-**Blocker**: Phase 1 must compile and pass existing tests before starting Phase 2.
+**Blocker**: Cleared — Phase 1 compiles and its supervised-mode regressions pass.

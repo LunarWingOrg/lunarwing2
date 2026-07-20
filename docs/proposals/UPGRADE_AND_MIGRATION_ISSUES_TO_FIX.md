@@ -1,5 +1,11 @@
 # Upgrade / Migrate Issues Found
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL / MOSTLY SUPERSEDED.**
+> Kawarimi import-side owner-scope detection now closes the leading silent-empty
+> risk, and upgrade-tool responsibilities are explicit. The migration-on-boot,
+> backup discipline, PostgreSQL config-hash, and key-continuity notes remain
+> useful operational cautions.
+
 ## The core problem: no tooling fits rootless-Podman tenants
 
 Mercury and venus are **rootless Podman + Quadlet** tenants. The three upgrade scripts all miss this case:

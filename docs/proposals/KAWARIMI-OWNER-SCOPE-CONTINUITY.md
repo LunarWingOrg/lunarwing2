@@ -1,6 +1,11 @@
 # Kawarimi Owner-Scope Continuity — Implementation Proposal
 
-**Status:** Proposed (deferred feature) · **Branch:** `staging-kawarimi-migration` ·
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** Phase 0 and the core
+> Phase 1 import-side owner-scope detection/reconciliation have landed, closing
+> the silent-empty gap. The export-side scope hint and full `users`-table FK
+> rekey described as Phase 2 remain open.
+
+**Status:** Phase 0+1 implemented; Phase 2 open · **Branch:** `staging-kawarimi-migration` ·
 **Date:** 2026-06-30
 
 **Tracks:** GOALS_1.1.7 #13 ("Retest kawarimi tenant migration since NEW database

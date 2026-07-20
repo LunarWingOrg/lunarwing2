@@ -1,6 +1,11 @@
 
 # SSH Harness — Delivery Options
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** All three
+> delivery mechanisms are in tree. The older recommendation table's description
+> of the WASM option as future/exploratory is retained as design history, not its
+> present implementation status.
+
 **Date:** 2026-06-25 (updated 2026-07-01)  
 **Status:** ✅ **All three options implemented.** This is the original options
 overview; the authoritative as-built doc is

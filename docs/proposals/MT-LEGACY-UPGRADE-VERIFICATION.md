@@ -1,5 +1,9 @@
 # Legacy Upgrade Harness: Live-Validation Plan (v1.0.3-era → v1.1.x)
 
+> **Current status (2026-07-20, rev `50c8f99`): VERIFICATION-PENDING.** The
+> reviewed implementation remains in tree, but the live checklist, rehearsal
+> evidence, canary soak, and sign-off below remain incomplete.
+
 **Status:** Reviewed + hardened — **not yet live-validated**
 **Date:** 2026-06-21
 **Source range:** v1.0.3–v1.0.8

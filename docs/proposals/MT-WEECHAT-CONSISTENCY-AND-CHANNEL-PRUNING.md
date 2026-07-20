@@ -1,5 +1,11 @@
 # Proposal: MT WeeChat Service Consistency & WASM Channel Pruning
 
+> **Current status (2026-07-20, rev `50c8f99`): SUPERSEDED DEPLOYMENT SNAPSHOT.**
+> WeeChat is now an explicit per-tenant service with automated relay
+> bootstrap, and Telegram is no longer shipped. The durable per-tenant WASM
+> channel allowlist and tenant-log rotation ideas remain open and should be
+> tracked separately.
+
 *Drafted 2026-06-15, for the Gentoo + OpenRC + Podman multi-tenant deployment on branch
 `2026-06-15-eris-gentoo-1-1.1.4`. Tenants: zeus / mars / ate.*
 

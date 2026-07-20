@@ -1,5 +1,9 @@
 # Port IronClaw 0.29.1 Changes to LunarWing
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED / HISTORICAL RECORD.**
+> The non-UUID conversation-scope isolation fix and its regressions are
+> present; no selected port item remains open in this analysis.
+
 **Date:** 2026-06-05 (status updated 2026-06-05)
 **Status:** Analysis complete. P0-A implemented 2026-06-05.
 

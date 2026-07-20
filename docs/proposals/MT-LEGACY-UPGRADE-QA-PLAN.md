@@ -1,5 +1,10 @@
 # MT Legacy Upgrade: Live QA Plan (v1.0.3-era → v1.1.2/3)
 
+> **Current status (2026-07-20, rev `50c8f99`): VERIFICATION-PENDING.** The
+> scripts are present and hardened, but this checklist has not been completed
+> end-to-end against a real v1.0.3-era tenant. Keep its acceptance boxes unchecked
+> until evidence is captured.
+
 **Status:** Reviewed + hardened — live validation pending (open risk: old v1.0.x code may not build on the current toolchain)  
 **Date:** 2026-06-21  
 **Source:** v1.0.3–v1.0.8 (Docker rootful, PostgreSQL)  

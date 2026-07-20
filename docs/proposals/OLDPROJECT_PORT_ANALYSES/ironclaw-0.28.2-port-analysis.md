@@ -1,5 +1,10 @@
 # Port IronClaw 0.28.2 Changes to LunarWing
 
+> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** The permission
+> cleanup, resume-output handling, pattern expansion, and registry `hidden` field
+> landed. The model-fetch facade and snapshot harness remain open; the proposed
+> WIT item remains not applicable.
+
 **Date:** 2026-05-15 (updated 2026-05-28, status audit 2026-06-05, updated 2026-06-05)
 **Status:** Analysis complete. P1-F + P1-G implemented 2026-05-28 with pattern-fix expansion — see [Implementation Note](#implementation-note-2026-05-28-p1-f--p1-g-pattern-fix-expansion) below. P0-A + P1-H implemented 2026-06-05 on branch `1.1.1-333-security-improvements-3`. P1-I, P2-C, P2-D remain open.
 

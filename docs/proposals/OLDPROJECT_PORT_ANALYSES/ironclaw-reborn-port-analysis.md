@@ -1,5 +1,9 @@
 # Port IronClaw Reborn Architecture Mechanisms to LunarWing
 
+> **Current status (2026-07-20, rev `50c8f99`): OPEN / PLANNED.** No selected
+> Reborn mechanism from this analysis has landed. Treat this as a selective
+> hardening backlog, not a plan to adopt the upstream architecture wholesale.
+
 **Date:** 2026-06-30
 **Status:** Analysis complete. No code implemented. Selective mechanism backport — **not** a Reborn adoption.
 **Kind:** Architecture-level analysis (not a per-release delta). Appends to the `OLDPROJECT_PORT_ANALYSES/` series (0.28.1 / 0.28.2 / 0.29.0 / 0.29.1).

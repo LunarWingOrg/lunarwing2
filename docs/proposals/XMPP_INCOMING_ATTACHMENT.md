@@ -1,3 +1,7 @@
+> **Current status (2026-07-20, rev `50c8f99`): SUPERSEDED.** This pasted warning
+> is stale: `incoming_attachment_for_url` is test-gated and used by current XMPP
+> regression tests.
+
 warning: function `incoming_attachment_for_url` is never used
     --> src/channels/xmpp/mod.rs:2962:4
      |

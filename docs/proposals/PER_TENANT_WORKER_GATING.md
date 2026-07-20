@@ -1,5 +1,9 @@
 # Per-tenant worker gating (fix: unselected workers start anyway)
 
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** Worker selection
+> is persisted per tenant, `start-tenant` gates each worker from that registry,
+> and Kawarimi plus onboarding paths forward the selected `--with-*` flags.
+
 ## Bug
 
 `start-tenant` starts every external worker (nanocode/pebble/opencode) whose

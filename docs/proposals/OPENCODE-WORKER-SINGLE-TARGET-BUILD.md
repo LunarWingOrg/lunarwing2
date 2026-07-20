@@ -1,6 +1,10 @@
 # Proposal: Build Only the Native Target in the OpenCode Worker Image
 
-**Status:** Proposed
+> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** The worker image
+> invokes `bun run build -- --single`. The optional `--skip-install`, build-arg
+> escape hatch, and further toolchain pruning were not part of the landed change.
+
+**Status:** Implemented
 **Date:** 2026-07-02
 **Owner:** Christopher (GGMethos)
 **Scope:** `opencode4lunarwing/Dockerfile`

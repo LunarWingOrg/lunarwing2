@@ -1,5 +1,10 @@
 # Human Delay Mode - Testing Guide
 
+> **Current status (2026-07-20, rev `50c8f99`): SUPERSEDED AS AN OPERATIONAL GUIDE.**
+> The feature is implemented, but this guide references nonexistent
+> `thread` and `gate` CLI subcommands and stale crate names. Do not use those
+> commands; current approvals run through the interactive channel/gateway flow.
+
 > **Last updated: 2026-07-09.** Supervised mode (`--supervised`) shipped in v1.1.9.
 > Phase 2 features (timeout expiration, gate pipeline full integration, modify UI) remain planned.
 
