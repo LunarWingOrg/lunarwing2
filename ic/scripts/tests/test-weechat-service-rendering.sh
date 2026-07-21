@@ -189,6 +189,31 @@ else
   failures=$((failures + 1))
 fi
 
+# ExecStop uses the graceful stop helper (saves buffers via /upgrade -quit)
+if grep -q 'ExecStop=.*lunarwing-weechat-stop.sh' "$unit_file"; then
+  echo "  PASS: systemd ExecStop uses graceful stop helper"
+else
+  echo "  FAIL: systemd ExecStop missing graceful stop helper"
+  failures=$((failures + 1))
+fi
+
+# ExecStop passes the weechat home and tmux socket
+if grep -q 'ExecStop=.*--weechat-home' "$unit_file" \
+  && grep -q 'ExecStop=.*--tmux-socket' "$unit_file"; then
+  echo "  PASS: systemd ExecStop passes weechat-home and tmux-socket"
+else
+  echo "  FAIL: systemd ExecStop missing helper arguments"
+  failures=$((failures + 1))
+fi
+
+# TimeoutStopSec gives the graceful stop time to complete
+if grep -q 'TimeoutStopSec=' "$unit_file"; then
+  echo "  PASS: systemd sets TimeoutStopSec"
+else
+  echo "  FAIL: systemd missing TimeoutStopSec"
+  failures=$((failures + 1))
+fi
+
 echo "=== OpenRC renderer helper ==="
 
 openrc_out="$MT_FIXTURE/openrc-output"
@@ -264,6 +289,23 @@ if grep -q 'weechat_command:=.*tmux' "$rc_file" \
   echo "  PASS: OpenRC preserves tmux + weechat --dir start"
 else
   echo "  FAIL: OpenRC missing tmux weechat start"
+  failures=$((failures + 1))
+fi
+
+# stop() uses the graceful stop helper (saves buffers via /upgrade -quit)
+if grep -q 'weechat_stop_helper' "$rc_file" \
+  && grep -q 'lunarwing-weechat-stop.sh' "$rc_file"; then
+  echo "  PASS: OpenRC stop() uses graceful stop helper"
+else
+  echo "  FAIL: OpenRC stop() missing graceful stop helper"
+  failures=$((failures + 1))
+fi
+
+# stop() still has a tmux kill-session fallback for when the helper is missing
+if grep -q 'kill-session -t weechat' "$rc_file"; then
+  echo "  PASS: OpenRC stop() retains tmux kill-session fallback"
+else
+  echo "  FAIL: OpenRC stop() missing tmux kill-session fallback"
   failures=$((failures + 1))
 fi
 

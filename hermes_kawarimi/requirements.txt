@@ -1,0 +1,8 @@
+# UX (shared with lunarwing_mt_onboard)
+rich
+questionary
+# Hermes config.yaml parsing
+pyyaml
+# Secrets crypto + live tenant DB writes (reused from lunarwing_mt_onboard.secrets_ops)
+cryptography
+psycopg2-binary
