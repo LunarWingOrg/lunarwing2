@@ -16,20 +16,14 @@
 7. [x] CHPAR-006 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 8. [x] CHPAR-007 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 9. [x] CHPAR-008 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
-10. [x] CHPAR-009 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
-11. [x] CHPAR-010 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
-12. [x] CHPAR-011 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
-13. [x] CHPAR-012 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
+10. [x] X
+11. [x] CHPAR-011 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
+12. [ ] Take a look at docs/proposals/IRONCLAW_ADDITION_CANDIDATES.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/README.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-1.0.0-rc.1-port-analysis.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-reborn-port-analysis.md - Identify the top 2 HIGHEST PRIORITY things to implement from candidate additions. Create a single document under docs/proposals to plan these 2 additions.
+13. [ ] Take a look at docs/proposals/IRONCLAW_ADDITION_CANDIDATES.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/README.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-1.0.0-rc.1-port-analysis.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-reborn-port-analysis.md - Identify the top 3 EASIEST things to implement from candidate additions. Create a single document under docs/proposals to plan these 3 additions.
 14. [ ] get back to previous refactor mt admin idea. see the section of docs/proposals/MT-ADMIN-DECOMPOSITION.md — review notes section of: `docs/ops/KUMOGAKURE_RECENT_REV_T.md` - you will NOT begin ANY work on this yet. you will simply edit the document already created under docs/proposals called `MT-ADMIN-DECOMPOSITION.md`
 15. [ ] continue to work on kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. SEE: SECTION: hermes_kawarimi — review notes in docs/ops/KUMOGAKURE_RECENT_REV_T.md for suggestedm improvements/concerns
 16. [ ] work on weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued. FEEDBACK FROM LAST TIME: 19:34:19 wrench │ ### Verdict
-19:34:20 wrench │ One real bug found: OpenRC weechat stop() invokes the helper as root instead of the tenant user, which   
-                │ will fail to find the tmux socket. Medium severity — the graceful stop silently becomes a no-op on
-                │ OpenRC, though the old kill-session behavior would also be broken (same root-cause: missing su). The    
-                │ systemd path is unaffected.
-19:34:20 wrench │ Otherwise: solid feature work. The weechat buffer restore is well-designed (proper wrapper script, good  
-                │ fallback chain, both init systems covered, renderer tests). The test-deferral approach is pragmatic and
-                │ well-documented. Crate audit status doc is thorough.
+One real bug found: OpenRC weechat stop() invokes the helper as root instead of the tenant user, which will fail to find the tmux socket. Medium severity — the graceful stop silently becomes a no-op on OpenRC, though the old kill-session behavior would also be broken (same root-cause: missing su). The systemd path is unaffected. Otherwise: solid feature work. The weechat buffer restore is well-designed (proper wrapper script, good fallback chain, both init systems covered, renderer tests). The test-deferral approach is pragmatic and well-documented.
 17. [x] Inspect status of cargo crates and create documented report of any crates that might still need to be updated. Verify if the info dump below is still correct, then write up a document in docs/ops detailing the status: is each piece verifiable? what outstanding issues remain? which points have already been addressed?
     <details>
     <summary><b>INFO DUMP — Crate audit reference</b></summary>
@@ -57,31 +51,28 @@
     - The cargo update (patch/minor bumps) recommendation may or may not have been run.
     Verdict: The deferred crates (rand, base64, tower-http) are intentionally held back for 2.0.0+. The patch-level cargo update should be verified. Genuinely open — deferred to 2.0.0+.
     </details>
-18. [ ] Kestrel created a UNIFIED build script to optimize for speed. Take a look at this. You can find it at: scripts/build-lunarwing.sh - let's continue to work on this and make suggestions and ensure it works properly on your machine first to create nice full builds of LunarWing safely across machines with all kinds of resources... (we can use (`nproc × 0.75`) instead of nproc btw if that seems safer ). According to kestrel:
+18. [ ] Kestrel created a UNIFIED build script to optimize for speed. Take a look at this. You can find it at: scripts/build-lunarwing.sh - let's continue to work on this and make suggestions and ensure it works properly on your machine first to create nice full builds of LunarWing safely across machines with all kinds of resources... ALSO: We can use (`nproc × 0.75`) instead of nproc. That seems safer to me. According to kestrel (see section below):
+<details>
+<summary><b>Recommendation</b></summary>
 kestrel │ Two ways:
-                 │ 
-                 │ **Per-build override** (no code change):
-                 │ ```bash
-                 │ # Flag
-                 │ ./scripts/build-lunarwing.sh -j $(($(nproc) * 3 / 4))
-                 │ 
-                 │ # Or env var
-                 │ BUILD_JOBS=$(($(nproc) * 3 / 4)) ./scripts/build-lunarwing.sh
-                 │ ```
-                 │ 
-                 │ **Or change the default in the script** — line 73-74, swap:
-                 │ 
-                 │ ```bash
-                 │         DEFAULT_JOBS=$NPROC
-                 │ ```
-                 │         
-                 │ to:
-                 │ 
-                 │ ```bash
-                 │         DEFAULT_JOBS=$(( NPROC * 3 / 4 ))
-                 │ ```
-kestrel │ The `-j` flag and `BUILD_JOBS` env var always override the default, so you've got flexibility
-                 per-machine without touching the script.
+**Per-build override** (no code change):
+```bash
+# Flag
+./scripts/build-lunarwing.sh -j $(($(nproc) * 3 / 4))
+# Or env var
+BUILD_JOBS=$(($(nproc) * 3 / 4)) ./scripts/build-lunarwing.sh
+```
+**Or change the default in the script** — line 73-74, swap:
+```bash
+DEFAULT_JOBS=$NPROC
+```
+to:
+```bash
+DEFAULT_JOBS=$(( NPROC * 3 / 4 ))
+```
+The `-j` flag and `BUILD_JOBS` env var always override the default, so you've got flexibility per-machine without touching the script.
+  </details>
+  
 19. [ ] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and one Recommended-List item (registry validation) are DONE and verified in code (2026-07-21). Closed 2026-07-21 by completing the Diagnostics / command preflight Recommended-List item (see below). Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
     <details>
     <summary><b>✅ DONE (verified 2026-07-21) — Foundational: first-class host-local stdio MCP installation</b></summary>
@@ -96,15 +87,12 @@ kestrel │ The `-j` flag and `BUILD_JOBS` env var always override the default, 
     - Validation for empty commands, NUL bytes, invalid env names/values — `ic/src/tools/mcp/config.rs:174-193`.
     - Removal stops the managed child before deleting config — `ic/src/extensions/manager.rs:1144` (unregister tools → drop client → `shutdown(name)` → delete config).
     - Existing HTTP MCP + registry precedence preserved; install kept separate from execution (install stores config; activation spawns + discovers tools).
-
     Intentionally excluded: worker-local execution, automatic npm/pip install, secret injection through stdio env vars, gateway changes.
     </details>
     <details>
     <summary><b>Recommended List — status (finish ONE incomplete item to close #19)</b></summary>
     Status verified against code on 2026-07-21:
-
     - ✅ **Registry validation — DONE.** `registry validate` CLI command + `ic/src/registry/validation/mod.rs` (+ tests). Covers exactly one of url/transport, valid stdio command/args/env, `auth: none` for stdio, duplicate names, and unsupported transport types.
-
     - 🟡 **Deactivate / re-enable — PARTIAL.**
       - Done: CLI `mcp toggle --enable/--disable` persists the `enabled` flag (`ic/src/cli/mcp.rs:576`); startup honors it (`ic/src/app.rs:606` via `enabled_servers()`, `ic/src/tools/mcp/config.rs:387`).
       - Remaining: stop the child + unregister its tools at runtime on disable (today `toggle` only rewrites config, so it takes effect on next restart); conversational `tool_deactivate`; web API + web UI toggle controls.
