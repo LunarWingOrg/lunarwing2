@@ -1,9 +1,10 @@
-# Roadmap Document
+# The Roadmap Document
 
 | Feature | Target |
 |---------|--------|
 | Add weechat buffer resiliency | v2.0.2 |
 | update onboard ui to correspond with changes in codebase since v2.0.0.0 | v2.0.2 |
+| Refactor mt admin | v2.0.2 |
 | Update (this) roadmap document | v2.0.2 |
 | XMPP file transfer — remaining polish (further hardening) | v2.0.3 |
 | Additional WASM Channel Polishing | v2.0.3 |
