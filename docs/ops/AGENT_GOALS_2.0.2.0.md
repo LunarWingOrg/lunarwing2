@@ -51,7 +51,7 @@
     Verdict: The deferred crates (rand, base64, tower-http) are intentionally held back for 2.0.0+. The patch-level cargo update should be verified. Genuinely open — deferred to 2.0.0+.
     </details>
 18. [x] Fix any remaining broken cargo tests and ensure updated documentation. Create (or rewrite) new tests if necessary. then re-run cargo tests to ensure
-19. [ ] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and one Recommended-List item (registry validation) are DONE and verified in code (2026-07-21). To close this item, complete AT LEAST ONE of the incomplete Recommended-List items below (each has a status + what remains). Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
+19. [x] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and one Recommended-List item (registry validation) are DONE and verified in code (2026-07-21). Closed 2026-07-21 by completing the Diagnostics / command preflight Recommended-List item (see below). Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
     <details>
     <summary><b>✅ DONE (verified 2026-07-21) — Foundational: first-class host-local stdio MCP installation</b></summary>
     Confirmed present in code with references:
@@ -78,9 +78,10 @@
       - Done: CLI `mcp toggle --enable/--disable` persists the `enabled` flag (`ic/src/cli/mcp.rs:576`); startup honors it (`ic/src/app.rs:606` via `enabled_servers()`, `ic/src/tools/mcp/config.rs:387`).
       - Remaining: stop the child + unregister its tools at runtime on disable (today `toggle` only rewrites config, so it takes effect on next restart); conversational `tool_deactivate`; web API + web UI toggle controls.
 
-    - 🟡 **Diagnostics / command preflight — PARTIAL.**
-      - Done: `lunarwing doctor` `check_mcp_config()` loads enabled servers and runs config `validate()` (`ic/src/cli/doctor.rs:483`).
-      - Remaining: report transport + enabled state per server; check executable availability / resolve command through PATH; report spawn + negotiation failures in the installed-extension response (still no execution during install).
+    - ✅ **Diagnostics / command preflight — DONE (2026-07-21).**
+      - Done: `lunarwing doctor` `check_mcp_config()` loads enabled servers and runs config `validate()` (`ic/src/cli/doctor.rs`).
+      - Done (added 2026-07-21): reports transport (http/stdio/unix) + enabled state per server, resolves stdio commands through PATH (without executing), and flags enabled stdio servers whose command is missing on PATH. Helpers: `preflight_mcp_server`, `resolve_command_in_path`, `is_executable` in `ic/src/cli/doctor.rs`. Unit tests cover PATH resolution and stdio-disabled missing-command behavior.
+      - Intentionally still excluded: spawning the server or running an actual MCP handshake during install — install remains separate from execution.
 
     - ❌ **In-place configuration updates — NOT STARTED.** Let users edit command/args/env/url without remove+reinstall; if active, require explicit restart confirmation; preserve registry precedence + approval rules. (Only add/remove/toggle/auth/test exist today.)
 
