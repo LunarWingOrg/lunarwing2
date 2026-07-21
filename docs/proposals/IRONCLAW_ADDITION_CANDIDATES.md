@@ -10,6 +10,9 @@
 - Compiled as a follow-up to the IronClaw/LunarWing comparison pass.
 - No code changes are implied by this document.
 - Existing detailed port analyses remain in `docs/proposals/OLDPROJECT_PORT_ANALYSES/`.
+- The newer `OLDPROJECT_PORT_ANALYSES/ironclaw-1.0.0-rc.1-port-analysis.md`
+  is the canonical audit for changes after 0.29.1 and adds candidates not
+  represented in this earlier filtered list.
 - This document is a filtered candidate list: it calls out the additions that still look useful after checking the current LunarWing tree, and it marks broad or duplicate work accordingly.
 
 ## Scope
@@ -182,7 +185,7 @@ Current raw-string surfaces include:
 
 ### 6. Bound concurrent WASM prepare/execute/callback work
 
-**Priority:** P2/P3
+**Priority:** P1/P2 availability hardening
 **Size:** medium
 **IronClaw reference:** `799eb1540` (`fix(reborn): stop WASM execution from starving the tokio worker pool`)
 **LunarWing fit:** partial
@@ -201,7 +204,9 @@ Remaining LunarWing gap:
 - Preserve current panic-to-error behavior.
 - Add cancellation/permit-release tests.
 
-**Recommendation:** do after the channel HTTP/leak-scan work unless production has evidence of WASM storms.
+**Recommendation:** do after the channel HTTP/leak-scan work. Upstream's reproduced
+blocking-pool starvation incident is sufficient evidence for the same unbounded
+host-resource shape; do not wait for a LunarWing outage.
 
 ## Existing Proposal Items Still Worth Carrying
 
