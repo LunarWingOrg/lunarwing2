@@ -1,6 +1,6 @@
 # IronClaw Port-Analysis Backlog — Status Index
 
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL / VERIFICATION-PENDING.**
+> **Current status (2026-07-21, rev `61d0c1e`): RANGE AUDIT COMPLETE / BACKLOG OPEN.**
 > Implemented rows remain present, while the open backlog remains open. The
 > Wasmtime baseline is now 36.0.12 rather than 28.x, so advisory counts below
 > require a fresh `cargo deny check` before security prioritization.
@@ -10,7 +10,18 @@
 > Many items listed as "open/deferred" may have been independently implemented or
 > obsoleted by LunarWing's own architecture changes since the fork.
 
-Consolidated status across the four upstream port analyses, **reconciled 2026-06-07** against the
+## Latest range audit
+
+`ironclaw-1.0.0-rc.1-port-analysis.md` audits the full 1,978-commit range from
+`ironclaw-v0.29.1` to `ironclaw-v1.0.0-rc.1` against current LunarWing v1 and
+v2. It supersedes the old assumption that Reborn was only an unfinished side
+binary, but retains the selective-port conclusion. New leading candidates are
+row-bound secret encryption, browser-send idempotency, reserved SSE error-event
+handling, routine hold/schedule correctness, compaction and
+stale-edit circuit breakers, durable extension cleanup, crash-consistency
+tests, deployment-state validation, and a deliberate Responses API project.
+
+Historical consolidated status across the four pre-RC release analyses, **reconciled 2026-06-07** against the
 LunarWing tree. Each analysis file carries its own per-item detail; this is the at-a-glance view.
 Per the v1.1.1 release decision, **all remaining code-level ports are deferred** — see the
 "Features and changes deferred to future releases" table in `RELEASE-v1.1.1.md`.
