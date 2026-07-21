@@ -52,6 +52,8 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
     Verdict: The deferred crates (rand, base64, tower-http) are intentionally held back for 2.0.0+. The patch-level cargo update should be verified. Genuinely open — deferred to 2.0.0+.
     </details>
 18. [ ] Kestrel created a UNIFIED build script to optimize for speed. Take a look at this. You can find it at: scripts/build-lunarwing.sh - let's continue to work on this and make suggestions and ensure it works properly on your machine first to create nice full builds of LunarWing safely across machines with all kinds of resources... ALSO: We can use (`nproc × 0.75`) instead of nproc. That seems safer to me. According to kestrel:
+<details>
+<summary><b>Recommendation</b></summary>
 kestrel │ Two ways:
 **Per-build override** (no code change):
 ```bash
@@ -69,6 +71,8 @@ to:
 DEFAULT_JOBS=$(( NPROC * 3 / 4 ))
 ```
 The `-j` flag and `BUILD_JOBS` env var always override the default, so you've got flexibility per-machine without touching the script.
+  </details>
+  
 19. [ ] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and one Recommended-List item (registry validation) are DONE and verified in code (2026-07-21). Closed 2026-07-21 by completing the Diagnostics / command preflight Recommended-List item (see below). Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
     <details>
     <summary><b>✅ DONE (verified 2026-07-21) — Foundational: first-class host-local stdio MCP installation</b></summary>
