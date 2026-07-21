@@ -51,60 +51,46 @@
     Verdict: The deferred crates (rand, base64, tower-http) are intentionally held back for 2.0.0+. The patch-level cargo update should be verified. Genuinely open — deferred to 2.0.0+.
     </details>
 18. [ ] Fix any remaining broken cargo tests and ensure updated documentation. Create (or rewrite) new tests if necessary. then re-run cargo tests to ensure
-19. [x] (HOLDING OFF ON THIS TASK SO MAEKED IT DONE RN) MCP additions: ( please reference the following branch for a hint on getting started, old failed implementations from previous opencode/codex workers: faility/failed-partial-old-item-3-20260711-0601 AND slopmcp1/codex/upgrade/v2.0.0.0 ) - There are two sections below. You must read BOTH of them (as well as reference the old failed implementation from previous failed opencode worker). Once you have, follow the following instructions: One of the sections is `Recommended List — Pick ONE, implement it, check off item 18` Pick ONE from the `Recommended List — Pick ONE, implement it, check off item 18` list below, implement it, check off this box. Two Informational Sections following this sentence:
+19. [ ] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and one Recommended-List item (registry validation) are DONE and verified in code (2026-07-21). To close this item, complete AT LEAST ONE of the incomplete Recommended-List items below (each has a status + what remains). Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
     <details>
-    <summary><b>DONE — First-class host-local stdio MCP installation</b></summary>
-    Implemented first-class host-local stdio MCP installation across LunarWing:
-    - Added typed stdio MCP registry manifests with command, structured args, and non-secret env.
-    - Added a shared validated ExtensionManager::install_mcp_config persistence path.
-    - Extended conversational tool_install and the web API to accept stdio configuration.
-    - Added HTTP/stdio controls to the web MCP settings UI.
-    - Added stdio support to lunarwing registry list/info/install, including --force handling.
-    - Exposed transport and command metadata when listing installed MCP servers.
-    - Treated stdio servers as requiring no OAuth authentication.
-    - Added validation for empty commands, NUL bytes, and invalid environment names/values.
-    - Ensured removal stops the managed child process before deleting its configuration.
-    - Preserved existing HTTP MCP and registry precedence behavior.
-    - Kept installation separate from execution: installation stores configuration; activation starts the process and discovers tools.
-    - Updated the architecture proposal, historical supergateway note, and MCP documentation with neutral local-files examples.
-    Worker-local execution, automatic npm/pip installation, secret injection through stdio environment variables, and gateway changes were intentionally excluded. All targeted tests, formatting, JavaScript syntax checks, and cargo check passed.
+    <summary><b>✅ DONE (verified 2026-07-21) — Foundational: first-class host-local stdio MCP installation</b></summary>
+    Confirmed present in code with references:
+    - Typed stdio MCP registry manifests (command, structured args, non-secret env; mutually exclusive with url) — `ic/src/registry/manifest.rs` (`McpManifestTransport::Stdio`, `ExtensionSource::McpStdio`).
+    - Shared validated `ExtensionManager::install_mcp_config` persistence path — `ic/src/extensions/manager.rs`.
+    - Conversational `tool_install` and web API accept stdio configuration — `ic/src/tools/builtin/extension_tools.rs:102`, `ic/src/channels/web/handlers/extensions.rs:118`, `ic/src/channels/web/server.rs:2150`.
+    - HTTP/stdio controls in the web MCP settings UI — `ic/src/channels/web/static/app.js:4614` (`setMcpInstallTransport`, `mcp-http-fields`/`mcp-stdio-fields`).
+    - stdio support in `lunarwing registry list/info/install` (incl. `--force`) plus `mcp add` stdio — `ic/src/cli/registry.rs`, `ic/src/cli/mcp.rs`.
+    - Transport + command metadata exposed when listing installed MCP servers.
+    - stdio servers require no OAuth — `ic/src/tools/mcp/config.rs:250` (`requires_auth()` false for stdio/unix).
+    - Validation for empty commands, NUL bytes, invalid env names/values — `ic/src/tools/mcp/config.rs:174-193`.
+    - Removal stops the managed child before deleting config — `ic/src/extensions/manager.rs:1144` (unregister tools → drop client → `shutdown(name)` → delete config).
+    - Existing HTTP MCP + registry precedence preserved; install kept separate from execution (install stores config; activation spawns + discovers tools).
+
+    Intentionally excluded: worker-local execution, automatic npm/pip install, secret injection through stdio env vars, gateway changes.
     </details>
     <details>
-    <summary><b>Recommended List — Pick ONE, implement it, check off</b></summary>
-    Recommended Next:
-    MCP deactivate/re-enable
-       - Stop the child, unregister its tools, and preserve configuration.
-       - Persist enabled = false so restart does not relaunch it.
-       - Add tool_deactivate, API, and web controls.
-       - This completes the lifecycle without involving WASM or workers.
-       Diagnostics and command preflight
-       - Extend doctor/status with transport, enabled state, and executable availability.
-       - Validate absolute commands or resolve commands through PATH.
-       - Report spawn and negotiation failures in the installed-extension response.
-       - Do not execute anything during installation.
-       Registry validation — DONE
-       - Add a validation test or registry validate command covering:
-         - exactly one of url or transport
-         - valid stdio command/args/env
-         - auth: none for stdio
-         - duplicate names and unsupported transport types
-       - This is almost entirely isolated to registry code and CI.
-       In-place configuration updates
-       - Let users edit command, args, env, or URL without remove/reinstall.
-       - If active, require explicit restart confirmation.
-       - Preserve existing registry precedence and approval rules.
-       Focused integration coverage
-       - Exercise the real install API through the router.
-       - Verify install → list → activate failure reporting → deactivate → remove.
-       - Add a browser-level check for HTTP/stdio mode switching and mobile layout.
-    Useful, Slightly Larger (optional):
-    - Optional stdio working directory (cwd) with path validation.
-    - Per-server startup and request timeouts.
-    - A visible risk label explaining that host-local processes are unsandboxed.
-    - Better process cleanup when a spawn replaces an existing managed transport.
-    - Tenant/owner selection for mcp add and registry install; today the CLI persistence path still assumes the default owner.
-    Defer For Now:
-    Worker-local MCP, automatic npm/pip installation, secret injection through process environment, a general runtime-adapter refactor, gateway integration, and automatic crash restart all increase the security or lifecycle surface materially. Recommended: implement deactivate/re-enable, diagnostics, registry validation, and integration tests as one contained follow-up. That provides a complete and inspectable host-local lifecycle before introducing another execution placement.
+    <summary><b>Recommended List — status (finish ONE incomplete item to close #19)</b></summary>
+    Status verified against code on 2026-07-21:
+
+    - ✅ **Registry validation — DONE.** `registry validate` CLI command + `ic/src/registry/validation/mod.rs` (+ tests). Covers exactly one of url/transport, valid stdio command/args/env, `auth: none` for stdio, duplicate names, and unsupported transport types.
+
+    - 🟡 **Deactivate / re-enable — PARTIAL.**
+      - Done: CLI `mcp toggle --enable/--disable` persists the `enabled` flag (`ic/src/cli/mcp.rs:576`); startup honors it (`ic/src/app.rs:606` via `enabled_servers()`, `ic/src/tools/mcp/config.rs:387`).
+      - Remaining: stop the child + unregister its tools at runtime on disable (today `toggle` only rewrites config, so it takes effect on next restart); conversational `tool_deactivate`; web API + web UI toggle controls.
+
+    - 🟡 **Diagnostics / command preflight — PARTIAL.**
+      - Done: `lunarwing doctor` `check_mcp_config()` loads enabled servers and runs config `validate()` (`ic/src/cli/doctor.rs:483`).
+      - Remaining: report transport + enabled state per server; check executable availability / resolve command through PATH; report spawn + negotiation failures in the installed-extension response (still no execution during install).
+
+    - ❌ **In-place configuration updates — NOT STARTED.** Let users edit command/args/env/url without remove+reinstall; if active, require explicit restart confirmation; preserve registry precedence + approval rules. (Only add/remove/toggle/auth/test exist today.)
+
+    - 🟡 **Focused integration coverage — PARTIAL.**
+      - Done: `mcp_extension_lifecycle` e2e (search → install → activate → use) + `mcp_compat/{transport,auth,oauth}` tests — all HTTP mock (`ic/tests/e2e_advanced_traces.rs:511`, `ic/tests/mcp_compat/`).
+      - Remaining: stdio-based lifecycle test; install → list → activate-failure reporting → deactivate → remove; browser-level HTTP/stdio mode switching + mobile-layout check.
+
+    **Useful, slightly larger (optional):** stdio working directory (cwd) with path validation; per-server startup/request timeouts; visible "host-local processes are unsandboxed" risk label; better process cleanup when a spawn replaces an existing managed transport; tenant/owner selection for `mcp add` + registry install (CLI persistence still assumes the default owner).
+
+    **Defer for now:** worker-local MCP, automatic npm/pip install, secret injection through process env, general runtime-adapter refactor, gateway integration, automatic crash restart — each materially increases the security/lifecycle surface.
     </details>
 20. [ ] dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md
 21. [ ] update onboard ui to correspond with changes in codebase since v2.0.0.0 - surely some things have been broken at this point - in particular, kawarimi is likely broken now due to new 7z encryption
