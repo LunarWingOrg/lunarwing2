@@ -21,8 +21,15 @@
 12. [x] CHPAR-011 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 13. [x] CHPAR-012 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 14. [x] refactor mt admin idea. write up a doc on how we can break mt admin setup monolithic megascript (8000 lines of bash rn) into AT LEAST FOUR SEPERATE PARTS. put it in docs/proposals
-15. [x] kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. you should use THIS branch for reference (plan is included on this branch too): kawarimi-hermes-adapter-1
-16. [x] figure out a way for weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued
+15. [ ] continue to work on kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. you should use THIS branch for reference (plan is included on this branch too): kawarimi-hermes-adapter-1
+16. [ ] work on weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued. FEEDBACK FROM LAST TIME: 19:34:19 wrench │ ### Verdict
+19:34:20 wrench │ One real bug found: OpenRC weechat stop() invokes the helper as root instead of the tenant user, which   
+                │ will fail to find the tmux socket. Medium severity — the graceful stop silently becomes a no-op on
+                │ OpenRC, though the old kill-session behavior would also be broken (same root-cause: missing su). The    
+                │ systemd path is unaffected.
+19:34:20 wrench │ Otherwise: solid feature work. The weechat buffer restore is well-designed (proper wrapper script, good  
+                │ fallback chain, both init systems covered, renderer tests). The test-deferral approach is pragmatic and
+                │ well-documented. Crate audit status doc is thorough.
 17. [x] Inspect status of cargo crates and create documented report of any crates that might still need to be updated. Verify if the info dump below is still correct, then write up a document in docs/ops detailing the status: is each piece verifiable? what outstanding issues remain? which points have already been addressed?
     <details>
     <summary><b>INFO DUMP — Crate audit reference</b></summary>
@@ -50,8 +57,32 @@
     - The cargo update (patch/minor bumps) recommendation may or may not have been run.
     Verdict: The deferred crates (rand, base64, tower-http) are intentionally held back for 2.0.0+. The patch-level cargo update should be verified. Genuinely open — deferred to 2.0.0+.
     </details>
-18. [x] Fix any remaining broken cargo tests and ensure updated documentation. Create (or rewrite) new tests if necessary. then re-run cargo tests to ensure
-19. [x] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and one Recommended-List item (registry validation) are DONE and verified in code (2026-07-21). Closed 2026-07-21 by completing the Diagnostics / command preflight Recommended-List item (see below). Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
+18. [ ] Kestrel created a UNIFIED build script to optimize for speed. Take a look at this. You can find it at: scripts/build-lunarwing.sh - let's continue to work on this and make suggestions and ensure it works properly on your machine first to create nice full builds of LunarWing safely across machines with all kinds of resources... (we can use (`nproc × 0.75`) instead of nproc btw if that seems safer ). According to kestrel:
+kestrel │ Two ways:
+                 │ 
+                 │ **Per-build override** (no code change):
+                 │ ```bash
+                 │ # Flag
+                 │ ./scripts/build-lunarwing.sh -j $(($(nproc) * 3 / 4))
+                 │ 
+                 │ # Or env var
+                 │ BUILD_JOBS=$(($(nproc) * 3 / 4)) ./scripts/build-lunarwing.sh
+                 │ ```
+                 │ 
+                 │ **Or change the default in the script** — line 73-74, swap:
+                 │ 
+                 │ ```bash
+                 │         DEFAULT_JOBS=$NPROC
+                 │ ```
+                 │         
+                 │ to:
+                 │ 
+                 │ ```bash
+                 │         DEFAULT_JOBS=$(( NPROC * 3 / 4 ))
+                 │ ```
+kestrel │ The `-j` flag and `BUILD_JOBS` env var always override the default, so you've got flexibility
+                 per-machine without touching the script.
+19. [ ] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and one Recommended-List item (registry validation) are DONE and verified in code (2026-07-21). Closed 2026-07-21 by completing the Diagnostics / command preflight Recommended-List item (see below). Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
     <details>
     <summary><b>✅ DONE (verified 2026-07-21) — Foundational: first-class host-local stdio MCP installation</b></summary>
     Confirmed present in code with references:
