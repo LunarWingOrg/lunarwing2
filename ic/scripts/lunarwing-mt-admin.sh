@@ -2297,6 +2297,7 @@ _weechat_generate_relay_config() {  # <tenant> <temp_dir> <port> <lunarwing_env>
     --run-command '/set relay.network.ipv6 off' \
     --run-command '/set relay.network.bind_address "127.0.0.1"' \
     --run-command "/relay add api ${relay_port}" \
+    --run-command '/set weechat.look.save_layout_on_exit buffers' \
     --run-command '/save' \
     --run-command '/quit'
 }
@@ -4978,11 +4979,15 @@ EOF
 
 # Render the WeeChat systemd user unit into <out_dir>.
 # Loads only weechat.env (RELAY_PASSWORD), not the full lunarwing.env.
+# ExecStop sends /upgrade -quit via the WeeChat FIFO so WeeChat saves its
+# session (buffers, lines, connections) before exiting; next start restores
+# it. Falls back to tmux kill-session if the graceful stop fails.
 _render_weechat_systemd_unit() {  # <tenant> <out_dir>
   local name="$1" out_dir="$2"
-  local weechat_home env_dir
+  local weechat_home env_dir stop_helper
   weechat_home="$(tenant_weechat_home "$name")"
   env_dir="$(tenant_env_dir "$name")"
+  stop_helper="$(tenant_lw_root "$name")/ic/scripts/lunarwing-weechat-stop.sh"
   cat >"$out_dir/lunarwing-weechat-${name}.service" <<EOF
 [Unit]
 Description=WeeChat IRC client ($name)
@@ -4991,7 +4996,8 @@ After=network.target
 [Service]
 Type=forking
 ExecStart=$(command -v tmux) -L weechat-${name} new-session -d -s weechat '$(command -v weechat) --dir ${weechat_home}'
-ExecStop=$(command -v tmux) -L weechat-${name} kill-session -t weechat
+ExecStop=$stop_helper --weechat-home ${weechat_home} --tmux-socket weechat-${name} --session weechat
+TimeoutStopSec=30
 EnvironmentFile=$env_dir/weechat.env
 Restart=on-failure
 RestartSec=5
@@ -5301,6 +5307,8 @@ _render_weechat_openrc_unit() {  # <tenant> <out_file>
   env_dir="$(tenant_env_dir "$name")"
   run_dir="$(tenant_run_dir "$name")"
   log_dir="$(tenant_log_dir "$name")"
+  local stop_helper
+  stop_helper="$(tenant_lw_root "$name")/ic/scripts/lunarwing-weechat-stop.sh"
   cat >"$out_file" <<INITEOF
 #!/sbin/openrc-run
 
@@ -5319,6 +5327,7 @@ description="WeeChat IRC client ($name)"
 : "\${weechat_openrc_env_exec:=$OPENRC_ENV_EXEC}"
 : "\${weechat_command:=$(command -v tmux)}"
 : "\${weechat_binary:=$(command -v weechat)}"
+: "\${weechat_stop_helper:=$stop_helper}"
 
 command="\${weechat_openrc_env_exec}"
 command_args="--env-file \${weechat_env_file} -- \${weechat_command} -L weechat-${name} new-session -d -s weechat '\${weechat_binary} --dir \${weechat_home}'"
@@ -5345,7 +5354,17 @@ start() {
 
 stop() {
     ebegin "Stopping WeeChat ($name)"
-    su -s /bin/sh "\${weechat_user}" -c "$(command -v tmux) -L weechat-${name} kill-session -t weechat 2>/dev/null" || true
+    # Graceful: /upgrade -quit via FIFO saves buffers before exit; falls back
+    # to tmux kill-session if the FIFO is unavailable or times out.
+    if [ -x "\${weechat_stop_helper}" ]; then
+        "\${weechat_stop_helper}" \\
+            --weechat-home "\${weechat_home}" \\
+            --tmux-socket weechat-${name} \\
+            --session weechat \\
+            --timeout 20 || true
+    else
+        su -s /bin/sh "\${weechat_user}" -c "$(command -v tmux) -L weechat-${name} kill-session -t weechat 2>/dev/null" || true
+    fi
     eend 0
 }
 INITEOF
