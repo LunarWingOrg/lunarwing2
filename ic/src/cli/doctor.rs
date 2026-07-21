@@ -481,41 +481,123 @@ fn check_gateway_config(settings: &Settings) -> CheckResult {
 // ── MCP servers ─────────────────────────────────────────────
 
 async fn check_mcp_config() -> CheckResult {
-    match crate::tools::mcp::config::load_mcp_servers().await {
-        Ok(file) => {
-            let servers: Vec<_> = file.enabled_servers().collect();
-            if servers.is_empty() {
-                return CheckResult::Skip("no MCP servers configured".into());
-            }
-
-            let mut invalid = Vec::new();
-            for server in &servers {
-                if let Err(e) = server.validate() {
-                    invalid.push(format!("{}: {}", server.name, e));
-                }
-            }
-
-            if invalid.is_empty() {
-                CheckResult::Pass(format!("{} server(s) configured, all valid", servers.len()))
-            } else {
-                CheckResult::Fail(format!(
-                    "{} server(s), {} invalid: {}",
-                    servers.len(),
-                    invalid.len(),
-                    invalid.join("; ")
-                ))
-            }
-        }
+    let file = match crate::tools::mcp::config::load_mcp_servers().await {
+        Ok(f) => f,
         Err(e) => {
-            // Distinguish no config from corrupted config
             let msg = e.to_string();
             if msg.contains("not found") || msg.contains("No such file") {
-                CheckResult::Skip("no MCP config file".into())
-            } else {
-                CheckResult::Fail(format!("config error: {e}"))
+                return CheckResult::Skip("no MCP config file".into());
+            }
+            return CheckResult::Fail(format!("config error: {e}"));
+        }
+    };
+
+    let servers = &file.servers;
+    if servers.is_empty() {
+        return CheckResult::Skip("no MCP servers configured".into());
+    }
+
+    let mut details: Vec<String> = Vec::with_capacity(servers.len());
+    let mut invalid = 0u32;
+    let mut missing_enabled = 0u32;
+
+    for server in servers {
+        let pre = preflight_mcp_server(server);
+        if pre.invalid {
+            invalid += 1;
+        } else if pre.missing && server.enabled {
+            missing_enabled += 1;
+        }
+        details.push(pre.detail);
+    }
+
+    if invalid > 0 || missing_enabled > 0 {
+        CheckResult::Fail(format!(
+            "{} server(s); {} invalid, {} enabled missing command: {}",
+            servers.len(),
+            invalid,
+            missing_enabled,
+            details.join("; ")
+        ))
+    } else {
+        CheckResult::Pass(format!(
+            "{} server(s) configured: {}",
+            servers.len(),
+            details.join("; ")
+        ))
+    }
+}
+
+struct McpPreflight {
+    detail: String,
+    invalid: bool,
+    missing: bool,
+}
+
+fn preflight_mcp_server(
+    server: &crate::tools::mcp::config::McpServerConfig,
+) -> McpPreflight {
+    use crate::tools::mcp::config::EffectiveTransport;
+
+    let transport = match server.effective_transport() {
+        EffectiveTransport::Http => "http",
+        EffectiveTransport::Stdio { .. } => "stdio",
+        EffectiveTransport::Unix { .. } => "unix",
+    };
+    let state = if server.enabled { "enabled" } else { "disabled" };
+    let mut detail = format!("{} [{} {}]", server.name, transport, state);
+    let mut invalid = false;
+    let mut missing = false;
+
+    if let Err(e) = server.validate() {
+        invalid = true;
+        detail.push_str(&format!(" — invalid: {e}"));
+        return McpPreflight { detail, invalid, missing };
+    }
+
+    if let EffectiveTransport::Stdio { command, .. } = server.effective_transport() {
+        match resolve_command_in_path(command) {
+            Some(path) => detail.push_str(&format!(" — resolves to {}", path.display())),
+            None => {
+                missing = true;
+                detail.push_str(&format!(" — command '{command}' not found in PATH"));
             }
         }
     }
+
+    McpPreflight { detail, invalid, missing }
+}
+
+fn resolve_command_in_path(command: &str) -> Option<PathBuf> {
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        let path = PathBuf::from(command);
+        return if is_executable(&path) { Some(path) } else { None };
+    }
+    let path_env = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_env) {
+        let candidate = dir.join(command);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if !path.exists() {
+        return false;
+    }
+    match std::fs::metadata(path) {
+        Ok(md) => md.is_file() && (md.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &std::path::Path) -> bool {
+    path.exists()
 }
 
 // ── Skills ──────────────────────────────────────────────────
@@ -887,6 +969,61 @@ mod tests {
                 format_result(&other)
             ),
         }
+    }
+
+    #[test]
+    fn resolve_command_in_path_finds_sh() {
+        // sh is present on every POSIX system; resolve by bare name.
+        let resolved = resolve_command_in_path("sh");
+        let Some(path) = resolved else {
+            // On exotic test runners without sh, don't fail — just report.
+            eprintln!("note: 'sh' not resolvable in this environment");
+            return;
+        };
+        assert!(path.is_absolute(), "resolved sh should be absolute: {}", path.display());
+    }
+
+    #[test]
+    fn resolve_command_in_path_returns_none_for_nonexistent() {
+        let resolved = resolve_command_in_path("__lunarwing_definitely_missing_bin__");
+        assert!(
+            resolved.is_none(),
+            "expected None for nonexistent command, got {:?}",
+            resolved
+        );
+    }
+
+    #[test]
+    fn preflight_mcp_server_http_enabled_passes_with_transport_state() {
+        use crate::tools::mcp::config::McpServerConfig;
+        let server = McpServerConfig::new("demo", "https://example.invalid/mcp");
+        let pf = preflight_mcp_server(&server);
+        assert!(!pf.invalid, "expected valid http server, detail: {}", pf.detail);
+        assert!(
+            pf.detail.contains("demo") && pf.detail.contains("http") && pf.detail.contains("enabled"),
+            "expected transport+state in detail, got: {}",
+            pf.detail
+        );
+    }
+
+    #[test]
+    fn preflight_mcp_server_stdio_disabled_marks_missing_as_not_counted() {
+        use crate::tools::mcp::config::McpServerConfig;
+        let mut server = McpServerConfig::new_stdio(
+            "ghost",
+            "__lunarwing_missing_stdio_cmd__",
+            vec![],
+            std::collections::HashMap::new(),
+        );
+        server.enabled = false;
+        let pf = preflight_mcp_server(&server);
+        assert!(!pf.invalid, "disabled stdio with missing cmd is still valid config");
+        assert!(pf.missing, "disabled stdio should still flag missing command");
+        assert!(
+            pf.detail.contains("disabled"),
+            "expected 'disabled' in detail, got: {}",
+            pf.detail
+        );
     }
 
     fn format_result(r: &CheckResult) -> String {
