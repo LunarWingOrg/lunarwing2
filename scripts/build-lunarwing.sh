@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
 # ============================================================
-# build-lunarwing.sh — LunarWing native build script for a Pi 5
+# build-lunarwing.sh — LunarWing native build script
 # ============================================================
 #
-# Builds the LunarWing (ic) crate natively on aarch64.
-# Designed for Raspberry Pi 5 or similar low-resource ARM systems.
+# Builds the LunarWing (ic) crate natively. Auto-detects
+# architecture and optimizes defaults accordingly:
+#
+#   aarch64  → low jobs, strict memory checking (Pi 5, etc.)
+#   x86_64   → speed optimized, assumes ≥8GB free RAM
 #
 # Usage:
 #   ./scripts/build-lunarwing.sh [OPTIONS]
 #
 # Options:
 #   -c, --clean       Run cargo clean before building
-#   -j, --jobs N      Number of parallel jobs (default: 2)
+#   -j, --jobs N      Number of parallel jobs (auto-detected by default)
 #   -t, --target DIR  Override CARGO_TARGET_DIR
 #   -r, --repo DIR    Override repo root path
-#   --profile MODE    Build profile: release (default) or debug   PRO TIP DONT USE DEBUG LOL
-#   --wasm            Accepted for compatibility; supported WASM artifacts build elsewhere
+#   --profile MODE    Build profile: release (default) or debug
+#   --wasm            Accepted for compatibility; WASM artifacts build elsewhere
 #   --no-kill         Don't kill stale cargo/rustc processes
+#   --no-locks        Don't clear stale lock files
 #   -v, --verbose     Show cargo output in real-time
 #   -h, --help        Show this help message
 #
@@ -26,10 +30,11 @@
 #   BUILD_JOBS        Number of parallel jobs
 #
 # Examples:
-#   ./scripts/build-lunarwing.sh                    # Default: release, -j2
+#   ./scripts/build-lunarwing.sh                    # Auto-detect arch, build
 #   ./scripts/build-lunarwing.sh -c                 # Clean + build
-#   ./scripts/build-lunarwing.sh -j 4 --profile debug  # Debug build, 4 jobs
-#   ./scripts/build-lunarwing.sh --wasm             # Also build WASM channels
+#   ./scripts/build-lunarwing.sh -j 8               # Force 8 jobs
+#   ./scripts/build-lunarwing.sh --profile debug    # Debug build
+#   BUILD_JOBS=4 ./scripts/build-lunarwing.sh       # Env override
 
 set -euo pipefail
 
@@ -40,12 +45,49 @@ REPO_ROOT="${LUNARWING_REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 IC_DIR="$REPO_ROOT/ic"
 TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cargo-target}"
 WASM_TARGET_DIR="${TARGET_DIR}-wasm"
-JOBS="${BUILD_JOBS:-1}"
 PROFILE="release"
 DO_CLEAN=false
 DO_WASM=false
 DO_KILL=true
+DO_LOCKS=true
 VERBOSE=false
+
+# ── Architecture detection ─────────────────────────────────
+
+ARCH="$(uname -m)"
+NPROC="$(nproc 2>/dev/null || echo 2)"
+
+case "$ARCH" in
+    aarch64|arm64)
+        ARCH_FAMILY="arm"
+        # ARM: conservative defaults. Pi 5 has 4-8GB RAM.
+        # -j2 is the sweet spot; -j1 for ≤4GB systems.
+        DEFAULT_JOBS=2
+        MEM_WARN_MB=6144        # Warn if <6GB free
+        MEM_MIN_JOBS2_MB=4096   # If <4GB free, force -j1
+        MEM_HARD_MIN_MB=2048    # Refuse to build with <2GB free
+        ;;
+    x86_64|amd64)
+        ARCH_FAMILY="x86"
+        # x86: optimize for speed. Assume ≥8GB free RAM.
+        # Use all cores — memory checks will throttle if RAM is actually low.
+        DEFAULT_JOBS=$NPROC
+        [ "$DEFAULT_JOBS" -lt 2 ] && DEFAULT_JOBS=2
+        MEM_WARN_MB=8192        # Warn if <8GB free (below assumed baseline)
+        MEM_MIN_JOBS2_MB=4096   # If <4GB free, throttle to -j2
+        MEM_HARD_MIN_MB=4096    # Refuse to build with <4GB free
+        ;;
+    *)
+        log_warn "Unknown architecture '$ARCH' — using conservative defaults"
+        ARCH_FAMILY="unknown"
+        DEFAULT_JOBS=1
+        MEM_WARN_MB=4096
+        MEM_MIN_JOBS2_MB=2048
+        MEM_HARD_MIN_MB=2048
+        ;;
+esac
+
+JOBS="${BUILD_JOBS:-$DEFAULT_JOBS}"
 
 # ── Colors ─────────────────────────────────────────────────
 
@@ -101,15 +143,47 @@ check_target_dir() {
     fi
     log_ok "Target: $TARGET_DIR"
 
-    # Memory check — Pi 5 with 4GB RAM struggles with -j2 release builds
+    # ── Memory check (based on AVAILABLE memory, not total) ──
     local mem_total_kb
-    mem_total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null)
+    mem_total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
     local mem_total_mb=$((mem_total_kb / 1024))
-    if [ "$mem_total_mb" -lt 6144 ] && [ "$JOBS" -gt 1 ]; then
-        log_warn "System has ${mem_total_mb}MB RAM with -j${JOBS} — OOM kills are likely"
-        log_warn "Consider: -j 1  (or add more swap)"
+    local mem_avail_kb
+    mem_avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local mem_avail_mb=$((mem_avail_kb / 1024))
+
+    log_ok "Memory: ${mem_total_mb}MB total, ${mem_avail_mb}MB available"
+
+    # Hard minimum — refuse to build (based on available RAM)
+    if [ "$mem_avail_mb" -lt "$MEM_HARD_MIN_MB" ]; then
+        log_error "Only ${mem_avail_mb}MB RAM available — minimum ${MEM_HARD_MIN_MB}MB required"
+        log_error "Free up memory or use a machine with more RAM"
+        exit 1
     fi
-    log_ok "Memory: ${mem_total_mb}MB total, $(awk '/MemAvailable/ {printf "%.0f", $2/1024}' /proc/meminfo)MB available"
+
+    # Architecture-specific job adjustment (based on available RAM)
+    case "$ARCH_FAMILY" in
+        arm)
+            # ARM: strict memory enforcement
+            if [ "$mem_avail_mb" -lt "$MEM_MIN_JOBS2_MB" ] && [ "$JOBS" -gt 1 ]; then
+                log_warn "Only ${mem_avail_mb}MB RAM available — forcing -j1 to prevent OOM"
+                JOBS=1
+            elif [ "$mem_avail_mb" -lt "$MEM_WARN_MB" ]; then
+                log_warn "Low available memory (${mem_avail_mb}MB) — OOM kills possible with -j${JOBS}"
+                log_warn "Consider: -j 1  (or add swap)"
+            fi
+            ;;
+        x86)
+            # x86: assume ≥8GB free. Only intervene if genuinely low.
+            if [ "$mem_avail_mb" -lt "$MEM_WARN_MB" ]; then
+                log_warn "Only ${mem_avail_mb}MB free — expected ≥${MEM_WARN_MB}MB for optimal x86 builds"
+            fi
+            # Only throttle if we're below the hard floor for multi-job
+            if [ "$mem_avail_mb" -lt "$MEM_MIN_JOBS2_MB" ] && [ "$JOBS" -gt 2 ]; then
+                log_warn "Low available RAM (${mem_avail_mb}MB) — reducing jobs from $JOBS to 2"
+                JOBS=2
+            fi
+            ;;
+    esac
 }
 
 kill_stale_processes() {
@@ -118,15 +192,15 @@ kill_stale_processes() {
     fi
 
     local found=false
-    if pgrep -f "cargo build.*--release" &>/dev/null || \
-       pgrep -f "cargo build.*wasm32" &>/dev/null; then
+    if pgrep -f "cargo build" &>/dev/null || \
+       pgrep -f "rustc" &>/dev/null; then
         found=true
     fi
 
     if [ "$found" = true ]; then
         log_info "Killing stale cargo/rustc processes..."
         pkill -9 -f "cargo build" 2>/dev/null || true
-        pkill -9 -f "rustc.*lunarwing" 2>/dev/null || true
+        pkill -9 -f "rustc" 2>/dev/null || true
         sleep 2
 
         # Verify they're dead
@@ -143,6 +217,10 @@ kill_stale_processes() {
 }
 
 clear_locks() {
+    if [ "$DO_LOCKS" = false ]; then
+        return
+    fi
+
     local lock_count=0
     while IFS= read -r lockfile; do
         rm -f "$lockfile"
@@ -184,16 +262,31 @@ run_build() {
         profile_flag="--release"
     fi
 
+    # ── x86 speed optimizations ────────────────────────────
+    if [ "$ARCH_FAMILY" = "x86" ]; then
+        # Use sccache if available (faster incremental builds)
+        if command -v sccache &>/dev/null; then
+            export RUSTC_WRAPPER="sccache"
+            log_ok "sccache enabled for incremental builds"
+        else
+            log_warn "sccache not found — incremental rebuilds will be slower"
+            log_warn "Install:  cargo install sccache"
+            log_warn "      or:  apt install sccache  /  brew install sccache"
+            log_warn "Then re-run this script to auto-enable caching"
+        fi
+    fi
+
     local log_file="/tmp/cargo_build_$(date +%Y%m%d_%H%M%S).log"
 
     echo ""
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║         LunarWing Build — $profile_name profile           ║${NC}"
+    echo -e "${BOLD}${CYAN}║         LunarWing Build — $profile_name profile"
     echo -e "${BOLD}${CYAN}╠══════════════════════════════════════════════════╣${NC}"
-    echo -e "${BOLD}${CYAN}║${NC}  Jobs:     ${BOLD}$JOBS${NC}                                  ${BOLD}${CYAN}║${NC}"
-    echo -e "${BOLD}${CYAN}║${NC}  Target:   ${BOLD}$TARGET_DIR${NC}  ${BOLD}${CYAN}║${NC}"
-    echo -e "${BOLD}${CYAN}║${NC}  Repo:     ${BOLD}$REPO_ROOT${NC}  ${BOLD}${CYAN}║${NC}"
-    echo -e "${BOLD}${CYAN}║${NC}  Log:      ${BOLD}$log_file${NC}  ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}  Arch:     ${BOLD}$ARCH ($ARCH_FAMILY)${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}  Jobs:     ${BOLD}$JOBS${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}  Target:   ${BOLD}$TARGET_DIR${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}  Repo:     ${BOLD}$REPO_ROOT${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}  Log:      ${BOLD}$log_file${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════╝${NC}"
     echo ""
 
@@ -217,6 +310,7 @@ run_build() {
         exit_code=$?
         set -e
     fi
+
     local end_time
     end_time=$(date +%s)
     local elapsed=$((end_time - start_time))
@@ -231,6 +325,7 @@ run_build() {
         target_size=$(du -sh "$TARGET_DIR" 2>/dev/null | awk '{print $1}')
 
         echo -e "${GREEN}${BOLD}✓ Build succeeded!${NC}"
+        echo -e "  Arch:            ${BOLD}$ARCH${NC}"
         echo -e "  Crates compiled: ${BOLD}$crate_count${NC}"
         echo -e "  Time:            ${BOLD}${minutes}m ${seconds}s${NC}"
         echo -e "  Target size:     ${BOLD}$target_size${NC}"
@@ -240,15 +335,17 @@ run_build() {
         local binary
         binary=$(find "$TARGET_DIR/$PROFILE" -maxdepth 1 -type f -executable -name "lunarwing*" 2>/dev/null | head -1)
         if [ -n "$binary" ]; then
-            echo -e "  Binary:          ${BOLD}$binary${NC}"
+            local bin_size
+            bin_size=$(du -h "$binary" 2>/dev/null | awk '{print $1}')
+            echo -e "  Binary:          ${BOLD}$binary${NC} (${bin_size})"
         fi
     else
         echo -e "${RED}${BOLD}✗ Build failed!${NC}"
         echo -e "  Exit code: ${BOLD}$exit_code${NC}"
         echo -e "  Log:       ${BOLD}$log_file${NC}"
         echo ""
-        echo -e "${YELLOW}Last 20 lines of build output:${NC}"
-        tail -20 "$log_file" 2>/dev/null
+        echo -e "${YELLOW}Last 30 lines of build output:${NC}"
+        tail -30 "$log_file" 2>/dev/null
         exit "$exit_code"
     fi
 }
@@ -272,6 +369,7 @@ while [[ $# -gt 0 ]]; do
         --profile)     PROFILE="$2"; shift 2 ;;
         --wasm)        DO_WASM=true; shift ;;
         --no-kill)     DO_KILL=false; shift ;;
+        --no-locks)    DO_LOCKS=false; shift ;;
         -v|--verbose)  VERBOSE=true; shift ;;
         -h|--help)     usage ;;
         *)
@@ -289,6 +387,7 @@ export CARGO_TARGET_DIR="$TARGET_DIR"
 echo ""
 echo -e "${BOLD}🦅 LunarWing Build Script${NC}"
 echo -e "   $(date '+%Y-%m-%d %H:%M:%S')"
+echo -e "   Arch: ${BOLD}$ARCH${NC} ($ARCH_FAMILY profile)"
 echo ""
 
 check_cargo
