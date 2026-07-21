@@ -51,7 +51,7 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
     - The cargo update (patch/minor bumps) recommendation may or may not have been run.
     Verdict: The deferred crates (rand, base64, tower-http) are intentionally held back for 2.0.0+. The patch-level cargo update should be verified. Genuinely open — deferred to 2.0.0+.
     </details>
-18. [ ] Kestrel created a UNIFIED build script to optimize for speed. Take a look at this. You can find it at: scripts/build-lunarwing.sh - let's continue to work on this and make suggestions and ensure it works properly on your machine first to create nice full builds of LunarWing safely across machines with all kinds of resources... ALSO: We can use (`nproc × 0.75`) instead of nproc. That seems safer to me. According to kestrel:
+18. [ ] Kestrel created a UNIFIED build script to optimize for speed. Take a look at this. You can find it at: scripts/build-lunarwing.sh - let's continue to work on this and make suggestions and ensure it works properly on your machine first to create nice full builds of LunarWing safely across machines with all kinds of resources... ALSO: We can use (`nproc × 0.75`) instead of nproc. That seems safer to me. According to kestrel (see section below):
 <details>
 <summary><b>Recommendation</b></summary>
 kestrel │ Two ways:
