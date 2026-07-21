@@ -20,7 +20,7 @@
 11. [x] CHPAR-010 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 12. [x] CHPAR-011 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 13. [x] CHPAR-012 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
-14. [ ] refactor mt admin idea. write up a doc on how we can break mt admin setup monolithic megascript (8000 lines of bash rn) into AT LEAST FOUR SEPERATE PARTS. put it in docs/proposals
+14. [x] refactor mt admin idea. write up a doc on how we can break mt admin setup monolithic megascript (8000 lines of bash rn) into AT LEAST FOUR SEPERATE PARTS. put it in docs/proposals
 15. [ ] kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. you should use THIS branch for reference (plan is included on this branch too): kawarimi-hermes-adapter-1
 16. [ ] figure out a way for weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued
 17. [ ] Inspect status of cargo crates and create documented report of any crates that might still need to be updated. Verify if the info dump below is still correct, then write up a document in docs/ops detailing the status: is each piece verifiable? what outstanding issues remain? which points have already been addressed?
