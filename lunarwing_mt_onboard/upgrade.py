@@ -22,6 +22,7 @@ from lunarwing_mt_onboard.config import TenantConfig
 from lunarwing_mt_onboard.provisioner import (
     PhaseResult,
     ProvisionResult,
+    ensure_mt_admin,
     run_command,
 )
 
@@ -150,6 +151,66 @@ class UpgradeConfig:
         return cls.from_dict(data)
 
 
+@dataclass
+class TenantUpgradeConfig:
+    """Current init-agnostic ``mt-admin upgrade-tenant`` parameters."""
+
+    tenant: str = ""
+    target: str = ""
+    source_repo: str = ""
+    no_backup: bool = False
+    skip_render: bool = False
+    apply: bool = False
+
+    def validate(self) -> str | None:
+        error = TenantConfig.validate_name(self.tenant)
+        if error:
+            return error
+        if not self.target:
+            return "target ref is required"
+        if self.target.startswith("-") or any(char.isspace() for char in self.target):
+            return "target ref must not start with '-' or contain whitespace"
+        return None
+
+    def to_dict(self) -> dict[str, UpgradeValue]:
+        return {
+            "tenant": self.tenant,
+            "target": self.target,
+            "source_repo": self.source_repo,
+            "no_backup": self.no_backup,
+            "skip_render": self.skip_render,
+            "apply": self.apply,
+        }
+
+    def to_json(self, path: str | Path) -> None:
+        p = Path(path)
+        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as config_file:
+            _ = config_file.write(json.dumps(self.to_dict(), indent=2) + "\n")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, UpgradeValue]) -> TenantUpgradeConfig:
+        return cls(
+            tenant=_str_value(data.get("tenant", "")),
+            target=_str_value(data.get("target", "")),
+            source_repo=_str_value(data.get("source_repo", "")),
+            no_backup=_bool_value(data.get("no_backup", False)),
+            skip_render=_bool_value(data.get("skip_render", False)),
+            apply=_bool_value(data.get("apply", False)),
+        )
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> TenantUpgradeConfig:
+        raw: UpgradeJson = json.loads(Path(path).read_text())
+        if not isinstance(raw, dict):
+            raise UpgradeConfigFormatError("upgrade config JSON must be an object")
+        data: dict[str, UpgradeValue] = {}
+        for key, value in raw.items():
+            if isinstance(key, str) and isinstance(value, (str, bool)):
+                data[key] = value
+        return cls.from_dict(data)
+
+
 def _str_value(value: UpgradeValue) -> str:
     return value if isinstance(value, str) else ""
 
@@ -212,6 +273,19 @@ def build_upgrade_args(cfg: UpgradeConfig) -> list[str]:
         args.append("--force")
     if cfg.auto_yes:
         args.append("--yes")
+    return args
+
+
+def build_mt_admin_upgrade_args(cfg: TenantUpgradeConfig) -> list[str]:
+    """Construct argv for the current init-agnostic tenant upgrade path."""
+    script = ensure_mt_admin()
+    args = [script, "upgrade-tenant", cfg.tenant, "--target", cfg.target]
+    if cfg.source_repo:
+        args.extend(["--source-repo", cfg.source_repo])
+    if cfg.no_backup:
+        args.append("--no-backup")
+    if cfg.skip_render:
+        args.append("--skip-render")
     return args
 
 

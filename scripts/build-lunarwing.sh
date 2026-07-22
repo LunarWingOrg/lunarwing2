@@ -1,424 +1,634 @@
 #!/usr/bin/env bash
-# ============================================================
-# build-lunarwing.sh — LunarWing native build script
-# ============================================================
-#
-# Created by Kestrel
-#
-# Powered by pure Griffon Energy
-#
-# @ C KestrelSoft Enterprises LLC
-#
-# We know speed...TM
-#
-# Builds the LunarWing (ic) crate natively. Auto-detects
-# architecture and optimizes defaults accordingly:
-#
-#   aarch64  → low jobs, strict memory checking (Pi 5, etc.)
-#   x86_64   → speed optimized, assumes ≥8GB free RAM
-#
-# Usage:
-#   ./scripts/build-lunarwing.sh [OPTIONS]
-#
-# Options:
-#   -c, --clean       Run cargo clean before building
-#   -j, --jobs N      Number of parallel jobs (auto-detected by default)
-#   -t, --target DIR  Override CARGO_TARGET_DIR
-#   -r, --repo DIR    Override repo root path
-#   --profile MODE    Build profile: release (default) or debug
-#   --wasm            Accepted for compatibility; WASM artifacts build elsewhere
-#   --no-kill         Don't kill stale cargo/rustc processes
-#   --no-locks        Don't clear stale lock files
-#   -v, --verbose     Show cargo output in real-time
-#   -h, --help        Show this help message
-#
-# Environment variables (override flags):
-#   CARGO_TARGET_DIR  Build artifacts directory
-#   LUNARWING_REPO   Repo root path
-#   BUILD_JOBS        Number of parallel jobs
-#
-# Examples:
-#   ./scripts/build-lunarwing.sh                    # Auto-detect arch, build
-#   ./scripts/build-lunarwing.sh -c                 # Clean + build
-#   ./scripts/build-lunarwing.sh -j 8               # Force 8 jobs
-#   ./scripts/build-lunarwing.sh --profile debug    # Debug build
-#   BUILD_JOBS=4 ./scripts/build-lunarwing.sh       # Env override
+# Unified native LunarWing build helper for Linux aarch64 and x86_64 hosts.
 
 set -euo pipefail
 
-# ── Defaults ───────────────────────────────────────────────
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INVOCATION_DIR="$PWD"
 REPO_ROOT="${LUNARWING_REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-IC_DIR="$REPO_ROOT/ic"
 TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cargo-target}"
-WASM_TARGET_DIR="${TARGET_DIR}-wasm"
+BUILD_LOG_DIR="${BUILD_LOG_DIR:-${TMPDIR:-/tmp}}"
+MEMORY_PER_JOB_MB="${BUILD_MEMORY_PER_JOB_MB:-1536}"
+
+IC_DIR=""
 PROFILE="release"
+JOBS="${BUILD_JOBS:-}"
+JOBS_SOURCE="auto"
+[[ -n "$JOBS" ]] && JOBS_SOURCE="BUILD_JOBS"
+
 DO_CLEAN=false
 DO_WASM=false
-DO_KILL=true
-DO_LOCKS=true
+DRY_RUN=false
 VERBOSE=false
 
-# ── Architecture detection ─────────────────────────────────
+OS=""
+ARCH=""
+CPU_COUNT=1
+CPU_JOB_LIMIT=1
+MEM_TOTAL_MB=0
+MEM_AVAILABLE_MB=0
+MEMORY_KNOWN=false
+MEMORY_JOB_LIMIT=1
+RECOMMENDED_JOBS=1
+CGROUP_MEMORY_DIR=""
+CGROUP_CPU_DIR=""
+CGROUP_VERSION=""
+CGROUP_MEMORY_ROOT=""
+CGROUP_CPU_ROOT=""
+BUILD_LOCK_FD=""
+BUILD_LOCK_FILE=""
 
-ARCH="$(uname -m)"
-NPROC="$(nproc 2>/dev/null || echo 2)"
+log_info() { printf '[INFO]  %s\n' "$*"; }
+log_ok() { printf '[OK]    %s\n' "$*"; }
+log_warn() { printf '[WARN]  %s\n' "$*" >&2; }
+log_error() { printf '[ERROR] %s\n' "$*" >&2; }
 
-case "$ARCH" in
-    aarch64|arm64)
-        ARCH_FAMILY="arm"
-        # ARM: conservative defaults. Pi 5 has 4-8GB RAM.
-        # -j2 is the sweet spot; -j1 for ≤4GB systems.
-        DEFAULT_JOBS=2
-        MEM_WARN_MB=6144        # Warn if <6GB free
-        MEM_MIN_JOBS2_MB=4096   # If <4GB free, force -j1
-        MEM_HARD_MIN_MB=2048    # Refuse to build with <2GB free
-        ;;
-    x86_64|amd64)
-        ARCH_FAMILY="x86"
-        # x86: optimize for speed. Assume ≥8GB free RAM.
-        # Use all cores — memory checks will throttle if RAM is actually low.
-        DEFAULT_JOBS=$NPROC
-        [ "$DEFAULT_JOBS" -lt 2 ] && DEFAULT_JOBS=2
-        MEM_WARN_MB=8192        # Warn if <8GB free (below assumed baseline)
-        MEM_MIN_JOBS2_MB=4096   # If <4GB free, throttle to -j2
-        MEM_HARD_MIN_MB=4096    # Refuse to build with <4GB free
-        ;;
-    *)
-        log_warn "Unknown architecture '$ARCH' — using conservative defaults"
-        ARCH_FAMILY="unknown"
-        DEFAULT_JOBS=1
-        MEM_WARN_MB=4096
-        MEM_MIN_JOBS2_MB=2048
-        MEM_HARD_MIN_MB=2048
-        ;;
-esac
-
-JOBS="${BUILD_JOBS:-$DEFAULT_JOBS}"
-
-# ── Colors ─────────────────────────────────────────────────
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
-
-# ── Helpers ────────────────────────────────────────────────
-
-log_info()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
-log_ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
-
-usage() {
-    sed -n '2,/^# Examples:/p' "$0" | sed 's/^# *//' | sed 's/^#//'
-    exit 0
+die() {
+    local message="$1"
+    local exit_code="${2:-1}"
+    log_error "$message"
+    exit "$exit_code"
 }
 
-check_cargo() {
-    if ! command -v cargo &>/dev/null; then
-        if [ -x "$HOME/.cargo/bin/cargo" ]; then
-            export PATH="$HOME/.cargo/bin:$PATH"
-        else
-            log_error "cargo not found. Run install_rust_debian.sh first."
-            exit 1
+usage() {
+    cat <<'EOF'
+build-lunarwing.sh - build LunarWing natively on Linux
+
+Usage:
+  ./scripts/build-lunarwing.sh [OPTIONS]
+
+Options:
+  -c, --clean         Run cargo clean before building
+  -j, --jobs N        Override auto-detected parallel jobs
+  -t, --target DIR    Override CARGO_TARGET_DIR
+  -r, --repo DIR      Override the repository root
+      --profile MODE  Build profile: release (default) or debug
+      --wasm          Compatibility no-op; WASM artifacts build elsewhere
+      --dry-run       Print the validated build command without running it
+  -v, --verbose       Stream Cargo output while retaining the build log
+  -h, --help          Show this help message
+
+Environment defaults (command-line flags take precedence):
+  CARGO_TARGET_DIR        Build artifact directory
+  LUNARWING_REPO          Repository root
+  BUILD_JOBS              Positive integer job override
+  BUILD_MEMORY_PER_JOB_MB Memory reserved per automatic job (default: 1536)
+  BUILD_LOG_DIR           Build log directory (default: TMPDIR or /tmp)
+
+Automatic jobs are the smaller of:
+  - 75% of effective CPUs, with a minimum of one
+  - available memory divided by BUILD_MEMORY_PER_JOB_MB
+
+Automatic selection stops if memory cannot support one job. An explicit -j
+override is allowed with a warning. Real builds take a non-blocking sidecar
+lock for the canonical target directory; --clean requires flock.
+
+Examples:
+  ./scripts/build-lunarwing.sh
+  ./scripts/build-lunarwing.sh --clean
+  ./scripts/build-lunarwing.sh -j 4
+  BUILD_JOBS=2 ./scripts/build-lunarwing.sh --profile release
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--clean)
+                DO_CLEAN=true
+                shift
+                ;;
+            -j|--jobs)
+                [[ $# -ge 2 ]] || die "$1 requires a value" 2
+                JOBS="$2"
+                JOBS_SOURCE="command line"
+                shift 2
+                ;;
+            -t|--target)
+                [[ $# -ge 2 ]] || die "$1 requires a value" 2
+                TARGET_DIR="$2"
+                shift 2
+                ;;
+            -r|--repo)
+                [[ $# -ge 2 ]] || die "$1 requires a value" 2
+                REPO_ROOT="$2"
+                shift 2
+                ;;
+            --profile)
+                [[ $# -ge 2 ]] || die "$1 requires a value" 2
+                PROFILE="$2"
+                shift 2
+                ;;
+            --wasm)
+                DO_WASM=true
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                usage >&2
+                exit 2
+                ;;
+        esac
+    done
+}
+
+is_positive_integer() {
+    [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 > 0))
+}
+
+make_absolute() {
+    local path="$1"
+    if [[ "$path" == /* ]]; then
+        printf '%s\n' "$path"
+    else
+        printf '%s/%s\n' "$INVOCATION_DIR" "$path"
+    fi
+}
+
+validate_config() {
+    case "$PROFILE" in
+        release|debug) ;;
+        *) die "Invalid profile '$PROFILE'; expected release or debug" 2 ;;
+    esac
+
+    [[ -n "$REPO_ROOT" ]] || die "Repository path cannot be empty" 2
+    [[ -n "$TARGET_DIR" ]] || die "Target directory cannot be empty" 2
+    [[ -n "$BUILD_LOG_DIR" ]] || die "Build log directory cannot be empty" 2
+    is_positive_integer "$MEMORY_PER_JOB_MB" || \
+        die "BUILD_MEMORY_PER_JOB_MB must be a positive integer" 2
+    MEMORY_PER_JOB_MB=$((10#$MEMORY_PER_JOB_MB))
+
+    if [[ -n "$JOBS" ]]; then
+        is_positive_integer "$JOBS" || \
+            die "Build jobs must be a positive integer, got '$JOBS'" 2
+        JOBS=$((10#$JOBS))
+    fi
+
+    REPO_ROOT="$(make_absolute "$REPO_ROOT")"
+    TARGET_DIR="$(make_absolute "$TARGET_DIR")"
+    BUILD_LOG_DIR="$(make_absolute "$BUILD_LOG_DIR")"
+    command -v realpath >/dev/null 2>&1 || die "realpath is required to validate CARGO_TARGET_DIR"
+    TARGET_DIR="$(realpath -m -- "$TARGET_DIR")" || die "Unable to resolve target directory: $TARGET_DIR"
+    [[ "$TARGET_DIR" != "/" ]] || die "The filesystem root cannot be used as CARGO_TARGET_DIR" 2
+    IC_DIR="$REPO_ROOT/ic"
+}
+
+detect_platform() {
+    OS="$(uname -s 2>/dev/null || true)"
+    [[ "$OS" == "Linux" ]] || \
+        die "Unsupported operating system '${OS:-unknown}'; this script supports Linux only"
+
+    ARCH="$(uname -m 2>/dev/null || true)"
+    case "$ARCH" in
+        x86_64|amd64|aarch64|arm64) ;;
+        *) die "Unsupported Linux architecture '${ARCH:-unknown}'; expected aarch64 or x86_64" ;;
+    esac
+}
+
+detect_cgroup_paths() {
+    local relative_path=""
+    local candidate=""
+    local controller_root=""
+
+    CGROUP_MEMORY_DIR=""
+    CGROUP_CPU_DIR=""
+    CGROUP_VERSION=""
+    CGROUP_MEMORY_ROOT=""
+    CGROUP_CPU_ROOT=""
+
+    if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+        relative_path="$(awk -F: '$1 == "0" {print $3; exit}' /proc/self/cgroup 2>/dev/null || true)"
+        candidate="/sys/fs/cgroup${relative_path:-/}"
+        if [[ -d "$candidate" ]]; then
+            CGROUP_VERSION="2"
+            CGROUP_MEMORY_DIR="$candidate"
+            CGROUP_CPU_DIR="$candidate"
+            CGROUP_MEMORY_ROOT="/sys/fs/cgroup"
+            CGROUP_CPU_ROOT="/sys/fs/cgroup"
+        fi
+        return 0
+    fi
+
+    relative_path="$(awk -F: '$2 ~ /(^|,)memory(,|$)/ {print $3; exit}' /proc/self/cgroup 2>/dev/null || true)"
+    candidate="/sys/fs/cgroup/memory${relative_path:-/}"
+    if [[ -d "$candidate" ]]; then
+        CGROUP_VERSION="1"
+        CGROUP_MEMORY_DIR="$candidate"
+        CGROUP_MEMORY_ROOT="/sys/fs/cgroup/memory"
+    fi
+
+    relative_path="$(awk -F: '$2 ~ /(^|,)cpu(,|$)/ {print $3; exit}' /proc/self/cgroup 2>/dev/null || true)"
+    for controller_root in /sys/fs/cgroup/cpu /sys/fs/cgroup/cpu,cpuacct; do
+        candidate="$controller_root${relative_path:-/}"
+        if [[ -d "$candidate" ]]; then
+            CGROUP_VERSION="1"
+            CGROUP_CPU_DIR="$candidate"
+            CGROUP_CPU_ROOT="$controller_root"
+            break
+        fi
+    done
+}
+
+cgroup_cpu_count() {
+    local current_dir="$CGROUP_CPU_DIR"
+    local quota=""
+    local period=""
+    local quota_count=0
+    local minimum_count=""
+
+    [[ -n "$current_dir" && -n "$CGROUP_CPU_ROOT" ]] || return 0
+
+    while [[ "$current_dir" == "$CGROUP_CPU_ROOT" || "$current_dir" == "$CGROUP_CPU_ROOT/"* ]]; do
+        quota=""
+        period=""
+        if [[ "$CGROUP_VERSION" == "2" && -r "$current_dir/cpu.max" ]]; then
+            read -r quota period < "$current_dir/cpu.max" || true
+        elif [[ "$CGROUP_VERSION" == "1" \
+            && -r "$current_dir/cpu.cfs_quota_us" \
+            && -r "$current_dir/cpu.cfs_period_us" ]]; then
+            quota="$(<"$current_dir/cpu.cfs_quota_us")"
+            period="$(<"$current_dir/cpu.cfs_period_us")"
+        fi
+
+        if [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ ]] \
+            && ((quota > 0 && period > 0)); then
+            quota_count=$(((quota + period - 1) / period))
+            if [[ -z "$minimum_count" ]] || ((quota_count < minimum_count)); then
+                minimum_count="$quota_count"
+            fi
+        fi
+
+        [[ "$current_dir" == "$CGROUP_CPU_ROOT" ]] && break
+        current_dir="${current_dir%/*}"
+    done
+
+    if [[ -n "$minimum_count" ]]; then
+        printf '%s\n' "$minimum_count"
+    fi
+}
+
+cgroup_memory_available_mb() {
+    local current_dir="$CGROUP_MEMORY_DIR"
+    local limit_bytes=""
+    local current_bytes=""
+    local remaining_bytes=0
+    local minimum_bytes=""
+
+    [[ -n "$current_dir" && -n "$CGROUP_MEMORY_ROOT" ]] || return 0
+
+    while [[ "$current_dir" == "$CGROUP_MEMORY_ROOT" || "$current_dir" == "$CGROUP_MEMORY_ROOT/"* ]]; do
+        limit_bytes=""
+        current_bytes=""
+        if [[ "$CGROUP_VERSION" == "2" \
+            && -r "$current_dir/memory.max" \
+            && -r "$current_dir/memory.current" ]]; then
+            limit_bytes="$(<"$current_dir/memory.max")"
+            current_bytes="$(<"$current_dir/memory.current")"
+        elif [[ "$CGROUP_VERSION" == "1" \
+            && -r "$current_dir/memory.limit_in_bytes" \
+            && -r "$current_dir/memory.usage_in_bytes" ]]; then
+            limit_bytes="$(<"$current_dir/memory.limit_in_bytes")"
+            current_bytes="$(<"$current_dir/memory.usage_in_bytes")"
+        fi
+
+        if [[ "$limit_bytes" =~ ^[0-9]+$ && "$current_bytes" =~ ^[0-9]+$ ]]; then
+            remaining_bytes=0
+            if ((limit_bytes > current_bytes)); then
+                remaining_bytes=$((limit_bytes - current_bytes))
+            fi
+            if [[ -z "$minimum_bytes" ]] || ((remaining_bytes < minimum_bytes)); then
+                minimum_bytes="$remaining_bytes"
+            fi
+        fi
+
+        [[ "$current_dir" == "$CGROUP_MEMORY_ROOT" ]] && break
+        current_dir="${current_dir%/*}"
+    done
+
+    if [[ -n "$minimum_bytes" ]]; then
+        printf '%s\n' "$((minimum_bytes / 1024 / 1024))"
+    fi
+}
+
+detect_cpu_count() {
+    local detected=""
+    local quota_count=""
+
+    if command -v nproc >/dev/null 2>&1; then
+        detected="$(nproc 2>/dev/null || true)"
+    elif command -v getconf >/dev/null 2>&1; then
+        detected="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    fi
+
+    if ! is_positive_integer "${detected:-}"; then
+        log_warn "Unable to determine effective CPU count; using one job"
+        detected=1
+    fi
+    detected=$((10#$detected))
+
+    quota_count="$(cgroup_cpu_count)"
+    if is_positive_integer "${quota_count:-}" && ((quota_count < detected)); then
+        detected="$quota_count"
+    fi
+
+    CPU_COUNT="$detected"
+}
+
+detect_memory() {
+    local total_kb=""
+    local available_kb=""
+    local cgroup_available_mb=""
+
+    total_kb="$(awk '$1 == "MemTotal:" {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+    available_kb="$(awk '$1 == "MemAvailable:" {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+
+    if [[ "$total_kb" =~ ^[0-9]+$ ]]; then
+        MEM_TOTAL_MB=$((total_kb / 1024))
+    fi
+    if [[ "$available_kb" =~ ^[0-9]+$ ]]; then
+        MEM_AVAILABLE_MB=$((available_kb / 1024))
+        MEMORY_KNOWN=true
+    fi
+
+    cgroup_available_mb="$(cgroup_memory_available_mb)"
+    if [[ "$cgroup_available_mb" =~ ^[0-9]+$ ]]; then
+        if [[ "$MEMORY_KNOWN" == false ]] || ((cgroup_available_mb < MEM_AVAILABLE_MB)); then
+            MEM_AVAILABLE_MB="$cgroup_available_mb"
+            MEMORY_KNOWN=true
         fi
     fi
-    log_ok "cargo $(cargo --version | awk '{print $2}')"
-    log_ok "rustc $(rustc --version | awk '{print $2}')"
+
+    if [[ "$MEMORY_KNOWN" == false ]]; then
+        log_warn "Unable to determine available memory; automatic jobs will use CPU capacity only"
+    fi
+}
+
+calculate_recommended_jobs() {
+    CPU_JOB_LIMIT=$((CPU_COUNT * 3 / 4))
+    ((CPU_JOB_LIMIT > 0)) || CPU_JOB_LIMIT=1
+    RECOMMENDED_JOBS="$CPU_JOB_LIMIT"
+
+    if [[ "$MEMORY_KNOWN" == true ]]; then
+        MEMORY_JOB_LIMIT=$((MEM_AVAILABLE_MB / MEMORY_PER_JOB_MB))
+        if ((MEMORY_JOB_LIMIT < RECOMMENDED_JOBS)); then
+            RECOMMENDED_JOBS="$MEMORY_JOB_LIMIT"
+        fi
+    fi
+}
+
+select_jobs() {
+    calculate_recommended_jobs
+    if [[ -z "$JOBS" ]]; then
+        if ((RECOMMENDED_JOBS < 1)); then
+            die "Only ${MEM_AVAILABLE_MB}MB is available; automatic builds require at least ${MEMORY_PER_JOB_MB}MB. Free memory or explicitly override with -j 1"
+        fi
+        JOBS="$RECOMMENDED_JOBS"
+        JOBS_SOURCE="automatic"
+    elif ((RECOMMENDED_JOBS < 1)); then
+        log_warn "Only ${MEM_AVAILABLE_MB}MB is available, below the ${MEMORY_PER_JOB_MB}MB automatic per-job allowance; explicit -j$JOBS will be attempted"
+    elif ((JOBS > RECOMMENDED_JOBS)); then
+        log_warn "Requested -j$JOBS via $JOBS_SOURCE exceeds the safe automatic recommendation (-j$RECOMMENDED_JOBS)"
+    fi
+}
+
+check_toolchain() {
+    if ! command -v cargo >/dev/null 2>&1; then
+        if [[ -x "$HOME/.cargo/bin/cargo" ]]; then
+            export PATH="$HOME/.cargo/bin:$PATH"
+        else
+            die "cargo was not found in PATH"
+        fi
+    fi
+    command -v rustc >/dev/null 2>&1 || die "rustc was not found in PATH"
+
+    log_ok "$(cargo --version)"
+    log_ok "$(rustc --version)"
 }
 
 check_repo() {
-    if [ ! -f "$IC_DIR/Cargo.toml" ]; then
-        log_error "Cargo.toml not found at $IC_DIR/Cargo.toml"
-        log_error "Is LUNARWING_REPO set correctly? (current: $REPO_ROOT)"
-        exit 1
-    fi
+    [[ -f "$IC_DIR/Cargo.toml" ]] || \
+        die "Cargo.toml was not found at $IC_DIR/Cargo.toml"
+    [[ -f "$IC_DIR/Cargo.lock" ]] || \
+        die "Cargo.lock was not found at $IC_DIR/Cargo.lock; locked builds require it"
     log_ok "Repo: $REPO_ROOT"
 }
 
-check_target_dir() {
-    # Warn if target dir is on tmpfs (will run out of space)
-    local mount_point
-    mount_point=$(df "$TARGET_DIR" 2>/dev/null | tail -1 | awk '{print $1}')
-    if [[ "$mount_point" == *"tmpfs"* ]] || [[ "$mount_point" == *"tmp"* ]]; then
-        log_warn "Target directory is on tmpfs — builds may fail due to space limits"
-        log_warn "Consider: export CARGO_TARGET_DIR=/home/\$USER/.cargo-target"
+prepare_target_dir() {
+    local fs_type=""
+    local available_kb=""
+    local available_mb=0
+    local canonical_target=""
+
+    if [[ -e "$TARGET_DIR" && ! -d "$TARGET_DIR" ]]; then
+        die "Target path exists but is not a directory: $TARGET_DIR"
     fi
+    mkdir -p -- "$TARGET_DIR" || die "Unable to create target directory: $TARGET_DIR"
+    canonical_target="$(realpath -e -- "$TARGET_DIR")" || \
+        die "Unable to resolve created target directory: $TARGET_DIR"
+    [[ "$canonical_target" != "/" ]] || die "The filesystem root cannot be used as CARGO_TARGET_DIR" 2
+    TARGET_DIR="$canonical_target"
+
+    if command -v df >/dev/null 2>&1; then
+        fs_type="$(df -PT "$TARGET_DIR" 2>/dev/null | awk 'NR == 2 {print $2}' || true)"
+        case "$fs_type" in
+            tmpfs|ramfs)
+                log_warn "Target directory uses $fs_type and may run out of memory during a full build"
+                ;;
+        esac
+
+        available_kb="$(df -Pk "$TARGET_DIR" 2>/dev/null | awk 'NR == 2 {print $4}' || true)"
+        if [[ "$available_kb" =~ ^[0-9]+$ ]]; then
+            available_mb=$((available_kb / 1024))
+            log_ok "Target: $TARGET_DIR (${available_mb}MB disk available${fs_type:+, $fs_type})"
+            if ((available_mb < 10240)); then
+                log_warn "Less than 10GB is available in the target filesystem; a full build may exhaust it"
+            fi
+            return
+        fi
+    fi
+
     log_ok "Target: $TARGET_DIR"
-
-    # ── Memory check (based on AVAILABLE memory, not total) ──
-    local mem_total_kb
-    mem_total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-    local mem_total_mb=$((mem_total_kb / 1024))
-    local mem_avail_kb
-    mem_avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-    local mem_avail_mb=$((mem_avail_kb / 1024))
-
-    log_ok "Memory: ${mem_total_mb}MB total, ${mem_avail_mb}MB available"
-
-    # Hard minimum — refuse to build (based on available RAM)
-    if [ "$mem_avail_mb" -lt "$MEM_HARD_MIN_MB" ]; then
-        log_error "Only ${mem_avail_mb}MB RAM available — minimum ${MEM_HARD_MIN_MB}MB required"
-        log_error "Free up memory or use a machine with more RAM"
-        exit 1
-    fi
-
-    # Architecture-specific job adjustment (based on available RAM)
-    case "$ARCH_FAMILY" in
-        arm)
-            # ARM: strict memory enforcement
-            if [ "$mem_avail_mb" -lt "$MEM_MIN_JOBS2_MB" ] && [ "$JOBS" -gt 1 ]; then
-                log_warn "Only ${mem_avail_mb}MB RAM available — forcing -j1 to prevent OOM"
-                JOBS=1
-            elif [ "$mem_avail_mb" -lt "$MEM_WARN_MB" ]; then
-                log_warn "Low available memory (${mem_avail_mb}MB) — OOM kills possible with -j${JOBS}"
-                log_warn "Consider: -j 1  (or add swap)"
-            fi
-            ;;
-        x86)
-            # x86: assume ≥8GB free. Only intervene if genuinely low.
-            if [ "$mem_avail_mb" -lt "$MEM_WARN_MB" ]; then
-                log_warn "Only ${mem_avail_mb}MB free — expected ≥${MEM_WARN_MB}MB for optimal x86 builds"
-            fi
-            # Only throttle if we're below the hard floor for multi-job
-            if [ "$mem_avail_mb" -lt "$MEM_MIN_JOBS2_MB" ] && [ "$JOBS" -gt 2 ]; then
-                log_warn "Low available RAM (${mem_avail_mb}MB) — reducing jobs from $JOBS to 2"
-                JOBS=2
-            fi
-            ;;
-    esac
 }
 
-kill_stale_processes() {
-    if [ "$DO_KILL" = false ]; then
-        return
+prepare_log_dir() {
+    if [[ -e "$BUILD_LOG_DIR" && ! -d "$BUILD_LOG_DIR" ]]; then
+        die "Build log path exists but is not a directory: $BUILD_LOG_DIR"
     fi
+    mkdir -p -- "$BUILD_LOG_DIR" || die "Unable to create build log directory: $BUILD_LOG_DIR"
+}
 
-    local found=false
-    if pgrep -f "cargo build" &>/dev/null || \
-       pgrep -f "rustc" &>/dev/null; then
-        found=true
-    fi
+acquire_build_lock() {
+    [[ "$DRY_RUN" == false ]] || return 0
 
-    if [ "$found" = true ]; then
-        log_info "Killing stale cargo/rustc processes..."
-        pkill -9 -f "cargo build" 2>/dev/null || true
-        pkill -9 -f "rustc" 2>/dev/null || true
-        sleep 2
-
-        # Verify they're dead
-        if pgrep -f "cargo build" &>/dev/null; then
-            log_warn "Some cargo processes survived — forcing kill"
-            pkill -9 cargo 2>/dev/null || true
-            pkill -9 rustc 2>/dev/null || true
-            sleep 1
+    if ! command -v flock >/dev/null 2>&1; then
+        if [[ "$DO_CLEAN" == true ]]; then
+            die "flock is required for a concurrency-safe --clean build"
         fi
-        log_ok "Stale processes killed"
-    else
-        log_ok "No stale cargo/rustc processes found"
+        log_warn "flock is unavailable; relying on Cargo's internal build locking"
+        return 0
+    fi
+
+    BUILD_LOCK_FILE="${TARGET_DIR%/}.lunarwing-build.lock"
+    if [[ -L "$BUILD_LOCK_FILE" || ( -e "$BUILD_LOCK_FILE" && ! -f "$BUILD_LOCK_FILE" ) ]]; then
+        die "Build lock path is not a regular file: $BUILD_LOCK_FILE"
+    fi
+    exec {BUILD_LOCK_FD}>> "$BUILD_LOCK_FILE" || die "Unable to open build lock: $BUILD_LOCK_FILE"
+    if ! flock -n "$BUILD_LOCK_FD"; then
+        die "Another build-lunarwing process is using target directory: $TARGET_DIR"
+    fi
+    log_ok "Build lock: $BUILD_LOCK_FILE"
+}
+
+configure_rustc_wrapper() {
+    if [[ -n "${RUSTC_WRAPPER:-}" ]]; then
+        log_ok "Using configured RUSTC_WRAPPER: $RUSTC_WRAPPER"
+    elif command -v sccache >/dev/null 2>&1; then
+        export RUSTC_WRAPPER="sccache"
+        log_ok "sccache enabled"
     fi
 }
 
-clear_locks() {
-    if [ "$DO_LOCKS" = false ]; then
-        return
-    fi
-
-    local lock_count=0
-    while IFS= read -r lockfile; do
-        rm -f "$lockfile"
-        lock_count=$((lock_count + 1))
-    done < <(find "$TARGET_DIR" -type f \( -name ".cargo-lock" -o -name ".cargo-build-lock" -o -name ".cargo-artifact-lock" \) 2>/dev/null)
-
-    while IFS= read -r lockfile; do
-        rm -f "$lockfile"
-        lock_count=$((lock_count + 1))
-    done < <(find "$WASM_TARGET_DIR" -type f \( -name ".cargo-lock" -o -name ".cargo-build-lock" -o -name ".cargo-artifact-lock" \) 2>/dev/null)
-
-    # Also clear stale locks in the global cargo home
-    for f in "$HOME/.cargo/.package-cache" "$HOME/.cargo/.package-cache-mutate"; do
-        if [ -f "$f" ]; then
-            rm -f "$f"
-            lock_count=$((lock_count + 1))
-        fi
-    done
-
-    if [ "$lock_count" -gt 0 ]; then
-        log_ok "Cleared $lock_count stale lock file(s)"
-    else
-        log_ok "No stale lock files found"
-    fi
+format_command() {
+    printf '%q ' "$@"
+    printf '\n'
 }
 
 run_clean() {
-    if [ "$DO_CLEAN" = true ]; then
-        log_info "Running cargo clean..."
-        (cd "$IC_DIR" && cargo clean) 2>&1
-        log_ok "Clean complete"
-    fi
-}
-
-run_build() {
-    local profile_flag=""
-    local profile_name="$PROFILE"
-    if [ "$PROFILE" = "release" ]; then
-        profile_flag="--release"
+    if [[ "$DO_CLEAN" != true ]]; then
+        return 0
     fi
 
-    # ── x86 speed optimizations ────────────────────────────
-    if [ "$ARCH_FAMILY" = "x86" ]; then
-        # Use sccache if available (faster incremental builds)
-        if command -v sccache &>/dev/null; then
-            export RUSTC_WRAPPER="sccache"
-            log_ok "sccache enabled for incremental builds"
-        else
-            log_warn "sccache not found — incremental rebuilds will be slower"
-            log_warn "Install:  cargo install sccache"
-            log_warn "      or:  apt install sccache  /  brew install sccache"
-            log_warn "Then re-run this script to auto-enable caching"
-        fi
-    fi
-
-    local log_file="/tmp/cargo_build_$(date +%Y%m%d_%H%M%S).log"
-
-    echo ""
-    echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║         LunarWing Build — $profile_name profile"
-    echo -e "${BOLD}${CYAN}╠══════════════════════════════════════════════════╣${NC}"
-    echo -e "${BOLD}${CYAN}║${NC}  Arch:     ${BOLD}$ARCH ($ARCH_FAMILY)${NC}"
-    echo -e "${BOLD}${CYAN}║${NC}  Jobs:     ${BOLD}$JOBS${NC}"
-    echo -e "${BOLD}${CYAN}║${NC}  Target:   ${BOLD}$TARGET_DIR${NC}"
-    echo -e "${BOLD}${CYAN}║${NC}  Repo:     ${BOLD}$REPO_ROOT${NC}"
-    echo -e "${BOLD}${CYAN}║${NC}  Log:      ${BOLD}$log_file${NC}"
-    echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════╝${NC}"
-    echo ""
-
-    local start_time
-    start_time=$(date +%s)
-
-    local cargo_cmd="cargo build -j $JOBS $profile_flag"
-    local exit_code=0
-
-    if [ "$VERBOSE" = true ]; then
-        log_info "Running: $cargo_cmd (verbose)"
-        set +e
-        (cd "$IC_DIR" && eval "$cargo_cmd" 2>&1 | tee "$log_file")
-        exit_code=${PIPESTATUS[0]}
-        set -e
-    else
-        log_info "Running: $cargo_cmd"
-        log_info "Log: $log_file"
-        set +e
-        (cd "$IC_DIR" && eval "$cargo_cmd" > "$log_file" 2>&1)
-        exit_code=$?
-        set -e
-    fi
-
-    local end_time
-    end_time=$(date +%s)
-    local elapsed=$((end_time - start_time))
-    local minutes=$((elapsed / 60))
-    local seconds=$((elapsed % 60))
-
-    echo ""
-    if [ "$exit_code" -eq 0 ]; then
-        local crate_count
-        crate_count=$(grep -c "Compiling" "$log_file" 2>/dev/null || echo "?")
-        local target_size
-        target_size=$(du -sh "$TARGET_DIR" 2>/dev/null | awk '{print $1}')
-
-        echo -e "${GREEN}${BOLD}✓ Build succeeded!${NC}"
-        echo -e "  Arch:            ${BOLD}$ARCH${NC}"
-        echo -e "  Crates compiled: ${BOLD}$crate_count${NC}"
-        echo -e "  Time:            ${BOLD}${minutes}m ${seconds}s${NC}"
-        echo -e "  Target size:     ${BOLD}$target_size${NC}"
-        echo -e "  Log:             ${BOLD}$log_file${NC}"
-
-        # Show binary location
-        local binary
-        binary=$(find "$TARGET_DIR/$PROFILE" -maxdepth 1 -type f -executable -name "lunarwing*" 2>/dev/null | head -1)
-        if [ -n "$binary" ]; then
-            local bin_size
-            bin_size=$(du -h "$binary" 2>/dev/null | awk '{print $1}')
-            echo -e "  Binary:          ${BOLD}$binary${NC} (${bin_size})"
-        fi
-    else
-        echo -e "${RED}${BOLD}✗ Build failed!${NC}"
-        echo -e "  Exit code: ${BOLD}$exit_code${NC}"
-        echo -e "  Log:       ${BOLD}$log_file${NC}"
-        echo ""
-        echo -e "${YELLOW}Last 30 lines of build output:${NC}"
-        tail -30 "$log_file" 2>/dev/null
-        exit "$exit_code"
-    fi
-}
-
-run_wasm_build() {
-    if [ "$DO_WASM" = false ]; then
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "Would run: $(format_command cargo clean)"
         return
     fi
 
-    log_warn "--wasm no longer builds proprietary channel artifacts; build supported WASM extensions through mt-admin or their own build scripts"
+    log_info "Running cargo clean"
+    (cd "$IC_DIR" && cargo clean)
+    log_ok "Clean complete"
 }
 
-# ── Parse arguments ────────────────────────────────────────
+run_build() {
+    local -a cargo_cmd=(cargo build --locked --bin lunarwing -j "$JOBS")
+    local profile_dir="$PROFILE"
+    local log_file=""
+    local start_time=0
+    local end_time=0
+    local elapsed=0
+    local exit_code=0
+    local crate_count=0
+    local target_size="unknown"
+    local binary=""
+    local binary_size=""
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -c|--clean)    DO_CLEAN=true; shift ;;
-        -j|--jobs)     JOBS="$2"; shift 2 ;;
-        -t|--target)   TARGET_DIR="$2"; shift 2 ;;
-        -r|--repo)     REPO_ROOT="$2"; IC_DIR="$REPO_ROOT/ic"; shift 2 ;;
-        --profile)     PROFILE="$2"; shift 2 ;;
-        --wasm)        DO_WASM=true; shift ;;
-        --no-kill)     DO_KILL=false; shift ;;
-        --no-locks)    DO_LOCKS=false; shift ;;
-        -v|--verbose)  VERBOSE=true; shift ;;
-        -h|--help)     usage ;;
-        *)
-            log_error "Unknown option: $1"
-            usage
-            ;;
-    esac
-done
+    if [[ "$PROFILE" == "release" ]]; then
+        cargo_cmd+=(--release)
+    fi
 
-# Export CARGO_TARGET_DIR so cargo actually uses it
-export CARGO_TARGET_DIR="$TARGET_DIR"
+    log_info "Command: $(format_command "${cargo_cmd[@]}")"
+    if [[ "$DRY_RUN" == true ]]; then
+        log_ok "Dry run complete; Cargo build was not invoked"
+        return
+    fi
 
-# ── Main ───────────────────────────────────────────────────
+    log_file="$(mktemp "$BUILD_LOG_DIR/lunarwing-build.XXXXXX.log")" || \
+        die "Unable to create a build log in $BUILD_LOG_DIR"
+    log_info "Build log: $log_file"
+    start_time="$(date +%s)"
 
-echo ""
-echo -e "${BOLD}🦅 LunarWing Build Script${NC}"
-echo -e "   $(date '+%Y-%m-%d %H:%M:%S')"
-echo -e "   Arch: ${BOLD}$ARCH${NC} ($ARCH_FAMILY profile)"
-echo ""
+    set +e
+    if [[ "$VERBOSE" == true ]]; then
+        (
+            set -o pipefail
+            cd "$IC_DIR" || exit 1
+            "${cargo_cmd[@]}" 2>&1 | tee "$log_file"
+        )
+        exit_code=$?
+    else
+        (cd "$IC_DIR" && "${cargo_cmd[@]}" > "$log_file" 2>&1)
+        exit_code=$?
+    fi
+    set -e
 
-check_cargo
-check_repo
-check_target_dir
+    end_time="$(date +%s)"
+    elapsed=$((end_time - start_time))
 
-echo ""
-log_info "Phase 1: Cleanup"
-kill_stale_processes
-clear_locks
+    if ((exit_code != 0)); then
+        log_error "Build failed with exit code $exit_code"
+        log_error "Build log: $log_file"
+        printf '\nLast 30 lines of build output:\n' >&2
+        tail -n 30 "$log_file" >&2 || true
+        exit "$exit_code"
+    fi
 
-echo ""
-log_info "Phase 2: Prepare"
-run_clean
+    crate_count="$(grep -c '^ *Compiling ' "$log_file" 2>/dev/null || true)"
+    target_size="$(du -sh "$TARGET_DIR" 2>/dev/null | awk '{print $1}' || true)"
+    [[ -n "$target_size" ]] || target_size="unknown"
+    binary="$(find "$TARGET_DIR" -maxdepth 3 -type f -path "*/$profile_dir/lunarwing" -perm -u+x -print -quit 2>/dev/null || true)"
 
-echo ""
-log_info "Phase 3: Build"
-run_build
+    log_ok "Build succeeded in $((elapsed / 60))m $((elapsed % 60))s"
+    log_ok "Crates compiled: $crate_count"
+    log_ok "Target size: $target_size"
+    log_ok "Build log: $log_file"
 
-echo ""
-log_info "Phase 4: WASM (optional)"
-run_wasm_build
+    if [[ -x "$binary" ]]; then
+        binary_size="$(du -h "$binary" 2>/dev/null | awk '{print $1}' || true)"
+        log_ok "Binary: $binary${binary_size:+ ($binary_size)}"
+    else
+        log_warn "Cargo succeeded but no executable LunarWing binary was found under $TARGET_DIR"
+    fi
+}
 
-echo ""
-echo -e "${BOLD}${GREEN}🦅 All done.${NC}"
-echo ""
+run_wasm_notice() {
+    if [[ "$DO_WASM" == true ]]; then
+        log_warn "--wasm is a compatibility no-op; build supported WASM extensions through their dedicated build paths"
+    fi
+}
+
+print_summary() {
+    log_info "Platform: $OS $ARCH"
+    log_info "Effective CPUs: $CPU_COUNT; 75% CPU limit: $CPU_JOB_LIMIT job(s)"
+    if [[ "$MEMORY_KNOWN" == true ]]; then
+        log_info "Memory: ${MEM_TOTAL_MB}MB total, ${MEM_AVAILABLE_MB}MB available; memory limit: $MEMORY_JOB_LIMIT job(s)"
+    fi
+    log_info "Selected jobs: $JOBS ($JOBS_SOURCE)"
+    log_info "Profile: $PROFILE"
+}
+
+main() {
+    parse_args "$@"
+    validate_config
+    detect_platform
+    detect_cgroup_paths
+    detect_cpu_count
+    detect_memory
+    select_jobs
+
+    check_toolchain
+    check_repo
+    prepare_target_dir
+    export CARGO_TARGET_DIR="$TARGET_DIR"
+    prepare_log_dir
+    acquire_build_lock
+    configure_rustc_wrapper
+    print_summary
+    run_clean
+    run_build
+    run_wasm_notice
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

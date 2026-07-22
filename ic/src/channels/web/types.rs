@@ -796,6 +796,9 @@ pub struct ExtensionInfo {
     pub command: Option<String>,
     pub authenticated: bool,
     pub active: bool,
+    /// Desired startup state for MCP servers. Omitted for other extension kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     pub tools: Vec<String>,
     /// Whether this extension has configurable secrets (setup schema).
     #[serde(default)]

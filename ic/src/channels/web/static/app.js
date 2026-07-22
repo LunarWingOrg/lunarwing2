@@ -2945,6 +2945,12 @@ function renderMcpServerCard(entry, installedExt) {
 
   if (installedExt) {
     if (!installedExt.active) {
+      var inactiveLabel = document.createElement('span');
+      inactiveLabel.className = 'ext-active-label inactive';
+      inactiveLabel.textContent = installedExt.enabled === false
+        ? I18n.t('ext.inactive')
+        : I18n.t('status.installed');
+      actions.appendChild(inactiveLabel);
       var activateBtn = document.createElement('button');
       activateBtn.className = 'btn-ext activate';
       activateBtn.textContent = I18n.t('common.activate');
@@ -2955,6 +2961,11 @@ function renderMcpServerCard(entry, installedExt) {
       activeLabel.className = 'ext-active-label';
       activeLabel.textContent = I18n.t('ext.active');
       actions.appendChild(activeLabel);
+      var deactivateBtn = document.createElement('button');
+      deactivateBtn.className = 'btn-ext deactivate';
+      deactivateBtn.textContent = I18n.t('common.deactivate');
+      deactivateBtn.addEventListener('click', function() { deactivateExtension(installedExt.name); });
+      actions.appendChild(deactivateBtn);
     }
     if (installedExt.needs_setup || (installedExt.has_auth && installedExt.authenticated)) {
       var configBtn = document.createElement('button');
@@ -3122,7 +3133,12 @@ function renderExtensionCard(ext) {
     // WASM tools / MCP servers
     const activeLabel = document.createElement('span');
     activeLabel.className = 'ext-active-label';
-    activeLabel.textContent = ext.active ? I18n.t('ext.active') : I18n.t('status.installed');
+    activeLabel.textContent = ext.active
+      ? I18n.t('ext.active')
+      : (ext.kind === 'mcp_server' && ext.enabled === false
+        ? I18n.t('ext.inactive')
+        : I18n.t('status.installed'));
+    if (!ext.active) activeLabel.classList.add('inactive');
     actions.appendChild(activeLabel);
 
     // MCP servers and channel-relay extensions may be installed but inactive — show Activate button
@@ -3132,6 +3148,14 @@ function renderExtensionCard(ext) {
       activateBtn.textContent = I18n.t('common.activate');
       activateBtn.addEventListener('click', () => activateExtension(ext.name));
       actions.appendChild(activateBtn);
+    }
+
+    if (ext.kind === 'mcp_server' && ext.active) {
+      const deactivateBtn = document.createElement('button');
+      deactivateBtn.className = 'btn-ext deactivate';
+      deactivateBtn.textContent = I18n.t('common.deactivate');
+      deactivateBtn.addEventListener('click', () => deactivateExtension(ext.name));
+      actions.appendChild(deactivateBtn);
     }
 
     // Show Configure/Reconfigure button when there are secrets to enter.
@@ -3205,6 +3229,21 @@ function activateExtension(name) {
       refreshCurrentSettingsTab();
     })
     .catch((err) => showToast('Activate failed: ' + err.message, 'error'));
+}
+
+function deactivateExtension(name) {
+  apiFetch('/api/extensions/' + encodeURIComponent(name) + '/deactivate', { method: 'POST' })
+    .then((res) => {
+      if (res.success) {
+        showToast(I18n.t('mcp.deactivated', { name: name }), 'success');
+      } else {
+        showToast(I18n.t('mcp.deactivateFailed', { message: res.message }), 'error');
+      }
+      refreshCurrentSettingsTab();
+    })
+    .catch((err) => {
+      showToast(I18n.t('mcp.deactivateFailed', { message: err.message }), 'error');
+    });
 }
 
 function removeExtension(name) {

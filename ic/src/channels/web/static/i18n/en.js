@@ -168,6 +168,8 @@ I18n.register('en', {
   'mcp.addCustom': 'Add Custom MCP Server',
   'mcp.add': 'Add',
   'mcp.addedSuccess': 'Added MCP server {name}',
+  'mcp.deactivated': 'Deactivated MCP server {name}',
+  'mcp.deactivateFailed': 'Deactivate failed: {message}',
   'mcp.transport': 'MCP transport',
   'mcp.http': 'HTTP',
   'mcp.stdio': 'stdio',

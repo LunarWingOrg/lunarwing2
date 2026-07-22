@@ -534,9 +534,7 @@ struct McpPreflight {
     missing: bool,
 }
 
-fn preflight_mcp_server(
-    server: &crate::tools::mcp::config::McpServerConfig,
-) -> McpPreflight {
+fn preflight_mcp_server(server: &crate::tools::mcp::config::McpServerConfig) -> McpPreflight {
     use crate::tools::mcp::config::EffectiveTransport;
 
     let transport = match server.effective_transport() {
@@ -544,7 +542,11 @@ fn preflight_mcp_server(
         EffectiveTransport::Stdio { .. } => "stdio",
         EffectiveTransport::Unix { .. } => "unix",
     };
-    let state = if server.enabled { "enabled" } else { "disabled" };
+    let state = if server.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
     let mut detail = format!("{} [{} {}]", server.name, transport, state);
     let mut invalid = false;
     let mut missing = false;
@@ -552,7 +554,11 @@ fn preflight_mcp_server(
     if let Err(e) = server.validate() {
         invalid = true;
         detail.push_str(&format!(" — invalid: {e}"));
-        return McpPreflight { detail, invalid, missing };
+        return McpPreflight {
+            detail,
+            invalid,
+            missing,
+        };
     }
 
     if let EffectiveTransport::Stdio { command, .. } = server.effective_transport() {
@@ -565,13 +571,21 @@ fn preflight_mcp_server(
         }
     }
 
-    McpPreflight { detail, invalid, missing }
+    McpPreflight {
+        detail,
+        invalid,
+        missing,
+    }
 }
 
 fn resolve_command_in_path(command: &str) -> Option<PathBuf> {
     if command.contains(std::path::MAIN_SEPARATOR) {
         let path = PathBuf::from(command);
-        return if is_executable(&path) { Some(path) } else { None };
+        return if is_executable(&path) {
+            Some(path)
+        } else {
+            None
+        };
     }
     let path_env = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_env) {
@@ -980,7 +994,11 @@ mod tests {
             eprintln!("note: 'sh' not resolvable in this environment");
             return;
         };
-        assert!(path.is_absolute(), "resolved sh should be absolute: {}", path.display());
+        assert!(
+            path.is_absolute(),
+            "resolved sh should be absolute: {}",
+            path.display()
+        );
     }
 
     #[test]
@@ -998,9 +1016,15 @@ mod tests {
         use crate::tools::mcp::config::McpServerConfig;
         let server = McpServerConfig::new("demo", "https://example.invalid/mcp");
         let pf = preflight_mcp_server(&server);
-        assert!(!pf.invalid, "expected valid http server, detail: {}", pf.detail);
         assert!(
-            pf.detail.contains("demo") && pf.detail.contains("http") && pf.detail.contains("enabled"),
+            !pf.invalid,
+            "expected valid http server, detail: {}",
+            pf.detail
+        );
+        assert!(
+            pf.detail.contains("demo")
+                && pf.detail.contains("http")
+                && pf.detail.contains("enabled"),
             "expected transport+state in detail, got: {}",
             pf.detail
         );
@@ -1017,8 +1041,14 @@ mod tests {
         );
         server.enabled = false;
         let pf = preflight_mcp_server(&server);
-        assert!(!pf.invalid, "disabled stdio with missing cmd is still valid config");
-        assert!(pf.missing, "disabled stdio should still flag missing command");
+        assert!(
+            !pf.invalid,
+            "disabled stdio with missing cmd is still valid config"
+        );
+        assert!(
+            pf.missing,
+            "disabled stdio should still flag missing command"
+        );
         assert!(
             pf.detail.contains("disabled"),
             "expected 'disabled' in detail, got: {}",

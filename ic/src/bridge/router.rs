@@ -938,7 +938,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                     "properties": {
                         "name": {"type": "string", "description": "Short name for the mission/routine"},
                         "goal": {"type": "string", "description": "What this mission should accomplish each run"},
-                        "cadence": {"type": "string", "description": "How often to run: 'hourly', '30m', '6h', 'daily', 'manual'"},
+                        "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds"},
                         "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl']). Defaults to current channel."}
                     },
                     "required": ["name", "goal"]
@@ -1001,7 +1001,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                         "id": {"type": "string", "description": "Mission/routine ID to update"},
                         "name": {"type": "string", "description": "New name"},
                         "goal": {"type": "string", "description": "New goal"},
-                        "cadence": {"type": "string", "description": "New cadence: 'hourly', '30m', '6h', 'daily', 'manual'"},
+                        "cadence": {"type": "string", "description": "New cadence: 'manual', 'hourly', 'daily', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds"},
                         "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl'])"},
                         "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited)"},
                         "success_criteria": {"type": "string", "description": "Criteria for declaring mission complete"}

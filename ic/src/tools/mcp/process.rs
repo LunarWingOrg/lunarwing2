@@ -48,17 +48,18 @@ impl McpProcessManager {
         let name = name.into();
         let command = command.into();
 
-        // Store config for potential restart
-        self.configs.write().await.insert(
-            name.clone(),
-            StdioSpawnConfig {
-                command: command.clone(),
-                args: args.clone(),
-                env: env.clone(),
-            },
-        );
-
+        let spawn_config = StdioSpawnConfig {
+            command: command.clone(),
+            args: args.clone(),
+            env: env.clone(),
+        };
         let transport = Arc::new(StdioMcpTransport::spawn(&name, &command, args, env).await?);
+
+        // A failed spawn must not leave a restart configuration behind.
+        self.configs
+            .write()
+            .await
+            .insert(name.clone(), spawn_config);
 
         self.transports
             .write()

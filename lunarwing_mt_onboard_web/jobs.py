@@ -26,6 +26,16 @@ _TERMINATING_GROUPS: set[int] = set()
 _TERMINATING_LOCK = threading.Lock()
 
 
+class JobConflictError(RuntimeError):
+    """Raised when another privileged web job is still active."""
+
+    def __init__(self, active: "Job") -> None:
+        self.active = active
+        super().__init__(
+            f"job {active.id} ({active.mode}) is already {active.status}"
+        )
+
+
 def terminate_process_tree(proc: subprocess.Popen) -> None:
     """Terminate a script and descendants started in its POSIX session."""
     if os.name != "posix":
@@ -108,6 +118,16 @@ class JobManager:
     def create(self, mode: str) -> Job:
         job = Job(id=secrets.token_hex(6), mode=mode, demo=self.demo)
         with self._lock:
+            active = next(
+                (
+                    existing
+                    for existing in self._jobs.values()
+                    if existing.status in {"pending", "running"}
+                ),
+                None,
+            )
+            if active is not None:
+                raise JobConflictError(active)
             self._jobs[job.id] = job
         return job
 

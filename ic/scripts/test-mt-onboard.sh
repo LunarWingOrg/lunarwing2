@@ -60,13 +60,14 @@ print('Parsed:', args)
 "
 
 echo ""
-echo "── Upgrade dry-run parser check ──"
+echo "── Current mt-admin upgrade parser check ──"
 python3 -c "
 from lunarwing_mt_onboard.cli import _build_parser
 p = _build_parser()
 args = p.parse_args([
-    'upgrade', '--tenant', 'alpha', '--target', 'v1.1.9',
-    '--non-interactive', '--no-preflight'
+    'upgrade', '--tenant', 'alpha', '--target', 'v2.0.2.0',
+    '--source-repo', '/srv/lunarwing', '--no-backup', '--skip-render',
+    '--apply', '--yes', '--non-interactive'
 ])
 print('Parsed:', args)
 "

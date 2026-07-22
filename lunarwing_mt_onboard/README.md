@@ -71,32 +71,24 @@ Flags:
 
 ### In-place tenant upgrade
 
-Upgrade mode is dry-run by default. It is intended for existing PostgreSQL,
-rootful-Docker tenants on older 1.1.x releases such as 1.1.6, 1.1.7, and 1.1.8.
-The underlying shell scripts remain the authority for compatibility checks and
-will stop on unsupported layouts.
+Upgrade mode drives `lunarwing-mt-admin.sh upgrade-tenant`, using its current
+systemd-user/OpenRC lifecycle. It accepts an explicit branch, tag, or commit,
+creates a PostgreSQL backup, rebuilds, renders units, restarts, and verifies the
+tenant. There is no dry-run; interactive and non-interactive use both require
+explicit apply confirmation.
 
-Interactive dry-run:
+Interactive upgrade:
 
 ```bash
 sudo python3 -m lunarwing_mt_onboard upgrade
 ```
 
-Non-interactive dry-run:
+Non-interactive upgrade:
 
 ```bash
 sudo python3 -m lunarwing_mt_onboard upgrade \
   --tenant ruffles \
-  --target v1.1.9 \
-  --non-interactive
-```
-
-Apply an upgrade after reviewing the dry-run/preflight output:
-
-```bash
-sudo python3 -m lunarwing_mt_onboard upgrade \
-  --tenant ruffles \
-  --target v1.1.9 \
+  --target v2.0.2.0 \
   --apply \
   --yes \
   --non-interactive
@@ -107,19 +99,20 @@ Upgrade flags:
 | Flag | Description |
 |------|-------------|
 | `--tenant NAME` | Existing tenant to upgrade |
-| `--target TAG` | Exact release tag such as `v1.1.9`; empty uses the script default |
-| `--source-version-override TAG` | Override source-version detection, for example `v1.1.7` |
-| `--apply` | Execute the upgrade; omitted means dry-run |
-| `--no-preflight` | Skip `upgrade-preflight.sh` |
-| `--force` | Continue even if preflight fails |
-| `--yes` | Forward non-interactive confirmation to the shell upgrade script |
+| `--target REF` | Required branch, tag, or commit such as `v2.0.2.0` |
+| `--source-repo PATH` | Retarget the tenant checkout's origin before fetch |
+| `--no-backup` | Skip the pre-upgrade PostgreSQL backup |
+| `--skip-render` | Keep existing service units |
+| `--apply` | Explicitly authorize the mutating upgrade |
+| `--yes` | Skip the final summary confirmation |
 
 ### Kawarimi tenant export (cross-host migration)
 
 Export mode defaults to dry-run. It wraps `ic/scripts/export-tenant.sh`,
 which stops the tenant, takes a `pg_dump`, bundles secrets manifests and
-workspace state into a single `0600` tar file suitable for
-`import-tenant.sh` on a target host.
+workspace state into a single root-owned `0600`, AES-256 encrypted `.7z`
+archive suitable for `import-tenant.sh` on a target host. Interactive apply
+prompts for and confirms a passphrase before the tenant is stopped.
 
 Interactive dry-run:
 
@@ -135,13 +128,22 @@ sudo python3 -m lunarwing_mt_onboard export \
   --non-interactive
 ```
 
-Apply an export (stops the tenant and writes the bundle):
+Apply an export interactively (stops the tenant and writes the bundle):
 
 ```bash
 sudo python3 -m lunarwing_mt_onboard export \
   --tenant ruffles \
-  --apply \
-  --non-interactive
+  --apply
+```
+
+For non-interactive automation, provide a root-owned mode-`0600` passphrase
+file to the underlying script environment. The passphrase is not saved in
+resume JSON:
+
+```bash
+sudo env KAWARIMI_PASS_FILE=/root/kawarimi.pass \
+  python3 -m lunarwing_mt_onboard export \
+  --tenant ruffles --apply --non-interactive
 ```
 
 Export flags:
@@ -156,7 +158,8 @@ Export flags:
 The web GUI also wraps `ic/scripts/import-tenant.sh` through
 `import_tenant.py`. Import defaults to a non-interactive, stage-only dry-run;
 apply and start are separate choices, and unattended start requires the old
-host to be stopped.
+host to be stopped. Encrypted `.7z` bundles require a per-job passphrase; legacy
+plaintext `.tar` import remains available with an explicit warning.
 
 ### Secrets insertion
 
@@ -263,7 +266,7 @@ unittest.TextTestRunner(verbosity=2).run(
   "gotify_title": "",
   "workers": ["nanocode", "opencode"],
   "toolchains": false,
-  "tensorzero_url": "http://192.168.1.157:3000/openai/v1",
+  "llm_base_url": "",
   "llm_model": "tensorzero::function_name::FrontierCODE",
   "llm_api_key": "",
   "secrets_master_key": "",

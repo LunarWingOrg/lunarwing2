@@ -4,7 +4,7 @@ set -uo pipefail
 SLEEP="${LUNARWING_DEMO_SLEEP:-0.3}"
 nap() { sleep "$SLEEP"; }
 
-bundle="${1:-demo.tar}"
+bundle="${1:-demo.7z}"
 shift || true
 apply="yes"
 start="no"
@@ -16,7 +16,7 @@ while (($#)); do
     --start) start="yes"; shift ;;
     --old-stopped) old_stopped="yes"; shift ;;
     --name) name="${2:-}"; shift 2 ;;
-    --tensorzero-url|--owner-scope) shift 2 ;;
+    --owner-scope) shift 2 ;;
     *) shift ;;
   esac
 done

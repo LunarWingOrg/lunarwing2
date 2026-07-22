@@ -507,7 +507,7 @@ impl AppBuilder {
         ),
         anyhow::Error,
     > {
-        use crate::tools::mcp::config::load_mcp_servers_from_db;
+        use crate::tools::mcp::config::load_mcp_servers_from_db_or_migrate;
         use crate::tools::wasm::{WasmToolLoader, load_dev_tools};
 
         let mcp_session_manager = Arc::new(McpSessionManager::new());
@@ -597,7 +597,7 @@ impl AppBuilder {
             let owner_id = self.config.owner_id.clone();
             async move {
                 let servers_result = if let Some(ref d) = db {
-                    load_mcp_servers_from_db(d.as_ref(), &owner_id).await
+                    load_mcp_servers_from_db_or_migrate(d.as_ref(), &owner_id).await
                 } else {
                     crate::tools::mcp::config::load_mcp_servers().await
                 };
@@ -647,8 +647,20 @@ impl AppBuilder {
                                         let tool_count = mcp_tools.len();
                                         match client.create_tools().await {
                                             Ok(tool_impls) => {
+                                                let mut registered_tools = Vec::new();
                                                 for tool in tool_impls {
-                                                    tools.register(tool).await;
+                                                    if tools
+                                                        .register_if_vacant(Arc::clone(&tool))
+                                                        .await
+                                                    {
+                                                        registered_tools.push(tool);
+                                                    } else {
+                                                        tracing::warn!(
+                                                            server = %server_name,
+                                                            tool = %tool.name(),
+                                                            "Skipped startup MCP tool because its name is already registered"
+                                                        );
+                                                    }
                                                 }
                                                 tracing::debug!(
                                                     "Loaded {} tools from MCP server '{}'",
@@ -658,6 +670,7 @@ impl AppBuilder {
                                                 return Some((
                                                     server_name,
                                                     Arc::new(client),
+                                                    registered_tools,
                                                 ));
                                             }
                                             Err(e) => {
@@ -666,6 +679,20 @@ impl AppBuilder {
                                                     server_name,
                                                     e
                                                 );
+                                                if let Err(cleanup_error) = crate::tools::mcp::factory::shutdown_client_runtime(
+                                                    &server_name,
+                                                    Some(&client),
+                                                    &mcp_sm,
+                                                    &pm,
+                                                )
+                                                .await
+                                                {
+                                                    tracing::warn!(
+                                                        server = %server_name,
+                                                        error = %cleanup_error,
+                                                        "Failed to clean up MCP runtime after startup tool creation failure"
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -685,6 +712,20 @@ impl AppBuilder {
                                                 "Failed to connect to MCP server '{}': {}",
                                                 server_name,
                                                 e
+                                            );
+                                        }
+                                        if let Err(cleanup_error) = crate::tools::mcp::factory::shutdown_client_runtime(
+                                            &server_name,
+                                            Some(&client),
+                                            &mcp_sm,
+                                            &pm,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                server = %server_name,
+                                                error = %cleanup_error,
+                                                "Failed to clean up MCP runtime after startup connection failure"
                                             );
                                         }
                                     }
@@ -800,8 +841,10 @@ impl AppBuilder {
                     count = startup_mcp_clients.len(),
                     "Injecting startup MCP clients into extension manager"
                 );
-                for (name, client) in startup_mcp_clients {
-                    manager.inject_mcp_client(name, client).await;
+                for (name, client, registered_tools) in startup_mcp_clients {
+                    manager
+                        .inject_mcp_client(name, client, registered_tools)
+                        .await;
                 }
             }
 

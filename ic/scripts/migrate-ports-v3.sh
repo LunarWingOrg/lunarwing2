@@ -13,6 +13,8 @@ if [[ ! -f "$PORTS_REGISTRY" ]]; then
   exit 1
 fi
 
+exec 199<"$(dirname "$PORTS_REGISTRY")"
+flock -x 199
 current_version="$(jq -r '.version // 0' "$PORTS_REGISTRY")"
 
 if [[ "$current_version" -ge 3 ]]; then

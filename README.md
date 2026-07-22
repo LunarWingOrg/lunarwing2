@@ -99,7 +99,7 @@ The GUI supports five operator workflows:
 | --- | --- |
 | Provision | Create, configure, build, start, and verify a new tenant |
 | Secrets | Store or replace one named secret in the encrypted secrets store for a tenant |
-| Legacy upgrade | Run preflight and legacy same-host upgrade tooling |
+| In-place upgrade | Upgrade through the current init-agnostic mt-admin lifecycle |
 | Kawarimi export | Preview or create a migration bundle; Apply stops the tenant daemon and bridge |
 | Kawarimi import | Inspect, stage, and restore a migration bundle on a v2 host |
 
@@ -115,13 +115,13 @@ Full GUI reference: [Browser onboarding console](lunarwing_mt_onboard_web/README
 
 ### Treat the GUI as a privileged local console
 
-The onboarding server is designed for one trusted operator on loopback. It does not provide user accounts or TLS. Keep `--host 127.0.0.1` and token authentication enabled; do not bind a non-loopback address or use `--no-token`. Use an SSH tunnel for remote administration. Treat the session URL, browser session, generated secrets, and audit directory as credentials. Audit redaction is heuristic and log files follow the process umask, so choose a protected `--log-dir` and handle logs as sensitive data.
+The onboarding server is designed for one trusted operator on loopback. It does not provide user accounts or TLS. Keep `--host 127.0.0.1` and token authentication enabled; real mode refuses non-loopback binding unless the dangerous `--allow-insecure-remote` override is supplied. Use an SSH tunnel for remote administration. Treat the session URL, browser session, generated secrets, and audit directory as credentials. Audit redaction remains defense in depth, and each audit file is forced to mode `0600`.
 
 ## Advanced setup paths
 
 ### Interactive Python CLI
 
-The terminal onboarding client remains available for provisioning, secrets, exports, and legacy upgrade operations. It does not provide the guided Kawarimi import flow available in the GUI.
+The terminal onboarding client remains available for provisioning, secrets, exports, and current mt-admin in-place upgrades. It does not provide the guided Kawarimi import flow available in the GUI.
 
 ```bash
 python3 -m venv .venv-mt-onboard
@@ -150,15 +150,17 @@ The production scripts support rootless per-user Podman or a configured rootful 
 
 ## Upgrades and migration
 
-The GUI legacy-upgrade workflow wraps the PostgreSQL and rootful-Docker v1
-upgrader. It runs preflight and dry-run by default, accepts supported three-part
-v1 target tags, and is not a supported v1-to-v2 upgrade path.
+The GUI in-place upgrade workflow wraps `lunarwing-mt-admin.sh upgrade-tenant`.
+It accepts an explicit branch, tag, or commit, including four-part v2 release
+tags, and uses the same systemd-user/OpenRC lifecycle as direct administration.
+It applies immediately after explicit confirmation; PostgreSQL backup and unit
+rendering are enabled unless deliberately disabled.
 
 For a v1 tenant moving to v2, prepare a separate v2 deployment and rehearse a staged Kawarimi export/import. Validate the restored tenant before cutover. Before selecting Start, the operator must stop the old tenant daemon and bridge when both tenants use the same XMPP identity; the GUI does not enforce this gate.
 
 GUI import defaults to `apply=false` and `start=false`: it validates the real bundle and prints a dry-run plan. Apply restores and stages the tenant; Start is a separate opt-in. These safe defaults are GUI-specific—the direct import script mutates the host unless `--dry-run` is passed explicitly.
 
-Kawarimi supports PostgreSQL tenants; libSQL bundles are refused. A real export stops tenant writers and produces a sensitive root-owned `0600` bundle containing the master key and XMPP credentials. Import creates fresh host-local gateway and webhook tokens, so clients must authenticate again. Back up first, review the plan, protect bundles in transit, and delete them after the restored tenant is verified.
+Kawarimi supports PostgreSQL tenants; libSQL bundles are refused. A real export validates its passphrase before stopping tenant writers and produces a root-owned mode-`0600`, AES-256 encrypted `.7z` bundle containing the master key and XMPP credentials. Encrypted import requires the passphrase even for dry-run. Import creates fresh host-local gateway and webhook tokens, so clients must authenticate again. Back up first, review the plan, protect bundles in transit, and delete them after the restored tenant is verified.
 
 - [Machine migration runbook](docs/ops/MT-MACHINE-MIGRATION.md)
 - [Legacy upgrade notes](docs/ops/MT-LEGACY-UPGRADE-NOTES.md)

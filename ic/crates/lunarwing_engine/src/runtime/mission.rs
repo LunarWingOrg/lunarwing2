@@ -4,9 +4,14 @@
 //! progress. The manager handles lifecycle (create, pause, resume, complete)
 //! and delegates thread spawning to [`ThreadManager`].
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{Arc, Weak},
+};
 
-use tokio::sync::RwLock;
+use chrono::{DateTime, Utc};
+use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
 use crate::memory::RetrievalEngine;
@@ -19,6 +24,9 @@ use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus};
 use crate::types::project::ProjectId;
 use crate::types::shared_owner_id;
 use crate::types::thread::{ThreadConfig, ThreadId, ThreadType};
+
+type MissionExecutionLock = Mutex<()>;
+type MissionLockRegistry = Mutex<HashMap<MissionId, Weak<MissionExecutionLock>>>;
 
 /// Notification emitted when a mission thread completes.
 ///
@@ -55,8 +63,78 @@ pub struct MissionManager {
     thread_manager: Arc<ThreadManager>,
     /// Active missions indexed by ID for quick lookup.
     active: RwLock<Vec<MissionId>>,
+    /// Serialize state transitions for each mission without retaining dead locks forever.
+    fire_locks: Arc<MissionLockRegistry>,
     /// Broadcast channel for mission outcome notifications.
     notification_tx: tokio::sync::broadcast::Sender<MissionNotification>,
+}
+
+fn normalize_cron_expression(expression: &str) -> String {
+    let fields: Vec<_> = expression.split_whitespace().collect();
+    match fields.len() {
+        5 => format!("0 {} *", fields.join(" ")),
+        6 => format!("{} *", fields.join(" ")),
+        _ => expression.trim().to_string(),
+    }
+}
+
+fn next_fire_for_cadence(
+    cadence: &MissionCadence,
+    after: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, EngineError> {
+    let MissionCadence::Cron {
+        expression,
+        timezone,
+    } = cadence
+    else {
+        return Ok(None);
+    };
+
+    let fields: Vec<_> = expression.split_whitespace().collect();
+    if matches!(fields.len(), 6 | 7) && fields.first() != Some(&"0") {
+        return Err(EngineError::Effect {
+            reason: format!(
+                "mission cron expression '{expression}' is sub-minute; seconds field must be 0"
+            ),
+        });
+    }
+
+    let normalized = normalize_cron_expression(expression);
+    let schedule = cron::Schedule::from_str(&normalized).map_err(|error| EngineError::Effect {
+        reason: format!("invalid mission cron expression '{expression}': {error}"),
+    })?;
+    let next = if let Some(timezone_name) = timezone.as_deref() {
+        let timezone =
+            chrono_tz::Tz::from_str(timezone_name).map_err(|error| EngineError::Effect {
+                reason: format!("invalid mission timezone '{timezone_name}': {error}"),
+            })?;
+        schedule
+            .after(&after.with_timezone(&timezone))
+            .next()
+            .map(|next| next.with_timezone(&Utc))
+    } else {
+        schedule.after(&after).next()
+    };
+
+    next.map(Some).ok_or_else(|| EngineError::Effect {
+        reason: format!("mission cron expression '{expression}' has no future fire time"),
+    })
+}
+
+fn refresh_next_fire_at(mission: &mut Mission, after: DateTime<Utc>) -> Result<(), EngineError> {
+    mission.next_fire_at = next_fire_for_cadence(&mission.cadence, after)?;
+    Ok(())
+}
+
+async fn mission_lock(locks: &MissionLockRegistry, id: MissionId) -> Arc<MissionExecutionLock> {
+    let mut locks = locks.lock().await;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(id, Arc::downgrade(&lock));
+    lock
 }
 
 impl MissionManager {
@@ -66,6 +144,7 @@ impl MissionManager {
             store,
             thread_manager,
             active: RwLock::new(Vec::new()),
+            fire_locks: Arc::new(Mutex::new(HashMap::new())),
             notification_tx,
         }
     }
@@ -81,11 +160,31 @@ impl MissionManager {
     pub async fn bootstrap_project(&self, project_id: ProjectId) -> Result<usize, EngineError> {
         // System operation: load all missions for the project regardless of user.
         let missions = self.store.list_all_missions(project_id).await?;
-        let active_ids: Vec<MissionId> = missions
-            .into_iter()
-            .filter(|mission| mission.status == MissionStatus::Active)
-            .map(|mission| mission.id)
-            .collect();
+        let mut active_ids = Vec::new();
+        for mut mission in missions {
+            if mission.status != MissionStatus::Active {
+                continue;
+            }
+            let mut changed = false;
+            if mission.threads_today_date.is_none() {
+                mission.threads_today_date = Some(Utc::now().date_naive());
+                changed = true;
+            }
+            if matches!(mission.cadence, MissionCadence::Cron { .. })
+                && mission.next_fire_at.is_none()
+            {
+                match refresh_next_fire_at(&mut mission, Utc::now()) {
+                    Ok(()) => changed = true,
+                    Err(error) => {
+                        debug!(mission_id = %mission.id, %error, "could not repair mission schedule");
+                    }
+                }
+            }
+            if changed {
+                self.store.save_mission(&mission).await?;
+            }
+            active_ids.push(mission.id);
+        }
 
         let count = active_ids.len();
         *self.active.write().await = active_ids;
@@ -105,6 +204,7 @@ impl MissionManager {
     ) -> Result<MissionId, EngineError> {
         let mut mission = Mission::new(project_id, user_id, name, goal, cadence);
         mission.notify_channels = notify_channels;
+        refresh_next_fire_at(&mut mission, Utc::now())?;
         let id = mission.id;
         self.store.save_mission(&mission).await?;
         self.active.write().await.push(id);
@@ -119,6 +219,8 @@ impl MissionManager {
         user_id: &str,
         updates: MissionUpdate,
     ) -> Result<(), EngineError> {
+        let lock = mission_lock(&self.fire_locks, id).await;
+        let _guard = lock.lock().await;
         let mut mission = self
             .store
             .load_mission(id)
@@ -142,6 +244,7 @@ impl MissionManager {
         }
         if let Some(cadence) = updates.cadence {
             mission.cadence = cadence;
+            refresh_next_fire_at(&mut mission, Utc::now())?;
         }
         if let Some(channels) = updates.notify_channels {
             mission.notify_channels = channels;
@@ -164,6 +267,8 @@ impl MissionManager {
     /// For shared missions, the caller (web handler) must
     /// verify admin role before calling this. The engine only checks ownership.
     pub async fn pause_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
+        let lock = mission_lock(&self.fire_locks, id).await;
+        let _guard = lock.lock().await;
         // Validate ownership. Shared missions require admin role (checked by caller).
         if let Some(mission) = self.store.load_mission(id).await?
             && !mission.is_owned_by(user_id)
@@ -187,19 +292,25 @@ impl MissionManager {
     /// For shared missions, the caller (web handler) must
     /// verify admin role before calling this. The engine only checks ownership.
     pub async fn resume_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
-        // Validate ownership. Shared missions require admin role (checked by caller).
-        if let Some(mission) = self.store.load_mission(id).await?
-            && !mission.is_owned_by(user_id)
-            && !mission.owner_id().is_shared()
-        {
+        let lock = mission_lock(&self.fire_locks, id).await;
+        let _guard = lock.lock().await;
+        let mut mission = self
+            .store
+            .load_mission(id)
+            .await?
+            .ok_or_else(|| EngineError::Store {
+                reason: format!("mission {id} not found"),
+            })?;
+        if !mission.is_owned_by(user_id) && !mission.owner_id().is_shared() {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
                 entity: format!("mission {id}"),
             });
         }
-        self.store
-            .update_mission_status(id, MissionStatus::Active)
-            .await?;
+        mission.status = MissionStatus::Active;
+        mission.updated_at = Utc::now();
+        refresh_next_fire_at(&mut mission, Utc::now())?;
+        self.store.save_mission(&mission).await?;
         let mut active = self.active.write().await;
         if !active.contains(&id) {
             active.push(id);
@@ -210,6 +321,8 @@ impl MissionManager {
 
     /// Mark a mission as completed.
     pub async fn complete_mission(&self, id: MissionId) -> Result<(), EngineError> {
+        let lock = mission_lock(&self.fire_locks, id).await;
+        let _guard = lock.lock().await;
         self.store
             .update_mission_status(id, MissionStatus::Completed)
             .await?;
@@ -228,8 +341,21 @@ impl MissionManager {
         user_id: &str,
         trigger_payload: Option<serde_json::Value>,
     ) -> Result<Option<ThreadId>, EngineError> {
+        self.fire_mission_inner(id, user_id, trigger_payload, false)
+            .await
+    }
+
+    async fn fire_mission_inner(
+        &self,
+        id: MissionId,
+        user_id: &str,
+        trigger_payload: Option<serde_json::Value>,
+        advance_schedule: bool,
+    ) -> Result<Option<ThreadId>, EngineError> {
+        let fire_lock = mission_lock(&self.fire_locks, id).await;
+        let _fire_guard = fire_lock.lock().await;
         let mission = self.store.load_mission(id).await?;
-        let mission = match mission {
+        let mut mission = match mission {
             Some(m) => m,
             None => {
                 return Err(EngineError::Store {
@@ -252,9 +378,34 @@ impl MissionManager {
             debug!(mission_id = %id, status = ?mission.status, "cannot fire terminal mission");
             return Ok(None);
         }
+        if mission.status == MissionStatus::Paused {
+            debug!(mission_id = %id, "cannot fire paused mission");
+            return Ok(None);
+        }
+
+        let now = Utc::now();
+        let today = now.date_naive();
+        let budget_date_changed = match mission.threads_today_date {
+            None => {
+                mission.threads_today_date = Some(today);
+                true
+            }
+            Some(date) if date != today => {
+                mission.threads_today = 0;
+                mission.threads_today_date = Some(today);
+                true
+            }
+            Some(_) => false,
+        };
+        if advance_schedule {
+            mission.next_fire_at = next_fire_for_cadence(&mission.cadence, now)?;
+        }
 
         // Check daily budget
         if mission.max_threads_per_day > 0 && mission.threads_today >= mission.max_threads_per_day {
+            if advance_schedule || budget_date_changed {
+                self.store.save_mission(&mission).await?;
+            }
             debug!(mission_id = %id, "daily thread budget exhausted");
             return Ok(None);
         }
@@ -963,7 +1114,10 @@ impl MissionManager {
 
             // Fire cron missions with the mission's own user_id so artifacts
             // are scoped to the correct tenant.
-            if should_fire && let Some(tid) = self.fire_mission(mid, &mission.user_id, None).await?
+            if should_fire
+                && let Some(tid) = self
+                    .fire_mission_inner(mid, &mission.user_id, None, true)
+                    .await?
             {
                 spawned.push(tid);
             }
@@ -975,10 +1129,13 @@ impl MissionManager {
     fn spawn_mission_outcome_watcher(&self, mission_id: MissionId, thread_id: ThreadId) {
         let tm = Arc::clone(&self.thread_manager);
         let store = Arc::clone(&self.store);
+        let fire_locks = Arc::clone(&self.fire_locks);
         let notification_tx = self.notification_tx.clone();
         tokio::spawn(async move {
             match tm.join_thread(thread_id).await {
                 Ok(outcome) => {
+                    let lock = mission_lock(&fire_locks, mission_id).await;
+                    let _guard = lock.lock().await;
                     if let Err(e) = process_mission_outcome_and_notify(
                         &store,
                         mission_id,
@@ -1578,6 +1735,7 @@ mod tests {
         threads: tokio::sync::RwLock<HashMap<ThreadId, Thread>>,
         missions: tokio::sync::RwLock<HashMap<MissionId, Mission>>,
         docs: tokio::sync::RwLock<Vec<MemoryDoc>>,
+        mission_load_delay: Duration,
     }
 
     impl TestStore {
@@ -1586,6 +1744,14 @@ mod tests {
                 threads: tokio::sync::RwLock::new(HashMap::new()),
                 missions: tokio::sync::RwLock::new(HashMap::new()),
                 docs: tokio::sync::RwLock::new(Vec::new()),
+                mission_load_delay: Duration::ZERO,
+            }
+        }
+
+        fn with_mission_load_delay(delay: Duration) -> Self {
+            Self {
+                mission_load_delay: delay,
+                ..Self::new()
             }
         }
     }
@@ -1687,7 +1853,11 @@ mod tests {
             Ok(())
         }
         async fn load_mission(&self, id: MissionId) -> Result<Option<Mission>, EngineError> {
-            Ok(self.missions.read().await.get(&id).cloned())
+            let mission = self.missions.read().await.get(&id).cloned();
+            if !self.mission_load_delay.is_zero() {
+                tokio::time::sleep(self.mission_load_delay).await;
+            }
+            Ok(mission)
         }
         async fn list_missions(
             &self,
@@ -1844,6 +2014,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_cron_mission_sets_next_fire_at() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let before = Utc::now();
+
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "scheduled",
+                "run on schedule",
+                MissionCadence::Cron {
+                    expression: "*/5 * * * *".into(),
+                    timezone: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .expect("create cron mission");
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert!(mission.next_fire_at.is_some_and(|next| next > before));
+    }
+
+    #[tokio::test]
+    async fn invalid_cron_mission_is_not_persisted() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+
+        let result = mgr
+            .create_mission(
+                project_id,
+                "test-user",
+                "invalid schedule",
+                "never persist",
+                MissionCadence::Cron {
+                    expression: "not a cron expression".into(),
+                    timezone: None,
+                },
+                Vec::new(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(EngineError::Effect { .. })));
+        assert!(
+            store
+                .list_missions(project_id, "test-user")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let sub_minute = mgr
+            .create_mission(
+                project_id,
+                "test-user",
+                "too frequent",
+                "reject unsupported resolution",
+                MissionCadence::Cron {
+                    expression: "*/10 * * * * *".into(),
+                    timezone: None,
+                },
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(sub_minute, Err(EngineError::Effect { .. })));
+    }
+
+    #[tokio::test]
+    async fn cron_mission_validates_timezone() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+
+        let valid = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "zoned schedule",
+                "run in local time",
+                MissionCadence::Cron {
+                    expression: "0 9 * * *".into(),
+                    timezone: Some("America/New_York".into()),
+                },
+                Vec::new(),
+            )
+            .await
+            .expect("valid IANA timezone");
+        assert!(
+            mgr.get_mission(valid)
+                .await
+                .unwrap()
+                .unwrap()
+                .next_fire_at
+                .is_some()
+        );
+
+        let invalid = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "bad timezone",
+                "reject invalid timezone",
+                MissionCadence::Cron {
+                    expression: "0 9 * * *".into(),
+                    timezone: Some("Mars/Olympus_Mons".into()),
+                },
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(invalid, Err(EngineError::Effect { .. })));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_repairs_missing_cron_next_fire_at() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let mission = Mission::new(
+            project_id,
+            "test-user",
+            "legacy cron",
+            "repair schedule",
+            MissionCadence::Cron {
+                expression: "0 * * * *".into(),
+                timezone: None,
+            },
+        );
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        assert_eq!(mgr.bootstrap_project(project_id).await.unwrap(), 1);
+
+        let repaired = mgr.get_mission(id).await.unwrap().unwrap();
+        assert!(repaired.next_fire_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn cadence_update_recomputes_next_fire_at() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "change cadence",
+                "change safely",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        mgr.update_mission(
+            id,
+            "test-user",
+            MissionUpdate {
+                cadence: Some(MissionCadence::Cron {
+                    expression: "0 * * * *".into(),
+                    timezone: None,
+                }),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            mgr.get_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .next_fire_at
+                .is_some()
+        );
+
+        mgr.update_mission(
+            id,
+            "test-user",
+            MissionUpdate {
+                cadence: Some(MissionCadence::Manual),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mgr.get_mission(id).await.unwrap().unwrap().next_fire_at,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn pause_and_resume() {
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
@@ -1865,11 +2227,52 @@ mod tests {
         mgr.pause_mission(id, "test-user").await.unwrap();
         let mission = mgr.get_mission(id).await.unwrap().unwrap();
         assert_eq!(mission.status, MissionStatus::Paused);
+        assert!(
+            mgr.fire_mission(id, "test-user", None)
+                .await
+                .unwrap()
+                .is_none(),
+            "paused mission must not spawn a thread"
+        );
 
         // Resume
         mgr.resume_mission(id, "test-user").await.unwrap();
         let mission = mgr.get_mission(id).await.unwrap().unwrap();
         assert_eq!(mission.status, MissionStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn resume_cron_mission_recomputes_next_fire_at() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "resume cron",
+                "resume safely",
+                MissionCadence::Cron {
+                    expression: "0 * * * *".into(),
+                    timezone: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        mgr.pause_mission(id, "test-user").await.unwrap();
+        store
+            .missions
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .next_fire_at = None;
+
+        mgr.resume_mission(id, "test-user").await.unwrap();
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.status, MissionStatus::Active);
+        assert!(mission.next_fire_at.is_some_and(|next| next > Utc::now()));
     }
 
     #[tokio::test]
@@ -1980,7 +2383,7 @@ mod tests {
                 "cron mission",
                 "periodic goal",
                 MissionCadence::Cron {
-                    expression: "* * * * *".into(),
+                    expression: "0 * * * *".into(),
                     timezone: None,
                 },
                 Vec::new(),
@@ -2007,6 +2410,82 @@ mod tests {
         assert!(
             mission.thread_history.contains(&spawned[0]),
             "spawned thread should be recorded in mission history"
+        );
+        assert!(
+            mission.next_fire_at.is_some_and(|next| next > Utc::now()),
+            "fired cron mission should advance its schedule"
+        );
+
+        let duplicate = mgr.tick("test-user").await.unwrap();
+        assert!(
+            duplicate.is_empty(),
+            "cron mission must not fire again before its next occurrence"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_blocked_cron_advances_instead_of_spinning() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "budgeted cron",
+                "run when budget allows",
+                MissionCadence::Cron {
+                    expression: "0 * * * *".into(),
+                    timezone: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        {
+            let mut missions = store.missions.write().await;
+            let mission = missions.get_mut(&id).unwrap();
+            mission.max_threads_per_day = 1;
+            mission.threads_today = 1;
+            mission.next_fire_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        }
+
+        assert!(mgr.tick("test-user").await.unwrap().is_empty());
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert!(mission.next_fire_at.is_some_and(|next| next > Utc::now()));
+        assert!(mgr.tick("test-user").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_fire_preserves_cron_schedule() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "manual cron fire",
+                "do not shift schedule",
+                MissionCadence::Cron {
+                    expression: "0 * * * *".into(),
+                    timezone: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let scheduled = mgr.get_mission(id).await.unwrap().unwrap().next_fire_at;
+
+        assert!(
+            mgr.fire_mission(id, "test-user", None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(
+            mgr.get_mission(id).await.unwrap().unwrap().next_fire_at,
+            scheduled
         );
     }
 
@@ -2539,6 +3018,117 @@ mod tests {
             t2.is_none(),
             "second fire should be blocked by daily budget"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_fires_serialize_budget_and_history_updates() {
+        let store = Arc::new(TestStore::with_mission_load_delay(Duration::from_millis(
+            25,
+        )));
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "concurrent fire",
+                "run once per day",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        store
+            .missions
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .max_threads_per_day = 1;
+
+        let (first, second) = tokio::join!(
+            mgr.fire_mission(id, "test-user", None),
+            mgr.fire_mission(id, "test-user", None)
+        );
+        let fired = [first.unwrap(), second.unwrap()]
+            .into_iter()
+            .filter(Option::is_some)
+            .count();
+        assert_eq!(fired, 1, "daily budget must be checked atomically");
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.threads_today, 1);
+        assert_eq!(mission.thread_history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn daily_budget_resets_on_new_utc_day() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager_with_response(Arc::clone(&store) as Arc<dyn Store>, "done");
+
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "daily reset",
+                "run again tomorrow",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        {
+            let mut missions = store.missions.write().await;
+            let mission = missions.get_mut(&id).unwrap();
+            mission.max_threads_per_day = 1;
+            mission.threads_today = 1;
+            mission.threads_today_date = Some(
+                Utc::now()
+                    .date_naive()
+                    .pred_opt()
+                    .expect("today should have a predecessor"),
+            );
+        }
+
+        let fired = mgr.fire_mission(id, "test-user", None).await.unwrap();
+        assert!(fired.is_some(), "new UTC day should restore daily budget");
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.threads_today, 1);
+        assert_eq!(mission.threads_today_date, Some(Utc::now().date_naive()));
+    }
+
+    #[tokio::test]
+    async fn legacy_budget_count_is_preserved_on_first_fire() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "legacy budget",
+                "preserve existing count",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        {
+            let mut missions = store.missions.write().await;
+            let mission = missions.get_mut(&id).unwrap();
+            mission.max_threads_per_day = 1;
+            mission.threads_today = 1;
+            mission.threads_today_date = None;
+        }
+
+        let fired = mgr.fire_mission(id, "test-user", None).await.unwrap();
+        assert!(
+            fired.is_none(),
+            "upgrade must not grant extra same-day budget"
+        );
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.threads_today, 1);
+        assert_eq!(mission.threads_today_date, Some(Utc::now().date_naive()));
     }
 
     // ── Multi-tenancy tests ────────────────────────────────────
