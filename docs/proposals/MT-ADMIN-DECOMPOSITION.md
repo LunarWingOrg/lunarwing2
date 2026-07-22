@@ -1,10 +1,15 @@
 # Decomposing `lunarwing-mt-admin.sh` — Proposal
 
-> **Current status (2026-07-21, rev `HEAD`): PROPOSAL — not yet implemented.**
+> **Current status (2026-07-22, rev `HEAD`): PROPOSAL — reviewed, ready for implementation.**
 > This is a design document. No code changes are made in this proposal; it
 > describes how the monolithic multi-tenant admin script could be broken into
 > at least four separately-sourced bash libraries, and what the migration
 > path looks like.
+>
+> **Review history:** Reviewed in `docs/ops/KUMOGAKURE_RECENT_REV_T.md`
+> (2026-07-21). Verdict: "solid proposal, ready for sun to greenlight
+> implementation." This revision incorporates the review feedback (see
+> §5.1 Test Surface, §10.1 Updated Recommendations, and the 3a/3b note in §4).
 
 **Date:** 2026-07-21
 **Origin:** Item #14 of `docs/ops/AGENT_GOALS_2.0.2.0.md` — "refactor mt admin idea. write up a doc on how we can break mt admin setup monolithic megascript (8000 lines of bash rn) into AT LEAST FOUR SEPERATE PARTS. put it in docs/proposals".
@@ -137,6 +142,17 @@ the shared composition root rather than to each other, and keeping them
 separate makes init-system-specific edits far easier to review. That brings
 the total to **five** (or **six** if `tenant-lifecycle.sh` is extracted too),
 comfortably satisfying the "AT LEAST FOUR" requirement.
+
+**3a/3b counting confirmation (per review feedback):** The
+`KUMOGAKURE_RECENT_REV_T.md` review flagged this as "worth confirming sun
+agrees that 3a/3b count separately." The justification is structural: the
+two renderers share zero code with each other — every coupling they have is
+to the composition root, never cross-init-system. They are independently
+testable (you can exercise the systemd renderer without an OpenRC host and
+vice versa) and independently revertible. Splitting a single `units.sh`
+along the same seam would be equivalent in line count but worse in
+reviewability (the PR diff would mix both init systems' heredocs). Therefore
+3a/3b counting as two parts is the correct framing, not a padding trick.
 
 After the required splits, the composition root
 (`lunarwing-mt-admin.sh`) shrinks from ~7500 lines to **~4700 lines**:
@@ -321,6 +337,100 @@ because it has the clearest independent test surface.
 
 ---
 
+## 5.1 Test Surface and Shellcheck Scoping (added per review feedback)
+
+> **Review note:** "No mention of how `shellcheck` scoping or a test harness
+> would attach to the new libraries — that's the stated motivation (§2.1) but
+> the proposal doesn't sketch the test surface. Worth a follow-up section
+> before implementation begins." — `KUMOGAKURE_RECENT_REV_T.md`
+
+The decomposition is the *enabler* for per-library testing, not the test
+harness itself. This section sketches what that test surface looks like so
+implementers know what to build in the follow-up PRs.
+
+### Shellcheck scoping
+
+Today, `shellcheck` runs against the entire 7500-line monolith. Any warning
+in an OpenRC heredoc blocks linting of unrelated code. After the split:
+
+```bash
+# Scoped lint per library:
+shellcheck ic/scripts/mt-admin-lib/ports-registry.sh
+shellcheck ic/scripts/mt-admin-lib/env-generation.sh
+shellcheck ic/scripts/mt-admin-lib/units-systemd.sh
+shellcheck ic/scripts/mt-admin-lib/units-openrc.sh
+shellcheck ic/scripts/mt-admin-lib/health-pipeline.sh   # optional
+
+# Full-file lint (catches cross-library issues):
+shellcheck ic/scripts/lunarwing-mt-admin.sh
+```
+
+Each library should carry a top-level `# shellcheck shell=bash` directive and
+a `# shellcheck disable=SC2317` banner (functions are only called from the
+dispatcher in a different file). A CI rule can lint each library independently
+and report failures scoped to the library, not the monolith.
+
+### bats test harness (follow-up, not part of the split PRs)
+
+The natural test surface per library:
+
+| Library | Testable in isolation? | Mock requirements |
+|---|---|---|
+| `ports-registry.sh` | **Yes — highest priority.** Pure data layer. | Fake `PORTS_REGISTRY` temp file, `jq` (real binary). Test every migration step v2→v11, allocation, deallocation, feature-flag reads. |
+| `env-generation.sh` | **Yes.** Heredoc output is deterministic for fixed inputs. | Mock `ports_get`, `tenant_*_enabled`, `tenant_pg_password` by sourcing fakes before the lib. Byte-diff generated env files against golden fixtures. |
+| `units-systemd.sh` | **Partial.** Rendering is testable; start/stop/uninstall require a real systemd user manager. | Render to temp files; assert heredoc output. Skip lifecycle tests unless running under `systemd-run --user`. |
+| `units-openrc.sh` | **Partial.** Same as systemd — rendering testable, lifecycle not. | Render to temp files; assert. Cannot run on the dev VM (no OpenRC). |
+| `health-pipeline.sh` | **Yes.** Install surface is file-ops + systemctl/rc-update stubs. | Mock `INIT_SYSTEM`, stub `systemctl`/`rc-update` with no-op wrappers. |
+
+**Suggested test layout:**
+
+```
+ic/scripts/tests/
+├── mt-admin-lib/
+│   ├── ports-registry.bats         # migration ladder, alloc/dealloc, feature flags
+│   ├── env-generation.bats         # byte-diff against golden env files
+│   ├── units-systemd.bats          # heredoc output assertions
+│   ├── units-openrc.bats           # heredoc output assertions (render-only)
+│   └── health-pipeline.bats        # install surface (stubbed init)
+└── fixtures/
+    ├── ports-v1.json               # pre-migration registry snapshots
+    ├── ports-v11.json              # post-migration expected state
+    ├── golden-lunarwing.env        # expected env output for a fixed tenant
+    └── golden-systemd-unit.service # expected rendered unit
+```
+
+**The split PRs themselves should not include the test harness** — they are
+pure code moves. The test harness lands as a separate follow-up PR after the
+four splits are merged and the sourcing pattern is proven stable.
+
+### Symbol-availability self-check
+
+Per review suggestion (§11 Q3), a `mt-admin selfcheck` subcommand can verify
+all expected library symbols are defined after sourcing:
+
+```bash
+# Inside lunarwing-mt-admin.sh, after all libraries are sourced:
+mt_selfcheck() {
+  local missing=0
+  for fn in ports_registry_init ports_migrate ports_allocate ports_get \
+            ports_deallocate ports_list write_tenant_lunarwing_env \
+            render_tenant_systemd_units _systemctl_user start_tenant_systemd \
+            render_tenant_openrc_units start_tenant_openrc \
+            ensure_health_pipeline; do
+    if ! declare -f "$fn" >/dev/null 2>&1; then
+      say "MISSING: $fn"
+      missing=$((missing + 1))
+    fi
+  done
+  [[ "$missing" -eq 0 ]] || die "selfcheck: $missing function(s) not defined after sourcing"
+  say "selfcheck: all expected symbols present"
+}
+```
+
+This catches load-order regressions cheaply and can be wired into `doctor`.
+
+---
+
 ## 6. Sourcing Strategy and Migration Path
 
 ### 6.1 Source order
@@ -470,13 +580,37 @@ act on later. **Do not bundle them into the decomposition PRs.**
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Number of parts | **Five** (3a + 3b + ports + env + optional health) | Comfortably exceeds the "AT LEAST FOUR" floor; honors the author's own section banners. Counting 3a/3b separately reflects their mirror-image cohesion. |
+| Number of parts | **Five** (3a + 3b + ports + env + optional health) | Comfortably exceeds the "AT LEAST FOUR" floor; honors the author's own section banners. Counting 3a/3b separately reflects their mirror-image cohesion (see §4 confirmation note). |
 | Extraction order | ports → env → systemd → openrc | Each step has the smallest possible diff; ports is the cleanest seam to prove the sourcing pattern. |
 | Mechanism | Bash `source` of sibling files under `mt-admin-lib/` | Zero behavioral change; preserves the existing entrypoint and `LUNARWING_MT_ADMIN` override; no new runtime dependency. |
 | Composition root | `lunarwing-mt-admin.sh` keeps constants, helpers, detection, user/build, SSH, container lifecycle, tenant verbs, dispatcher | These have high inter-coupling and would create circular dependencies if split further. |
 | Rollout | Four sequential PRs, each independently revertible | Lets reviewers sign off per-part; lets OpenRC maintainers block PR 4 without blocking the first three. |
 | Post-split root size | ~4800 lines (after PR 4) | 36% reduction; remaining size is driven by legitimate container-lifecycle verbosity, not by lack of modularity. |
-| Testing | Per-library `bats`/`shellcheck` harness as a follow-up | The split is the enabler, not the test surface itself. |
+| Testing | Per-library `bats`/`shellcheck` harness as a follow-up (see §5.1) | The split is the enabler, not the test surface itself. Sketch in §5.1 defines the per-library test matrix and fixture layout. |
+
+### 10.1 Updated Recommendations (per review feedback)
+
+> **Review note:** "Phase-2 `tenant-lifecycle.sh` extraction is flagged
+> optional; given it's the 1301-line dispatcher + verbs, it's where the real
+> reviewability win is. Recommend not deferring it indefinitely." —
+> `KUMOGAKURE_RECENT_REV_T.md`
+
+**`tenant-lifecycle.sh` should be prioritized as PR 5, not indefinitely
+deferred.** The 1301-line high-level tenant verbs + dispatcher block
+(L6202–7502) is the single largest remaining chunk after the four required
+splits. It is where the most cross-referencing happens (every `add_tenant`
+call touches ports, env, units, health) and therefore where the
+reviewability win is greatest. Recommendation:
+
+- **PR 5 (post-required-splits):** Extract `tenant-lifecycle.sh` containing
+  `add_tenant`, `start_tenant`, `stop_tenant`, `restart_tenant`,
+  `upgrade_tenant`, `status_tenant`, `list_tenants`, `doctor`, and the
+  `usage()` heredoc. This shrinks the root to ~3400 lines.
+- **`main()` dispatcher** stays in the root (it is 522 lines of arg-parsing
+  + case-dispatch and is tightly coupled to the usage text). A future
+  per-subcommand lookup (§8 item 6) can address it separately.
+- This PR should land **after** the four required splits are proven stable,
+  so the sourcing pattern is battle-tested before the largest extraction.
 
 ---
 
@@ -492,11 +626,15 @@ These do not block the proposal but should be resolved before PR 1 lands:
 2. Should the libraries be made executable (with a `die "sourced only"`
    guard when run directly) or kept as `0644`? Lean toward `0644` with a
    banner.
-3. Should we add a top-level `mt-admin selfcheck` subcommand that verifies
+3. ~~Should we add a top-level `mt-admin selfcheck` subcommand that verifies
    all expected library symbols are defined after sourcing? Would catch
-   load-order regressions cheaply.
+   load-order regressions cheaply.~~ **Resolved:** Yes — see the `mt_selfcheck`
+   sketch in §5.1. Wire it into `doctor` as a post-sourcing assertion.
 
 ---
 
 **End of proposal.** No code is changed by this document. Implementation is
-tracked separately as four PRs per §6.2.
+tracked separately as four sequential PRs per §6.2 (plus optional PR 5 for
+`tenant-lifecycle.sh` per §10.1). The test harness (§5.1) lands as a
+follow-up after the splits are proven stable.
+

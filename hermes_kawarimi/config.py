@@ -37,7 +37,6 @@ class ImportPlan:
     with_vision: bool = False
     tensorzero_url: str = ""
     llm_model: str = ""
-    auto_yes: bool = True
 
     def validate(self) -> str | None:
         if not self.tenant.strip():
@@ -67,7 +66,6 @@ class ImportPlan:
             "with_vision": self.with_vision,
             "tensorzero_url": self.tensorzero_url,
             "llm_model": self.llm_model,
-            "auto_yes": self.auto_yes,
         }
 
     def to_json(self, path: str | Path) -> None:
@@ -93,7 +91,6 @@ class ImportPlan:
             with_vision=_bool(data.get("with_vision", False)),
             tensorzero_url=_str(data.get("tensorzero_url", "")),
             llm_model=_str(data.get("llm_model", "")),
-            auto_yes=_bool(data.get("auto_yes", True)),
         )
 
     @classmethod
