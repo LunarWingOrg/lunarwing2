@@ -1,7 +1,7 @@
 # Hermes → LunarWing Kawarimi Adapter — Proposal & Implementation
 
-**Status:** Phase 1 implemented (v0.1.0) · **Package:** `hermes_kawarimi/` ·
-**Date:** 2026-07-20
+**Status:** Phase 1 + review hardening (v0.2.0) · **Package:** `hermes_kawarimi/` ·
+**Date:** 2026-07-22
 
 > A Kawarimi adapter that imports a Hermes agent into a LunarWing tenant.
 > Read-only path (`inspect`, dry-run `import`) is implemented, unit-tested, and
@@ -118,8 +118,8 @@ runtime), `lunarwing_mt_onboard.provisioner` (mt-admin wrappers, `PhaseResult`),
 ## 6. Verification
 
 - **Unit (no root/DB) — passing:**
-  `python3 -m unittest hermes_kawarimi.model_tests hermes_kawarimi.extract_tests hermes_kawarimi.mapper_tests`
-  (12 tests; the config test skips when pyyaml is absent).
+  `python3 -m unittest hermes_kawarimi.model_tests hermes_kawarimi.extract_tests hermes_kawarimi.mapper_tests hermes_kawarimi.config_tests hermes_kawarimi.loader_tests`
+  (30 tests; the config test skips when pyyaml is absent).
 - **Dry-run — smoke-tested:** `inspect` and `import` (without `--apply`) render a
   correct migration report against a synthetic `$HERMES_HOME` and write nothing.
 - **End-to-end (pending rehearsal on a LunarWing host, root + throwaway tenant):**
@@ -131,6 +131,20 @@ runtime), `lunarwing_mt_onboard.provisioner` (mt-admin wrappers, `PhaseResult`),
 
 - **Phase 1 — DONE:** package scaffold, extractor, mapper, loader, `ImportPlan`,
   CLI (`inspect` + dry-run/apply `import`), unit tests, docs.
+- **Phase 1 review hardening (v0.2.0) — DONE:** addressed all 6 concerns from
+  `KUMOGAKURE_RECENT_REV_T.md`:
+  1. Documented the agent_id=NULL upsert assumption in `_populate` (comment).
+  2. Verified `secrets_ops.insert_secret` is already an upsert (ON CONFLICT
+     DO UPDATE) — no code change needed, added clarifying docstring.
+  3. Made `_SCHEMA_WAIT_SECONDS` configurable via `KAWARIMI_SCHEMA_WAIT_SECONDS`
+     env var (default 90, tunable for slow hosts).
+  4. Removed the dead `auto_yes` field from `ImportPlan`.
+  5. Wired `with_toolchains` into `build-tenant` args (it belongs there, not
+     `add-tenant`). `with_vision` fails closed in preflight (mt-admin has no
+     such flag — vision provisioning is manual post-import).
+  6. `_message_content` coalescing is correct for v1 (NOT NULL constraint).
+  Added `config_tests.py` (7 tests) and `loader_tests.py` (11 tests) covering
+  the new wiring. Total: 30 unit tests, all passing.
 - **Phase 2 — deferred:** `kanban.db` → `agent_jobs`; Hermes `skills/`
   (executable) → LunarWing wasm tools; `memory_chunks` embeddings (regenerate
   in-runtime); libsql tenants; state-dir/workspace file copy; interactive wizard;
