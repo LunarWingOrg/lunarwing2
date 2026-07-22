@@ -67,7 +67,7 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
     - Native execution on an `aarch64` host was not available in this worktree; the shared architecture path and resource calculations are covered by the shell harness.
     </details>
     
-19. [x] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
+19. [ ] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
     <details>
     <summary><b>✅ DONE (verified 2026-07-21) — Foundational: first-class host-local stdio MCP installation</b></summary>
     Confirmed present in code with references:
@@ -113,14 +113,16 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
     </details>
 20. [ ] dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the branch: rarity/item-20-20260722-1501
 21. [x] update onboard ui to correspond with changes in codebase since v2.0.0.0 - surely some things have been broken at this point - in particular, kawarimi is likely broken now due to new 7z encryption
-22. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
-23. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
-24. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
-25. [ ] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
-26. [ ] update docs/README.md
-27. [ ] update README.md at repo root
-28. [ ] come up with codename ideas for release
-29. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.2.0 explaining all relevant changes since v2.0.1.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.2.0.md and should be written to the ROOT of the repo
-30. [ ] Improve accuracy of RELEASE-v2.0.2.0.md
+22. [ ] review recent changes in onboard ui
+23. [ ] review darkirc key exchange implementation
+24. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
+25. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+26. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
+27. [ ] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
+28. [ ] update docs/README.md
+29. [ ] update README.md at repo root
+30. [ ] come up with codename ideas for release
+31. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.2.0 explaining all relevant changes since v2.0.1.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.2.0.md and should be written to the ROOT of the repo
+32. [ ] Improve accuracy of RELEASE-v2.0.2.0.md
 
 ---
