@@ -47,6 +47,77 @@ async def _ensure_removed(base_url, name):
         await api_post(base_url, f"/api/extensions/{name}/remove", timeout=30)
 
 
+async def test_stdio_mcp_failed_activation_lifecycle(lunarwing_server, tmp_path):
+    """Install, list, report activation failure, deactivate, and remove stdio MCP."""
+    name = "missing-stdio-mcp"
+    command = str(tmp_path / "missing-mcp-command")
+    await _ensure_removed(lunarwing_server, name)
+
+    try:
+        r = await api_post(
+            lunarwing_server,
+            "/api/extensions/install",
+            json={
+                "name": name,
+                "kind": "mcp_server",
+                "transport": "stdio",
+                "command": command,
+                "args": ["--stdio"],
+                "env": {"LOG_LEVEL": "warn"},
+            },
+            timeout=30,
+        )
+        assert r.status_code == 200
+        assert r.json().get("success") is True, f"Install failed: {r.json()}"
+
+        ext = await _get_extension(lunarwing_server, name)
+        assert ext is not None, "installed stdio MCP should appear in list"
+        assert ext["kind"] == "mcp_server"
+        assert ext["transport"] == "stdio"
+        assert ext["command"] == command
+        assert ext["active"] is False
+
+        r = await api_post(
+            lunarwing_server,
+            f"/api/extensions/{name}/activate",
+            timeout=30,
+        )
+        assert r.status_code == 200
+        activation = r.json()
+        assert activation.get("success") is False
+        assert activation.get("message", "").startswith("Activation failed:")
+        assert command in activation["message"]
+
+        ext = await _get_extension(lunarwing_server, name)
+        assert ext is not None, "failed activation must preserve configuration"
+        assert ext["active"] is False
+        assert ext["enabled"] is True
+        assert ext.get("tools", []) == []
+
+        r = await api_post(
+            lunarwing_server,
+            f"/api/extensions/{name}/deactivate",
+            timeout=30,
+        )
+        assert r.status_code == 200
+        assert r.json().get("success") is True, f"Deactivate failed: {r.json()}"
+        ext = await _get_extension(lunarwing_server, name)
+        assert ext is not None, "deactivation must preserve configuration"
+        assert ext["active"] is False
+        assert ext["enabled"] is False
+
+        r = await api_post(
+            lunarwing_server,
+            f"/api/extensions/{name}/remove",
+            timeout=30,
+        )
+        assert r.status_code == 200
+        assert r.json().get("success") is True, f"Remove failed: {r.json()}"
+        assert await _get_extension(lunarwing_server, name) is None
+    finally:
+        await _ensure_removed(lunarwing_server, name)
+
+
 # ── Section A: Install MCP Server ────────────────────────────────────────
 
 
