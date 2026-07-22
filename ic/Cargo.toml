@@ -66,6 +66,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 dotenvy = "0.15"
 toml = "0.8"
 
+# Capability-scoped filesystem access for tenant key state.
+cap-std = "3.4.5"
+cap-fs-ext = "3.4.5"
+
 # Core types
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -151,6 +155,7 @@ russh = { version = "0.62", default-features = false, features = ["flate2", "rin
 sha2 = "0.10"
 blake3 = "1"
 rand = "0.8"
+bs58 = "0.5.1"
 subtle = "2"  # Constant-time comparisons for token validation
 
 # Multi-provider LLM support

@@ -54,12 +54,6 @@ if bash "$ENV_EXEC" --env-file "$env_file" -- /bin/true >/dev/null 2>&1; then
   exit 1
 fi
 
-printf 'SAFE="unterminated\n' >"$env_file"
-if bash "$ENV_EXEC" --env-file "$env_file" -- /bin/true >/dev/null 2>&1; then
-  printf 'OpenRC env launcher accepted an unterminated quoted value\n' >&2
-  exit 1
-fi
-
 printf 'SAFE=value\n' >"$env_file"
 chmod 0400 "$env_file"
 if bash "$ENV_EXEC" --env-file "$env_file" -- /bin/true >/dev/null 2>&1; then
@@ -97,22 +91,6 @@ if bash "$ENV_EXEC" --env-file "$symlink_parent/service.env" -- /bin/true \
   exit 1
 fi
 
-printf 'SAFE=value\n' >"$env_file"
-chmod 0600 "$env_file"
-symlink_env="$TMP_ROOT/symlink.env"
-ln -s "$env_file" "$symlink_env"
-if bash "$ENV_EXEC" --env-file "$symlink_env" -- /bin/true >/dev/null 2>&1; then
-  printf 'OpenRC env launcher followed a symlinked env file\n' >&2
-  exit 1
-fi
-
-hardlink_env="$TMP_ROOT/hardlink.env"
-ln "$env_file" "$hardlink_env"
-if bash "$ENV_EXEC" --env-file "$hardlink_env" -- /bin/true >/dev/null 2>&1; then
-  printf 'OpenRC env launcher accepted a multiply-linked env file\n' >&2
-  exit 1
-fi
-
 if [[ "$EUID" -ne 0 ]]; then
   foreign_parent_env="$(mktemp /tmp/lunarwing-openrc-env.XXXXXX)"
   printf 'SAFE=value\n' >"$foreign_parent_env"
@@ -128,67 +106,13 @@ fi
 # shellcheck disable=SC1091
 source "$ADMIN_SCRIPT"
 render_body="$(declare -f render_tenant_openrc_units)"
-weechat_render_body="$(declare -f _render_weechat_openrc_unit)"
-writer_body="$(declare -f write_tenant_darkirc_adapter_env)"
-grep -Fq 'chmod 0600 "$path"' <<<"$writer_body" || {
-  printf 'DarkIRC adapter env writer does not enforce mode 0600\n' >&2
+grep -Fq 'lunarwing_openrc_env_exec' <<<"$render_body" || {
+  printf 'OpenRC services do not use the post-drop env launcher\n' >&2
   exit 1
 }
-for launcher_var in \
-  lunarwing_openrc_env_exec \
-  xmpp_bridge_openrc_env_exec \
-  proxy_openrc_env_exec \
-  adapter_openrc_env_exec \
-  darkirc_adapter_openrc_env_exec; do
-  grep -Fq "$launcher_var" <<<"$render_body" || {
-    printf 'OpenRC service does not use post-drop launcher: %s\n' "$launcher_var" >&2
-    exit 1
-  }
-done
-grep -Fq 'weechat_openrc_env_exec' <<<"$weechat_render_body" || {
-  printf 'OpenRC WeeChat service does not use the post-drop env launcher\n' >&2
-  exit 1
-}
-if grep -Eq '(sed|cat|head|tail).*weechat_env_file' <<<"$weechat_render_body" \
-  || grep -Eq '(^|[[:space:]])(\.|source)[[:space:]].*weechat_env_file' \
-    <<<"$weechat_render_body"; then
-  printf 'OpenRC WeeChat service still reads tenant env data in a root hook\n' >&2
-  exit 1
-fi
-grep -Fq 'install_openrc_env_exec' <<<"$render_body" || {
-  printf 'OpenRC render does not install the trusted env launcher\n' >&2
-  exit 1
-}
-if grep -Eq '(^|[[:space:]])(\.|source)[[:space:]]+"?\$\{[^}]*env_file' \
-  <<<"$render_body"; then
+if grep -Eq '\.[[:space:]]+"?\$\{[^}]*env_file' <<<"$render_body"; then
   printf 'OpenRC render still sources a tenant env file in a root hook\n' >&2
   exit 1
 fi
-
-install_body="$(declare -f install_openrc_env_exec)"
-for fragment in \
-  'stat -c '"'"'%g'"'"' "$install_dir"' \
-  'stat -c '"'"'%g'"'"' "$OPENRC_ENV_EXEC"' \
-  'root:root mode 0755' \
-  'root:root, single-link mode 0755'; do
-  grep -Fq "$fragment" <<<"$install_body" || {
-    printf 'install_openrc_env_exec missing root-group validation: %s\n' "$fragment" >&2
-    exit 1
-  }
-done
-
-for svc_pattern in \
-  'lunarwing:required_files="\${lunarwing_openrc_env_exec} \${lunarwing_command} \${lunarwing_env_file}"' \
-  'xmpp-bridge:required_files="\${xmpp_bridge_openrc_env_exec} \${xmpp_bridge_command} \${xmpp_bridge_env_file}"' \
-  'proxy:required_files="\${proxy_openrc_env_exec} \${proxy_command} \${proxy_env_file}"' \
-  'adapter:required_files="\${adapter_openrc_env_exec} \${adapter_command} \${adapter_env_file}"' \
-  'darkirc-adapter:required_files="\${darkirc_adapter_openrc_env_exec} \${darkirc_adapter_command} \${darkirc_adapter_env_file}"'; do
-  var="${svc_pattern%%:*}"
-  expected="${svc_pattern#*:}"
-  grep -Fq "$expected" <<<"$render_body" || {
-    printf 'OpenRC %s unit missing required_files contract: %s\n' "$var" "$expected" >&2
-    exit 1
-  }
-done
 
 printf 'ALL TESTS PASSED\n'

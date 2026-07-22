@@ -21,15 +21,29 @@ BUILD_LOCK="/var/lock/lunarwing-build.lock"
 PORTS_LOCK_HELD="false"
 PROFILE="${LUNARWING_MT_PROFILE:-release}"
 SOURCE_REPO="${LUNARWING_MT_SOURCE_REPO:-$LUNARWING_ROOT}"
-DARKIRC_SOURCE="${LUNARWING_MT_DARKIRC_SOURCE:-}"
-DARKIRC_BIN="${LUNARWING_MT_DARKIRC_BIN:-/usr/local/bin/darkirc}"
-# darkfi source for build-darkirc auto-clone. The source is cloned + built as the
-# tenant (or invoking) user, never root, so there are no root-owned artifacts and
-# the user's own rust toolchain is used. Override for a pinned rev or local mirror.
-DARKIRC_REPO="${LUNARWING_MT_DARKIRC_REPO:-https://github.com/darkrenaissance/darkfi}"
-DARKIRC_REV="${LUNARWING_MT_DARKIRC_REV:-a05956d412a091e8b54c1cd4f4264c33b941203d}"
+# The shared daemon and its attestation are fixed root-owned trust anchors.
+# Caller-controlled destinations would turn a root build/install into an
+# arbitrary-path write and would make service units attest one binary but run
+# another.
+DARKIRC_BIN="/usr/local/bin/darkirc"
+DARKIRC_BUILD_ROOT="/var/cache/lunarwing/darkirc-build"
+DARKIRC_TRUSTED_PATH="/usr/bin:/bin"
+DEFAULT_DARKIRC_KEY_HELPER="${LUNARWING_MT_DARKIRC_KEY_HELPER:-}"
+DARKIRC_KEY_HELPER_BIN="/usr/local/libexec/lunarwing-darkirc-key-helper"
+DARKIRC_KEY_HELPER_BUILD_ROOT="/var/cache/lunarwing/darkirc-key-helper-target"
 OPENRC_ENV_EXEC_SRC="$SCRIPT_DIR/lunarwing-openrc-env-exec.sh"
 OPENRC_ENV_EXEC="/usr/local/libexec/lunarwing-openrc-env-exec"
+# The Rust helper owns the tenant-state lock.  This root-owned companion lock
+# only serializes mt-admin's non-config DarkIRC writers and never follows a
+# tenant-controlled path. Keep it fixed: root must not honor a caller-supplied
+# lock directory from the environment.
+DARKIRC_WRITER_LOCK_ROOT="/run/lunarwing"
+DARKIRC_COMPAT_FILE="/etc/lunarwing/darkirc-compat.json"
+DARKIRC_COMPAT_ARGS=()
+# The shared binary is built only from this fixed upstream revision. Neither a
+# tenant environment nor the root caller can redirect the privileged build.
+DARKIRC_REPO="https://github.com/darkrenaissance/darkfi"
+DARKIRC_REV="a05956d412a091e8b54c1cd4f4264c33b941203d"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 DEFAULT_TENSORZERO_URL="${LUNARWING_MT_TENSORZERO_URL:-http://192.168.1.157:3000/openai/v1}"
 # Fleet-wide default VL (vision-language) backend URL the OCR sidecar proxies to.
@@ -140,6 +154,520 @@ tenant_state_dir() { printf '%s/state' "$(tenant_lw_root "$1")"; }
 tenant_log_dir() { printf '%s/logs' "$(tenant_lw_root "$1")"; }
 tenant_run_dir() { printf '%s/run' "$(tenant_lw_root "$1")"; }
 
+# Check every existing component without resolving or following symlinks.  The
+# final component may be absent when a tenant is being provisioned; callers
+# create it only after this guard and re-check before invoking the typed helper.
+darkirc_path_components_safe() {
+  local path="$1" rest component current="/"
+  [[ "$path" == /* ]] || return 1
+  rest="${path#/}"
+  while [[ -n "$rest" ]]; do
+    component="${rest%%/*}"
+    if [[ "$rest" == */* ]]; then
+      rest="${rest#*/}"
+    else
+      rest=""
+    fi
+    [[ -n "$component" ]] || return 1
+    [[ "$component" != . && "$component" != .. ]] || return 1
+    current="${current%/}/$component"
+    [[ -L "$current" ]] && return 1
+    [[ -e "$current" && ! -d "$current" ]] && return 1
+  done
+  return 0
+}
+
+darkirc_prepare_tenant_dirs() {
+  local name="$1" state_dir config_dir datastore_dir path
+  state_dir="$(tenant_state_dir "$name")"
+  config_dir="$state_dir/darkirc"
+  datastore_dir="$config_dir/datastore"
+  for path in "$state_dir" "$config_dir" "$datastore_dir"; do
+    darkirc_path_components_safe "$path" \
+      || die "unsafe DarkIRC state path for tenant '$name': $path"
+  done
+  # Creation and mode changes happen under the tenant identity.  A tenant can
+  # therefore not use a symlink to make a root process mutate another tenant's
+  # files; the Rust helper performs the final no-follow validation as well.
+  sudo -u "$name" mkdir -p "$config_dir" "$datastore_dir" \
+    || die "could not create DarkIRC state directories for '$name'"
+  sudo -u "$name" chmod 0700 "$config_dir" "$datastore_dir" \
+    || die "could not secure DarkIRC state directories for '$name'"
+  for path in "$state_dir" "$config_dir" "$datastore_dir"; do
+    darkirc_path_components_safe "$path" \
+      || die "unsafe DarkIRC state path for tenant '$name': $path"
+  done
+  [[ -d "$config_dir" && ! -L "$config_dir" ]] \
+    || die "DarkIRC config directory is not a regular directory for '$name'"
+  [[ -d "$datastore_dir" && ! -L "$datastore_dir" ]] \
+    || die "DarkIRC datastore directory is not a regular directory for '$name'"
+}
+
+darkirc_file_path_safe() {
+  local target="$1" parent="${1%/*}"
+  [[ "$target" == /* && "$target" != "$parent" ]] || return 1
+  darkirc_path_components_safe "$parent" || return 1
+  [[ ! -L "$target" && ( ! -e "$target" || -f "$target" ) ]]
+}
+
+# Write a fixed tenant-owned file without putting its contents in argv or the
+# environment.  The caller pipes the content on stdin; the tenant process
+# validates the destination, writes a same-directory 0600 candidate, and renames
+# it atomically.  This is used for adapter env files, not the TOML transaction
+# (which remains exclusively owned by the Rust helper).
+write_tenant_file_atomic() {
+  local name="$1" target="$2" mode="${3:-600}"
+  darkirc_file_path_safe "$target" \
+    || die "unsafe tenant file path: $target"
+  local parent="${target%/*}"
+  [[ -d "$parent" && ! -L "$parent" ]] \
+    || die "unsafe tenant file parent: $parent"
+  sudo -u "$name" env TARGET_PATH="$target" TARGET_MODE="$mode" bash -c '
+    set -euo pipefail
+    target="$TARGET_PATH"
+    parent="${target%/*}"
+    base="${target##*/}"
+    [[ -d "$parent" && ! -L "$parent" ]] || exit 73
+    [[ ! -L "$target" && ( ! -e "$target" || -f "$target" ) ]] || exit 73
+    if [[ -e "$target" ]]; then
+      owner="$(stat -c %u "$target" 2>/dev/null || printf "-1")"
+      [[ "$owner" == "$(id -u)" ]] || exit 73
+    fi
+    umask 077
+    tmp="$(mktemp "$parent/.${base}.next.XXXXXX")"
+    trap '\''rm -f -- "$tmp"'\'' EXIT
+    cat >"$tmp"
+    chmod "$TARGET_MODE" "$tmp"
+    mv -f -- "$tmp" "$target"
+    trap - EXIT
+  '
+}
+
+# Read one value from a tenant secret-bearing env file without ever opening the
+# file under root's credentials. The tenant-side process rejects symlinks,
+# shared hard links, unexpected ownership, and permissive modes before reading.
+read_tenant_env_value() {
+  local name="$1" target="$2" key="$3"
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid tenant env key"
+  darkirc_file_path_safe "$target" \
+    || die "unsafe tenant env path: $target"
+  sudo -u "$name" env TARGET_PATH="$target" TARGET_KEY="$key" bash -c '
+    set -euo pipefail
+    target="$TARGET_PATH"
+    parent="${target%/*}"
+    [[ -d "$parent" && ! -L "$parent" ]] || exit 73
+    uid="$(id -u)"
+    parent_owner="$(stat -c %u "$parent" 2>/dev/null || printf "-1")"
+    parent_mode="$(stat -c %a "$parent" 2>/dev/null || true)"
+    [[ "$parent_owner" == "$uid" && "$parent_mode" =~ ^[0-7]+$ ]] || exit 73
+    (( (8#$parent_mode & 077) == 0 )) || exit 73
+    [[ ! -e "$target" ]] && exit 0
+    [[ -f "$target" && ! -L "$target" ]] || exit 73
+    owner="$(stat -c %u "$target" 2>/dev/null || printf "-1")"
+    mode="$(stat -c %a "$target" 2>/dev/null || true)"
+    links="$(stat -c %h "$target" 2>/dev/null || printf "0")"
+    [[ "$owner" == "$uid" && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] || exit 73
+    (( (8#$mode & 077) == 0 && (8#$mode & 0400) != 0 )) || exit 73
+    prefix="$TARGET_KEY="
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" == "$prefix"* ]] || continue
+      printf "%s\n" "${line#"$prefix"}"
+      break
+    done <"$target"
+  '
+}
+
+# Append stdin to an existing tenant env file only when KEY is absent. The
+# complete read-copy-rename sequence runs as the tenant and the candidate stays
+# in the same owner-only directory. Exit 10 means the key already existed.
+append_tenant_env_if_missing() {
+  local name="$1" target="$2" key="$3"
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid tenant env key"
+  darkirc_file_path_safe "$target" \
+    || die "unsafe tenant env path: $target"
+  sudo -u "$name" env TARGET_PATH="$target" TARGET_KEY="$key" bash -c '
+    set -euo pipefail
+    target="$TARGET_PATH"
+    parent="${target%/*}"
+    base="${target##*/}"
+    [[ -d "$parent" && ! -L "$parent" ]] || exit 73
+    uid="$(id -u)"
+    parent_owner="$(stat -c %u "$parent" 2>/dev/null || printf "-1")"
+    parent_mode="$(stat -c %a "$parent" 2>/dev/null || true)"
+    [[ "$parent_owner" == "$uid" && "$parent_mode" =~ ^[0-7]+$ ]] || exit 73
+    (( (8#$parent_mode & 077) == 0 )) || exit 73
+    [[ -f "$target" && ! -L "$target" ]] || exit 73
+    owner="$(stat -c %u "$target" 2>/dev/null || printf "-1")"
+    mode="$(stat -c %a "$target" 2>/dev/null || true)"
+    links="$(stat -c %h "$target" 2>/dev/null || printf "0")"
+    [[ "$owner" == "$uid" && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] || exit 73
+    (( (8#$mode & 077) == 0 && (8#$mode & 0400) != 0 )) || exit 73
+    prefix="$TARGET_KEY="
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "$prefix"* ]]; then
+        cat >/dev/null
+        exit 10
+      fi
+    done <"$target"
+    umask 077
+    tmp="$(mktemp "$parent/.${base}.next.XXXXXX")"
+    trap '\''rm -f -- "$tmp"'\'' EXIT
+    cat "$target" >"$tmp"
+    cat >>"$tmp"
+    chmod 0600 "$tmp"
+    mv -f -- "$tmp" "$target"
+    trap - EXIT
+  '
+}
+
+TENANT_ENV_ENTRY_ADDED=false
+
+patch_tenant_env_entry() {
+  local name="$1" target="$2" key="$3" existing_message="$4" added_message="$5" rc
+  TENANT_ENV_ENTRY_ADDED=false
+  if append_tenant_env_if_missing "$name" "$target" "$key"; then
+    TENANT_ENV_ENTRY_ADDED=true
+    say "$added_message"
+    return 0
+  else
+    rc=$?
+  fi
+  if [[ "$rc" -eq 10 ]]; then
+    say "$existing_message"
+    return 0
+  fi
+  die "could not safely patch $key in $target"
+}
+
+darkirc_scope_id() {
+  local name="$1"
+  jq -r ".tenants[\"$name\"].darkirc_scope_id // empty" "$PORTS_REGISTRY" 2>/dev/null
+}
+
+darkirc_load_compatibility() {
+  require_cmd jq
+  require_cmd sha256sum
+  [[ -f "$DARKIRC_COMPAT_FILE" && ! -L "$DARKIRC_COMPAT_FILE" ]] \
+    || die "DarkIRC compatibility attestation is missing: $DARKIRC_COMPAT_FILE"
+  local mode owner links profile digest key_format source_revision actual
+  mode="$(stat -c '%a' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  owner="$(stat -c '%u' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  [[ "$mode" == 600 && "$owner" == 0 && "$links" == 1 ]] \
+    || die "DarkIRC compatibility attestation must be root-owned, single-link mode 0600"
+  profile="$(jq -r '.profile_id // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  digest="$(jq -r '.binary_sha256 // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  key_format="$(jq -r '.key_format // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  source_revision="$(jq -r '.source_revision // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  [[ "$(jq -r '.schema // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)" == "lunarwing.darkirc-compat/v1" ]] \
+    || die "invalid DarkIRC compatibility attestation schema"
+  [[ "$profile" == "darkfi-a05956d41-chacha-v1" ]] \
+    || die "unknown DarkIRC compatibility profile"
+  [[ "$key_format" == "darkfi-chacha-base58-32" ]] \
+    || die "unknown DarkIRC key format"
+  [[ "$source_revision" == "$DARKIRC_REV" ]] \
+    || die "unapproved DarkIRC source revision"
+  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "invalid DarkIRC binary digest in compatibility attestation"
+  darkirc_validate_root_executable "$DARKIRC_BIN" \
+    || die "attested DarkIRC binary is missing or unsafe: $DARKIRC_BIN"
+  actual="sha256:$(sha256sum "$DARKIRC_BIN" | awk '{print $1}')"
+  [[ "$actual" == "$digest" ]] \
+    || die "DarkIRC binary digest does not match the root-owned compatibility attestation"
+  DARKIRC_COMPAT_ARGS=(
+    --generator-profile "$profile"
+    --binary-sha256 "$digest"
+    --binary-path "$DARKIRC_BIN"
+    --key-format "$key_format"
+    --source-revision "$source_revision"
+  )
+}
+
+validate_darkirc_build_candidate() {
+  local candidate="$1"
+  [[ "$candidate" == "$DARKIRC_BUILD_ROOT/darkirc.candidate."* ]] \
+    || die "DarkIRC compatibility validation requires a pinned build artifact"
+  [[ -s "$candidate" ]] && darkirc_validate_root_executable "$candidate" \
+    || die "pinned DarkIRC build artifact is missing or unsafe"
+}
+
+darkirc_validate_root_directory_path() {
+  local path="$1" rest component current="/" mode owner
+  [[ "$path" == /* ]] || return 1
+  rest="${path#/}"
+  while [[ -n "$rest" ]]; do
+    component="${rest%%/*}"
+    if [[ "$rest" == */* ]]; then
+      rest="${rest#*/}"
+    else
+      rest=""
+    fi
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+    current="${current%/}/$component"
+    [[ -d "$current" && ! -L "$current" ]] || return 1
+    mode="$(stat -c '%a' "$current" 2>/dev/null || true)"
+    owner="$(stat -c '%u' "$current" 2>/dev/null || true)"
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+  done
+}
+
+prepare_darkirc_build_root() {
+  local parent parent_base path
+  parent="$(dirname "$DARKIRC_BUILD_ROOT")"
+  parent_base="$(dirname "$parent")"
+  darkirc_validate_root_directory_path "$parent_base" \
+    || die "unsafe DarkIRC build-root base: $parent_base"
+  darkirc_path_components_safe "$parent" \
+    || die "unsafe DarkIRC build-root parent: $parent"
+  if [[ ! -e "$parent" ]]; then
+    install -d -o root -g root -m 0755 "$parent"
+  fi
+  darkirc_validate_root_directory_path "$parent" \
+    || die "DarkIRC build-root parent is not root-controlled: $parent"
+  for path in "$DARKIRC_BUILD_ROOT" \
+    "$DARKIRC_BUILD_ROOT/home" "$DARKIRC_BUILD_ROOT/cargo-home"; do
+    darkirc_path_components_safe "$path" \
+      || die "unsafe DarkIRC build path: $path"
+    [[ ! -e "$path" || -d "$path" && ! -L "$path" ]] \
+      || die "DarkIRC build path is not a regular directory: $path"
+  done
+  install -d -o root -g root -m 0700 \
+    "$DARKIRC_BUILD_ROOT" \
+    "$DARKIRC_BUILD_ROOT/home" \
+    "$DARKIRC_BUILD_ROOT/cargo-home"
+  for path in "$parent" "$DARKIRC_BUILD_ROOT" \
+    "$DARKIRC_BUILD_ROOT/home" "$DARKIRC_BUILD_ROOT/cargo-home"; do
+    darkirc_validate_root_directory_path "$path" \
+      || die "DarkIRC build path is not root-controlled: $path"
+  done
+}
+
+trusted_darkirc_tool_path() {
+  local name="$1" candidate
+  candidate="$(PATH="$DARKIRC_TRUSTED_PATH" type -P "$name" 2>/dev/null || true)"
+  [[ -n "$candidate" ]] \
+    || die "trusted system DarkIRC build tool is unavailable: $name"
+  darkirc_validate_root_executable "$candidate" \
+    || die "DarkIRC build tool is not a root-owned system executable: $candidate"
+  printf '%s' "$candidate"
+}
+
+validate_darkirc_source_checkout() {
+  local source_dir="$1" git_bin="$2" source_revision dirty
+  darkirc_validate_root_directory_path "$source_dir" \
+    || die "DarkIRC source checkout is outside the root-controlled build boundary"
+  source_revision="$(/usr/bin/env -i \
+    HOME="$DARKIRC_BUILD_ROOT/home" \
+    PATH="$DARKIRC_TRUSTED_PATH" \
+    "$git_bin" -C "$source_dir" rev-parse HEAD 2>/dev/null || true)"
+  [[ "$source_revision" == "$DARKIRC_REV" ]] \
+    || die "DarkIRC source revision is not the approved compatibility revision"
+  dirty="$(/usr/bin/env -i \
+    HOME="$DARKIRC_BUILD_ROOT/home" \
+    PATH="$DARKIRC_TRUSTED_PATH" \
+    "$git_bin" -C "$source_dir" status --porcelain 2>/dev/null || true)"
+  [[ -z "$dirty" ]] \
+    || die "DarkIRC source checkout is not clean; refusing compatibility attestation"
+  [[ -f "$source_dir/Makefile" && ! -L "$source_dir/Makefile" ]] \
+    || die "DarkIRC Makefile is missing or unsafe"
+  [[ -f "$source_dir/bin/darkirc/Cargo.toml" && ! -L "$source_dir/bin/darkirc/Cargo.toml" ]] \
+    || die "DarkIRC Cargo.toml is missing or unsafe"
+}
+
+pin_darkirc_build_candidate() {
+  local candidate="$1" pinned
+  [[ "$candidate" == "$DARKIRC_BUILD_ROOT/"* ]] \
+    || die "DarkIRC build artifact is outside the root-controlled build boundary"
+  [[ -f "$candidate" && -s "$candidate" && ! -L "$candidate" ]] \
+    || die "DarkIRC build artifact is missing or unsafe"
+  pinned="$(mktemp "$DARKIRC_BUILD_ROOT/darkirc.candidate.XXXXXX")"
+  if ! cp --no-dereference -- "$candidate" "$pinned"; then
+    rm -f -- "$pinned"
+    die "failed to pin DarkIRC build artifact"
+  fi
+  [[ -f "$pinned" && ! -L "$pinned" ]] || {
+    rm -f -- "$pinned"
+    die "pinned DarkIRC build artifact is not a regular file"
+  }
+  chown root:root "$pinned" && chmod 0755 "$pinned" || {
+    rm -f -- "$pinned"
+    die "failed to secure pinned DarkIRC build artifact"
+  }
+  darkirc_validate_root_executable "$pinned" || {
+    rm -f -- "$pinned"
+    die "pinned DarkIRC build artifact failed ownership validation"
+  }
+  printf '%s' "$pinned"
+}
+
+install_darkirc_binary_atomic() {
+  local candidate="$1" destination_dir tmp source_digest installed_digest
+  [[ "$candidate" == "$DARKIRC_BUILD_ROOT/darkirc.candidate."* ]] \
+    || die "DarkIRC installation requires a pinned build artifact"
+  darkirc_validate_root_executable "$candidate" \
+    || die "DarkIRC installation candidate is not root-controlled"
+  source_digest="$(sha256sum "$candidate" | awk '{print $1}')"
+  destination_dir="$(dirname "$DARKIRC_BIN")"
+  [[ "$destination_dir" == /usr/local/bin ]] \
+    || die "DarkIRC binary destination must remain under /usr/local/bin"
+  [[ -d "$destination_dir" && ! -L "$destination_dir" ]] \
+    || die "unsafe DarkIRC binary destination directory"
+  [[ "$(stat -c '%u' "$destination_dir" 2>/dev/null || true)" == 0 ]] \
+    || die "DarkIRC binary destination directory must be root-owned"
+  local destination_mode
+  destination_mode="$(stat -c '%a' "$destination_dir" 2>/dev/null || true)"
+  [[ "$destination_mode" =~ ^[0-7]+$ ]] \
+    || die "could not validate DarkIRC binary destination mode"
+  (( (8#$destination_mode & 07022) == 0 )) \
+    || die "DarkIRC binary destination directory must not be group/world writable"
+  [[ ! -L "$DARKIRC_BIN" && ( ! -e "$DARKIRC_BIN" || -f "$DARKIRC_BIN" ) ]] \
+    || die "unsafe DarkIRC binary destination"
+  tmp="$(mktemp "$destination_dir/.darkirc.next.XXXXXX")"
+  if ! install -o root -g root -m 0755 "$candidate" "$tmp"; then
+    rm -f -- "$tmp"
+    die "failed to stage DarkIRC binary"
+  fi
+  if ! mv -fT -- "$tmp" "$DARKIRC_BIN"; then
+    rm -f -- "$tmp"
+    die "failed to install DarkIRC binary"
+  fi
+  darkirc_validate_root_executable "$DARKIRC_BIN" \
+    || die "installed DarkIRC binary failed ownership validation"
+  installed_digest="$(sha256sum "$DARKIRC_BIN" | awk '{print $1}')"
+  [[ "$installed_digest" == "$source_digest" ]] \
+    || die "installed DarkIRC binary does not match the pinned build artifact"
+}
+
+record_darkirc_compatibility() {
+  local source_revision="$DARKIRC_REV" digest compat_dir tmp
+  local binary_mode binary_owner binary_links
+  binary_mode="$(stat -c '%a' "$DARKIRC_BIN" 2>/dev/null || true)"
+  binary_owner="$(stat -c '%u' "$DARKIRC_BIN" 2>/dev/null || true)"
+  binary_links="$(stat -c '%h' "$DARKIRC_BIN" 2>/dev/null || true)"
+  [[ "$binary_mode" =~ ^[0-7]+$ && "$((8#$binary_mode & 07022))" -eq 0 \
+     && "$binary_owner" == 0 && "$binary_links" == 1 ]] \
+    || die "installed DarkIRC binary is not a root-owned, non-writable regular file"
+  digest="sha256:$(sha256sum "$DARKIRC_BIN" | awk '{print $1}')"
+  compat_dir="$(dirname "$DARKIRC_COMPAT_FILE")"
+  mkdir -p "$compat_dir"
+  chmod 0755 "$compat_dir"
+  tmp="$(mktemp "$DARKIRC_COMPAT_FILE.next.XXXXXX")"
+  jq -n \
+    --arg schema "lunarwing.darkirc-compat/v1" \
+    --arg profile "darkfi-a05956d41-chacha-v1" \
+    --arg digest "$digest" \
+    --arg key_format "darkfi-chacha-base58-32" \
+    --arg source_revision "$source_revision" \
+    '{schema:$schema,profile_id:$profile,binary_sha256:$digest,key_format:$key_format,source_revision:$source_revision}' \
+    >"$tmp" || { rm -f "$tmp"; die "could not render DarkIRC compatibility attestation"; }
+  chmod 0600 "$tmp"
+  chown root:root "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$DARKIRC_COMPAT_FILE"
+  chmod 0600 "$DARKIRC_COMPAT_FILE"
+  chown root:root "$DARKIRC_COMPAT_FILE" 2>/dev/null || true
+}
+
+generate_darkirc_scope_id() {
+  command -v od >/dev/null 2>&1 || die "od is required for cryptographic DarkIRC scope IDs"
+  [[ -r /dev/urandom ]] || die "/dev/urandom is required for cryptographic DarkIRC scope IDs"
+  local id
+  id="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  [[ "$id" =~ ^[0-9a-f]{32}$ ]] || die "failed to generate a 128-bit DarkIRC scope ID"
+  printf '%s' "$id"
+}
+
+PORTS_REGISTRY_LOCK_FD=""
+
+ports_registry_lock() {
+  [[ -n "$PORTS_REGISTRY_LOCK_FD" ]] && return 0
+  require_cmd flock
+  local lock_file="${PORTS_REGISTRY}.lock" lock_dir
+  lock_dir="$(dirname "$lock_file")"
+  mkdir -p "$lock_dir" || die "could not create port registry directory"
+  if [[ -L "$lock_file" || -e "$lock_file" && ! -f "$lock_file" ]]; then
+    die "unsafe port registry lock: $lock_file"
+  fi
+  if [[ ! -e "$lock_file" ]]; then
+    ( umask 077; : >"$lock_file" ) || die "could not create port registry lock"
+  fi
+  chmod 0600 "$lock_file" 2>/dev/null || true
+  exec {PORTS_REGISTRY_LOCK_FD}>"$lock_file"
+  flock -x -w 10 "$PORTS_REGISTRY_LOCK_FD" || die "port registry is busy"
+}
+
+ports_registry_unlock() {
+  [[ -n "$PORTS_REGISTRY_LOCK_FD" ]] || return 0
+  flock -u "$PORTS_REGISTRY_LOCK_FD" || true
+  eval "exec ${PORTS_REGISTRY_LOCK_FD}>&-"
+  PORTS_REGISTRY_LOCK_FD=""
+}
+
+validate_darkirc_scope_id() {
+  local id="$1"
+  [[ "$id" =~ ^[0-9a-f]{32}$ && ! "$id" =~ ^0+$ ]] \
+    || die "invalid DarkIRC scope ID"
+}
+
+validate_existing_darkirc_scope_id() {
+  local name="$1" id="$2" duplicate
+  validate_darkirc_scope_id "$id"
+  duplicate="$(jq -r --arg name "$name" --arg id "$id" \
+    '.tenants | to_entries[] | select(.key != $name and .value.darkirc_scope_id == $id) | .key' \
+    "$PORTS_REGISTRY" 2>/dev/null | head -1)"
+  [[ -z "$duplicate" ]] || die "darkirc_scope_id for '$name' conflicts with tenant '$duplicate'"
+}
+
+darkirc_scope_is_unique() {
+  local name="$1" id="$2"
+  ! jq -e --arg name "$name" --arg id "$id" \
+    '.tenants | to_entries[] | select(.key != $name and .value.darkirc_scope_id == $id)' \
+    "$PORTS_REGISTRY" >/dev/null 2>&1
+}
+
+ensure_darkirc_scope_id() {
+  local name="$1" current id tmp
+  local lock_owned=false
+  if [[ -z "$PORTS_REGISTRY_LOCK_FD" ]]; then
+    ports_registry_lock
+    lock_owned=true
+  fi
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  current="$(darkirc_scope_id "$name")"
+  if [[ -n "$current" ]]; then
+    validate_darkirc_scope_id "$current" || die "tenant '$name' has an invalid darkirc_scope_id"
+    local duplicate
+    duplicate="$(jq -r --arg name "$name" --arg id "$current" \
+      '.tenants | to_entries[] | select(.key != $name and .value.darkirc_scope_id == $id) | .key' \
+      "$PORTS_REGISTRY" 2>/dev/null | head -1)"
+    [[ -z "$duplicate" ]] || die "darkirc_scope_id for '$name' conflicts with tenant '$duplicate'"
+    if [[ "$lock_owned" == true ]]; then
+      ports_registry_unlock
+    fi
+    printf '%s' "$current"
+    return 0
+  fi
+
+  for _ in {1..8}; do
+    id="$(generate_darkirc_scope_id)"
+    if ! jq -e --arg id "$id" '.tenants | to_entries[] | select(.value.darkirc_scope_id == $id)' \
+      "$PORTS_REGISTRY" >/dev/null 2>&1; then
+      break
+    fi
+    id=""
+  done
+  [[ -n "$id" ]] || die "could not allocate a unique DarkIRC scope ID"
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  jq --arg name "$name" --arg id "$id" '.tenants[$name].darkirc_scope_id = $id' \
+    "$PORTS_REGISTRY" >"$tmp" || { rm -f "$tmp"; die "failed to persist DarkIRC scope ID"; }
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  if [[ "$lock_owned" == true ]]; then
+    ports_registry_unlock
+  fi
+  printf '%s' "$id"
+}
+
 # ── Container config-hash tracking ────────────────────────────────────────────
 #
 # Quadlet and imperative `podman run` both create a container with config
@@ -196,6 +724,12 @@ tenant_darkirc_enabled() {
   local val
   val="$(jq -r ".tenants[\"$name\"].enable_darkirc // false" "$PORTS_REGISTRY" 2>/dev/null)"
   [[ "$val" == "true" ]]
+}
+
+darkirc_state_available() {
+  local name="$1" path
+  path="$(tenant_state_dir "$name")/darkirc"
+  [[ -d "$path" && ! -L "$path" ]]
 }
 
 tenant_proxy_enabled() {
@@ -329,14 +863,17 @@ Commands:
 
   build-vision-sidecar             Build the LunarVision OCR sidecar Docker image
 
-  build-darkirc                   Build darkirc daemon from external source
-                                   (shared binary, not per-tenant)
+  build-darkirc                   Build darkirc from the pinned upstream revision
+    --tenant <name>                Compatibility selector only; tenant files and
+                                   toolchains never enter the shared binary build
 
   install-wasm <name>             Install built WASM tools/channels into tenant state dir
   install-wasm-all                Install WASM for all tenants
 
   start-tenant <name>             Start all services for a tenant
   stop-tenant <name>              Stop all services for a tenant
+  stop-writers <name>             Stop tenant writers but leave PostgreSQL up
+  writers-active <name>            Exit 0 when any tenant writer is active
   restart-tenant <name>           Stop then start
   render-units <name>             Re-render a tenant's service units from the current
                                   generator (no restart; applies init-script changes)
@@ -379,6 +916,38 @@ Commands:
 
   patch-env <name>                 Add missing env vars (e.g. ORCHESTRATOR_PORT)
   patch-env-all                    Patch env for all registered tenants
+  darkirc-contact list <tenant>    Read-only contact inventory (fingerprints only)
+  darkirc-contact status <tenant> <contact>
+                                   Inspect one DarkIRC contact (read-only)
+  darkirc-contact doctor [--all]   Validate legacy contacts without mutation
+  darkirc-contact adopt <tenant> --yes
+                                   Adopt settled manual contacts into metadata ledger
+  darkirc-contact export-migration <tenant>
+                                   Write owner-only darkirc-contacts-v1 manifest
+  darkirc-contact stage-migration <tenant> --in -
+                                   Stage a manifest from stdin (no secret argv)
+  darkirc-contact import-migration <tenant>
+                                   Import the staged contact manifest
+  darkirc-contact migration-ready <tenant>
+                                   Recover/check settled DarkIRC state before upgrade
+  darkirc-contact recover <tenant>
+                                   Recover an unfinished config/ledger transaction
+  darkirc-contact validate-migration --in -
+                                   Validate a manifest without writing tenant state
+  darkirc-contact prepare <tenant> <contact> --out <file|->
+                                   Generate a keypair and emit a public offer artifact
+    --expires <secs>               Offer lifetime in seconds (default 1800)
+  darkirc-contact respond <tenant> <contact> --in <offer.json> --out <file|->
+                                   Respond to an initiator offer with a bound response
+    --expect-peer-fingerprint <sha256>  Required: initiator's public fingerprint
+  darkirc-contact complete <tenant> <contact> --in <response.json>
+                                   Install a contact from a completed exchange (--defer-apply)
+    --expect-peer-fingerprint <sha256>  Required: responder's public fingerprint
+  darkirc-contact cancel <tenant> --exchange-id <id>
+                                   Cancel a pending exchange
+  darkirc-contact exchanges <tenant>
+                                   List pending DarkIRC key exchanges
+  darkirc-health <tenant> --strict Strict DarkIRC activation gate (fail-closed)
 
   migrate-owner-scope <name>       Rekey DB data from 'default' to tenant scope
     --from <old_scope>             Old owner_id (default: 'default')
@@ -423,15 +992,14 @@ EOF
 
 # ── Template rendering ────────────────────────
 #
-# render_template <template-file> <output-file> [var=value ...]
+# render_template_content <template-file> [var=value ...]
 #
-# Reads a template file, replaces __VARNAME__ placeholders with their values
-# (supplied as var=value pairs on the command line), and writes the result.
-# Template files live under $TEMPLATES_DIR. If the template path is relative
-# (no leading /), it is resolved against $TEMPLATES_DIR.
-render_template() {
-  local template="$1" out="$2"
-  shift 2
+# Reads a template file and emits the substituted content. Callers that own
+# secret-bearing or stateful files must hand the result to their semantic
+# updater rather than redirecting it directly to the destination.
+render_template_content() {
+  local template="$1"
+  shift
 
   [[ "$template" = /* ]] || template="$TEMPLATES_DIR/$template"
   [[ -f "$template" ]] || die "template not found: $template"
@@ -446,7 +1014,16 @@ render_template() {
     content="${content//__${var}__/${val}}"
   done
 
-  printf '%s\n' "$content" > "$out"
+  printf '%s\n' "$content"
+}
+
+# Legacy helper for non-state templates (env/unit fragments). DarkIRC's active
+# TOML never uses this direct writer; generate_darkirc_config pipes content to
+# the locked Rust updater below.
+render_template() {
+  local template="$1" out="$2"
+  shift 2
+  render_template_content "$template" "$@" >"$out"
 }
 # ── Root check ────────────────────────────────────────────────────────────────
 
@@ -903,18 +1480,7 @@ _deregister_babysitter() {
 # ── Port registry ────────────────────────────────────────────────────────────
 
 ports_registry_init() {
-  local registry_version="" registry_needs_repair="false"
-  if [[ -f "$PORTS_REGISTRY" ]]; then
-    registry_version="$(jq -r '.version // 0' "$PORTS_REGISTRY" 2>/dev/null || true)"
-    if jq -e '.tenants | to_entries[] | select(.value.extended_ports | has("darkirc_adapter") | not)' \
-        "$PORTS_REGISTRY" >/dev/null 2>&1; then
-      registry_needs_repair="true"
-    fi
-  fi
-  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "11" || "$registry_needs_repair" == "true" ]]; then
-    acquire_ports_lock
-  fi
-
+  ports_registry_lock
   if [[ ! -d /etc/lunarwing ]]; then
     mkdir -p /etc/lunarwing
     chmod 0755 /etc/lunarwing
@@ -937,7 +1503,15 @@ ENDJSON
   fi
 
   ports_migrate
-  release_ports_lock
+  ports_registry_unlock
+}
+
+ports_registry_require_readonly() {
+  require_cmd jq
+  [[ -f "$PORTS_REGISTRY" && ! -L "$PORTS_REGISTRY" ]] \
+    || die "port registry not found: $PORTS_REGISTRY"
+  jq -e '.tenants | type == "object"' "$PORTS_REGISTRY" >/dev/null 2>&1 \
+    || die "invalid port registry: $PORTS_REGISTRY"
 }
 
 ports_migrate_v2() {
@@ -1141,6 +1715,25 @@ ports_migrate() {
   if [[ "$current_version" -lt 9 ]]; then ports_migrate_v9; fi
   if [[ "$current_version" -lt 10 ]]; then ports_migrate_v10; fi
   if [[ "$current_version" -lt 11 ]]; then ports_migrate_v11; fi
+  ports_migrate_v12
+}
+
+# v11 -> v12: attach an immutable random scope ID to every DarkIRC-enabled
+# tenant. This is also called unconditionally so mixed-version mt-admin copies
+# repair a missing field without changing an existing ID.
+ports_migrate_v12() {
+  local name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if [[ "$(tenant_darkirc_enabled "$name" && echo true || echo false)" == "true" ]]; then
+      ensure_darkirc_scope_id "$name" >/dev/null
+    fi
+  done < <(jq -r '.tenants // {} | keys[]' "$PORTS_REGISTRY" 2>/dev/null || true)
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  jq '.version = 12' "$PORTS_REGISTRY" >"$tmp" || { rm -f "$tmp"; die "failed to migrate port registry to v12"; }
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
 }
 
 # v8 -> v9: rename extended_ports.reserved_5 -> vision_service.
@@ -1251,6 +1844,7 @@ ports_migrate_v11() {
 
 ports_allocate() {
   local name="$1"
+  ports_registry_lock
   local enable_darkirc="${2:-false}"
   local enable_proxy="${3:-false}"
   # Selected external workers, as a JSON object literal
@@ -1260,9 +1854,15 @@ ports_allocate() {
   # (bash closes the ${...} at the first `}`, appending a stray `}` and
   # corrupting the JSON), so default explicitly instead.
   local workers_json="${4:-}"
+  local requested_scope="${5:-}"
   [[ -n "$workers_json" ]] || workers_json='{}'
   require_cmd jq
-  acquire_ports_lock
+  if [[ -n "$requested_scope" ]]; then
+    [[ "$enable_darkirc" == true ]] || die "an explicit DarkIRC scope requires --enable-darkirc"
+    validate_darkirc_scope_id "$requested_scope"
+    darkirc_scope_is_unique "$name" "$requested_scope" \
+      || die "darkirc_scope_id '$requested_scope' is already active for another tenant"
+  fi
 
   # Resumable (F4): if this tenant already has a block, reuse it (echo its
   # base_port) instead of dying — so re-running add-tenant after a mid-flow failure
@@ -1279,7 +1879,7 @@ ports_allocate() {
     # `add-tenant <existing> --enable-darkirc` leaves the tenant half-configured.
     # One-directional (false -> true): disabling darkirc post-provision is a
     # manual teardown (see docs/ops/DARKIRC-MULTITENANT.md).
-    [[ "$enable_darkirc" == "true" ]] && ports_enable_darkirc "$name"
+    [[ "$enable_darkirc" == "true" ]] && ports_enable_darkirc "$name" "$requested_scope"
     [[ "$enable_proxy" == "true" ]] && ports_enable_proxy "$name"
     # Reconcile worker selection on resume, same one-directional false->true rule
     # as darkirc/proxy: re-running `add-tenant <existing> --with-<worker>` turns a
@@ -1310,6 +1910,10 @@ ports_allocate() {
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
   local darkirc_json="false"
   [[ "$enable_darkirc" == "true" ]] && darkirc_json="true"
+  local darkirc_scope=""
+  if [[ "$enable_darkirc" == "true" ]]; then
+    darkirc_scope="${requested_scope:-$(generate_darkirc_scope_id)}"
+  fi
   local proxy_json="false"
   [[ "$enable_proxy" == "true" ]] && proxy_json="true"
   # Normalize the workers spec to a full {nanocode,pebble,opencode} bool map so
@@ -1320,7 +1924,7 @@ ports_allocate() {
       pebble:   (.pebble   // false),
       opencode: (.opencode // false)
     }' <<<"$workers_json" 2>/dev/null || echo '{"nanocode":false,"pebble":false,"opencode":false}')"
-  jq --arg name "$name" --argjson base "$base" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson darkirc "$darkirc_json" --argjson proxy "$proxy_json" --argjson workers "$workers_norm" '
+  jq --arg name "$name" --argjson base "$base" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson darkirc "$darkirc_json" --argjson proxy "$proxy_json" --arg scope "$darkirc_scope" --argjson workers "$workers_norm" '
     ( .range.start // 10000 ) as $rstart
     | ( .extended_range.start // 20000 ) as $estart
     | ( .extended_block_size // 10 ) as $ebs
@@ -1330,6 +1934,7 @@ ports_allocate() {
         user: $name,
         created_at: $ts,
         enable_darkirc: $darkirc,
+        darkirc_scope_id: (if $darkirc then $scope else null end),
         enable_proxy: $proxy,
         workers: $workers,
         ports: {
@@ -1375,14 +1980,37 @@ ports_allocate() {
 # down darkirc (disabling is a manual operation; see DARKIRC-MULTITENANT.md).
 ports_enable_darkirc() {
   local name="$1"
+  local requested_scope="${2:-}"
+  ports_registry_lock
   require_cmd jq
   local current
   current="$(jq -r ".tenants[\"$name\"].enable_darkirc // false" "$PORTS_REGISTRY" 2>/dev/null || true)"
-  [[ "$current" == "true" ]] && return 0
+  if [[ "$current" == "true" ]]; then
+    if [[ -n "$requested_scope" ]]; then
+      validate_darkirc_scope_id "$requested_scope"
+      [[ "$(darkirc_scope_id "$name")" == "$requested_scope" ]] \
+        || die "tenant '$name' already has a different DarkIRC scope ID"
+    else
+      ensure_darkirc_scope_id "$name" >/dev/null
+    fi
+    return 0
+  fi
 
-  local tmp
+  local tmp existing_scope scope_id
+  existing_scope="$(darkirc_scope_id "$name")"
+  if [[ -n "$existing_scope" ]]; then
+    validate_darkirc_scope_id "$existing_scope" \
+      || die "tenant '$name' has an invalid existing DarkIRC scope ID"
+    if [[ -n "$requested_scope" && "$requested_scope" != "$existing_scope" ]]; then
+      die "tenant '$name' already has a different DarkIRC scope ID"
+    fi
+  fi
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
-  if ! jq --arg name "$name" '.tenants[$name].enable_darkirc = true' \
+  scope_id="${requested_scope:-${existing_scope:-$(generate_darkirc_scope_id)}}"
+  validate_darkirc_scope_id "$scope_id"
+  darkirc_scope_is_unique "$name" "$scope_id" \
+    || die "darkirc_scope_id '$scope_id' is already active for another tenant"
+  if ! jq --arg name "$name" --arg scope "$scope_id" '.tenants[$name].enable_darkirc = true | .tenants[$name].darkirc_scope_id = $scope' \
       "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
     rm -f "$tmp"
     die "failed to enable darkirc flag for tenant '$name'"
@@ -1396,6 +2024,7 @@ ports_enable_darkirc() {
 # Idempotent. Used by ports_allocate()'s resume path and by the --enable-proxy flag.
 ports_enable_proxy() {
   local name="$1"
+  ports_registry_lock
   require_cmd jq
   local current
   current="$(jq -r ".tenants[\"$name\"].enable_proxy // false" "$PORTS_REGISTRY" 2>/dev/null || true)"
@@ -1420,6 +2049,7 @@ ports_enable_proxy() {
 # entries that predate the workers map.
 ports_enable_worker() {
   local name="$1" worker="$2"
+  ports_registry_lock
   require_cmd jq
   case "$worker" in
     nanocode|pebble|opencode) ;;
@@ -1799,6 +2429,14 @@ build_tenant() {
 
   [[ -d "$repo" ]] || die "repo not found at $repo; run add-tenant first"
 
+  local darkirc_enabled=false
+  if tenant_darkirc_enabled "$name"; then
+    darkirc_enabled=true
+    # The helper is a shared root trust anchor, so build it from the admin
+    # checkout only when this tenant actually needs DarkIRC configuration.
+    install_trusted_darkirc_key_helper
+  fi
+
   say "acquiring build lock (only one tenant builds at a time) ..."
   (
     flock -x 200
@@ -1806,8 +2444,13 @@ build_tenant() {
     local cargo_env="if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; else export PATH=\"\$HOME/.cargo/bin:\$PATH\"; fi;"
 
     say "building lunarwing for $name ..."
-    sudo -u "$name" bash -c "$cargo_env cd '$repo' && cargo build --profile $PROFILE --bin lunarwing" \
+    sudo -u "$name" bash -c "$cargo_env cd '$repo' && taskset -c 0-5 cargo build --profile $PROFILE -j6 --bin lunarwing" \
       || die "lunarwing build failed for $name"
+
+    if [[ "$darkirc_enabled" == true ]]; then
+      say "updating DarkIRC config through the typed helper ..."
+      generate_darkirc_config "$name"
+    fi
 
     say "building xmpp-bridge for $name ..."
     sudo -u "$name" bash -c "$cargo_env cd '$repo/bridges/xmpp-bridge' && cargo build --profile $PROFILE" \
@@ -1866,64 +2509,66 @@ build_tenant() {
 # ── Darkirc daemon build (shared, not per-tenant) ────────────────────────────
 
 build_darkirc() {
-  local tenant_name="${1:-}" darkirc_src="" build_user=""
-
-  if [[ -n "$tenant_name" ]]; then
-    build_user="$tenant_name"
-    local envf
-    envf="$(tenant_env_dir "$tenant_name")/lunarwing.env"
-    if [[ -f "$envf" ]]; then
-      darkirc_src="$(grep -s '^DARKIRC_SOURCE=' "$envf" | cut -d= -f2-)" || true
-    fi
-    [[ -n "$darkirc_src" ]] || darkirc_src="$DARKIRC_SOURCE"
-    [[ -n "$darkirc_src" ]] || darkirc_src="$(tenant_home "$tenant_name")/darkfi"
-  else
-    # Fleet-wide build: run as the invoking (sudo) user, never root. Root has no
-    # per-user rust toolchain under rustup, and root-owned source/artifacts break
-    # the tenant-run daemon.
-    build_user="${SUDO_USER:-$(id -un)}"
-    [[ -n "$darkirc_src" ]] || darkirc_src="$DARKIRC_SOURCE"
-    [[ -n "$darkirc_src" ]] || die "darkirc source path not configured — set DARKIRC_SOURCE/LUNARWING_MT_DARKIRC_SOURCE or pass --tenant <name>"
-  fi
-
-  [[ "$build_user" != "root" ]] || die "refusing to build darkirc as root — pass --tenant <name>, or invoke via sudo from a user that has a rust toolchain"
+  local git_bin make_bin cargo_bin rustc_bin taskset_bin
+  prepare_darkirc_build_root
+  git_bin="$(trusted_darkirc_tool_path git)"
+  make_bin="$(trusted_darkirc_tool_path make)"
+  cargo_bin="$(trusted_darkirc_tool_path cargo)"
+  rustc_bin="$(trusted_darkirc_tool_path rustc)"
+  taskset_bin="$(trusted_darkirc_tool_path taskset)"
+  darkirc_validate_root_executable /usr/bin/env \
+    || die "DarkIRC build requires a trusted /usr/bin/env"
 
   say "acquiring build lock for darkirc ..."
   (
     flock -x 200
+    local work_dir source_dir built_bin pinned_bin=""
+    work_dir="$(mktemp -d "$DARKIRC_BUILD_ROOT/build.XXXXXX")"
+    source_dir="$work_dir/source"
+    trap 'rm -rf -- "$work_dir"; [[ -z "$pinned_bin" ]] || rm -f -- "$pinned_bin"' EXIT
 
-    # Clone darkfi as the build user if absent, so the source tree and build
-    # artifacts are owned by that user (no root-owned files) — "clone as the user".
-    if [[ ! -d "$darkirc_src/.git" ]]; then
-      say "darkirc source not present at $darkirc_src — cloning $DARKIRC_REPO ($DARKIRC_REV) as $build_user ..."
-      sudo -u "$build_user" git clone "$DARKIRC_REPO" "$darkirc_src" || die "darkirc clone failed"
-      if [[ -n "$DARKIRC_REV" && "$DARKIRC_REV" != "master" ]]; then
-        sudo -u "$build_user" git -C "$darkirc_src" checkout "$DARKIRC_REV" || die "darkirc checkout '$DARKIRC_REV' failed"
-      fi
-    else
-      say "darkirc source present at $darkirc_src ($(sudo -u "$build_user" git -C "$darkirc_src" rev-parse --short HEAD 2>/dev/null || echo unknown)) — using as-is"
-    fi
+    say "cloning approved DarkIRC source revision into the root-controlled build workspace ..."
+    /usr/bin/env -i \
+      HOME="$DARKIRC_BUILD_ROOT/home" \
+      PATH="$DARKIRC_TRUSTED_PATH" \
+      USER=root LOGNAME=root \
+      "$git_bin" clone --no-checkout -- "$DARKIRC_REPO" "$source_dir" \
+      || die "darkirc clone failed"
+    /usr/bin/env -i \
+      HOME="$DARKIRC_BUILD_ROOT/home" \
+      PATH="$DARKIRC_TRUSTED_PATH" \
+      USER=root LOGNAME=root \
+      "$git_bin" -C "$source_dir" checkout --detach "$DARKIRC_REV" \
+      || die "darkirc checkout '$DARKIRC_REV' failed"
+    validate_darkirc_source_checkout "$source_dir" "$git_bin"
 
-    [[ -f "$darkirc_src/Makefile" ]] || die "darkirc Makefile not found (expected darkfi repo root)"
-    [[ -f "$darkirc_src/bin/darkirc/Cargo.toml" ]] || die "darkirc Cargo.toml not found"
-
-    local cargo_env="if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; else export PATH=\"\$HOME/.cargo/bin:\$PATH\"; fi;"
-
-    # Build with darkfi's make as the build user (mirrors build_tenant): uses that
-    # user's rust toolchain and leaves no root-owned artifacts.
-    say "building darkirc from $darkirc_src via make (as $build_user) ..."
-    sudo -u "$build_user" bash -c "$cargo_env cd '$darkirc_src' && make darkirc" \
+    say "building approved DarkIRC source with the trusted system toolchain ..."
+    /usr/bin/env -i \
+      HOME="$DARKIRC_BUILD_ROOT/home" \
+      PATH="$DARKIRC_TRUSTED_PATH" \
+      USER=root LOGNAME=root \
+      CARGO="$cargo_bin" RUSTC="$rustc_bin" \
+      CARGO_HOME="$DARKIRC_BUILD_ROOT/cargo-home" \
+      CARGO_BUILD_JOBS=6 \
+      "$taskset_bin" -c 0-5 "$make_bin" -C "$source_dir" darkirc \
       || die "darkirc build failed"
 
-    local built_bin="$darkirc_src/darkirc"
+    built_bin="$source_dir/darkirc"
     [[ -x "$built_bin" ]] || die "darkirc binary not found at $built_bin"
+    pinned_bin="$(pin_darkirc_build_candidate "$built_bin")"
+    validate_darkirc_source_checkout "$source_dir" "$git_bin"
+    validate_darkirc_build_candidate "$pinned_bin"
 
-    # Install the shared daemon binary — the only root-privileged step.
+    # Validation and installation consume the same root-owned pinned copy.
     say "installing darkirc to $DARKIRC_BIN ..."
-    install -m 0755 "$built_bin" "$DARKIRC_BIN"
+    install_darkirc_binary_atomic "$pinned_bin"
 
+    record_darkirc_compatibility
     say "darkirc build complete: $DARKIRC_BIN"
-    "$DARKIRC_BIN" --version || say "(darkirc --version not supported, skipping)"
+    rm -f -- "$pinned_bin"
+    pinned_bin=""
+    rm -rf -- "$work_dir"
+    trap - EXIT
   ) 200>"$BUILD_LOCK"
 }
 
@@ -2503,7 +3148,8 @@ write_tenant_lunarwing_env() {
   # tenant's encrypted DB secrets (it is the AES-256-GCM vault key); rotating the
   # tokens would break live clients/workers; minting a fresh XMPP_PASSWORD would
   # break the already-registered XMPP account. Generate fresh ONLY on first write.
-  local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password darkirc_adapter_secret
+  local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password
+  local darkirc_adapter_secret=""
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
   relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
@@ -2530,6 +3176,13 @@ write_tenant_lunarwing_env() {
   # Stable + migration-safe; resolved before the heredoc so it can read an
   # existing DATABASE_URL (preserving an already-initialised DB's password).
   pg_password="$(tenant_pg_password "$name")"
+
+  # Read this before the env file is replaced.  The adapter credential is an
+  # existing tenant secret and must remain stable across patch-env/upgrade.
+  if tenant_darkirc_enabled "$name"; then
+    darkirc_adapter_secret="$(_env_existing "$path" DARKIRC_ADAPTER_SECRET)"
+    darkirc_adapter_secret="${darkirc_adapter_secret:-$(generate_token | cut -c1-32)}"
+  fi
 
   # LLM endpoint the daemon's OpenAI-compatible client dials. When the proxy is
   # enabled, defaults to this tenant's local TensorZero proxy. When disabled,
@@ -2664,7 +3317,6 @@ ENVEOF
   if tenant_darkirc_enabled "$name"; then
     local darkirc_adapter_port
     darkirc_adapter_port="$(ports_get "$name" darkirc_adapter)" || true
-    darkirc_adapter_secret="${darkirc_adapter_secret:-$(generate_token | cut -c1-32)}"
     printf '\nDARKIRC_ADAPTER_URL=http://127.0.0.1:%s\nDARKIRC_ADAPTER_SECRET=%s\n' \
       "$darkirc_adapter_port" "$darkirc_adapter_secret" >> "$path"
   fi
@@ -2777,28 +3429,38 @@ ENVEOF
 
 write_tenant_darkirc_adapter_env() {
   local name="$1"
+  local lock_owned=false
+  if [[ "$DARKIRC_WRITER_LOCK_HELD" != true ]]; then
+    darkirc_writer_lock "$name"
+    lock_owned=true
+  fi
 
   local path adapter_port darkirc_irc_port lunarwing_env
   path="$(tenant_env_dir "$name")/darkirc-adapter.env"
   lunarwing_env="$(tenant_env_dir "$name")/lunarwing.env"
+  darkirc_file_path_safe "$path" \
+    || die "unsafe DarkIRC adapter env path for tenant '$name'"
+  darkirc_file_path_safe "$lunarwing_env" \
+    || die "unsafe LunarWing env path for tenant '$name'"
   adapter_port="$(ports_get "$name" darkirc_adapter)" || true
   darkirc_irc_port="$(ports_get "$name" darkirc_irc)" || true
 
   local adapter_secret
-  adapter_secret="$(grep -s '^DARKIRC_ADAPTER_SECRET=' "$lunarwing_env" | cut -d= -f2- || true)"
+  adapter_secret="$(read_tenant_env_value \
+    "$name" "$lunarwing_env" DARKIRC_ADAPTER_SECRET)" \
+    || die "could not safely read DarkIRC adapter secret for tenant '$name'"
   [[ -n "$adapter_secret" ]] || adapter_secret="$(generate_token | cut -c1-32)"
 
   if [[ -f "$TEMPLATES_DIR/darkirc-adapter.env.template" ]]; then
-    render_template \
-      "darkirc-adapter.env.template" "$path" \
+    render_template_content \
+      "darkirc-adapter.env.template" \
       "TENANT_NAME=$name" \
       "DARKIRC_IRC_PORT=$darkirc_irc_port" \
       "DARKIRC_ADAPTER_PORT=$adapter_port" \
-      "ADAPTER_SECRET=$adapter_secret"
+      "ADAPTER_SECRET=$adapter_secret" \
+      | write_tenant_file_atomic "$name" "$path" 600
   else
-    (
-      umask 077
-      cat >"$path" <<ENVEOF
+    cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600
 DARKIRC_HOST=127.0.0.1
 DARKIRC_PORT=$darkirc_irc_port
 DARKIRC_NICK=${name}-bridge
@@ -2809,54 +3471,427 @@ ADAPTER_PORT=$adapter_port
 ADAPTER_SECRET=$adapter_secret
 ADAPTER_LOG_LEVEL=INFO
 ENVEOF
-    )
   fi
-  chmod 0600 "$path"
-  chown "$name:$name" "$path"
   say "wrote: $path"
+  if [[ "$lock_owned" == true ]]; then
+    darkirc_writer_unlock
+  fi
+}
+
+install_trusted_darkirc_key_helper() {
+  require_cmd cargo
+  require_cmd flock
+  require_cmd taskset
+  [[ -f "$REPO_ROOT/Cargo.toml" && ! -L "$REPO_ROOT/Cargo.toml" ]] \
+    || die "trusted LunarWing admin checkout is unavailable: $REPO_ROOT"
+
+  install -d -o root -g root -m 0700 "$DARKIRC_KEY_HELPER_BUILD_ROOT"
+  say "building shared DarkIRC key helper from the admin checkout ..."
+  (
+    flock -x 200
+    cd "$REPO_ROOT"
+    CARGO_TARGET_DIR="$DARKIRC_KEY_HELPER_BUILD_ROOT" \
+      taskset -c 0-5 cargo build --release -j6 --bin lunarwing-darkirc-key-helper
+  ) 200>"$BUILD_LOCK" || die "failed to build trusted DarkIRC key helper"
+
+  local artifact="$DARKIRC_KEY_HELPER_BUILD_ROOT/release/lunarwing-darkirc-key-helper"
+  darkirc_validate_root_executable "$artifact" \
+    || die "trusted DarkIRC key-helper artifact failed ownership validation"
+  install -d -o root -g root -m 0755 "$(dirname "$DARKIRC_KEY_HELPER_BIN")"
+  install -o root -g root -m 0755 "$artifact" "$DARKIRC_KEY_HELPER_BIN" \
+    || die "failed to install trusted DarkIRC key helper"
+  darkirc_validate_root_executable "$DARKIRC_KEY_HELPER_BIN" \
+    || die "installed DarkIRC key helper failed ownership validation"
+}
+
+darkirc_key_helper_path() {
+  local name="$1" candidate
+  : "$name"
+  if [[ -n "$DEFAULT_DARKIRC_KEY_HELPER" ]]; then
+    darkirc_validate_root_executable "$DEFAULT_DARKIRC_KEY_HELPER" \
+      || return 1
+    printf '%s' "$DEFAULT_DARKIRC_KEY_HELPER"
+    return 0
+  fi
+  for candidate in "$DARKIRC_KEY_HELPER_BIN"; do
+    if darkirc_validate_root_executable "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+run_darkirc_manifest_validator() {
+  local unbound="${1:-false}" helper
+  helper="${DEFAULT_DARKIRC_KEY_HELPER:-}"
+  if [[ -z "$helper" ]] || ! darkirc_validate_root_executable "$helper"; then
+    install_trusted_darkirc_key_helper
+    helper="$DARKIRC_KEY_HELPER_BIN"
+  fi
+  [[ -x "$helper" ]] || die "DarkIRC key helper is not installed"
+  darkirc_validate_root_executable "$helper" \
+    || die "DarkIRC manifest validator must be a root-owned, non-writable regular file"
+  # This command parses only public/metadata fields and never opens a tenant
+  # path; stdin carries the protected manifest directly to the helper.
+  if [[ "$unbound" == true ]]; then
+    "$helper" validate-migration --json --unbound
+  else
+    darkirc_load_compatibility
+    "$helper" validate-migration --json "${DARKIRC_COMPAT_ARGS[@]}"
+  fi
+}
+
+darkirc_validate_root_executable() {
+  local path="$1" mode owner links parent parent_mode parent_owner
+  [[ "$path" == /* ]] || return 1
+  parent="$(dirname "$path")"
+  darkirc_path_components_safe "$parent" || return 1
+  [[ -d "$parent" && ! -L "$parent" ]] || return 1
+  parent_mode="$(stat -c '%a' "$parent" 2>/dev/null || true)"
+  parent_owner="$(stat -c '%u' "$parent" 2>/dev/null || true)"
+  [[ "$parent_owner" == 0 && "$parent_mode" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$parent_mode & 07022) == 0 )) || return 1
+  [[ -f "$path" && ! -L "$path" && -x "$path" ]] || return 1
+  mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+  owner="$(stat -c '%u' "$path" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$path" 2>/dev/null || true)"
+  [[ "$owner" == 0 && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] || return 1
+  [[ "$((8#$mode & 07022))" -eq 0 ]]
+}
+
+run_darkirc_key_helper() {
+  local name="$1"; shift
+  local helper uid gid home command_name
+  command_name="${1:-}"
+  case "$command_name" in
+    rewrite-baseline|list|status|doctor|adopt|export-migration|stage-migration|import-migration|migration-ready|recover|prepare|respond|complete|cancel|exchanges)
+      darkirc_load_compatibility
+      set -- "$@" "${DARKIRC_COMPAT_ARGS[@]}"
+      ;;
+  esac
+  helper="$(darkirc_key_helper_path "$name")" \
+    || die "DarkIRC key helper is not installed; install lunarwing-darkirc-key-helper before writing tenant config"
+  darkirc_validate_root_executable "$helper" \
+    || die "DarkIRC key helper is not a root-owned, non-writable regular file"
+  uid="$(id -u "$name")" || die "cannot resolve uid for tenant '$name'"
+  gid="$(id -g "$name")" || die "cannot resolve gid for tenant '$name'"
+  home="$(getent passwd "$name" | cut -d: -f6)"
+  [[ -n "$home" ]] || die "cannot resolve home for tenant '$name'"
+  if [[ "${EUID}" -eq 0 && "$(id -un)" != "$name" ]]; then
+    ( cd / && exec sudo -u "$name" env -i HOME="$home" PATH="/usr/bin:/bin" "$helper" "$@" \
+      --expected-uid "$uid" --expected-gid "$gid" )
+  else
+    "$helper" "$@" --expected-uid "$uid" --expected-gid "$gid"
+  fi
+}
+
+DARKIRC_WRITER_FD=""
+DARKIRC_WRITER_LOCK_HELD=false
+
+darkirc_writer_lock_root_safe() {
+  local path="$1" parent owner mode
+  [[ "$path" == /* && "$path" != / ]] || return 1
+  darkirc_path_components_safe "$path" || return 1
+  if [[ -e "$path" ]]; then
+    [[ -d "$path" && ! -L "$path" ]] || return 1
+    owner="$(stat -c '%u' "$path" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+    [[ "$owner" == "$EUID" && "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 07022) == 0 ))
+    return
+  fi
+  parent="${path%/*}"
+  [[ -d "$parent" && ! -L "$parent" ]] || return 1
+  darkirc_path_components_safe "$parent" || return 1
+  owner="$(stat -c '%u' "$parent" 2>/dev/null || true)"
+  mode="$(stat -c '%a' "$parent" 2>/dev/null || true)"
+  [[ "$owner" == "$EUID" && "$mode" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$mode & 07022) == 0 ))
+}
+
+darkirc_writer_lock() {
+  local name="$1" scope lock_file lock_owner lock_mode lock_links
+  [[ "$DARKIRC_WRITER_LOCK_HELD" == true ]] && return 0
+  require_cmd flock
+  scope="$(darkirc_scope_id "$name")"
+  validate_darkirc_scope_id "$scope"
+  darkirc_writer_lock_root_safe "$DARKIRC_WRITER_LOCK_ROOT" \
+    || die "unsafe DarkIRC writer lock root: $DARKIRC_WRITER_LOCK_ROOT"
+  if [[ ! -e "$DARKIRC_WRITER_LOCK_ROOT" ]]; then
+    mkdir -- "$DARKIRC_WRITER_LOCK_ROOT" \
+      || die "could not create DarkIRC writer lock root"
+    darkirc_writer_lock_root_safe "$DARKIRC_WRITER_LOCK_ROOT" \
+      || die "unsafe DarkIRC writer lock root after creation: $DARKIRC_WRITER_LOCK_ROOT"
+  fi
+  chmod 0700 "$DARKIRC_WRITER_LOCK_ROOT"
+  [[ "$(stat -c '%a' "$DARKIRC_WRITER_LOCK_ROOT" 2>/dev/null || true)" == 700 ]] \
+    || die "DarkIRC writer lock root must be mode 0700"
+  lock_file="$DARKIRC_WRITER_LOCK_ROOT/darkirc-${scope}.lock"
+  if [[ -L "$lock_file" || -e "$lock_file" && ! -f "$lock_file" ]]; then
+    die "unsafe DarkIRC writer lock: $lock_file"
+  fi
+  if [[ ! -e "$lock_file" ]]; then
+    ( umask 077; : >"$lock_file" ) || die "could not create DarkIRC writer lock"
+    chmod 0600 "$lock_file"
+  fi
+  lock_owner="$(stat -c '%u' "$lock_file" 2>/dev/null || true)"
+  lock_mode="$(stat -c '%a' "$lock_file" 2>/dev/null || true)"
+  lock_links="$(stat -c '%h' "$lock_file" 2>/dev/null || true)"
+  [[ "$lock_owner" == "$EUID" && "$lock_mode" == 600 && "$lock_links" == 1 ]] \
+    || die "DarkIRC writer lock must be owner-controlled, single-link mode 0600 for tenant '$name'"
+  exec {DARKIRC_WRITER_FD}>"$lock_file"
+  flock -x -w 10 "$DARKIRC_WRITER_FD" \
+    || die "DarkIRC config update is busy for tenant '$name'"
+  DARKIRC_WRITER_LOCK_HELD=true
+}
+
+darkirc_writer_unlock() {
+  [[ "$DARKIRC_WRITER_LOCK_HELD" == true ]] || return 0
+  flock -u "$DARKIRC_WRITER_FD" || true
+  eval "exec ${DARKIRC_WRITER_FD}>&-"
+  DARKIRC_WRITER_FD=""
+  DARKIRC_WRITER_LOCK_HELD=false
 }
 
 generate_darkirc_config() {
   local name="$1"
-  local state_dir
+  local state_dir config_dir datastore_dir irc_port rpc_port log_dir scope_id baseline
+  local registry_lock_owned=false
   state_dir="$(tenant_state_dir "$name")"
+  config_dir="$state_dir/darkirc"
+  datastore_dir="$config_dir/datastore"
 
-  local config_dir="$state_dir/darkirc"
-  mkdir -p "$config_dir" "$config_dir/datastore" 2>/dev/null || true
-  chmod 0700 "$config_dir"
+  # Never create/chmod/chown beneath the tenant-controlled state path as root.
+  # The tenant-side setup is guarded component-by-component, then the typed
+  # helper repeats the no-follow and ownership checks before opening anything.
+  darkirc_prepare_tenant_dirs "$name"
 
-  mkdir -p "$state_dir/logs" 2>/dev/null || true
-
-  local irc_port rpc_port
+  if [[ -z "$PORTS_REGISTRY_LOCK_FD" ]]; then
+    ports_registry_lock
+    registry_lock_owned=true
+  fi
   irc_port="$(ports_get "$name" darkirc_irc)" || die "no darkirc_irc port for tenant '$name'"
   rpc_port="$(ports_get "$name" darkirc_rpc)" || die "no darkirc_rpc port for tenant '$name'"
-
-  local log_dir
   log_dir="$(tenant_log_dir "$name")"
+  scope_id="$(ensure_darkirc_scope_id "$name")"
+  [[ -f "$TEMPLATES_DIR/darkirc_config.toml.template" ]] \
+    || die "darkirc config template not found at $TEMPLATES_DIR/darkirc_config.toml.template"
 
-  local toml_out="$config_dir/darkirc_config.toml"
-  if [[ -f "$TEMPLATES_DIR/darkirc_config.toml.template" ]]; then
-    render_template \
-      "darkirc_config.toml.template" "$toml_out" \
-      "TENANT_NAME=$name" \
-      "IRC_PORT=$irc_port" \
-      "RPC_PORT=$rpc_port" \
-      "CONFIG_DIR=$config_dir" \
-      "LOG_DIR=$log_dir"
-  else
-    die "darkirc config template not found at $TEMPLATES_DIR/darkirc_config.toml.template"
+  baseline="$(render_template_content \
+    "darkirc_config.toml.template" \
+    "TENANT_NAME=$name" \
+    "IRC_PORT=$irc_port" \
+    "RPC_PORT=$rpc_port" \
+    "CONFIG_DIR=$config_dir" \
+    "LOG_DIR=$log_dir")"
+  # The baseline is public/non-secret. Existing contact secrets are read only by
+  # the tenant-scoped helper through its private file descriptor and never enter
+  # argv, environment, logs, or shell output.
+  printf '%s' "$baseline" | run_darkirc_key_helper "$name" rewrite-baseline \
+    --tenant "$name" --scope-id "$scope_id" >/dev/null \
+    || die "DarkIRC semantic config update failed for tenant '$name'"
+  [[ -f "$config_dir/darkirc_config.toml" ]] \
+    || die "DarkIRC helper did not produce a config for '$name'"
+  if [[ "$registry_lock_owned" == true ]]; then
+    ports_registry_unlock
   fi
+  say "darkirc config updated for $name (irc=$irc_port rpc=$rpc_port scope=$scope_id)"
+}
 
-  chmod 0700 "$config_dir"
-  chmod 0600 "$toml_out"
+darkirc_contact_helper() {
+  local command_name="$1" name="$2" contact="${3:-}"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  case "$command_name" in
+    list|status|doctor|adopt|export-migration|recover)
+      if ! tenant_darkirc_enabled "$name" && ! darkirc_state_available "$name"; then
+        die "DarkIRC is disabled and no existing state is available for tenant '$name'"
+      fi
+      ;;
+    *)
+      tenant_darkirc_enabled "$name" || die "DarkIRC is disabled for tenant '$name'"
+      ;;
+  esac
+  local scope_id
+  case "$command_name" in
+    list|doctor)
+      scope_id="$(darkirc_scope_id "$name")"
+      if [[ -n "$scope_id" ]]; then
+        validate_existing_darkirc_scope_id "$name" "$scope_id"
+        run_darkirc_key_helper "$name" "$command_name" --tenant "$name" --scope-id "$scope_id" --json
+      else
+        run_darkirc_key_helper "$name" "$command_name" --tenant "$name" --json
+      fi
+      ;;
+    status)
+      [[ -n "$contact" ]] || die "usage: darkirc-contact status <tenant> <contact>"
+      scope_id="$(darkirc_scope_id "$name")"
+      if [[ -n "$scope_id" ]]; then
+        validate_existing_darkirc_scope_id "$name" "$scope_id"
+        run_darkirc_key_helper "$name" status --tenant "$name" --scope-id "$scope_id" \
+          --contact "$contact" --json
+      else
+        run_darkirc_key_helper "$name" status --tenant "$name" --contact "$contact" --json
+      fi
+      ;;
+    adopt)
+      scope_id="$(ensure_darkirc_scope_id "$name")"
+      [[ "${DARKIRC_ADOPT_CONFIRMED:-false}" == true ]] \
+        || die "adoption requires explicit --yes; no key is rotated"
+      run_darkirc_key_helper "$name" adopt --tenant "$name" --scope-id "$scope_id" --yes --json
+      ;;
+    export-migration)
+      scope_id="$(ensure_darkirc_scope_id "$name")"
+      run_darkirc_key_helper "$name" export-migration --tenant "$name" --scope-id "$scope_id" --json
+      ;;
+    stage-migration)
+      scope_id="$(ensure_darkirc_scope_id "$name")"
+      run_darkirc_key_helper "$name" stage-migration --tenant "$name" --scope-id "$scope_id" --json
+      ;;
+    import-migration)
+      scope_id="$(ensure_darkirc_scope_id "$name")"
+      run_darkirc_key_helper "$name" import-migration --tenant "$name" --scope-id "$scope_id" --json
+      ;;
+    migration-ready)
+      scope_id="$(ensure_darkirc_scope_id "$name")"
+      run_darkirc_key_helper "$name" migration-ready --tenant "$name" --scope-id "$scope_id" --json
+      ;;
+    recover)
+      scope_id="$(darkirc_scope_id "$name")"
+      validate_darkirc_scope_id "$scope_id"
+      run_darkirc_key_helper "$name" recover --tenant "$name" --scope-id "$scope_id" --json
+      ;;
+    prepare)
+      [[ -n "$contact" ]] || die "usage: darkirc-contact prepare <tenant> <contact> --out <file|-> [options]"
+      darkirc_exchange_prepare "$name" "$contact"
+      ;;
+    respond)
+      [[ -n "$contact" ]] || die "usage: darkirc-contact respond <tenant> <contact> --in <file|-> --out <file|-> --expect-peer-fingerprint <sha256>"
+      darkirc_exchange_respond "$name" "$contact"
+      ;;
+    complete)
+      [[ -n "$contact" ]] || die "usage: darkirc-contact complete <tenant> <contact> --in <file|-> --expect-peer-fingerprint <sha256>"
+      darkirc_exchange_complete "$name" "$contact"
+      ;;
+    cancel)
+      darkirc_exchange_cancel "$name"
+      ;;
+    exchanges)
+      darkirc_exchange_list "$name"
+      ;;
+    *) die "unknown DarkIRC contact operation '$command_name'" ;;
+  esac
+}
 
-  # The darkirc daemon runs as the tenant user, so it must own its config dir,
-  # rendered config, and datastore. This function runs as root during add-tenant,
-  # so chown the whole tree to the tenant — otherwise the daemon gets EACCES on
-  # its config and fails to start.
-  chown -R "$name:$name" "$config_dir"
+darkirc_exchange_prepare() {
+  local name="$1" contact="$2" scope_id
+  scope_id="$(ensure_darkirc_scope_id "$name")"
+  local out_flag=() expires_flag=()
+  DARKIRC_EXCHANGE_ARGS=()
+  while [[ $# -gt 2 ]]; do
+    shift
+    case "$1" in
+      --out) out_flag=(--out "$2"); shift ;;
+      --out=*) out_flag=(--out "${1#--out=}") ;;
+      --expires) expires_flag=(--expires "$2"); shift ;;
+      --json) DARKIRC_EXCHANGE_ARGS+=(--json) ;;
+      --) shift; break ;;
+      -*) die "unknown prepare flag: $1" ;;
+    esac
+  done
+  run_darkirc_key_helper "$name" prepare \
+    --tenant "$name" --scope-id "$scope_id" --contact "$contact" \
+    "${out_flag[@]}" "${expires_flag[@]}" "${DARKIRC_EXCHANGE_ARGS[@]}"
+}
 
-  say "darkirc config generated for $name (irc=$irc_port rpc=$rpc_port)"
+darkirc_exchange_respond() {
+  local name="$1" contact="$2" scope_id
+  scope_id="$(ensure_darkirc_scope_id "$name")"
+  local out_flag=() in_flag=() fp_flag=()
+  DARKIRC_EXCHANGE_ARGS=()
+  while [[ $# -gt 2 ]]; do
+    shift
+    case "$1" in
+      --out) out_flag=(--out "$2"); shift ;;
+      --out=*) out_flag=(--out "${1#--out=}") ;;
+      --in) in_flag=(--in "$2"); shift ;;
+      --in=*) in_flag=(--in "${1#--in=}") ;;
+      --expect-peer-fingerprint) fp_flag=(--expect-peer-fingerprint "$2"); shift ;;
+      --expect-peer-fingerprint=*) fp_flag=(--expect-peer-fingerprint "${1#--expect-peer-fingerprint=}") ;;
+      --json) DARKIRC_EXCHANGE_ARGS+=(--json) ;;
+      --) shift; break ;;
+      -*) die "unknown respond flag: $1" ;;
+    esac
+  done
+  [[ ${#fp_flag[@]} -gt 0 ]] || die "respond requires --expect-peer-fingerprint"
+  run_darkirc_key_helper "$name" respond \
+    --tenant "$name" --scope-id "$scope_id" --contact "$contact" \
+    "${in_flag[@]}" "${out_flag[@]}" "${fp_flag[@]}" "${DARKIRC_EXCHANGE_ARGS[@]}"
+}
+
+darkirc_exchange_complete() {
+  local name="$1" contact="$2" scope_id
+  scope_id="$(ensure_darkirc_scope_id "$name")"
+  local in_flag=() fp_flag=()
+  DARKIRC_EXCHANGE_ARGS=()
+  while [[ $# -gt 2 ]]; do
+    shift
+    case "$1" in
+      --in) in_flag=(--in "$2"); shift ;;
+      --in=*) in_flag=(--in "${1#--in=}") ;;
+      --expect-peer-fingerprint) fp_flag=(--expect-peer-fingerprint "$2"); shift ;;
+      --expect-peer-fingerprint=*) fp_flag=(--expect-peer-fingerprint "${1#--expect-peer-fingerprint=}") ;;
+      --json) DARKIRC_EXCHANGE_ARGS+=(--json) ;;
+      --) shift; break ;;
+      -*) die "unknown complete flag: $1" ;;
+    esac
+  done
+  [[ ${#fp_flag[@]} -gt 0 ]] || die "complete requires --expect-peer-fingerprint"
+  run_darkirc_key_helper "$name" complete \
+    --tenant "$name" --scope-id "$scope_id" --contact "$contact" \
+    "${in_flag[@]}" "${fp_flag[@]}" "${DARKIRC_EXCHANGE_ARGS[@]}"
+}
+
+darkirc_exchange_cancel() {
+  local name="$1" scope_id
+  scope_id="$(ensure_darkirc_scope_id "$name")"
+  local id_flag=()
+  DARKIRC_EXCHANGE_ARGS=()
+  while [[ $# -gt 1 ]]; do
+    shift
+    case "$1" in
+      --exchange-id) id_flag=(--offer-id "$2"); shift ;;
+      --exchange-id=*) id_flag=(--offer-id "${1#--exchange-id=}") ;;
+      --json) DARKIRC_EXCHANGE_ARGS+=(--json) ;;
+      --) shift; break ;;
+      -*) die "unknown cancel flag: $1" ;;
+    esac
+  done
+  [[ ${#id_flag[@]} -gt 0 ]] || die "cancel requires --exchange-id"
+  run_darkirc_key_helper "$name" cancel \
+    --tenant "$name" --scope-id "$scope_id" \
+    "${id_flag[@]}" "${DARKIRC_EXCHANGE_ARGS[@]}"
+}
+
+darkirc_exchange_list() {
+  local name="$1" scope_id
+  scope_id="$(darkirc_scope_id "$name")"
+  if [[ -n "$scope_id" ]]; then
+    validate_existing_darkirc_scope_id "$name" "$scope_id"
+    run_darkirc_key_helper "$name" exchanges --tenant "$name" --scope-id "$scope_id" --json
+  else
+    run_darkirc_key_helper "$name" exchanges --tenant "$name" --json
+  fi
+}
+
+darkirc_contact_doctor_all() {
+  local name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if tenant_darkirc_enabled "$name" || darkirc_state_available "$name"; then
+      darkirc_contact_helper doctor "$name"
+    fi
+  done < <(all_tenant_names)
 }
 
 # ── External-worker config.toml generation ────────────────────────────────────
@@ -3233,16 +4268,20 @@ patch_tenant_env() {
 
   local env_path
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
-  [[ -f "$env_path" ]] || die "env file not found: $env_path"
+  [[ -f "$env_path" && ! -L "$env_path" ]] || die "env file not found or unsafe: $env_path"
+  darkirc_file_path_safe "$env_path" || die "unsafe tenant env path: $env_path"
 
   # LUNARWING_OWNER_ID: sets the daemon's DB-scoping owner_id so sessions,
   # memory, and settings are isolated per tenant. Without it the daemon
   # defaults to "default", sharing state across all tenants on the host.
-  if grep -q '^LUNARWING_OWNER_ID=' "$env_path"; then
-    say "LUNARWING_OWNER_ID already set in $env_path (skipping)"
-  else
-    printf '\n# Runtime identity (DB scope — must match tenant name)\nLUNARWING_OWNER_ID=%s\n' "$name" >>"$env_path"
-    say "added LUNARWING_OWNER_ID=$name to $env_path"
+  patch_tenant_env_entry "$name" "$env_path" LUNARWING_OWNER_ID \
+    "LUNARWING_OWNER_ID already set in $env_path (skipping)" \
+    "added LUNARWING_OWNER_ID=$name to $env_path" <<ENVEOF
+
+# Runtime identity (DB scope — must match tenant name)
+LUNARWING_OWNER_ID=$name
+ENVEOF
+  if [[ "$TENANT_ENV_ENTRY_ADDED" == true ]]; then
     # Auto-migrate existing DB data from 'default' scope to the tenant's scope
     # so the daemon doesn't lose access to conversations, memory, and settings.
     if _owner_scope_needs_migration "$name"; then
@@ -3253,100 +4292,107 @@ patch_tenant_env() {
 
   local orchestrator_port
   orchestrator_port="$(ports_get "$name" orchestrator)"
+  patch_tenant_env_entry "$name" "$env_path" ORCHESTRATOR_PORT \
+    "ORCHESTRATOR_PORT already set in $env_path (skipping)" \
+    "added ORCHESTRATOR_PORT=$orchestrator_port to $env_path" <<ENVEOF
 
-  if grep -q '^ORCHESTRATOR_PORT=' "$env_path"; then
-    say "ORCHESTRATOR_PORT already set in $env_path (skipping)"
-  else
-    printf '\n# Orchestrator (sandbox container callback)\nORCHESTRATOR_PORT=%s\n' "$orchestrator_port" >>"$env_path"
-    say "added ORCHESTRATOR_PORT=$orchestrator_port to $env_path"
-  fi
+# Orchestrator (sandbox container callback)
+ORCHESTRATOR_PORT=$orchestrator_port
+ENVEOF
 
   local nanocode_wss_port
   nanocode_wss_port="$(ports_get "$name" nanocode_wss)"
   if [[ -n "$nanocode_wss_port" ]]; then
-    if grep -q '^NANOCODE_WSS_PORT=' "$env_path"; then
-      say "NANOCODE_WSS_PORT already set in $env_path (skipping)"
-    else
-      printf '\n# Nanocode worker (WebSocket port for agent communication)\nNANOCODE_WSS_PORT=%s\n' "$nanocode_wss_port" >>"$env_path"
-      say "added NANOCODE_WSS_PORT=$nanocode_wss_port to $env_path"
-    fi
+    patch_tenant_env_entry "$name" "$env_path" NANOCODE_WSS_PORT \
+      "NANOCODE_WSS_PORT already set in $env_path (skipping)" \
+      "added NANOCODE_WSS_PORT=$nanocode_wss_port to $env_path" <<ENVEOF
+
+# Nanocode worker (WebSocket port for agent communication)
+NANOCODE_WSS_PORT=$nanocode_wss_port
+ENVEOF
   fi
 
   local pebble_wss_port
   pebble_wss_port="$(ports_get "$name" pebble_wss)"
   if [[ -n "$pebble_wss_port" ]]; then
-    if grep -q '^PEBBLE_WSS_PORT=' "$env_path"; then
-      say "PEBBLE_WSS_PORT already set in $env_path (skipping)"
-    else
-      printf '\n# Pebble worker (WebSocket port for agent communication)\nPEBBLE_WSS_PORT=%s\n' "$pebble_wss_port" >>"$env_path"
-      say "added PEBBLE_WSS_PORT=$pebble_wss_port to $env_path"
-    fi
+    patch_tenant_env_entry "$name" "$env_path" PEBBLE_WSS_PORT \
+      "PEBBLE_WSS_PORT already set in $env_path (skipping)" \
+      "added PEBBLE_WSS_PORT=$pebble_wss_port to $env_path" <<ENVEOF
+
+# Pebble worker (WebSocket port for agent communication)
+PEBBLE_WSS_PORT=$pebble_wss_port
+ENVEOF
   fi
 
   local opencode_wss_port
   opencode_wss_port="$(ports_get "$name" opencode_wss)" || true
   if [[ -n "$opencode_wss_port" ]]; then
-    if grep -q '^OPENCODE_WSS_PORT=' "$env_path"; then
-      say "OPENCODE_WSS_PORT already set in $env_path (skipping)"
-    else
-      printf '\n# Opencode worker (WebSocket port for agent communication)\nOPENCODE_WSS_PORT=%s\n' "$opencode_wss_port" >>"$env_path"
-      say "added OPENCODE_WSS_PORT=$opencode_wss_port to $env_path"
-    fi
+    patch_tenant_env_entry "$name" "$env_path" OPENCODE_WSS_PORT \
+      "OPENCODE_WSS_PORT already set in $env_path (skipping)" \
+      "added OPENCODE_WSS_PORT=$opencode_wss_port to $env_path" <<ENVEOF
+
+# Opencode worker (WebSocket port for agent communication)
+OPENCODE_WSS_PORT=$opencode_wss_port
+ENVEOF
   fi
 
   local weechat_adapter_port
   weechat_adapter_port="$(ports_get "$name" weechat_adapter)"
   if [[ -n "$weechat_adapter_port" ]]; then
-    if grep -q '^WEECHAT_ADAPTER_PORT=' "$env_path"; then
-      say "WEECHAT_ADAPTER_PORT already set in $env_path (skipping)"
-    else
-      printf '\n# WeeChat adapter (local HTTP adapter bridging WeeChat WS relay to WASM)\nWEECHAT_ADAPTER_PORT=%s\n' "$weechat_adapter_port" >>"$env_path"
-      say "added WEECHAT_ADAPTER_PORT=$weechat_adapter_port to $env_path"
-    fi
+    patch_tenant_env_entry "$name" "$env_path" WEECHAT_ADAPTER_PORT \
+      "WEECHAT_ADAPTER_PORT already set in $env_path (skipping)" \
+      "added WEECHAT_ADAPTER_PORT=$weechat_adapter_port to $env_path" <<ENVEOF
+
+# WeeChat adapter (local HTTP adapter bridging WeeChat WS relay to WASM)
+WEECHAT_ADAPTER_PORT=$weechat_adapter_port
+ENVEOF
     # WS_ADAPTER_URL is the full adapter URL consumed by the in-process WASM
     # channel (via the capabilities `env` source). Without it the channel
     # falls back to the hardcoded :6681 default and silently fails.
-    if grep -q '^WS_ADAPTER_URL=' "$env_path"; then
-      say "WS_ADAPTER_URL already set in $env_path (skipping)"
-    else
-      printf 'WS_ADAPTER_URL=http://127.0.0.1:%s\n' "$weechat_adapter_port" >>"$env_path"
-      say "added WS_ADAPTER_URL=http://127.0.0.1:$weechat_adapter_port to $env_path"
-    fi
+    patch_tenant_env_entry "$name" "$env_path" WS_ADAPTER_URL \
+      "WS_ADAPTER_URL already set in $env_path (skipping)" \
+      "added WS_ADAPTER_URL=http://127.0.0.1:$weechat_adapter_port to $env_path" <<ENVEOF
+WS_ADAPTER_URL=http://127.0.0.1:$weechat_adapter_port
+ENVEOF
   fi
 
   local weechat_port
   weechat_port="$(ports_get "$name" weechat)"
   if [[ -n "$weechat_port" ]]; then
-    if grep -q '^RELAY_URL=' "$env_path"; then
-      say "RELAY_URL already set in $env_path (skipping)"
-    else
-      printf '\n# WeeChat relay URL consumed by the in-process WASM channel\nRELAY_URL=http://127.0.0.1:%s\n' "$weechat_port" >>"$env_path"
-      say "added RELAY_URL=http://127.0.0.1:$weechat_port to $env_path"
-    fi
+    patch_tenant_env_entry "$name" "$env_path" RELAY_URL \
+      "RELAY_URL already set in $env_path (skipping)" \
+      "added RELAY_URL=http://127.0.0.1:$weechat_port to $env_path" <<ENVEOF
+
+# WeeChat relay URL consumed by the in-process WASM channel
+RELAY_URL=http://127.0.0.1:$weechat_port
+ENVEOF
   fi
 
   if tenant_darkirc_enabled "$name"; then
+    ensure_darkirc_scope_id "$name" >/dev/null
+    darkirc_writer_lock "$name"
     local darkirc_adapter_port
     darkirc_adapter_port="$(ports_get "$name" darkirc_adapter)" || true
     if [[ -n "$darkirc_adapter_port" ]]; then
-      if grep -q '^DARKIRC_ADAPTER_URL=' "$env_path"; then
-        say "DARKIRC_ADAPTER_URL already set in $env_path (skipping)"
-      else
-        printf '\nDARKIRC_ADAPTER_URL=http://127.0.0.1:%s\n' "$darkirc_adapter_port" >>"$env_path"
-        say "added DARKIRC_ADAPTER_URL=http://127.0.0.1:$darkirc_adapter_port to $env_path"
-      fi
-      if grep -q '^DARKIRC_ADAPTER_SECRET=' "$env_path"; then
-        say "DARKIRC_ADAPTER_SECRET already set in $env_path (skipping)"
-      else
-        local darkirc_adapter_secret
-        darkirc_adapter_secret="$(generate_token | cut -c1-32)"
-        printf 'DARKIRC_ADAPTER_SECRET=%s\n' "$darkirc_adapter_secret" >>"$env_path"
-        say "added DARKIRC_ADAPTER_SECRET to $env_path"
-      fi
+      patch_tenant_env_entry "$name" "$env_path" DARKIRC_ADAPTER_URL \
+        "DARKIRC_ADAPTER_URL already set in $env_path (skipping)" \
+        "added DARKIRC_ADAPTER_URL=http://127.0.0.1:$darkirc_adapter_port to $env_path" <<ENVEOF
+
+DARKIRC_ADAPTER_URL=http://127.0.0.1:$darkirc_adapter_port
+ENVEOF
+      local darkirc_adapter_secret
+      darkirc_adapter_secret="$(generate_token | cut -c1-32)"
+      patch_tenant_env_entry "$name" "$env_path" DARKIRC_ADAPTER_SECRET \
+        "DARKIRC_ADAPTER_SECRET already set in $env_path (skipping)" \
+        "added DARKIRC_ADAPTER_SECRET to $env_path" <<ENVEOF
+DARKIRC_ADAPTER_SECRET=$darkirc_adapter_secret
+ENVEOF
+      unset darkirc_adapter_secret
       write_tenant_darkirc_adapter_env "$name"
-      if ports_get "$name" darkirc_irc >/dev/null 2>&1; then
-        generate_darkirc_config "$name"
-      fi
+    fi
+    darkirc_writer_unlock
+    if [[ -n "${darkirc_adapter_port:-}" ]] && ports_get "$name" darkirc_irc >/dev/null 2>&1; then
+      generate_darkirc_config "$name"
     fi
   fi
 
@@ -5412,31 +6458,13 @@ INITEOF
 # ── OpenRC service units ─────────────────────────────────────────────────────
 
 install_openrc_env_exec() {
-  local install_dir owner group mode links
   [[ -f "$OPENRC_ENV_EXEC_SRC" && ! -L "$OPENRC_ENV_EXEC_SRC" ]] \
     || die "OpenRC tenant env launcher is missing: $OPENRC_ENV_EXEC_SRC"
-
-  install_dir="$(dirname "$OPENRC_ENV_EXEC")"
-  install -d -o root -g root -m 0755 "$install_dir" \
-    || die "failed to prepare OpenRC tenant env launcher directory"
-  [[ -d "$install_dir" && ! -L "$install_dir" ]] \
-    || die "unsafe OpenRC tenant env launcher directory: $install_dir"
-  owner="$(stat -c '%u' "$install_dir" 2>/dev/null || true)"
-  group="$(stat -c '%g' "$install_dir" 2>/dev/null || true)"
-  mode="$(stat -c '%a' "$install_dir" 2>/dev/null || true)"
-  [[ "$owner" == 0 && "$group" == 0 && "$mode" == 755 ]] \
-    || die "OpenRC tenant env launcher directory must be root:root mode 0755"
-
+  install -d -o root -g root -m 0755 "$(dirname "$OPENRC_ENV_EXEC")"
   install -o root -g root -m 0755 "$OPENRC_ENV_EXEC_SRC" "$OPENRC_ENV_EXEC" \
     || die "failed to install OpenRC tenant env launcher"
-  [[ -f "$OPENRC_ENV_EXEC" && ! -L "$OPENRC_ENV_EXEC" && -x "$OPENRC_ENV_EXEC" ]] \
-    || die "unsafe OpenRC tenant env launcher: $OPENRC_ENV_EXEC"
-  owner="$(stat -c '%u' "$OPENRC_ENV_EXEC" 2>/dev/null || true)"
-  group="$(stat -c '%g' "$OPENRC_ENV_EXEC" 2>/dev/null || true)"
-  mode="$(stat -c '%a' "$OPENRC_ENV_EXEC" 2>/dev/null || true)"
-  links="$(stat -c '%h' "$OPENRC_ENV_EXEC" 2>/dev/null || true)"
-  [[ "$owner" == 0 && "$group" == 0 && "$mode" == 755 && "$links" == 1 ]] \
-    || die "OpenRC tenant env launcher must be root:root, single-link mode 0755"
+  darkirc_validate_root_executable "$OPENRC_ENV_EXEC" \
+    || die "OpenRC tenant env launcher failed ownership validation"
 }
 
 render_tenant_openrc_units() {
@@ -5721,7 +6749,9 @@ depend() {
 }
 
 start_pre() {
-    checkpath -d -m 0750 -o "\${darkirc_user}:\${darkirc_group}" "\${darkirc_state_dir}/darkirc"
+    # DarkIRC state is prepared and ownership-checked by mt-admin/the typed
+    # helper.  Do not let OpenRC's root-side checkpath follow a tenant symlink.
+    [ -d "\${darkirc_state_dir}/darkirc" ] && [ ! -L "\${darkirc_state_dir}/darkirc" ] || return 1
     checkpath -d -m 0750 -o "\${darkirc_user}:\${darkirc_group}" "\${darkirc_log_dir}"
     checkpath -d -m 0750 -o "\${darkirc_user}:\${darkirc_group}" "\${darkirc_runtime_dir}"
     checkpath -f -m 0640 -o "\${darkirc_user}:\${darkirc_group}" "\${output_log}"
@@ -6023,6 +7053,122 @@ stop_tenant_openrc() {
   say "OpenRC services stopped for $name"
 }
 
+# Stop only tenant services that can write the migration snapshot. PostgreSQL is
+# deliberately excluded so export-tenant.sh can still run pg_dump after the
+# writer quiesce. All init-specific calls stay behind mt-admin; migration
+# wrappers must never probe or control tenant units directly.
+tenant_writer_services() {
+  local name="$1"
+  printf '%s\n' "lunarwing-${name}" "xmpp-bridge-${name}" \
+    "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}"
+  tenant_proxy_enabled "$name" \
+    && printf '%s\n' "lunarwing-proxy-${name}"
+  if tenant_darkirc_enabled "$name"; then
+    printf '%s\n' "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}"
+  fi
+  for worker in nanocode pebble opencode; do
+    if tenant_worker_enabled "$name" "$worker"; then
+      printf '%s\n' "lunarwing-${worker}-${name}" "lunarwing-${worker}-${name}-sup"
+    fi
+  done
+  if [[ "$INIT_SYSTEM" != openrc || -e "/etc/init.d/lunarwing-vision-${name}" ]]; then
+    printf '%s\n' "lunarwing-vision-${name}"
+  fi
+}
+
+stop_tenant_writers() {
+  local name="$1" service
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    while IFS= read -r service; do
+      _systemctl_user "$name" stop "${service}.service" >/dev/null 2>&1 || true
+    done < <(tenant_writer_services "$name")
+  else
+    while IFS= read -r service; do
+      rc-service "$service" stop >/dev/null 2>&1 || true
+    done < <(tenant_writer_services "$name")
+  fi
+  say "tenant writers stopped for $name (PostgreSQL left running)"
+}
+
+tenant_writers_active() {
+  local name="$1" service state rc
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || return 2
+  ensure_init_system || return 2
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    while IFS= read -r service; do
+      rc=0
+      state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
+      case "$state" in
+        active|activating|reloading|deactivating) return 0 ;;
+        inactive|dead|failed|maintenance) ;;
+        unknown) [[ "$rc" -eq 4 ]] || return 2 ;;
+        *) return 2 ;;
+      esac
+    done < <(tenant_writer_services "$name")
+  else
+    while IFS= read -r service; do
+      rc=0
+      state="$(rc-service "$service" status 2>/dev/null)" || rc=$?
+      case "$state" in
+        *stopped*|*inactive*|*dead*) ;;
+        *started*|*running*|*active*) return 0 ;;
+        *) return 2 ;;
+      esac
+    done < <(tenant_writer_services "$name")
+  fi
+  return 1
+}
+
+# Strict DarkIRC activation gate used by managed contact operations. The daemon
+# and adapter must both be active through the selected init abstraction, then
+# the adapter's authenticated health endpoint must report an IRC connection.
+# The bearer is supplied to curl over stdin (`--header @-`) so it never appears
+# in argv or process listings.
+darkirc_health_strict() {
+  local name="$1" attempts="${2:-10}" quiet="${3:-false}" service adapter_port env_path secret response
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || return 1
+  tenant_darkirc_enabled "$name" || return 1
+  ensure_init_system
+
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _systemctl_user "$name" is-active --quiet "lunarwing-darkirc-${name}.service" \
+      || return 1
+    _systemctl_user "$name" is-active --quiet "lunarwing-darkirc-adapter-${name}.service" \
+      || return 1
+  else
+    rc-service "lunarwing-darkirc-${name}" status >/dev/null 2>&1 || return 1
+    rc-service "lunarwing-darkirc-adapter-${name}" status >/dev/null 2>&1 || return 1
+  fi
+
+  adapter_port="$(ports_get "$name" darkirc_adapter 2>/dev/null || true)"
+  [[ "$adapter_port" =~ ^[0-9]+$ ]] || return 1
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  secret="$(read_tenant_env_value \
+    "$name" "$env_path" DARKIRC_ADAPTER_SECRET 2>/dev/null)" || return 1
+  [[ -n "$secret" ]] || return 1
+  require_cmd curl
+  require_cmd jq
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    response="$(printf 'Authorization: Bearer %s\n' "$secret" | \
+      curl -fsS --max-time 2 --header @- \
+        "http://127.0.0.1:${adapter_port}/health" 2>/dev/null || true)"
+    if jq -e '(.status == "ok") and (.irc_connected == true)' <<<"$response" \
+      >/dev/null 2>&1; then
+      [[ "$quiet" == true ]] || say "strict DarkIRC health passed for $name"
+      return 0
+    fi
+    [[ "$attempt" -lt "$attempts" ]] && sleep 1
+  done
+  say "strict DarkIRC health failed for $name" >&2
+  return 1
+}
+
 uninstall_tenant_openrc() {
   local name="$1"
   for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-vision-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup"; do
@@ -6281,6 +7427,7 @@ add_tenant() {
   local with_nanocode="${19:-false}"
   local with_pebble="${20:-false}"
   local with_opencode="${21:-false}"
+  local darkirc_scope_override="${22:-}"
 
   name="$(sanitize_name "$name")"
   [[ -n "$name" ]] || die "invalid tenant name"
@@ -6303,7 +7450,7 @@ add_tenant() {
   local base_port workers_json
   workers_json="$(printf '{"nanocode":%s,"pebble":%s,"opencode":%s}' \
     "$with_nanocode" "$with_pebble" "$with_opencode")"
-  base_port="$(ports_allocate "$name" "$enable_darkirc" "$enable_proxy" "$workers_json")"
+  base_port="$(ports_allocate "$name" "$enable_darkirc" "$enable_proxy" "$workers_json" "$darkirc_scope_override")"
   say ""
 
   create_tenant_user "$name" "$docker_group"
@@ -6322,8 +7469,15 @@ add_tenant() {
     write_tenant_proxy_env "$name" "$tensorzero_url"
   fi
   if [[ "$enable_darkirc" == "true" ]]; then
+    ensure_darkirc_scope_id "$name" >/dev/null
+    darkirc_writer_lock "$name"
     write_tenant_darkirc_adapter_env "$name"
-    generate_darkirc_config "$name"
+    darkirc_writer_unlock
+    if darkirc_key_helper_path "$name" >/dev/null 2>&1; then
+      generate_darkirc_config "$name"
+    else
+      say "DarkIRC config deferred until build-tenant installs the typed key helper"
+    fi
   fi
   write_tenant_gotify_config "$name" "$gotify_url" "$gotify_title"
   ensure_external_worker_config "$name" "nanocode" "nanocode_wss"
@@ -6681,6 +7835,15 @@ upgrade_tenant() {
   repo="$(tenant_repo "$name")"
 
   [[ -d "$lw_root/.git" ]] || die "no git checkout at $lw_root; run add-tenant first"
+
+  if tenant_darkirc_enabled "$name"; then
+    local darkirc_scope
+    darkirc_scope="$(darkirc_scope_id "$name")"
+    validate_darkirc_scope_id "$darkirc_scope"
+    run_darkirc_key_helper "$name" migration-ready --tenant "$name" \
+      --scope-id "$darkirc_scope" --json >/dev/null \
+      || die "DarkIRC migration state is not settled; refusing upgrade"
+  fi
 
   local tgit=(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root")
 
@@ -7048,7 +8211,7 @@ main() {
   case "$command_name" in
     add-tenant)
       require_root
-      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" with_nanocode="false" with_pebble="false" with_opencode="false"
+      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" with_nanocode="false" with_pebble="false" with_opencode="false" darkirc_scope_override=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -7057,6 +8220,7 @@ main() {
           --no-ssh)          SSH_OPT_OUT=true; shift ;;
           --no-weechat-bootstrap) WEECHAT_BOOTSTRAP_OPT_OUT=true; shift ;;
           --enable-darkirc)  enable_darkirc="true"; shift ;;
+          --darkirc-scope-id) darkirc_scope_override="$2"; shift 2 ;;
           --enable-proxy)    enable_proxy="true"; shift ;;
           --with-nanocode)   with_nanocode="true"; shift ;;
           --with-pebble)     with_pebble="true"; shift ;;
@@ -7084,7 +8248,7 @@ main() {
       done
       [[ -n "$name" ]] || die "usage: add-tenant <name> [--docker-group] [--xmpp-jid <jid>]"
       [[ -n "$xmpp_jid" ]] || xmpp_jid="$(sanitize_name "$name")@xmpp.localhost"
-      add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode"
+      add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode" "$darkirc_scope_override"
       ;;
 
     add-tenants)
@@ -7203,7 +8367,10 @@ main() {
           *)        die "unexpected argument: $1" ;;
         esac
       done
-      build_darkirc "$darkirc_tenant"
+      if [[ -n "$darkirc_tenant" ]]; then
+        say "note: --tenant identifies the requesting tenant only; the shared DarkIRC binary uses the fixed root-controlled build boundary"
+      fi
+      build_darkirc
       ;;
 
     build-nanocode-worker)
@@ -7277,6 +8444,30 @@ main() {
       require_root
       [[ -n "${1:-}" ]] || die "usage: stop-tenant <name>"
       stop_tenant "$1"
+      ;;
+
+    stop-writers)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: stop-writers <name>"
+      ports_registry_init
+      stop_tenant_writers "$1"
+      ;;
+
+    writers-active)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: writers-active <name>"
+      ports_registry_init
+      local writers_rc=0
+      tenant_writers_active "$1" || writers_rc=$?
+      if [[ "$writers_rc" -eq 0 ]]; then
+        say "active"
+        exit 0
+      fi
+      if [[ "$writers_rc" -eq 1 ]]; then
+        say "stopped"
+        exit 1
+      fi
+      die "could not determine tenant writer state"
       ;;
 
     restart-tenant)
@@ -7436,15 +8627,104 @@ main() {
       say "Run '$0 restart-tenant $name' to start the daemon and upload the key to the secrets store"
       ;;
 
-    configure-weechat-relay)
-      [[ -n "${1:-}" ]] || die "usage: configure-weechat-relay <name>"
-      [[ $# -eq 1 ]]   || die "usage: configure-weechat-relay <name> (unexpected extra arguments)"
+    darkirc-contact)
       require_root
-      local name
-      name="$(sanitize_name "$1")"
+      local contact_action="" contact_tenant="" contact_name="" adopt_yes=false doctor_all=false migration_in=false migration_json=false
+      contact_action="${1:-}"; shift || true
+      case "$contact_action" in
+        list|doctor)
+          if [[ "$contact_action" == doctor && "${1:-}" == "--all" ]]; then
+            doctor_all=true; shift
+          else
+            contact_tenant="${1:-}"; shift || true
+          fi
+          ;;
+        status)
+          contact_tenant="${1:-}"; contact_name="${2:-}"; shift 2 || true
+          ;;
+        adopt)
+          contact_tenant="${1:-}"; shift || true
+          [[ "${1:-}" == "--yes" ]] && adopt_yes=true && shift
+          ;;
+        export-migration|import-migration|migration-ready|recover)
+          contact_tenant="${1:-}"; shift || true
+          ;;
+        stage-migration)
+          contact_tenant="${1:-}"; shift || true
+          [[ "${1:-}" == "--in" ]] || die "stage-migration requires --in -"
+          [[ "${2:-}" == "-" ]] || die "stage-migration accepts stdin only (--in -)"
+          migration_in=true; shift 2
+          ;;
+        validate-migration)
+          [[ "${1:-}" == "--in" ]] || die "validate-migration requires --in -"
+          [[ "${2:-}" == "-" ]] || die "validate-migration accepts stdin only (--in -)"
+          migration_in=true; shift 2
+          [[ "${1:-}" == "--json" ]] && migration_json=true && shift
+          local migration_unbound=false
+          [[ "${1:-}" == "--unbound" ]] && migration_unbound=true && shift
+          [[ $# -eq 0 ]] || die "unexpected validate-migration argument: $1"
+          run_darkirc_manifest_validator "$migration_unbound"
+          exit 0
+          ;;
+        prepare|respond|complete)
+          contact_tenant="${1:-}"; contact_name="${2:-}"; shift 2 || true
+          ;;
+        cancel)
+          contact_tenant="${1:-}"; shift || true
+          ;;
+        exchanges)
+          contact_tenant="${1:-}"; shift || true
+          ;;
+        *) die "usage: darkirc-contact {list|status|doctor|adopt|export-migration|stage-migration|import-migration|migration-ready|recover|validate-migration|prepare|respond|complete|cancel|exchanges} ..." ;;
+      esac
+      if [[ "$contact_action" == list || "$contact_action" == status || "$contact_action" == doctor || "$contact_action" == exchanges ]]; then
+        ports_registry_require_readonly
+      else
+        ports_registry_init
+      fi
+      if $doctor_all; then
+        darkirc_contact_doctor_all
+      else
+        [[ -n "$contact_tenant" ]] || die "missing DarkIRC tenant"
+        contact_tenant="$(sanitize_name "$contact_tenant")"
+        if [[ "$contact_action" == adopt ]]; then
+          $adopt_yes || die "adoption requires --yes (this does not rotate any key)"
+          DARKIRC_ADOPT_CONFIRMED=true darkirc_contact_helper adopt "$contact_tenant"
+        elif [[ "$contact_action" == status ]]; then
+          darkirc_contact_helper status "$contact_tenant" "$contact_name"
+        elif [[ "$contact_action" == prepare || "$contact_action" == respond || "$contact_action" == complete ]]; then
+          darkirc_contact_helper "$contact_action" "$contact_tenant" "$contact_name" "$@"
+        elif [[ "$contact_action" == cancel ]]; then
+          darkirc_contact_helper cancel "$contact_tenant" "$@"
+        elif [[ "$contact_action" == exchanges ]]; then
+          darkirc_contact_helper exchanges "$contact_tenant"
+        else
+          darkirc_contact_helper "$contact_action" "$contact_tenant"
+        fi
+      fi
+      ;;
+
+    darkirc-health)
+      require_root
+      local health_tenant="" health_strict=false health_json=false
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --strict) health_strict=true; shift ;;
+          --json) health_json=true; shift ;;
+          -*) die "unknown flag: $1" ;;
+          *) [[ -z "$health_tenant" ]] || die "unexpected argument: $1"; health_tenant="$1"; shift ;;
+        esac
+      done
+      $health_strict || die "darkirc-health requires --strict"
       ports_registry_init
-      tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
-      configure_weechat_relay "$name"
+      tenant_exists_in_registry "$health_tenant" || die "tenant '$health_tenant' not found in registry"
+      if darkirc_health_strict "$health_tenant" 10 "$health_json"; then
+        if $health_json; then
+          printf '{"status":"ok","tenant":"%s","irc_connected":true}\n' "$health_tenant"
+        fi
+      else
+        die "strict DarkIRC health failed for tenant '$health_tenant'"
+      fi
       ;;
 
     patch-env)
