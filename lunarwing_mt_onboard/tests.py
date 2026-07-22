@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import call, patch
 
 from lunarwing_mt_onboard import provisioner
 from lunarwing_mt_onboard.config import TenantConfig, WorkerType
@@ -49,7 +50,6 @@ class TestConfigSerialization(unittest.TestCase):
             xmpp_enabled=True,
             xmpp_jid="alpha@xmpp.localhost",
             workers=[WorkerType.NANOCODE, WorkerType.OPENCODE],
-            tensorzero_url="http://example:3000/v1",
             secrets_master_key="ab" * 32,
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -60,8 +60,18 @@ class TestConfigSerialization(unittest.TestCase):
         self.assertEqual(loaded.gateway_host, "0.0.0.0")
         self.assertTrue(loaded.xmpp_enabled)
         self.assertEqual(loaded.workers, [WorkerType.NANOCODE, WorkerType.OPENCODE])
-        self.assertEqual(loaded.tensorzero_url, "http://example:3000/v1")
         self.assertEqual(loaded.secrets_master_key, "ab" * 32)
+
+    def test_current_llm_and_worker_overrides_round_trip(self):
+        config = TenantConfig(
+            name="alpha",
+            llm_base_url="http://127.0.0.1:4000/openai/v1",
+            nanocode_model="nano-model",
+            nanocode_base_url="http://nano.test/v1",
+            opencode_model="open-model",
+            opencode_base_url="http://open.test/v1",
+        )
+        self.assertEqual(TenantConfig.from_dict(config.to_dict()), config)
 
     def test_to_dict_serializes_workers_as_strings(self):
         config = TenantConfig(
@@ -212,6 +222,38 @@ class TestProvisionerArgs(unittest.TestCase):
         self.assertIn("--llm-model", args)
         self.assertIn("tensorzero::function_name::lunarwing", args)
 
+    def test_current_llm_and_worker_overrides_are_forwarded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "lunarwing-mt-admin.sh")
+            with open(script, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(script, 0o700)
+            previous = provisioner.MT_ADMIN_SCRIPT
+            provisioner.MT_ADMIN_SCRIPT = script
+            try:
+                args = provisioner.build_add_tenant_args(
+                    TenantConfig(
+                        name="alpha",
+                        llm_base_url="http://llm.test/v1",
+                        nanocode_model="nano-model",
+                        nanocode_base_url="http://nano.test/v1",
+                        opencode_model="open-model",
+                        opencode_base_url="http://open.test/v1",
+                    )
+                )
+            finally:
+                provisioner.MT_ADMIN_SCRIPT = previous
+
+        for flag, value in (
+            ("--llm-base-url", "http://llm.test/v1"),
+            ("--nanocode-model", "nano-model"),
+            ("--nanocode-base-url", "http://nano.test/v1"),
+            ("--opencode-model", "open-model"),
+            ("--opencode-base-url", "http://open.test/v1"),
+        ):
+            self.assertIn(flag, args)
+            self.assertIn(value, args)
+
     def test_worker_selection_is_forwarded_to_add_tenant(self):
         # start-tenant gates workers on the per-tenant registry flag persisted at
         # add-tenant, so build_add_tenant_args must emit --with-* for selected
@@ -281,6 +323,64 @@ class TestProvisionerArgs(unittest.TestCase):
                 provisioner.MT_ADMIN_SCRIPT = previous
         self.assertIn("--no-weechat-bootstrap", opted_out)
         self.assertNotIn("--no-weechat-bootstrap", default)
+
+    def test_xmpp_password_is_written_to_daemon_and_bridge_envs(self):
+        config = TenantConfig(name="alpha", xmpp_password="shared-password")
+        with patch.object(provisioner.os.path, "isfile", return_value=True), patch.object(
+            provisioner, "_write_env_values"
+        ) as write_values:
+            provisioner._inject_secrets(config)
+
+        self.assertEqual(
+            write_values.call_args_list,
+            [
+                call(
+                    "/home/alpha/lunarwing/env/lunarwing.env",
+                    {"XMPP_PASSWORD": "shared-password"},
+                ),
+                call(
+                    "/home/alpha/lunarwing/env/xmpp-bridge.env",
+                    {"XMPP_PASSWORD": "shared-password"},
+                ),
+            ],
+        )
+
+    def test_skip_build_also_skips_start(self):
+        phase = provisioner.PhaseResult(name="add-tenant", returncode=0)
+        with patch.object(provisioner, "build_add_tenant_args", return_value=["mt", "add"]), patch.object(
+            provisioner, "_run", return_value=phase
+        ) as run, patch.object(provisioner, "_inject_secrets"):
+            result = provisioner.provision(
+                TenantConfig(name="alpha"),
+                skip_build=True,
+                skip_start=False,
+            )
+
+        self.assertTrue(result.ok)
+        run.assert_called_once()
+
+    def test_unrelated_subprocess_does_not_inherit_kawarimi_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "check-env.sh")
+            with open(script, "w") as script_file:
+                script_file.write(
+                    "#!/bin/sh\n"
+                    "test -z \"${KAWARIMI_PASS:-}\"\n"
+                    "test -z \"${KAWARIMI_PASS_FILE:-}\"\n"
+                    "test -z \"${KAWARIMI_PASS_FD:-}\"\n"
+                )
+            os.chmod(script, 0o700)
+            with patch.dict(
+                os.environ,
+                {
+                    "KAWARIMI_PASS": "secret",
+                    "KAWARIMI_PASS_FILE": "/root/secret",
+                    "KAWARIMI_PASS_FD": "9",
+                },
+            ):
+                result = provisioner.run_command([script], phase_name="env-check")
+
+        self.assertTrue(result.ok)
 
 
 class TestSecretsHelpers(unittest.TestCase):

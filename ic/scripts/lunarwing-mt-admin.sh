@@ -18,6 +18,7 @@ PORT_RANGE_START=10000
 PORT_RANGE_END=19999
 PORT_BLOCK_SIZE=10
 BUILD_LOCK="/var/lock/lunarwing-build.lock"
+PORTS_LOCK_HELD="false"
 PROFILE="${LUNARWING_MT_PROFILE:-release}"
 SOURCE_REPO="${LUNARWING_MT_SOURCE_REPO:-$LUNARWING_ROOT}"
 DARKIRC_SOURCE="${LUNARWING_MT_DARKIRC_SOURCE:-}"
@@ -97,6 +98,24 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+acquire_ports_lock() {
+  local registry_dir
+  [[ "$PORTS_LOCK_HELD" == "true" ]] && return 0
+  require_cmd flock
+  registry_dir="$(dirname "$PORTS_REGISTRY")"
+  mkdir -p "$registry_dir"
+  exec 199<"$registry_dir"
+  flock -x 199
+  PORTS_LOCK_HELD="true"
+}
+
+release_ports_lock() {
+  [[ "$PORTS_LOCK_HELD" == "true" ]] || return 0
+  flock -u 199
+  exec 199>&-
+  PORTS_LOCK_HELD="false"
 }
 
 generate_token() {
@@ -884,6 +903,18 @@ _deregister_babysitter() {
 # ── Port registry ────────────────────────────────────────────────────────────
 
 ports_registry_init() {
+  local registry_version="" registry_needs_repair="false"
+  if [[ -f "$PORTS_REGISTRY" ]]; then
+    registry_version="$(jq -r '.version // 0' "$PORTS_REGISTRY" 2>/dev/null || true)"
+    if jq -e '.tenants | to_entries[] | select(.value.extended_ports | has("darkirc_adapter") | not)' \
+        "$PORTS_REGISTRY" >/dev/null 2>&1; then
+      registry_needs_repair="true"
+    fi
+  fi
+  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "11" || "$registry_needs_repair" == "true" ]]; then
+    acquire_ports_lock
+  fi
+
   if [[ ! -d /etc/lunarwing ]]; then
     mkdir -p /etc/lunarwing
     chmod 0755 /etc/lunarwing
@@ -906,6 +937,7 @@ ENDJSON
   fi
 
   ports_migrate
+  release_ports_lock
 }
 
 ports_migrate_v2() {
@@ -1230,6 +1262,7 @@ ports_allocate() {
   local workers_json="${4:-}"
   [[ -n "$workers_json" ]] || workers_json='{}'
   require_cmd jq
+  acquire_ports_lock
 
   # Resumable (F4): if this tenant already has a block, reuse it (echo its
   # base_port) instead of dying — so re-running add-tenant after a mid-flow failure
@@ -1258,6 +1291,7 @@ ports_allocate() {
       fi
     done
     printf '%s' "$existing"
+    release_ports_lock
     return 0
   fi
 
@@ -1332,6 +1366,7 @@ ports_allocate() {
 
   say "allocated port block $base-$((base + PORT_BLOCK_SIZE - 1)) for tenant '$name'" >&2
   printf '%s' "$base"
+  release_ports_lock
 }
 
 # Mark darkirc enabled for a tenant in the registry (one-directional: false -> true).
@@ -1410,9 +1445,11 @@ ports_enable_worker() {
 ports_deallocate() {
   local name="$1"
   require_cmd jq
+  acquire_ports_lock
 
   if ! jq -e ".tenants[\"$name\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
     say "tenant '$name' not in port registry (already removed?)"
+    release_ports_lock
     return 0
   fi
 
@@ -1423,6 +1460,7 @@ ports_deallocate() {
   mv "$tmp" "$PORTS_REGISTRY"
 
   say "deallocated ports for tenant '$name'"
+  release_ports_lock
 }
 
 ports_get() {

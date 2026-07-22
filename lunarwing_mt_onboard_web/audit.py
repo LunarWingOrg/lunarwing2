@@ -21,7 +21,16 @@ _KV_RE = re.compile(
 # Bare 64-char hex (a secrets master key) appearing anywhere.
 _HEX64_RE = re.compile(r"\b[0-9a-fA-F]{64}\b")
 # argv flags whose following token is a secret value.
-_SECRET_FLAGS = {"--xmpp-password", "--llm-api-key", "--secret", "--secretvalue", "--password"}
+_SECRET_FLAGS = {
+    "--xmpp-password",
+    "--llm-api-key",
+    "--secret",
+    "--secretvalue",
+    "--password",
+    "--passphrase",
+    "--bundle-passphrase",
+    "--passphrase-file",
+}
 
 _REDACTED = "***REDACTED***"
 
@@ -87,7 +96,9 @@ class AuditLogger:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         safe_tenant = re.sub(r"[^A-Za-z0-9_-]", "_", tenant or "none")
         self.path = self.dir / f"{ts}-{mode}-{safe_tenant}-{job_id}.log"
-        self._fh = self.path.open("a", encoding="utf-8")
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(fd, 0o600)
+        self._fh = os.fdopen(fd, "a", encoding="utf-8")
         self._start = time.monotonic()
         tag = "DEMO" if demo else "REAL"
         self._raw(f"# lunarwing-mt-onboard-web audit log ({tag})")

@@ -48,6 +48,30 @@ class TestListTenants(unittest.TestCase):
             finally:
                 os.unlink(f.name)
 
+    def test_tenant_gateway_port_reads_registry(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(
+                {
+                    "version": 11,
+                    "tenants": {"alpha": {"ports": {"gateway": 10020}}},
+                },
+                f,
+            )
+            f.flush()
+            try:
+                with patch.object(secrets_ops, "_PORTS_JSON", f.name):
+                    self.assertEqual(secrets_ops.tenant_gateway_port("alpha"), 10020)
+                    self.assertEqual(secrets_ops.tenant_gateway_port("missing"), 0)
+            finally:
+                os.unlink(f.name)
+
+    def test_tenant_gateway_host_reads_tenant_env(self):
+        with patch(
+            "lunarwing_mt_onboard.secrets_ops.parse_tenant_env",
+            return_value={"GATEWAY_HOST": "192.0.2.10"},
+        ):
+            self.assertEqual(secrets_ops.tenant_gateway_host("alpha"), "192.0.2.10")
+
     def test_populated_tenants(self):
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False

@@ -153,7 +153,7 @@ pub enum ToolDomain {
 }
 
 /// Error type for tool execution.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum ToolError {
     #[error("Invalid parameters: {0}")]
     InvalidParameters(String),
@@ -278,6 +278,11 @@ pub trait Tool: Send + Sync {
 
     /// Get the JSON Schema for the tool's parameters.
     fn parameters_schema(&self) -> serde_json::Value;
+
+    /// Restrict discovery and execution to one user when the tool holds owner-bound state.
+    fn owner_user_id(&self) -> Option<&str> {
+        None
+    }
 
     /// Execute the tool with the given parameters.
     async fn execute(

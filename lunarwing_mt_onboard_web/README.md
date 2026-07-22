@@ -19,7 +19,7 @@ Kawarimi import/export scripts.
 
 Then open the printed URL, e.g. `http://127.0.0.1:1969/?token=…`.
 
-Demo mode swaps five `LUNARWING_*` script paths for bundled fake scripts
+Demo mode swaps the active `LUNARWING_*` script paths for bundled fake scripts
 that emit realistic phased output with pauses, so you can exercise the entire
 UI (all five flows, progress, logs, mascot, moon) safely. Tip: to make a demo
 build fail (and see the angry bat), use a tenant name containing `fail`.
@@ -37,6 +37,13 @@ the UI streams logs and shows progress throughout.
 Kawarimi import is dry-run and stage-only by default. Applying an import does
 not start the restored tenant unless **Start restored tenant** is also checked;
 unattended start requires the operator to confirm that the old host is stopped.
+Encrypted `.7z` imports require the bundle passphrase even for dry-run because
+the metadata must be decrypted before validation. A real export requires a
+confirmed passphrase of at least 12 characters before it can stop services.
+
+The upgrade form drives `lunarwing-mt-admin.sh upgrade-tenant`, accepts a branch,
+tag, or commit such as `v2.0.2.0`, and applies immediately after explicit
+confirmation. Backup and service-unit rendering remain enabled by default.
 
 ## Options
 
@@ -47,6 +54,7 @@ unattended start requires the operator to confirm that the old host is stopped.
 | `--demo` | off | Use bundled fake scripts; no sudo, no system changes |
 | `--log-dir DIR` | `/var/log/lunarwing-mt-onboard-web` or package `logs/` | Audit log location |
 | `--no-token` | off | Disable the session token (not recommended) |
+| `--allow-insecure-remote` | off | Permit real mode outside loopback without TLS (dangerous; prefer an SSH tunnel) |
 
 ## Security
 
@@ -54,12 +62,20 @@ unattended start requires the operator to confirm that the old host is stopped.
 - A random **session token** is generated at startup and embedded in the launch
   URL; every REST and WebSocket call must present it. Because this app can
   create OS users and run privileged scripts, do not expose it beyond loopback.
+- Real mode refuses non-loopback binds unless the operator supplies the explicit
+  `--allow-insecure-remote` override. The application does not terminate TLS.
+- Kawarimi passphrases are sent only in POST bodies, held per job, passed to the
+  shell through an anonymous descriptor, and fed to `7z` over stdin. They are
+  excluded from model serialization, subprocess argv, streamed output, and logs.
+- Only one privileged job may run at a time. A concurrent request receives HTTP
+  `409` instead of racing tenant lifecycle or port-registry mutations.
 
 ## Audit logs
 
 Every underlying invocation is recorded to a per-run log file (command line,
 every output line, phase results, duration). Secret values — master keys,
 passwords, API keys, secret payloads — are redacted and never written to disk.
+Audit files are created and enforced as mode `0600`.
 
 ## Architecture
 
@@ -90,8 +106,15 @@ relay without re-running provisioning.
 
 Import (Kawarimi) forms do not expose a WeeChat opt-out control.
 
+The provision form also exposes current controls for the daemon LLM base URL
+and Nanocode/OpenCode model and base-URL
+overrides. The XMPP control customizes the identity; leaving it off uses the
+default `<tenant>@xmpp.localhost` bridge rather than disabling XMPP.
+
 ## Requirements
 
-Python 3.10+ and a venv with `fastapi`, `uvicorn`, `websockets`
+Python 3.10+ and a venv with `fastapi`, Pydantic v2, `uvicorn`, `websockets`
 (`run.sh` creates it automatically). Real `secrets` mode also needs
 `cryptography` and `psycopg2-binary`, installed on demand.
+The test suite additionally uses `httpx` through FastAPI's `TestClient`; it is
+included in `requirements.txt`.

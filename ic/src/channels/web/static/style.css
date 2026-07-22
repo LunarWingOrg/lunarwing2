@@ -3024,6 +3024,10 @@ body {
   font-weight: 500;
 }
 
+.ext-active-label.inactive {
+  color: var(--text-muted);
+}
+
 /* WASM channel setup stepper */
 .ext-stepper {
   display: flex;
@@ -3168,6 +3172,15 @@ body {
 
 .btn-ext.activate:hover {
   background: var(--accent-subtle);
+}
+
+.btn-ext.deactivate {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.btn-ext.deactivate:hover {
+  background: var(--warning-subtle);
 }
 
 .btn-ext.remove {
