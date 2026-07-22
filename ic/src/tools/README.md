@@ -154,6 +154,23 @@ negotiates MCP, and registers its tools. Treat the executable as trusted install
 code: stdio servers are not sandboxed. Values in `env` are plain configuration,
 not secret storage; use LunarWing's credential systems for secrets.
 
+MCP servers can be deactivated without uninstalling them. Deactivation unloads
+only that server's registered tools, closes its transport and session, stops a
+managed stdio child, and persists `enabled = false`; configuration and credentials
+remain available for later reactivation. Use `tool_deactivate`, the web MCP panel,
+or the CLI against a running gateway:
+
+```bash
+lunarwing mcp toggle local-files --disable
+lunarwing mcp toggle local-files --enable
+```
+
+The CLI uses the configured gateway and bearer token for a live transition. If the
+gateway or token is unavailable, it reports the fallback and saves the state for
+the next startup. Pass `--offline` to request that behavior explicitly. A custom
+`--url` also requires an explicit `--token`, so a stored gateway credential is
+never forwarded to an overridden origin.
+
 **Decision guide:**
 
 | Scenario | Use |

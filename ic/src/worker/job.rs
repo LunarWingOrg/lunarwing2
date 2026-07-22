@@ -301,17 +301,21 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         reason_ctx: &mut ReasoningContext,
     ) -> Result<(), Error> {
         const MAX_WORKER_ITERATIONS: usize = 500;
-        let max_iterations = self
-            .context_manager()
-            .get_context(self.job_id)
-            .await
-            .ok()
+        let job_context = self.context_manager().get_context(self.job_id).await.ok();
+        let max_iterations = job_context
+            .as_ref()
             .and_then(|ctx| ctx.metadata.get("max_iterations").and_then(|v| v.as_u64()))
             .unwrap_or(50) as usize;
         let max_iterations = max_iterations.min(MAX_WORKER_ITERATIONS);
 
         // Initial tool definitions for planning (will be refreshed in loop)
-        reason_ctx.available_tools = self.tools().tool_definitions().await;
+        reason_ctx.available_tools = if let Some(context) = job_context.as_ref() {
+            self.tools()
+                .tool_definitions_for_user(&context.user_id)
+                .await
+        } else {
+            Vec::new()
+        };
 
         // Generate plan if planning is enabled
         let plan = if self.use_planning() {
@@ -1232,7 +1236,20 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
         _iteration: usize,
     ) -> Option<LoopOutcome> {
         // Refresh tool definitions so newly built tools become visible
-        reason_ctx.available_tools = self.worker.tools().tool_definitions().await;
+        reason_ctx.available_tools = match self
+            .worker
+            .context_manager()
+            .get_context(self.worker.job_id)
+            .await
+        {
+            Ok(context) => {
+                self.worker
+                    .tools()
+                    .tool_definitions_for_user(&context.user_id)
+                    .await
+            }
+            Err(_) => Vec::new(),
+        };
         None
     }
 

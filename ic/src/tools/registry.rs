@@ -1,6 +1,6 @@
 //! Tool registry for managing available tools.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -22,8 +22,8 @@ use crate::tools::builtin::{
     JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool,
     MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool,
     ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool,
-    ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
-    ToolUpgradeTool, WriteFileTool,
+    ToolActivateTool, ToolAuthTool, ToolDeactivateTool, ToolInstallTool, ToolListTool,
+    ToolRemoveTool, ToolSearchTool, ToolUpgradeTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolDomain};
@@ -61,6 +61,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "tool_install",
     "tool_auth",
     "tool_activate",
+    "tool_deactivate",
     "tool_list",
     "tool_remove",
     "routine_create",
@@ -106,6 +107,10 @@ impl ToolRegistry {
             description: schema.description,
             parameters: schema.parameters,
         }
+    }
+
+    fn is_visible_to(tool: &Arc<dyn Tool>, user_id: &str) -> bool {
+        tool.owner_user_id().is_none_or(|owner| owner == user_id)
     }
 
     /// Create a new empty registry.
@@ -162,6 +167,20 @@ impl ToolRegistry {
         tracing::trace!("Registered tool: {}", name);
     }
 
+    /// Register a tool only when its exact name is not already present.
+    pub async fn register_if_vacant(&self, tool: Arc<dyn Tool>) -> bool {
+        let name = tool.name().to_string();
+        let mut tools = self.tools.write().await;
+        match tools.entry(name.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(tool);
+                tracing::trace!("Registered tool in vacant slot: {}", name);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
     /// Register a tool (sync version for startup, marks as built-in).
     pub fn register_sync(&self, tool: Arc<dyn Tool>) {
         let name = tool.name().to_string();
@@ -177,6 +196,18 @@ impl ToolRegistry {
     /// Unregister a tool.
     pub async fn unregister(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.write().await.remove(name)
+    }
+
+    /// Unregister a tool only if the current registration is the expected instance.
+    pub async fn unregister_if_same(&self, name: &str, expected: &Arc<dyn Tool>) -> bool {
+        let mut tools = self.tools.write().await;
+        let is_same = tools
+            .get(name)
+            .is_some_and(|registered| Arc::ptr_eq(registered, expected));
+        if is_same {
+            tools.remove(name);
+        }
+        is_same
     }
 
     /// Resolve a tool name, accepting legacy and provider-safe aliases.
@@ -210,10 +241,28 @@ impl ToolRegistry {
         Some((resolved, tool))
     }
 
+    /// Resolve a tool only when it is available to the specified user.
+    pub async fn get_resolved_for_user(
+        &self,
+        name: &str,
+        user_id: &str,
+    ) -> Option<(String, Arc<dyn Tool>)> {
+        let resolved = self.resolve_name(name).await?;
+        let tool = self.get_for_user(&resolved, user_id).await?;
+        Some((resolved, tool))
+    }
+
     /// Get a tool by name.
     pub async fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         let tools = self.tools.read().await;
         tools.get(name).map(Arc::clone)
+    }
+
+    /// Get a tool only when it is available to the specified user.
+    pub async fn get_for_user(&self, name: &str, user_id: &str) -> Option<Arc<dyn Tool>> {
+        self.get(name)
+            .await
+            .filter(|tool| Self::is_visible_to(tool, user_id))
     }
 
     /// Check if a tool exists.
@@ -260,6 +309,20 @@ impl ToolRegistry {
             .read()
             .await
             .values()
+            .map(Self::tool_definition)
+            .collect();
+        defs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        defs
+    }
+
+    /// Get tool definitions visible to a specific user.
+    pub async fn tool_definitions_for_user(&self, user_id: &str) -> Vec<ToolDefinition> {
+        let mut defs: Vec<ToolDefinition> = self
+            .tools
+            .read()
+            .await
+            .values()
+            .filter(|tool| Self::is_visible_to(tool, user_id))
             .map(Self::tool_definition)
             .collect();
         defs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
@@ -533,7 +596,7 @@ impl ToolRegistry {
         tracing::debug!("Registered ssh_git tool");
     }
 
-    /// Register extension management tools (search, install, auth, activate, list, remove).
+    /// Register extension management tools.
     ///
     /// These allow the LLM to manage MCP servers and WASM tools through conversation.
     pub fn register_extension_tools(&self, manager: Arc<ExtensionManager>) {
@@ -541,11 +604,12 @@ impl ToolRegistry {
         self.register_sync(Arc::new(ToolInstallTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolAuthTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolActivateTool::new(Arc::clone(&manager))));
+        self.register_sync(Arc::new(ToolDeactivateTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolListTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolRemoveTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolUpgradeTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ExtensionInfoTool::new(manager)));
-        tracing::debug!("Registered 8 extension management tools");
+        tracing::debug!("Registered 9 extension management tools");
     }
 
     /// Register skill management tools (list, search, install, remove).
@@ -909,6 +973,92 @@ mod tests {
     use crate::tools::registry::EchoTool;
     use crate::tools::tool::ToolDiscoverySummary;
 
+    struct NamedTool(&'static str);
+
+    struct OwnedNamedTool {
+        name: &'static str,
+        owner: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "ownership test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<crate::tools::tool::ToolOutput, crate::tools::tool::ToolError> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for OwnedNamedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "owner-scoped tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn owner_user_id(&self) -> Option<&str> {
+            Some(self.owner)
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<crate::tools::tool::ToolOutput, crate::tools::tool::ToolError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn register_if_vacant_preserves_existing_tool() {
+        let registry = ToolRegistry::new();
+        let first: Arc<dyn Tool> = Arc::new(NamedTool("shared"));
+        let second: Arc<dyn Tool> = Arc::new(NamedTool("shared"));
+
+        assert!(registry.register_if_vacant(Arc::clone(&first)).await);
+        assert!(!registry.register_if_vacant(second).await);
+        let registered = registry.get("shared").await.expect("registered tool");
+        assert!(Arc::ptr_eq(&registered, &first));
+    }
+
+    #[tokio::test]
+    async fn unregister_if_same_preserves_replacement() {
+        let registry = ToolRegistry::new();
+        let original: Arc<dyn Tool> = Arc::new(NamedTool("replaceable"));
+        let replacement: Arc<dyn Tool> = Arc::new(NamedTool("replaceable"));
+
+        registry.register(Arc::clone(&original)).await;
+        registry.register(Arc::clone(&replacement)).await;
+
+        assert!(!registry.unregister_if_same("replaceable", &original).await);
+        let registered = registry
+            .get("replaceable")
+            .await
+            .expect("replacement remains registered");
+        assert!(Arc::ptr_eq(&registered, &replacement));
+    }
+
     #[tokio::test]
     async fn test_register_and_get() {
         let registry = ToolRegistry::new();
@@ -917,6 +1067,36 @@ mod tests {
         assert!(registry.has("echo").await);
         assert!(registry.get("echo").await.is_some());
         assert!(registry.get("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn owner_scoped_tools_are_only_discoverable_by_their_owner() {
+        let registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(OwnedNamedTool {
+                name: "alice_private",
+                owner: "alice",
+            }))
+            .await;
+        registry.register(Arc::new(NamedTool("shared"))).await;
+
+        let alice = registry.tool_definitions_for_user("alice").await;
+        let bob = registry.tool_definitions_for_user("bob").await;
+        assert!(alice.iter().any(|tool| tool.name == "alice_private"));
+        assert!(!bob.iter().any(|tool| tool.name == "alice_private"));
+        assert!(bob.iter().any(|tool| tool.name == "shared"));
+        assert!(
+            registry
+                .get_for_user("alice_private", "alice")
+                .await
+                .is_some()
+        );
+        assert!(
+            registry
+                .get_for_user("alice_private", "bob")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

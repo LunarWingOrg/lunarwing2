@@ -181,6 +181,39 @@ async def test_mcp_tools_registered(lunarwing_server):
     assert len(tool_names) > 0, f"Expected mock_search tool, got: {tools}"
 
 
+async def test_mcp_deactivate_and_reenable_without_reinstall(lunarwing_server):
+    """MCP tools unload and reconnect while configuration remains installed."""
+    ext = await _get_extension(lunarwing_server, "mock-mcp")
+    if ext is None or not ext.get("active"):
+        pytest.skip("mock-mcp is not active")
+
+    r = await api_post(
+        lunarwing_server,
+        "/api/extensions/mock-mcp/deactivate",
+        timeout=30,
+    )
+    assert r.status_code == 200
+    assert r.json().get("success") is True, f"Deactivate failed: {r.json()}"
+    ext = await _get_extension(lunarwing_server, "mock-mcp")
+    assert ext is not None, "deactivation must preserve the installed config"
+    assert ext["active"] is False
+    assert ext["enabled"] is False
+    assert ext.get("tools", []) == []
+
+    r = await api_post(
+        lunarwing_server,
+        "/api/extensions/mock-mcp/activate",
+        timeout=30,
+    )
+    assert r.status_code == 200
+    assert r.json().get("success") is True, f"Re-enable failed: {r.json()}"
+    ext = await _get_extension(lunarwing_server, "mock-mcp")
+    assert ext is not None
+    assert ext["active"] is True
+    assert ext["enabled"] is True
+    assert any("mock_search" in name for name in ext.get("tools", []))
+
+
 # ── Section D: Auth Mode Cleared — LLM Turn Fires ───────────────────────
 
 
