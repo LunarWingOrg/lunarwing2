@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from lunarwing_mt_onboard import upgrade
-from lunarwing_mt_onboard.upgrade import UpgradeConfig
+from lunarwing_mt_onboard.upgrade import TenantUpgradeConfig, UpgradeConfig
 
 
 class TestTargetTagValidation(unittest.TestCase):
@@ -248,6 +248,70 @@ class TestUpgradeArgs(unittest.TestCase):
         self.assertIn("v1.1.7", args)
         self.assertIn("--force", args)
         self.assertIn("--yes", args)
+
+
+class TestMtAdminUpgradeArgs(unittest.TestCase):
+    def test_v2_ref_and_current_flags_are_forwarded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = _write_script(tmp, "lunarwing-mt-admin.sh", "exit 0")
+            from lunarwing_mt_onboard import provisioner
+
+            previous = provisioner.MT_ADMIN_SCRIPT
+            provisioner.MT_ADMIN_SCRIPT = script
+            try:
+                cfg = TenantUpgradeConfig(
+                    tenant="alpha",
+                    target="v2.0.2.0",
+                    source_repo="/srv/lunarwing",
+                    no_backup=True,
+                    skip_render=True,
+                )
+                args = upgrade.build_mt_admin_upgrade_args(cfg)
+            finally:
+                provisioner.MT_ADMIN_SCRIPT = previous
+
+        self.assertEqual(
+            args,
+            [
+                script,
+                "upgrade-tenant",
+                "alpha",
+                "--target",
+                "v2.0.2.0",
+                "--source-repo",
+                "/srv/lunarwing",
+                "--no-backup",
+                "--skip-render",
+            ],
+        )
+
+    def test_target_accepts_branch_tag_or_commit_but_not_options(self):
+        for target in ("main", "v2.0.2.0", "deadbeef", "feature/onboard-ui"):
+            with self.subTest(target=target):
+                self.assertIsNone(
+                    TenantUpgradeConfig(tenant="alpha", target=target).validate()
+                )
+        self.assertIsNotNone(
+            TenantUpgradeConfig(tenant="alpha", target="--help").validate()
+        )
+
+    def test_current_config_round_trips_with_owner_only_permissions(self):
+        config = TenantUpgradeConfig(
+            tenant="alpha",
+            target="v2.0.2.0",
+            source_repo="/srv/lunarwing",
+            no_backup=True,
+            skip_render=True,
+            apply=True,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "upgrade.json")
+            config.to_json(path)
+            restored = TenantUpgradeConfig.from_json(path)
+            mode = os.stat(path).st_mode & 0o777
+
+        self.assertEqual(restored, config)
+        self.assertEqual(mode, 0o600)
 
 
 class TestUpgradePhaseNames(unittest.TestCase):

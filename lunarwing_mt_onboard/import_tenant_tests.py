@@ -31,11 +31,11 @@ class TestImportConfigSerialization(unittest.TestCase):
             with_toolchains=True,
             with_vision=True,
             docker_group=True,
-            tensorzero_url="http://tensorzero.test/openai/v1",
             owner_scope="legacy-alpha",
             apply=True,
             force=True,
             auto_yes=False,
+            passphrase="not-written-to-disk",
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "cfg.json")
@@ -45,7 +45,15 @@ class TestImportConfigSerialization(unittest.TestCase):
             mode = os.stat(path).st_mode & 0o777
 
         self.assertEqual(loaded, cfg)
+        self.assertEqual(loaded.passphrase, "")
         self.assertEqual(mode, 0o600)
+
+    def test_passphrase_is_not_serialized_or_represented(self) -> None:
+        secret = "legacy archive password"
+        cfg = ImportConfig(bundle="/tmp/alpha.7z", passphrase=secret)
+
+        self.assertNotIn("passphrase", cfg.to_dict())
+        self.assertNotIn(secret, repr(cfg))
 
     def test_to_dict_roundtrip_uses_safe_defaults(self) -> None:
         cfg = ImportConfig.from_dict(
@@ -77,6 +85,12 @@ class TestImportConfigValidation(unittest.TestCase):
         self.assertIsNotNone(
             ImportConfig(bundle="/tmp/alpha.tar", name="BAD NAME").validate()
         )
+
+    def test_multiline_passphrase_rejected(self) -> None:
+        error = ImportConfig(
+            bundle="/tmp/alpha.7z", passphrase="first\nsecond"
+        ).validate()
+        self.assertIn("line breaks", error or "")
 
 
 class TestEnsureImportScript(unittest.TestCase):
@@ -145,7 +159,6 @@ class TestImportArgs(unittest.TestCase):
                 with_toolchains=True,
                 with_vision=True,
                 docker_group=True,
-                tensorzero_url="http://tensorzero.test/openai/v1",
                 owner_scope="legacy-alpha",
                 apply=True,
                 force=True,
@@ -160,8 +173,6 @@ class TestImportArgs(unittest.TestCase):
         self.assertIn("--with-toolchains", args)
         self.assertIn("--with-vision", args)
         self.assertIn("--docker-group", args)
-        self.assertIn("--tensorzero-url", args)
-        self.assertIn("http://tensorzero.test/openai/v1", args)
         self.assertIn("--owner-scope", args)
         self.assertIn("legacy-alpha", args)
         self.assertIn("--force", args)
@@ -187,6 +198,33 @@ class TestImportPhaseNames(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(result.phases[0].name, "import")
+
+    @unittest.skipUnless(os.name == "posix", "pass_fds requires POSIX")
+    def test_run_import_supplies_passphrase_through_fd(self) -> None:
+        passphrase = "archive password"
+        body = (
+            'fd="$KAWARIMI_PASS_FD"\n'
+            'eval "IFS= read -r supplied <&${fd}"\n'
+            f'[ "$supplied" = "{passphrase}" ]\n'
+            'case "$*" in *"archive password"*) exit 9;; esac\n'
+            "exit 0"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            script = _write_script(tmp, "import-tenant.sh", body)
+            previous = import_tenant.IMPORT_SCRIPT
+            import_tenant.IMPORT_SCRIPT = script
+            try:
+                result = import_tenant.run_import(
+                    ImportConfig(
+                        bundle="/tmp/alpha.7z",
+                        apply=True,
+                        passphrase=passphrase,
+                    )
+                )
+            finally:
+                import_tenant.IMPORT_SCRIPT = previous
+
+        self.assertTrue(result.ok)
 
 
 def _build_args(cfg: ImportConfig) -> list[str]:

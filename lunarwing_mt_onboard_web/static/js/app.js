@@ -55,6 +55,15 @@
 
   const withToken = (path) => path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
 
+  async function refreshTenants() {
+    try {
+      const r = await fetch(withToken('/api/tenants'));
+      if (r.ok) tenants = (await r.json()).tenants || [];
+    } catch (e) {
+      /* tenant list optional */
+    }
+  }
+
   async function init() {
     if (!token) $('token-error').classList.remove('hidden');
     try {
@@ -72,12 +81,7 @@
     } catch (e) {
       /* config unavailable; keep going */
     }
-    try {
-      const r = await fetch(withToken('/api/tenants'));
-      if (r.ok) tenants = (await r.json()).tenants || [];
-    } catch (e) {
-      /* tenant list optional */
-    }
+    await refreshTenants();
   }
 
   function show(view) {
@@ -98,7 +102,8 @@
   }
 
   document.querySelectorAll('.mode-card').forEach((card) => {
-    card.addEventListener('click', () => {
+    card.addEventListener('click', async () => {
+      await refreshTenants();
       LW.mountWizard($('wizard-host'), card.dataset.mode, { tenants, demo, onRun });
       show('view-wizard');
     });
@@ -133,7 +138,12 @@
         body: JSON.stringify(payload),
       });
       if (!r.ok) {
-        panel.error('server rejected request (' + r.status + ')');
+        let detail = '';
+        try {
+          const body = await r.json();
+          detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail || '');
+        } catch (e) { /* response had no JSON detail */ }
+        panel.error('server rejected request (' + r.status + ')' + (detail ? ': ' + detail : ''));
         bat.set('angry');
         return;
       }

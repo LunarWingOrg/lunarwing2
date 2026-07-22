@@ -61,6 +61,7 @@ def _run(
     args: list[str],
     *,
     env: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
     on_output: Callable[[str], None] | None = None,
     phase_name: str | None = None,
 ) -> PhaseResult:
@@ -69,31 +70,33 @@ def _run(
     Returns a PhaseResult with merged stdout+stderr and the return code.
     """
     merged_env = os.environ.copy()
+    for key in ("KAWARIMI_PASS", "KAWARIMI_PASS_FILE", "KAWARIMI_PASS_FD"):
+        merged_env.pop(key, None)
     if env:
         merged_env.update(env)
 
-    proc = subprocess.Popen(
+    lines: list[str] = []
+    with subprocess.Popen(
         args,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         env=merged_env,
         bufsize=1,
-    )
-
-    lines: list[str] = []
-    try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            lines.append(line)
-            if on_output:
-                on_output(line)
-        proc.wait()
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
+        pass_fds=pass_fds,
+    ) as proc:
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                lines.append(line)
+                if on_output:
+                    on_output(line)
             proc.wait()
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait()
 
     return PhaseResult(
         name=phase_name or (args[1] if len(args) > 1 else args[0]),
@@ -106,10 +109,17 @@ def run_command(
     args: list[str],
     *,
     env: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
     on_output: Callable[[str], None] | None = None,
     phase_name: str | None = None,
 ) -> PhaseResult:
-    return _run(args, env=env, on_output=on_output, phase_name=phase_name)
+    return _run(
+        args,
+        env=env,
+        pass_fds=pass_fds,
+        on_output=on_output,
+        phase_name=phase_name,
+    )
 
 
 def ensure_mt_admin() -> str:
@@ -148,10 +158,18 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
         args.extend(["--gotify-url", config.gotify_url])
         if config.gotify_title:
             args.extend(["--gotify-title", config.gotify_title])
-    if config.tensorzero_url:
-        args.extend(["--tensorzero-url", config.tensorzero_url])
+    if config.llm_base_url:
+        args.extend(["--llm-base-url", config.llm_base_url])
     if config.llm_model:
         args.extend(["--llm-model", config.llm_model])
+    if config.nanocode_model:
+        args.extend(["--nanocode-model", config.nanocode_model])
+    if config.nanocode_base_url:
+        args.extend(["--nanocode-base-url", config.nanocode_base_url])
+    if config.opencode_model:
+        args.extend(["--opencode-model", config.opencode_model])
+    if config.opencode_base_url:
+        args.extend(["--opencode-base-url", config.opencode_base_url])
     if config.enable_darkirc:
         args.append("--enable-darkirc")
     # Persist the tenant's external-worker selection at add-tenant so
@@ -214,6 +232,8 @@ def provision(
     *on_output* is called for every line of merged output across all phases.
     If a phase fails, the run stops immediately and returns the partial result.
     """
+    if skip_build:
+        skip_start = True
     result = ProvisionResult()
 
     add_args = build_add_tenant_args(config)
@@ -248,14 +268,11 @@ def provision(
 def _inject_secrets(config: "TenantConfig") -> None:
     env_dir = os.path.join("/home", config.name, "lunarwing", "env")
     env_file = os.path.join(env_dir, "lunarwing.env")
+    bridge_env_file = os.path.join(env_dir, "xmpp-bridge.env")
     if not os.path.isfile(env_file):
         raise FileNotFoundError(
             f"lunarwing.env not found at {env_file} — add-tenant may have failed"
         )
-
-    lines = []
-    with open(env_file, "r") as f:
-        lines = f.readlines()
 
     secrets: dict[str, str] = {}
     if config.xmpp_password:
@@ -265,8 +282,26 @@ def _inject_secrets(config: "TenantConfig") -> None:
     if config.secrets_master_key:
         secrets["SECRETS_MASTER_KEY"] = config.secrets_master_key
 
-    if not secrets:
+    _write_env_values(env_file, secrets)
+
+    if config.xmpp_password:
+        if not os.path.isfile(bridge_env_file):
+            raise FileNotFoundError(
+                f"xmpp-bridge.env not found at {bridge_env_file}"
+            )
+        _write_env_values(
+            bridge_env_file,
+            {"XMPP_PASSWORD": config.xmpp_password},
+        )
+
+
+def _write_env_values(env_file: str, values: dict[str, str]) -> None:
+    """Replace selected values in an existing env file without changing its inode."""
+    if not values:
         return
+
+    with open(env_file, "r") as f:
+        lines = f.readlines()
 
     def _fmt(key: str, val: str) -> str:
         escaped = val.replace("\\", "\\\\").replace("'", "\\'")
@@ -280,13 +315,13 @@ def _inject_secrets(config: "TenantConfig") -> None:
             new_lines.append(line)
             continue
         key = stripped.split("=", 1)[0]
-        if key in secrets:
-            new_lines.append(_fmt(key, secrets[key]))
+        if key in values:
+            new_lines.append(_fmt(key, values[key]))
             seen.add(key)
         else:
             new_lines.append(line)
 
-    for key, val in secrets.items():
+    for key, val in values.items():
         if key not in seen:
             new_lines.append(_fmt(key, val))
 

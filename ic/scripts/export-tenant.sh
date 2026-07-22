@@ -11,7 +11,7 @@
 # OMEMO double-ratchet store isn't torn mid-write), it STOPS the tenant's daemon +
 # xmpp-bridge first (PostgreSQL stays up only for pg_dump). Plan a maintenance window.
 #
-# Bundle (a single 0600 tar):
+# Bundle (a single 0600, AES-256 encrypted 7z archive):
 #   meta.txt                 tenant, source version/runtime, pg role/db, timestamp
 #   db.dump                  pg_dump -Fc of the tenant DB
 #   manifest-lunarwing.env   carry-over keys for lunarwing.env (0600) — see CARRY below
@@ -26,8 +26,8 @@
 # rooms/allowlist/OMEMO + LLM model/key). Intra-host tokens (gateway/bridge/webhook/
 # relay) are intentionally NOT carried — the new host mints fresh, self-consistent
 # ones (gateway UI / external webhook senders re-auth after cutover). Host-specific
-# LLM_BASE_URL and OPENCODE_BASE_URL local proxies are carried ONLY when they
-# point at non-local custom endpoints. Vision sidecar ports are regenerated, but
+# LLM/worker base URLs are carried ONLY when they point at non-loopback custom
+# endpoints; obsolete host-local proxy URLs are discarded. Vision sidecar ports are regenerated, but
 # a custom VL_URL/VL_MODEL and sidecar auth token are carried when vision.env exists.
 #
 # SECURITY: the bundle contains SECRETS_MASTER_KEY + the XMPP password. It is 0600,
@@ -39,6 +39,11 @@
 #     --no-quiesce    do NOT stop the daemon/bridge (you stopped them already);
 #                     the script still verifies the daemon is not running
 #     --dry-run       show what would happen; make no changes
+#     --no-encrypt    testing only: write a sensitive legacy plaintext tar
+#
+# Non-interactive passphrase sources, in precedence order: KAWARIMI_PASS_FD,
+# KAWARIMI_PASS, KAWARIMI_PASS_FILE. Interactive use prompts and confirms before
+# any tenant service is stopped. The passphrase is fed to 7z over stdin.
 set -euo pipefail
 
 OUT_DIR="${LUNARWING_MIGRATE_DIR:-/var/lib/lunarwing-migrate}"
@@ -64,11 +69,72 @@ banner() { printf '\n========== %s ==========\n' "$*"; }
 note()   { printf '  · %s\n' "$*"; }
 run()    { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; return 0; fi; printf '  + %s\n' "$*"; "$@"; }
 
+validate_passphrase() {
+  [[ -n "$1" ]] || die "encryption passphrase must not be empty"
+  [[ "${#1}" -ge 12 ]] || die "encryption passphrase must be at least 12 characters"
+  [[ "${#1}" -le 1024 ]] || die "encryption passphrase must be at most 1024 characters"
+  [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] || die "encryption passphrase must not contain line breaks"
+}
+
+load_passphrase_file() {
+  local path="$1" mode owner
+  [[ -f "$path" && ! -L "$path" ]] || die "passphrase file must be a regular, non-symlink file: $path"
+  owner="$(stat -c '%u' "$path")" || die "cannot inspect passphrase file owner: $path"
+  [[ "$owner" == "$(id -u)" ]] || die "passphrase file must be owned by the current user: $path"
+  mode="$(stat -c '%a' "$path")" || die "cannot inspect passphrase file mode: $path"
+  (( (8#$mode & 077) == 0 )) || die "passphrase file must not be accessible by group or others: $path"
+  KAWARIMI_ARCHIVE_PASS="$(<"$path")"
+}
+
+acquire_export_passphrase() {
+  local fd confirm=""
+  if [[ -n "${KAWARIMI_PASS_FD:-}" ]]; then
+    [[ "$KAWARIMI_PASS_FD" =~ ^[0-9]+$ ]] || die "KAWARIMI_PASS_FD must be a file descriptor number"
+    fd="$KAWARIMI_PASS_FD"
+    if ! IFS= read -r KAWARIMI_ARCHIVE_PASS <&"$fd"; then
+      [[ -n "$KAWARIMI_ARCHIVE_PASS" ]] || die "failed to read passphrase from KAWARIMI_PASS_FD"
+    fi
+    eval "exec ${fd}<&-"
+  elif [[ -n "${KAWARIMI_PASS:-}" ]]; then
+    KAWARIMI_ARCHIVE_PASS="$KAWARIMI_PASS"
+  elif [[ -n "${KAWARIMI_PASS_FILE:-}" ]]; then
+    load_passphrase_file "$KAWARIMI_PASS_FILE"
+  else
+    [[ -t 0 ]] || die "encryption passphrase required via KAWARIMI_PASS_FD, KAWARIMI_PASS_FILE, KAWARIMI_PASS, or an interactive terminal"
+    read -r -s -p "Enter encryption passphrase: " KAWARIMI_ARCHIVE_PASS
+    echo
+    read -r -s -p "Confirm passphrase: " confirm
+    echo
+    [[ "$KAWARIMI_ARCHIVE_PASS" == "$confirm" ]] || die "passphrases do not match"
+  fi
+  unset KAWARIMI_PASS KAWARIMI_PASS_FILE KAWARIMI_PASS_FD
+  validate_passphrase "$KAWARIMI_ARCHIVE_PASS"
+}
+
+read_env_value() {
+  local file="$1" key="$2" value
+  value="$(sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -1)"
+  value="${value%$'\r'}"
+  if [[ "$value" == \'*\' && "${#value}" -ge 2 ]]; then
+    value="${value:1:${#value}-2}"
+  elif [[ "$value" == \"*\" && "${#value}" -ge 2 ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s' "$value"
+}
+
+is_loopback_url() {
+  local lower="${1,,}"
+  [[ "$lower" =~ ^https?://(localhost|127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|\[::1\]|\[0:0:0:0:0:0:0:1\])(:[0-9]+)?(/|$) ]]
+}
+
 [[ -n "$TENANT" ]] || die "usage: $0 <tenant> [--out-dir DIR] [--no-quiesce] [--dry-run] [--no-encrypt]"
 [[ "$(id -u)" -eq 0 ]] || die "run as root (sudo): stops the tenant services, reads its home/state, execs its DB container"
 command -v jq  >/dev/null 2>&1 || die "jq required"
 command -v tar >/dev/null 2>&1 || die "tar required"
-command -v 7z >/dev/null 2>&1 || die "7z (p7zip) required for encrypted bundles"
+if ! $NO_ENCRYPT; then
+  command -v 7z >/dev/null 2>&1 || die "7z (p7zip) required for encrypted bundles"
+fi
 
 id "$TENANT" >/dev/null 2>&1 || die "OS user '$TENANT' not found"
 UID_T="$(id -u "$TENANT")"
@@ -79,6 +145,17 @@ BRIDGE_ENVF="$LWROOT/env/xmpp-bridge.env"
 VISION_ENVF="$LWROOT/env/vision.env"
 STATE_DIR="$LWROOT/state"
 [[ -f "$ENVF" ]] || die "tenant env not found: $ENVF (is '$TENANT' a LunarWing tenant on this host?)"
+
+# Validate critical source secrets before prompting or stopping tenant services.
+SOURCE_MASTER_KEY="$(read_env_value "$ENVF" SECRETS_MASTER_KEY)"
+[[ "$SOURCE_MASTER_KEY" =~ ^[0-9a-fA-F]{64}$ ]] \
+  || die "SECRETS_MASTER_KEY is missing or invalid in $ENVF — refusing export before quiescence"
+DAEMON_XMPP_PASSWORD="$(read_env_value "$ENVF" XMPP_PASSWORD)"
+BRIDGE_XMPP_PASSWORD="$(read_env_value "$BRIDGE_ENVF" XMPP_PASSWORD)"
+if [[ -n "$DAEMON_XMPP_PASSWORD" || -n "$BRIDGE_XMPP_PASSWORD" ]]; then
+  [[ -n "$DAEMON_XMPP_PASSWORD" && "$DAEMON_XMPP_PASSWORD" == "$BRIDGE_XMPP_PASSWORD" ]] \
+    || die "XMPP_PASSWORD differs between lunarwing.env and xmpp-bridge.env — reconcile the source tenant before export"
+fi
 
 DB_BACKEND="$(sed -n 's/^DATABASE_BACKEND=//p' "$ENVF" | head -1)"; DB_BACKEND="${DB_BACKEND:-postgres}"
 [[ "$DB_BACKEND" == "postgres" ]] || die "DATABASE_BACKEND=$DB_BACKEND: machine migration supports postgres only (libSQL would need a manual DB-file copy + a libSQL target). Aborting rather than risk a silent empty import."
@@ -123,6 +200,11 @@ pick_runtime() {
 }
 RUNTIME="$(pick_runtime || true)"
 [[ -n "$RUNTIME" ]] || die "could not find container '$PG' in podman or docker — is the tenant's PostgreSQL container present on this host? (set LUNARWING_CONTAINER_RUNTIME to force)"
+
+# Refuse a missing or malformed passphrase before stopping any tenant service.
+if ! $DRY_RUN && ! $NO_ENCRYPT; then
+  acquire_export_passphrase
+fi
 
 # Determine if the tenant's containers are rootless (need _ctr wrapper).
 _is_rootless() {
@@ -186,9 +268,9 @@ fi
 
 # ---- 3. carry-over manifests (secrets + operator config) ---------------------
 banner "3/5  Secrets + config manifest"
-LW_KEYS=(SECRETS_MASTER_KEY XMPP_JID XMPP_PASSWORD XMPP_DM_POLICY XMPP_ALLOW_FROM
+  LW_KEYS=(SECRETS_MASTER_KEY XMPP_JID XMPP_PASSWORD XMPP_DM_POLICY XMPP_ALLOW_FROM
          XMPP_ALLOW_ROOMS XMPP_ENCRYPTED_ROOMS XMPP_ALLOW_PLAINTEXT_FALLBACK
-         XMPP_OMEMO_DEVICE_ID LLM_API_KEY LLM_MODEL OPENCODE_MODEL GOTIFY_URL
+         XMPP_OMEMO_DEVICE_ID LLM_API_KEY LLM_MODEL NANOCODE_MODEL OPENCODE_MODEL GOTIFY_URL
          GATEWAY_HOST HTTP_HOST)   # bind ADDRESS is operator config (carried); the
                                    # PORTS are host-specific and regenerated by add-tenant.
                                    # local proxy URLs are handled specially below.
@@ -218,18 +300,25 @@ else
   # LLM_BASE_URL: carry ONLY a non-local custom endpoint; a local proxy URL is
   # host-specific (its port differs on the new host, which sets its own).
   llm_url="$(sed -n 's/^LLM_BASE_URL=//p' "$ENVF" | head -1)"; llm_url="${llm_url%$'\r'}"
-  if [[ -n "$llm_url" && "$llm_url" != http://127.0.0.1:* && "$llm_url" != http://localhost:* ]]; then
+  if [[ -n "$llm_url" ]] && ! is_loopback_url "$llm_url"; then
     printf 'LLM_BASE_URL=%s\n' "$llm_url" >> "$WORK/manifest-lunarwing.env"
     note "carrying custom LLM_BASE_URL"
   else
-    note "LLM_BASE_URL is the local proxy ($llm_url) — NOT carried (new host sets its own)"
+    note "LLM_BASE_URL is host-local ($llm_url) — NOT carried"
   fi
   opencode_url="$(sed -n 's/^OPENCODE_BASE_URL=//p' "$ENVF" | head -1)"; opencode_url="${opencode_url%$'\r'}"
-  if [[ -n "$opencode_url" && "$opencode_url" != http://127.0.0.1:* && "$opencode_url" != http://localhost:* ]]; then
+  if [[ -n "$opencode_url" ]] && ! is_loopback_url "$opencode_url"; then
     printf 'OPENCODE_BASE_URL=%s\n' "$opencode_url" >> "$WORK/manifest-lunarwing.env"
     note "carrying custom OPENCODE_BASE_URL"
   elif [[ -n "$opencode_url" ]]; then
-    note "OPENCODE_BASE_URL is local ($opencode_url) — NOT carried (new host sets its own)"
+    note "OPENCODE_BASE_URL is host-local ($opencode_url) — NOT carried"
+  fi
+  nanocode_url="$(sed -n 's/^NANOCODE_BASE_URL=//p' "$ENVF" | head -1)"; nanocode_url="${nanocode_url%$'\r'}"
+  if [[ -n "$nanocode_url" ]] && ! is_loopback_url "$nanocode_url"; then
+    printf 'NANOCODE_BASE_URL=%s\n' "$nanocode_url" >> "$WORK/manifest-lunarwing.env"
+    note "carrying custom NANOCODE_BASE_URL"
+  elif [[ -n "$nanocode_url" ]]; then
+    note "NANOCODE_BASE_URL is host-local ($nanocode_url) — NOT carried"
   fi
   for k in "${BRIDGE_KEYS[@]}"; do copy_key "$BRIDGE_ENVF" "$WORK/manifest-bridge.env" "$k"; done
   if [[ -f "$VISION_ENVF" ]]; then
@@ -306,30 +395,14 @@ else
   # Encrypted 7z with header encryption
   BUNDLE="$OUT_DIR/${TENANT}-migrate-${STAMP}.7z"
 
-  # Collect passphrase: env var, key file, or interactive prompt
-  if [[ -n "${KAWARIMI_PASS:-}" ]]; then
-    : # from environment
-  elif [[ -n "${KAWARIMI_PASS_FILE:-}" ]]; then
-    [[ -f "$KAWARIMI_PASS_FILE" ]] || die "passphrase file not found: $KAWARIMI_PASS_FILE"
-    KAWARIMI_PASS=$(<"$KAWARIMI_PASS_FILE")
-  else
-    read -s -p "Enter encryption passphrase: " KAWARIMI_PASS
-    echo
-    read -s -p "Confirm passphrase: " KAWARIMI_PASS_CONFIRM
-    echo
-    [[ "$KAWARIMI_PASS" == "$KAWARIMI_PASS_CONFIRM" ]] || die "passphrases do not match"
-  fi
-
-  # Create encrypted 7z: AES-256, header encryption, moderate compression
-  7z a -t7z \
-    -mhe=on \
-    -p"$KAWARIMI_PASS" \
+  # Bare -p reads the password twice from stdin and keeps it out of process argv.
+  { printf '%s\n%s\n' "$KAWARIMI_ARCHIVE_PASS" "$KAWARIMI_ARCHIVE_PASS"; } | 7z a -t7z \
+    -mhe=on -p \
     -mx=5 \
     "$BUNDLE" "$WORK"/* \
     >/dev/null 2>&1 || die "7z encryption failed"
   chmod 0600 "$BUNDLE"
-  # Clear passphrase from memory
-  unset KAWARIMI_PASS KAWARIMI_PASS_CONFIRM
+  unset KAWARIMI_ARCHIVE_PASS
 fi
 
 banner "Done — bundle written (tenant is STOPPED — cutover in progress)"

@@ -14,10 +14,14 @@ import json
 import os
 import shutil
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from lunarwing_mt_onboard.config import TenantConfig
+from lunarwing_mt_onboard.kawarimi_secret import (
+    passphrase_transport,
+    validate_passphrase,
+)
 from lunarwing_mt_onboard.provisioner import (
     PhaseResult,
     ProvisionResult,
@@ -51,6 +55,7 @@ class ExportConfig:
     out_dir: str = DEFAULT_OUT_DIR
     apply: bool = False
     no_quiesce: bool = False
+    passphrase: str = field(default="", repr=False, compare=False)
 
     def validate(self) -> str | None:
         err = TenantConfig.validate_name(self.tenant)
@@ -58,6 +63,11 @@ class ExportConfig:
             return err
         if not self.out_dir:
             return "output directory must not be empty"
+        if self.passphrase:
+            return validate_passphrase(
+                self.passphrase,
+                min_length=12 if self.apply else 1,
+            )
         return None
 
     def to_dict(self) -> dict[str, ExportValue]:
@@ -132,11 +142,14 @@ def run_export(
     on_output: Callable[[str], None] | None = None,
 ) -> ProvisionResult:
     result = ProvisionResult()
-    export = run_command(
-        build_export_args(cfg),
-        on_output=on_output,
-        phase_name="export",
-    )
+    with passphrase_transport(cfg.passphrase) as secret:
+        export = run_command(
+            build_export_args(cfg),
+            env=secret.env,
+            pass_fds=secret.pass_fds,
+            on_output=on_output,
+            phase_name="export",
+        )
     result.phases.append(export)
     return result
 

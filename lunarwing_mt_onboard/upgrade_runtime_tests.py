@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from lunarwing_mt_onboard import upgrade
+from lunarwing_mt_onboard import provisioner, upgrade
 from lunarwing_mt_onboard.upgrade_cli import UpgradeCliArgs, run_upgrade_flow
 from lunarwing_mt_onboard.upgrade import UpgradeConfig
+from lunarwing_mt_onboard.verify import CheckResult
 
 
 class TestRunPreflight(unittest.TestCase):
@@ -63,36 +65,97 @@ class TestRunUpgrade(unittest.TestCase):
 
 
 class TestUpgradeFlow(unittest.TestCase):
-    def test_non_interactive_dry_run_executes_without_prompt(self):
+    def test_non_interactive_v2_upgrade_uses_mt_admin_and_verifies(self):
         with tempfile.TemporaryDirectory() as tmp:
             upgrade_script = _write_script(
                 tmp,
-                "upgrade-tenant-version.sh",
-                "echo dry-run\nexit 0",
+                "lunarwing-mt-admin.sh",
+                "echo \"$*\"\nexit 0",
             )
 
-            previous = upgrade.UPGRADE_SCRIPT
-            upgrade.UPGRADE_SCRIPT = upgrade_script
+            previous = provisioner.MT_ADMIN_SCRIPT
+            provisioner.MT_ADMIN_SCRIPT = upgrade_script
             try:
-                code = run_upgrade_flow(
-                    UpgradeCliArgs(
-                        tenant="alpha",
-                        target="v1.1.9",
-                        source_version_override="",
-                        apply=False,
-                        yes=False,
-                        force=False,
-                        no_preflight=True,
-                        non_interactive=True,
-                        accept_defaults=False,
-                        resume=None,
-                        save=None,
+                with patch(
+                    "lunarwing_mt_onboard.upgrade_cli.verify_tenant",
+                    return_value=[CheckResult("service lunarwing-alpha", True, "active")],
+                ) as verify, patch(
+                    "lunarwing_mt_onboard.upgrade_cli.tenant_gateway_port",
+                    return_value=10020,
+                ), patch(
+                    "lunarwing_mt_onboard.upgrade_cli.tenant_gateway_host",
+                    return_value="192.0.2.10",
+                ):
+                    code = run_upgrade_flow(
+                        UpgradeCliArgs(
+                            tenant="alpha",
+                            target="v2.0.2.0",
+                            source_repo="/srv/lunarwing",
+                            no_backup=True,
+                            skip_render=True,
+                            apply=True,
+                            yes=True,
+                            non_interactive=True,
+                            accept_defaults=False,
+                            resume=None,
+                            save=None,
+                        )
                     )
-                )
+                    verify.assert_called_once_with(
+                        "alpha", host="192.0.2.10", port=10020
+                    )
             finally:
-                upgrade.UPGRADE_SCRIPT = previous
+                provisioner.MT_ADMIN_SCRIPT = previous
 
         self.assertEqual(code, 0)
+
+    def test_non_interactive_upgrade_requires_apply(self):
+        code = run_upgrade_flow(
+            UpgradeCliArgs(
+                tenant="alpha",
+                target="v2.0.2.0",
+                non_interactive=True,
+            )
+        )
+        self.assertEqual(code, 1)
+
+    def test_upgrade_fails_verification_without_gateway_allocation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            upgrade_script = _write_script(
+                tmp,
+                "lunarwing-mt-admin.sh",
+                "exit 0",
+            )
+
+            previous = provisioner.MT_ADMIN_SCRIPT
+            provisioner.MT_ADMIN_SCRIPT = upgrade_script
+            try:
+                with patch(
+                    "lunarwing_mt_onboard.upgrade_cli.verify_tenant",
+                    return_value=[CheckResult("service lunarwing-alpha", True, "active")],
+                ) as verify, patch(
+                    "lunarwing_mt_onboard.upgrade_cli.tenant_gateway_port",
+                    return_value=0,
+                ), patch(
+                    "lunarwing_mt_onboard.upgrade_cli.tenant_gateway_host",
+                    return_value="127.0.0.1",
+                ):
+                    code = run_upgrade_flow(
+                        UpgradeCliArgs(
+                            tenant="alpha",
+                            target="v2.0.2.0",
+                            apply=True,
+                            yes=True,
+                            non_interactive=True,
+                        )
+                    )
+                    verify.assert_called_once_with(
+                        "alpha", host="127.0.0.1", port=0
+                    )
+            finally:
+                provisioner.MT_ADMIN_SCRIPT = previous
+
+        self.assertEqual(code, 2)
 
 
 def _run_upgrade_with_scripts(
