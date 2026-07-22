@@ -51,27 +51,20 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
     - The cargo update (patch/minor bumps) recommendation may or may not have been run.
     Verdict: The deferred crates (rand, base64, tower-http) are intentionally held back for 2.0.0+. The patch-level cargo update should be verified. Genuinely open — deferred to 2.0.0+.
     </details>
-18. [ ] Kestrel created a UNIFIED build script to optimize for speed. Take a look at this. You can find it at: scripts/build-lunarwing.sh - let's continue to work on this and make suggestions and ensure it works properly on your machine first to create nice full builds of LunarWing safely across machines with all kinds of resources... ALSO: We can use (`nproc × 0.75`) instead of nproc. That seems safer to me. According to kestrel (see section below):
-<details>
-<summary><b>Recommendation</b></summary>
-kestrel │ Two ways:
-**Per-build override** (no code change):
-```bash
-# Flag
-./scripts/build-lunarwing.sh -j $(($(nproc) * 3 / 4))
-# Or env var
-BUILD_JOBS=$(($(nproc) * 3 / 4)) ./scripts/build-lunarwing.sh
-```
-**Or change the default in the script** — line 73-74, swap:
-```bash
-DEFAULT_JOBS=$NPROC
-```
-to:
-```bash
-DEFAULT_JOBS=$(( NPROC * 3 / 4 ))
-```
-The `-j` flag and `BUILD_JOBS` env var always override the default, so you've got flexibility per-machine without touching the script.
-  </details>
+18. [x] Harden and verify the unified Linux `aarch64`/`x86_64` native build script at `scripts/build-lunarwing.sh`. Completed 2026-07-22.
+    <details>
+    <summary><b>Completion and verification</b></summary>
+
+    - Automatic parallelism now uses 75% of effective CPUs, never zero, capped by available memory. Affinity and inherited cgroup v1/v2 CPU and memory limits are included.
+    - `-j` and `BUILD_JOBS` remain explicit overrides, with validation and warnings when they exceed the safe automatic recommendation. Command-line flags take precedence over environment defaults.
+    - Removed all automatic Cargo/Rust process killing and Cargo lock-file deletion. Concurrent invocations of this helper use a canonical-target sidecar `flock`; `--clean` fails closed when safe locking is unavailable.
+    - Target paths are created and canonicalized, aliases resolving to `/` are rejected, tmpfs/ramfs and low-disk conditions are reported, and paths containing spaces are preserved.
+    - Cargo is invoked without `eval` as `cargo build --locked --bin lunarwing`; release/debug validation, unique logs, dry-run behavior, configured Cargo targets, and failure propagation are covered.
+    - The script intentionally supports Linux only. `aarch64` and `x86_64` use the same resource-based policy rather than unreliable architecture-specific resource assumptions.
+    - Added `scripts/tests/test-build-lunarwing.sh`: 37 focused checks pass. `bash -n`, ShellCheck warning-level validation, and `git diff --check` also pass.
+    - Native `x86_64` verification command: `taskset -c 0-5 ./scripts/build-lunarwing.sh`. Result: automatic `-j4`, 769 crates compiled, successful release build in 11m 5s, 2.8GB target directory, and a stripped 97MB x86-64 ELF binary. `lunarwing --version` reports `2.0.1`.
+    - Native execution on an `aarch64` host was not available in this worktree; the shared architecture path and resource calculations are covered by the shell harness.
+    </details>
   
 19. [ ] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and one Recommended-List item (registry validation) are DONE and verified in code (2026-07-21). Closed 2026-07-21 by completing the Diagnostics / command preflight Recommended-List item (see below). Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
     <details>
