@@ -177,6 +177,8 @@ def _plan_from_args(args: argparse.Namespace) -> ImportPlan:
     plan.with_nanocode = plan.with_nanocode or bool(args.with_nanocode)
     plan.with_pebble = plan.with_pebble or bool(args.with_pebble)
     plan.with_opencode = plan.with_opencode or bool(args.with_opencode)
+    plan.with_toolchains = plan.with_toolchains or bool(args.with_toolchains)
+    plan.with_vision = plan.with_vision or bool(args.with_vision)
     if args.tensorzero_url:
         plan.tensorzero_url = args.tensorzero_url
     if args.llm_model:
@@ -211,6 +213,8 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--with-nanocode", action="store_true")
     imp.add_argument("--with-pebble", action="store_true")
     imp.add_argument("--with-opencode", action="store_true")
+    imp.add_argument("--with-toolchains", action="store_true", help="pass --with-toolchains to build-tenant")
+    imp.add_argument("--with-vision", action="store_true", help="unsupported by mt-admin — will fail in preflight")
     imp.add_argument("--tensorzero-url", default="")
     imp.add_argument("--llm-model", default="")
     imp.add_argument("--save", help="write the resolved import plan to this JSON file")

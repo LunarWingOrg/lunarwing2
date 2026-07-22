@@ -41,8 +41,20 @@ from lunarwing_mt_onboard.provisioner import (
 OutputCb = "object"  # callable[[str], None] | None; kept loose to avoid import churn
 
 _SCHEMA_SENTINEL_TABLE = "memory_documents"
-_SCHEMA_WAIT_SECONDS = 90
 _SCHEMA_POLL_INTERVAL = 2.0
+
+
+def _schema_wait_seconds() -> int:
+    """Configurable via KAWARIMI_SCHEMA_WAIT_SECONDS env (default 90)."""
+    raw = os.environ.get("KAWARIMI_SCHEMA_WAIT_SECONDS", "").strip()
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return 90
 
 
 @dataclass
@@ -84,6 +96,11 @@ def preflight(plan: ImportPlan) -> None:
         raise ImportError_(
             f"tenant '{plan.tenant}' already exists — pass --force to reuse it"
         )
+    if plan.with_vision:
+        raise ImportError_(
+            "--with-vision is not supported by mt-admin add-tenant/build-tenant; "
+            "vision provisioning must be done manually after import"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -110,7 +127,7 @@ def run_import(
     if not phase(_add_tenant_args(mt, plan)):
         result.error = "add-tenant failed"
         return result
-    if not phase([mt, "build-tenant", plan.tenant, "--with-wasm", *_worker_flags(plan)]):
+    if not phase([mt, "build-tenant", plan.tenant, "--with-wasm", *_worker_flags(plan), *_build_flags(plan)]):
         result.error = "build-tenant failed"
         return result
     phase([mt, "install-wasm", plan.tenant])  # best-effort, mirrors import-tenant.sh
@@ -192,6 +209,14 @@ def _worker_flags(plan: ImportPlan) -> list[str]:
     return flags
 
 
+def _build_flags(plan: ImportPlan) -> list[str]:
+    """Flags that build-tenant accepts but add-tenant does not."""
+    flags: list[str] = []
+    if plan.with_toolchains:
+        flags.append("--with-toolchains")
+    return flags
+
+
 # --------------------------------------------------------------------------- #
 # Schema wait + populate
 # --------------------------------------------------------------------------- #
@@ -201,7 +226,8 @@ def _wait_for_schema(db_url: str) -> None:
     """Poll until the core schema exists (daemon migrations finished)."""
     import psycopg2
 
-    deadline = time.monotonic() + _SCHEMA_WAIT_SECONDS
+    wait_seconds = _schema_wait_seconds()
+    deadline = time.monotonic() + wait_seconds
     last_exc: Exception | None = None
     while time.monotonic() < deadline:
         try:
@@ -219,7 +245,7 @@ def _wait_for_schema(db_url: str) -> None:
         time.sleep(_SCHEMA_POLL_INTERVAL)
     raise TimeoutError(
         f"schema table '{_SCHEMA_SENTINEL_TABLE}' did not appear within "
-        f"{_SCHEMA_WAIT_SECONDS}s after start-tenant"
+        f"{wait_seconds}s after start-tenant"
         + (f" (last error: {last_exc})" if last_exc else "")
     )
 
@@ -235,8 +261,11 @@ def _populate(db_url: str, owner_id: str, mapped: MappedAgent) -> dict[str, int]
         cur = conn.cursor()
 
         for doc in mapped.memory_docs:
-            # UNIQUE(user_id, agent_id, path) treats NULL agent_id as distinct,
-            # so ON CONFLICT won't dedupe — do a manual upsert on the natural key.
+            # UNIQUE(user_id, agent_id, path) treats NULL as distinct in
+            # Postgres, so ON CONFLICT won't fire for our agent_id=NULL rows.
+            # Manual UPDATE-then-INSERT keeps re-imports idempotent. If
+            # LunarWing ever imports docs under a non-null agent_id, those
+            # would need their own path (not the kawarimi use case).
             cur.execute(
                 "UPDATE memory_documents SET content = %s, metadata = %s, "
                 "updated_at = NOW() WHERE user_id = %s AND agent_id IS NULL AND path = %s",
@@ -308,7 +337,11 @@ def _insert_secrets(
     mapped: MappedAgent,
     result: ImportResult,
 ) -> None:
-    """Encrypt each secret into the secrets table (reuses secrets_ops crypto)."""
+    """Encrypt each secret into the secrets table (reuses secrets_ops crypto).
+
+    secrets_ops.insert_secret is an upsert (ON CONFLICT (user_id, name)
+    DO UPDATE), so re-imports update rather than duplicate.
+    """
     inserted = 0
     for secret in mapped.secrets:
         try:
