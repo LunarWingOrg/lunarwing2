@@ -126,7 +126,12 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Command::Registry(registry_cmd)) => {
             init_cli_tracing();
-            return lunarwing::cli::run_registry_command(registry_cmd.clone()).await;
+            return lunarwing::cli::run_registry_command(
+                registry_cmd.clone(),
+                cli.config.as_deref(),
+                cli.no_db,
+            )
+            .await;
         }
         Some(Command::Channels(channels_cmd)) => {
             init_cli_tracing();
@@ -158,7 +163,7 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Command::Mcp(mcp_cmd)) => {
             init_cli_tracing();
-            return run_mcp_command(*mcp_cmd.clone()).await;
+            return run_mcp_command(*mcp_cmd.clone(), cli.config.as_deref(), cli.no_db).await;
         }
         Some(Command::Memory(mem_cmd)) => {
             init_cli_tracing();

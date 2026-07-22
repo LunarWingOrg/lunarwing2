@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from lunarwing_mt_onboard import export
 from lunarwing_mt_onboard.export import ExportConfig
@@ -25,6 +26,7 @@ class TestExportConfigSerialization(unittest.TestCase):
             out_dir="/tmp/migrate",
             apply=True,
             no_quiesce=True,
+            passphrase="not-written-to-disk",
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "cfg.json")
@@ -34,6 +36,14 @@ class TestExportConfigSerialization(unittest.TestCase):
         self.assertEqual(loaded.out_dir, "/tmp/migrate")
         self.assertTrue(loaded.apply)
         self.assertTrue(loaded.no_quiesce)
+        self.assertEqual(loaded.passphrase, "")
+
+    def test_passphrase_is_not_serialized_or_represented(self):
+        secret = "correct horse battery staple"
+        cfg = ExportConfig(tenant="alpha", passphrase=secret)
+
+        self.assertNotIn("passphrase", cfg.to_dict())
+        self.assertNotIn(secret, repr(cfg))
 
     def test_json_file_permissions(self):
         cfg = ExportConfig(tenant="perms")
@@ -85,6 +95,10 @@ class TestExportConfigValidation(unittest.TestCase):
         cfg = ExportConfig(tenant="alpha", out_dir="")
         err = cfg.validate()
         self.assertIsNotNone(err)
+
+    def test_short_apply_passphrase_rejected(self):
+        cfg = ExportConfig(tenant="alpha", apply=True, passphrase="short")
+        self.assertIn("at least 12", cfg.validate() or "")
 
 
 class TestEnsureExportScript(unittest.TestCase):
@@ -171,6 +185,58 @@ class TestExportPhaseNames(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(result.phases[0].name, "export")
+
+    @unittest.skipUnless(os.name == "posix", "pass_fds requires POSIX")
+    def test_run_export_supplies_passphrase_through_fd(self):
+        passphrase = "correct horse battery staple"
+        body = (
+            'fd="$KAWARIMI_PASS_FD"\n'
+            'eval "IFS= read -r supplied <&${fd}"\n'
+            f'[ "$supplied" = "{passphrase}" ]\n'
+            'case "$*" in *"correct horse"*) exit 9;; esac\n'
+            "exit 0"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            script = _write_script(tmp, "export-tenant.sh", body)
+            previous = export.EXPORT_SCRIPT
+            export.EXPORT_SCRIPT = script
+            try:
+                result = export.run_export(
+                    ExportConfig(
+                        tenant="alpha",
+                        apply=True,
+                        passphrase=passphrase,
+                    )
+                )
+            finally:
+                export.EXPORT_SCRIPT = previous
+
+        self.assertTrue(result.ok)
+
+    @unittest.skipUnless(os.name == "posix", "pass_fds requires POSIX")
+    def test_legacy_environment_passphrase_is_converted_without_global_mutation(self):
+        passphrase = "environment passphrase"
+        body = (
+            'fd="$KAWARIMI_PASS_FD"\n'
+            'eval "IFS= read -r supplied <&${fd}"\n'
+            f'[ "$supplied" = "{passphrase}" ]\n'
+            '[ -z "${KAWARIMI_PASS:-}" ]\n'
+            "exit 0"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            script = _write_script(tmp, "export-tenant.sh", body)
+            previous = export.EXPORT_SCRIPT
+            export.EXPORT_SCRIPT = script
+            try:
+                with patch.dict(os.environ, {"KAWARIMI_PASS": passphrase}):
+                    result = export.run_export(
+                        ExportConfig(tenant="alpha", apply=True)
+                    )
+                    self.assertEqual(os.environ.get("KAWARIMI_PASS"), passphrase)
+            finally:
+                export.EXPORT_SCRIPT = previous
+
+        self.assertTrue(result.ok)
 
 
 def _write_script(directory: str, name: str, body: str) -> str:

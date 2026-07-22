@@ -69,6 +69,7 @@ SEL = {
     "ext_install_btn":          ".btn-ext.install",
     "ext_remove_btn":           ".btn-ext.remove",
     "ext_activate_btn":         ".btn-ext.activate",
+    "ext_deactivate_btn":       ".btn-ext.deactivate",
     "ext_configure_btn":        ".btn-ext.configure",
     # Configure modal
     "configure_overlay":        ".configure-overlay",

@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
@@ -207,6 +208,7 @@ impl McpServerConfig {
 
         // Validate custom header names and values using the http crate's RFC 9110
         // token validation (catches CRLF, spaces, colons, null bytes, etc.)
+        let mut normalized_headers = std::collections::HashSet::new();
         for (name, value) in &self.headers {
             if name.is_empty() {
                 return Err(ConfigError::InvalidConfig {
@@ -224,6 +226,20 @@ impl McpServerConfig {
             if reqwest::header::HeaderValue::from_str(value).is_err() {
                 return Err(ConfigError::InvalidConfig {
                     reason: format!("Header value for '{}' contains invalid characters", name),
+                });
+            }
+            let normalized = name.to_ascii_lowercase();
+            if !normalized_headers.insert(normalized.clone()) {
+                return Err(ConfigError::InvalidConfig {
+                    reason: format!("Duplicate header name '{name}' (case-insensitive)"),
+                });
+            }
+            if matches!(
+                normalized.as_str(),
+                "mcp-session-id" | "content-type" | "accept"
+            ) {
+                return Err(ConfigError::InvalidConfig {
+                    reason: format!("Header '{name}' is managed by the MCP client"),
                 });
             }
         }
@@ -402,6 +418,12 @@ pub enum ConfigError {
 
     #[error("Server not found: {name}")]
     ServerNotFound { name: String },
+
+    #[error("Server already exists: {name}")]
+    ServerAlreadyExists { name: String },
+
+    #[error("MCP configuration changed repeatedly; retry the operation")]
+    ConcurrentUpdate,
 }
 
 impl From<ConfigError> for ToolError {
@@ -413,6 +435,33 @@ impl From<ConfigError> for ToolError {
 /// Get the default MCP servers configuration path.
 pub fn default_config_path() -> PathBuf {
     lunarwing_base_dir().join("mcp-servers.json")
+}
+
+/// Cross-process guard for disk-backed MCP configuration updates.
+pub(crate) struct McpConfigWriteGuard(std::fs::File);
+
+impl Drop for McpConfigWriteGuard {
+    fn drop(&mut self) {
+        let _ = fs4::FileExt::unlock(&self.0);
+    }
+}
+
+pub(crate) async fn acquire_mcp_config_write_guard() -> Result<McpConfigWriteGuard, ConfigError> {
+    let lock_path = default_config_path().with_extension("lock");
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        file.lock_exclusive()?;
+        Ok(McpConfigWriteGuard(file))
+    })
+    .await
+    .map_err(|error| ConfigError::Io(std::io::Error::other(error)))?
 }
 
 /// Load MCP server configurations from the default location.
@@ -471,9 +520,23 @@ pub async fn save_mcp_servers_to(
 
 /// Add a new MCP server configuration.
 pub async fn add_mcp_server(config: McpServerConfig) -> Result<(), ConfigError> {
+    persist_mcp_server(config, true).await
+}
+
+/// Persist an MCP server while preserving concurrent changes from other processes.
+pub async fn persist_mcp_server(
+    config: McpServerConfig,
+    overwrite: bool,
+) -> Result<(), ConfigError> {
     config.validate()?;
+    let _config_guard = acquire_mcp_config_write_guard().await?;
 
     let mut servers = load_mcp_servers().await?;
+    if !overwrite && servers.get(&config.name).is_some() {
+        return Err(ConfigError::ServerAlreadyExists {
+            name: config.name.clone(),
+        });
+    }
     servers.upsert(config);
     save_mcp_servers(&servers).await?;
 
@@ -482,6 +545,7 @@ pub async fn add_mcp_server(config: McpServerConfig) -> Result<(), ConfigError> 
 
 /// Remove an MCP server by name.
 pub async fn remove_mcp_server(name: &str) -> Result<(), ConfigError> {
+    let _config_guard = acquire_mcp_config_write_guard().await?;
     let mut servers = load_mcp_servers().await?;
 
     if !servers.remove(name) {
@@ -493,6 +557,56 @@ pub async fn remove_mcp_server(name: &str) -> Result<(), ConfigError> {
     save_mcp_servers(&servers).await?;
 
     Ok(())
+}
+
+/// Set an MCP server's enabled state on disk.
+pub async fn set_mcp_server_enabled(
+    name: &str,
+    enabled: bool,
+) -> Result<McpServerConfig, ConfigError> {
+    let _config_guard = acquire_mcp_config_write_guard().await?;
+    let mut servers = load_mcp_servers().await?;
+    let server = servers
+        .get_mut(name)
+        .ok_or_else(|| ConfigError::ServerNotFound {
+            name: name.to_string(),
+        })?;
+    server.enabled = enabled;
+    let server = server.clone();
+    save_mcp_servers(&servers).await?;
+    Ok(server)
+}
+
+/// Atomically invert an MCP server's enabled state on disk.
+pub async fn toggle_mcp_server_enabled(name: &str) -> Result<McpServerConfig, ConfigError> {
+    let _config_guard = acquire_mcp_config_write_guard().await?;
+    let mut servers = load_mcp_servers().await?;
+    let server = servers
+        .get_mut(name)
+        .ok_or_else(|| ConfigError::ServerNotFound {
+            name: name.to_string(),
+        })?;
+    server.enabled = !server.enabled;
+    let server = server.clone();
+    save_mcp_servers(&servers).await?;
+    Ok(server)
+}
+
+/// Disable a disk-backed server only if its configuration has not changed.
+pub async fn disable_mcp_server_if_unchanged(
+    expected: &McpServerConfig,
+) -> Result<bool, ConfigError> {
+    let _config_guard = acquire_mcp_config_write_guard().await?;
+    let mut servers = load_mcp_servers().await?;
+    let Some(server) = servers.get_mut(&expected.name) else {
+        return Ok(false);
+    };
+    if serde_json::to_value(&*server)? != serde_json::to_value(expected)? {
+        return Ok(false);
+    }
+    server.enabled = false;
+    save_mcp_servers(&servers).await?;
+    Ok(true)
 }
 
 /// Get a specific MCP server configuration.
@@ -510,35 +624,40 @@ pub async fn get_mcp_server(name: &str) -> Result<McpServerConfig, ConfigError> 
 // ==================== Database-backed MCP server config ====================
 
 /// Load MCP server configurations from the database settings table.
-///
-/// Falls back to the disk file if DB has no entry.
 pub async fn load_mcp_servers_from_db(
     store: &dyn crate::db::Database,
     user_id: &str,
 ) -> Result<McpServersFile, ConfigError> {
     match store.get_setting(user_id, "mcp_servers").await {
-        Ok(Some(value)) => {
-            let config: McpServersFile = serde_json::from_value(value)?;
-            // Validate every server on load so corrupted DB configs are caught early
-            for server in &config.servers {
-                server.validate().map_err(|e| ConfigError::InvalidConfig {
-                    reason: format!("Server '{}': {}", server.name, e),
-                })?;
-            }
-            Ok(config)
-        }
-        Ok(None) => {
-            // No entry in DB, fall back to disk
-            load_mcp_servers().await
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Failed to load MCP servers from DB: {}, falling back to disk",
-                e
-            );
-            load_mcp_servers().await
-        }
+        Ok(Some(value)) => parse_mcp_servers_value(value),
+        Ok(None) => Ok(McpServersFile::default()),
+        Err(error) => Err(ConfigError::Io(std::io::Error::other(error))),
     }
+}
+
+/// Load DB configuration, migrating the legacy disk file into this owner once.
+pub async fn load_mcp_servers_from_db_or_migrate(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+) -> Result<McpServersFile, ConfigError> {
+    let current = store
+        .get_setting(user_id, "mcp_servers")
+        .await
+        .map_err(|error| ConfigError::Io(std::io::Error::other(error)))?;
+    if let Some(value) = current {
+        return parse_mcp_servers_value(value);
+    }
+
+    let disk = load_mcp_servers().await?;
+    let value = serde_json::to_value(&disk)?;
+    if store
+        .compare_and_set_setting(user_id, "mcp_servers", None, &value)
+        .await
+        .map_err(|error| ConfigError::Io(std::io::Error::other(error)))?
+    {
+        return Ok(disk);
+    }
+    load_mcp_servers_from_db(store, user_id).await
 }
 
 /// Save MCP server configurations to the database settings table.
@@ -561,13 +680,27 @@ pub async fn add_mcp_server_db(
     user_id: &str,
     config: McpServerConfig,
 ) -> Result<(), ConfigError> {
+    persist_mcp_server_db(store, user_id, config, true).await
+}
+
+/// Persist a DB-backed MCP server using optimistic concurrency control.
+pub async fn persist_mcp_server_db(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    config: McpServerConfig,
+    overwrite: bool,
+) -> Result<(), ConfigError> {
     config.validate()?;
-
-    let mut servers = load_mcp_servers_from_db(store, user_id).await?;
-    servers.upsert(config);
-    save_mcp_servers_to_db(store, user_id, &servers).await?;
-
-    Ok(())
+    mutate_mcp_servers_db(store, user_id, |servers| {
+        if !overwrite && servers.get(&config.name).is_some() {
+            return Err(ConfigError::ServerAlreadyExists {
+                name: config.name.clone(),
+            });
+        }
+        servers.upsert(config.clone());
+        Ok(())
+    })
+    .await
 }
 
 /// Remove an MCP server by name (DB-backed).
@@ -576,16 +709,115 @@ pub async fn remove_mcp_server_db(
     user_id: &str,
     name: &str,
 ) -> Result<(), ConfigError> {
-    let mut servers = load_mcp_servers_from_db(store, user_id).await?;
+    mutate_mcp_servers_db(store, user_id, |servers| {
+        if servers.remove(name) {
+            Ok(())
+        } else {
+            Err(ConfigError::ServerNotFound {
+                name: name.to_string(),
+            })
+        }
+    })
+    .await
+}
 
-    if !servers.remove(name) {
-        return Err(ConfigError::ServerNotFound {
-            name: name.to_string(),
-        });
+/// Set an MCP server's enabled state in the database atomically.
+pub async fn set_mcp_server_enabled_db(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    name: &str,
+    enabled: bool,
+) -> Result<McpServerConfig, ConfigError> {
+    mutate_mcp_servers_db(store, user_id, |servers| {
+        let server = servers
+            .get_mut(name)
+            .ok_or_else(|| ConfigError::ServerNotFound {
+                name: name.to_string(),
+            })?;
+        server.enabled = enabled;
+        Ok(server.clone())
+    })
+    .await
+}
+
+/// Atomically invert an MCP server's enabled state in the database.
+pub async fn toggle_mcp_server_enabled_db(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    name: &str,
+) -> Result<McpServerConfig, ConfigError> {
+    mutate_mcp_servers_db(store, user_id, |servers| {
+        let server = servers
+            .get_mut(name)
+            .ok_or_else(|| ConfigError::ServerNotFound {
+                name: name.to_string(),
+            })?;
+        server.enabled = !server.enabled;
+        Ok(server.clone())
+    })
+    .await
+}
+
+/// Disable a DB-backed server only if its configuration has not changed.
+pub async fn disable_mcp_server_if_unchanged_db(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    expected: &McpServerConfig,
+) -> Result<bool, ConfigError> {
+    mutate_mcp_servers_db(store, user_id, |servers| {
+        let Some(server) = servers.get_mut(&expected.name) else {
+            return Ok(false);
+        };
+        if serde_json::to_value(&*server)? != serde_json::to_value(expected)? {
+            return Ok(false);
+        }
+        server.enabled = false;
+        Ok(true)
+    })
+    .await
+}
+
+fn parse_mcp_servers_value(value: serde_json::Value) -> Result<McpServersFile, ConfigError> {
+    let config: McpServersFile = serde_json::from_value(value)?;
+    for server in &config.servers {
+        server
+            .validate()
+            .map_err(|error| ConfigError::InvalidConfig {
+                reason: format!("Server '{}': {error}", server.name),
+            })?;
+    }
+    Ok(config)
+}
+
+async fn mutate_mcp_servers_db<T>(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    mut mutate: impl FnMut(&mut McpServersFile) -> Result<T, ConfigError>,
+) -> Result<T, ConfigError> {
+    const MAX_ATTEMPTS: usize = 16;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let expected = store
+            .get_setting(user_id, "mcp_servers")
+            .await
+            .map_err(|error| ConfigError::Io(std::io::Error::other(error)))?;
+        let mut servers = match expected.as_ref() {
+            Some(value) => parse_mcp_servers_value(value.clone())?,
+            None => McpServersFile::default(),
+        };
+        let result = mutate(&mut servers)?;
+        let value = serde_json::to_value(&servers)?;
+        if store
+            .compare_and_set_setting(user_id, "mcp_servers", expected.as_ref(), &value)
+            .await
+            .map_err(|error| ConfigError::Io(std::io::Error::other(error)))?
+        {
+            return Ok(result);
+        }
+        tokio::task::yield_now().await;
     }
 
-    save_mcp_servers_to_db(store, user_id, &servers).await?;
-    Ok(())
+    Err(ConfigError::ConcurrentUpdate)
 }
 
 /// Check if a URL points to a loopback address (localhost, 127.0.0.1, [::1]).
@@ -1013,6 +1245,27 @@ mod tests {
             err.contains("empty"),
             "Expected empty name error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_case_variant_duplicate_headers_rejected() {
+        let headers = HashMap::from([
+            ("Authorization".to_string(), "Bearer first".to_string()),
+            ("authorization".to_string(), "Bearer second".to_string()),
+        ]);
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_custom_session_header_rejected() {
+        let headers = HashMap::from([("Mcp-Session-Id".to_string(), "stale".to_string())]);
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

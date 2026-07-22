@@ -606,6 +606,16 @@ mod tests {
                 }),
             ),
             (
+                "tool_deactivate",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "MCP server name" }
+                    },
+                    "required": ["name"]
+                }),
+            ),
+            (
                 "tool_list",
                 serde_json::json!({
                     "type": "object",

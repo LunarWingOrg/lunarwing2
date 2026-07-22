@@ -2267,6 +2267,39 @@ impl Store {
         Ok(())
     }
 
+    /// Compare and set a single setting atomically.
+    pub async fn compare_and_set_setting(
+        &self,
+        user_id: &str,
+        key: &str,
+        expected: Option<&serde_json::Value>,
+        value: &serde_json::Value,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.conn().await?;
+        let changed = if let Some(expected) = expected {
+            conn.execute(
+                r#"
+                UPDATE settings
+                SET value = $4, updated_at = NOW()
+                WHERE user_id = $1 AND key = $2 AND value = $3
+                "#,
+                &[&user_id, &key, expected, value],
+            )
+            .await?
+        } else {
+            conn.execute(
+                r#"
+                INSERT INTO settings (user_id, key, value, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (user_id, key) DO NOTHING
+                "#,
+                &[&user_id, &key, value],
+            )
+            .await?
+        };
+        Ok(changed == 1)
+    }
+
     /// Delete a single setting (reset to default).
     pub async fn delete_setting(&self, user_id: &str, key: &str) -> Result<bool, DatabaseError> {
         let conn = self.conn().await?;

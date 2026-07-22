@@ -25,10 +25,11 @@ Replace the manual, error-prone sequence of `add-tenant → build-tenant → sta
 
 A web UI (SSE-driven real-time build logs) is deferred to a future phase. CLI ships first.
 
-The same CLI now also exposes an `upgrade` subcommand for existing tenants that
-need an in-place move from older 1.1.x releases such as 1.1.6, 1.1.7, and
-1.1.8. That mode remains a thin wrapper over the existing shell upgrade tools
-instead of duplicating upgrade logic in Python.
+The same CLI also exposes an `upgrade` subcommand. As of v2.0.2 it is a thin
+wrapper over `lunarwing-mt-admin.sh upgrade-tenant`, accepts an explicit branch,
+tag, or commit, and uses the init-agnostic systemd-user/OpenRC lifecycle. The
+legacy v1 upgrade-wrapper discussion below is retained only as original design
+history; see `lunarwing_mt_onboard/README.md` for the current command contract.
 
 ## Recommendation Summary
 
@@ -126,7 +127,7 @@ $ sudo python3 -m lunarwing_mt_onboard
   ● opencode (sst/opencode)
 ? Include Rust/Go/C++ toolchains in workers? (increases image size ~5GB)  Yes
 ? LLM provider configuration
-  ? TensorZero upstream URL  http://192.168.1.157:3000/openai/v1
+  ? Daemon LLM base URL override (optional)
   ? LLM model  tensorzero::function_name::FrontierCODE
   ? LLM API key  [hidden]
 ? Secrets master key (leave blank to auto-generate a 32-byte hex)  [hidden]
@@ -195,7 +196,7 @@ class TenantConfig:
     gotify_title: str | None = None
     workers: list[WorkerType] = field(default_factory=list)
     toolchains: bool = False
-    tensorzero_url: str = "http://192.168.1.157:3000/openai/v1"
+    llm_base_url: str = ""
     llm_model: str = "tensorzero::function_name::FrontierCODE"
     llm_api_key: str | None = None
     secrets_master_key: str | None = None

@@ -14,20 +14,52 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from pydantic import ValidationError
 
 from lunarwing_mt_onboard.config import WorkerType
 
 from . import audit, demo
-from .jobs import Job, JobManager
+from .__main__ import _is_loopback_host
+from .jobs import Job, JobConflictError, JobManager
 from .models import ExportRequest, ImportRequest, ProvisionRequest, UpgradeRequest
 from .security import generate_token, token_matches
 
+try:
+    from fastapi.testclient import TestClient
+
+    from .app import create_app
+except ModuleNotFoundError:
+    TestClient = None
+    create_app = None
+
 
 class ModelMappingTests(unittest.TestCase):
+    def test_request_models_reject_unknown_fields(self) -> None:
+        with self.assertRaises(ValidationError):
+            UpgradeRequest(
+                tenant="alpha",
+                target="v2.0.2.0",
+                apply=True,
+                source_reop="/srv/lunarwing",
+            )
+
+    def test_provision_rejects_unknown_workers(self) -> None:
+        with self.assertRaises(ValidationError):
+            ProvisionRequest(name="alpha", workers=["opencdoe"])
+
+    def test_obsolete_tensorzero_url_is_rejected(self) -> None:
+        with self.assertRaises(ValidationError):
+            ProvisionRequest(
+                name="alpha",
+                tensorzero_url="http://proxy.example.test/openai/v1",
+            )
+
     def test_provision_maps_fields_and_workers(self) -> None:
         req = ProvisionRequest(
             name="  sphinx  ",
-            workers=["nanocode", "bogus", "opencode"],
+            workers=["nanocode", "opencode"],
             no_ssh=True,
             no_weechat_bootstrap=True,
             xmpp_allow_from=["a@x", "  ", "b@y"],
@@ -46,9 +78,19 @@ class ModelMappingTests(unittest.TestCase):
         self.assertFalse(cfg.no_weechat_bootstrap)
 
     def test_upgrade_and_export_mappers(self) -> None:
-        u = UpgradeRequest(tenant="griffin", target="v1.1.9", apply=True).to_upgrade_config()
+        u = UpgradeRequest(
+            tenant="griffin",
+            target="v2.0.2.0",
+            source_repo=" /srv/lunarwing ",
+            no_backup=True,
+            skip_render=True,
+            apply=True,
+        ).to_upgrade_config()
         self.assertEqual(u.tenant, "griffin")
-        self.assertEqual(u.target, "v1.1.9")
+        self.assertEqual(u.target, "v2.0.2.0")
+        self.assertEqual(u.source_repo, "/srv/lunarwing")
+        self.assertTrue(u.no_backup)
+        self.assertTrue(u.skip_render)
         self.assertTrue(u.apply)
         e = ExportRequest(tenant="chimera").to_export_config()
         self.assertEqual(e.tenant, "chimera")
@@ -66,7 +108,6 @@ class ModelMappingTests(unittest.TestCase):
             with_pebble=True,
             with_vision=True,
             docker_group=True,
-            tensorzero_url="  http://tensorzero.test/openai/v1  ",
             owner_scope="  legacy-chimera  ",
             apply=True,
             force=True,
@@ -74,7 +115,6 @@ class ModelMappingTests(unittest.TestCase):
 
         self.assertEqual(cfg.bundle, "/tmp/chimera.tar")
         self.assertEqual(cfg.name, "chimera-new")
-        self.assertEqual(cfg.tensorzero_url, "http://tensorzero.test/openai/v1")
         self.assertEqual(cfg.owner_scope, "legacy-chimera")
         self.assertTrue(cfg.start)
         self.assertTrue(cfg.old_stopped)
@@ -87,6 +127,78 @@ class ModelMappingTests(unittest.TestCase):
         self.assertTrue(cfg.apply)
         self.assertTrue(cfg.force)
         self.assertTrue(cfg.auto_yes)
+
+    def test_current_provision_fields_map_to_tenant_config(self) -> None:
+        cfg = ProvisionRequest(
+            name="sphinx",
+            workers=["nanocode", "opencode"],
+            llm_base_url=" http://llm.test/v1 ",
+            nanocode_model=" nano ",
+            nanocode_base_url=" http://nano.test/v1 ",
+            opencode_model=" open ",
+            opencode_base_url=" http://open.test/v1 ",
+        ).to_tenant_config()
+
+        self.assertEqual(cfg.llm_base_url, "http://llm.test/v1")
+        self.assertEqual(cfg.nanocode_model, "nano")
+        self.assertEqual(cfg.nanocode_base_url, "http://nano.test/v1")
+        self.assertEqual(cfg.opencode_model, "open")
+        self.assertEqual(cfg.opencode_base_url, "http://open.test/v1")
+
+    def test_worker_overrides_are_dropped_when_worker_is_not_selected(self) -> None:
+        cfg = ProvisionRequest(
+            name="sphinx",
+            nanocode_model="stale-nano",
+            opencode_model="stale-open",
+        ).to_tenant_config()
+        self.assertEqual(cfg.nanocode_model, "")
+        self.assertEqual(cfg.opencode_model, "")
+
+    def test_invalid_master_key_and_skip_build_start_mismatch_are_rejected(self) -> None:
+        with self.assertRaises(ValidationError):
+            ProvisionRequest(name="sphinx", secrets_master_key="not-hex")
+        with self.assertRaises(ValidationError):
+            ProvisionRequest(name="sphinx", skip_build=True, skip_start=False)
+
+    def test_export_passphrase_is_confirmed_and_excluded_from_dump(self) -> None:
+        secret = "correct horse battery staple"
+        request = ExportRequest(
+            tenant="sphinx",
+            apply=True,
+            passphrase=secret,
+            passphrase_confirm=secret,
+        )
+
+        self.assertEqual(request.to_export_config().passphrase, secret)
+        self.assertNotIn("passphrase", request.model_dump())
+        self.assertNotIn("passphrase_confirm", request.model_dump())
+        self.assertNotIn(secret, repr(request))
+        with self.assertRaises(ValidationError):
+            ExportRequest(
+                tenant="sphinx",
+                apply=True,
+                passphrase=secret,
+                passphrase_confirm="different password",
+            )
+
+    def test_encrypted_import_requires_passphrase_but_legacy_tar_does_not(self) -> None:
+        with self.assertRaises(ValidationError):
+            ImportRequest(bundle="/tmp/sphinx.7z")
+        request = ImportRequest(bundle="/tmp/sphinx.7z", passphrase="legacy")
+        self.assertEqual(request.to_import_config().passphrase, "legacy")
+        self.assertNotIn("passphrase", request.model_dump())
+        ImportRequest(bundle="/tmp/sphinx.tar")
+
+    def test_import_start_requires_old_host_stopped_confirmation(self) -> None:
+        with self.assertRaises(ValidationError):
+            ImportRequest(bundle="/tmp/sphinx.tar", start=True, old_stopped=False)
+        ImportRequest(bundle="/tmp/sphinx.tar", start=True, old_stopped=True)
+
+    def test_upgrade_requires_target_and_explicit_confirmation(self) -> None:
+        with self.assertRaises(ValidationError):
+            UpgradeRequest(tenant="sphinx", target="v2.0.2.0")
+        with self.assertRaises(ValidationError):
+            UpgradeRequest(tenant="sphinx", target="", apply=True)
 
 
 class RedactionTests(unittest.TestCase):
@@ -106,6 +218,13 @@ class RedactionTests(unittest.TestCase):
     def test_plain_line_unchanged(self) -> None:
         self.assertEqual(audit.redact_text("Compiling lunarwing v1.1.9"), "Compiling lunarwing v1.1.9")
 
+    def test_audit_file_is_always_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = audit.AuditLogger("export", "sphinx", "mode", log_dir=tmp)
+            path = logger.path
+            logger.close()
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
 
 class TokenTests(unittest.TestCase):
     def test_token_match(self) -> None:
@@ -114,6 +233,14 @@ class TokenTests(unittest.TestCase):
         self.assertFalse(token_matches(t, "nope"))
         self.assertFalse(token_matches(t, None))
         self.assertTrue(token_matches("", "anything"))  # empty = disabled
+
+
+class BindSecurityTests(unittest.TestCase):
+    def test_full_loopback_ranges_are_recognized(self) -> None:
+        for host in ("localhost", "127.0.0.1", "127.0.0.2", "::1", "[::1]"):
+            with self.subTest(host=host):
+                self.assertTrue(_is_loopback_host(host))
+        self.assertFalse(_is_loopback_host("0.0.0.0"))
 
 
 class CancellationTests(unittest.TestCase):
@@ -180,6 +307,18 @@ class CancellationTests(unittest.TestCase):
                         pass
                 if job.thread is not None:
                     job.thread.join(timeout=2)
+
+
+class JobExclusionTests(unittest.TestCase):
+    def test_second_privileged_job_is_rejected_until_first_finishes(self) -> None:
+        manager = JobManager(demo=True)
+        first = manager.create("export")
+        with self.assertRaises(JobConflictError):
+            manager.create("import")
+
+        first.status = "done"
+        second = manager.create("import")
+        self.assertEqual(second.mode, "import")
 
 
 def _drain(q: "queue.Queue") -> list[dict]:
@@ -269,6 +408,79 @@ class DemoProvisionIntegrationTests(unittest.TestCase):
         self.assertIn("--yes", audit_text)
         self.assertNotIn("--start", audit_text)
 
+    def test_encrypted_export_passphrase_never_reaches_events_or_audit(self) -> None:
+        secret = "correct horse battery staple"
+        job = Job(id="test5", mode="export", demo=True)
+        req = ExportRequest(
+            tenant="sphinx",
+            apply=True,
+            passphrase=secret,
+            passphrase_confirm=secret,
+        )
+
+        self.runner.run_export_job(job, req, log_dir=self.tmp)
+
+        events = _drain(job.queue)
+        self.assertTrue(job.ok, events)
+        self.assertNotIn(secret, repr(events))
+        for name in os.listdir(self.tmp):
+            self.assertNotIn(secret, Path(self.tmp, name).read_text())
+
+    def test_encrypted_import_passphrase_never_reaches_events_or_audit(self) -> None:
+        secret = "bundle passphrase"
+        job = Job(id="test6", mode="import", demo=True)
+        req = ImportRequest(bundle="/tmp/chimera.7z", passphrase=secret)
+
+        self.runner.run_import_job(job, req, log_dir=self.tmp)
+
+        events = _drain(job.queue)
+        self.assertTrue(job.ok, events)
+        self.assertNotIn(secret, repr(events))
+        for name in os.listdir(self.tmp):
+            self.assertNotIn(secret, Path(self.tmp, name).read_text())
+
+    def test_verification_failure_fails_overall_job(self) -> None:
+        job = Job(id="test7", mode="provision", demo=True)
+        req = ProvisionRequest(name="sphinx")
+        failed_check = [{"label": "gateway port", "ok": False, "detail": "closed"}]
+
+        with patch.object(self.runner, "_verify", return_value=failed_check):
+            self.runner.run_provision_job(job, req, log_dir=self.tmp)
+
+        events = _drain(job.queue)
+        done = [event for event in events if event.get("type") == "done"]
+        self.assertTrue(done)
+        self.assertFalse(done[-1]["ok"])
+        self.assertIn(
+            {"name": "verify", "ok": False, "code": 1},
+            done[-1]["phases"],
+        )
+
+    def test_v2_upgrade_uses_mt_admin_lifecycle(self) -> None:
+        job = Job(id="test8", mode="upgrade", demo=True)
+        req = UpgradeRequest(
+            tenant="sphinx",
+            target="v2.0.2.0",
+            source_repo="/srv/lunarwing",
+            no_backup=True,
+            skip_render=True,
+            apply=True,
+        )
+
+        self.runner.run_upgrade_job(job, req, log_dir=self.tmp)
+
+        events = _drain(job.queue)
+        self.assertTrue(job.ok, events)
+        audit_text = "\n".join(
+            Path(self.tmp, name).read_text()
+            for name in os.listdir(self.tmp)
+            if "-upgrade-" in name
+        )
+        self.assertIn("upgrade-tenant sphinx --target v2.0.2.0", audit_text)
+        self.assertIn("--source-repo /srv/lunarwing", audit_text)
+        self.assertIn("--no-backup", audit_text)
+        self.assertIn("--skip-render", audit_text)
+
 
 class AppRouteTests(unittest.TestCase):
     def test_import_route_is_registered_as_post(self) -> None:
@@ -288,6 +500,27 @@ class AppRouteTests(unittest.TestCase):
         }
 
         self.assertIn("/api/import", post_paths)
+
+    @unittest.skipIf(TestClient is None, "FastAPI test dependencies are not installed")
+    def test_validation_response_never_echoes_passphrase(self) -> None:
+        secret = "correct horse battery staple"
+        with tempfile.TemporaryDirectory() as tmp:
+            assert TestClient is not None and create_app is not None
+            client = TestClient(create_app(token="test-token", demo=True, log_dir=tmp))
+            response = client.post(
+                "/api/export?token=test-token",
+                json={
+                    "tenant": "sphinx",
+                    "apply": True,
+                    "passphrase": secret,
+                    "passphrase_confirm": "different passphrase",
+                },
+            )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn(secret, response.text)
+        self.assertNotIn("different passphrase", response.text)
+        self.assertNotIn("input", response.json()["detail"][0])
 
 
 class ImportUiTests(unittest.TestCase):
@@ -316,12 +549,28 @@ class ImportUiTests(unittest.TestCase):
             "with_pebble",
             "with_vision",
             "docker_group",
-            "tensorzero_url",
             "owner_scope",
+            "passphrase",
         ):
             self.assertIn(field, import_form)
         self.assertIn("stage-only by default", import_form.lower())
         self.assertIn("old host stopped", import_form.lower())
+
+    def test_export_and_upgrade_forms_match_current_contracts(self) -> None:
+        wizard = (Path(__file__).resolve().parent / "static" / "js" / "wizard.js").read_text()
+        export_form = wizard.split("function mountExport", 1)[1].split(
+            "function mountImport", 1
+        )[0]
+        upgrade_form = wizard.split("function mountUpgrade", 1)[1].split(
+            "function mountExport", 1
+        )[0]
+
+        self.assertIn("passphrase_confirm", export_form)
+        self.assertIn("at least 12 characters", export_form)
+        self.assertIn("source_repo", upgrade_form)
+        self.assertIn("no_backup", upgrade_form)
+        self.assertIn("skip_render", upgrade_form)
+        self.assertNotIn("upgrade-tenant-version.sh", upgrade_form)
 
 
 class ProvisionWeechatUiTests(unittest.TestCase):
@@ -378,4 +627,3 @@ class MascotSpriteTests(unittest.TestCase):
         text = app.read_text()
         self.assertIn("bat.greet()", text)
         self.assertIn("bat.celebrate()", text)
-

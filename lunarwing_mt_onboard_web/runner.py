@@ -11,7 +11,6 @@ re-implemented here.
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import time
@@ -23,6 +22,7 @@ import lunarwing_mt_onboard.upgrade as upgrade
 from lunarwing_mt_onboard import secrets as lw_secrets
 from lunarwing_mt_onboard import secrets_ops
 from lunarwing_mt_onboard.config import TenantConfig
+from lunarwing_mt_onboard.kawarimi_secret import passphrase_transport
 from lunarwing_mt_onboard.verify import verify_tenant
 
 from . import demo as demo_mod
@@ -50,17 +50,31 @@ def list_tenants(demo: bool) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-def _run_phase(job: Job, argv: list[str], phase_name: str, audit: AuditLogger) -> int:
+def _run_phase(
+    job: Job,
+    argv: list[str],
+    phase_name: str,
+    audit: AuditLogger,
+    *,
+    env: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
+) -> int:
     audit.command(argv)
     if job.cancelled():
         return 130
+    child_env = os.environ.copy()
+    for key in ("KAWARIMI_PASS", "KAWARIMI_PASS_FILE", "KAWARIMI_PASS_FD"):
+        child_env.pop(key, None)
+    if env:
+        child_env.update(env)
     with subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        env=os.environ.copy(),
+        env=child_env,
+        pass_fds=pass_fds,
         start_new_session=os.name == "posix",
     ) as proc:
         job.proc = proc
@@ -119,14 +133,7 @@ def _read_gateway_port(tenant: str, *, demo: bool, fallback: int = 0) -> int:
         return int(fallback) if fallback else 10000
     if fallback:
         return int(fallback)
-    try:
-        with open("/etc/lunarwing/ports.json", encoding="utf-8") as fh:
-            data = json.load(fh)
-        ports = (data.get("tenants") or {}).get(tenant, {}).get("ports") or {}
-        port = ports.get("gateway")
-        return int(port) if port else 0
-    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
-        return 0
+    return secrets_ops.tenant_gateway_port(tenant)
 
 
 def _emit_gateway_auth_token(
@@ -253,6 +260,10 @@ def run_provision_job(job: Job, req: ProvisionRequest, *, log_dir: str | None = 
             job.emit(type="verify", checks=checks)
             for c in checks:
                 audit.note(f"verify {c['label']}: {'PASS' if c['ok'] else 'FAIL'}")
+            verify_ok = bool(checks) and all(c["ok"] for c in checks)
+            summary.append(
+                {"name": "verify", "ok": verify_ok, "code": 0 if verify_ok else 1}
+            )
 
         return _finish(job, audit, summary)
     finally:
@@ -266,8 +277,23 @@ def _verify(job: Job, cfg: TenantConfig) -> list[dict]:
             {"label": "gateway port", "ok": True, "detail": "reachable"},
             {"label": f"service lunarwing-{cfg.name}", "ok": True, "detail": "active"},
         ]
-    results = verify_tenant(cfg.name, cfg.gateway_host, cfg.gateway_port)
-    return [{"label": r.label, "ok": r.ok, "detail": r.detail} for r in results]
+    gateway_port = _read_gateway_port(
+        cfg.name,
+        demo=False,
+        fallback=cfg.gateway_port,
+    )
+    results = verify_tenant(cfg.name, cfg.gateway_host, gateway_port)
+    checks = [{"label": r.label, "ok": r.ok, "detail": r.detail} for r in results]
+    if not gateway_port:
+        checks.insert(
+            0,
+            {
+                "label": "gateway port",
+                "ok": False,
+                "detail": "gateway allocation not found in ports registry",
+            },
+        )
+    return checks
 
 
 # --------------------------------------------------------------------------- #
@@ -286,34 +312,15 @@ def run_upgrade_job(job: Job, req: UpgradeRequest, *, log_dir: str | None = None
     audit = AuditLogger("upgrade", cfg.tenant, job.id, log_dir=log_dir, demo=job.demo)
     summary: list[dict] = []
     try:
-        plan = (["preflight"] if cfg.run_preflight else []) + ["upgrade"]
-        total = len(plan)
-        counter = {"i": 0}
-
-        def announce(name: str, label: str) -> None:
-            counter["i"] += 1
-            job.emit(type="phase", name=name, label=label, index=counter["i"], total=total)
-
-        if cfg.run_preflight:
-            announce("preflight", f"Preflight checks for '{cfg.tenant}'")
-            try:
-                args = upgrade.build_preflight_args(cfg)
-            except FileNotFoundError as exc:
-                job.emit(type="error", message=str(exc))
-                job.ok = False
-                audit.finish(False)
-                return
-            rc = _run_phase(job, args, "preflight", audit)
-            summary.append({"name": "preflight", "ok": rc == 0, "code": rc})
-            if job.cancelled():
-                return _finish(job, audit, summary)
-            if rc != 0 and not cfg.force:
-                return _finish(job, audit, summary)
-
-        mode = "APPLY" if cfg.apply else "dry-run"
-        announce("upgrade", f"Upgrading '{cfg.tenant}' to {cfg.target or 'default'} [{mode}]")
+        job.emit(
+            type="phase",
+            name="upgrade",
+            label=f"Upgrading '{cfg.tenant}' to {cfg.target} [APPLY]",
+            index=1,
+            total=2,
+        )
         try:
-            args = upgrade.build_upgrade_args(cfg)
+            args = upgrade.build_mt_admin_upgrade_args(cfg)
         except FileNotFoundError as exc:
             job.emit(type="error", message=str(exc))
             job.ok = False
@@ -321,6 +328,32 @@ def run_upgrade_job(job: Job, req: UpgradeRequest, *, log_dir: str | None = None
             return
         rc = _run_phase(job, args, "upgrade", audit)
         summary.append({"name": "upgrade", "ok": rc == 0, "code": rc})
+        if _halt(job, rc):
+            return _finish(job, audit, summary)
+
+        job.emit(
+            type="phase",
+            name="verify",
+            label=f"Verifying upgraded tenant '{cfg.tenant}'",
+            index=2,
+            total=2,
+        )
+        checks = _verify(
+            job,
+            TenantConfig(
+                name=cfg.tenant,
+                gateway_host=secrets_ops.tenant_gateway_host(cfg.tenant),
+            ),
+        )
+        job.emit(type="verify", checks=checks)
+        for check in checks:
+            audit.note(
+                f"verify {check['label']}: {'PASS' if check['ok'] else 'FAIL'}"
+            )
+        verify_ok = bool(checks) and all(check["ok"] for check in checks)
+        summary.append(
+            {"name": "verify", "ok": verify_ok, "code": 0 if verify_ok else 1}
+        )
         return _finish(job, audit, summary)
     finally:
         audit.close()
@@ -333,6 +366,8 @@ def run_upgrade_job(job: Job, req: UpgradeRequest, *, log_dir: str | None = None
 
 def run_export_job(job: Job, req: ExportRequest, *, log_dir: str | None = None) -> None:
     cfg = req.to_export_config()
+    req.passphrase = type(req.passphrase)("")
+    req.passphrase_confirm = type(req.passphrase_confirm)("")
     err = cfg.validate()
     if err:
         job.emit(type="error", message=f"Invalid export config: {err}")
@@ -357,7 +392,16 @@ def run_export_job(job: Job, req: ExportRequest, *, log_dir: str | None = None) 
             job.ok = False
             audit.finish(False)
             return
-        rc = _run_phase(job, args, "export", audit)
+        with passphrase_transport(cfg.passphrase) as secret:
+            cfg.passphrase = ""
+            rc = _run_phase(
+                job,
+                args,
+                "export",
+                audit,
+                env=secret.env,
+                pass_fds=secret.pass_fds,
+            )
         summary.append({"name": "export", "ok": rc == 0, "code": rc})
         return _finish(job, audit, summary)
     finally:
@@ -371,6 +415,7 @@ def run_export_job(job: Job, req: ExportRequest, *, log_dir: str | None = None) 
 
 def run_import_job(job: Job, req: ImportRequest, *, log_dir: str | None = None) -> None:
     cfg = req.to_import_config()
+    req.passphrase = type(req.passphrase)("")
     err = cfg.validate()
     if err:
         job.emit(type="error", message=f"Invalid import config: {err}")
@@ -398,7 +443,16 @@ def run_import_job(job: Job, req: ImportRequest, *, log_dir: str | None = None) 
             job.ok = False
             audit.finish(False)
             return
-        rc = _run_phase(job, args, "import", audit)
+        with passphrase_transport(cfg.passphrase) as secret:
+            cfg.passphrase = ""
+            rc = _run_phase(
+                job,
+                args,
+                "import",
+                audit,
+                env=secret.env,
+                pass_fds=secret.pass_fds,
+            )
         summary.append({"name": "import", "ok": rc == 0, "code": rc})
         return _finish(job, audit, summary)
     finally:

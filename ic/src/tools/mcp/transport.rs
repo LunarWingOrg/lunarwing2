@@ -33,6 +33,14 @@ pub trait McpTransport: Send + Sync {
     /// Shut down the transport, releasing any resources (child processes, connections).
     async fn shutdown(&self) -> Result<(), ToolError>;
 
+    /// Shut down using request headers when the transport has a remote session to terminate.
+    async fn shutdown_with_headers(
+        &self,
+        _headers: &HashMap<String, String>,
+    ) -> Result<(), ToolError> {
+        self.shutdown().await
+    }
+
     /// Whether this transport supports HTTP-specific features like session headers.
     fn supports_http_features(&self) -> bool {
         false

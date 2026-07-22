@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 
 use clap::{Args, Subcommand};
@@ -122,6 +123,18 @@ pub enum McpCommand {
         /// Disable the server
         #[arg(long, conflicts_with = "enable")]
         disable: bool,
+
+        /// Gateway URL for applying the change to a running LunarWing instance
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Gateway auth token (required with --url; otherwise reads configuration or env)
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Only update persisted configuration; do not contact the running gateway
+        #[arg(long)]
+        offline: bool,
     },
 }
 
@@ -140,23 +153,46 @@ fn parse_env_var(s: &str) -> Result<(String, String), String> {
 }
 
 /// Run an MCP command.
-pub async fn run_mcp_command(cmd: McpCommand) -> anyhow::Result<()> {
+pub async fn run_mcp_command(
+    cmd: McpCommand,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
     match cmd {
-        McpCommand::Add(args) => add_server(*args).await,
-        McpCommand::Remove { name } => remove_server(name).await,
-        McpCommand::List { verbose } => list_servers(verbose).await,
-        McpCommand::Auth { name, user } => auth_server(name, user).await,
-        McpCommand::Test { name, user } => test_server(name, user).await,
+        McpCommand::Add(args) => add_server(*args, config_path, no_db).await,
+        McpCommand::Remove { name } => remove_server(name, config_path, no_db).await,
+        McpCommand::List { verbose } => list_servers(verbose, config_path, no_db).await,
+        McpCommand::Auth { name, user } => auth_server(name, user, config_path, no_db).await,
+        McpCommand::Test { name, user } => test_server(name, user, config_path, no_db).await,
         McpCommand::Toggle {
             name,
             enable,
             disable,
-        } => toggle_server(name, enable, disable).await,
+            url,
+            token,
+            offline,
+        } => {
+            toggle_server(
+                name,
+                enable,
+                disable,
+                url,
+                token,
+                offline,
+                config_path,
+                no_db,
+            )
+            .await
+        }
     }
 }
 
 /// Add a new MCP server.
-async fn add_server(args: McpAddArgs) -> anyhow::Result<()> {
+async fn add_server(
+    args: McpAddArgs,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
     let McpAddArgs {
         name,
         url,
@@ -239,7 +275,7 @@ async fn add_server(args: McpAddArgs) -> anyhow::Result<()> {
         config = config.with_oauth(oauth);
     }
 
-    persist_server(config, true).await?;
+    persist_server_with_path(config, true, config_path, no_db).await?;
 
     println!();
     println!("  ✓ Added MCP server '{}'", name);
@@ -273,13 +309,18 @@ async fn add_server(args: McpAddArgs) -> anyhow::Result<()> {
 }
 
 /// Remove an MCP server.
-async fn remove_server(name: String) -> anyhow::Result<()> {
-    let db = connect_db().await;
-    let mut servers = load_servers(db.as_deref()).await?;
-    if !servers.remove(&name) {
-        anyhow::bail!("Server '{}' not found", name);
+async fn remove_server(
+    name: String,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
+    let db = connect_db(config_path, no_db).await?;
+    if let Some(db) = db.as_ref() {
+        config::load_mcp_servers_from_db_or_migrate(db.store.as_ref(), &db.owner_id).await?;
+        config::remove_mcp_server_db(db.store.as_ref(), &db.owner_id, &name).await?;
+    } else {
+        config::remove_mcp_server(&name).await?;
     }
-    save_servers(db.as_deref(), &servers).await?;
 
     println!();
     println!("  ✓ Removed MCP server '{}'", name);
@@ -289,9 +330,13 @@ async fn remove_server(name: String) -> anyhow::Result<()> {
 }
 
 /// List configured MCP servers.
-async fn list_servers(verbose: bool) -> anyhow::Result<()> {
-    let db = connect_db().await;
-    let servers = load_servers(db.as_deref()).await?;
+async fn list_servers(
+    verbose: bool,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
+    let db = connect_db(config_path, no_db).await?;
+    let servers = load_servers(db.as_ref()).await?;
 
     if servers.servers.is_empty() {
         println!();
@@ -394,10 +439,15 @@ async fn list_servers(verbose: bool) -> anyhow::Result<()> {
 }
 
 /// Authenticate with an MCP server.
-async fn auth_server(name: String, user_id: String) -> anyhow::Result<()> {
+async fn auth_server(
+    name: String,
+    user_id: String,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
     // Get server config
-    let db = connect_db().await;
-    let servers = load_servers(db.as_deref()).await?;
+    let db = connect_db(config_path, no_db).await?;
+    let servers = load_servers(db.as_ref()).await?;
     let server = servers
         .get(&name)
         .cloned()
@@ -467,10 +517,15 @@ async fn auth_server(name: String, user_id: String) -> anyhow::Result<()> {
 }
 
 /// Test connection to an MCP server.
-async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
+async fn test_server(
+    name: String,
+    user_id: String,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
     // Get server config
-    let db = connect_db().await;
-    let servers = load_servers(db.as_deref()).await?;
+    let db = connect_db(config_path, no_db).await?;
+    let servers = load_servers(db.as_ref()).await?;
     let server = servers
         .get(&name)
         .cloned()
@@ -573,76 +628,234 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
 }
 
 /// Toggle server enabled/disabled state.
-async fn toggle_server(name: String, enable: bool, disable: bool) -> anyhow::Result<()> {
-    let db = connect_db().await;
-    let mut servers = load_servers(db.as_deref()).await?;
-
-    let server = servers
-        .get_mut(&name)
-        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
-
-    let new_state = if enable {
-        true
+async fn toggle_server(
+    name: String,
+    enable: bool,
+    disable: bool,
+    gateway_url: Option<String>,
+    gateway_token: Option<String>,
+    offline: bool,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
+    let db = connect_db(config_path, no_db).await?;
+    let servers = load_servers(db.as_ref()).await?;
+    if servers.get(&name).is_none() {
+        anyhow::bail!("Server '{}' not found", name);
+    }
+    let requested_state = if enable {
+        Some(true)
     } else if disable {
-        false
+        Some(false)
     } else {
-        !server.enabled // Toggle if neither specified
+        None
     };
 
-    server.enabled = new_state;
-    save_servers(db.as_deref(), &servers).await?;
+    if !offline {
+        match apply_live_toggle(
+            &name,
+            requested_state,
+            gateway_url.as_deref(),
+            gateway_token.as_deref(),
+            config_path,
+            db.as_ref(),
+        )
+        .await?
+        {
+            LiveToggleResult::Applied(message) => {
+                println!();
+                println!("  ✓ {message}");
+                println!();
+                return Ok(());
+            }
+            LiveToggleResult::Unavailable(reason) => {
+                eprintln!("  Gateway unavailable ({reason}); saving for next startup.");
+            }
+        }
+    }
+
+    let server = if let Some(db) = db.as_ref() {
+        match requested_state {
+            Some(enabled) => {
+                config::set_mcp_server_enabled_db(db.store.as_ref(), &db.owner_id, &name, enabled)
+                    .await?
+            }
+            None => {
+                config::toggle_mcp_server_enabled_db(db.store.as_ref(), &db.owner_id, &name).await?
+            }
+        }
+    } else {
+        match requested_state {
+            Some(enabled) => config::set_mcp_server_enabled(&name, enabled).await?,
+            None => config::toggle_mcp_server_enabled(&name).await?,
+        }
+    };
+    let new_state = server.enabled;
 
     let status = if new_state { "enabled" } else { "disabled" };
     println!();
-    println!("  ✓ Server '{}' is now {}.", name, status);
+    println!("  ✓ Server '{name}' is now {status} in persisted configuration.");
+    if !offline {
+        println!("    The change will take effect when LunarWing next starts.");
+    }
     println!();
 
     Ok(())
 }
 
-const DEFAULT_USER_ID: &str = "default";
+enum LiveToggleResult {
+    Applied(String),
+    Unavailable(String),
+}
+
+async fn apply_live_toggle(
+    name: &str,
+    enabled: Option<bool>,
+    url_override: Option<&str>,
+    token_override: Option<&str>,
+    config_path: Option<&Path>,
+    db: Option<&McpDbContext>,
+) -> anyhow::Result<LiveToggleResult> {
+    let config = match Config::from_env_with_toml(config_path).await {
+        Ok(config) => Some(config),
+        Err(error) if config_path.is_some() => return Err(anyhow::anyhow!("{error:#}")),
+        Err(_) => None,
+    };
+    let gateway = config
+        .as_ref()
+        .and_then(|config| config.channels.gateway.as_ref());
+    let base_url = url_override
+        .map(str::to_string)
+        .or_else(|| gateway.map(|gateway| format!("http://{}:{}", gateway.host, gateway.port)))
+        .unwrap_or_else(|| {
+            let host = std::env::var("GATEWAY_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+            let port = std::env::var("GATEWAY_PORT").unwrap_or_else(|_| "3000".to_string());
+            format!("http://{host}:{port}")
+        });
+    let persisted_token = if let Some(db) = db {
+        db.store
+            .get_setting(&db.owner_id, "channels.gateway_auth_token")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| value.as_str().map(str::to_string))
+    } else {
+        None
+    };
+    let token = if url_override.is_some() {
+        token_override.map(str::to_string)
+    } else {
+        token_override
+            .map(str::to_string)
+            .or_else(|| gateway.and_then(|gateway| gateway.auth_token.clone()))
+            .or_else(|| std::env::var("GATEWAY_AUTH_TOKEN").ok())
+            .or(persisted_token)
+    };
+    let Some(token) = token.filter(|token| !token.trim().is_empty()) else {
+        return Ok(LiveToggleResult::Unavailable(
+            "no gateway auth token was provided".to_string(),
+        ));
+    };
+
+    let action = match enabled {
+        Some(true) => "activate",
+        Some(false) => "deactivate",
+        None => "toggle",
+    };
+    let mut endpoint = url::Url::parse(base_url.trim_end_matches('/'))
+        .map_err(|error| anyhow::anyhow!("Invalid gateway URL '{base_url}': {error}"))?;
+    endpoint
+        .path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Gateway URL cannot be used as a base URL"))?
+        .pop_if_empty()
+        .extend(["api", "extensions", name, action]);
+    let response = match reqwest::Client::new()
+        .post(endpoint.clone())
+        .bearer_auth(token.trim())
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(LiveToggleResult::Unavailable(format!(
+                "could not connect to {endpoint}: {error}"
+            )));
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND
+        || response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
+    {
+        return Ok(LiveToggleResult::Unavailable(format!(
+            "gateway does not support live MCP {action}"
+        )));
+    }
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "Gateway returned HTTP {}: {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        );
+    }
+    let payload: serde_json::Value = response.json().await?;
+    let message = payload
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("MCP lifecycle updated")
+        .to_string();
+    if payload.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
+        anyhow::bail!("Gateway rejected MCP lifecycle change: {message}");
+    }
+    Ok(LiveToggleResult::Applied(message))
+}
+
+struct McpDbContext {
+    store: Arc<dyn Database>,
+    owner_id: String,
+}
 
 /// Try to connect to the database (backend-agnostic).
-async fn connect_db() -> Option<Arc<dyn Database>> {
-    let config = Config::from_env().await.ok()?;
-    crate::db::connect_from_config(&config.database).await.ok()
+async fn connect_db(
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<Option<McpDbContext>> {
+    if no_db {
+        return Ok(None);
+    }
+    let config = Config::from_env_with_toml(config_path)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+    let owner_id = config.owner_id.clone();
+    let store = crate::db::connect_from_config(&config.database)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+    Ok(Some(McpDbContext { store, owner_id }))
 }
 
 /// Load MCP servers (DB if available, else disk).
-async fn load_servers(db: Option<&dyn Database>) -> Result<McpServersFile, config::ConfigError> {
+async fn load_servers(db: Option<&McpDbContext>) -> Result<McpServersFile, config::ConfigError> {
     if let Some(db) = db {
-        config::load_mcp_servers_from_db(db, DEFAULT_USER_ID).await
+        config::load_mcp_servers_from_db_or_migrate(db.store.as_ref(), &db.owner_id).await
     } else {
         config::load_mcp_servers().await
     }
 }
 
-/// Save MCP servers (DB if available, else disk).
-async fn save_servers(
-    db: Option<&dyn Database>,
-    servers: &McpServersFile,
-) -> Result<(), config::ConfigError> {
-    if let Some(db) = db {
-        config::save_mcp_servers_to_db(db, DEFAULT_USER_ID, servers).await
-    } else {
-        config::save_mcp_servers(servers).await
-    }
-}
-
-/// Persist an MCP server configuration using the CLI's database-or-disk rules.
-pub(super) async fn persist_server(config: McpServerConfig, overwrite: bool) -> anyhow::Result<()> {
+pub(super) async fn persist_server_with_path(
+    config: McpServerConfig,
+    overwrite: bool,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
     config.validate()?;
 
-    let db = connect_db().await;
-    let mut servers = load_servers(db.as_deref()).await?;
-    if !overwrite && servers.get(&config.name).is_some() {
-        anyhow::bail!(
-            "MCP server '{}' is already configured. Use --force to overwrite.",
-            config.name
-        );
+    let db = connect_db(config_path, no_db).await?;
+    if let Some(db) = db.as_ref() {
+        config::load_mcp_servers_from_db_or_migrate(db.store.as_ref(), &db.owner_id).await?;
+        config::persist_mcp_server_db(db.store.as_ref(), &db.owner_id, config, overwrite).await?;
+    } else {
+        config::persist_mcp_server(config, overwrite).await?;
     }
-    servers.upsert(config);
-    save_servers(db.as_deref(), &servers).await?;
     Ok(())
 }
 
@@ -668,6 +881,194 @@ mod tests {
         }
 
         TestCli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_mcp_toggle_live_control_flags_parse() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "toggle",
+            "local-files",
+            "--disable",
+            "--url",
+            "http://127.0.0.1:3000",
+            "--token",
+            "test-token",
+        ])
+        .expect("parse live toggle flags");
+        match parsed.cmd {
+            McpCommand::Toggle {
+                name,
+                disable,
+                url,
+                token,
+                offline,
+                ..
+            } => {
+                assert_eq!(name, "local-files");
+                assert!(disable);
+                assert_eq!(url.as_deref(), Some("http://127.0.0.1:3000"));
+                assert_eq!(token.as_deref(), Some("test-token"));
+                assert!(!offline);
+            }
+            other => panic!("expected toggle command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_live_mcp_toggle_calls_authenticated_gateway() {
+        use axum::extract::Path as AxumPath;
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        async fn deactivate(
+            AxumPath(name): AxumPath<String>,
+            headers: HeaderMap,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(name, "local-files");
+            assert_eq!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer test-token")
+            );
+            Json(serde_json::json!({
+                "success": true,
+                "message": "deactivated live"
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test gateway");
+        let address = listener.local_addr().expect("gateway address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/api/extensions/{name}/deactivate", post(deactivate)),
+            )
+            .await
+        });
+
+        let result = apply_live_toggle(
+            "local-files",
+            Some(false),
+            Some(&format!("http://{address}")),
+            Some("test-token"),
+            None,
+            None,
+        )
+        .await
+        .expect("live toggle");
+        match result {
+            LiveToggleResult::Applied(message) => assert_eq!(message, "deactivated live"),
+            LiveToggleResult::Unavailable(reason) => {
+                panic!("test gateway unexpectedly unavailable: {reason}")
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_apply_live_implicit_toggle_uses_atomic_gateway_route() {
+        use axum::{Json, Router, routing::post};
+
+        async fn toggle() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "success": true,
+                "message": "toggled live"
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test gateway");
+        let address = listener.local_addr().expect("gateway address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/api/extensions/local-files/toggle", post(toggle)),
+            )
+            .await
+        });
+
+        let result = apply_live_toggle(
+            "local-files",
+            None,
+            Some(&format!("http://{address}")),
+            Some("test-token"),
+            None,
+            None,
+        )
+        .await
+        .expect("live implicit toggle");
+        match result {
+            LiveToggleResult::Applied(message) => assert_eq!(message, "toggled live"),
+            LiveToggleResult::Unavailable(reason) => {
+                panic!("test gateway unexpectedly unavailable: {reason}")
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_custom_gateway_url_never_reuses_stored_token() {
+        let result = apply_live_toggle(
+            "local-files",
+            Some(false),
+            Some("http://127.0.0.1:9"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("missing explicit token is an offline fallback");
+        match result {
+            LiveToggleResult::Unavailable(reason) => {
+                assert!(reason.contains("no gateway auth token"));
+            }
+            LiveToggleResult::Applied(message) => {
+                panic!("unexpected live transition: {message}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_old_gateway_route_returns_offline_fallback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind old gateway fixture");
+        let address = listener.local_addr().expect("gateway address");
+        let server = tokio::spawn(async move { axum::serve(listener, axum::Router::new()).await });
+
+        let result = apply_live_toggle(
+            "local-files",
+            Some(false),
+            Some(&format!("http://{address}")),
+            Some("test-token"),
+            None,
+            None,
+        )
+        .await
+        .expect("404 is an offline fallback");
+        match result {
+            LiveToggleResult::Unavailable(reason) => {
+                assert!(reason.contains("does not support"));
+            }
+            LiveToggleResult::Applied(message) => {
+                panic!("unexpected live transition: {message}")
+            }
+        }
+        server.abort();
     }
 
     #[test]

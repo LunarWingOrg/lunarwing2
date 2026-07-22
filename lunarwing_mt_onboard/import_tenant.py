@@ -14,10 +14,14 @@ import json
 import os
 import shutil
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from lunarwing_mt_onboard.config import TenantConfig
+from lunarwing_mt_onboard.kawarimi_secret import (
+    passphrase_transport,
+    validate_passphrase,
+)
 from lunarwing_mt_onboard.provisioner import ProvisionResult, run_command
 
 IMPORT_SCRIPT = os.environ.get(
@@ -51,17 +55,21 @@ class ImportConfig:
     with_toolchains: bool = False
     with_vision: bool = False
     docker_group: bool = False
-    tensorzero_url: str = ""
     owner_scope: str = ""
     apply: bool = False
     force: bool = False
     auto_yes: bool = True
+    passphrase: str = field(default="", repr=False, compare=False)
 
     def validate(self) -> str | None:
         if not self.bundle.strip():
             return "bundle path is required"
         if self.name:
-            return TenantConfig.validate_name(self.name)
+            error = TenantConfig.validate_name(self.name)
+            if error:
+                return error
+        if self.passphrase:
+            return validate_passphrase(self.passphrase)
         return None
 
     def to_dict(self) -> dict[str, ImportValue]:
@@ -76,7 +84,6 @@ class ImportConfig:
             "with_toolchains": self.with_toolchains,
             "with_vision": self.with_vision,
             "docker_group": self.docker_group,
-            "tensorzero_url": self.tensorzero_url,
             "owner_scope": self.owner_scope,
             "apply": self.apply,
             "force": self.force,
@@ -102,7 +109,6 @@ class ImportConfig:
             with_toolchains=_bool_value(data.get("with_toolchains", False)),
             with_vision=_bool_value(data.get("with_vision", False)),
             docker_group=_bool_value(data.get("docker_group", False)),
-            tensorzero_url=_str_value(data.get("tensorzero_url", "")),
             owner_scope=_str_value(data.get("owner_scope", "")),
             apply=_bool_value(data.get("apply", False)),
             force=_bool_value(data.get("force", False)),
@@ -161,8 +167,6 @@ def build_import_args(cfg: ImportConfig) -> list[str]:
         args.append("--with-vision")
     if cfg.docker_group:
         args.append("--docker-group")
-    if cfg.tensorzero_url:
-        args.extend(["--tensorzero-url", cfg.tensorzero_url])
     if cfg.owner_scope:
         args.extend(["--owner-scope", cfg.owner_scope])
     if not cfg.apply:
@@ -180,11 +184,14 @@ def run_import(
     on_output: Callable[[str], None] | None = None,
 ) -> ProvisionResult:
     result = ProvisionResult()
-    import_result = run_command(
-        build_import_args(cfg),
-        on_output=on_output,
-        phase_name="import",
-    )
+    with passphrase_transport(cfg.passphrase) as secret:
+        import_result = run_command(
+            build_import_args(cfg),
+            env=secret.env,
+            pass_fds=secret.pass_fds,
+            on_output=on_output,
+            phase_name="import",
+        )
     result.phases.append(import_result)
     return result
 

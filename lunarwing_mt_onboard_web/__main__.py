@@ -7,6 +7,7 @@ then serves the app on 127.0.0.1.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import sys
 
@@ -45,6 +46,15 @@ def _banner(url: str, demo: bool, needs_sudo_warning: bool) -> None:
     sys.stdout.flush()
 
 
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="lunarwing_mt_onboard_web",
@@ -72,7 +82,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Disable the session token (NOT recommended).",
     )
+    parser.add_argument(
+        "--allow-insecure-remote",
+        action="store_true",
+        help="Allow real mode to bind outside loopback without TLS (DANGEROUS).",
+    )
     args = parser.parse_args(argv)
+
+    loopback = _is_loopback_host(args.host)
+    if not args.demo and not loopback and not args.allow_insecure_remote:
+        parser.error(
+            "real mode refuses a non-loopback bind without --allow-insecure-remote; "
+            "use an SSH tunnel instead"
+        )
 
     # Ensure the banner (with the URL + token) appears immediately even when
     # stdout is piped/redirected, not just on a TTY.
@@ -113,10 +135,10 @@ def main(argv: list[str] | None = None) -> int:
     is_root = hasattr(os, "geteuid") and os.geteuid() == 0
     _banner(url, args.demo, needs_sudo_warning=(not args.demo and not is_root))
 
-    if args.host not in ("127.0.0.1", "localhost", "::1"):
+    if not loopback:
         print(
-            "WARNING: binding a non-loopback host exposes tenant provisioning "
-            "to your network.",
+            "WARNING: insecure non-loopback bind exposes tenant provisioning "
+            "and submitted secrets to your network without TLS.",
             file=sys.stderr,
         )
 

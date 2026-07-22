@@ -44,7 +44,7 @@ case "$cmd" in
   build-tenant)
     echo "=== Building tenant: $name ==="
     echo "--- Building lunarwing binary (cargo) ---"
-    for c in near-agent lunarwing-core tensorzero-client secrets-store gateway xmpp-bridge; do
+    for c in lunarwing-agent lunarwing-core tensorzero-client secrets-store gateway xmpp-bridge; do
       echo "   Compiling $c v1.1.9"
       nap
     done
@@ -78,9 +78,30 @@ case "$cmd" in
     echo "--- Starting vision sidecar ---"; nap
     echo "--- Starting daemon service ---"; nap
     echo "started lunarwing-$name"; nap
-    echo "--- Starting workers ---"; nap
-    echo "started nanocode, pebble, opencode workers"; nap
+    echo "--- Starting selected workers from tenant registry ---"; nap
     echo "=== Tenant '$name' started ==="
+    ;;
+
+  upgrade-tenant)
+    target=""
+    no_backup="no"
+    skip_render="no"
+    previous=""
+    for arg in "$@"; do
+      if [ "$previous" = "--target" ]; then target="$arg"; previous=""; continue; fi
+      case "$arg" in
+        --no-backup) no_backup="yes" ;;
+        --skip-render) skip_render="yes" ;;
+      esac
+      previous="$arg"
+    done
+    echo "=== Upgrading tenant '$name' to ${target:-unknown} ==="
+    if [ "$no_backup" = "yes" ]; then echo "--- Skipping PostgreSQL backup ---"; else echo "--- Backing up PostgreSQL ---"; fi; nap
+    echo "--- Fetching and checking out target ref ---"; nap
+    echo "--- Rebuilding tenant and WASM extensions ---"; nap
+    if [ "$skip_render" = "yes" ]; then echo "--- Keeping existing init-system units ---"; else echo "--- Re-rendering init-system units ---"; fi; nap
+    echo "--- Restarting tenant through mt-admin lifecycle ---"; nap
+    echo "=== Tenant '$name' upgraded ==="
     ;;
 
   *)
