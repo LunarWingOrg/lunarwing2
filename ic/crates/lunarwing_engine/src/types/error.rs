@@ -84,6 +84,9 @@ pub enum ThreadError {
     #[error("thread already running: {0}")]
     AlreadyRunning(ThreadId),
 
+    #[error("thread is waiting for external input: {0}")]
+    Waiting(ThreadId),
+
     #[error("thread is in terminal state: {0}")]
     Terminal(ThreadState),
 

@@ -99,20 +99,41 @@ impl PendingGateStore {
         Self::new(None)
     }
 
-    /// Insert a pending gate. Fails if one already exists for (user, thread).
+    /// Insert a pending gate. Fails if a non-expired gate already exists for
+    /// `(user, thread)`; expired entries are replaced atomically in memory.
     pub async fn insert(&self, gate: PendingGate) -> Result<(), GateStoreError> {
         let key = gate.key();
         {
             let mut inner = self.inner.lock().await;
-            if inner.by_key.contains_key(&key) {
-                return Err(GateStoreError::AlreadyExists);
+            match inner
+                .by_key
+                .get(&key)
+                .map(|existing| (existing.request_id, existing.is_expired()))
+            {
+                Some((_, false)) => return Err(GateStoreError::AlreadyExists),
+                Some((expired_request_id, true)) => {
+                    inner.by_key.remove(&key);
+                    inner.by_request_id.remove(&expired_request_id);
+                }
+                None => {}
             }
             inner.by_request_id.insert(gate.request_id, key.clone());
-            inner.by_key.insert(key, gate.clone());
+            inner.by_key.insert(key.clone(), gate.clone());
         }
         // Persist after lock is released (async I/O outside lock)
-        if let Some(ref persistence) = self.persistence {
-            persistence.save(&gate).await?;
+        if let Some(ref persistence) = self.persistence
+            && let Err(error) = persistence.save(&gate).await
+        {
+            let mut inner = self.inner.lock().await;
+            if inner
+                .by_key
+                .get(&key)
+                .is_some_and(|stored| stored.request_id == gate.request_id)
+            {
+                inner.by_key.remove(&key);
+                inner.by_request_id.remove(&gate.request_id);
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -158,6 +179,12 @@ impl PendingGateStore {
                 let gate = inner.by_key.remove(key);
                 if let Some(ref g) = gate {
                     inner.by_request_id.remove(&g.request_id);
+                }
+                drop(inner);
+                if let Some(ref persistence) = self.persistence
+                    && let Err(e) = persistence.remove(key).await
+                {
+                    tracing::debug!(error = %e, "failed to remove expired gate from persistence");
                 }
                 return Err(GateStoreError::Expired);
             }
@@ -346,6 +373,59 @@ mod tests {
             store.insert(g2).await,
             Err(GateStoreError::AlreadyExists)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_insert_replaces_expired_gate_for_same_thread() {
+        let store = PendingGateStore::in_memory();
+        let tid = ThreadId::new();
+        let expired = sample_gate_with("user1", tid, "web", -1);
+        let replacement = sample_gate_with("user1", tid, "web", 300);
+        let replacement_id = replacement.request_id;
+
+        store.insert(expired).await.unwrap();
+        store.insert(replacement).await.unwrap();
+
+        let view = store
+            .peek(&PendingGateKey {
+                user_id: "user1".into(),
+                thread_id: tid,
+            })
+            .await
+            .expect("replacement gate should remain pending");
+        assert_eq!(view.request_id, replacement_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_failed_persistence_does_not_leave_gate_in_memory() {
+        struct FailingPersistence;
+
+        #[async_trait]
+        impl GatePersistence for FailingPersistence {
+            async fn save(&self, _gate: &PendingGate) -> Result<(), GateStoreError> {
+                Err(GateStoreError::Persistence {
+                    reason: "test failure".into(),
+                })
+            }
+
+            async fn remove(&self, _key: &PendingGateKey) -> Result<(), GateStoreError> {
+                Ok(())
+            }
+
+            async fn load_all(&self) -> Result<Vec<PendingGate>, GateStoreError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let store = PendingGateStore::new(Some(Arc::new(FailingPersistence)));
+        let gate = sample_gate("web");
+        let key = gate.key();
+
+        assert!(matches!(
+            store.insert(gate).await,
+            Err(GateStoreError::Persistence { .. })
+        ));
+        assert!(store.peek(&key).await.is_none());
     }
 
     // ── Request ID verification ──────────────────────────────

@@ -22,6 +22,7 @@ use crate::types::thread::{ThreadConfig, ThreadId, ThreadState, ThreadType};
 
 enum ActiveForeground {
     Running(ThreadId),
+    Waiting(ThreadId),
     Resumable(ThreadId),
 }
 
@@ -183,14 +184,12 @@ impl ConversationManager {
             });
         }
 
-        // Record the user entry
-        conv.add_entry(ConversationEntry::user(&user_message.content));
-
         // Check for an active foreground thread
         let active_foreground = self.find_active_foreground(conv).await;
 
         match active_foreground {
             Some(ActiveForeground::Running(thread_id)) => {
+                conv.add_entry(ConversationEntry::user(&user_message.content));
                 debug!(
                     conversation_id = %conversation_id,
                     thread_id = %thread_id,
@@ -202,7 +201,11 @@ impl ConversationManager {
                 self.store.save_conversation(conv).await?;
                 Ok(thread_id)
             }
+            Some(ActiveForeground::Waiting(thread_id)) => Err(EngineError::Thread(
+                crate::types::error::ThreadError::Waiting(thread_id),
+            )),
             Some(ActiveForeground::Resumable(thread_id)) => {
+                conv.add_entry(ConversationEntry::user(&user_message.content));
                 debug!(
                     conversation_id = %conversation_id,
                     thread_id = %thread_id,
@@ -219,6 +222,7 @@ impl ConversationManager {
                 Ok(thread_id)
             }
             None => {
+                conv.add_entry(ConversationEntry::user(&user_message.content));
                 // Build conversation history from prior entries for context continuity
                 let history = build_history_from_entries(&conv.entries);
 
@@ -375,9 +379,12 @@ impl ConversationManager {
             }
             if let Ok(Some(thread)) = self.store.load_thread(tid).await
                 && thread.thread_type == ThreadType::Foreground
-                && thread.state == ThreadState::Suspended
             {
-                return Some(ActiveForeground::Resumable(tid));
+                match thread.state {
+                    ThreadState::Waiting => return Some(ActiveForeground::Waiting(tid)),
+                    ThreadState::Suspended => return Some(ActiveForeground::Resumable(tid)),
+                    _ => {}
+                }
             }
         }
         None
@@ -784,6 +791,61 @@ mod tests {
             .find(|message| message.content == "continue from there")
             .expect("resumed message should be retained");
         assert_eq!(resumed_message.transient_content_parts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_message_rejects_waiting_thread_without_overwrite() {
+        let (tm, cm) = make_conv_manager();
+        let conv_id = cm.get_or_create_conversation("web", "user1").await.unwrap();
+        let project = ProjectId::new();
+        let mut waiting = crate::types::thread::Thread::new(
+            "original request",
+            ThreadType::Foreground,
+            project,
+            "user1",
+            ThreadConfig::default(),
+        );
+        waiting.transition_to(ThreadState::Running, None).unwrap();
+        waiting
+            .transition_to(ThreadState::Waiting, Some("approval required".into()))
+            .unwrap();
+        let thread_id = waiting.id;
+        cm.store.save_thread(&waiting).await.unwrap();
+        cm.conversations
+            .write()
+            .await
+            .get_mut(&conv_id)
+            .unwrap()
+            .track_thread(thread_id);
+
+        let result = cm
+            .handle_user_message(
+                conv_id,
+                "second message",
+                project,
+                "user1",
+                ThreadConfig::default(),
+                Some(thread_id),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::Thread(
+                crate::types::error::ThreadError::Waiting(id)
+            )) if id == thread_id
+        ));
+        assert!(!tm.is_running(thread_id).await);
+        let saved = cm.store.load_thread(thread_id).await.unwrap().unwrap();
+        assert_eq!(saved.state, ThreadState::Waiting);
+        assert_eq!(saved.goal, "original request");
+        assert!(
+            cm.get_conversation(conv_id)
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
     }
 
     #[tokio::test]
