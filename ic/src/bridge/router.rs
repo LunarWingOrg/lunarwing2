@@ -114,10 +114,10 @@ fn thread_outcome_response(outcome: &ThreadOutcome) -> Option<String> {
 
 /// Shorthand for building an `Error` from an engine-related failure.
 fn engine_err(context: &str, e: impl std::fmt::Display) -> Error {
-    Error::from(crate::error::JobError::ContextError {
-        id: uuid::Uuid::nil(),
-        reason: format!("engine v2 {context}: {e}"),
-    })
+    Error::Engine {
+        context: context.to_string(),
+        reason: e.to_string(),
+    }
 }
 
 /// Convert a local v1 `LoadedSkill` to an `lunarwing_skills::LoadedSkill` for migration.
@@ -220,11 +220,49 @@ async fn insert_and_notify_pending_gate(
 ) -> Result<Option<String>, Error> {
     let display_parameters = gate_display_parameters(&pending);
 
-    state
-        .pending_gates
-        .insert(pending.clone())
-        .await
-        .map_err(|e| engine_err("pending gate insert", e))?;
+    if let Err(error) = state.pending_gates.insert(pending.clone()).await {
+        let existing = state
+            .pending_gates
+            .list_for_user(&pending.user_id)
+            .await
+            .into_iter()
+            .find(|gate| gate.thread_id == pending.thread_id);
+        let existing_request_id = existing
+            .as_ref()
+            .map(|gate| gate.request_id.to_string())
+            .unwrap_or_else(|| "none".into());
+        let existing_gate = existing
+            .as_ref()
+            .map(|gate| gate.gate_name.as_str())
+            .unwrap_or("none");
+        let existing_action = existing
+            .as_ref()
+            .map(|gate| gate.action_name.as_str())
+            .unwrap_or("none");
+        let existing_created_at = existing
+            .as_ref()
+            .map(|gate| gate.created_at.to_rfc3339())
+            .unwrap_or_else(|| "none".into());
+        let existing_expires_at = existing
+            .as_ref()
+            .map(|gate| gate.expires_at.to_rfc3339())
+            .unwrap_or_else(|| "none".into());
+        tracing::warn!(
+            user_id = %pending.user_id,
+            thread_id = %pending.thread_id,
+            incoming_request_id = %pending.request_id,
+            incoming_gate = %pending.gate_name,
+            incoming_action = %pending.action_name,
+            %existing_request_id,
+            existing_gate,
+            existing_action,
+            %existing_created_at,
+            %existing_expires_at,
+            %error,
+            "engine v2: pending gate insert rejected"
+        );
+        return Err(engine_err("pending gate insert", error));
+    }
 
     // GateRequired is a structural engine-gate event with no `StatusUpdate`
     // equivalent, so it stays on the direct SSE path.
@@ -827,6 +865,26 @@ async fn fail_orphaned_waiting_thread_if_needed(
     Ok(true)
 }
 
+async fn fail_scoped_orphaned_waiting_threads_if_needed(
+    state: &EngineState,
+    message: &IncomingMessage,
+    thread_hint: Option<lunarwing_engine::ThreadId>,
+) -> Result<bool, Error> {
+    if let Some(thread_id) = thread_hint {
+        return fail_orphaned_waiting_thread_if_needed(state, &message.user_id, thread_id).await;
+    }
+
+    let Some(conversation) = find_engine_conversation_for_message(state, message).await else {
+        return Ok(false);
+    };
+    let mut failed_any = false;
+    for thread_id in conversation.active_threads {
+        failed_any |=
+            fail_orphaned_waiting_thread_if_needed(state, &message.user_id, thread_id).await?;
+    }
+    Ok(failed_any)
+}
+
 /// Get or initialize the engine state using the agent's dependencies.
 ///
 /// Called eagerly at startup (from `Agent::run()`) when `ENGINE_V2=true`,
@@ -1421,6 +1479,29 @@ async fn scoped_pending_gates(
             gate.conversation_id == conversation_id && gate_channel_matches(gate, &message.channel)
         })
         .collect()
+}
+
+async fn has_scoped_pending_gate(state: &EngineState, message: &IncomingMessage) -> bool {
+    if let Some(thread_id) = parse_engine_thread_id(message.conversation_scope()) {
+        let exact_match = state
+            .pending_gates
+            .list_for_user(&message.user_id)
+            .await
+            .into_iter()
+            .any(|gate| {
+                gate.thread_id == thread_id && gate_channel_matches(&gate, &message.channel)
+            });
+        if exact_match {
+            return true;
+        }
+    }
+
+    let Some(conversation) = find_engine_conversation_for_message(state, message).await else {
+        return false;
+    };
+    !scoped_pending_gates(state, message, conversation.id)
+        .await
+        .is_empty()
 }
 
 async fn discard_scoped_pending_gates(
@@ -2486,6 +2567,11 @@ async fn handle_with_engine_inner(
         .as_ref()
         .ok_or_else(|| engine_err("init", "engine state is empty"))?;
 
+    let expired_gates = state.pending_gates.expire_stale().await;
+    if expired_gates > 0 {
+        debug!(expired_gates, "engine v2: removed expired pending gates");
+    }
+
     debug!(
         user_id = %message.user_id,
         channel = %message.channel,
@@ -2518,9 +2604,14 @@ async fn handle_with_engine_inner(
         PendingGateResolution::None => {}
     }
 
-    if let Some(thread_id) = scoped_thread_id
-        && fail_orphaned_waiting_thread_if_needed(state, &message.user_id, thread_id).await?
-    {
+    if has_scoped_pending_gate(state, message).await {
+        return Ok(Some(
+            "This thread is waiting on a pending gate. Resolve it or use /interrupt before sending another message."
+                .into(),
+        ));
+    }
+
+    if fail_scoped_orphaned_waiting_threads_if_needed(state, message, scoped_thread_id).await? {
         return Ok(Some(
             "This thread was waiting on approval or authentication, but that pending state was lost. The thread has been marked failed; resend your request.".into(),
         ));
@@ -5885,6 +5976,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn engine_error_does_not_report_a_nil_job_id() {
+        let error = engine_err(
+            "pending gate insert",
+            crate::gate::store::GateStoreError::AlreadyExists,
+        );
+        assert_eq!(
+            error.to_string(),
+            "Engine V2 error during pending gate insert: a gate is already pending for this thread"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("00000000-0000-0000-0000-000000000000")
+        );
+    }
+
     #[tokio::test]
     async fn pending_gate_approval_returns_empty_and_sends_one_status() {
         use crate::testing::StubChannel;
@@ -6052,6 +6160,40 @@ mod tests {
             IncomingMessage::new("gateway", "alice", "yes").with_conversation_scope("thread-a");
         let matched = matching_engine_approval_gate(&state, &msg, None).await;
         assert_eq!(matched.map(|gate| gate.thread_id), Some(tid_a));
+    }
+
+    #[tokio::test]
+    async fn pending_gate_blocks_only_its_scoped_conversation() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-b", "alice")
+            .await
+            .unwrap();
+        state
+            .pending_gates
+            .insert(gate_in_conversation(
+                "alice",
+                "gateway",
+                conv_a,
+                lunarwing_engine::ResumeKind::Approval { allow_always: true },
+            ))
+            .await
+            .unwrap();
+
+        let message_a = IncomingMessage::new("gateway", "alice", "another request")
+            .with_conversation_scope("thread-a");
+        let message_b = IncomingMessage::new("gateway", "alice", "unrelated request")
+            .with_conversation_scope("thread-b");
+
+        assert!(has_scoped_pending_gate(&state, &message_a).await);
+        assert!(!has_scoped_pending_gate(&state, &message_b).await);
     }
 
     #[tokio::test]

@@ -28,6 +28,9 @@ pub enum Error {
     #[error("Job error: {0}")]
     Job(#[from] JobError),
 
+    #[error("Engine V2 error during {context}: {reason}")]
+    Engine { context: String, reason: String },
+
     #[error("Estimation error: {0}")]
     Estimation(#[from] EstimationError),
 
