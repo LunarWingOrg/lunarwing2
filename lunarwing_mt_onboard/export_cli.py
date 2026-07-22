@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 from dataclasses import dataclass
 
 from rich.console import Console
@@ -15,6 +16,7 @@ from lunarwing_mt_onboard.export import (
     ensure_export_script,
     run_export,
 )
+from lunarwing_mt_onboard.kawarimi_secret import validate_passphrase
 from lunarwing_mt_onboard.provisioner import ProvisionResult
 
 console = Console()
@@ -91,6 +93,20 @@ def _q_confirm(label: str, *, default: bool = False) -> bool:
         return raw in ("y", "yes")
 
 
+def _q_password(label: str) -> str:
+    try:
+        import questionary
+
+        result = questionary.password(label).ask()
+        if result is None:
+            raise KeyboardInterrupt
+        return str(result)
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        return getpass.getpass(f"{label}: ")
+
+
 def gather_export_config(config: ExportConfig) -> ExportConfig:
     console.print(
         Panel.fit(
@@ -130,6 +146,18 @@ def gather_export_config(config: ExportConfig) -> ExportConfig:
             "Skip auto-stop (--no-quiesce)? Only if you already stopped services.",
             default=config.no_quiesce,
         )
+        while True:
+            passphrase = _q_password("Encryption passphrase (at least 12 characters)")
+            error = validate_passphrase(passphrase, min_length=12)
+            if error:
+                console.print(f"[red]{error}[/]")
+                continue
+            confirmation = _q_password("Confirm encryption passphrase")
+            if passphrase != confirmation:
+                console.print("[red]Passphrases do not match.[/]")
+                continue
+            config.passphrase = passphrase
+            break
 
     return config
 
@@ -146,7 +174,7 @@ def _show_export_summary(config: ExportConfig) -> bool:
     table.add_row("No-quiesce", "yes" if config.no_quiesce else "no")
     table.add_row(
         "Mode",
-        "APPLY (will stop tenant)" if config.apply else "DRY-RUN",
+        "APPLY (encrypted; will stop tenant)" if config.apply else "DRY-RUN",
     )
     console.print(table)
     return _q_confirm("Proceed with export?", default=True)
@@ -221,10 +249,16 @@ def run_export_flow(args: ExportCliArgs) -> int:
 
     should_run = args.non_interactive or args.accept_defaults or _show_export_summary(config)
     if should_run:
-        result: ProvisionResult = run_export(
-            config,
-            on_output=lambda line: console.print(line, highlight=False),
-        )
+        try:
+            result: ProvisionResult = run_export(
+                config,
+                on_output=lambda line: console.print(line, highlight=False),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            console.print(f"[red]{exc}[/]")
+            return 1
+        finally:
+            config.passphrase = ""
         _display_export_results(result)
         if result.ok and config.apply:
             console.print(

@@ -78,8 +78,10 @@
       xmpp_enabled: false, xmpp_jid: '', xmpp_password: '', xmpp_allow_from: '',
       gotify_enabled: false, gotify_url: '', gotify_title: '',
       w_nanocode: false, w_pebble: false, w_opencode: false, toolchains: false,
-      tensorzero_url: 'http://192.168.1.157:3000/openai/v1',
+      llm_base_url: '',
       model_choice: 'lunarwing', model_custom: '',
+      nanocode_model: '', nanocode_base_url: '',
+      opencode_model: '', opencode_base_url: '',
       llm_api_key: '', secrets_master_key: '',
       ssh_harness: true, health_pipeline: true, weechat_bootstrap: true,
       skip_build: false, skip_start: false,
@@ -151,7 +153,7 @@
 
     function stepChannels(b) {
       b.appendChild(checkField(data, 'enable_darkirc', 'Enable DarkIRC services'));
-      b.appendChild(checkField(data, 'xmpp_enabled', 'Enable XMPP bridge', () => render()));
+      b.appendChild(checkField(data, 'xmpp_enabled', 'Customize XMPP identity', () => render()));
       if (data.xmpp_enabled) {
         const sub = h('div', { class: 'subgroup' });
         sub.appendChild(textField(data, 'xmpp_jid', 'XMPP JID', { placeholder: data.name + '@xmpp.localhost' }));
@@ -169,14 +171,34 @@
     }
 
     function stepWorkers(b) {
-      b.appendChild(checkField(data, 'w_nanocode', 'nanocode (NanoGPT)'));
+      b.appendChild(checkField(data, 'w_nanocode', 'nanocode (NanoGPT)', (checked) => {
+        if (!checked) { data.nanocode_model = ''; data.nanocode_base_url = ''; }
+        render();
+      }));
+      if (data.w_nanocode) {
+        const nanocode = h('div', { class: 'subgroup' });
+        nanocode.appendChild(textField(data, 'nanocode_model', 'Nanocode model override (optional)', {}));
+        nanocode.appendChild(textField(data, 'nanocode_base_url', 'Nanocode base URL override (optional)', {}));
+        b.appendChild(nanocode);
+      }
       b.appendChild(checkField(data, 'w_pebble', 'pebble (Rust harness)'));
-      b.appendChild(checkField(data, 'w_opencode', 'opencode (sst/opencode)'));
+      b.appendChild(checkField(data, 'w_opencode', 'opencode (sst/opencode)', (checked) => {
+        if (!checked) { data.opencode_model = ''; data.opencode_base_url = ''; }
+        render();
+      }));
+      if (data.w_opencode) {
+        const opencode = h('div', { class: 'subgroup' });
+        opencode.appendChild(textField(data, 'opencode_model', 'OpenCode model override (optional)', {}));
+        opencode.appendChild(textField(data, 'opencode_base_url', 'OpenCode base URL override (optional)', {}));
+        b.appendChild(opencode);
+      }
       b.appendChild(checkField(data, 'toolchains', 'Include Rust/Go/C++ toolchains (+~5GB image)'));
     }
 
     function stepLLM(b) {
-      b.appendChild(textField(data, 'tensorzero_url', 'TensorZero upstream URL', {}));
+      b.appendChild(textField(data, 'llm_base_url', 'Daemon LLM base URL override (optional)', {
+        hint: 'Leave blank to use the normal daemon default.',
+      }));
       b.appendChild(selectField(data, 'model_choice', 'LLM model', [
         { value: 'FrontierCODE', label: 'FrontierCODE' },
         { value: 'lunarwing', label: 'lunarwing' },
@@ -203,7 +225,7 @@
         ['Tenant', data.name || '(unset)'],
         ['Gateway host', data.gateway_host],
         ['DarkIRC', String(data.enable_darkirc)],
-        ['XMPP', data.xmpp_enabled ? (data.xmpp_jid || '(auto)') : 'disabled'],
+        ['XMPP identity', data.xmpp_enabled ? (data.xmpp_jid || '(custom auto)') : 'default tenant identity'],
         ['Gotify', data.gotify_enabled ? data.gotify_url : 'disabled'],
         ['Workers', workers.join(', ') || 'none'],
         ['Toolchains', String(data.toolchains)],
@@ -216,7 +238,10 @@
       rows.forEach((r) => { dl.appendChild(h('dt', {}, [r[0]])); dl.appendChild(h('dd', {}, [String(r[1])])); });
       b.appendChild(dl);
       const adv = h('div', { class: 'subgroup' });
-      adv.appendChild(checkField(data, 'skip_build', 'Advanced: skip build-tenant'));
+      adv.appendChild(checkField(data, 'skip_build', 'Advanced: skip build-tenant', (checked) => {
+        if (checked) data.skip_start = true;
+        render();
+      }));
       adv.appendChild(checkField(data, 'skip_start', 'Advanced: skip start-tenant'));
       b.appendChild(adv);
     }
@@ -243,8 +268,12 @@
         gotify_title: data.gotify_title.trim(),
         workers: workers,
         toolchains: data.toolchains,
-        tensorzero_url: data.tensorzero_url.trim(),
+        llm_base_url: data.llm_base_url.trim(),
         llm_model: model,
+        nanocode_model: data.nanocode_model.trim(),
+        nanocode_base_url: data.nanocode_base_url.trim(),
+        opencode_model: data.opencode_model.trim(),
+        opencode_base_url: data.opencode_base_url.trim(),
         llm_api_key: data.llm_api_key,
         secrets_master_key: data.secrets_master_key.trim(),
         no_ssh: !data.ssh_harness,
@@ -267,7 +296,13 @@
     btn.addEventListener('click', () => {
       const problem = buildPayload.validate ? buildPayload.validate(data) : null;
       if (problem) { err.textContent = problem; err.classList.remove('hidden'); return; }
-      opts.onRun(mode, buildPayload(data));
+      const payload = buildPayload(data);
+      opts.onRun(mode, payload);
+      (buildPayload.secretKeys || []).forEach((key) => {
+        data[key] = '';
+        if (Object.prototype.hasOwnProperty.call(payload, key)) payload[key] = '';
+      });
+      body.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ''; });
     });
     const wrap = h('div', { class: 'wizard glass' }, [
       h('div', { class: 'wizard-head' }, [h('h2', {}, [title]), h('span', { class: 'step-count' }, [subtitle || ''])]),
@@ -279,44 +314,42 @@
   }
 
   function mountUpgrade(host, opts) {
-    simpleForm(host, 'Upgrade a tenant', 'dry-run by default', (b, data) => {
-      Object.assign(data, { tenant: '', target: '', source_version_override: '', run_preflight: true, apply: false, force: false, auto_yes: false });
-      // Truthful warning: this form drives the v1-only version-tag upgrade
-      // script (upgrade-tenant-version.sh), which parses vX.Y.Z and defaults to
-      // v1.1.2. It CANNOT do a v2.0.0.0 -> v2.0.0.0 (or any v2) upgrade.
+    simpleForm(host, 'Upgrade a tenant', 'current mt-admin lifecycle', (b, data) => {
+      Object.assign(data, { tenant: '', target: '', source_repo: '', backup: true, render_units: true, apply: false });
       b.appendChild(h('div', { class: 'form-warn' }, [
-        h('strong', null, ['⚠ v1 upgrades only.']),
-        ' This drives ',
-        h('code', null, ['upgrade-tenant-version.sh']),
-        ' (v1 release tags; blank target = ',
-        h('code', null, ['v1.1.2']),
-        '). It does NOT support v2.0.0.0 → v2.0.0.0. For a v2 tenant, use the CLI instead: ',
-        h('code', null, ['sudo ic/scripts/lunarwing-mt-admin.sh upgrade-tenant <tenant> --target <ref>']),
-        '.',
+        h('strong', null, ['This operation applies immediately.']),
+        ' It backs up PostgreSQL, stops the tenant, fetches and checks out the target ref, rebuilds, renders units, and restarts through init-agnostic mt-admin.',
       ]));
       b.appendChild(textField(data, 'tenant', 'Tenant', { datalist: opts.tenants, placeholder: 'sphinx' }));
-      b.appendChild(textField(data, 'target', 'Target release tag (blank = script default)', { placeholder: 'v1.1.9' }));
-      b.appendChild(textField(data, 'source_version_override', 'Source version override (optional)', { placeholder: 'v1.1.7' }));
-      b.appendChild(checkField(data, 'run_preflight', 'Run preflight checks first'));
-      b.appendChild(checkField(data, 'apply', 'Apply changes (unchecked = dry-run)'));
-      b.appendChild(checkField(data, 'force', 'Force (continue after preflight failure)'));
-      b.appendChild(checkField(data, 'auto_yes', 'Assume yes to script prompts'));
+      b.appendChild(textField(data, 'target', 'Target branch, tag, or commit', { placeholder: 'v2.0.2.0' }));
+      b.appendChild(textField(data, 'source_repo', 'Source repository override (optional)', { placeholder: '/path/to/repo' }));
+      b.appendChild(checkField(data, 'backup', 'Create pre-upgrade PostgreSQL backup'));
+      b.appendChild(checkField(data, 'render_units', 'Re-render service units'));
+      b.appendChild(checkField(data, 'apply', 'I understand this will stop and modify the tenant'));
     }, 'Run upgrade', Object.assign(
-      (data) => ({ ...data, tenant: data.tenant.trim(), target: data.target.trim(), source_version_override: data.source_version_override.trim() }),
-      { validate: (d) => (d.tenant && d.tenant.trim() ? null : 'tenant is required') }
+      (data) => ({
+        tenant: data.tenant.trim(), target: data.target.trim(), source_repo: data.source_repo.trim(),
+        no_backup: !data.backup, skip_render: !data.render_units, apply: data.apply,
+      }),
+      { validate: (d) => (!d.tenant.trim() ? 'tenant is required' : !d.target.trim() ? 'target ref is required' : !d.apply ? 'confirm the upgrade before running' : null) }
     ), 'upgrade', opts);
   }
 
   function mountExport(host, opts) {
     simpleForm(host, 'Export a tenant', 'Kawarimi migration · dry-run by default', (b, data) => {
-      Object.assign(data, { tenant: '', out_dir: '/var/lib/lunarwing-migrate', apply: false, no_quiesce: false });
+      Object.assign(data, { tenant: '', out_dir: '/var/lib/lunarwing-migrate', apply: false, no_quiesce: false, passphrase: '', passphrase_confirm: '' });
       b.appendChild(textField(data, 'tenant', 'Tenant', { datalist: opts.tenants, placeholder: 'sphinx' }));
       b.appendChild(textField(data, 'out_dir', 'Output directory', {}));
       b.appendChild(checkField(data, 'apply', 'Apply (write bundle; unchecked = dry-run)'));
       b.appendChild(checkField(data, 'no_quiesce', 'Skip auto-stopping services (--no-quiesce)'));
+      b.appendChild(textField(data, 'passphrase', 'Encryption passphrase (required for apply)', { type: 'password', hint: 'At least 12 characters. Never written to config or audit logs.' }));
+      b.appendChild(textField(data, 'passphrase_confirm', 'Confirm encryption passphrase', { type: 'password' }));
     }, 'Run export', Object.assign(
       (data) => ({ ...data, tenant: data.tenant.trim(), out_dir: data.out_dir.trim() }),
-      { validate: (d) => (d.tenant && d.tenant.trim() ? null : 'tenant is required') }
+      {
+        validate: (d) => (!d.tenant.trim() ? 'tenant is required' : d.apply && d.passphrase.length < 12 ? 'passphrase must be at least 12 characters' : d.apply && d.passphrase !== d.passphrase_confirm ? 'passphrases do not match' : null),
+        secretKeys: ['passphrase', 'passphrase_confirm'],
+      }
     ), 'export', opts);
   }
 
@@ -326,9 +359,10 @@
         bundle: '', name: '', apply: false, start: false, old_stopped: false, force: false,
         with_opencode: false, with_toolchains: false, with_nanocode: false,
         with_pebble: false, with_vision: false, docker_group: false,
-        tensorzero_url: '', owner_scope: '',
+        owner_scope: '', passphrase: '',
       });
-      b.appendChild(textField(data, 'bundle', 'Migration bundle path', { placeholder: '/var/lib/lunarwing-migrate/tenant.tar' }));
+      b.appendChild(textField(data, 'bundle', 'Migration bundle path', { placeholder: '/var/lib/lunarwing-migrate/tenant-migrate-20260722.7z' }));
+      b.appendChild(textField(data, 'passphrase', 'Bundle passphrase (.7z only)', { type: 'password', hint: 'Required even for an encrypted dry-run because metadata must be decrypted.' }));
       b.appendChild(textField(data, 'name', 'Tenant name override (optional)', { placeholder: 'sphinx-new' }));
       b.appendChild(checkField(data, 'apply', 'Apply import (unchecked = dry-run)'));
       b.appendChild(checkField(data, 'start', 'Start restored tenant (--start)'));
@@ -342,17 +376,18 @@
       workers.appendChild(checkField(data, 'with_vision', 'Restore LunarVision'));
       workers.appendChild(checkField(data, 'docker_group', 'Add tenant user to docker/podman group'));
       b.appendChild(workers);
-      b.appendChild(textField(data, 'tensorzero_url', 'TensorZero upstream URL (optional)', {}));
       b.appendChild(textField(data, 'owner_scope', 'Legacy owner scope (optional)', {}));
     }, 'Run import', Object.assign(
       (data) => ({
         ...data,
         bundle: data.bundle.trim(),
         name: data.name.trim(),
-        tensorzero_url: data.tensorzero_url.trim(),
         owner_scope: data.owner_scope.trim(),
       }),
-      { validate: (d) => (!d.bundle.trim() ? 'bundle path is required' : d.name.trim() ? validateName(d.name.trim()) : null) }
+      {
+        validate: (d) => (!d.bundle.trim() ? 'bundle path is required' : d.start && !d.old_stopped ? 'confirm the old host is stopped before requesting start' : d.bundle.trim().toLowerCase().endsWith('.7z') && !d.passphrase ? 'bundle passphrase is required for .7z import' : d.name.trim() ? validateName(d.name.trim()) : null),
+        secretKeys: ['passphrase'],
+      }
     ), 'import', opts);
   }
 
@@ -365,7 +400,10 @@
       b.appendChild(textField(data, 'confirm', 'Confirm value', { type: 'password' }));
     }, 'Store secret', Object.assign(
       (data) => ({ tenant: data.tenant.trim(), name: data.name.trim(), value: data.value }),
-      { validate: (d) => (!d.tenant.trim() ? 'tenant is required' : !d.name.trim() ? 'secret name is required' : !d.value ? 'value is required' : d.value !== d.confirm ? 'values do not match' : null) }
+      {
+        validate: (d) => (!d.tenant.trim() ? 'tenant is required' : !d.name.trim() ? 'secret name is required' : !d.value ? 'value is required' : d.value !== d.confirm ? 'values do not match' : null),
+        secretKeys: ['value', 'confirm'],
+      }
     ), 'secrets', opts);
   }
 

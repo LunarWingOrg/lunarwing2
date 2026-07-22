@@ -51,6 +51,25 @@ def list_tenants() -> list[str]:
         return []
 
 
+def tenant_gateway_port(tenant: str) -> int:
+    """Return a tenant's allocated gateway port, or zero when unavailable."""
+    try:
+        with open(_PORTS_JSON) as ports_file:
+            data = json.load(ports_file)
+        port = data.get("tenants", {}).get(tenant, {}).get("ports", {}).get("gateway")
+        return int(port) if port else 0
+    except (FileNotFoundError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+        return 0
+
+
+def tenant_gateway_host(tenant: str) -> str:
+    """Return the tenant's configured gateway host, or the loopback default."""
+    try:
+        return parse_tenant_env(tenant).get("GATEWAY_HOST", "").strip() or "127.0.0.1"
+    except OSError:
+        return "127.0.0.1"
+
+
 def parse_tenant_env(tenant: str) -> dict[str, str]:
     """Parse /home/{tenant}/lunarwing/env/lunarwing.env into a dict."""
     path = f"/home/{tenant}/lunarwing/env/lunarwing.env"

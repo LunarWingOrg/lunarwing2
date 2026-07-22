@@ -8,17 +8,25 @@ the reused runners.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from lunarwing_mt_onboard.config import TenantConfig, WorkerType
 from lunarwing_mt_onboard.export import DEFAULT_OUT_DIR, ExportConfig
 from lunarwing_mt_onboard.import_tenant import ImportConfig
-from lunarwing_mt_onboard.upgrade import UpgradeConfig
+from lunarwing_mt_onboard.kawarimi_secret import validate_passphrase
+from lunarwing_mt_onboard.secrets import is_valid_master_key
+from lunarwing_mt_onboard.upgrade import TenantUpgradeConfig
 
 _VALID_WORKERS = {w.value for w in WorkerType}
 
 
-class ProvisionRequest(BaseModel):
+class RequestModel(BaseModel):
+    """Base request policy that keeps invalid input out of error strings."""
+
+    model_config = ConfigDict(hide_input_in_errors=True, extra="forbid")
+
+
+class ProvisionRequest(RequestModel):
     """New-tenant provisioning form (mirrors cli.gather_config)."""
 
     name: str = ""
@@ -34,8 +42,12 @@ class ProvisionRequest(BaseModel):
     gotify_title: str = ""
     workers: list[str] = Field(default_factory=list)
     toolchains: bool = False
-    tensorzero_url: str = "http://192.168.1.157:3000/openai/v1"
+    llm_base_url: str = ""
     llm_model: str = "tensorzero::function_name::lunarwing"
+    nanocode_model: str = ""
+    nanocode_base_url: str = ""
+    opencode_model: str = ""
+    opencode_base_url: str = ""
     llm_api_key: str = ""
     secrets_master_key: str = ""
     no_ssh: bool = False
@@ -44,8 +56,20 @@ class ProvisionRequest(BaseModel):
     skip_build: bool = False
     skip_start: bool = False
 
+    @model_validator(mode="after")
+    def validate_request(self) -> "ProvisionRequest":
+        master_key = self.secrets_master_key.strip()
+        if master_key and not is_valid_master_key(master_key):
+            raise ValueError("secrets master key must be exactly 64 hexadecimal characters")
+        if self.skip_build and not self.skip_start:
+            raise ValueError("skip start-tenant when build-tenant is skipped")
+        unknown_workers = sorted(set(self.workers) - _VALID_WORKERS)
+        if unknown_workers:
+            raise ValueError(f"unknown workers: {', '.join(unknown_workers)}")
+        return self
+
     def to_tenant_config(self) -> TenantConfig:
-        workers = [WorkerType(w) for w in self.workers if w in _VALID_WORKERS]
+        workers = [WorkerType(w) for w in self.workers]
         return TenantConfig(
             name=self.name.strip(),
             gateway_host=self.gateway_host.strip() or "127.0.0.1",
@@ -60,8 +84,28 @@ class ProvisionRequest(BaseModel):
             gotify_title=self.gotify_title.strip(),
             workers=workers,
             toolchains=self.toolchains,
-            tensorzero_url=self.tensorzero_url.strip(),
+            llm_base_url=self.llm_base_url.strip(),
             llm_model=self.llm_model.strip(),
+            nanocode_model=(
+                self.nanocode_model.strip()
+                if WorkerType.NANOCODE in workers
+                else ""
+            ),
+            nanocode_base_url=(
+                self.nanocode_base_url.strip()
+                if WorkerType.NANOCODE in workers
+                else ""
+            ),
+            opencode_model=(
+                self.opencode_model.strip()
+                if WorkerType.OPENCODE in workers
+                else ""
+            ),
+            opencode_base_url=(
+                self.opencode_base_url.strip()
+                if WorkerType.OPENCODE in workers
+                else ""
+            ),
             llm_api_key=self.llm_api_key,
             secrets_master_key=self.secrets_master_key.strip(),
             no_ssh=self.no_ssh,
@@ -70,36 +114,62 @@ class ProvisionRequest(BaseModel):
         )
 
 
-class UpgradeRequest(BaseModel):
-    """In-place tenant upgrade form (mirrors upgrade_cli)."""
+class UpgradeRequest(RequestModel):
+    """Current init-agnostic in-place tenant upgrade form."""
 
     tenant: str = ""
     target: str = ""
+    source_repo: str = ""
+    no_backup: bool = False
+    skip_render: bool = False
     apply: bool = False
-    auto_yes: bool = False
-    force: bool = False
-    source_version_override: str = ""
-    run_preflight: bool = True
 
-    def to_upgrade_config(self) -> UpgradeConfig:
-        return UpgradeConfig(
+    @model_validator(mode="after")
+    def validate_request(self) -> "UpgradeRequest":
+        config = self.to_upgrade_config()
+        error = config.validate()
+        if error:
+            raise ValueError(error)
+        if not self.apply:
+            raise ValueError("explicit upgrade confirmation is required")
+        return self
+
+    def to_upgrade_config(self) -> TenantUpgradeConfig:
+        return TenantUpgradeConfig(
             tenant=self.tenant.strip(),
             target=self.target.strip(),
+            source_repo=self.source_repo.strip(),
+            no_backup=self.no_backup,
+            skip_render=self.skip_render,
             apply=self.apply,
-            auto_yes=self.auto_yes,
-            force=self.force,
-            source_version_override=self.source_version_override.strip(),
-            run_preflight=self.run_preflight,
         )
 
 
-class ExportRequest(BaseModel):
+class ExportRequest(RequestModel):
     """Kawarimi export form (mirrors export_cli)."""
 
     tenant: str = ""
     out_dir: str = DEFAULT_OUT_DIR
     apply: bool = False
     no_quiesce: bool = False
+    passphrase: SecretStr = Field(
+        default_factory=lambda: SecretStr(""), exclude=True, repr=False
+    )
+    passphrase_confirm: SecretStr = Field(
+        default_factory=lambda: SecretStr(""), exclude=True, repr=False
+    )
+
+    @model_validator(mode="after")
+    def validate_passphrase(self) -> "ExportRequest":
+        passphrase = self.passphrase.get_secret_value()
+        confirmation = self.passphrase_confirm.get_secret_value()
+        if self.apply:
+            error = validate_passphrase(passphrase, min_length=12)
+            if error:
+                raise ValueError(error)
+            if passphrase != confirmation:
+                raise ValueError("passphrase confirmation does not match")
+        return self
 
     def to_export_config(self) -> ExportConfig:
         return ExportConfig(
@@ -107,10 +177,11 @@ class ExportRequest(BaseModel):
             out_dir=self.out_dir.strip() or DEFAULT_OUT_DIR,
             apply=self.apply,
             no_quiesce=self.no_quiesce,
+            passphrase=self.passphrase.get_secret_value(),
         )
 
 
-class ImportRequest(BaseModel):
+class ImportRequest(RequestModel):
     """Kawarimi import form."""
 
     bundle: str = ""
@@ -123,10 +194,24 @@ class ImportRequest(BaseModel):
     with_toolchains: bool = False
     with_vision: bool = False
     docker_group: bool = False
-    tensorzero_url: str = ""
     owner_scope: str = ""
     apply: bool = False
     force: bool = False
+    passphrase: SecretStr = Field(
+        default_factory=lambda: SecretStr(""), exclude=True, repr=False
+    )
+
+    @model_validator(mode="after")
+    def validate_passphrase(self) -> "ImportRequest":
+        if self.start and not self.old_stopped:
+            raise ValueError(
+                "starting an imported tenant requires confirmation that the old host is stopped"
+            )
+        if self.bundle.strip().lower().endswith(".7z"):
+            error = validate_passphrase(self.passphrase.get_secret_value())
+            if error:
+                raise ValueError(error)
+        return self
 
     def to_import_config(self) -> ImportConfig:
         return ImportConfig(
@@ -140,15 +225,15 @@ class ImportRequest(BaseModel):
             with_toolchains=self.with_toolchains,
             with_vision=self.with_vision,
             docker_group=self.docker_group,
-            tensorzero_url=self.tensorzero_url.strip(),
             owner_scope=self.owner_scope.strip(),
             apply=self.apply,
             force=self.force,
             auto_yes=True,
+            passphrase=self.passphrase.get_secret_value(),
         )
 
 
-class SecretRequest(BaseModel):
+class SecretRequest(RequestModel):
     """A single secret to insert into a tenant's encrypted store."""
 
     tenant: str = ""

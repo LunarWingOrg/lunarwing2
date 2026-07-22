@@ -123,16 +123,20 @@ def _add_provision_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_upgrade_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tenant", help="Existing tenant name to upgrade.")
-    parser.add_argument("--target", default="", help="Target release tag, e.g. v1.1.9.")
+    parser.add_argument("--target", default="", help="Target branch, tag, or commit.")
     parser.add_argument(
-        "--source-version-override",
+        "--source-repo",
         default="",
-        help="Override detected source release tag, e.g. v1.1.7.",
+        help="Point the tenant's git origin at this repository before upgrading.",
     )
-    parser.add_argument("--apply", action="store_true", help="Apply changes; default is dry-run.")
-    parser.add_argument("--yes", action="store_true", help="Forward --yes to the upgrade script.")
-    parser.add_argument("--force", action="store_true", help="Continue after preflight failure.")
-    parser.add_argument("--no-preflight", action="store_true", help="Skip upgrade preflight.")
+    parser.add_argument("--no-backup", action="store_true", help="Skip the PostgreSQL backup.")
+    parser.add_argument("--skip-render", action="store_true", help="Keep existing service units.")
+    parser.add_argument("--apply", action="store_true", help="Explicitly apply the upgrade.")
+    parser.add_argument("--yes", action="store_true", help="Skip the final summary confirmation.")
+    parser.add_argument("--non-interactive", action="store_true")
+    parser.add_argument("--accept-defaults", action="store_true")
+    parser.add_argument("--resume", metavar="FILE")
+    parser.add_argument("--save", metavar="FILE")
 
 
 def _add_export_args(parser: argparse.ArgumentParser) -> None:
@@ -331,7 +335,7 @@ def _configure_channels(config: TenantConfig) -> None:
         "Enable DarkIRC services?", default=config.enable_darkirc
     )
 
-    config.xmpp_enabled = _q_confirm("Enable XMPP bridge?")
+    config.xmpp_enabled = _q_confirm("Customize the default XMPP identity?")
     if config.xmpp_enabled:
         default_xmpp_domain = "xmpp.localhost"
         if "@" in config.xmpp_jid:
@@ -373,12 +377,28 @@ def _configure_workers(config: TenantConfig) -> None:
             "Include Rust/Go/C++ toolchains in workers? (increases image size ~5GB)",
             default=config.toolchains,
         )
+    if WorkerType.NANOCODE in config.workers:
+        config.nanocode_model = _q_text(
+            "Nanocode model override (optional)", default=config.nanocode_model
+        )
+        config.nanocode_base_url = _q_text(
+            "Nanocode base URL override (optional)",
+            default=config.nanocode_base_url,
+        )
+    if WorkerType.OPENCODE in config.workers:
+        config.opencode_model = _q_text(
+            "OpenCode model override (optional)", default=config.opencode_model
+        )
+        config.opencode_base_url = _q_text(
+            "OpenCode base URL override (optional)",
+            default=config.opencode_base_url,
+        )
 
 
 def _configure_llm(config: TenantConfig) -> None:
-    config.tensorzero_url = _q_text(
-        "TensorZero upstream URL",
-        default=config.tensorzero_url,
+    config.llm_base_url = _q_text(
+        "Daemon LLM base URL override (optional)",
+        default=config.llm_base_url,
     )
     idx = _q_select(
         "LLM model",
@@ -434,7 +454,7 @@ def _show_summary(config: TenantConfig) -> bool:
     table.add_row("Docker group", str(config.docker_group))
     table.add_row(
         "XMPP bridge",
-        config.xmpp_jid if config.xmpp_enabled else "disabled",
+        config.xmpp_jid if config.xmpp_enabled else "default tenant identity",
     )
     table.add_row(
         "Gotify",
@@ -445,7 +465,7 @@ def _show_summary(config: TenantConfig) -> bool:
         ", ".join(WORKER_LABELS[w] for w in config.workers) or "none",
     )
     table.add_row("Toolchains", str(config.toolchains))
-    table.add_row("TensorZero URL", config.tensorzero_url)
+    table.add_row("Daemon LLM base URL", config.llm_base_url or "automatic")
     table.add_row("LLM model", config.llm_model)
     table.add_row(
         "Secrets master key",

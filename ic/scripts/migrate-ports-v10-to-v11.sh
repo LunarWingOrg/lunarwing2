@@ -34,6 +34,8 @@ command -v jq >/dev/null 2>&1 || {
   exit 1
 }
 
+exec 199<"$(dirname "$PORTS_REGISTRY")"
+flock -x 199
 current_version="$(jq -r '.version // 0' "$PORTS_REGISTRY")"
 
 if [[ "$current_version" -ge 11 ]]; then

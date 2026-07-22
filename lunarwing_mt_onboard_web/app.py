@@ -9,12 +9,13 @@ from pathlib import Path
 
 import re
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__, runner
-from .jobs import JobManager
+from .jobs import JobConflictError, JobManager
 from .models import (
     ExportRequest,
     ImportRequest,
@@ -35,11 +36,31 @@ def create_app(*, token: str, demo: bool, log_dir: str | None) -> FastAPI:
     manager = JobManager(demo=demo, log_dir=log_dir)
     app.state.token = token
 
+    @app.exception_handler(RequestValidationError)
+    async def safe_validation_error(
+        _request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        detail = [
+            {
+                "type": error.get("type", "value_error"),
+                "loc": error.get("loc", ()),
+                "msg": error.get("msg", "invalid request"),
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": detail})
+
     def check(provided: str) -> None:
         if not token_matches(token, provided):
             raise HTTPException(
                 status_code=401, detail="invalid or missing session token"
             )
+
+    def create_job(mode: str):
+        try:
+            return manager.create(mode)
+        except JobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     # -- static shell -------------------------------------------------------
     _ASSET_RE = re.compile(r'(href|src)="(/static/[^"?]+)"')
@@ -94,35 +115,35 @@ def create_app(*, token: str, demo: bool, log_dir: str | None) -> FastAPI:
     @app.post("/api/provision")
     async def start_provision(req: ProvisionRequest, token: str = Query("")) -> dict:
         check(token)
-        job = manager.create("provision")
+        job = create_job("provision")
         manager.start(job, lambda j: runner.run_provision_job(j, req, log_dir=log_dir))
         return {"job_id": job.id}
 
     @app.post("/api/upgrade")
     async def start_upgrade(req: UpgradeRequest, token: str = Query("")) -> dict:
         check(token)
-        job = manager.create("upgrade")
+        job = create_job("upgrade")
         manager.start(job, lambda j: runner.run_upgrade_job(j, req, log_dir=log_dir))
         return {"job_id": job.id}
 
     @app.post("/api/export")
     async def start_export(req: ExportRequest, token: str = Query("")) -> dict:
         check(token)
-        job = manager.create("export")
+        job = create_job("export")
         manager.start(job, lambda j: runner.run_export_job(j, req, log_dir=log_dir))
         return {"job_id": job.id}
 
     @app.post("/api/import")
     async def start_import(req: ImportRequest, token: str = Query("")) -> dict:
         check(token)
-        job = manager.create("import")
+        job = create_job("import")
         manager.start(job, lambda j: runner.run_import_job(j, req, log_dir=log_dir))
         return {"job_id": job.id}
 
     @app.post("/api/secrets")
     async def start_secret(req: SecretRequest, token: str = Query("")) -> dict:
         check(token)
-        job = manager.create("secrets")
+        job = create_job("secrets")
         manager.start(job, lambda j: runner.run_secret_job(j, req, log_dir=log_dir))
         return {"job_id": job.id}
 

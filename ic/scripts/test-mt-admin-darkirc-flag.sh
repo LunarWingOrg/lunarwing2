@@ -90,6 +90,50 @@ after_mtime="$(stat -c %Y "$PORTS_REGISTRY" 2>/dev/null || stat -f %m "$PORTS_RE
 assert_eq "idempotent: registry not rewritten"     "$after_mtime"          "$before_mtime"
 assert_eq "beta still enabled after idempotent call" "$(darkirc_flag beta)" "true"
 
+# 6. Separate mt-admin processes must serialize allocation against the same
+#    registry instead of selecting the same free block from stale snapshots.
+parallel_dir="$(mktemp -d -t mt-port-lock.XXXXXX)"
+bash -c 'source "$1"; PORTS_REGISTRY="$2"; ports_allocate gamma false' \
+  _ "$MT_ADMIN" "$PORTS_REGISTRY" >"$parallel_dir/gamma" &
+gamma_pid=$!
+bash -c 'source "$1"; PORTS_REGISTRY="$2"; ports_allocate delta false' \
+  _ "$MT_ADMIN" "$PORTS_REGISTRY" >"$parallel_dir/delta" &
+delta_pid=$!
+wait "$gamma_pid" "$delta_pid"
+gamma_base="$(<"$parallel_dir/gamma")"
+delta_base="$(<"$parallel_dir/delta")"
+rm -rf "$parallel_dir"
+parallel_result="duplicate"
+[[ "$gamma_base" != "$delta_base" ]] && parallel_result="distinct"
+assert_eq "parallel allocations receive distinct port blocks" "$parallel_result" "distinct"
+
+# 7. A v11 registry can still need the versionless v6.1 repair. That write must
+#    be protected even though the registry's numeric version is current.
+cat >"$PORTS_REGISTRY" <<'ENDJSON'
+{
+  "version": 11,
+  "range": { "start": 10000, "end": 19999 },
+  "block_size": 10,
+  "extended_range": { "start": 20000, "end": 29999 },
+  "extended_block_size": 10,
+  "tenants": {
+    "legacy": {
+      "extended_ports": { "reserved_0": 20000 }
+    }
+  }
+}
+ENDJSON
+LOCK_CALLS=0
+acquire_ports_lock() {
+  LOCK_CALLS=$((LOCK_CALLS + 1))
+  PORTS_LOCK_HELD="true"
+}
+release_ports_lock() { PORTS_LOCK_HELD="false"; }
+ports_registry_init 2>/dev/null
+assert_eq "v11 repair acquires registry lock" "$LOCK_CALLS" "1"
+assert_eq "v11 repair assigns darkirc adapter" \
+  "$(jq -r '.tenants.legacy.extended_ports.darkirc_adapter' "$PORTS_REGISTRY")" "20000"
+
 echo ""
 if [[ "$FAIL" -eq 0 ]]; then
   echo "RESULT: PASS ($PASS assertions)"

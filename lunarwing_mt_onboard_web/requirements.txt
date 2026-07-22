@@ -4,7 +4,9 @@
 fastapi>=0.110
 uvicorn>=0.29
 websockets>=12.0
-# pydantic is pulled in transitively by fastapi (>=2).
+pydantic>=2.0
+# Used by FastAPI's TestClient in web_tests.py.
+httpx>=0.27
 #
 # The parent `lunarwing_mt_onboard` package is imported directly and needs no
 # extra deps for the web backend. Real (non-demo) `secrets` mode additionally
