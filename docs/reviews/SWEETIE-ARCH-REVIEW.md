@@ -965,12 +965,13 @@ Plugin discovery scans active WASM tools, dev-loaded tools, and active WASM chan
 
 ### Build Script (`scripts/build-lunarwing.sh`)
 
-Specialized native build script for low-resource ARM hosts (especially Raspberry Pi 5):
-- Default parallelism intentionally low (Pi-safe).
-- Warns on tmpfs target dirs, low RAM, likely OOM conditions.
-- Kills stale `cargo`/`rustc` processes and clears stale lockfiles before building.
-- Supports optional WASM channel build with separate target dir.
-- Produces structured output with timing, artifact location, crate count.
+Unified native build script for Linux `aarch64` and `x86_64` hosts:
+- Selects 75% of the effective CPUs, capped by available memory; inherited cgroup CPU and memory limits are included.
+- Creates and canonicalizes the target directory, rejects paths resolving to `/`, warns on memory-backed filesystems and low disk space, and coordinates script invocations with a sidecar `flock`.
+- Never kills Cargo/Rust processes or removes Cargo lock files. Explicit `--clean` is protected against concurrent invocations of this helper by the same target lock.
+- Uses an argument-safe `cargo build --locked --bin lunarwing` invocation and supports release/debug profiles, unique logs, dry runs, and explicit job overrides.
+- Keeps `--wasm` only as a compatibility no-op because supported WASM artifacts use dedicated build paths.
+- Has a standalone mocked shell harness covering resource calculations, ancestor cgroup limits, injection rejection, root-path aliases, lock contention, paths with spaces, configured Cargo targets, and build-failure propagation.
 
 Confirms the project is **deployed on resource-constrained edge hardware**, not just dev workstations.
 
