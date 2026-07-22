@@ -112,10 +112,10 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
     </details>
 20. [ ] dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the branch: rarity/item-20-20260722-1501
 21. [x] update onboard ui to correspond with changes in codebase since v2.0.0.0 - surely some things have been broken at this point - in particular, kawarimi is likely broken now due to new 7z encryption
-22. [ ] update any architecture docs in docs/
-23. [ ] update any bugs docs in docs/bugs
-24. [ ] update any ops docs in docs/ops  
-25. [ ] update any proposals docs in docs/proposals
+22. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
+23. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+24. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
+25. [ ] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
 26. [ ] update docs/README.md
 27. [ ] update README.md at repo root
 28. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.2.0 explaining all relevant changes since v2.0.1.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.2.0.md and should be written to the ROOT of the repo
