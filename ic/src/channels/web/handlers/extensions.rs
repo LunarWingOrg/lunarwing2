@@ -61,6 +61,7 @@ pub async fn extensions_list_handler(
                 command: ext.command,
                 authenticated: ext.authenticated,
                 active: ext.active,
+                enabled: ext.enabled,
                 tools: ext.tools,
                 needs_setup: ext.needs_setup,
                 has_auth: ext.has_auth,
@@ -76,14 +77,14 @@ pub async fn extensions_list_handler(
 
 pub async fn extensions_tools_handler(
     State(state): State<Arc<GatewayState>>,
-    AuthenticatedUser(_user): AuthenticatedUser,
+    AuthenticatedUser(user): AuthenticatedUser,
 ) -> Result<Json<ToolListResponse>, (StatusCode, String)> {
     let registry = state.tool_registry.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Tool registry not available".to_string(),
     ))?;
 
-    let definitions = registry.tool_definitions().await;
+    let definitions = registry.tool_definitions_for_user(&user.user_id).await;
     let tools = definitions
         .into_iter()
         .map(|td| ToolInfo {

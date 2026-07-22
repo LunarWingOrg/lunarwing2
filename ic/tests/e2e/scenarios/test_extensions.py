@@ -44,6 +44,7 @@ _MCP_ACTIVE = {
     "description": "An active MCP server",
     "url": "http://localhost:3000",
     "active": True,
+    "enabled": True,
     "authenticated": False,
     "has_auth": False,
     "needs_setup": False,
@@ -52,7 +53,13 @@ _MCP_ACTIVE = {
     "activation_error": None,
 }
 
-_MCP_INACTIVE = {**_MCP_ACTIVE, "name": "test-mcp-inactive", "display_name": "Inactive MCP", "active": False}
+_MCP_INACTIVE = {
+    **_MCP_ACTIVE,
+    "name": "test-mcp-inactive",
+    "display_name": "Inactive MCP",
+    "active": False,
+    "enabled": False,
+}
 
 _WASM_CHANNEL = {
     "name": "test-channel",
@@ -231,7 +238,7 @@ async def test_installed_wasm_tool_authed_shows_reconfigure_btn(page):
 # ─── Group C: MCP server cards ────────────────────────────────────────────────
 
 async def test_installed_mcp_server_active(page):
-    """Active MCP server shows 'Active' label and no Activate button."""
+    """Active MCP server shows Active and Deactivate, but no Activate button."""
     await mock_ext_apis(page, installed=[_MCP_ACTIVE])
     await go_to_mcp(page)
 
@@ -239,6 +246,7 @@ async def test_installed_mcp_server_active(page):
     await card.wait_for(state="visible", timeout=5000)
     assert await card.locator(SEL["ext_active_label"]).count() == 1
     assert await card.locator(SEL["ext_activate_btn"]).count() == 0
+    assert await card.locator(SEL["ext_deactivate_btn"]).count() == 1
     assert await card.locator(SEL["ext_remove_btn"]).count() == 1
 
 
@@ -250,6 +258,8 @@ async def test_installed_mcp_server_inactive_shows_activate(page):
     card = page.locator(SEL["ext_card_mcp"]).first
     await card.wait_for(state="visible", timeout=5000)
     assert await card.locator(SEL["ext_activate_btn"]).count() == 1
+    assert await card.locator(SEL["ext_deactivate_btn"]).count() == 0
+    assert "Inactive" in await card.locator(SEL["ext_active_label"]).text_content()
 
 
 async def test_mcp_server_in_registry_not_installed(page):
@@ -277,6 +287,43 @@ async def test_mcp_server_installed_auth_dot(page):
     await card.wait_for(state="visible", timeout=5000)
     # Installed MCP in registry section should show auth dot
     assert await card.locator(SEL["ext_auth_dot_unauthed"]).count() == 1
+    assert await card.locator(SEL["ext_deactivate_btn"]).count() == 1
+
+
+async def test_mcp_deactivate_calls_api_and_refreshes_card(page):
+    """Deactivate preserves the card and replaces Deactivate with Activate."""
+    deactivate_called = []
+    await mock_ext_apis(page, installed=[_MCP_ACTIVE])
+
+    async def handle_deactivate(route):
+        deactivate_called.append(True)
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"success": True}),
+        )
+
+    await page.route("**/api/extensions/test-mcp/deactivate", handle_deactivate)
+    await go_to_mcp(page)
+
+    async def handle_inactive_list(route):
+        path = route.request.url.split("?")[0]
+        if path.endswith("/api/extensions"):
+            await route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"extensions": [{**_MCP_ACTIVE, "active": False, "enabled": False}]}),
+            )
+        else:
+            await route.continue_()
+
+    await page.route("**/api/extensions*", handle_inactive_list)
+    card = page.locator(SEL["ext_card_mcp"]).first
+    await card.locator(SEL["ext_deactivate_btn"]).click()
+
+    await wait_for_toast(page, "Deactivated MCP server test-mcp")
+    await card.locator(SEL["ext_activate_btn"]).wait_for(state="visible", timeout=8000)
+    assert deactivate_called, "Deactivate API was not called"
 
 
 # ─── Group D: WASM channel stepper states ─────────────────────────────────────

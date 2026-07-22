@@ -147,6 +147,23 @@ impl McpClient {
         })
     }
 
+    /// Create an unauthenticated HTTP client with shared session tracking.
+    pub(crate) fn new_with_config_and_session_manager(
+        config: McpServerConfig,
+        session_manager: Arc<McpSessionManager>,
+        user_id: impl Into<String>,
+    ) -> Result<Self, ToolError> {
+        let transport = Arc::new(
+            HttpMcpTransport::new(config.url.clone(), config.name.clone())
+                .with_session_manager(Arc::clone(&session_manager)),
+        );
+        let mut client = Self::new_with_config(config)?;
+        client.transport = transport;
+        client.session_manager = Some(session_manager);
+        client.user_id = user_id.into();
+        Ok(client)
+    }
+
     /// Create a new authenticated MCP client.
     ///
     /// Use this for hosted MCP servers that require OAuth authentication.
@@ -235,6 +252,32 @@ impl McpClient {
         self.session_manager.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn owner_user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    /// Shut down the transport and discard local session/cache state.
+    pub async fn shutdown(&self) -> Result<(), ToolError> {
+        let headers = match self.build_request_headers().await {
+            Ok(headers) => headers,
+            Err(error) => {
+                tracing::warn!(
+                    server = %self.server_name,
+                    error = %error,
+                    "Failed to resolve MCP shutdown headers; closing transport without them"
+                );
+                HashMap::new()
+            }
+        };
+        let result = self.transport.shutdown_with_headers(&headers).await;
+        if let Some(ref session_manager) = self.session_manager {
+            session_manager.terminate(&self.server_name).await;
+        }
+        self.clear_cache().await;
+        result
+    }
+
     /// Get the next request ID.
     fn next_request_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
@@ -283,6 +326,7 @@ impl McpClient {
         if let Some(ref session_manager) = self.session_manager
             && let Some(session_id) = session_manager.get_session_id(&self.server_name).await
         {
+            headers.retain(|key, _| !key.eq_ignore_ascii_case("mcp-session-id"));
             headers.insert("Mcp-Session-Id".to_string(), session_id);
         }
         Ok(headers)
@@ -584,11 +628,20 @@ impl Tool for McpToolWrapper {
         self.tool.input_schema.clone()
     }
 
+    fn owner_user_id(&self) -> Option<&str> {
+        Some(&self.client.user_id)
+    }
+
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
+        if ctx.user_id != self.client.user_id {
+            return Err(ToolError::NotAuthorized(
+                "MCP tool is owned by a different user".to_string(),
+            ));
+        }
         let start = std::time::Instant::now();
 
         // Strip top-level null values before forwarding — LLMs often emit
@@ -864,6 +917,7 @@ mod tests {
         supports_http: bool,
         responses: std::sync::Mutex<Vec<McpResponse>>,
         recorded_headers: std::sync::Mutex<Vec<HashMap<String, String>>>,
+        shutdown_called: std::sync::atomic::AtomicBool,
     }
 
     impl MockTransport {
@@ -872,10 +926,15 @@ mod tests {
                 supports_http,
                 responses: std::sync::Mutex::new(responses),
                 recorded_headers: std::sync::Mutex::new(Vec::new()),
+                shutdown_called: std::sync::atomic::AtomicBool::new(false),
             }
         }
         fn recorded_headers(&self) -> Vec<HashMap<String, String>> {
             self.recorded_headers.lock().unwrap().clone()
+        }
+
+        fn shutdown_called(&self) -> bool {
+            self.shutdown_called.load(Ordering::SeqCst)
         }
     }
 
@@ -896,6 +955,7 @@ mod tests {
             Ok(responses.remove(0))
         }
         async fn shutdown(&self) -> Result<(), ToolError> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
             Ok(())
         }
         fn supports_http_features(&self) -> bool {
@@ -1005,6 +1065,28 @@ mod tests {
         assert!(http_transport.supports_http_features());
         let mock_non_http = MockTransport::new(false, vec![]);
         assert!(!mock_non_http.supports_http_features());
+    }
+
+    #[tokio::test]
+    async fn test_client_shutdown_releases_transport_and_session() {
+        let transport = Arc::new(MockTransport::new(false, Vec::new()));
+        let sessions = Arc::new(McpSessionManager::new());
+        sessions
+            .get_or_create("test-shutdown", "stdio://test-shutdown")
+            .await;
+        let client = McpClient::new_with_transport(
+            "test-shutdown",
+            transport.clone(),
+            Some(Arc::clone(&sessions)),
+            None,
+            "default",
+            None,
+        );
+
+        client.shutdown().await.expect("client shutdown");
+
+        assert!(transport.shutdown_called());
+        assert!(sessions.active_servers().await.is_empty());
     }
 
     /// Regression test for issue #890: stdio clients must auto-initialize
@@ -1283,6 +1365,32 @@ mod tests {
         };
         let approval = wrapper.requires_approval(&serde_json::json!({}));
         assert_eq!(approval, ApprovalRequirement::Never);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_tool_wrapper_rejects_another_user() {
+        let transport = Arc::new(MockTransport::new(false, Vec::new()));
+        let client = Arc::new(McpClient::new_with_transport(
+            "owned-server",
+            transport,
+            None,
+            None,
+            "alice",
+            None,
+        ));
+        let wrapper = McpToolWrapper {
+            tool: make_test_mcp_tool(false),
+            prefixed_name: "owned-server_do_thing".to_string(),
+            client,
+        };
+        let context = JobContext::with_user("bob", "test", "test");
+
+        let error = wrapper
+            .execute(serde_json::json!({}), &context)
+            .await
+            .expect_err("another user must not invoke an owner's MCP client");
+
+        assert!(matches!(error, ToolError::NotAuthorized(_)));
     }
 
     // Regression test: empty/whitespace-only tokens must not produce a

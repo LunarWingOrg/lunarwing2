@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::channels::ChannelManager;
 use crate::channels::wasm::{
@@ -25,7 +25,6 @@ use crate::extensions::{
 use crate::hooks::HookRegistry;
 use crate::pairing::PairingStore;
 use crate::secrets::{CreateSecretParams, SecretsStore};
-use crate::tools::ToolRegistry;
 use crate::tools::mcp::McpClient;
 use crate::tools::mcp::auth::{
     authorize_mcp_server, canonical_resource_uri, discover_full_oauth_metadata,
@@ -34,6 +33,7 @@ use crate::tools::mcp::auth::{
 use crate::tools::mcp::config::McpServerConfig;
 use crate::tools::mcp::session::McpSessionManager;
 use crate::tools::wasm::{WasmToolLoader, WasmToolRuntime, discover_tools};
+use crate::tools::{Tool, ToolRegistry};
 
 /// Pending OAuth authorization state.
 struct PendingAuth {
@@ -92,6 +92,18 @@ struct ChannelRuntimeState {
     wasm_channel_owner_actor_ids: std::collections::HashMap<String, String>,
 }
 
+struct ActiveMcpServer {
+    owner_id: String,
+    client: Arc<McpClient>,
+    tools: Vec<Arc<dyn Tool>>,
+}
+
+#[derive(Default)]
+struct StoppedMcpRuntime {
+    tool_names: Vec<String>,
+    cleanup_warning: Option<String>,
+}
+
 /// Setup schema returned to web UI for extension configuration.
 pub struct ExtensionSetupSchema {
     pub secrets: Vec<crate::channels::web::types::SecretFieldInfo>,
@@ -147,8 +159,10 @@ pub struct ExtensionManager {
     // MCP infrastructure
     mcp_session_manager: Arc<McpSessionManager>,
     mcp_process_manager: Arc<crate::tools::mcp::process::McpProcessManager>,
-    /// Active MCP clients keyed by server name.
-    mcp_clients: RwLock<HashMap<String, Arc<McpClient>>>,
+    /// Serializes MCP runtime transitions for each server name.
+    mcp_lifecycle_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Active MCP clients and their exact registered tools, keyed by server name.
+    active_mcp_servers: RwLock<HashMap<String, ActiveMcpServer>>,
 
     // WASM tool infrastructure
     wasm_tool_runtime: Option<Arc<WasmToolRuntime>>,
@@ -162,7 +176,7 @@ pub struct ExtensionManager {
     secrets: Arc<dyn SecretsStore + Send + Sync>,
     tool_registry: Arc<ToolRegistry>,
     hooks: Option<Arc<HookRegistry>>,
-    pending_auth: RwLock<HashMap<String, PendingAuth>>,
+    pending_auth: RwLock<HashMap<(String, String), PendingAuth>>,
     /// Tunnel URL for webhook configuration and remote OAuth callbacks.
     tunnel_url: Option<String>,
     user_id: String,
@@ -274,7 +288,8 @@ impl ExtensionManager {
             discovery: OnlineDiscovery::new(),
             mcp_session_manager,
             mcp_process_manager,
-            mcp_clients: RwLock::new(HashMap::new()),
+            mcp_lifecycle_locks: Mutex::new(HashMap::new()),
+            active_mcp_servers: RwLock::new(HashMap::new()),
             wasm_tool_runtime,
             wasm_tools_dir,
             wasm_channels_dir,
@@ -510,6 +525,7 @@ impl ExtensionManager {
         &self,
         name: String,
         client: Arc<crate::tools::mcp::McpClient>,
+        tools: Vec<Arc<dyn Tool>>,
     ) {
         if name.is_empty() {
             tracing::warn!("inject_mcp_client called with empty name; ignoring");
@@ -523,7 +539,14 @@ impl ExtensionManager {
             );
             return;
         }
-        self.mcp_clients.write().await.insert(name, client);
+        self.active_mcp_servers.write().await.insert(
+            name,
+            ActiveMcpServer {
+                owner_id: self.user_id.clone(),
+                client,
+                tools,
+            },
+        );
     }
 
     /// Register channel names that were loaded at startup.
@@ -655,10 +678,10 @@ impl ExtensionManager {
         }
     }
 
-    async fn clear_pending_extension_auth(&self, name: &str) {
+    async fn clear_pending_extension_auth(&self, name: &str, user_id: &str) {
         {
             let mut pending = self.pending_auth.write().await;
-            if let Some(old) = pending.remove(name)
+            if let Some(old) = pending.remove(&(name.to_string(), user_id.to_string()))
                 && let Some(handle) = old.task_handle
             {
                 handle.abort();
@@ -666,7 +689,7 @@ impl ExtensionManager {
         }
 
         let mut flows = self.pending_oauth_flows.write().await;
-        flows.retain(|_, flow| flow.extension_name != name);
+        flows.retain(|_, flow| flow.extension_name != name || flow.user_id != user_id);
     }
 
     fn rewrite_oauth_state_param(
@@ -724,13 +747,14 @@ impl ExtensionManager {
             &hosted_state,
         );
 
+        let user_id = request.flow.user_id.clone();
         self.pending_oauth_flows
             .write()
             .await
             .insert(request.expected_state, request.flow);
 
         self.pending_auth.write().await.insert(
-            request.name.clone(),
+            (request.name.clone(), user_id),
             PendingAuth {
                 _name: request.name.clone(),
                 _kind: request.kind,
@@ -748,14 +772,34 @@ impl ExtensionManager {
     }
 
     /// Broadcast an extension status change to the web UI via SSE.
-    async fn broadcast_extension_status(&self, name: &str, status: &str, message: Option<&str>) {
+    async fn broadcast_extension_status(
+        &self,
+        user_id: &str,
+        name: &str,
+        status: &str,
+        message: Option<&str>,
+    ) {
         if let Some(ref sse) = *self.sse_manager.read().await {
-            sse.broadcast(crate::channels::web::types::SseEvent::ExtensionStatus {
-                extension_name: name.to_string(),
-                status: status.to_string(),
-                message: message.map(|m| m.to_string()),
-            });
+            sse.broadcast_for_user(
+                user_id,
+                crate::channels::web::types::SseEvent::ExtensionStatus {
+                    extension_name: name.to_string(),
+                    status: status.to_string(),
+                    message: message.map(|m| m.to_string()),
+                },
+            );
         }
+    }
+
+    async fn lock_mcp_lifecycle(&self, name: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .mcp_lifecycle_locks
+            .lock()
+            .await
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        lock.lock_owned().await
     }
 
     /// Search for extensions. If `discover` is true, also searches online.
@@ -845,6 +889,10 @@ impl ExtensionManager {
         let kind = self.determine_installed_kind(name, user_id).await?;
 
         match kind {
+            ExtensionKind::McpServer if self.should_use_gateway_mode() => {
+                let _lifecycle_guard = self.lock_mcp_lifecycle(name).await;
+                self.auth_mcp(name, user_id).await
+            }
             ExtensionKind::McpServer => self.auth_mcp(name, user_id).await,
             ExtensionKind::WasmTool => self.auth_wasm_tool(name, user_id).await,
             ExtensionKind::WasmChannel => self.auth_wasm_channel_status(name, user_id).await,
@@ -867,6 +915,111 @@ impl ExtensionManager {
         }
     }
 
+    /// Activate after OAuth only when an MCP server remains enabled.
+    pub async fn activate_after_auth(
+        &self,
+        name: &str,
+        user_id: &str,
+    ) -> Result<Option<ActivateResult>, ExtensionError> {
+        Self::validate_extension_name(name)?;
+        let kind = self.determine_installed_kind(name, user_id).await?;
+        match kind {
+            ExtensionKind::McpServer => self.activate_mcp_if_enabled(name, user_id).await,
+            ExtensionKind::WasmTool | ExtensionKind::WasmChannel => {
+                self.activate(name, user_id).await.map(Some)
+            }
+        }
+    }
+
+    /// Deactivate an MCP server without deleting its configuration or credentials.
+    pub async fn deactivate(&self, name: &str, user_id: &str) -> Result<String, ExtensionError> {
+        Self::validate_extension_name(name)?;
+        let kind = self.determine_installed_kind(name, user_id).await?;
+        if kind != ExtensionKind::McpServer {
+            return Err(ExtensionError::Other(format!(
+                "Only MCP servers can be deactivated; '{name}' is a {kind}"
+            )));
+        }
+
+        let _lifecycle_guard = self.lock_mcp_lifecycle(name).await;
+        self.set_mcp_enabled(name, user_id, false).await?;
+        self.clear_pending_extension_auth(name, user_id).await;
+        let stopped = self.stop_mcp_runtime(name, user_id).await;
+        let mut message = format!(
+            "Deactivated MCP server '{name}' and unloaded {} tool(s); configuration preserved",
+            stopped.tool_names.len()
+        );
+        if let Some(warning) = stopped.cleanup_warning {
+            message.push_str(&format!(". Runtime cleanup warning: {warning}"));
+        }
+        self.broadcast_extension_status(user_id, name, "inactive", Some(&message))
+            .await;
+
+        Ok(message)
+    }
+
+    /// Atomically toggle an MCP server and apply the corresponding runtime transition.
+    pub async fn toggle_mcp(&self, name: &str, user_id: &str) -> Result<String, ExtensionError> {
+        Self::validate_extension_name(name)?;
+        let kind = self.determine_installed_kind(name, user_id).await?;
+        if kind != ExtensionKind::McpServer {
+            return Err(ExtensionError::Other(format!(
+                "Only MCP servers can be toggled; '{name}' is a {kind}"
+            )));
+        }
+
+        let _lifecycle_guard = self.lock_mcp_lifecycle(name).await;
+        let server = if let Some(ref store) = self.store {
+            crate::tools::mcp::config::toggle_mcp_server_enabled_db(store.as_ref(), user_id, name)
+                .await
+        } else {
+            crate::tools::mcp::config::toggle_mcp_server_enabled(name).await
+        }
+        .map_err(|error| ExtensionError::Config(error.to_string()))?;
+
+        if server.enabled {
+            if let Err(error) = self.ensure_mcp_owner_available(name, user_id).await {
+                return match self.disable_mcp_if_unchanged(user_id, &server).await {
+                    Ok(true) => Err(error),
+                    Ok(false) => Err(ExtensionError::Other(format!(
+                        "{error}; enabled state changed concurrently and was not rolled back"
+                    ))),
+                    Err(rollback_error) => Err(ExtensionError::Other(format!(
+                        "{error}; failed to roll back enabled state: {rollback_error}"
+                    ))),
+                };
+            }
+            return match self
+                .activate_mcp_locked(name, user_id, server.clone())
+                .await
+            {
+                Ok(result) => Ok(result.message),
+                Err(error) => match self.disable_mcp_if_unchanged(user_id, &server).await {
+                    Ok(true) => Err(error),
+                    Ok(false) => Err(ExtensionError::Other(format!(
+                        "{error}; enabled state changed concurrently and was not rolled back"
+                    ))),
+                    Err(rollback_error) => Err(ExtensionError::Other(format!(
+                        "{error}; failed to roll back enabled state: {rollback_error}"
+                    ))),
+                },
+            };
+        }
+
+        self.clear_pending_extension_auth(name, user_id).await;
+        let stopped = self.stop_mcp_runtime(name, user_id).await;
+        let mut message = format!(
+            "Deactivated MCP server '{name}' and unloaded {} tool(s); configuration preserved",
+            stopped.tool_names.len()
+        );
+        if let Some(warning) = stopped.cleanup_warning {
+            message.push_str(&format!(". Runtime cleanup warning: {warning}"));
+        }
+        self.broadcast_extension_status(user_id, name, "inactive", Some(&message))
+            .await;
+        Ok(message)
+    }
+
     /// List extensions with their status.
     ///
     /// When `include_available` is `true`, registry entries that are not yet
@@ -885,19 +1038,21 @@ impl ExtensionManager {
                 Ok(servers) => {
                     for server in &servers.servers {
                         let authenticated = is_authenticated(server, &self.secrets, user_id).await;
-                        let clients = self.mcp_clients.read().await;
-                        let active = clients.contains_key(&server.name);
-
-                        // Get tool names if active
-                        let tools = if active {
-                            self.tool_registry
-                                .list()
-                                .await
-                                .into_iter()
-                                .filter(|t| t.starts_with(&format!("{}_", server.name)))
-                                .collect()
-                        } else {
-                            Vec::new()
+                        let (active, tools) = {
+                            let active_servers = self.active_mcp_servers.read().await;
+                            let active_server = active_servers
+                                .get(&server.name)
+                                .filter(|runtime| runtime.owner_id == user_id);
+                            let tools = active_server
+                                .map(|runtime| {
+                                    runtime
+                                        .tools
+                                        .iter()
+                                        .map(|tool| tool.name().to_string())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            (active_server.is_some(), tools)
                         };
 
                         let display_name = self
@@ -940,6 +1095,7 @@ impl ExtensionManager {
                                 crate::tools::mcp::config::EffectiveTransport::Http
                             ) || authenticated,
                             active,
+                            enabled: Some(server.enabled),
                             tools,
                             needs_setup: false,
                             has_auth: false,
@@ -993,6 +1149,7 @@ impl ExtensionManager {
                             command: None,
                             authenticated: auth_state == ToolAuthState::Ready,
                             active,
+                            enabled: None,
                             tools: if active { vec![name] } else { Vec::new() },
                             needs_setup: auth_state == ToolAuthState::NeedsSetup,
                             has_auth: auth_state != ToolAuthState::NoAuth,
@@ -1051,6 +1208,7 @@ impl ExtensionManager {
                             command: None,
                             authenticated: auth_state == ToolAuthState::Ready,
                             active,
+                            enabled: None,
                             tools: Vec::new(),
                             needs_setup: auth_state == ToolAuthState::NeedsSetup,
                             has_auth: auth_state != ToolAuthState::NoAuth,
@@ -1092,6 +1250,7 @@ impl ExtensionManager {
                     command: None,
                     authenticated: false,
                     active: false,
+                    enabled: None,
                     tools: Vec::new(),
                     needs_setup: false,
                     has_auth: false,
@@ -1110,51 +1269,27 @@ impl ExtensionManager {
         Self::validate_extension_name(name)?;
         let kind = self.determine_installed_kind(name, user_id).await?;
 
-        // Clean up any in-progress OAuth flows for this extension.
-        // TCP mode: abort the listener task so port 9876 is freed immediately.
-        // Gateway mode: remove stale pending flow entries.
-        if let Some(pending) = self.pending_auth.write().await.remove(name)
-            && let Some(handle) = pending.task_handle
-        {
-            handle.abort();
-        }
-        self.pending_oauth_flows
-            .write()
-            .await
-            .retain(|_, flow| flow.extension_name != name);
+        self.clear_pending_extension_auth(name, user_id).await;
 
         match kind {
             ExtensionKind::McpServer => {
-                // Unregister tools with this server's prefix
-                let tool_names: Vec<String> = self
-                    .tool_registry
-                    .list()
-                    .await
-                    .into_iter()
-                    .filter(|t| t.starts_with(&format!("{}_", name)))
-                    .collect();
-
-                for tool_name in &tool_names {
-                    self.tool_registry.unregister(tool_name).await;
-                }
-
-                // Remove MCP client
-                self.mcp_clients.write().await.remove(name);
-
-                self.mcp_process_manager.shutdown(name).await.map_err(|e| {
-                    ExtensionError::Other(format!("Failed to stop MCP server '{name}': {e}"))
-                })?;
+                let _lifecycle_guard = self.lock_mcp_lifecycle(name).await;
+                let stopped = self.stop_mcp_runtime(name, user_id).await;
 
                 // Remove from config
                 self.remove_mcp_server(name, user_id)
                     .await
                     .map_err(|e| ExtensionError::Config(e.to_string()))?;
 
-                Ok(format!(
+                let mut message = format!(
                     "Removed MCP server '{}' and {} tool(s)",
                     name,
-                    tool_names.len()
-                ))
+                    stopped.tool_names.len()
+                );
+                if let Some(warning) = stopped.cleanup_warning {
+                    message.push_str(&format!(". Runtime cleanup warning: {warning}"));
+                }
+                Ok(message)
             }
             ExtensionKind::WasmTool => {
                 // Unregister from tool registry
@@ -1511,7 +1646,12 @@ impl ExtensionManager {
                 let info = serde_json::json!({
                     "name": name,
                     "kind": "mcp_server",
-                    "connected": self.mcp_clients.read().await.contains_key(name),
+                    "connected": self
+                        .active_mcp_servers
+                        .read()
+                        .await
+                        .get(name)
+                        .is_some_and(|runtime| runtime.owner_id == user_id),
                 });
                 Ok(info)
             }
@@ -1552,9 +1692,10 @@ impl ExtensionManager {
     ) -> Result<(), crate::tools::mcp::config::ConfigError> {
         config.validate()?;
         if let Some(ref store) = self.store {
-            crate::tools::mcp::config::add_mcp_server_db(store.as_ref(), user_id, config).await
+            crate::tools::mcp::config::persist_mcp_server_db(store.as_ref(), user_id, config, false)
+                .await
         } else {
-            crate::tools::mcp::config::add_mcp_server(config).await
+            crate::tools::mcp::config::persist_mcp_server(config, false).await
         }
     }
 
@@ -1567,6 +1708,131 @@ impl ExtensionManager {
             crate::tools::mcp::config::remove_mcp_server_db(store.as_ref(), user_id, name).await
         } else {
             crate::tools::mcp::config::remove_mcp_server(name).await
+        }
+    }
+
+    async fn set_mcp_enabled(
+        &self,
+        name: &str,
+        user_id: &str,
+        enabled: bool,
+    ) -> Result<McpServerConfig, ExtensionError> {
+        if let Some(ref store) = self.store {
+            crate::tools::mcp::config::set_mcp_server_enabled_db(
+                store.as_ref(),
+                user_id,
+                name,
+                enabled,
+            )
+            .await
+            .map_err(|e| ExtensionError::Config(e.to_string()))
+        } else {
+            crate::tools::mcp::config::set_mcp_server_enabled(name, enabled)
+                .await
+                .map_err(|e| ExtensionError::Config(e.to_string()))
+        }
+    }
+
+    async fn disable_mcp_if_unchanged(
+        &self,
+        user_id: &str,
+        expected: &McpServerConfig,
+    ) -> Result<bool, ExtensionError> {
+        if let Some(ref store) = self.store {
+            crate::tools::mcp::config::disable_mcp_server_if_unchanged_db(
+                store.as_ref(),
+                user_id,
+                expected,
+            )
+            .await
+        } else {
+            crate::tools::mcp::config::disable_mcp_server_if_unchanged(expected).await
+        }
+        .map_err(|error| ExtensionError::Config(error.to_string()))
+    }
+
+    async fn stop_mcp_runtime(&self, name: &str, user_id: &str) -> StoppedMcpRuntime {
+        if self
+            .active_mcp_servers
+            .read()
+            .await
+            .get(name)
+            .is_some_and(|runtime| runtime.owner_id != user_id)
+        {
+            return StoppedMcpRuntime::default();
+        }
+        let runtime = self.active_mcp_servers.write().await.remove(name);
+        let tool_names = runtime
+            .as_ref()
+            .map(|runtime| {
+                runtime
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if let Some(runtime) = runtime.as_ref() {
+            for tool in &runtime.tools {
+                self.tool_registry
+                    .unregister_if_same(tool.name(), tool)
+                    .await;
+            }
+        }
+
+        let cleanup_warning = self
+            .shutdown_mcp_runtime(
+            name,
+            runtime.as_ref().map(|runtime| runtime.client.as_ref()),
+        )
+            .await
+            .err()
+            .map(|error| {
+                tracing::warn!(server = %name, error = %error, "MCP runtime cleanup was incomplete");
+                error.to_string()
+            });
+        StoppedMcpRuntime {
+            tool_names,
+            cleanup_warning,
+        }
+    }
+
+    async fn shutdown_mcp_runtime(
+        &self,
+        name: &str,
+        client: Option<&McpClient>,
+    ) -> Result<(), ExtensionError> {
+        crate::tools::mcp::factory::shutdown_client_runtime(
+            name,
+            client,
+            &self.mcp_session_manager,
+            &self.mcp_process_manager,
+        )
+        .await
+        .map_err(|error| ExtensionError::Other(error.to_string()))
+    }
+
+    async fn cleanup_failed_mcp_activation(&self, name: &str, client: &McpClient) {
+        if let Err(error) = self.shutdown_mcp_runtime(name, Some(client)).await {
+            tracing::warn!(
+                server = %name,
+                error = %error,
+                "Failed to clean up MCP runtime after activation failure"
+            );
+        }
+    }
+
+    fn classify_mcp_activation_error(message: String) -> ExtensionError {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("requires authentication")
+            || message.contains("401")
+            || (message.contains("400")
+                && (lower.contains("authorization") || lower.contains("authenticate")))
+        {
+            ExtensionError::AuthRequired
+        } else {
+            ExtensionError::ActivationFailed(message)
         }
     }
 
@@ -1714,6 +1980,7 @@ impl ExtensionManager {
         user_id: &str,
     ) -> Result<InstallResult, ExtensionError> {
         Self::validate_extension_name(&config.name)?;
+        let _lifecycle_guard = self.lock_mcp_lifecycle(&config.name).await;
         if self.get_mcp_server(&config.name, user_id).await.is_ok() {
             return Err(ExtensionError::AlreadyInstalled(config.name));
         }
@@ -2187,7 +2454,7 @@ impl ExtensionManager {
         use crate::cli::oauth_defaults;
 
         let is_gateway = self.should_use_gateway_mode();
-        self.clear_pending_extension_auth(name).await;
+        self.clear_pending_extension_auth(name, user_id).await;
 
         // Build redirect URI: gateway uses the public callback URL,
         // local mode binds a random port.
@@ -2289,7 +2556,7 @@ impl ExtensionManager {
         } else {
             // Local mode: return URL for manual opening
             self.pending_auth.write().await.insert(
-                name.to_string(),
+                (name.to_string(), user_id.to_string()),
                 PendingAuth {
                     _name: name.to_string(),
                     _kind: ExtensionKind::McpServer,
@@ -2725,7 +2992,7 @@ impl ExtensionManager {
             )
             .await;
 
-        self.clear_pending_extension_auth(name).await;
+        self.clear_pending_extension_auth(name, user_id).await;
 
         let redirect_uri = self
             .gateway_callback_redirect_uri()
@@ -2814,7 +3081,8 @@ impl ExtensionManager {
             let secret_name = auth.secret_name.clone();
             let provider = auth.provider.clone();
             let validation_endpoint = auth.validation_endpoint.clone();
-            let user_id = user_id.to_string();
+            let pending_user_id = user_id.to_string();
+            let task_user_id = pending_user_id.clone();
             let secrets = Arc::clone(&self.secrets);
             let sse_manager = self.sse_manager.read().await.clone();
             let ext_name = name.to_string();
@@ -2855,7 +3123,7 @@ impl ExtensionManager {
 
                     oauth_defaults::store_oauth_tokens(
                         secrets.as_ref(),
-                        &user_id,
+                        &task_user_id,
                         &secret_name,
                         provider.as_deref(),
                         &token_response.access_token,
@@ -2906,7 +3174,7 @@ impl ExtensionManager {
 
             // Store pending auth with task handle
             self.pending_auth.write().await.insert(
-                name.to_string(),
+                (name.to_string(), pending_user_id),
                 PendingAuth {
                     _name: name.to_string(),
                     _kind: ExtensionKind::WasmTool,
@@ -3150,87 +3418,139 @@ impl ExtensionManager {
         name: &str,
         user_id: &str,
     ) -> Result<ActivateResult, ExtensionError> {
-        // Check if already activated
-        {
-            let clients = self.mcp_clients.read().await;
-            if clients.contains_key(name) {
-                // Already connected, just return the tool names
-                let tools: Vec<String> = self
-                    .tool_registry
-                    .list()
-                    .await
-                    .into_iter()
-                    .filter(|t| t.starts_with(&format!("{}_", name)))
-                    .collect();
+        let _lifecycle_guard = self.lock_mcp_lifecycle(name).await;
+        self.ensure_mcp_owner_available(name, user_id).await?;
+        let server = self.set_mcp_enabled(name, user_id, true).await?;
+        self.activate_mcp_locked(name, user_id, server).await
+    }
 
-                return Ok(ActivateResult {
-                    name: name.to_string(),
-                    kind: ExtensionKind::McpServer,
-                    tools_loaded: tools,
-                    message: format!("MCP server '{}' already active", name),
-                });
-            }
-        }
-
+    async fn activate_mcp_if_enabled(
+        &self,
+        name: &str,
+        user_id: &str,
+    ) -> Result<Option<ActivateResult>, ExtensionError> {
+        let _lifecycle_guard = self.lock_mcp_lifecycle(name).await;
+        self.ensure_mcp_owner_available(name, user_id).await?;
         let server = self
             .get_mcp_server(name, user_id)
             .await
-            .map_err(|e| ExtensionError::NotInstalled(e.to_string()))?;
+            .map_err(|error| ExtensionError::NotInstalled(error.to_string()))?;
+        if !server.enabled {
+            return Ok(None);
+        }
+        self.activate_mcp_locked(name, user_id, server)
+            .await
+            .map(Some)
+    }
 
-        let client = crate::tools::mcp::create_client_from_config(
-            server.clone(),
-            &self.mcp_session_manager,
-            &self.mcp_process_manager,
-            Some(Arc::clone(&self.secrets)),
-            user_id,
-        )
-        .await
-        .map_err(|e| ExtensionError::ActivationFailed(e.to_string()))?;
+    async fn ensure_mcp_owner_available(
+        &self,
+        name: &str,
+        user_id: &str,
+    ) -> Result<(), ExtensionError> {
+        if self
+            .active_mcp_servers
+            .read()
+            .await
+            .get(name)
+            .is_some_and(|runtime| runtime.owner_id != user_id)
+        {
+            return Err(ExtensionError::ActivationFailed(format!(
+                "MCP server '{name}' is already active for a different owner"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn activate_mcp_locked(
+        &self,
+        name: &str,
+        user_id: &str,
+        server: McpServerConfig,
+    ) -> Result<ActivateResult, ExtensionError> {
+        if let Some(runtime) = self.active_mcp_servers.read().await.get(name) {
+            return Ok(ActivateResult {
+                name: name.to_string(),
+                kind: ExtensionKind::McpServer,
+                tools_loaded: runtime
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect(),
+                message: format!("MCP server '{name}' already active"),
+            });
+        }
+
+        // Clear resources left by an interrupted activation before reconnecting.
+        self.stop_mcp_runtime(name, user_id).await;
+        let client = Arc::new(
+            crate::tools::mcp::create_client_from_config(
+                server,
+                &self.mcp_session_manager,
+                &self.mcp_process_manager,
+                Some(Arc::clone(&self.secrets)),
+                user_id,
+            )
+            .await
+            .map_err(|e| ExtensionError::ActivationFailed(e.to_string()))?,
+        );
 
         // Try to list and create tools.
         // A 401/auth error means the server requires OAuth — surface as
         // AuthRequired so the activate handler triggers the OAuth flow.
         // Some servers (e.g. GitHub MCP) return 400 with "Authorization header
         // is badly formatted" instead of 401 when auth is missing or invalid.
-        let mcp_tools = client.list_tools().await.map_err(|e| {
-            let msg = e.to_string();
-            let msg_lower = msg.to_ascii_lowercase();
-            if msg_lower.contains("requires authentication")
-                || msg.contains("401")
-                || (msg.contains("400")
-                    && (msg_lower.contains("authorization") || msg_lower.contains("authenticate")))
-            {
-                ExtensionError::AuthRequired
-            } else {
-                ExtensionError::ActivationFailed(msg)
-            }
-        })?;
-
-        let tool_impls = client
-            .create_tools()
-            .await
-            .map_err(|e| ExtensionError::ActivationFailed(e.to_string()))?;
-
-        let tool_names: Vec<String> = mcp_tools
-            .iter()
-            .map(|t| format!("{}_{}", name, t.name))
-            .collect();
-
-        for tool in tool_impls {
-            self.tool_registry.register(tool).await;
+        if let Err(error) = client.list_tools().await {
+            self.cleanup_failed_mcp_activation(name, client.as_ref())
+                .await;
+            return Err(Self::classify_mcp_activation_error(error.to_string()));
         }
 
-        // Store the client
-        self.mcp_clients
-            .write()
-            .await
-            .insert(name.to_string(), Arc::new(client));
+        let tool_impls = match client.create_tools().await {
+            Ok(tools) => tools,
+            Err(error) => {
+                self.cleanup_failed_mcp_activation(name, client.as_ref())
+                    .await;
+                return Err(ExtensionError::ActivationFailed(error.to_string()));
+            }
+        };
+        let mut registered_tools = Vec::new();
+        for tool in tool_impls {
+            if self
+                .tool_registry
+                .register_if_vacant(Arc::clone(&tool))
+                .await
+            {
+                registered_tools.push(tool);
+            } else {
+                tracing::warn!(
+                    server = %name,
+                    tool = %tool.name(),
+                    "Skipped MCP tool because its name is already registered"
+                );
+            }
+        }
+        let tool_names = registered_tools
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+
+        self.active_mcp_servers.write().await.insert(
+            name.to_string(),
+            ActiveMcpServer {
+                owner_id: user_id.to_string(),
+                client,
+                tools: registered_tools,
+            },
+        );
 
         tracing::info!(
             "Activated MCP server '{}' with {} tools",
             name,
             tool_names.len()
         );
+        self.broadcast_extension_status(user_id, name, "active", None)
+            .await;
 
         Ok(ActivateResult {
             name: name.to_string(),
@@ -4403,7 +4723,8 @@ impl ExtensionManager {
         match activate_result {
             Ok(result) => {
                 self.activation_errors.write().await.remove(name);
-                self.broadcast_extension_status(name, "active", None).await;
+                self.broadcast_extension_status(user_id, name, "active", None)
+                    .await;
                 let message = format!(
                     "Configuration saved and '{}' activated. {}",
                     name, result.message
@@ -4427,7 +4748,7 @@ impl ExtensionManager {
                     .write()
                     .await
                     .insert(name.to_string(), error_msg.clone());
-                self.broadcast_extension_status(name, "failed", Some(&error_msg))
+                self.broadcast_extension_status(user_id, name, "failed", Some(&error_msg))
                     .await;
                 Ok(ConfigureResult {
                     message: format!(
@@ -4829,13 +5150,82 @@ mod tests {
     use std::collections::HashMap;
     use std::fmt::Debug;
     use std::sync::Arc;
+    use std::time::Duration;
 
+    use async_trait::async_trait;
+
+    use crate::context::JobContext;
     use crate::extensions::ExtensionManager;
     use crate::extensions::manager::{
         FallbackDecision, build_wasm_channel_runtime_config_updates, combine_install_errors,
         fallback_decision, infer_kind_from_url, normalize_hosted_callback_url,
     };
     use crate::extensions::{ExtensionError, ExtensionKind, ExtensionSource, InstallResult};
+    use crate::tools::{Tool, ToolError, ToolOutput};
+
+    struct NamedTestTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Tool for NamedTestTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "MCP lifecycle test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::success(params, Duration::ZERO))
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_mcp_lifecycle_fixture(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_path = dir.path().join("mcp-lifecycle-fixture.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+if [ -n "$1" ]; then
+  printf '%s\n' "$$" >> "$1"
+  sleep 0.2
+fi
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      if [ "$MCP_FAIL_LIST" = "1" ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"fixture list failure"}}'
+      else
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"ping","description":"Ping","inputSchema":{"type":"object"}}]}}'
+      fi
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("fixture metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script_path, permissions).expect("make fixture executable");
+        script_path
+    }
 
     fn require_eq<T>(actual: T, expected: T, label: &str) -> Result<(), String>
     where
@@ -5204,6 +5594,368 @@ mod tests {
             .await
             .expect("reload MCP config");
         assert!(stored.get("filesystem").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_mcp_config_transitions_preserve_both_updates() {
+        use crate::tools::mcp::McpServerConfig;
+
+        let (store, dir) = make_test_store().await;
+        let first_manager = Arc::new(make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(Arc::clone(&store)),
+        ));
+        let second_manager = Arc::new(make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools-2"),
+            dir.path().join("channels-2"),
+            Some(Arc::clone(&store)),
+        ));
+        for name in ["first", "second"] {
+            first_manager
+                .install_mcp_config(
+                    McpServerConfig::new(name, format!("https://{name}.example/mcp")),
+                    "test",
+                )
+                .await
+                .expect("install MCP config");
+        }
+
+        let (first, second) = tokio::join!(
+            first_manager.deactivate("first", "test"),
+            second_manager.deactivate("second", "test")
+        );
+        first.expect("deactivate first");
+        second.expect("deactivate second");
+
+        let stored = crate::tools::mcp::config::load_mcp_servers_from_db(store.as_ref(), "test")
+            .await
+            .expect("reload MCP configs");
+        assert!(!stored.get("first").expect("first config").enabled);
+        assert!(!stored.get("second").expect("second config").enabled);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_lifecycle_sse_is_owner_scoped() {
+        use futures::StreamExt;
+
+        let (store, dir) = make_test_store().await;
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(store),
+        );
+        let sse = Arc::new(crate::channels::web::sse::SseManager::new());
+        let mut alice = sse
+            .subscribe_raw(Some("alice".to_string()))
+            .expect("subscribe alice");
+        let mut bob = sse
+            .subscribe_raw(Some("bob".to_string()))
+            .expect("subscribe bob");
+        manager.set_sse_sender(sse).await;
+
+        manager
+            .broadcast_extension_status("alice", "files", "inactive", None)
+            .await;
+
+        assert!(matches!(
+            alice.next().await,
+            Some(crate::channels::web::types::SseEvent::ExtensionStatus { .. })
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), bob.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stdio_mcp_deactivate_and_reenable_manages_runtime_state() {
+        use crate::tools::mcp::McpServerConfig;
+
+        let (store, dir) = make_test_store().await;
+        let script_path = write_mcp_lifecycle_fixture(&dir);
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(Arc::clone(&store)),
+        );
+        let mut config = McpServerConfig::new_stdio(
+            "fixture",
+            script_path.to_string_lossy(),
+            Vec::new(),
+            HashMap::new(),
+        );
+        config.enabled = false;
+        manager
+            .install_mcp_config(config, "test")
+            .await
+            .expect("install disabled fixture");
+
+        let first = manager
+            .activate("fixture", "test")
+            .await
+            .expect("activate fixture");
+        assert_eq!(first.tools_loaded, ["fixture_ping"]);
+        assert!(manager.tool_registry.has("fixture_ping").await);
+        assert_eq!(
+            manager.mcp_process_manager.managed_servers().await,
+            ["fixture"]
+        );
+
+        let unrelated: Arc<dyn Tool> = Arc::new(NamedTestTool {
+            name: "fixture_extra_ping".to_string(),
+        });
+        manager.tool_registry.register(unrelated).await;
+        manager
+            .deactivate("fixture", "test")
+            .await
+            .expect("deactivate fixture");
+
+        assert!(!manager.tool_registry.has("fixture_ping").await);
+        assert!(manager.tool_registry.has("fixture_extra_ping").await);
+        assert!(
+            manager
+                .mcp_process_manager
+                .managed_servers()
+                .await
+                .is_empty()
+        );
+        let stored = crate::tools::mcp::config::load_mcp_servers_from_db(store.as_ref(), "test")
+            .await
+            .expect("reload disabled fixture");
+        assert!(!stored.get("fixture").expect("stored fixture").enabled);
+        let listed = manager
+            .list(Some(ExtensionKind::McpServer), false, "test")
+            .await
+            .expect("list disabled fixture");
+        assert_eq!(listed[0].enabled, Some(false));
+        assert!(!listed[0].active);
+        manager
+            .deactivate("fixture", "test")
+            .await
+            .expect("deactivation is idempotent");
+        assert!(
+            manager
+                .activate_after_auth("fixture", "test")
+                .await
+                .expect("post-auth activation check")
+                .is_none()
+        );
+        assert!(
+            manager
+                .mcp_process_manager
+                .managed_servers()
+                .await
+                .is_empty()
+        );
+
+        let second = manager
+            .activate("fixture", "test")
+            .await
+            .expect("re-enable fixture");
+        assert_eq!(second.tools_loaded, ["fixture_ping"]);
+        let stored = crate::tools::mcp::config::load_mcp_servers_from_db(store.as_ref(), "test")
+            .await
+            .expect("reload enabled fixture");
+        assert!(stored.get("fixture").expect("stored fixture").enabled);
+
+        let replacement: Arc<dyn Tool> = Arc::new(NamedTestTool {
+            name: "fixture_ping".to_string(),
+        });
+        manager
+            .tool_registry
+            .register(Arc::clone(&replacement))
+            .await;
+        manager
+            .deactivate("fixture", "test")
+            .await
+            .expect("deactivate fixture with replacement");
+        let registered = manager
+            .tool_registry
+            .get("fixture_ping")
+            .await
+            .expect("replacement remains registered");
+        assert!(Arc::ptr_eq(&registered, &replacement));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_concurrent_mcp_activation_starts_one_stdio_child() {
+        use crate::tools::mcp::McpServerConfig;
+
+        let (store, dir) = make_test_store().await;
+        let script_path = write_mcp_lifecycle_fixture(&dir);
+        let starts_path = dir.path().join("mcp-starts.log");
+        let manager = Arc::new(make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(Arc::clone(&store)),
+        ));
+        let mut config = McpServerConfig::new_stdio(
+            "fixture-race",
+            script_path.to_string_lossy(),
+            vec![starts_path.to_string_lossy().into_owned()],
+            HashMap::new(),
+        );
+        config.enabled = false;
+        manager
+            .install_mcp_config(config, "test")
+            .await
+            .expect("install fixture");
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let first = {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                manager.activate("fixture-race", "test").await
+            })
+        };
+        let second = {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                manager.activate("fixture-race", "test").await
+            })
+        };
+        barrier.wait().await;
+
+        first
+            .await
+            .expect("first activation task")
+            .expect("activate");
+        second
+            .await
+            .expect("second activation task")
+            .expect("activate");
+        manager
+            .deactivate("fixture-race", "test")
+            .await
+            .expect("stop fixture");
+
+        let starts = std::fs::read_to_string(starts_path).expect("read process starts");
+        assert_eq!(starts.lines().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_failed_mcp_activation_stops_spawned_stdio_child() {
+        use crate::tools::mcp::McpServerConfig;
+
+        let (store, dir) = make_test_store().await;
+        let script_path = write_mcp_lifecycle_fixture(&dir);
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(Arc::clone(&store)),
+        );
+        let mut config = McpServerConfig::new_stdio(
+            "fixture-failure",
+            script_path.to_string_lossy(),
+            Vec::new(),
+            HashMap::from([("MCP_FAIL_LIST".to_string(), "1".to_string())]),
+        );
+        config.enabled = false;
+        manager
+            .install_mcp_config(config, "test")
+            .await
+            .expect("install fixture");
+
+        let error = manager
+            .activate("fixture-failure", "test")
+            .await
+            .expect_err("activation must fail");
+        assert!(error.to_string().contains("fixture list failure"));
+        assert!(
+            manager
+                .mcp_process_manager
+                .managed_servers()
+                .await
+                .is_empty()
+        );
+        assert!(!manager.tool_registry.has("fixture-failure_ping").await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_mcp_deactivation_and_removal_skip_another_owner_runtime() {
+        use crate::tools::mcp::McpServerConfig;
+
+        let (store, dir) = make_test_store().await;
+        let script_path = write_mcp_lifecycle_fixture(&dir);
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(Arc::clone(&store)),
+        );
+        for user_id in ["alice", "bob"] {
+            manager
+                .install_mcp_config(
+                    McpServerConfig::new_stdio(
+                        "shared-name",
+                        script_path.to_string_lossy(),
+                        Vec::new(),
+                        HashMap::new(),
+                    ),
+                    user_id,
+                )
+                .await
+                .expect("install owner-scoped fixture");
+        }
+        manager
+            .activate("shared-name", "alice")
+            .await
+            .expect("activate alice fixture");
+
+        manager
+            .deactivate("shared-name", "bob")
+            .await
+            .expect("bob can disable his inactive configuration");
+        assert!(manager.tool_registry.has("shared-name_ping").await);
+        assert_eq!(
+            manager.mcp_process_manager.managed_servers().await,
+            ["shared-name"]
+        );
+        let alice = manager
+            .list(Some(ExtensionKind::McpServer), false, "alice")
+            .await
+            .expect("list alice");
+        let bob = manager
+            .list(Some(ExtensionKind::McpServer), false, "bob")
+            .await
+            .expect("list bob");
+        assert!(alice[0].active);
+        assert!(!bob[0].active);
+        assert_eq!(bob[0].enabled, Some(false));
+
+        manager
+            .remove("shared-name", "bob")
+            .await
+            .expect("bob can remove his inactive configuration");
+        assert!(manager.tool_registry.has("shared-name_ping").await);
+        assert!(
+            manager
+                .list(Some(ExtensionKind::McpServer), false, "bob")
+                .await
+                .expect("list bob after removal")
+                .is_empty()
+        );
+
+        manager
+            .deactivate("shared-name", "alice")
+            .await
+            .expect("clean up alice fixture");
     }
 
     #[test]
@@ -5927,12 +6679,21 @@ mod tests {
         });
         let abort_handle = listener.abort_handle();
         mgr.pending_auth.write().await.insert(
-            "gmail".to_string(),
+            ("gmail".to_string(), "test".to_string()),
             super::PendingAuth {
                 _name: "gmail".to_string(),
                 _kind: ExtensionKind::WasmTool,
                 created_at: std::time::Instant::now(),
                 task_handle: Some(listener),
+            },
+        );
+        mgr.pending_auth.write().await.insert(
+            ("gmail".to_string(), "other-user".to_string()),
+            super::PendingAuth {
+                _name: "gmail".to_string(),
+                _kind: ExtensionKind::WasmTool,
+                created_at: std::time::Instant::now(),
+                task_handle: None,
             },
         );
 
@@ -5996,6 +6757,33 @@ mod tests {
                 created_at: std::time::Instant::now(),
             },
         );
+        mgr.pending_oauth_flows().write().await.insert(
+            "gmail-other-user-state".to_string(),
+            crate::cli::oauth_defaults::PendingOAuthFlow {
+                extension_name: "gmail".to_string(),
+                display_name: "Gmail".to_string(),
+                token_url: "https://example.com/token".to_string(),
+                client_id: "client789".to_string(),
+                client_secret: None,
+                redirect_uri: "https://example.com/oauth/callback".to_string(),
+                code_verifier: None,
+                access_token_field: "access_token".to_string(),
+                secret_name: "other_user_token".to_string(),
+                provider: None,
+                validation_endpoint: None,
+                scopes: vec![],
+                user_id: "other-user".to_string(),
+                secrets: Arc::clone(&mgr.secrets),
+                sse_manager: None,
+                gateway_token: None,
+                token_exchange_extra_params: std::collections::HashMap::new(),
+                client_id_secret_name: None,
+                client_secret_secret_name: None,
+                client_secret_expires_at: None,
+                auto_activate_extension: false,
+                created_at: std::time::Instant::now(),
+            },
+        );
 
         let result = mgr.remove("gmail", "test").await;
         assert!(result.is_ok(), "remove should succeed: {:?}", result.err());
@@ -6003,8 +6791,19 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(
-            mgr.pending_auth.read().await.get("gmail").is_none(),
+            mgr.pending_auth
+                .read()
+                .await
+                .get(&("gmail".to_string(), "test".to_string()))
+                .is_none(),
             "pending auth entry should be removed"
+        );
+        assert!(
+            mgr.pending_auth
+                .read()
+                .await
+                .contains_key(&("gmail".to_string(), "other-user".to_string())),
+            "another user's pending auth entry must remain"
         );
         assert!(
             abort_handle.is_finished(),
@@ -6019,6 +6818,10 @@ mod tests {
         assert!(
             !flows.contains_key("gmail-state"),
             "gateway OAuth flow for removed extension should be cleared"
+        );
+        assert!(
+            flows.contains_key("gmail-other-user-state"),
+            "another user's OAuth flow with the same extension name must remain"
         );
         assert!(
             flows.contains_key("other-state"),

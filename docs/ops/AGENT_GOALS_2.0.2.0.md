@@ -73,7 +73,7 @@ DEFAULT_JOBS=$(( NPROC * 3 / 4 ))
 The `-j` flag and `BUILD_JOBS` env var always override the default, so you've got flexibility per-machine without touching the script.
   </details>
   
-19. [ ] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and one Recommended-List item (registry validation) are DONE and verified in code (2026-07-21). Closed 2026-07-21 by completing the Diagnostics / command preflight Recommended-List item (see below). Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
+19. [x] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable was completed on 2026-07-22. Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
     <details>
     <summary><b>✅ DONE (verified 2026-07-21) — Foundational: first-class host-local stdio MCP installation</b></summary>
     Confirmed present in code with references:
@@ -93,9 +93,12 @@ The `-j` flag and `BUILD_JOBS` env var always override the default, so you've go
     <summary><b>Recommended List — status (finish ONE incomplete item to close #19)</b></summary>
     Status verified against code on 2026-07-21:
     - ✅ **Registry validation — DONE.** `registry validate` CLI command + `ic/src/registry/validation/mod.rs` (+ tests). Covers exactly one of url/transport, valid stdio command/args/env, `auth: none` for stdio, duplicate names, and unsupported transport types.
-    - 🟡 **Deactivate / re-enable — PARTIAL.**
-      - Done: CLI `mcp toggle --enable/--disable` persists the `enabled` flag (`ic/src/cli/mcp.rs:576`); startup honors it (`ic/src/app.rs:606` via `enabled_servers()`, `ic/src/tools/mcp/config.rs:387`).
-      - Remaining: stop the child + unregister its tools at runtime on disable (today `toggle` only rewrites config, so it takes effect on next restart); conversational `tool_deactivate`; web API + web UI toggle controls.
+    - ✅ **Deactivate / re-enable — DONE (2026-07-22).**
+      - `ExtensionManager` now serializes each server's lifecycle transition, tracks exact MCP tool ownership, enforces the activating owner at execution time, persists the desired `enabled` state with atomic DB updates or a disk lock, and explicitly closes transports, managed stdio children, HTTP session state, and pending auth flows on deactivation.
+      - Reactivation creates a fresh client, renegotiates MCP, rediscovers tools, and restores `enabled = true`; activation failures clean up spawned runtime resources.
+      - Conversational `tool_deactivate`, authenticated `POST /api/extensions/{name}/deactivate`, and MCP-panel Deactivate/Activate controls expose the nondestructive lifecycle. Extension status reports desired `enabled` separately from live `active`.
+      - `lunarwing mcp toggle [--enable|--disable]` applies an explicit or atomic invert transition through the authenticated gateway when available. Its explicit `--offline` mode, or a reported gateway-unavailable fallback, persists the change for next startup.
+      - Focused coverage includes stdio deactivate/re-enable with process and exact-tool cleanup, client/session shutdown, web handler persistence, browser control behavior, and authenticated HTTP MCP reactivation without reinstalling.
 
     - ✅ **Diagnostics / command preflight — DONE (2026-07-21).**
       - Done: `lunarwing doctor` `check_mcp_config()` loads enabled servers and runs config `validate()` (`ic/src/cli/doctor.rs`).
@@ -106,7 +109,8 @@ The `-j` flag and `BUILD_JOBS` env var always override the default, so you've go
 
     - 🟡 **Focused integration coverage — PARTIAL.**
       - Done: `mcp_extension_lifecycle` e2e (search → install → activate → use) + `mcp_compat/{transport,auth,oauth}` tests — all HTTP mock (`ic/tests/e2e_advanced_traces.rs:511`, `ic/tests/mcp_compat/`).
-      - Remaining: stdio-based lifecycle test; install → list → activate-failure reporting → deactivate → remove; browser-level HTTP/stdio mode switching + mobile-layout check.
+      - Done 2026-07-22: stdio activate → deactivate → re-enable coverage, live authenticated HTTP deactivate/re-enable coverage, and browser-level Deactivate/Activate control coverage.
+      - Remaining: one contiguous install → list → activation-failure reporting → deactivate → remove scenario; browser-level HTTP/stdio mode switching + mobile-layout check.
 
     **Useful, slightly larger (optional):** stdio working directory (cwd) with path validation; per-server startup/request timeouts; visible "host-local processes are unsandboxed" risk label; better process cleanup when a spawn replaces an existing managed transport; tenant/owner selection for `mcp add` + registry install (CLI persistence still assumes the default owner).
 

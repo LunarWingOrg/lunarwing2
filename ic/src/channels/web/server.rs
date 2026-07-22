@@ -468,6 +468,14 @@ pub async fn start_server(
             post(extensions_activate_handler),
         )
         .route(
+            "/api/extensions/{name}/deactivate",
+            post(extensions_deactivate_handler),
+        )
+        .route(
+            "/api/extensions/{name}/toggle",
+            post(extensions_toggle_handler),
+        )
+        .route(
             "/api/extensions/{name}/remove",
             post(extensions_remove_handler),
         )
@@ -1067,8 +1075,18 @@ async fn oauth_callback_impl(
     // OAuth success is independent of activation — tokens are already stored.
     // Report auth as successful and attempt activation as a bonus step.
     let (final_message, activation_succeeded) = if success {
-        match ext_mgr.activate(&flow.extension_name, &flow.user_id).await {
-            Ok(result) => (result.message, true),
+        match ext_mgr
+            .activate_after_auth(&flow.extension_name, &flow.user_id)
+            .await
+        {
+            Ok(Some(result)) => (result.message, true),
+            Ok(None) => (
+                format!(
+                    "{} authenticated successfully and remains deactivated.",
+                    flow.display_name
+                ),
+                false,
+            ),
             Err(e) => {
                 tracing::warn!(
                     extension = %flow.extension_name,
@@ -2073,6 +2091,7 @@ async fn extensions_list_handler(
                 command: ext.command,
                 authenticated: ext.authenticated,
                 active: ext.active,
+                enabled: ext.enabled,
                 tools: ext.tools,
                 needs_setup: ext.needs_setup,
                 has_auth: ext.has_auth,
@@ -2088,14 +2107,14 @@ async fn extensions_list_handler(
 
 async fn extensions_tools_handler(
     State(state): State<Arc<GatewayState>>,
-    AuthenticatedUser(_user): AuthenticatedUser,
+    AuthenticatedUser(user): AuthenticatedUser,
 ) -> Result<Json<ToolListResponse>, (StatusCode, String)> {
     let registry = state.tool_registry.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Tool registry not available".to_string(),
     ))?;
 
-    let definitions = registry.tool_definitions().await;
+    let definitions = registry.tool_definitions_for_user(&user.user_id).await;
     let tools = definitions
         .into_iter()
         .map(|td| ToolInfo {
@@ -2257,6 +2276,38 @@ async fn extensions_activate_handler(
                 )))),
             }
         }
+    }
+}
+
+async fn extensions_deactivate_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Path(name): Path<String>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let ext_mgr = state.extension_manager.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Extension manager not available (secrets store required)".to_string(),
+    ))?;
+
+    match ext_mgr.deactivate(&name, &user.user_id).await {
+        Ok(message) => Ok(Json(ActionResponse::ok(message))),
+        Err(error) => Ok(Json(ActionResponse::fail(error.to_string()))),
+    }
+}
+
+async fn extensions_toggle_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Path(name): Path<String>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let ext_mgr = state.extension_manager.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Extension manager not available (secrets store required)".to_string(),
+    ))?;
+
+    match ext_mgr.toggle_mcp(&name, &user.user_id).await {
+        Ok(message) => Ok(Json(ActionResponse::ok(message))),
+        Err(error) => Ok(Json(ActionResponse::fail(error.to_string()))),
     }
 }
 
@@ -2997,6 +3048,7 @@ mod tests {
             command: None,
             authenticated: true,
             active: true,
+            enabled: None,
             tools: Vec::new(),
             needs_setup: true,
             has_auth: false,
@@ -3150,6 +3202,71 @@ mod tests {
             "expected activation failure in message: {:?}",
             parsed
         );
+    }
+
+    #[tokio::test]
+    async fn test_extensions_deactivate_preserves_mcp_config() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (store, db_dir) = crate::testing::test_db().await;
+        let ext_mgr = Arc::new(ExtensionManager::new(
+            Arc::new(crate::tools::mcp::session::McpSessionManager::new()),
+            Arc::new(crate::tools::mcp::process::McpProcessManager::new()),
+            test_secrets_store(),
+            Arc::new(ToolRegistry::new()),
+            None,
+            None,
+            db_dir.path().join("tools"),
+            db_dir.path().join("channels"),
+            None,
+            "test".to_string(),
+            Some(Arc::clone(&store)),
+            Vec::new(),
+        ));
+        ext_mgr
+            .install_mcp_config(
+                crate::tools::mcp::McpServerConfig::new_stdio(
+                    "local-files",
+                    "cat",
+                    Vec::new(),
+                    std::collections::HashMap::new(),
+                ),
+                "test",
+            )
+            .await
+            .expect("install test MCP");
+
+        let app = Router::new()
+            .route(
+                "/api/extensions/{name}/deactivate",
+                post(extensions_deactivate_handler),
+            )
+            .with_state(test_gateway_state(Some(ext_mgr)));
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/extensions/local-files/deactivate")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(UserIdentity {
+            user_id: "test".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let response = ServiceExt::<axum::http::Request<Body>>::oneshot(app, request)
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 64)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
+        assert_eq!(payload["success"], true);
+
+        let stored = crate::tools::mcp::config::load_mcp_servers_from_db(store.as_ref(), "test")
+            .await
+            .expect("reload MCP config");
+        assert!(!stored.get("local-files").expect("config preserved").enabled);
     }
 
     fn expired_flow_created_at() -> Option<std::time::Instant> {

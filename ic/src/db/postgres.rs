@@ -648,6 +648,18 @@ impl SettingsStore for PgBackend {
         self.store.set_setting(user_id, key, value).await
     }
 
+    async fn compare_and_set_setting(
+        &self,
+        user_id: &str,
+        key: &str,
+        expected: Option<&serde_json::Value>,
+        value: &serde_json::Value,
+    ) -> Result<bool, DatabaseError> {
+        self.store
+            .compare_and_set_setting(user_id, key, expected, value)
+            .await
+    }
+
     async fn delete_setting(&self, user_id: &str, key: &str) -> Result<bool, DatabaseError> {
         self.store.delete_setting(user_id, key).await
     }

@@ -708,6 +708,15 @@ pub trait SettingsStore: Send + Sync {
         key: &str,
         value: &serde_json::Value,
     ) -> Result<(), DatabaseError>;
+    /// Replace a setting only when its current value still matches `expected`.
+    /// `None` matches an absent row.
+    async fn compare_and_set_setting(
+        &self,
+        user_id: &str,
+        key: &str,
+        expected: Option<&serde_json::Value>,
+        value: &serde_json::Value,
+    ) -> Result<bool, DatabaseError>;
     async fn delete_setting(&self, user_id: &str, key: &str) -> Result<bool, DatabaseError>;
     async fn list_settings(&self, user_id: &str) -> Result<Vec<SettingRow>, DatabaseError>;
     async fn get_all_settings(

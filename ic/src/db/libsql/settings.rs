@@ -89,6 +89,40 @@ impl SettingsStore for LibSqlBackend {
         Ok(())
     }
 
+    async fn compare_and_set_setting(
+        &self,
+        user_id: &str,
+        key: &str,
+        expected: Option<&serde_json::Value>,
+        value: &serde_json::Value,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.connect().await?;
+        let now = fmt_ts(&Utc::now());
+        let changed = if let Some(expected) = expected {
+            conn.execute(
+                r#"
+                UPDATE settings
+                SET value = ?4, updated_at = ?5
+                WHERE user_id = ?1 AND key = ?2 AND value = ?3
+                "#,
+                params![user_id, key, expected.to_string(), value.to_string(), now],
+            )
+            .await
+        } else {
+            conn.execute(
+                r#"
+                INSERT INTO settings (user_id, key, value, updated_at)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT (user_id, key) DO NOTHING
+                "#,
+                params![user_id, key, value.to_string(), now],
+            )
+            .await
+        }
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(changed == 1)
+    }
+
     async fn delete_setting(&self, user_id: &str, key: &str) -> Result<bool, DatabaseError> {
         let conn = self.connect().await?;
         let count = conn

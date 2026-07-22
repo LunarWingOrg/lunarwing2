@@ -1,6 +1,7 @@
 //! Registry CLI commands for discovering and installing extensions.
 
 use clap::Subcommand;
+use std::path::Path;
 
 use crate::extensions::ExtensionSource;
 use crate::registry::catalog::RegistryCatalog;
@@ -62,7 +63,11 @@ pub enum RegistryCommand {
 }
 
 /// Run a registry command.
-pub async fn run_registry_command(cmd: RegistryCommand) -> anyhow::Result<()> {
+pub async fn run_registry_command(
+    cmd: RegistryCommand,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
     match cmd {
         RegistryCommand::List { kind, tag, verbose } => {
             let (catalog, _) = load_catalog()?;
@@ -74,11 +79,29 @@ pub async fn run_registry_command(cmd: RegistryCommand) -> anyhow::Result<()> {
         }
         RegistryCommand::Install { name, force, build } => {
             let (catalog, repo_root) = load_catalog()?;
-            cmd_install(&catalog, &repo_root, &name, force, build).await
+            cmd_install(
+                &catalog,
+                &repo_root,
+                &name,
+                force,
+                build,
+                config_path,
+                no_db,
+            )
+            .await
         }
         RegistryCommand::InstallDefaults { force, build } => {
             let (catalog, repo_root) = load_catalog()?;
-            cmd_install(&catalog, &repo_root, "lunarwing", force, build).await
+            cmd_install(
+                &catalog,
+                &repo_root,
+                "lunarwing",
+                force,
+                build,
+                config_path,
+                no_db,
+            )
+            .await
         }
         RegistryCommand::Validate => {
             let registry_dir = RegistryCatalog::find_dir()
@@ -311,6 +334,8 @@ async fn cmd_install(
     name: &str,
     force: bool,
     prefer_build: bool,
+    config_path: Option<&Path>,
+    no_db: bool,
 ) -> anyhow::Result<()> {
     let installer = RegistryInstaller::with_defaults(repo_root.to_path_buf());
 
@@ -373,7 +398,7 @@ async fn cmd_install(
         let manifest = manifests[0];
         if manifest.kind == ManifestKind::McpServer {
             let config = mcp_config_from_manifest(manifest)?;
-            crate::cli::mcp::persist_server(config, force).await?;
+            crate::cli::mcp::persist_server_with_path(config, force, config_path, no_db).await?;
 
             println!("\nInstalled successfully:");
             println!("  Name: {}", manifest.name);

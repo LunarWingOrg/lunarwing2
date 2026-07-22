@@ -168,6 +168,8 @@ I18n.register('zh-CN', {
   'mcp.addCustom': '添加自定义 MCP 服务器',
   'mcp.add': '添加',
   'mcp.addedSuccess': '已添加 MCP 服务器 {name}',
+  'mcp.deactivated': '已停用 MCP 服务器 {name}',
+  'mcp.deactivateFailed': '停用失败: {message}',
   'mcp.transport': 'MCP 传输方式',
   'mcp.http': 'HTTP',
   'mcp.stdio': 'stdio',

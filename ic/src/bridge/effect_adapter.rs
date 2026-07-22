@@ -509,7 +509,11 @@ impl EffectBridgeAdapter {
             });
         }
 
-        if let Some((_, tool)) = self.tools.get_resolved(action_name).await {
+        if let Some((_, tool)) = self
+            .tools
+            .get_resolved_for_user(action_name, &context.user_id)
+            .await
+        {
             // ── Human delay / supervision mode ──
             // When supervised_mode is enabled on the thread, gate EVERY action
             // through human approval, regardless of the tool's tier.
@@ -1440,6 +1444,25 @@ FINAL(echoed + "|" + http_result["error"])"#,
                 .or_default()
                 .insert(key.to_string(), value.clone());
             Ok(())
+        }
+
+        async fn compare_and_set_setting(
+            &self,
+            user_id: &str,
+            key: &str,
+            expected: Option<&serde_json::Value>,
+            value: &serde_json::Value,
+        ) -> Result<bool, crate::error::DatabaseError> {
+            let mut values = self.values.write().await;
+            let current = values.get(user_id).and_then(|row| row.get(key));
+            if current != expected {
+                return Ok(false);
+            }
+            values
+                .entry(user_id.to_string())
+                .or_default()
+                .insert(key.to_string(), value.clone());
+            Ok(true)
         }
 
         async fn delete_setting(

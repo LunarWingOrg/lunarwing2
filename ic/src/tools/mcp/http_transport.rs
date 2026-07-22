@@ -5,8 +5,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use tokio::sync::Notify;
 
 use crate::tools::mcp::protocol::{McpRequest, McpResponse};
 use crate::tools::mcp::session::McpSessionManager;
@@ -24,6 +26,10 @@ pub struct HttpMcpTransport {
     http_client: reqwest::Client,
     session_manager: Option<Arc<McpSessionManager>>,
     custom_headers: HashMap<String, String>,
+    closed: AtomicBool,
+    in_flight: AtomicUsize,
+    drained: Notify,
+    shutdown_result: tokio::sync::OnceCell<Result<(), ToolError>>,
 }
 
 impl HttpMcpTransport {
@@ -42,6 +48,10 @@ impl HttpMcpTransport {
                 .expect("Failed to create HTTP client"), // safety: TLS init with default rustls cannot fail
             session_manager: None,
             custom_headers: HashMap::new(),
+            closed: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            drained: Notify::new(),
+            shutdown_result: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -78,6 +88,7 @@ impl McpTransport for HttpMcpTransport {
         request: &McpRequest,
         headers: &HashMap<String, String>,
     ) -> Result<McpResponse, ToolError> {
+        let _request_guard = self.begin_request()?;
         // Build the HTTP request.
         let mut req_builder = self
             .http_client
@@ -161,8 +172,14 @@ impl McpTransport for HttpMcpTransport {
     }
 
     async fn shutdown(&self) -> Result<(), ToolError> {
-        // HTTP transport is stateless; nothing to shut down.
-        Ok(())
+        self.shutdown_session(&HashMap::new()).await
+    }
+
+    async fn shutdown_with_headers(
+        &self,
+        headers: &HashMap<String, String>,
+    ) -> Result<(), ToolError> {
+        self.shutdown_session(headers).await
     }
 
     fn supports_http_features(&self) -> bool {
@@ -171,6 +188,86 @@ impl McpTransport for HttpMcpTransport {
 }
 
 impl HttpMcpTransport {
+    fn begin_request(&self) -> Result<InFlightRequest<'_>, ToolError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
+        }
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let guard = InFlightRequest { transport: self };
+        if self.closed.load(Ordering::Acquire) {
+            drop(guard);
+            return Err(self.closed_error());
+        }
+        Ok(guard)
+    }
+
+    fn closed_error(&self) -> ToolError {
+        ToolError::ExternalService(format!("[{}] MCP transport is shut down", self.server_name))
+    }
+
+    async fn wait_until_drained(&self) {
+        loop {
+            let notified = self.drained.notified();
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn shutdown_session(&self, headers: &HashMap<String, String>) -> Result<(), ToolError> {
+        self.shutdown_result
+            .get_or_init(|| self.perform_shutdown(headers))
+            .await
+            .clone()
+    }
+
+    async fn perform_shutdown(&self, headers: &HashMap<String, String>) -> Result<(), ToolError> {
+        self.closed.store(true, Ordering::Release);
+        self.wait_until_drained().await;
+        let Some(session_manager) = self.session_manager.as_ref() else {
+            return Ok(());
+        };
+        let Some(session_id) = session_manager.get_session_id(&self.server_name).await else {
+            return Ok(());
+        };
+
+        let mut request = self.http_client.delete(&self.server_url);
+        for (key, value) in &self.custom_headers {
+            if !key.eq_ignore_ascii_case("mcp-session-id") {
+                request = request.header(key.as_str(), value.as_str());
+            }
+        }
+        for (key, value) in headers {
+            if !key.eq_ignore_ascii_case("mcp-session-id") {
+                request = request.header(key.as_str(), value.as_str());
+            }
+        }
+        let response = request
+            .header("Mcp-Session-Id", session_id)
+            .send()
+            .await
+            .map_err(|error| {
+                ToolError::ExternalService(format!(
+                    "[{}] Failed to terminate MCP HTTP session: {}",
+                    self.server_name, error
+                ))
+            })?;
+        if response.status().is_success()
+            || response.status() == reqwest::StatusCode::NOT_FOUND
+            || response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
+            return Ok(());
+        }
+
+        let status = response.status();
+        let body = sanitize_error_body(&response.text().await.unwrap_or_default());
+        Err(ToolError::ExternalService(format!(
+            "[{}] MCP session termination returned status: {} - {}",
+            self.server_name, status, body
+        )))
+    }
+
     /// Parse a Server-Sent Events response, returning the JSON-RPC response
     /// whose `id` matches `request_id`. Non-matching events (e.g. server
     /// notifications or progress updates) are skipped so that the caller
@@ -241,6 +338,18 @@ impl HttpMcpTransport {
             "[{}] No matching response (id={:?}) in SSE stream",
             self.server_name, request_id
         )))
+    }
+}
+
+struct InFlightRequest<'a> {
+    transport: &'a HttpMcpTransport,
+}
+
+impl Drop for InFlightRequest<'_> {
+    fn drop(&mut self) {
+        if self.transport.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.transport.drained.notify_waiters();
+        }
     }
 }
 
@@ -566,5 +675,149 @@ mod tests {
         assert_eq!(response.id, request.id);
         assert!(response.result.is_none());
         assert!(response.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_client_shutdown_terminates_http_session_and_closes_stale_clones() {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::{Router, routing::delete};
+        use tokio::net::TcpListener;
+
+        async fn terminate(headers: HeaderMap) -> StatusCode {
+            assert_eq!(headers.get_all("mcp-session-id").iter().count(), 1);
+            assert_eq!(
+                headers
+                    .get("mcp-session-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some("session-123")
+            );
+            assert_eq!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer shutdown-token")
+            );
+            StatusCode::NO_CONTENT
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/", delete(terminate)))
+                .await
+                .unwrap();
+        });
+        let url = format!("http://{address}");
+        let sessions = Arc::new(McpSessionManager::new());
+        sessions.get_or_create("shutdown-http", &url).await;
+        sessions
+            .update_session_id("shutdown-http", Some("session-123".to_string()))
+            .await;
+        let transport = Arc::new(
+            HttpMcpTransport::new(&url, "shutdown-http")
+                .with_session_manager(Arc::clone(&sessions)),
+        );
+        let mut config = crate::tools::mcp::McpServerConfig::new("shutdown-http", &url);
+        config.headers.insert(
+            "Authorization".to_string(),
+            "Bearer shutdown-token".to_string(),
+        );
+        let client = crate::tools::mcp::McpClient::new_with_transport(
+            "shutdown-http",
+            transport,
+            Some(Arc::clone(&sessions)),
+            None,
+            "test",
+            Some(config),
+        );
+        let stale_clone = client.clone();
+
+        client.shutdown().await.expect("shutdown HTTP client");
+
+        assert!(sessions.active_servers().await.is_empty());
+        let error = stale_clone
+            .test_connection()
+            .await
+            .expect_err("stale clone must stay closed");
+        assert!(error.to_string().contains("shut down"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_drains_in_flight_request_before_session_delete() {
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        struct TestState {
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            post_completed: AtomicBool,
+            delete_count: AtomicUsize,
+        }
+
+        async fn delayed_post(State(state): State<Arc<TestState>>) -> Json<serde_json::Value> {
+            state.started.notify_one();
+            state.release.notified().await;
+            state.post_completed.store(true, Ordering::Release);
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": []}
+            }))
+        }
+
+        async fn terminate(State(state): State<Arc<TestState>>) -> StatusCode {
+            assert!(state.post_completed.load(Ordering::Acquire));
+            state.delete_count.fetch_add(1, Ordering::AcqRel);
+            StatusCode::NO_CONTENT
+        }
+
+        let state = Arc::new(TestState {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            post_completed: AtomicBool::new(false),
+            delete_count: AtomicUsize::new(0),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/", post(delayed_post).delete(terminate))
+            .with_state(Arc::clone(&state));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let url = format!("http://{address}");
+        let sessions = Arc::new(McpSessionManager::new());
+        sessions.get_or_create("drain-http", &url).await;
+        sessions
+            .update_session_id("drain-http", Some("drain-session".to_string()))
+            .await;
+        let transport = Arc::new(
+            HttpMcpTransport::new(&url, "drain-http").with_session_manager(Arc::clone(&sessions)),
+        );
+        let started = state.started.notified();
+        let request_transport = Arc::clone(&transport);
+        let request = tokio::spawn(async move {
+            request_transport
+                .send(&McpRequest::list_tools(1), &HashMap::new())
+                .await
+        });
+        started.await;
+
+        let first_shutdown_transport = Arc::clone(&transport);
+        let first_shutdown = tokio::spawn(async move { first_shutdown_transport.shutdown().await });
+        let second_shutdown_transport = Arc::clone(&transport);
+        let second_shutdown =
+            tokio::spawn(async move { second_shutdown_transport.shutdown().await });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert_eq!(state.delete_count.load(Ordering::Acquire), 0);
+
+        state.release.notify_one();
+        request.await.unwrap().expect("in-flight request completes");
+        first_shutdown.await.unwrap().expect("shutdown completes");
+        second_shutdown.await.unwrap().expect("shutdown completes");
+        assert_eq!(state.delete_count.load(Ordering::Acquire), 1);
+        server.abort();
     }
 }

@@ -1,7 +1,6 @@
 //! Agent-callable tools for managing extensions (MCP servers and WASM tools).
 //!
-//! These six tools let the LLM search, install, authenticate, activate, list,
-//! and remove extensions entirely through conversation.
+//! These tools let the LLM manage extensions entirely through conversation.
 
 use std::sync::Arc;
 
@@ -464,6 +463,65 @@ impl Tool for ToolActivateTool {
     }
 }
 
+// ── tool_deactivate ──────────────────────────────────────────────────────
+
+pub struct ToolDeactivateTool {
+    manager: Arc<ExtensionManager>,
+}
+
+impl ToolDeactivateTool {
+    pub fn new(manager: Arc<ExtensionManager>) -> Self {
+        Self { manager }
+    }
+}
+
+#[async_trait]
+impl Tool for ToolDeactivateTool {
+    fn name(&self) -> &str {
+        "tool_deactivate"
+    }
+
+    fn description(&self) -> &str {
+        "Deactivate an MCP server without uninstalling it. This unloads its tools and stops its host-local process while preserving configuration and credentials."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Installed MCP server name to deactivate"
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = std::time::Instant::now();
+        let name = require_str(&params, "name")?;
+        let message = self
+            .manager
+            .deactivate(name, &ctx.user_id)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+        Ok(ToolOutput::success(
+            serde_json::json!({"name": name, "message": message}),
+            start.elapsed(),
+        ))
+    }
+
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
+    }
+}
+
 // ── tool_list ────────────────────────────────────────────────────────────
 
 pub struct ToolListTool {
@@ -863,6 +921,22 @@ mod tests {
             tool.requires_approval(&serde_json::json!({})),
             ApprovalRequirement::Never
         );
+    }
+
+    #[test]
+    fn test_tool_deactivate_schema() {
+        use crate::tools::tool::ApprovalRequirement;
+        let tool = ToolDeactivateTool {
+            manager: test_manager_stub(),
+        };
+        assert_eq!(tool.name(), "tool_deactivate");
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::UnlessAutoApproved
+        );
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"].get("name").is_some());
+        assert_eq!(schema["required"], serde_json::json!(["name"]));
     }
 
     #[test]
