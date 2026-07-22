@@ -4,7 +4,7 @@
 //! threads to make progress. Missions can run on a schedule (cron),
 //! in response to events, or be triggered manually.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -50,9 +50,8 @@ pub enum MissionStatus {
 
 /// How a mission triggers new threads.
 ///
-/// The engine defines the trigger *types*. The bridge/host implements the
-/// actual trigger infrastructure (cron tickers, webhook endpoints, event
-/// matchers). The engine just needs to be told "fire this mission now."
+/// The engine owns cron scheduling and manual fire behavior. The bridge/host
+/// connects external webhook and event sources to the matching mission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MissionCadence {
     /// Spawn on a cron schedule (e.g., "0 */6 * * *" for every 6 hours).
@@ -108,8 +107,11 @@ pub struct Mission {
     // ── Budget ──
     /// Maximum threads per day (0 = unlimited).
     pub max_threads_per_day: u32,
-    /// Threads spawned today (reset daily by the cron ticker).
+    /// Threads spawned on `threads_today_date`.
     pub threads_today: u32,
+    /// UTC date associated with `threads_today`. Missing on older persisted missions.
+    #[serde(default)]
+    pub threads_today_date: Option<NaiveDate>,
 
     // ── Trigger payload ──
     /// Payload from the most recent trigger (webhook body, event data, etc.).
@@ -147,6 +149,7 @@ impl Mission {
             notify_channels: Vec::new(),
             max_threads_per_day: 10,
             threads_today: 0,
+            threads_today_date: Some(now.date_naive()),
             last_trigger_payload: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             created_at: now,
@@ -180,5 +183,29 @@ impl Mission {
             self.status,
             MissionStatus::Completed | MissionStatus::Failed
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_mission_without_budget_date_still_deserializes() {
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "legacy",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        let mut value = serde_json::to_value(mission).expect("serialize mission");
+        value
+            .as_object_mut()
+            .expect("mission should serialize as object")
+            .remove("threads_today_date");
+
+        let restored: Mission = serde_json::from_value(value).expect("deserialize legacy mission");
+        assert_eq!(restored.threads_today_date, None);
     }
 }

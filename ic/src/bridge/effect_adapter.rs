@@ -207,6 +207,45 @@ impl EffectBridgeAdapter {
             .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
     }
 
+    fn mission_updates(
+        params: &serde_json::Value,
+    ) -> Result<lunarwing_engine::MissionUpdate, EngineError> {
+        let mut updates = lunarwing_engine::MissionUpdate::default();
+        updates.name = params
+            .get("new_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        updates.goal = params
+            .get("goal")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        updates.cadence = params
+            .get("cadence")
+            .and_then(serde_json::Value::as_str)
+            .map(parse_cadence)
+            .transpose()?;
+        if let Some(channels) = params
+            .get("notify_channels")
+            .and_then(serde_json::Value::as_array)
+        {
+            updates.notify_channels = Some(
+                channels
+                    .iter()
+                    .filter_map(|value| value.as_str().map(String::from))
+                    .collect(),
+            );
+        }
+        updates.max_threads_per_day = params
+            .get("max_threads_per_day")
+            .and_then(Self::coerce_to_u64)
+            .map(|max| max as u32);
+        updates.success_criteria = params
+            .get("success_criteria")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        Ok(updates)
+    }
+
     async fn resolve_mission_id(
         params: &serde_json::Value,
         context: &ThreadExecutionContext,
@@ -284,20 +323,23 @@ impl EffectBridgeAdapter {
                     } else {
                         vec![]
                     };
-                match mgr
-                    .create_mission(
-                        context.project_id,
-                        &context.user_id,
-                        name,
-                        goal,
-                        parse_cadence(cadence_str),
-                        notify_channels,
-                    )
-                    .await
-                {
-                    Ok(id) => {
-                        Ok(serde_json::json!({"mission_id": id.to_string(), "status": "created"}))
-                    }
+                match parse_cadence(cadence_str) {
+                    Ok(cadence) => match mgr
+                        .create_mission(
+                            context.project_id,
+                            &context.user_id,
+                            name,
+                            goal,
+                            cadence,
+                            notify_channels,
+                        )
+                        .await
+                    {
+                        Ok(id) => Ok(
+                            serde_json::json!({"mission_id": id.to_string(), "status": "created"}),
+                        ),
+                        Err(e) => Err(e),
+                    },
                     Err(e) => Err(e),
                 }
             }
@@ -369,41 +411,15 @@ impl EffectBridgeAdapter {
             "mission_update" => {
                 let id = Self::resolve_mission_id(params, context, mgr).await;
                 match id {
-                    Ok(id) => {
-                        let mut updates = lunarwing_engine::MissionUpdate::default();
-                        if let Some(new_name) = params.get("new_name").and_then(|v| v.as_str()) {
-                            updates.name = Some(new_name.to_string());
+                    Ok(id) => match Self::mission_updates(params) {
+                        Ok(updates) => {
+                            match mgr.update_mission(id, &context.user_id, updates).await {
+                                Ok(()) => Ok(serde_json::json!({"status": "updated"})),
+                                Err(e) => Err(e),
+                            }
                         }
-                        if let Some(goal) = params.get("goal").and_then(|v| v.as_str()) {
-                            updates.goal = Some(goal.to_string());
-                        }
-                        if let Some(cadence) = params.get("cadence").and_then(|v| v.as_str()) {
-                            updates.cadence = Some(parse_cadence(cadence));
-                        }
-                        if let Some(arr) = params.get("notify_channels").and_then(|v| v.as_array())
-                        {
-                            updates.notify_channels = Some(
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect(),
-                            );
-                        }
-                        if let Some(max) = params
-                            .get("max_threads_per_day")
-                            .and_then(Self::coerce_to_u64)
-                        {
-                            updates.max_threads_per_day = Some(max as u32);
-                        }
-                        if let Some(criteria) =
-                            params.get("success_criteria").and_then(|v| v.as_str())
-                        {
-                            updates.success_criteria = Some(criteria.to_string());
-                        }
-                        match mgr.update_mission(id, &context.user_id, updates).await {
-                            Ok(()) => Ok(serde_json::json!({"status": "updated"})),
-                            Err(e) => Err(e),
-                        }
-                    }
+                        Err(e) => Err(e),
+                    },
                     Err(e) => Err(e),
                 }
             }
@@ -874,39 +890,109 @@ impl EffectExecutor for EffectBridgeAdapter {
     }
 }
 
-/// Parse a cadence string into a MissionCadence.
-fn parse_cadence(s: &str) -> lunarwing_engine::types::mission::MissionCadence {
-    use lunarwing_engine::types::mission::MissionCadence;
-    let trimmed = s.trim().to_lowercase();
-    if trimmed == "manual" {
-        MissionCadence::Manual
-    } else if trimmed.contains(' ') && trimmed.split_whitespace().count() >= 5 {
-        // Looks like a cron expression
-        MissionCadence::Cron {
-            expression: s.trim().to_string(),
-            timezone: None,
-        }
-    } else if trimmed.starts_with("event:") {
-        MissionCadence::OnEvent {
-            event_pattern: trimmed
-                .strip_prefix("event:")
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-        }
-    } else if trimmed.starts_with("webhook:") {
-        MissionCadence::Webhook {
-            path: trimmed
-                .strip_prefix("webhook:")
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-            secret: None,
-        }
-    } else {
-        // Default to manual if unrecognized
-        MissionCadence::Manual
+fn invalid_cadence(value: &str, reason: impl std::fmt::Display) -> EngineError {
+    EngineError::Effect {
+        reason: format!("invalid mission cadence '{value}': {reason}"),
     }
+}
+
+fn cron_cadence(
+    input: &str,
+    expression: String,
+) -> Result<lunarwing_engine::types::mission::MissionCadence, EngineError> {
+    let fields: Vec<_> = expression.split_whitespace().collect();
+    if matches!(fields.len(), 6 | 7) && fields.first() != Some(&"0") {
+        return Err(invalid_cadence(
+            input,
+            "sub-minute cron schedules are unsupported; seconds field must be 0",
+        ));
+    }
+    crate::agent::routine::next_cron_fire(&expression, None)
+        .map_err(|error| invalid_cadence(input, error))?;
+    Ok(lunarwing_engine::types::mission::MissionCadence::Cron {
+        expression,
+        timezone: None,
+    })
+}
+
+fn interval_cadence(
+    input: &str,
+) -> Option<Result<lunarwing_engine::types::mission::MissionCadence, EngineError>> {
+    let unit = match input.as_bytes().last().copied()? {
+        b'm' => "m",
+        b'h' => "h",
+        _ => return None,
+    };
+    let amount = &input[..input.len() - 1];
+    let amount = match amount.parse::<u8>() {
+        Ok(amount) => amount,
+        Err(_) => return None,
+    };
+    let expression = match unit {
+        "m" if (1..=59).contains(&amount) => format!("*/{amount} * * * *"),
+        "h" if (1..=23).contains(&amount) => format!("0 */{amount} * * *"),
+        "m" => {
+            return Some(Err(invalid_cadence(
+                input,
+                "minute intervals must be between 1m and 59m",
+            )));
+        }
+        "h" => {
+            return Some(Err(invalid_cadence(
+                input,
+                "hour intervals must be between 1h and 23h",
+            )));
+        }
+        _ => return None,
+    };
+    Some(cron_cadence(input, expression))
+}
+
+/// Parse a user-facing cadence string without silently changing its meaning.
+fn parse_cadence(
+    value: &str,
+) -> Result<lunarwing_engine::types::mission::MissionCadence, EngineError> {
+    use lunarwing_engine::types::mission::MissionCadence;
+    let trimmed = value.trim();
+    let normalized = trimmed.to_ascii_lowercase();
+    match normalized.as_str() {
+        "manual" => return Ok(MissionCadence::Manual),
+        "hourly" => return cron_cadence(value, "0 * * * *".to_string()),
+        "daily" => return cron_cadence(value, "0 0 * * *".to_string()),
+        _ => {}
+    }
+
+    let field_count = trimmed.split_whitespace().count();
+    if (5..=7).contains(&field_count) {
+        return cron_cadence(value, trimmed.to_string());
+    }
+    if normalized.starts_with("event:") {
+        let event_pattern = trimmed["event:".len()..].trim();
+        if event_pattern.is_empty() {
+            return Err(invalid_cadence(value, "event pattern cannot be empty"));
+        }
+        return Ok(MissionCadence::OnEvent {
+            event_pattern: event_pattern.to_string(),
+        });
+    }
+    if normalized.starts_with("webhook:") {
+        let path = trimmed["webhook:".len()..].trim();
+        if path.is_empty() {
+            return Err(invalid_cadence(value, "webhook path cannot be empty"));
+        }
+        return Ok(MissionCadence::Webhook {
+            path: path.to_string(),
+            secret: None,
+        });
+    }
+    if let Some(cadence) = interval_cadence(&normalized) {
+        return cadence;
+    }
+
+    Err(invalid_cadence(
+        value,
+        "expected manual, hourly, daily, <N>m, <N>h, a cron expression, event:<pattern>, or webhook:<path>",
+    ))
 }
 
 /// Extract credential name from an authentication_required error message.
@@ -1004,6 +1090,52 @@ mod tests {
             Arc::new(SafetyLayer::new(&config)),
             Arc::new(HookRegistry::default()),
         )
+    }
+
+    fn parsed_cron_expression(value: &str) -> String {
+        match parse_cadence(value).expect("cadence should parse") {
+            lunarwing_engine::MissionCadence::Cron { expression, .. } => expression,
+            cadence => panic!("expected cron cadence, got {cadence:?}"),
+        }
+    }
+
+    #[test]
+    fn documented_mission_cadences_map_to_cron() {
+        assert_eq!(parsed_cron_expression("hourly"), "0 * * * *");
+        assert_eq!(parsed_cron_expression("daily"), "0 0 * * *");
+        assert_eq!(parsed_cron_expression("30m"), "*/30 * * * *");
+        assert_eq!(parsed_cron_expression("6h"), "0 */6 * * *");
+        assert_eq!(parsed_cron_expression("0 9 * * *"), "0 9 * * *");
+    }
+
+    #[test]
+    fn mission_cadence_preserves_event_and_webhook_case() {
+        assert!(matches!(
+            parse_cadence("event:^Deploy-[A-Z]+$").expect("event cadence"),
+            lunarwing_engine::MissionCadence::OnEvent { event_pattern }
+                if event_pattern == "^Deploy-[A-Z]+$"
+        ));
+        assert!(matches!(
+            parse_cadence("webhook:Build/Ready").expect("webhook cadence"),
+            lunarwing_engine::MissionCadence::Webhook { path, .. }
+                if path == "Build/Ready"
+        ));
+    }
+
+    #[test]
+    fn invalid_mission_cadence_is_rejected() {
+        for value in [
+            "sometimes",
+            "0m",
+            "60m",
+            "24h",
+            "*/10 * * * * *",
+            "event:",
+            "webhook:",
+            "é",
+        ] {
+            assert!(parse_cadence(value).is_err(), "{value} should be rejected");
+        }
     }
 
     /// Verify that reset_call_count resets the counter to zero,

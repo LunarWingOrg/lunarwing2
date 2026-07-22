@@ -223,6 +223,19 @@ ExecutionMode:
 
 ## Learning Missions
 
+### Mission Scheduling
+
+Mission cron schedules run at one-minute resolution. User-facing mission tools
+accept `manual`, `hourly`, `daily`, minute intervals such as `30m`, hour
+intervals such as `6h`, and 5-7 field cron expressions whose seconds field is
+zero. Invalid cadence values fail instead of silently becoming manual missions.
+
+Cron missions receive `next_fire_at` when created, updated, or resumed. Startup
+repairs older valid cron missions missing this value. Scheduler fires advance
+the next occurrence even when the daily thread budget blocks a run; manual
+fires do not shift the cron schedule. Daily thread budgets reset on UTC day
+boundaries.
+
 `MissionManager::ensure_learning_missions()` provisions three baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, two additional skill-improvement
 missions. They are event-driven; not every mission runs after thread completion.
