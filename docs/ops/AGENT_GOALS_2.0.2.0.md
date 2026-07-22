@@ -118,7 +118,8 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
 25. [ ] update any proposals docs in docs/proposals
 26. [ ] update docs/README.md
 27. [ ] update README.md at repo root
-28. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.2.0 explaining all relevant changes since v2.0.1.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.2.0.md and should be written to the ROOT of the repo
-29. [ ] Improve accuracy of RELEASE-v2.0.2.0.md
+28. [ ] come up with codename ideas for release
+29. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.2.0 explaining all relevant changes since v2.0.1.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.2.0.md and should be written to the ROOT of the repo
+30. [ ] Improve accuracy of RELEASE-v2.0.2.0.md
 
 ---
