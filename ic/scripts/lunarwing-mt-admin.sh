@@ -5394,12 +5394,9 @@ stop() {
     ebegin "Stopping WeeChat ($name)"
     # Graceful: /upgrade -quit via FIFO saves buffers before exit; falls back
     # to tmux kill-session if the FIFO is unavailable or times out.
+    # Must run as tenant user — tmux sockets are uid-scoped.
     if [ -x "\${weechat_stop_helper}" ]; then
-        "\${weechat_stop_helper}" \\
-            --weechat-home "\${weechat_home}" \\
-            --tmux-socket weechat-${name} \\
-            --session weechat \\
-            --timeout 20 || true
+        su -s /bin/sh "\${weechat_user}" -c "\${weechat_stop_helper} --weechat-home \${weechat_home} --tmux-socket weechat-${name} --session weechat --timeout 20" || true
     else
         su -s /bin/sh "\${weechat_user}" -c "$(command -v tmux) -L weechat-${name} kill-session -t weechat 2>/dev/null" || true
     fi
