@@ -140,8 +140,7 @@ impl AppBuilder {
     /// below the timeout, i.e. `budget <= timeout - MARGIN` (the "ceiling").
     /// A budget of `0` disables the cap and is always [`TurnBudgetOutcome::Ok`].
     /// Otherwise:
-    /// - `budget <= ceiling` → [`Ok`] (the default 270 vs 300 sits exactly at
-    ///   the ceiling and is safe — no spurious warning);
+    /// - `budget <= ceiling` → [`Ok`] (the default 370 vs 630 is safe);
     /// - `budget > ceiling`  → [`Clamp`] down to `ceiling`;
     /// - `timeout <= MARGIN` (ceiling saturates to 0) → [`TimeoutTooSmall`].
     ///
@@ -920,8 +919,8 @@ impl AppBuilder {
         // message-dropping hard-kill. If the configured budget sits too close to
         // (or over) the timeout, clamp it down to a safe ceiling so the cap is
         // GUARANTEED to fire first — self-correcting rather than warn-only.
-        // See: llm/timeout.rs, config/llm.rs (`LLM_TURN_BUDGET_SECS`, default 270),
-        // config/agent.rs (`HANDLE_MESSAGE_TIMEOUT_SECS`, default 300).
+        // See: llm/timeout.rs, config/llm.rs (`LLM_TURN_BUDGET_SECS`, default 370),
+        // config/agent.rs (`AGENT_HANDLE_MESSAGE_TIMEOUT_SECS`, default 630).
         let budget = self.config.llm.llm_turn_budget_secs;
         let timeout_secs = self.config.agent.handle_message_timeout.as_secs();
         match Self::resolve_turn_budget(budget, self.config.agent.handle_message_timeout) {
@@ -1476,12 +1475,22 @@ mod tests {
 
     #[test]
     fn turn_budget_default_is_safe() {
-        // Defaults: budget=270, timeout=300s, margin=30 → ceiling=270.
-        // 270 sits exactly AT the ceiling (not over), so it is safe — no clamp,
-        // no warning. (The prior warn-only check flagged this on every startup.)
+        // Defaults: budget=370, timeout=630s, margin=30 → ceiling=600.
         assert_eq!(
-            AppBuilder::resolve_turn_budget(270, std::time::Duration::from_secs(300)),
+            AppBuilder::resolve_turn_budget(370, std::time::Duration::from_secs(630)),
             TurnBudgetOutcome::Ok
+        );
+    }
+
+    #[test]
+    fn engine_timeout_fits_default_message_timeout() {
+        let message_timeout = crate::settings::AgentSettings::default().handle_message_timeout_secs;
+        let engine_timeout = lunarwing_engine::executor::orchestrator::ORCHESTRATOR_TIMEOUT_SECS;
+
+        assert_eq!(engine_timeout, 600);
+        assert_eq!(
+            message_timeout,
+            engine_timeout + crate::agent::HARD_KILL_GRACE_SECS
         );
     }
 

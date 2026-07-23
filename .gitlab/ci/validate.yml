@@ -1,0 +1,76 @@
+ci-config:
+  extends: .lint-job
+  stage: validate
+  needs: []
+  before_script:
+    - python3 -m pip install --no-deps PyYAML==6.0.3
+  script:
+    - python3 .gitlab/scripts/validate_config.py
+    - python3 .gitlab/scripts/verify_release_version.py --self-test
+
+shell-syntax:
+  extends: .shell-job
+  stage: validate
+  needs: []
+  script:
+    - bash .gitlab/scripts/shell-syntax.sh
+
+python-syntax:
+  extends: .lint-job
+  stage: validate
+  needs: []
+  script:
+    - python3 .gitlab/scripts/python_syntax.py
+
+registry-json:
+  extends: .lint-job
+  stage: validate
+  needs: []
+  script:
+    - python3 .gitlab/scripts/registry_json.py
+
+version-policy:
+  extends: .shell-job
+  stage: validate
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+    - when: never
+  script:
+    - bash .gitlab/scripts/version-policy.sh
+
+panic-policy:
+  extends: .shell-job
+  stage: validate
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+    - when: never
+  script:
+    - bash .gitlab/scripts/panic-policy.sh
+
+rustfmt:
+  extends: .rust-job
+  stage: validate
+  needs: []
+  script:
+    - bash .gitlab/scripts/cargo-ci.sh fmt --all -- --check
+
+cargo-metadata:
+  extends: .rust-job
+  stage: validate
+  needs: []
+  script:
+    - bash .gitlab/scripts/cargo-ci.sh metadata --locked --no-deps --format-version 1
+
+release-version:
+  extends: .lint-job
+  stage: validate
+  needs: []
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+    - when: never
+  script:
+    - python3 .gitlab/scripts/verify_release_version.py

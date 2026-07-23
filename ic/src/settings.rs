@@ -607,7 +607,7 @@ pub struct AgentSettings {
     #[serde(default)]
     pub max_tokens_per_job: u64,
 
-    /// Max seconds per message before the agent loop skips it (default: 300).
+    /// Max seconds per message before the agent loop skips it (default: 630).
     #[serde(default = "default_handle_message_timeout")]
     pub handle_message_timeout_secs: u64,
 
@@ -665,7 +665,7 @@ fn default_timezone() -> String {
 }
 
 fn default_handle_message_timeout() -> u64 {
-    400
+    630
 }
 
 fn default_self_repair_op_timeout() -> u64 {

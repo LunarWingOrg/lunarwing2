@@ -32,6 +32,7 @@ workspace/
 │   └── alpha/
 │       ├── README.md
 │       └── notes.md
+├── engine/.runtime/       <- Internal Engine recovery state (persisted, not search-indexed)
 └── ...
 ```
 
@@ -73,9 +74,22 @@ let prompt = workspace.system_prompt().await?;
 Four tools for LLM use:
 
 - **`memory_search`** - Hybrid search, MUST be called before answering questions about prior work
-- **`memory_write`** - Write to any path (memory, daily_log, or custom paths)
-- **`memory_read`** - Read any file by path
-- **`memory_tree`** - View workspace structure as a tree (depth parameter, default 1)
+- **`memory_write`** - Write memory, daily logs, or custom user paths
+- **`memory_read`** - Read bounded pages from a file by path
+- **`memory_tree`** - View a bounded workspace tree (depth parameter, default 1)
+
+`memory_search` excludes internal `engine/.runtime/**` documents. Each returned
+snippet is bounded to 2,000 JSON-encoded bytes, and the complete result remains
+valid JSON bounded to 8,000 serialized bytes. Queries are limited to 1,024
+UTF-8 bytes before embedding or database search.
+
+All agent-facing memory tools reserve `engine/.runtime/**`: writes and direct
+reads are rejected, and tree listings hide the subtree. Direct `Workspace` APIs
+remain available to the Engine for recovery. `memory_read` returns at most 6,000
+source bytes per page plus `next_offset` and a revision required for later pages;
+each response is at most 8,000 serialized bytes. `memory_tree` returns at most
+256 entries and 8,000 serialized bytes with machine-readable `truncated`,
+`entry_count`, `next_offset`, and root-list `revision` fields.
 
 ## Hybrid Search (RRF)
 
@@ -139,3 +153,6 @@ Documents are chunked for search indexing:
 - Default: 800 words per chunk (roughly 800 tokens for English)
 - 15% overlap between chunks for context preservation
 - Minimum chunk size: 50 words (tiny trailing chunks merge with previous)
+
+Internal Engine state under `engine/.runtime/**` is stored as normal workspace
+documents for restart recovery but receives no chunks or embeddings.

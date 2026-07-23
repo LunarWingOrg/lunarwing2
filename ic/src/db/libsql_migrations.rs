@@ -926,6 +926,20 @@ ALTER TABLE reflex_patterns ADD COLUMN embedding BLOB;
 ALTER TABLE reflex_patterns ADD COLUMN embedding_model TEXT;
 "#,
     ),
+    (
+        23,
+        "exclude_engine_runtime_from_search",
+        // Keep runtime documents for Engine recovery, but remove their FTS/vector chunks.
+        r#"
+DELETE FROM memory_chunks
+WHERE document_id IN (
+    SELECT id
+    FROM memory_documents
+    WHERE path = 'engine/.runtime'
+       OR substr(path, 1, length('engine/.runtime/')) = 'engine/.runtime/'
+);
+"#,
+    ),
 ];
 
 /// Migrations whose ADD COLUMN should be skipped when the column already
@@ -1095,4 +1109,114 @@ pub async fn run_incremental(conn: &libsql::Connection) -> Result<(), crate::err
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::Database;
+    use crate::db::libsql::LibSqlBackend;
+
+    use super::*;
+
+    async fn fts_count(conn: &libsql::Connection, term: &str) -> i64 {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM memory_chunks_fts WHERE memory_chunks_fts MATCH ?1",
+                libsql::params![term],
+            )
+            .await
+            .expect("query FTS count");
+        rows.next()
+            .await
+            .expect("fetch FTS count")
+            .expect("FTS count row")
+            .get(0)
+            .expect("read FTS count")
+    }
+
+    #[tokio::test]
+    async fn runtime_cleanup_migration_keeps_documents_and_normal_chunks() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("runtime_cleanup.db");
+        let backend = LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("LibSqlBackend");
+        backend.run_migrations().await.expect("migrations");
+        let conn = backend.connect().await.expect("connect");
+
+        let runtime_doc = uuid::Uuid::new_v4().to_string();
+        let normal_doc = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO memory_documents (id, user_id, path, content) VALUES (?1, 'test', ?2, ?3)",
+            libsql::params![
+                runtime_doc.clone(),
+                "engine/.runtime/threads/archive/legacy.json",
+                "legacy runtime document"
+            ],
+        )
+        .await
+        .expect("insert runtime document");
+        conn.execute(
+            "INSERT INTO memory_documents (id, user_id, path, content) VALUES (?1, 'test', ?2, ?3)",
+            libsql::params![
+                normal_doc.clone(),
+                "engine/.runtime-notes.md",
+                "normal document"
+            ],
+        )
+        .await
+        .expect("insert normal document");
+        conn.execute(
+            "INSERT INTO memory_chunks (id, document_id, chunk_index, content) VALUES (?1, ?2, 0, ?3)",
+            libsql::params![
+                uuid::Uuid::new_v4().to_string(),
+                runtime_doc.clone(),
+                "legacyruntime"
+            ],
+        )
+        .await
+        .expect("insert runtime chunk");
+        conn.execute(
+            "INSERT INTO memory_chunks (id, document_id, chunk_index, content) VALUES (?1, ?2, 0, ?3)",
+            libsql::params![
+                uuid::Uuid::new_v4().to_string(),
+                normal_doc.clone(),
+                "ordinarymemory"
+            ],
+        )
+        .await
+        .expect("insert normal chunk");
+        assert_eq!(fts_count(&conn, "legacyruntime").await, 1);
+        assert_eq!(fts_count(&conn, "ordinarymemory").await, 1);
+
+        conn.execute("DELETE FROM _migrations WHERE version = 23", ())
+            .await
+            .expect("reset migration");
+        run_incremental(&conn).await.expect("rerun migration");
+
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM memory_documents WHERE id = ?1),
+                    (SELECT COUNT(*) FROM memory_chunks WHERE document_id = ?1),
+                    (SELECT COUNT(*) FROM memory_chunks WHERE document_id = ?2),
+                    (SELECT COUNT(*) FROM _migrations WHERE version = 23)
+                "#,
+                libsql::params![runtime_doc, normal_doc],
+            )
+            .await
+            .expect("query cleanup state");
+        let row = rows
+            .next()
+            .await
+            .expect("fetch cleanup state")
+            .expect("cleanup state row");
+        assert_eq!(row.get::<i64>(0).expect("runtime document count"), 1);
+        assert_eq!(row.get::<i64>(1).expect("runtime chunk count"), 0);
+        assert_eq!(row.get::<i64>(2).expect("normal chunk count"), 1);
+        assert_eq!(row.get::<i64>(3).expect("migration count"), 1);
+        assert_eq!(fts_count(&conn, "legacyruntime").await, 0);
+        assert_eq!(fts_count(&conn, "ordinarymemory").await, 1);
+    }
 }

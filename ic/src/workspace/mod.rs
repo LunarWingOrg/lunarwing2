@@ -31,7 +31,7 @@
 //! - `append(path, content)` - Append to a file
 //! - `list(dir)` - List directory contents
 //! - `delete(path)` - Delete a file
-//! - `search(query)` - Full-text + semantic search across all files
+//! - `search(query)` - Full-text + semantic search across indexed files
 //!
 //! # Key Patterns
 //!
@@ -54,7 +54,8 @@ mod search;
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{
     DocumentVersion, IDENTITY_PATHS, MemoryChunk, MemoryDocument, VersionSummary, WorkspaceEntry,
-    is_identity_path, merge_workspace_entries, paths,
+    is_engine_runtime_path, is_identity_path, is_search_indexable_path, merge_workspace_entries,
+    paths,
 };
 pub use embedding_cache::{CachedEmbeddingProvider, EmbeddingCacheConfig};
 pub use embeddings::{
@@ -660,7 +661,8 @@ impl Workspace {
     /// Write (create or update) a file.
     ///
     /// Creates parent directories implicitly (they're virtual in the DB).
-    /// Re-indexes the document for search after writing.
+    /// Re-indexes the document for search after writing. Internal Engine runtime
+    /// state remains persisted but is excluded from search indexing.
     ///
     /// # Example
     /// ```ignore
@@ -677,7 +679,7 @@ impl Workspace {
             .await?;
 
         // Compute chunks + embeddings upfront (no DB connections held).
-        let prepared = self.prepare_chunks(content).await;
+        let prepared = self.prepare_chunks_for_path(&path, content).await;
 
         // Atomic: update content + replace chunks in one transaction.
         self.storage
@@ -800,7 +802,7 @@ impl Workspace {
             .get_or_create_document_by_path(&scope, self.agent_id, &path)
             .await?;
 
-        let prepared = self.prepare_chunks(content).await;
+        let prepared = self.prepare_chunks_for_path(&path, content).await;
         self.storage
             .update_document_and_replace_chunks(doc.id, content, &prepared)
             .await?;
@@ -1538,6 +1540,20 @@ impl Workspace {
 
     // ==================== Indexing ====================
 
+    /// Prepare search chunks for an eligible path. Runtime state remains stored
+    /// as a document, but gets an empty chunk set so it cannot enter search.
+    async fn prepare_chunks_for_path(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> Vec<(i32, String, Option<Vec<f32>>)> {
+        if is_search_indexable_path(path) {
+            self.prepare_chunks(content).await
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Chunk content and generate embeddings without holding any DB connections.
     async fn prepare_chunks(&self, content: &str) -> Vec<(i32, String, Option<Vec<f32>>)> {
         let chunk_texts = chunk_document(content, ChunkConfig::default());
@@ -1583,7 +1599,7 @@ impl Workspace {
     /// which makes the content update and chunk replacement atomic.
     async fn reindex_document(&self, document_id: Uuid) -> Result<(), WorkspaceError> {
         let doc = self.storage.get_document_by_id(document_id).await?;
-        let prepared = self.prepare_chunks(&doc.content).await;
+        let prepared = self.prepare_chunks_for_path(&doc.path, &doc.content).await;
         self.storage.replace_chunks(document_id, &prepared).await?;
         Ok(())
     }
@@ -1796,7 +1812,7 @@ impl Workspace {
 }
 
 /// Normalize a file path (remove leading/trailing slashes, collapse //).
-fn normalize_path(path: &str) -> String {
+pub(crate) fn normalize_path(path: &str) -> String {
     let path = path.trim().trim_matches('/');
     // Collapse multiple slashes
     let mut result = String::new();
@@ -1988,6 +2004,86 @@ mod tests {
         // Injection content targeting a non-system-prompt file should not
         // be checked (the guard is in write/append, not reject_if_injected).
         assert!(!is_system_prompt_file("notes/foo.md"));
+    }
+}
+
+#[cfg(all(test, feature = "libsql"))]
+mod runtime_index_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::db::Database;
+    use crate::db::libsql::LibSqlBackend;
+
+    async fn create_test_workspace() -> (Workspace, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("runtime_index_test.db");
+        let backend = LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("LibSqlBackend");
+        backend.run_migrations().await.expect("migrations");
+        let db: Arc<dyn Database> = Arc::new(backend);
+        (Workspace::new_with_db("runtime_index_test", db), temp_dir)
+    }
+
+    #[tokio::test]
+    async fn runtime_documents_persist_without_entering_search() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let runtime_path = "engine/.runtime/threads/active/test.json";
+        let shared_term = "runtimeindexsentinel";
+
+        workspace
+            .write("notes/searchable.md", &format!("searchable {shared_term}"))
+            .await
+            .expect("write searchable document");
+        workspace
+            .write(
+                "/engine//.runtime/threads/active/test.json/",
+                &format!(r#"{{"transcript":"{shared_term}"}}"#),
+            )
+            .await
+            .expect("write runtime document");
+
+        let runtime = workspace
+            .read(runtime_path)
+            .await
+            .expect("read runtime state");
+        assert!(runtime.content.contains(shared_term));
+        assert!(
+            workspace
+                .list_all()
+                .await
+                .expect("list workspace")
+                .contains(&runtime_path.to_string())
+        );
+
+        let results = workspace
+            .search(shared_term, 10)
+            .await
+            .expect("search workspace");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].document_path, "notes/searchable.md");
+
+        let appended_term = "runtimeappendsentinel";
+        workspace
+            .append(runtime_path, appended_term)
+            .await
+            .expect("append runtime state");
+        assert!(
+            workspace
+                .search(appended_term, 10)
+                .await
+                .expect("search appended runtime state")
+                .is_empty()
+        );
+        assert!(
+            workspace
+                .read(runtime_path)
+                .await
+                .expect("read appended runtime state")
+                .content
+                .contains(appended_term)
+        );
     }
 }
 
