@@ -788,6 +788,23 @@ mod tests {
     }
 
     #[test]
+    fn cavepony_sidecar_parses_with_no_host_capabilities() {
+        let json = include_str!("../../../tools-src/cavepony/cavepony-tool.capabilities.json");
+        let caps = CapabilitiesFile::from_json(json).expect("Cavepony sidecar should parse");
+
+        assert_eq!(caps.version.as_deref(), Some("0.3.0"));
+        assert_eq!(caps.wit_version.as_deref(), Some("0.3.0"));
+        assert!(caps.http.is_none());
+        assert!(caps.secrets.is_none());
+        assert!(caps.tool_invoke.is_none());
+        assert!(caps.workspace.is_none());
+        assert!(caps.webhook.is_none());
+        assert!(caps.ssh.is_none());
+        assert!(caps.auth.is_none());
+        assert!(caps.setup.is_none());
+    }
+
+    #[test]
     fn test_parse_ssh_capability() {
         // Nested under `capabilities` (the sidecar shape), so this also
         // exercises resolve_nested_inner for the ssh field.

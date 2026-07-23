@@ -105,6 +105,22 @@ fn missing_namespace_directories_are_clean() {
     assert!(report.is_clean());
 }
 
+#[test]
+fn checked_in_cavepony_manifest_is_clean() {
+    let registry = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("registry");
+    let report = crate::registry::validation::validate_registry_dir(&registry);
+    let cavepony_findings: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.file == "tools/cavepony-tool.json")
+        .collect();
+
+    assert!(
+        cavepony_findings.is_empty(),
+        "Cavepony registry manifest findings: {cavepony_findings:#?}"
+    );
+}
+
 fn stdio(auth: &str, transport_fields: &str) -> &'static str {
     Box::leak(
         format!(

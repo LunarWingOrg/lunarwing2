@@ -290,6 +290,73 @@ async def test_mcp_server_installed_auth_dot(page):
     assert await card.locator(SEL["ext_deactivate_btn"]).count() == 1
 
 
+async def test_mcp_transport_switching_and_mobile_layout(page):
+    """HTTP/stdio controls expose correct fields without mobile overflow."""
+    await mock_ext_apis(page)
+    await go_to_mcp(page)
+    await page.set_viewport_size({"width": 390, "height": 844})
+
+    form = page.locator(SEL["mcp_install_form"])
+    http = form.locator(SEL["mcp_transport_http"])
+    stdio = form.locator(SEL["mcp_transport_stdio"])
+    http_fields = form.locator(SEL["mcp_http_fields"])
+    stdio_fields = form.locator(SEL["mcp_stdio_fields"])
+
+    assert await http.get_attribute("aria-pressed") == "true"
+    assert await stdio.get_attribute("aria-pressed") == "false"
+    assert await http_fields.is_visible()
+    assert await stdio_fields.is_hidden()
+
+    await stdio.click()
+    assert await http.get_attribute("aria-pressed") == "false"
+    assert await stdio.get_attribute("aria-pressed") == "true"
+    assert await http_fields.is_hidden()
+    assert await stdio_fields.is_visible()
+    assert await form.locator(SEL["mcp_install_command"]).is_visible()
+    assert await form.locator(SEL["mcp_install_args"]).is_visible()
+    assert await form.locator(SEL["mcp_install_env"]).is_visible()
+    assert await form.locator(SEL["mcp_env_note"]).is_visible()
+
+    layout = await form.evaluate(
+        """form => {
+            const formRect = form.getBoundingClientRect();
+            const visibleElements = Array.from(form.querySelectorAll(
+                'input, textarea, button, .mcp-transport-control, '
+                + '.mcp-mode-fields, .mcp-env-note'
+            )).filter(element => element.getClientRects().length > 0);
+            const nameRect = form.querySelector('#mcp-install-name').getBoundingClientRect();
+            const transportRect = form.querySelector('.mcp-transport-control').getBoundingClientRect();
+            const fieldsRect = form.querySelector('#mcp-stdio-fields').getBoundingClientRect();
+            const viewportWidth = window.innerWidth;
+            return {
+                pageFitsViewport: Math.max(
+                    document.documentElement.scrollWidth,
+                    document.body.scrollWidth
+                ) <= viewportWidth + 1,
+                formFitsViewport: formRect.left >= -1 && formRect.right <= viewportWidth + 1,
+                childrenFitViewport: visibleElements.every(element => {
+                    const rect = element.getBoundingClientRect();
+                    return rect.left >= -1 && rect.right <= viewportWidth + 1;
+                }),
+                controlsStacked: transportRect.top >= nameRect.bottom - 1
+                    && fieldsRect.top >= transportRect.bottom - 1,
+            };
+        }"""
+    )
+    assert layout == {
+        "pageFitsViewport": True,
+        "formFitsViewport": True,
+        "childrenFitViewport": True,
+        "controlsStacked": True,
+    }
+
+    await http.click()
+    assert await http.get_attribute("aria-pressed") == "true"
+    assert await stdio.get_attribute("aria-pressed") == "false"
+    assert await http_fields.is_visible()
+    assert await stdio_fields.is_hidden()
+
+
 async def test_mcp_deactivate_calls_api_and_refreshes_card(page):
     """Deactivate preserves the card and replaces Deactivate with Activate."""
     deactivate_called = []

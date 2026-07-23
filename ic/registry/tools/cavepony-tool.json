@@ -1,0 +1,33 @@
+{
+  "name": "cavepony-tool",
+  "display_name": "Cavepony",
+  "kind": "tool",
+  "version": "0.3.0",
+  "wit_version": "0.3.0",
+  "description": "Compress, expand, and measure prose with Cavepony token, concise, pony, and Canterlot modes",
+  "keywords": [
+    "cavepony",
+    "compression",
+    "expand",
+    "concise",
+    "tokens",
+    "pony",
+    "canterlot"
+  ],
+  "source": {
+    "dir": "tools-src/cavepony",
+    "capabilities": "cavepony-tool.capabilities.json",
+    "crate_name": "cavepony-tool"
+  },
+  "artifacts": {
+    "wasm32-wasip2": {
+      "url": null,
+      "sha256": null
+    }
+  },
+  "tags": [
+    "text",
+    "compression",
+    "productivity"
+  ]
+}

@@ -230,6 +230,12 @@ else
 fi
 assert_eq "script name is lunarwing-weechat-<tenant>" \
   "$(basename "$rc_file")" "lunarwing-weechat-render-test"
+if sh -n "$rc_file"; then
+  echo "  PASS: OpenRC script passes shell syntax check"
+else
+  echo "  FAIL: OpenRC script does not pass shell syntax check"
+  failures=$((failures + 1))
+fi
 
 # Has weechat_env_file assignment pointing at weechat.env (in := default pattern)
 expected_env_file_path="$(tenant_env_dir "render-test")/weechat.env"
@@ -298,6 +304,16 @@ if grep -q 'weechat_stop_helper' "$rc_file" \
   echo "  PASS: OpenRC stop() uses graceful stop helper"
 else
   echo "  FAIL: OpenRC stop() missing graceful stop helper"
+  failures=$((failures + 1))
+fi
+
+# stop() runs the helper under the tenant UID with argv boundaries preserved.
+if grep -qF 'start-stop-daemon --start --user "${weechat_user}"' "$rc_file" \
+  && grep -qF -- '--exec "${weechat_stop_helper}" --' "$rc_file" \
+  && grep -qF 'unset RC_SVCNAME' "$rc_file"; then
+  echo "  PASS: OpenRC stop() invokes helper under tenant UID"
+else
+  echo "  FAIL: OpenRC stop() does not invoke helper under tenant UID"
   failures=$((failures + 1))
 fi
 
