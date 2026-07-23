@@ -104,7 +104,20 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
 10. [x] update onboard ui to correspond with changes in codebase since v2.0.0.0 - surely some things have been broken at this point - in particular, kawarimi is likely broken now due to new 7z encryption
 11. [ ] review recent changes in onboard ui and see if there are issues
 12. [x] come up with a plan to create proper CI/CD in our gitlab. put it in docs/proposals. Completed 2026-07-23: `docs/proposals/GITLAB_CI_CD_PLAN.md`.
-13. [ ] follow up from item 12. work on script or build pipeline for this. in its own directory in the repo
+13. [x] follow up from item 12. work on script or build pipeline for this. in its own directory in the repo. Completed 2026-07-23.
+    <details>
+    <summary><b>Completion and verification</b></summary>
+
+    - Added root `.gitlab-ci.yml` as a small composition root, with workflow, defaults, validation, Rust, integration, and security jobs under `.gitlab/ci/`; reusable helpers and pinned Python test dependencies live under `.gitlab/scripts/` and `.gitlab/requirements/`.
+    - Merge-request workflow suppresses duplicate branch pipelines. Required MR jobs are interruptible, unprivileged, secret-free, and assigned only to configurable `lint` and `rust-x86_64` runner tags.
+    - Added blocking format/metadata, four-shape Cargo checks, workspace library tests, hermetic libSQL tests, Python suites, shell syntax/harnesses, registry JSON, version/panic policy, cargo-deny, release-tag consistency, and current-tree Gitleaks jobs. Known Clippy, architecture-boundary, ShellCheck, and historical-secret debt is explicitly observational with named removal conditions.
+    - Pinned Rust 1.92.0, OCI image digests, cargo-deny 0.20.2 archive checksum, Gitleaks 8.30.1 image digest, and full Python test dependency versions. Cargo commands use `taskset -c 0-5` and `-j6`; Rust test cases run serially because existing config/setup tests mutate process-global environment state. No CI job uses a full debug `cargo build`.
+    - Fixed baseline blockers: quality-gate working directories/resources, forge-neutral version inputs, panic scanner monorepo paths, invalid Python requirements syntax, malformed `ic/stuck.sh`, yanked `spin` 0.9.8, global test-env leakage, and missing `integration` gating for the prebuilt-WASM test target.
+    - Local verification passed: all four Cargo check shapes; main and workspace library test suites; full libSQL test tier and doctests; 214 Python tests with no skips; fixture shell harnesses; cargo-deny advisories/bans/licenses/sources; redacted Gitleaks current-tree scan; CI YAML structure; Bash/ShellCheck for changed helpers; Python syntax; registry JSON; release-policy and panic-policy self-tests; `git diff --check`.
+    - Added detailed GitLab CE activation runbook at `.gitlab/README.md`: isolated runner registration/config, tags and capacities, network policy, cache separation, protected branch/tag settings, protected-variable isolation, merge checks, CI Lint, first-MR proof, nightly schedule, and required activation evidence.
+    - Authenticated GitLab CI Lint and one clean Rust 1.92 runner pipeline remain activation steps because this branch is not yet present on GitLab. PostgreSQL integration, strict WASM/browser, standalone crates, packages, releases, and deployment remain later phases from `docs/proposals/GITLAB_CI_CD_PLAN.md`.
+    - Production CD remains intentionally absent. Current mt-admin upgrades rebuild per tenant and cannot yet activate the exact artifact tested by CI safely.
+    </details>
 14. [ ] review kawarimi adapter (item 15)
 15. [ ] review darkirc key exchange implementation
 16. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs

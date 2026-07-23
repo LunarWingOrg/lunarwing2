@@ -1,9 +1,10 @@
 # GitLab CI/CD Plan for LunarWing
 
-> **Current status (2026-07-23): PROPOSAL - ready for implementation.**
+> **Current status (2026-07-23): PHASE 1 IMPLEMENTED - GitLab activation pending.**
 > This document completes item #12 in
-> `docs/ops/AGENT_GOALS_2.0.2.0.md`. It defines the pipeline and deployment
-> design only. Item #13 should implement it in staged changes.
+> `docs/ops/AGENT_GOALS_2.0.2.0.md`. Item #13 added the root pipeline and
+> `.gitlab/` implementation. Phases 2-4 remain gated by the prerequisites below.
+> GitLab project and runner activation instructions live in `.gitlab/README.md`.
 
 **Repository audited:** `lunarwing/lunarwing2`
 **Primary project:** `ic/`
@@ -11,11 +12,11 @@
 
 ## 1. Executive Summary
 
-LunarWing currently has no root `.gitlab-ci.yml`. Quality checks exist, but
-they are fragmented across local hooks, Rust scripts, shell harnesses, Python
-tests, and manual release instructions. Some checks are not ready to become
-blocking because they assume GitHub variables, run from the wrong directory,
-or already fail against the current tree.
+Before item #13, LunarWing had no root `.gitlab-ci.yml`. The initial pipeline
+now composes local files under `.gitlab/`, runs the four Rust feature shapes,
+hermetic Rust/Python/shell tests, version and panic policy, registry parsing,
+cargo-deny, and current-tree secret detection. Known architecture, Clippy,
+ShellCheck, and history-scan debt remains explicitly observational.
 
 The recommended rollout has four operational layers:
 
@@ -43,14 +44,14 @@ not the artifact tested by CI.
 
 | Area | Current state | Consequence |
 |---|---|---|
-| Root GitLab pipeline | No root `.gitlab-ci.yml` | GitLab does not build or test the monorepo. |
+| Root GitLab pipeline | `.gitlab-ci.yml` composes local files under `.gitlab/ci/` | Phase 1 MR CI is implemented; authenticated GitLab CI Lint and runner proof remain. |
 | Nested GitLab files | Generic Auto DevOps files exist under `lunarwing_weechat_wss/` and `git-lunarwing-unix-socket-client-repo/` | They do not govern the root project. |
 | Mirror workflow | `.forgejo/workflows/mirror.yaml` force-mirrors all refs to GitHub and puts `GH_PAT` in a remote URL | Keep separate from build CI; move credentials to safer protected automation. |
-| Local quality gate | `ic/scripts/ci/quality_gate.sh` runs fmt, correctness Clippy, and library tests | Useful base, but it assumes caller already changed to `ic/` and lacks CPU limits. |
-| Strict quality gate | `ic/scripts/ci/quality_gate_strict.sh` changes to the Git repository root | It fails because root has no `Cargo.toml`; core manifest is under `ic/`. |
-| Version checks | `ic/scripts/check-version-bumps.sh` reads `GITHUB_BASE_REF`, `PR_LABELS`, and defaults to `origin/main` | Must accept neutral variables and GitLab MR metadata. |
+| Local quality gate | `ic/scripts/ci/quality_gate.sh` anchors itself to `ic/` and bounds Cargo CPU/jobs/tests | Available for local hooks; GitLab uses smaller attributed jobs. |
+| Strict quality gate | `ic/scripts/ci/quality_gate_strict.sh` now anchors itself to `ic/` and applies resource limits | Available locally once cargo-deny is installed. |
+| Version checks | `ic/scripts/check-version-bumps.sh` accepts `BASE_BRANCH`, `BASE_SHA`, and `CHANGE_LABELS` | GitLab wrapper supplies deterministic MR/push metadata; bypass requires a second maintainer-controlled variable. |
 | Boundary checks | `ic/scripts/check-boundaries.sh` exists | 2026-07-23 audit found current DB, PostgreSQL gating, silent-skip, and LLM boundary failures; baseline must be fixed before blocking. |
-| Dependency policy | `ic/deny.toml` exists | CI image must include a pinned `cargo-deny`; current host does not. |
+| Dependency policy | `ic/deny.toml` plus checksum-pinned cargo-deny 0.20.2 installer | Blocking phase 1 job passes after `spin` 0.9.8 was updated to 0.9.9. |
 | Coverage | `ic/scripts/coverage.sh` and `ic/codecov.yml` exist | Measure first; do not enforce unverified 80/90 thresholds on first pipeline. |
 | Release flow | `docs/ops/RELEASE_COMMANDS.md` describes manual tag, API, and package upload commands | It references stale repository paths and a nonexistent earlier release job. |
 | Cargo dist | `ic/Cargo.toml` configures cargo-dist for GitHub and many targets | Do not use unchanged for GitLab or promise unsupported runners. |
@@ -59,8 +60,9 @@ not the artifact tested by CI.
 
 - Core workspace is rooted at `ic/Cargo.toml`, uses Rust 2024, and declares
   MSRV 1.92.
-- README and release material mention Rust 1.96 while Docker builders use
-  1.92. No `rust-toolchain.toml` pins one exact compiler.
+- Core manifests, Docker builders, root README, and `ic/rust-toolchain.toml`
+  now use Rust 1.92/1.92.0. Historical release notes still record their
+  original toolchain claims.
 - Every Cargo command must run with CPU affinity `taskset -c 0-5`; compile,
   test, and Clippy commands must use at most `-j6`, and tests must use at most
   six test threads.
@@ -267,22 +269,27 @@ is green or a bounded cleanup change lands. Do not leave it permanently
 Required hermetic MR jobs:
 
 ```bash
-taskset -c 0-5 cargo test -j6 --locked --workspace --lib -- --test-threads=6
-taskset -c 0-5 cargo test -j6 --locked --no-default-features --features libsql --no-fail-fast -- --test-threads=6
+taskset -c 0-5 cargo test -j6 --locked --workspace --lib -- --test-threads=1
+taskset -c 0-5 cargo test -j6 --locked --no-default-features --features libsql --no-fail-fast -- --test-threads=1
 ```
+
+Full-suite test cases run serially because existing config/setup tests mutate
+the process environment. Keep Cargo compilation at `-j6`; raise test-thread
+parallelism only after those tests use subprocess isolation or stop mutating
+process-global environment state.
 
 Default-branch or scheduled full jobs:
 
 ```bash
-taskset -c 0-5 cargo test -j6 --locked --workspace --no-fail-fast -- --test-threads=6
-taskset -c 0-5 cargo test -j6 --locked --no-default-features --features "libsql integration" --no-fail-fast -- --test-threads=6
+taskset -c 0-5 cargo test -j6 --locked --workspace --no-fail-fast -- --test-threads=1
+taskset -c 0-5 cargo test -j6 --locked --no-default-features --features "libsql integration" --no-fail-fast -- --test-threads=1
 ```
 
 PostgreSQL integration uses an isolated `pgvector/pgvector:pg16` service and a
 unique disposable database:
 
 ```bash
-taskset -c 0-5 cargo test -j6 --locked --no-default-features --features "postgres integration" --no-fail-fast -- --test-threads=6
+taskset -c 0-5 cargo test -j6 --locked --no-default-features --features "postgres integration" --no-fail-fast -- --test-threads=1
 ```
 
 Fix feature gates and silent skips before this job becomes release-blocking.

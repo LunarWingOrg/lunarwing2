@@ -4029,6 +4029,7 @@ mod tests {
         let _lock = lock_env();
         // Ensure the real env var is unset so the only source is the overlay.
         let _guard = EnvGuard::clear("LUNARWING_CLOUD_API_KEY");
+        let _guard2 = EnvGuard::clear("LUNARWING_CLOUD_BASE_URL");
 
         crate::config::helpers::set_runtime_env("LUNARWING_CLOUD_API_KEY", "test-key-from-overlay");
         let config = build_lunarwing_cloud_model_fetch_config();

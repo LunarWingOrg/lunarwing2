@@ -1,0 +1,36 @@
+python-unit:
+  extends: .python-job
+  stage: test
+  needs:
+    - python-syntax
+  script:
+    - python3 .gitlab/scripts/python_tests.py
+
+shell-harnesses:
+  extends: .shell-job
+  stage: test
+  needs:
+    - shell-syntax
+  timeout: 30m
+  script:
+    - bash .gitlab/scripts/shell-harnesses.sh
+
+# Owner: architecture maintainers. Block after current heuristic violations are fixed.
+architecture-boundaries:
+  extends:
+    - .shell-job
+    - .observational-job
+  stage: observe
+  needs: []
+  script:
+    - bash ic/scripts/check-boundaries.sh
+
+# Owner: operations maintainers. Block after existing warning baseline reaches zero.
+shellcheck:
+  extends:
+    - .shell-job
+    - .observational-job
+  stage: observe
+  needs: []
+  script:
+    - bash .gitlab/scripts/shellcheck.sh
