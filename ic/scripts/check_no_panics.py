@@ -6,11 +6,14 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from dataclasses import dataclass
+from unittest import mock
 
 
 PANIC_PATTERN = re.compile(r"\.(?:unwrap|expect)\(|(?<!_)assert(?:_eq|_ne)?!")
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 TEST_ATTR_PATTERN = re.compile(
     r"^\s*#\s*\[\s*(?:"
     r"test"
@@ -45,6 +48,7 @@ def run_git(*args: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        cwd=PROJECT_ROOT,
     )
     return result.stdout
 
@@ -186,7 +190,15 @@ def line_test_contexts(lines: list[str]) -> list[bool]:
 
 
 def changed_rust_files(base: str, head: str) -> list[pathlib.Path]:
-    output = run_git("diff", "--name-only", f"{base}...{head}", "--", "src", "crates")
+    output = run_git(
+        "diff",
+        "--name-only",
+        "--relative",
+        f"{base}...{head}",
+        "--",
+        "src",
+        "crates",
+    )
     files = []
     for line in output.splitlines():
         if line.endswith(".rs") and (line.startswith("src/") or line.startswith("crates/")):
@@ -223,13 +235,14 @@ def collect_violations(base: str, head: str) -> list[tuple[str, int, str]]:
     violations: list[tuple[str, int, str]] = []
 
     for path in changed_rust_files(base, head):
-        if not path.exists():
+        source_path = PROJECT_ROOT / path
+        if not source_path.exists():
             continue
         added_lines = added_lines_for_file(base, head, path)
         if not added_lines:
             continue
 
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = source_path.read_text(encoding="utf-8").splitlines()
         contexts = line_test_contexts(lines)
         lexer = LexerState()
         sanitized = [sanitize_line(line, lexer) for line in lines]
@@ -249,7 +262,7 @@ def collect_violations(base: str, head: str) -> list[tuple[str, int, str]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base", required=False, default="origin/staging")
+    parser.add_argument("--base")
     parser.add_argument("--head", required=False, default="HEAD")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -258,6 +271,9 @@ def main() -> int:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(CheckNoPanicsTests)
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         return 0 if result.wasSuccessful() else 1
+
+    if not args.base:
+        parser.error("--base is required unless --self-test is used")
 
     violations = collect_violations(args.base, args.head)
     if not violations:
@@ -276,6 +292,60 @@ def main() -> int:
 
 
 class CheckNoPanicsTests(unittest.TestCase):
+    def test_collect_violations_reads_core_relative_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = pathlib.Path(directory)
+            source = project_root / "src" / "example.rs"
+            source.parent.mkdir()
+            source.write_text('fn prod() { value.expect("boom"); }\n', encoding="utf-8")
+
+            with (
+                mock.patch(f"{__name__}.PROJECT_ROOT", project_root),
+                mock.patch(
+                    f"{__name__}.changed_rust_files",
+                    return_value=[pathlib.Path("src/example.rs")],
+                ),
+                mock.patch(f"{__name__}.added_lines_for_file", return_value={1}),
+            ):
+                violations = collect_violations("base", "head")
+
+        self.assertEqual(
+            violations,
+            [("src/example.rs", 1, 'fn prod() { value.expect("boom"); }')],
+        )
+
+    def test_run_git_is_anchored_to_core_project(self) -> None:
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="")
+        with mock.patch.object(subprocess, "run", return_value=completed) as run:
+            run_git("status", "--short")
+
+        run.assert_called_once_with(
+            ["git", "status", "--short"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT,
+        )
+
+    def test_changed_files_are_relative_to_core_project(self) -> None:
+        output = "src/agent.rs\ncrates/example/src/lib.rs\nic/src/wrong.rs\nREADME.md\n"
+        with mock.patch(f"{__name__}.run_git", return_value=output) as run:
+            files = changed_rust_files("base", "head")
+
+        self.assertEqual(
+            files,
+            [pathlib.Path("src/agent.rs"), pathlib.Path("crates/example/src/lib.rs")],
+        )
+        run.assert_called_once_with(
+            "diff",
+            "--name-only",
+            "--relative",
+            "base...head",
+            "--",
+            "src",
+            "crates",
+        )
+
     def test_cfg_test_module_marks_inner_lines(self) -> None:
         lines = [
             "#[cfg(test)]\n",

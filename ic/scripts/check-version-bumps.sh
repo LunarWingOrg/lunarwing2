@@ -14,6 +14,11 @@ PROJECT_PREFIX=${PROJECT_PREFIX%/}
 
 cd "$PROJECT_ROOT"
 
+if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required for registry version checks." >&2
+    exit 2
+fi
+
 repo_file_path() {
     local file="$1"
     if [[ -n "$PROJECT_PREFIX" ]]; then
@@ -23,35 +28,58 @@ repo_file_path() {
     fi
 }
 
-# --- Skip mechanism -----------------------------------------------------------
-
-if [[ "${PR_LABELS:-}" == *"skip-version-check"* ]]; then
-    echo "skip-version-check label detected — skipping all version checks."
-    exit 0
-fi
-
-# Check commit messages for [skip-version-check]
-if git log "origin/${GITHUB_BASE_REF:-main}...HEAD" --pretty=format:"%s %b" 2>/dev/null \
-    | grep -qF '[skip-version-check]'; then
-    echo "[skip-version-check] found in commit message — skipping all version checks."
-    exit 0
-fi
-
 # --- Determine base branch and changed files ----------------------------------
 
-BASE_BRANCH="${GITHUB_BASE_REF:-main}"
-echo "Base branch: $BASE_BRANCH"
+BASE_BRANCH="${BASE_BRANCH:-}"
+BASE_SHA="${BASE_SHA:-}"
+CHANGE_LABELS="${CHANGE_LABELS:-}"
 
-# Ensure the base branch ref is available
-if ! git rev-parse "origin/${BASE_BRANCH}" >/dev/null 2>&1; then
-    echo "Fetching origin/${BASE_BRANCH}..."
-    git fetch origin "$BASE_BRANCH" --depth=1
+if [[ -n "$BASE_SHA" ]]; then
+    if ! git -C "$REPO_ROOT" rev-parse --verify "$BASE_SHA^{commit}" >/dev/null 2>&1; then
+        echo "Fetching base commit $BASE_SHA..."
+        git -C "$REPO_ROOT" fetch origin "$BASE_SHA" --depth=1
+    fi
+    BASE_REF="$BASE_SHA"
+    echo "Base commit: $BASE_REF"
+else
+    if [[ -z "$BASE_BRANCH" ]]; then
+        remote_head=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+        BASE_BRANCH=${remote_head#origin/}
+    fi
+    if [[ -z "$BASE_BRANCH" ]]; then
+        if git -C "$REPO_ROOT" rev-parse --verify origin/master >/dev/null 2>&1; then
+            BASE_BRANCH=master
+        elif git -C "$REPO_ROOT" rev-parse --verify origin/main >/dev/null 2>&1; then
+            BASE_BRANCH=main
+        else
+            echo "ERROR: set BASE_BRANCH or BASE_SHA to a valid comparison base." >&2
+            exit 2
+        fi
+    fi
+
+    BASE_REF="origin/${BASE_BRANCH}"
+    echo "Base branch: $BASE_BRANCH"
+    if ! git -C "$REPO_ROOT" rev-parse --verify "$BASE_REF^{commit}" >/dev/null 2>&1; then
+        echo "Fetching $BASE_REF..."
+        git -C "$REPO_ROOT" fetch origin "$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH" --depth=1
+    fi
+fi
+
+# --- Skip mechanism -----------------------------------------------------------
+
+if [[ ",${CHANGE_LABELS}," == *",skip-version-check,"* ]]; then
+    if [[ "${ALLOW_VERSION_CHECK_SKIP:-0}" != "1" ]]; then
+        echo "ERROR: skip-version-check requires maintainer-controlled ALLOW_VERSION_CHECK_SKIP=1." >&2
+        exit 1
+    fi
+    echo "Authorized skip-version-check label detected - skipping all version checks."
+    exit 0
 fi
 
 if [[ -n "$PROJECT_PREFIX" ]]; then
-    CHANGED_FILES=$(git -C "$REPO_ROOT" diff --name-only --relative="$PROJECT_PREFIX" "origin/${BASE_BRANCH}...HEAD" -- "$PROJECT_PREFIX")
+    CHANGED_FILES=$(git -C "$REPO_ROOT" diff --name-only --relative="$PROJECT_PREFIX" "$BASE_REF...HEAD" -- "$PROJECT_PREFIX")
 else
-    CHANGED_FILES=$(git -C "$REPO_ROOT" diff --name-only "origin/${BASE_BRANCH}...HEAD")
+    CHANGED_FILES=$(git -C "$REPO_ROOT" diff --name-only "$BASE_REF...HEAD")
 fi
 
 if [[ -z "$CHANGED_FILES" ]]; then
@@ -75,7 +103,7 @@ extract_wit_version() {
 # Extract version from the base branch copy of a file
 extract_wit_version_base() {
     local file="$1"
-    git show "origin/${BASE_BRANCH}:$(repo_file_path "$file")" 2>/dev/null \
+    git show "$BASE_REF:$(repo_file_path "$file")" 2>/dev/null \
         | sed -n 's/^[[:space:]]*package[[:space:]]\+[^@]*@\([0-9][0-9.]*[0-9]\)[[:space:]]*;.*/\1/p' \
         | head -n1 || true
 }
@@ -105,7 +133,7 @@ extract_json_version() {
 # Extract JSON "version" from the base branch copy of a file
 extract_json_version_base() {
     local file="$1"
-    git show "origin/${BASE_BRANCH}:$(repo_file_path "$file")" 2>/dev/null | jq -r '.version // empty' 2>/dev/null || true
+    git show "$BASE_REF:$(repo_file_path "$file")" 2>/dev/null | jq -r '.version // empty' 2>/dev/null || true
 }
 
 # Return 0 if $1 (new) is strictly greater than $2 (old) via sort -V, or old is empty.
@@ -211,7 +239,8 @@ for tool in $TOOL_NAMES; do
     echo "  --- tools-src/${tool}/ changed ---"
 
     if [[ ! -f "$REGISTRY_FILE" ]]; then
-        echo "  SKIP: ${REGISTRY_FILE} does not exist yet (new extension?)."
+        echo "  ERROR: ${REGISTRY_FILE} is required for tools-src/${tool}/."
+        ERRORS=$((ERRORS + 1))
         continue
     fi
 
@@ -243,7 +272,8 @@ for channel in $CHANNEL_NAMES; do
     echo "  --- channels-src/${channel}/ changed ---"
 
     if [[ ! -f "$REGISTRY_FILE" ]]; then
-        echo "  SKIP: ${REGISTRY_FILE} does not exist yet (new extension?)."
+        echo "  ERROR: ${REGISTRY_FILE} is required for channels-src/${channel}/."
+        ERRORS=$((ERRORS + 1))
         continue
     fi
 

@@ -167,7 +167,7 @@ Kawarimi supports PostgreSQL tenants; libSQL bundles are refused. A real export 
 
 ## Development and testing
 
-The Rust workspace lives under `ic/` and uses Rust 1.96.
+The Rust workspace lives under `ic/` and uses Rust 1.92.0.
 
 ```bash
 cd ic

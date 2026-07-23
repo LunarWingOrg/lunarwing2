@@ -33,7 +33,7 @@ pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 3600;
 /// (try the next provider). The question is: "could this exact same request
 /// succeed if we try again?"
 ///
-/// Retryable: `RequestFailed`, `RateLimited`, `InvalidResponse`,
+/// Retryable: transient `RequestFailed`, `RateLimited`, `InvalidResponse`,
 /// `SessionRenewalFailed`, `Http`, `Io`.
 ///
 /// Non-retryable: `AuthFailed`, `SessionExpired`, `ContextLengthExceeded`,
@@ -45,15 +45,44 @@ pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 3600;
 /// See also `circuit_breaker::is_transient()` which answers a different
 /// question: "does this error indicate the backend is degraded?"
 pub(crate) fn is_retryable(err: &LlmError) -> bool {
-    matches!(
-        err,
-        LlmError::RequestFailed { .. }
-            | LlmError::RateLimited { .. }
-            | LlmError::InvalidResponse { .. }
-            | LlmError::SessionRenewalFailed { .. }
-            | LlmError::Http(_)
-            | LlmError::Io(_)
-    )
+    match err {
+        LlmError::RequestFailed { reason, .. } => !is_oversized_request(reason),
+        LlmError::RateLimited { .. }
+        | LlmError::InvalidResponse { .. }
+        | LlmError::SessionRenewalFailed { .. }
+        | LlmError::Io(_) => true,
+        LlmError::Http(error) => error.status().is_none_or(|status| status.as_u16() != 413),
+        LlmError::AuthFailed { .. }
+        | LlmError::SessionExpired { .. }
+        | LlmError::ContextLengthExceeded { .. }
+        | LlmError::ModelNotAvailable { .. }
+        | LlmError::Json(_) => false,
+    }
+}
+
+/// Rig and OpenAI-compatible proxies often flatten typed provider errors into
+/// `RequestFailed`. Detect deterministic size failures so retry/failover does
+/// not resend the exact same oversized payload.
+fn is_oversized_request(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    [
+        "context length exceeded",
+        "context_length_exceeded",
+        "maximum context length",
+        "context window exceeded",
+        "exceeds the context window",
+        "too many input tokens",
+        "payload too large",
+        "request entity too large",
+        "request too large",
+        "413 payload too large",
+        "status code: 413",
+        "status code 413",
+        "\"status_code\":413",
+        "\"status_code\": 413",
+    ]
+    .iter()
+    .any(|pattern| reason.contains(pattern))
 }
 
 /// Calculate exponential backoff delay with random jitter.
@@ -431,6 +460,21 @@ mod tests {
             provider: "p".into(),
             model: "m".into(),
         }));
+    }
+
+    #[test]
+    fn oversized_request_wrapped_as_request_failed_is_not_retryable() {
+        for reason in [
+            "400 Bad Request: maximum context length exceeded",
+            "upstream error: context_length_exceeded",
+            "413 Payload Too Large",
+            r#"502 Bad Gateway: {"status_code":413,"message":"Payload Too Large"}"#,
+        ] {
+            assert!(!is_retryable(&LlmError::RequestFailed {
+                provider: "proxy".into(),
+                reason: reason.into(),
+            }));
+        }
     }
 
     // -- RetryProvider tests --

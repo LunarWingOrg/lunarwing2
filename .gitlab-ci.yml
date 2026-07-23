@@ -1,0 +1,14 @@
+include:
+  - local: "/.gitlab/ci/workflow.yml"
+  - local: "/.gitlab/ci/defaults.yml"
+  - local: "/.gitlab/ci/validate.yml"
+  - local: "/.gitlab/ci/rust.yml"
+  - local: "/.gitlab/ci/integration.yml"
+  - local: "/.gitlab/ci/security.yml"
+
+stages:
+  - validate
+  - check
+  - test
+  - security
+  - observe

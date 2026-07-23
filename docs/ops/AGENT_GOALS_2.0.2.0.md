@@ -1,62 +1,19 @@
-# PRE-RELEASE CHECKLIST for LunarWing v2.0.2.0 Codename `Unknown`
+# PRE-RELEASE CHECKLIST for LunarWing v2.0.2.0 Codename `Dōkutsu`
 
-## Release Codename:  UNKNOWN
-## English Context:   UNKNOWN
+## Release Codename:  洞窟
+## English Context:   Cave
 
 **Open TODOs (v2.0.2.0) — To be done before release**
 
 ---
-
-1. [x] Take a look at docs/proposals/IRONCLAW_ADDITION_CANDIDATES.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/README.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-1.0.0-rc.1-port-analysis.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-reborn-port-analysis.md - Identify the top 2 HIGHEST PRIORITY things to implement from candidate additions. Create a single document under docs/proposals to plan these 2 additions.
-2. [x] Take a look at docs/proposals/IRONCLAW_ADDITION_CANDIDATES.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/README.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-1.0.0-rc.1-port-analysis.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-reborn-port-analysis.md - Identify the top 3 EASIEST things to implement from candidate additions. Create a single document under docs/proposals to plan these 3 additions.
-3. [x] get back to previous refactor mt admin idea. see the section of docs/proposals/MT-ADMIN-DECOMPOSITION.md — review notes section of: `docs/ops/KUMOGAKURE_RECENT_REV_T.md` - you will NOT begin ANY work on this yet. you will simply edit the document already created under docs/proposals called `MT-ADMIN-DECOMPOSITION.md`
-4. [x] continue to work on kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. SEE: SECTION: hermes_kawarimi — review notes in docs/ops/KUMOGAKURE_RECENT_REV_T.md for suggestedm improvements/concerns
-5. [x] work on weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued. FEEDBACK FROM LAST TIME: 19:34:19 wrench │ ### Verdict
+1. [ ] Bump crate versions. they are at 2.0.1. we bump to 2.0.2
+2. [x] (S) Go over proposals
+3. [x] (S) get back to previous refactor mt admin idea. see the section of docs/proposals/MT-ADMIN-DECOMPOSITION.md — review notes section of: `docs/ops/KUMOGAKURE_RECENT_REV_T.md` - you will NOT begin ANY work on this yet. you will simply edit the document already created under docs/proposals called `MT-ADMIN-DECOMPOSITION.md`
+4. [x] (S) continue to work on kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. SEE: SECTION: hermes_kawarimi — review notes in docs/ops/KUMOGAKURE_RECENT_REV_T.md for suggestedm improvements/concerns
+5. [x] (S) work on weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued. FEEDBACK FROM LAST TIME: 19:34:19 wrench │ ### Verdict
 One real bug found: OpenRC weechat stop() invokes the helper as root instead of the tenant user, which will fail to find the tmux socket. Medium severity — the graceful stop silently becomes a no-op on OpenRC, though the old kill-session behavior would also be broken (same root-cause: missing su). The systemd path is unaffected. Otherwise: solid feature work. The weechat buffer restore is well-designed (proper wrapper script, good fallback chain, both init systems covered, renderer tests). The test-deferral approach is pragmatic and well-documented. You may attempt to use the following work from failed/partial work on these salvaged, incomplete branches: { rarity/item-16-20260722-1201 } { rarity/item-16-20260722-2123 } { rarity/item-16-20260723-0000 }
-6. [x] Inspect status of cargo crates and create documented report of any crates that might still need to be updated. Verify if the info dump below is still correct, then write up a document in docs/ops detailing the status: is each piece verifiable? what outstanding issues remain? which points have already been addressed?
-    <details>
-    <summary><b>INFO DUMP — Crate audit reference</b></summary>
-    tower-http | 0.6.10 | 0.7.0 | Available but not required. 0.6.11 patch is available. That's the only crate with a major version available. And it's just 0.7.0 — not a huge jump.
-    Things You Might Have Missed:
-    1 rand 0.8.6 — Still on 0.8. The dry-run shows 0.10.2 is available but it would be a breaking change (API redesign in 0.9+). If you've deliberately stayed on 0.8, that's fine. Just be aware it's two major versions behind.
-    2 base64 0.21.7 — Still on 0.21. Version 0.22 is available. Minor API changes (Engine trait moved). Used in ssh_hostkeys.rs for fingerprint computation.
-    3 wasmparser 0.220.1 — Bundled with wasmtime 36, so it's fine. The dry-run doesn't try to update it independently.
-    4 pathdiff being removed — The dry-run removes pathdiff v0.2.3 as unused. Good, less deps.
-    5 wasip3 being removed — Also cleaned up as unused. Good.
-    My Recommendation:
-    # Safe to run right now — all patch/minor bumps
-    cargo update
-    # Then verify
-    cargo check --lib
-    cargo test --lib
-    NOTE: Crates to be deferred until 2.0.0+:
-    - rand 0.8 → 0.10 — Breaking, but can be deferred
-    - base64 0.21 → 0.22 — Minor breaking, can be deferred
-    - tower-http 0.6 → 0.7 — Can be deferred
-    This issue documents a crate audit. Current state:
-    - tower-http 0.6.10 → 0.7.0: Still on 0.6 in ic/Cargo.toml. Deferred per issue notes.
-    - rand 0.8.6 → 0.10.2: Still on 0.8 in ic/Cargo.toml. Breaking change, deferred.
-    - base64 0.21.7 → 0.22: Still on 0.21 in ic/Cargo.toml. Minor breaking, deferred.
-    - The cargo update (patch/minor bumps) recommendation may or may not have been run.
-    Verdict: The deferred crates (rand, base64, tower-http) are intentionally held back for 2.0.0+. The patch-level cargo update should be verified. Genuinely open — deferred to 2.0.0+.
-    </details>
-    
-7. [x] Harden and verify the unified Linux `aarch64`/`x86_64` native build script at `scripts/build-lunarwing.sh`. Completed 2026-07-22.
-    <details>
-    <summary><b>Completion and verification</b></summary>
-
-    - Automatic parallelism now uses 75% of effective CPUs, never zero, capped by available memory. Affinity and inherited cgroup v1/v2 CPU and memory limits are included.
-    - `-j` and `BUILD_JOBS` remain explicit overrides, with validation and warnings when they exceed the safe automatic recommendation. Command-line flags take precedence over environment defaults.
-    - Removed all automatic Cargo/Rust process killing and Cargo lock-file deletion. Concurrent invocations of this helper use a canonical-target sidecar `flock`; `--clean` fails closed when safe locking is unavailable.
-    - Target paths are created and canonicalized, aliases resolving to `/` are rejected, tmpfs/ramfs and low-disk conditions are reported, and paths containing spaces are preserved.
-    - Cargo is invoked without `eval` as `cargo build --locked --bin lunarwing`; release/debug validation, unique logs, dry-run behavior, configured Cargo targets, and failure propagation are covered.
-    - The script intentionally supports Linux only. `aarch64` and `x86_64` use the same resource-based policy rather than unreliable architecture-specific resource assumptions.
-    - Added `scripts/tests/test-build-lunarwing.sh`: 37 focused checks pass. `bash -n`, ShellCheck warning-level validation, and `git diff --check` also pass.
-    - Native `x86_64` verification command: `taskset -c 0-5 ./scripts/build-lunarwing.sh`. Result: automatic `-j4`, 769 crates compiled, successful release build in 11m 5s, 2.8GB target directory, and a stripped 97MB x86-64 ELF binary. `lunarwing --version` reports `2.0.1`.
-    - Native execution on an `aarch64` host was not available in this worktree; the shared architecture path and resource calculations are covered by the shell harness.
-    </details>
-    
-8. [ ] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
+6. [x] (S) Inspect status of cargo crates
+7. [ ] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. Reference the branch here for prior/failed/unverified attempt: rarity/item-8-20260723-0855
     <details>
     <summary><b>✅ DONE (verified 2026-07-21) — Foundational: first-class host-local stdio MCP installation</b></summary>
     Confirmed present in code with references:
@@ -100,21 +57,19 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
 
     **Defer for now:** worker-local MCP, automatic npm/pip install, secret injection through process env, general runtime-adapter refactor, gateway integration, automatic crash restart — each materially increases the security/lifecycle surface.
     </details>
-9. [ ] dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the branch: rarity/item-20-20260722-1501
-10. [x] update onboard ui to correspond with changes in codebase since v2.0.0.0 - surely some things have been broken at this point - in particular, kawarimi is likely broken now due to new 7z encryption
-11. [ ] review recent changes in onboard ui and see if there are issues
-12. [ ] come up with a plan to create proper CI/CD in our gitlab. put it in docs/proposals
-13. [ ] follow up from item 12. work on script or build pipeline for this. in its own directory in the repo
-14. [ ] review kawarimi adapter (item 15)
-15. [ ] review darkirc key exchange implementation
-16. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
-17. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
-18. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
-19. [ ] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
-20. [ ] update docs/README.md
-21. [ ] update README.md at repo root
-22. [ ] come up with codename ideas for release
-23. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.2.0 explaining all relevant changes since v2.0.1.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.2.0.md and should be written to the ROOT of the repo
-24. [ ] Improve accuracy of RELEASE-v2.0.2.0.md
+8. [x] (S) dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the branch: rarity/item-20-20260722-1501
+9. [ ] review recent changes in onboard ui and see if there are issues
+10. [x] (S) review kawarimi adapter (item 15)
+11. [x] (S) review darkirc key exchange implementation
+12. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
+13. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+14. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
+15. [ ] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
+16. [ ] update docs/README.md
+17. [ ] update README.md at repo root
+18. [x] come up with codename ideas for release
+19. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.2.0 explaining all relevant changes since v2.0.1.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `Dōkutsu` — The file you write will be RELEASE-v2.0.2.0.md and should be written to the ROOT of the repo
+20. [ ] Improve accuracy of the first draft of release notes (from previous task) - RELEASE-v2.0.2.0.md
 
 ---
+

@@ -1592,6 +1592,14 @@ ensure_tenant_wasm_toolchain() {
   local name="$1"
   local cargo_src='if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; else export PATH="$HOME/.cargo/bin:$PATH"; fi;'
 
+  # Run rustup inside the tenant repo when it exists so rust-toolchain.toml
+  # selects the pinned build toolchain: the wasm target must be added to (and
+  # verified on) THAT toolchain, not the tenant's default, or the pinned build in
+  # build-wasm-extensions.sh still can't find it.
+  local repo repo_cd=""
+  repo="$(tenant_repo "$name" 2>/dev/null || true)"
+  [[ -n "$repo" && -d "$repo" ]] && repo_cd="cd '$repo' && "
+
   # Install rustup for tenant user if not already present
   if ! sudo -u "$name" bash -c "${cargo_src} command -v rustup" &>/dev/null; then
     say "installing rustup for $name ..."
@@ -1608,7 +1616,7 @@ ensure_tenant_wasm_toolchain() {
 
   # Ensure WASM targets and cargo-component are installed
   say "ensuring WASM toolchain for $name ..."
-  sudo -u "$name" bash -c "${cargo_src} rustup target add wasm32-wasip1 wasm32-wasip2 2>&1" || true
+  sudo -u "$name" bash -c "${cargo_src} ${repo_cd}rustup target add wasm32-wasip1 wasm32-wasip2 2>&1" || true
   if ! sudo -u "$name" bash -c "${cargo_src} command -v cargo-component" &>/dev/null; then
     say "installing cargo-component and wasm-tools for $name ..."
     sudo -u "$name" bash -c "${cargo_src} cargo install cargo-component wasm-tools --locked 2>&1" || true
@@ -1617,7 +1625,7 @@ ensure_tenant_wasm_toolchain() {
   # Final verification — loud, actionable, never fatal.
   local missing=()
   sudo -u "$name" bash -c "${cargo_src} command -v cargo-component" &>/dev/null || missing+=("cargo-component")
-  sudo -u "$name" bash -c "${cargo_src} rustup target list --installed 2>/dev/null | grep -q wasm32-wasip2" \
+  sudo -u "$name" bash -c "${cargo_src} ${repo_cd}rustup target list --installed 2>/dev/null | grep -q wasm32-wasip2" \
     || missing+=("wasm32-wasip2 target")
   if ((${#missing[@]} > 0)); then
     say "" >&2

@@ -186,7 +186,7 @@ impl LlmConfig {
 
         let request_timeout_secs = parse_optional_env("LLM_REQUEST_TIMEOUT_SECS", 120)?;
         // Total budget for one logical LLM call (all internal retries included).
-        // Defaults to 270s — deliberately below the 300s agent `handle_message`
+        // Defaults to 370s — deliberately below the 630s agent `handle_message`
         // turn timeout — so a hung backend fails gracefully instead of being
         // hard-killed mid-turn (which clears the thread's pending queue and drops
         // the user's queued follow-up). See ic/src/llm/timeout.rs. 0 disables.

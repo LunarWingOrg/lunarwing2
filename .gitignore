@@ -34,6 +34,8 @@ tests/fixtures/llm_traces/live/github_dev_workflow_full_loop.log
 .pebble/mcp/
 .codegraph
 .zcode/
+/.ci-bin/
+/.ci-cache/
 
 # Claude↔Codex orchestration
 **/.codex-runs/
