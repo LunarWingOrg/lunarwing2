@@ -18,7 +18,7 @@ The v2 line introduces the new execution engine, a browser-based multi-tenant on
 - [Documentation index](docs/README.md)
 - [Community guide](COMMUNITY.md)
 - [Project manifesto](MANIFESTO.md)
-- [Canonical source on Codeberg](https://codeberg.org/LunarWing/LunarWing_v2)
+- [Canonical source on Gitlab](https://git.lunarwing.org/lunarwing/lunarwing2)
 - [IRC: #lunarwing on Libera.Chat](https://web.libera.chat/?channel=#lunarwing)
 - [AGPL-3.0-or-later license](LICENSE)
 
@@ -199,7 +199,6 @@ LunarWing focuses on user freedom, self-hostable infrastructure, and open commun
 [![Chat on IRC](https://img.shields.io/badge/IRC-%23lunarwing-00b0aa?style=for-the-badge&labelColor=000000)](https://web.libera.chat/?channel=#lunarwing)
 
 - [Project blog](https://blog.lunarwing.org/)
-- [Codeberg development repository](https://codeberg.org/LunarWing/LunarWing_v2)
-- [GitHub convenience mirror](https://github.com/LunarWingOrg/lunarwing2) — the mirror may lag behind Codeberg
+- [Gitlab development repository](https://git.lunarwing.org/lunarwing/lunarwing2)
 
 LunarWing is self-funded and maintained by volunteers. The project is licensed under [AGPL-3.0-or-later](LICENSE).
