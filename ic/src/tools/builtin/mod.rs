@@ -22,7 +22,7 @@ mod tool_info;
 pub use echo::EchoTool;
 pub use extension_tools::{
     ExtensionInfoTool, ToolActivateTool, ToolAuthTool, ToolDeactivateTool, ToolInstallTool,
-    ToolListTool, ToolRemoveTool, ToolSearchTool, ToolUpgradeTool,
+    ToolListTool, ToolRemoveTool, ToolSearchTool, ToolUpdateTool, ToolUpgradeTool,
 };
 pub use file::{ApplyPatchTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use http::{HttpTool, extract_host_from_params};
