@@ -89,10 +89,13 @@ fn normalize_pause_outcome(
     Ok(())
 }
 
+/// Maximum wall-clock duration for one orchestrator VM invocation.
+pub const ORCHESTRATOR_TIMEOUT_SECS: u64 = 600;
+
 /// Resource limits for the orchestrator VM.
 fn orchestrator_limits() -> ResourceLimits {
     ResourceLimits::new()
-        .max_duration(std::time::Duration::from_secs(300)) // 5 min (longer than user code)
+        .max_duration(std::time::Duration::from_secs(ORCHESTRATOR_TIMEOUT_SECS))
         .max_allocations(5_000_000)
         .max_memory(128 * 1024 * 1024) // 128 MB
 }

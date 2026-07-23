@@ -5,7 +5,8 @@
 //!
 //! Without this cap, a hung backend lets [`crate::llm::retry::RetryProvider`]
 //! stack `max_retries + 1` attempts of `request_timeout_secs` each (e.g.
-//! 4 × 120s ≈ 487s) far past the agent's `handle_message` turn budget (300s).
+//! 4 × 120s ≈ 487s) can consume most of the agent's 630s `handle_message`
+//! turn budget.
 //! The agent then *hard-kills* the turn and clears its pending queue, silently
 //! dropping the user's queued follow-up. By failing *gracefully* with a
 //! retryable [`LlmError`] before the turn budget is hit, the turn instead

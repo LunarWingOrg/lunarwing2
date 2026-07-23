@@ -2785,12 +2785,14 @@ async fn await_thread_outcome(
     thread_id: lunarwing_engine::ThreadId,
     mut event_rx: tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
 ) -> Result<Option<String>, Error> {
+    const OUTCOME_TIMEOUT_SECS: u64 =
+        lunarwing_engine::executor::orchestrator::ORCHESTRATOR_TIMEOUT_SECS + 10;
+
     let tid_str = thread_id.to_string();
 
-    // Safety timeout: if the thread doesn't finish within 5 minutes,
-    // break out to avoid hanging the user session forever (e.g. after
-    // a denied approval where the thread fails to resume).
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    // Allow the orchestrator's full runtime plus cleanup/event delivery grace.
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(OUTCOME_TIMEOUT_SECS);
 
     loop {
         tokio::select! {
@@ -2820,7 +2822,8 @@ async fn await_thread_outcome(
                 if tokio::time::Instant::now() >= deadline {
                     tracing::warn!(
                         thread_id = %thread_id,
-                        "await_thread_outcome timed out after 5 minutes — breaking to avoid hang"
+                        timeout_secs = OUTCOME_TIMEOUT_SECS,
+                        "await_thread_outcome timed out — breaking to avoid hang"
                     );
                     break;
                 }
