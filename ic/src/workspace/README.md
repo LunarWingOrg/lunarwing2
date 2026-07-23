@@ -32,6 +32,7 @@ workspace/
 │   └── alpha/
 │       ├── README.md
 │       └── notes.md
+├── engine/.runtime/       <- Internal Engine recovery state (persisted, not search-indexed)
 └── ...
 ```
 
@@ -76,6 +77,11 @@ Four tools for LLM use:
 - **`memory_write`** - Write to any path (memory, daily_log, or custom paths)
 - **`memory_read`** - Read any file by path
 - **`memory_tree`** - View workspace structure as a tree (depth parameter, default 1)
+
+`memory_search` excludes internal `engine/.runtime/**` documents. Each returned
+snippet is bounded to 2,000 JSON-encoded bytes, and the complete result remains
+valid JSON bounded to 8,000 serialized bytes. Queries are limited to 1,024
+UTF-8 bytes before embedding or database search.
 
 ## Hybrid Search (RRF)
 
@@ -139,3 +145,6 @@ Documents are chunked for search indexing:
 - Default: 800 words per chunk (roughly 800 tokens for English)
 - 15% overlap between chunks for context preservation
 - Minimum chunk size: 50 words (tiny trailing chunks merge with previous)
+
+Internal Engine state under `engine/.runtime/**` is stored as normal workspace
+documents for restart recovery but receives no chunks or embeddings.

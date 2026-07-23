@@ -19,7 +19,127 @@ use async_trait::async_trait;
 
 use crate::context::JobContext;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
-use crate::workspace::{Workspace, paths};
+use crate::workspace::{SearchResult, Workspace, paths};
+
+const MAX_MEMORY_SEARCH_OUTPUT_BYTES: usize = 8_000;
+const MAX_MEMORY_SEARCH_CONTENT_JSON_BYTES: usize = 2_000;
+const MAX_MEMORY_SEARCH_QUERY_BYTES: usize = 1_024;
+const MAX_MEMORY_SEARCH_QUERY_JSON_BYTES: usize = 1_024;
+const MAX_MEMORY_SEARCH_PATH_JSON_BYTES: usize = 1_024;
+const SEARCH_TRUNCATION_MARKER: &str = "...[truncated]";
+
+fn json_char_encoded_len(value: char) -> usize {
+    match value {
+        '"' | '\\' | '\u{08}' | '\t' | '\n' | '\u{0c}' | '\r' => 2,
+        '\u{00}'..='\u{1f}' => 6,
+        _ => value.len_utf8(),
+    }
+}
+
+fn json_string_fits(value: &str, max_serialized_bytes: usize) -> bool {
+    if max_serialized_bytes < 2 {
+        return false;
+    }
+    let mut encoded_len: usize = 2;
+    for character in value.chars() {
+        encoded_len = encoded_len.saturating_add(json_char_encoded_len(character));
+        if encoded_len > max_serialized_bytes {
+            return false;
+        }
+    }
+    true
+}
+
+/// Bound a string by its encoded JSON size, preserving UTF-8 and valid JSON.
+fn truncate_for_json(value: &str, max_serialized_bytes: usize) -> String {
+    if json_string_fits(value, max_serialized_bytes) {
+        return value.to_string();
+    }
+
+    let marker_encoded_len = 2 + SEARCH_TRUNCATION_MARKER
+        .chars()
+        .map(json_char_encoded_len)
+        .sum::<usize>();
+    if marker_encoded_len > max_serialized_bytes {
+        return String::new();
+    }
+
+    let mut encoded_len = marker_encoded_len;
+    let mut prefix_end = 0;
+    for (index, character) in value.char_indices() {
+        let next_len = encoded_len.saturating_add(json_char_encoded_len(character));
+        if next_len > max_serialized_bytes {
+            break;
+        }
+        encoded_len = next_len;
+        prefix_end = index + character.len_utf8();
+    }
+
+    format!("{}{}", &value[..prefix_end], SEARCH_TRUNCATION_MARKER)
+}
+
+fn validate_memory_search_query(query: &str) -> Result<(), ToolError> {
+    if query.len() > MAX_MEMORY_SEARCH_QUERY_BYTES {
+        return Err(ToolError::InvalidParameters(format!(
+            "query exceeds {MAX_MEMORY_SEARCH_QUERY_BYTES} UTF-8 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn memory_search_output_value(query: &str, results: &[serde_json::Value]) -> serde_json::Value {
+    serde_json::json!({
+        "query": query,
+        "results": results,
+        "result_count": results.len(),
+    })
+}
+
+fn memory_search_output_len(query: &str, results: &[serde_json::Value]) -> usize {
+    serde_json::to_vec_pretty(&memory_search_output_value(query, results))
+        .map_or(usize::MAX, |encoded| encoded.len())
+}
+
+/// Build a complete, valid JSON result within the Engine action-result budget.
+fn build_memory_search_output(query: &str, results: Vec<SearchResult>) -> serde_json::Value {
+    let query = truncate_for_json(query, MAX_MEMORY_SEARCH_QUERY_JSON_BYTES);
+    let mut output_results = Vec::with_capacity(results.len());
+
+    for result in results {
+        let path = truncate_for_json(&result.document_path, MAX_MEMORY_SEARCH_PATH_JSON_BYTES);
+        let item = serde_json::json!({
+            "content": "",
+            "score": result.score,
+            "path": path,
+            "document_id": result.document_id.to_string(),
+            "is_hybrid_match": result.is_hybrid(),
+        });
+        output_results.push(item);
+
+        // An empty JSON string occupies two bytes. The remaining whole-output
+        // budget can therefore be assigned exactly to this result's content.
+        let empty_output_len = memory_search_output_len(&query, &output_results);
+        if empty_output_len > MAX_MEMORY_SEARCH_OUTPUT_BYTES {
+            output_results.pop();
+            break;
+        }
+        let content_budget = (MAX_MEMORY_SEARCH_OUTPUT_BYTES - empty_output_len + 2)
+            .min(MAX_MEMORY_SEARCH_CONTENT_JSON_BYTES);
+        let content = truncate_for_json(&result.content, content_budget);
+        if content.is_empty() && !result.content.is_empty() {
+            output_results.pop();
+            break;
+        }
+
+        let last = output_results.len() - 1;
+        output_results[last]["content"] = serde_json::Value::String(content);
+        debug_assert!(
+            memory_search_output_len(&query, &output_results) <= MAX_MEMORY_SEARCH_OUTPUT_BYTES
+        );
+    }
+
+    memory_search_output_value(&query, &output_results)
+}
 
 // ── WorkspaceResolver ──────────────────────────────────────────────
 
@@ -126,7 +246,7 @@ impl Tool for MemorySearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The search query. Use natural language to describe what you're looking for."
+                    "description": "The search query. Use natural language to describe what you're looking for. Maximum encoded length: 1,024 UTF-8 bytes."
                 },
                 "limit": {
                     "type": "integer",
@@ -148,12 +268,13 @@ impl Tool for MemorySearchTool {
         let start = std::time::Instant::now();
 
         let query = require_str(&params, "query")?;
+        validate_memory_search_query(query)?;
 
         let limit = params
             .get("limit")
             .and_then(|v| v.as_u64())
             .unwrap_or(5)
-            .min(20) as usize;
+            .clamp(1, 20) as usize;
 
         let workspace = self.resolver.resolve(&ctx.user_id).await;
         let results = workspace
@@ -161,18 +282,7 @@ impl Tool for MemorySearchTool {
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Search failed: {}", e)))?;
 
-        let result_count = results.len();
-        let output = serde_json::json!({
-            "query": query,
-            "results": results.into_iter().map(|r| serde_json::json!({
-                "content": r.content,
-                "score": r.score,
-                "path": r.document_path,
-                "document_id": r.document_id.to_string(),
-                "is_hybrid_match": r.is_hybrid(),
-            })).collect::<Vec<_>>(),
-            "result_count": result_count,
-        });
+        let output = build_memory_search_output(query, results);
 
         Ok(ToolOutput::success(output, start.elapsed()))
     }
@@ -698,6 +808,117 @@ mod tests {
         assert!(!looks_like_filesystem_path("MEMORY.md"));
         assert!(!looks_like_filesystem_path("daily/2026-03-11.md"));
         assert!(!looks_like_filesystem_path("projects/alpha/notes.md"));
+    }
+
+    fn search_result(path: &str, content: &str, score: f32) -> SearchResult {
+        SearchResult {
+            document_id: uuid::Uuid::new_v4(),
+            document_path: path.to_string(),
+            chunk_id: uuid::Uuid::new_v4(),
+            content: content.to_string(),
+            score,
+            fts_rank: Some(1),
+            vector_rank: None,
+        }
+    }
+
+    #[test]
+    fn memory_search_output_preserves_small_results() {
+        let result = search_result("notes/example.md", "small useful memory", 0.75);
+        let output = build_memory_search_output("useful", vec![result]);
+
+        assert_eq!(output["query"], "useful");
+        assert_eq!(output["result_count"], 1);
+        assert_eq!(output["results"][0]["content"], "small useful memory");
+        assert_eq!(output["results"][0]["path"], "notes/example.md");
+    }
+
+    #[test]
+    fn json_size_accounting_matches_serde_json() {
+        let controls: String = ('\u{00}'..='\u{1f}').collect();
+        for value in ["plain", "quotes\"and\\slashes", "emoji🙂漢字", &controls] {
+            let encoded_len = serde_json::to_string(value)
+                .expect("serialize string")
+                .len();
+            assert!(json_string_fits(value, encoded_len));
+            assert!(!json_string_fits(value, encoded_len - 1));
+        }
+    }
+
+    #[test]
+    fn memory_search_rejects_oversized_query_before_search() {
+        let max_multibyte_query = "🙂".repeat(MAX_MEMORY_SEARCH_QUERY_BYTES / 4);
+        assert!(validate_memory_search_query(&max_multibyte_query).is_ok());
+
+        let query = format!("{max_multibyte_query}🙂");
+        assert!(matches!(
+            validate_memory_search_query(&query),
+            Err(ToolError::InvalidParameters(message)) if message.contains("query exceeds")
+        ));
+    }
+
+    #[test]
+    fn memory_search_output_bounds_many_large_results() {
+        let results = (0..20)
+            .map(|index| {
+                search_result(
+                    &format!("notes/{index}.md"),
+                    &format!("result-{index}:{}", "x".repeat(10_000)),
+                    1.0 - index as f32 / 100.0,
+                )
+            })
+            .collect();
+        let output = build_memory_search_output("large search", results);
+        let encoded = serde_json::to_vec_pretty(&output).expect("serialize search output");
+        let emitted = output["results"].as_array().expect("results array");
+
+        assert!(encoded.len() <= MAX_MEMORY_SEARCH_OUTPUT_BYTES);
+        assert!(!emitted.is_empty());
+        assert_eq!(output["result_count"], emitted.len());
+        assert_eq!(emitted[0]["path"], "notes/0.md");
+        for (index, result) in emitted.iter().enumerate() {
+            assert_eq!(result["path"], format!("notes/{index}.md"));
+            let content = result["content"].as_str().expect("content string");
+            assert!(
+                serde_json::to_string(content)
+                    .expect("serialize content")
+                    .len()
+                    <= MAX_MEMORY_SEARCH_CONTENT_JSON_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn memory_search_output_bounds_escaped_unicode() {
+        let noisy = "\0🙂\"\\\n".repeat(2_000);
+        let long_path = format!("notes/{noisy}.md");
+        let output =
+            build_memory_search_output(&noisy, vec![search_result(&long_path, &noisy, 1.0)]);
+        let encoded = serde_json::to_vec_pretty(&output).expect("serialize search output");
+        let reparsed: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("output remains valid JSON");
+
+        assert_eq!(reparsed, output);
+        assert!(encoded.len() <= MAX_MEMORY_SEARCH_OUTPUT_BYTES);
+        assert!(
+            serde_json::to_string(output["query"].as_str().expect("query string"))
+                .expect("serialize query")
+                .len()
+                <= MAX_MEMORY_SEARCH_QUERY_JSON_BYTES
+        );
+        let result = &output["results"][0];
+        assert!(
+            serde_json::to_string(result["path"].as_str().expect("path string"))
+                .expect("serialize path")
+                .len()
+                <= MAX_MEMORY_SEARCH_PATH_JSON_BYTES
+        );
+        assert!(
+            serde_json::to_string(result["content"].as_str().expect("content string"))
+                .expect("serialize content")
+                .len()
+                <= MAX_MEMORY_SEARCH_CONTENT_JSON_BYTES
+        );
     }
 
     #[cfg(feature = "postgres")]
