@@ -2009,6 +2009,105 @@ impl ExtensionManager {
         })
     }
 
+    /// Read an installed MCP server's configuration.
+    pub async fn get_mcp_server_pub(
+        &self,
+        name: &str,
+        user_id: &str,
+    ) -> Result<McpServerConfig, ExtensionError> {
+        self.get_mcp_server(name, user_id)
+            .await
+            .map_err(|e| ExtensionError::Config(e.to_string()))
+    }
+
+    /// Update an installed MCP server's configuration in-place.
+    ///
+    /// Preserves enabled state, OAuth credentials, and headers from the existing
+    /// config. If the server is currently active, it is stopped and restarted
+    /// with the new configuration. The lifecycle lock is held for the entire
+    /// operation to serialize concurrent transitions.
+    pub async fn update_mcp(
+        &self,
+        name: &str,
+        mut new_config: McpServerConfig,
+        user_id: &str,
+    ) -> Result<String, ExtensionError> {
+        Self::validate_extension_name(name)?;
+        let kind = self.determine_installed_kind(name, user_id).await?;
+        if kind != ExtensionKind::McpServer {
+            return Err(ExtensionError::Other(format!(
+                "Only MCP servers can be updated in-place; '{name}' is a {kind}"
+            )));
+        }
+
+        let _lifecycle_guard = self.lock_mcp_lifecycle(name).await;
+
+        let existing = self.get_mcp_server(name, user_id).await?;
+        new_config.name = existing.name.clone();
+        new_config.enabled = existing.enabled;
+        if new_config.oauth.is_none() {
+            new_config.oauth = existing.oauth.clone();
+        }
+        if new_config.headers.is_empty() {
+            new_config.headers = existing.headers.clone();
+        }
+        if new_config.description.is_none() {
+            new_config.description = existing.description.clone();
+        }
+
+        new_config
+            .validate()
+            .map_err(|e| ExtensionError::Config(e.to_string()))?;
+
+        let was_active = self
+            .active_mcp_servers
+            .read()
+            .await
+            .get(name)
+            .is_some_and(|rt| rt.owner_id == user_id);
+
+        if was_active {
+            self.stop_mcp_runtime(name, user_id).await;
+        }
+
+        self.persist_mcp_config(new_config.clone(), user_id)
+            .await?;
+
+        let message = if was_active && new_config.enabled {
+            match self.activate_mcp_locked(name, user_id, new_config.clone()).await {
+                Ok(result) => format!(
+                    "Updated and reactivated MCP server '{name}'; {}",
+                    result.message
+                ),
+                Err(e) => format!(
+                    "Updated MCP server '{name}' config but reactivation failed: {e}"
+                ),
+            }
+        } else {
+            format!("Updated MCP server '{name}' configuration")
+        };
+
+        tracing::info!(server = %name, "MCP server configuration updated in-place");
+        self.broadcast_extension_status(user_id, name, "updated", Some(&message))
+            .await;
+        Ok(message)
+    }
+
+    async fn persist_mcp_config(
+        &self,
+        config: McpServerConfig,
+        user_id: &str,
+    ) -> Result<(), ExtensionError> {
+        if let Some(ref store) = self.store {
+            crate::tools::mcp::config::persist_mcp_server_db(store.as_ref(), user_id, config, true)
+                .await
+        } else {
+            crate::tools::mcp::config::persist_mcp_server(config, true)
+                .await
+        }
+        .map_err(|e| ExtensionError::Config(e.to_string()))
+    }
+
     async fn install_wasm_tool_from_url(
         &self,
         name: &str,
