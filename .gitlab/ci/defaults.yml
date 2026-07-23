@@ -51,7 +51,8 @@ variables:
 
 .rust-job:
   image:
-    name: "docker.io/library/rust:1.92-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2"
+    name: "docker.io/library/rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663"
+
   tags:
     - "$CI_RUST_RUNNER_TAG"
   before_script:

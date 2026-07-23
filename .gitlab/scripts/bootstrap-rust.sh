@@ -21,14 +21,14 @@ apt-get install --yes --no-install-recommends \
 rm -rf /var/lib/apt/lists/*
 
 rust_version=$(rustc --version)
-if [[ "$rust_version" != rustc\ 1.92.0\ * ]]; then
-    echo "ERROR: expected rustc 1.92.0, found $rust_version" >&2
+if [[ "$rust_version" != rustc\ 1.96.1\ * ]]; then
+    echo "ERROR: expected rustc 1.96.1, found $rust_version" >&2
     exit 1
 fi
 
 if ! command -v rustfmt >/dev/null 2>&1; then
-    rustup component add --toolchain 1.92.0 rustfmt
+    rustup component add --toolchain 1.96.1 rustfmt
 fi
 if ! command -v cargo-clippy >/dev/null 2>&1; then
-    rustup component add --toolchain 1.92.0 clippy
+    rustup component add --toolchain 1.96.1 clippy
 fi
