@@ -16,6 +16,10 @@ Status of all WASM tool sources in `ic/tools-src/`.
 - [x] LLM Context (`llm-context/`) - LLM context management
 - [x] Web Search (`web-search/`) - web search capabilities
 
+## Writing & Productivity
+
+- [x] Cavepony (`cavepony/`) - local text compression, canonical token expansion, and estimated reduction statistics
+
 ## Instant Messengers
 
 For all messengers: receive notifications of new messages, read contacts, groups and 1:1 messages, send messages on behalf of the user. This is different from the channel because operates from the specific user's account. Be careful with accessing user's messages, make sure messages are kept unread.

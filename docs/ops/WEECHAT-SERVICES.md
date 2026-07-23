@@ -87,7 +87,8 @@ After=network.target
 [Service]
 Type=forking
 ExecStart=/usr/bin/tmux -L weechat-<name> new-session -d -s weechat '/usr/bin/weechat --dir /home/<name>/.config/weechat'
-ExecStop=/usr/bin/tmux -L weechat-<name> kill-session -t weechat
+ExecStop=<repo>/ic/scripts/lunarwing-weechat-stop.sh --weechat-home /home/<name>/.config/weechat --tmux-socket weechat-<name> --session weechat
+TimeoutStopSec=30
 EnvironmentFile=<env_dir>/weechat.env
 Restart=on-failure
 RestartSec=5
@@ -97,6 +98,15 @@ WantedBy=default.target
 ```
 
 Uses `Type=forking` because tmux daemonizes after creating the session.
+
+`ExecStop` sends `/upgrade -quit` through the WeeChat FIFO so WeeChat saves its
+session, including open buffers, lines, and connections. WeeChat restores that
+session on its next start. If the FIFO is unavailable or graceful shutdown
+times out, the helper falls back to `tmux kill-session`. `TimeoutStopSec=30`
+allows the graceful stop to finish.
+
+Automatic bootstrap sets `weechat.look.save_layout_on_exit buffers`, preserving
+the open-buffer layout across restarts.
 
 **`lunarwing-weechat-adapter-<name>.service`**
 
@@ -135,7 +145,7 @@ Init scripts are installed to `/etc/init.d/` with conf.d files in `/etc/conf.d/`
 
 **`/etc/init.d/lunarwing-weechat-<name>`**
 
-Runs WeeChat in a tmux session via `start-stop-daemon`. The `start()` function loads `env/weechat.env` (containing only `RELAY_PASSWORD`) before launching tmux, so the WeeChat process inherits the credential. `stop()` kills the session with `tmux kill-session`. Configurable via conf.d variables: `weechat_user`, `weechat_group`, `weechat_home`, `weechat_env_file`.
+Runs WeeChat in a tmux session via `start-stop-daemon`. The `start()` function loads `env/weechat.env` (containing only `RELAY_PASSWORD`) before launching tmux, so the WeeChat process inherits the credential. `stop()` runs `lunarwing-weechat-stop.sh` under the tenant UID with `start-stop-daemon`, allowing access to the UID-scoped tmux socket. The helper sends `/upgrade -quit` through the WeeChat FIFO to save buffers and session state, then falls back to `tmux kill-session` if needed. Configurable via conf.d variables: `weechat_user`, `weechat_group`, `weechat_home`, `weechat_env_file`, `weechat_stop_helper`.
 
 Dependency wiring:
 
