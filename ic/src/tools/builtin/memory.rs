@@ -19,13 +19,16 @@ use async_trait::async_trait;
 
 use crate::context::JobContext;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
-use crate::workspace::{SearchResult, Workspace, paths};
+use crate::workspace::{SearchResult, Workspace, is_engine_runtime_path, normalize_path, paths};
 
-const MAX_MEMORY_SEARCH_OUTPUT_BYTES: usize = 8_000;
+const MAX_MEMORY_TOOL_OUTPUT_BYTES: usize = 8_000;
 const MAX_MEMORY_SEARCH_CONTENT_JSON_BYTES: usize = 2_000;
 const MAX_MEMORY_SEARCH_QUERY_BYTES: usize = 1_024;
 const MAX_MEMORY_SEARCH_QUERY_JSON_BYTES: usize = 1_024;
-const MAX_MEMORY_SEARCH_PATH_JSON_BYTES: usize = 1_024;
+const MAX_MEMORY_PATH_JSON_BYTES: usize = 1_024;
+const MAX_MEMORY_READ_SOURCE_BYTES: usize = 6_000;
+const MAX_MEMORY_READ_CONTENT_JSON_BYTES: usize = 6_002;
+const MAX_MEMORY_TREE_ENTRIES: usize = 256;
 const SEARCH_TRUNCATION_MARKER: &str = "...[truncated]";
 
 fn json_char_encoded_len(value: char) -> usize {
@@ -87,6 +90,66 @@ fn validate_memory_search_query(query: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
+fn normalize_memory_tool_path(path: &str) -> Result<String, ToolError> {
+    let normalized = normalize_path(path);
+    if is_engine_runtime_path(&normalized) {
+        return Err(ToolError::NotAuthorized(
+            "internal Engine runtime state is not accessible through memory tools".to_string(),
+        ));
+    }
+    if !json_string_fits(&normalized, MAX_MEMORY_PATH_JSON_BYTES) {
+        return Err(ToolError::InvalidParameters(format!(
+            "workspace path exceeds {MAX_MEMORY_PATH_JSON_BYTES} JSON-encoded bytes"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn pretty_json_len(value: &serde_json::Value) -> usize {
+    serde_json::to_vec_pretty(value).map_or(usize::MAX, |encoded| encoded.len())
+}
+
+fn json_prefix_end(value: &str, max_source_bytes: usize, max_json_bytes: usize) -> usize {
+    let mut source_bytes: usize = 0;
+    let mut json_bytes: usize = 2;
+    let mut prefix_end = 0;
+    for (index, character) in value.char_indices() {
+        let character_bytes = character.len_utf8();
+        let next_source_bytes = source_bytes.saturating_add(character_bytes);
+        let next_json_bytes = json_bytes.saturating_add(json_char_encoded_len(character));
+        if next_source_bytes > max_source_bytes || next_json_bytes > max_json_bytes {
+            break;
+        }
+        source_bytes = next_source_bytes;
+        json_bytes = next_json_bytes;
+        prefix_end = index + character_bytes;
+    }
+    prefix_end
+}
+
+fn memory_tool_offset(params: &serde_json::Value) -> Result<usize, ToolError> {
+    let Some(value) = params.get("offset") else {
+        return Ok(0);
+    };
+    let Some(offset) = value.as_u64() else {
+        return Err(ToolError::InvalidParameters(
+            "offset must be a non-negative integer".to_string(),
+        ));
+    };
+    usize::try_from(offset)
+        .map_err(|_| ToolError::InvalidParameters("offset exceeds platform limits".to_string()))
+}
+
+fn memory_tool_revision(params: &serde_json::Value) -> Result<Option<&str>, ToolError> {
+    match params.get("revision") {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(ToolError::InvalidParameters(
+            "revision must be a string".to_string(),
+        )),
+    }
+}
+
 fn memory_search_output_value(query: &str, results: &[serde_json::Value]) -> serde_json::Value {
     serde_json::json!({
         "query": query,
@@ -96,8 +159,7 @@ fn memory_search_output_value(query: &str, results: &[serde_json::Value]) -> ser
 }
 
 fn memory_search_output_len(query: &str, results: &[serde_json::Value]) -> usize {
-    serde_json::to_vec_pretty(&memory_search_output_value(query, results))
-        .map_or(usize::MAX, |encoded| encoded.len())
+    pretty_json_len(&memory_search_output_value(query, results))
 }
 
 /// Build a complete, valid JSON result within the Engine action-result budget.
@@ -106,7 +168,7 @@ fn build_memory_search_output(query: &str, results: Vec<SearchResult>) -> serde_
     let mut output_results = Vec::with_capacity(results.len());
 
     for result in results {
-        let path = truncate_for_json(&result.document_path, MAX_MEMORY_SEARCH_PATH_JSON_BYTES);
+        let path = truncate_for_json(&result.document_path, MAX_MEMORY_PATH_JSON_BYTES);
         let item = serde_json::json!({
             "content": "",
             "score": result.score,
@@ -119,11 +181,11 @@ fn build_memory_search_output(query: &str, results: Vec<SearchResult>) -> serde_
         // An empty JSON string occupies two bytes. The remaining whole-output
         // budget can therefore be assigned exactly to this result's content.
         let empty_output_len = memory_search_output_len(&query, &output_results);
-        if empty_output_len > MAX_MEMORY_SEARCH_OUTPUT_BYTES {
+        if empty_output_len > MAX_MEMORY_TOOL_OUTPUT_BYTES {
             output_results.pop();
             break;
         }
-        let content_budget = (MAX_MEMORY_SEARCH_OUTPUT_BYTES - empty_output_len + 2)
+        let content_budget = (MAX_MEMORY_TOOL_OUTPUT_BYTES - empty_output_len + 2)
             .min(MAX_MEMORY_SEARCH_CONTENT_JSON_BYTES);
         let content = truncate_for_json(&result.content, content_budget);
         if content.is_empty() && !result.content.is_empty() {
@@ -134,7 +196,7 @@ fn build_memory_search_output(query: &str, results: Vec<SearchResult>) -> serde_
         let last = output_results.len() - 1;
         output_results[last]["content"] = serde_json::Value::String(content);
         debug_assert!(
-            memory_search_output_len(&query, &output_results) <= MAX_MEMORY_SEARCH_OUTPUT_BYTES
+            memory_search_output_len(&query, &output_results) <= MAX_MEMORY_TOOL_OUTPUT_BYTES
         );
     }
 
@@ -327,6 +389,7 @@ impl Tool for MemoryWriteTool {
          'daily_log' for timestamped session notes, 'heartbeat' for the periodic \
          checklist (HEARTBEAT.md), 'bootstrap' to clear the first-run ritual file, \
          or provide a custom workspace path for arbitrary file creation. \
+         Internal Engine runtime paths are reserved and cannot be modified. \
          Never pass absolute filesystem paths like '/Users/...' or 'C:\\...'."
     }
 
@@ -384,11 +447,10 @@ impl Tool for MemoryWriteTool {
             )));
         }
 
-        let workspace = self.resolver.resolve(&ctx.user_id).await;
-
         // Bootstrap target: clear BOOTSTRAP.md to mark first-run ritual complete.
         // Handled early because it accepts empty content (unlike other targets).
         if target == "bootstrap" {
+            let workspace = self.resolver.resolve(&ctx.user_id).await;
             // Write empty content to effectively disable the bootstrap injection.
             // system_prompt_for_context() skips empty files.
             workspace
@@ -442,18 +504,20 @@ impl Tool for MemoryWriteTool {
             "heartbeat" => paths::HEARTBEAT.to_string(),
             path => path.to_string(),
         };
+        let normalized_path = normalize_memory_tool_path(&resolved_path)?;
+        let workspace = self.resolver.resolve(&ctx.user_id).await;
 
         // When a layer is specified, route through layer-aware methods for ALL targets.
         // Otherwise, use default workspace methods (which include injection scanning).
         let layer_result = if let Some(layer_name) = layer {
             let result = if append {
                 workspace
-                    .append_to_layer(layer_name, &resolved_path, content, force)
+                    .append_to_layer(layer_name, &normalized_path, content, force)
                     .await
                     .map_err(map_write_err)?
             } else {
                 workspace
-                    .write_to_layer(layer_name, &resolved_path, content, force)
+                    .write_to_layer(layer_name, &normalized_path, content, force)
                     .await
                     .map_err(map_write_err)?
             };
@@ -487,12 +551,12 @@ impl Tool for MemoryWriteTool {
                 _ => {
                     if append {
                         workspace
-                            .append(&resolved_path, content)
+                            .append(&normalized_path, content)
                             .await
                             .map_err(map_write_err)?;
                     } else {
                         workspace
-                            .write(&resolved_path, content)
+                            .write(&normalized_path, content)
                             .await
                             .map_err(map_write_err)?;
                     }
@@ -502,23 +566,6 @@ impl Tool for MemoryWriteTool {
         };
 
         // Sync derived identity documents when the profile is written.
-        let normalized_path = {
-            let trimmed = resolved_path.trim().trim_matches('/');
-            let mut result = String::new();
-            let mut last_was_slash = false;
-            for c in trimmed.chars() {
-                if c == '/' {
-                    if !last_was_slash {
-                        result.push(c);
-                    }
-                    last_was_slash = true;
-                } else {
-                    result.push(c);
-                    last_was_slash = false;
-                }
-            }
-            result
-        };
         let mut synced_docs: Vec<&str> = Vec::new();
         if normalized_path == paths::PROFILE {
             match workspace.sync_profile_documents().await {
@@ -548,7 +595,7 @@ impl Tool for MemoryWriteTool {
 
         let mut output = serde_json::json!({
             "status": "written",
-            "path": resolved_path,
+            "path": normalized_path,
             "append": append,
             "content_length": content.len(),
         });
@@ -574,7 +621,7 @@ impl Tool for MemoryWriteTool {
 
 /// Tool for reading workspace files.
 ///
-/// Use this to read the full content of any file in the workspace.
+/// Returns bounded pages so large documents cannot overflow the model context.
 pub struct MemoryReadTool {
     resolver: Arc<dyn WorkspaceResolver>,
 }
@@ -604,7 +651,8 @@ impl Tool for MemoryReadTool {
          Use this to read files shown by memory_tree. NOT for local filesystem files \
          (use read_file for those). Do not pass absolute paths like '/Users/...' or 'C:\\...'. \
          Works with identity files, heartbeat checklist, \
-         memory, daily logs, or any custom workspace path."
+         memory, daily logs, or custom workspace paths. Internal Engine runtime state is reserved. \
+         Large files are paginated; pass next_offset as offset and include revision to continue."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -614,6 +662,16 @@ impl Tool for MemoryReadTool {
                 "path": {
                     "type": "string",
                     "description": "Path to the file (e.g., 'MEMORY.md', 'daily/2024-01-15.md', 'projects/alpha/notes.md')"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "UTF-8 byte offset. Use next_offset from the previous response to continue reading.",
+                    "default": 0,
+                    "minimum": 0
+                },
+                "revision": {
+                    "type": "string",
+                    "description": "Document revision returned by the first page. Required when offset is greater than zero."
                 }
             },
             "required": ["path"]
@@ -628,6 +686,8 @@ impl Tool for MemoryReadTool {
         let start = std::time::Instant::now();
 
         let path = require_str(&params, "path")?;
+        let offset = memory_tool_offset(&params)?;
+        let requested_revision = memory_tool_revision(&params)?;
 
         if looks_like_filesystem_path(path) {
             return Err(ToolError::InvalidParameters(format!(
@@ -636,19 +696,68 @@ impl Tool for MemoryReadTool {
                 path
             )));
         }
+        let path = normalize_memory_tool_path(path)?;
 
         let workspace = self.resolver.resolve(&ctx.user_id).await;
         let doc = workspace
-            .read(path)
+            .read(&path)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Read failed: {}", e)))?;
 
+        let revision = blake3::hash(doc.content.as_bytes()).to_hex().to_string();
+        if requested_revision.is_some_and(|expected| expected != revision) {
+            return Err(ToolError::InvalidParameters(
+                "document changed since the previous page; restart from offset 0".to_string(),
+            ));
+        }
+
+        if offset > doc.content.len() {
+            return Err(ToolError::InvalidParameters(format!(
+                "offset {offset} exceeds document size {}",
+                doc.content.len()
+            )));
+        }
+        if !doc.content.is_char_boundary(offset) {
+            return Err(ToolError::InvalidParameters(
+                "offset must fall on a UTF-8 character boundary".to_string(),
+            ));
+        }
+
+        if offset > 0 && requested_revision.is_none() {
+            return Err(ToolError::InvalidParameters(
+                "revision from the previous page is required when offset is greater than zero"
+                    .to_string(),
+            ));
+        }
+
+        let remaining = &doc.content[offset..];
+        let returned_bytes = json_prefix_end(
+            remaining,
+            MAX_MEMORY_READ_SOURCE_BYTES,
+            MAX_MEMORY_READ_CONTENT_JSON_BYTES,
+        );
+        let end = offset + returned_bytes;
+        let next_offset = (end < doc.content.len()).then_some(end);
+        let word_count = doc.word_count();
+
         let output = serde_json::json!({
             "path": doc.path,
-            "content": doc.content,
-            "word_count": doc.word_count(),
+            "content": &doc.content[offset..end],
+            "offset": offset,
+            "next_offset": next_offset,
+            "returned_bytes": returned_bytes,
+            "total_bytes": doc.content.len(),
+            "truncated": next_offset.is_some(),
+            "revision": revision,
+            "word_count": word_count,
             "updated_at": doc.updated_at.to_rfc3339(),
         });
+
+        if pretty_json_len(&output) > MAX_MEMORY_TOOL_OUTPUT_BYTES {
+            return Err(ToolError::ExecutionFailed(
+                "bounded memory_read response exceeded output limit".to_string(),
+            ));
+        }
 
         Ok(ToolOutput::success(output, start.elapsed()))
     }
@@ -660,9 +769,40 @@ impl Tool for MemoryReadTool {
 
 /// Tool for viewing workspace structure as a tree.
 ///
-/// Returns a hierarchical view of files and directories with configurable depth.
+/// Returns a bounded hierarchical view with configurable depth.
 pub struct MemoryTreeTool {
     resolver: Arc<dyn WorkspaceResolver>,
+}
+
+#[derive(Default)]
+struct MemoryTreeBuildState {
+    entry_count: usize,
+    root_offset: usize,
+    root_seen: usize,
+    root_entry_count: usize,
+    root_revision: String,
+    truncated: bool,
+}
+
+fn memory_tree_root_revision(entries: &[crate::workspace::WorkspaceEntry]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| !is_engine_runtime_path(&entry.path))
+    {
+        hasher.update(&entry.path.len().to_le_bytes());
+        hasher.update(entry.path.as_bytes());
+        hasher.update(&[u8::from(entry.is_directory)]);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn memory_tree_display_path(path: &str) -> String {
+    if json_string_fits(path, MAX_MEMORY_PATH_JSON_BYTES) {
+        return path.to_string();
+    }
+    let digest = blake3::hash(path.as_bytes()).to_hex().to_string();
+    format!("[path omitted: {}]", &digest[..12])
 }
 
 impl MemoryTreeTool {
@@ -686,6 +826,7 @@ impl MemoryTreeTool {
         path: &str,
         current_depth: usize,
         max_depth: usize,
+        state: &mut MemoryTreeBuildState,
     ) -> Result<Vec<serde_json::Value>, ToolError> {
         if current_depth > max_depth {
             return Ok(Vec::new());
@@ -695,15 +836,38 @@ impl MemoryTreeTool {
             .list(path)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Tree failed: {}", e)))?;
+        if current_depth == 1 {
+            state.root_revision = memory_tree_root_revision(&entries);
+        }
 
         let mut result = Vec::new();
         for entry in entries {
+            if is_engine_runtime_path(&entry.path) {
+                continue;
+            }
+            if current_depth == 1 {
+                if state.root_seen < state.root_offset {
+                    state.root_seen += 1;
+                    continue;
+                }
+                state.root_seen += 1;
+            }
+            if state.entry_count >= MAX_MEMORY_TREE_ENTRIES {
+                state.truncated = true;
+                break;
+            }
+            state.entry_count += 1;
+            if current_depth == 1 {
+                state.root_entry_count += 1;
+            }
+
             // Directories end with `/`, files don't
             let display_path = if entry.is_directory {
                 format!("{}/", entry.name())
             } else {
                 entry.name().to_string()
             };
+            let display_path = memory_tree_display_path(&display_path);
 
             if entry.is_directory && current_depth < max_depth {
                 let children = Box::pin(Self::build_tree(
@@ -711,6 +875,7 @@ impl MemoryTreeTool {
                     &entry.path,
                     current_depth + 1,
                     max_depth,
+                    state,
                 ))
                 .await?;
                 if children.is_empty() {
@@ -727,6 +892,80 @@ impl MemoryTreeTool {
     }
 }
 
+fn remove_last_tree_entry(entries: &mut Vec<serde_json::Value>) -> bool {
+    let Some(last_index) = entries.len().checked_sub(1) else {
+        return false;
+    };
+
+    let (removed_child, replacement) = {
+        let last = &mut entries[last_index];
+        if let Some(object) = last.as_object_mut() {
+            if let Some((name, value)) = object.iter_mut().next() {
+                if let Some(children) = value.as_array_mut() {
+                    if !children.is_empty() && remove_last_tree_entry(children) {
+                        (true, children.is_empty().then(|| name.clone()))
+                    } else {
+                        (false, None)
+                    }
+                } else {
+                    (false, None)
+                }
+            } else {
+                (false, None)
+            }
+        } else {
+            (false, None)
+        }
+    };
+
+    if removed_child {
+        if let Some(directory_name) = replacement {
+            entries[last_index] = serde_json::Value::String(directory_name);
+        }
+        return true;
+    }
+
+    entries.pop();
+    true
+}
+
+fn bounded_memory_tree_output(
+    path: &str,
+    depth: usize,
+    mut tree: Vec<serde_json::Value>,
+    mut state: MemoryTreeBuildState,
+) -> serde_json::Value {
+    loop {
+        let next_offset = state
+            .truncated
+            .then_some(state.root_offset + state.root_entry_count);
+        let output = serde_json::json!({
+            "path": path,
+            "depth": depth,
+            "tree": &tree,
+            "entry_count": state.entry_count,
+            "truncated": state.truncated,
+            "offset": state.root_offset,
+            "next_offset": next_offset,
+            "revision": &state.root_revision,
+        });
+        if pretty_json_len(&output) <= MAX_MEMORY_TOOL_OUTPUT_BYTES {
+            return output;
+        }
+
+        let root_entries_before = tree.len();
+        if !remove_last_tree_entry(&mut tree) {
+            debug_assert!(false, "empty memory_tree response exceeded output limit");
+            return output;
+        }
+        state.entry_count = state.entry_count.saturating_sub(1);
+        if tree.len() < root_entries_before {
+            state.root_entry_count = state.root_entry_count.saturating_sub(1);
+        }
+        state.truncated = true;
+    }
+}
+
 #[async_trait]
 impl Tool for MemoryTreeTool {
     fn name(&self) -> &str {
@@ -736,7 +975,9 @@ impl Tool for MemoryTreeTool {
     fn description(&self) -> &str {
         "View the workspace memory structure as a tree (database-backed storage). \
          Use memory_read to read files shown here, NOT read_file. \
-         The workspace is separate from the local filesystem."
+         Internal Engine runtime state is hidden. Large trees return a bounded prefix \
+         with truncated=true; use next_offset plus revision for more root entries, or \
+         query a visible subdirectory for omitted nested entries."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -754,6 +995,16 @@ impl Tool for MemoryTreeTool {
                     "default": 1,
                     "minimum": 1,
                     "maximum": 10
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Number of root entries to skip. Use next_offset from the previous response.",
+                    "default": 0,
+                    "minimum": 0
+                },
+                "revision": {
+                    "type": "string",
+                    "description": "Root-list revision returned by the first page. Required when offset is greater than zero."
                 }
             }
         })
@@ -767,6 +1018,9 @@ impl Tool for MemoryTreeTool {
         let start = std::time::Instant::now();
 
         let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let path = normalize_memory_tool_path(path)?;
+        let offset = memory_tool_offset(&params)?;
+        let requested_revision = memory_tool_revision(&params)?;
 
         let depth = params
             .get("depth")
@@ -775,13 +1029,25 @@ impl Tool for MemoryTreeTool {
             .clamp(1, 10) as usize;
 
         let workspace = self.resolver.resolve(&ctx.user_id).await;
-        let tree = Self::build_tree(&workspace, path, 1, depth).await?;
+        let mut state = MemoryTreeBuildState {
+            root_offset: offset,
+            ..MemoryTreeBuildState::default()
+        };
+        let tree = Self::build_tree(&workspace, &path, 1, depth, &mut state).await?;
+        if offset > 0 && requested_revision.is_none() {
+            return Err(ToolError::InvalidParameters(
+                "revision from the previous tree page is required when offset is greater than zero"
+                    .to_string(),
+            ));
+        }
+        if requested_revision.is_some_and(|expected| expected != state.root_revision) {
+            return Err(ToolError::InvalidParameters(
+                "workspace tree changed since the previous page; restart from offset 0".to_string(),
+            ));
+        }
+        let output = bounded_memory_tree_output(&path, depth, tree, state);
 
-        // Compact output: just the tree array
-        Ok(ToolOutput::success(
-            serde_json::Value::Array(tree),
-            start.elapsed(),
-        ))
+        Ok(ToolOutput::success(output, start.elapsed()))
     }
 
     fn requires_sanitization(&self) -> bool {
@@ -808,6 +1074,29 @@ mod tests {
         assert!(!looks_like_filesystem_path("MEMORY.md"));
         assert!(!looks_like_filesystem_path("daily/2026-03-11.md"));
         assert!(!looks_like_filesystem_path("projects/alpha/notes.md"));
+    }
+
+    #[test]
+    fn runtime_tool_path_guard_normalizes_and_preserves_near_matches() {
+        for path in [
+            "engine/.runtime",
+            " engine//.runtime/threads/active/id.json/ ",
+            "engine/.runtime/events/id.json",
+        ] {
+            assert!(matches!(
+                normalize_memory_tool_path(path),
+                Err(ToolError::NotAuthorized(_))
+            ));
+        }
+
+        assert_eq!(
+            normalize_memory_tool_path(" engine//.runtime-notes.md/ ").expect("near match"),
+            "engine/.runtime-notes.md"
+        );
+        assert_eq!(
+            normalize_memory_tool_path("foo/engine/.runtime/file.json").expect("nested path"),
+            "foo/engine/.runtime/file.json"
+        );
     }
 
     fn search_result(path: &str, content: &str, score: f32) -> SearchResult {
@@ -872,7 +1161,7 @@ mod tests {
         let encoded = serde_json::to_vec_pretty(&output).expect("serialize search output");
         let emitted = output["results"].as_array().expect("results array");
 
-        assert!(encoded.len() <= MAX_MEMORY_SEARCH_OUTPUT_BYTES);
+        assert!(encoded.len() <= MAX_MEMORY_TOOL_OUTPUT_BYTES);
         assert!(!emitted.is_empty());
         assert_eq!(output["result_count"], emitted.len());
         assert_eq!(emitted[0]["path"], "notes/0.md");
@@ -899,7 +1188,7 @@ mod tests {
             serde_json::from_slice(&encoded).expect("output remains valid JSON");
 
         assert_eq!(reparsed, output);
-        assert!(encoded.len() <= MAX_MEMORY_SEARCH_OUTPUT_BYTES);
+        assert!(encoded.len() <= MAX_MEMORY_TOOL_OUTPUT_BYTES);
         assert!(
             serde_json::to_string(output["query"].as_str().expect("query string"))
                 .expect("serialize query")
@@ -911,7 +1200,7 @@ mod tests {
             serde_json::to_string(result["path"].as_str().expect("path string"))
                 .expect("serialize path")
                 .len()
-                <= MAX_MEMORY_SEARCH_PATH_JSON_BYTES
+                <= MAX_MEMORY_PATH_JSON_BYTES
         );
         assert!(
             serde_json::to_string(result["content"].as_str().expect("content string"))
@@ -977,6 +1266,8 @@ mod tests {
 
             let schema = tool.parameters_schema();
             assert!(schema["properties"]["path"].is_object());
+            assert_eq!(schema["properties"]["offset"]["default"], 0);
+            assert!(schema["properties"]["revision"].is_object());
             assert!(
                 schema["required"]
                     .as_array()
@@ -996,6 +1287,8 @@ mod tests {
             assert!(schema["properties"]["path"].is_object());
             assert!(schema["properties"]["depth"].is_object());
             assert_eq!(schema["properties"]["depth"]["default"], 1);
+            assert_eq!(schema["properties"]["offset"]["default"], 0);
+            assert!(schema["properties"]["revision"].is_object());
         }
 
         #[tokio::test]
@@ -1132,6 +1425,362 @@ mod tests {
 
             let resolved = tracker.resolved_users();
             assert_eq!(resolved, vec!["alice", "bob"]);
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    mod memory_tool_boundary_tests {
+        use super::*;
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+
+        async fn setup_workspace() -> (Arc<Workspace>, tempfile::TempDir) {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let db_path = temp_dir.path().join("memory_tool_boundary.db");
+            let backend = LibSqlBackend::new_local(&db_path)
+                .await
+                .expect("LibSqlBackend");
+            backend.run_migrations().await.expect("migrations");
+            let db: Arc<dyn Database> = Arc::new(backend);
+            (
+                Arc::new(Workspace::new_with_db("memory_tool_test", db)),
+                temp_dir,
+            )
+        }
+
+        fn assert_not_authorized(result: Result<ToolOutput, ToolError>) {
+            assert!(
+                matches!(result, Err(ToolError::NotAuthorized(_))),
+                "expected runtime path to be unauthorized, got {result:?}"
+            );
+        }
+
+        fn collect_tree_names(value: &serde_json::Value, names: &mut Vec<String>) {
+            if let Some(name) = value.as_str() {
+                names.push(name.to_string());
+            } else if let Some(array) = value.as_array() {
+                for child in array {
+                    collect_tree_names(child, names);
+                }
+            } else if let Some(object) = value.as_object() {
+                for (name, children) in object {
+                    names.push(name.clone());
+                    collect_tree_names(children, names);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn runtime_state_is_blocked_from_agent_memory_tools() {
+            let (workspace, _temp_dir) = setup_workspace().await;
+            let runtime_path = "engine/.runtime/threads/active/test.json";
+            workspace
+                .write(runtime_path, "original runtime state")
+                .await
+                .expect("seed runtime state");
+
+            let context = JobContext::default();
+            let write = MemoryWriteTool::from_workspace(Arc::clone(&workspace));
+            for params in [
+                serde_json::json!({
+                    "content": "overwrite",
+                    "target": " engine//.runtime/threads/active/test.json/ ",
+                    "append": false,
+                }),
+                serde_json::json!({
+                    "content": "append",
+                    "target": runtime_path,
+                    "append": true,
+                }),
+                serde_json::json!({
+                    "content": "layer write",
+                    "target": runtime_path,
+                    "layer": "missing",
+                    "append": false,
+                }),
+            ] {
+                assert_not_authorized(write.execute(params, &context).await);
+            }
+
+            let read = MemoryReadTool::from_workspace(Arc::clone(&workspace));
+            assert_not_authorized(
+                read.execute(
+                    serde_json::json!({
+                        "path": " engine//.runtime/threads/active/test.json/ "
+                    }),
+                    &context,
+                )
+                .await,
+            );
+
+            let tree = MemoryTreeTool::from_workspace(Arc::clone(&workspace));
+            assert_not_authorized(
+                tree.execute(
+                    serde_json::json!({"path": " engine//.runtime/threads/ "}),
+                    &context,
+                )
+                .await,
+            );
+
+            assert_eq!(
+                workspace
+                    .read(runtime_path)
+                    .await
+                    .expect("direct runtime read")
+                    .content,
+                "original runtime state"
+            );
+
+            write
+                .execute(
+                    serde_json::json!({
+                        "content": "ordinary note",
+                        "target": "engine/.runtime-notes.md",
+                        "append": false,
+                    }),
+                    &context,
+                )
+                .await
+                .expect("near-match write");
+            let output = read
+                .execute(
+                    serde_json::json!({"path": "engine/.runtime-notes.md"}),
+                    &context,
+                )
+                .await
+                .expect("near-match read");
+            assert_eq!(output.result["content"], "ordinary note");
+        }
+
+        #[tokio::test]
+        async fn memory_read_pages_large_escaped_unicode_content() {
+            let (workspace, _temp_dir) = setup_workspace().await;
+            let content = "alpha\t🙂\"\\\n".repeat(1_000);
+            workspace
+                .write("notes/large.md", &content)
+                .await
+                .expect("write large document");
+
+            let context = JobContext::default();
+            let read = MemoryReadTool::from_workspace(Arc::clone(&workspace));
+            let mut reconstructed = String::new();
+            let mut offset = 0;
+            let mut revision: Option<String> = None;
+            loop {
+                let mut params = serde_json::json!({"path": "notes/large.md", "offset": offset});
+                if let Some(ref expected_revision) = revision {
+                    params["revision"] = serde_json::Value::String(expected_revision.clone());
+                }
+                let output = read.execute(params, &context).await.expect("read page");
+                assert!(pretty_json_len(&output.result) <= MAX_MEMORY_TOOL_OUTPUT_BYTES);
+                assert_eq!(output.result["offset"], offset);
+
+                let page_revision = output.result["revision"]
+                    .as_str()
+                    .expect("document revision");
+                if let Some(ref expected_revision) = revision {
+                    assert_eq!(page_revision, expected_revision);
+                } else {
+                    revision = Some(page_revision.to_string());
+                }
+
+                let page = output.result["content"].as_str().expect("content page");
+                assert_eq!(output.result["returned_bytes"], page.len());
+                reconstructed.push_str(page);
+
+                let Some(next_offset) = output.result["next_offset"].as_u64() else {
+                    assert_eq!(output.result["truncated"], false);
+                    break;
+                };
+                let next_offset = usize::try_from(next_offset).expect("next offset");
+                assert!(next_offset > offset);
+                assert!(content.is_char_boundary(next_offset));
+                offset = next_offset;
+            }
+            assert_eq!(reconstructed, content);
+
+            let terminal = read
+                .execute(
+                    serde_json::json!({
+                        "path": "notes/large.md",
+                        "offset": content.len(),
+                        "revision": revision.clone(),
+                    }),
+                    &context,
+                )
+                .await
+                .expect("read terminal page");
+            assert_eq!(terminal.result["content"], "");
+            assert!(terminal.result["next_offset"].is_null());
+
+            let emoji_offset = content.find('🙂').expect("emoji") + 1;
+            assert!(matches!(
+                read.execute(
+                    serde_json::json!({
+                        "path": "notes/large.md",
+                        "offset": emoji_offset,
+                        "revision": revision.clone(),
+                    }),
+                    &context,
+                )
+                .await,
+                Err(ToolError::InvalidParameters(_))
+            ));
+            assert!(matches!(
+                read.execute(
+                    serde_json::json!({
+                        "path": "notes/large.md",
+                        "offset": content.len() + 1,
+                        "revision": revision,
+                    }),
+                    &context,
+                )
+                .await,
+                Err(ToolError::InvalidParameters(_))
+            ));
+
+            let first_page = read
+                .execute(serde_json::json!({"path": "notes/large.md"}), &context)
+                .await
+                .expect("read first page before update");
+            let old_revision = first_page.result["revision"]
+                .as_str()
+                .expect("old revision");
+            let next_offset = first_page.result["next_offset"]
+                .as_u64()
+                .expect("next offset");
+            workspace
+                .write("notes/large.md", "updated content")
+                .await
+                .expect("update document");
+            assert!(matches!(
+                read.execute(
+                    serde_json::json!({
+                        "path": "notes/large.md",
+                        "offset": next_offset,
+                        "revision": old_revision,
+                    }),
+                    &context,
+                )
+                .await,
+                Err(ToolError::InvalidParameters(message)) if message.contains("document changed")
+            ));
+        }
+
+        #[tokio::test]
+        async fn memory_tree_hides_runtime_and_bounds_serialized_output() {
+            let (workspace, _temp_dir) = setup_workspace().await;
+            workspace
+                .write("engine/.runtime/threads/active/test.json", "runtime state")
+                .await
+                .expect("write runtime state");
+            workspace
+                .write("engine/knowledge/note.md", "knowledge")
+                .await
+                .expect("write knowledge");
+            workspace
+                .write("engine/.runtime-notes.md", "ordinary note")
+                .await
+                .expect("write near match");
+
+            let context = JobContext::default();
+            let tree = MemoryTreeTool::from_workspace(Arc::clone(&workspace));
+            let output = tree
+                .execute(serde_json::json!({"path": "engine", "depth": 4}), &context)
+                .await
+                .expect("build engine tree");
+            let mut names = Vec::new();
+            collect_tree_names(&output.result["tree"], &mut names);
+            assert!(!names.iter().any(|name| name == ".runtime/"));
+            assert!(names.iter().any(|name| name == ".runtime-notes.md"));
+            assert!(names.iter().any(|name| name == "knowledge/"));
+
+            for index in 0..40 {
+                let name = format!("tree/{index:02}-{}.md", "x".repeat(300));
+                workspace
+                    .write(&name, "tree entry")
+                    .await
+                    .expect("write tree entry");
+            }
+            let first = tree
+                .execute(serde_json::json!({"path": "tree", "depth": 1}), &context)
+                .await
+                .expect("build bounded tree");
+            let second = tree
+                .execute(serde_json::json!({"path": "tree", "depth": 1}), &context)
+                .await
+                .expect("rebuild bounded tree");
+
+            assert_eq!(first.result, second.result);
+            assert!(pretty_json_len(&first.result) <= MAX_MEMORY_TOOL_OUTPUT_BYTES);
+            assert_eq!(first.result["truncated"], true);
+            assert!(first.result["entry_count"].as_u64().expect("entry count") < 40);
+            assert_eq!(
+                first.result["entry_count"].as_u64().expect("entry count"),
+                first.result["tree"].as_array().expect("flat tree").len() as u64
+            );
+
+            let mut seen = std::collections::HashSet::new();
+            let mut offset = 0_u64;
+            let mut revision: Option<String> = None;
+            loop {
+                let mut params = serde_json::json!({"path": "tree", "depth": 1, "offset": offset});
+                if let Some(ref expected_revision) = revision {
+                    params["revision"] = serde_json::Value::String(expected_revision.clone());
+                }
+                let page = tree
+                    .execute(params, &context)
+                    .await
+                    .expect("page bounded tree");
+                assert!(pretty_json_len(&page.result) <= MAX_MEMORY_TOOL_OUTPUT_BYTES);
+                let page_revision = page.result["revision"].as_str().expect("tree revision");
+                if let Some(ref expected_revision) = revision {
+                    assert_eq!(page_revision, expected_revision);
+                } else {
+                    revision = Some(page_revision.to_string());
+                }
+                for entry in page.result["tree"].as_array().expect("flat tree") {
+                    assert!(
+                        seen.insert(entry.as_str().expect("file name").to_string()),
+                        "tree pages must not overlap"
+                    );
+                }
+
+                let Some(next_offset) = page.result["next_offset"].as_u64() else {
+                    break;
+                };
+                assert!(next_offset > offset);
+                offset = next_offset;
+            }
+            assert_eq!(seen.len(), 40);
+
+            let first_page = tree
+                .execute(serde_json::json!({"path": "tree", "depth": 1}), &context)
+                .await
+                .expect("tree page before update");
+            let old_revision = first_page.result["revision"]
+                .as_str()
+                .expect("old tree revision");
+            let next_offset = first_page.result["next_offset"]
+                .as_u64()
+                .expect("tree next offset");
+            workspace
+                .write("tree/00-000-before.md", "new entry")
+                .await
+                .expect("insert tree entry");
+            assert!(matches!(
+                tree.execute(
+                    serde_json::json!({
+                        "path": "tree",
+                        "depth": 1,
+                        "offset": next_offset,
+                        "revision": old_revision,
+                    }),
+                    &context,
+                )
+                .await,
+                Err(ToolError::InvalidParameters(message)) if message.contains("tree changed")
+            ));
         }
     }
 

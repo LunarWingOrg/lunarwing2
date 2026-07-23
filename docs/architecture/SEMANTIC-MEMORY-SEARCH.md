@@ -205,9 +205,9 @@ Four tools in `ic/src/tools/builtin/memory.rs`:
 | Tool | Purpose |
 |------|---------|
 | `memory_search` | Hybrid FTS + vector search, returns bounded scored results (limit 1-20) |
-| `memory_write` | Write to workspace (memory, daily_log, heartbeat, or custom path) |
-| `memory_read` | Read any file by path |
-| `memory_tree` | View workspace structure as a directory tree |
+| `memory_write` | Write to user memory paths; internal Engine runtime paths are rejected |
+| `memory_read` | Read a bounded page by path and continue with `next_offset` |
+| `memory_tree` | View a bounded directory tree with truncation metadata |
 
 Search results include:
 ```json
@@ -226,6 +226,26 @@ echoes are also bounded, and the complete pretty-serialized result is at most
 valid UTF-8 and valid JSON. Queries over 1,024 UTF-8 bytes are rejected before
 embedding or database search. Results remain a ranked prefix, and `result_count`
 reports results actually emitted.
+
+All three path-based tools normalize paths before enforcing the internal runtime
+boundary. `memory_read` and `memory_write` reject exact or descendant
+`engine/.runtime/**` paths, while `memory_tree` also filters that subtree from
+recursive listings. This policy exists only at the agent-facing tool boundary;
+the Engine continues to use direct `Workspace` APIs for persistence and recovery.
+
+`memory_read` pages by UTF-8 byte offset. Each page consumes at most 6,000 source
+bytes while also respecting JSON escape expansion, and the complete response is
+bounded to 8,000 serialized bytes. `next_offset` is always a valid UTF-8 boundary
+and is `null` at EOF. Page two and later require the prior response's content-hash
+`revision`; a changed document is rejected instead of producing mixed content.
+
+`memory_tree` returns an object containing `path`, `depth`, `tree`, `entry_count`,
+`truncated`, `offset`, `next_offset`, and `revision`. Traversal stops at 256
+entries, then removes the deterministic tail if needed to keep the complete
+serialized response within 8,000 bytes. `next_offset` continues omitted entries
+at the selected root; page two and later require the prior root-list `revision`
+so inserts or deletes cannot shift pagination silently. Query a returned
+subdirectory directly for a truncated nested subtree.
 
 ## Database Schema
 

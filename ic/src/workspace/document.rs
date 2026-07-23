@@ -59,12 +59,17 @@ pub fn is_identity_path(path: &str) -> bool {
 /// Engine runtime state is persisted in the workspace but excluded from search.
 const ENGINE_RUNTIME_PATH: &str = "engine/.runtime";
 
-/// Check whether a normalized workspace path should have search chunks.
-pub fn is_search_indexable_path(path: &str) -> bool {
-    path != ENGINE_RUNTIME_PATH
-        && !path
+/// Check whether a normalized path belongs to internal Engine runtime state.
+pub fn is_engine_runtime_path(path: &str) -> bool {
+    path == ENGINE_RUNTIME_PATH
+        || path
             .strip_prefix(ENGINE_RUNTIME_PATH)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Check whether a normalized workspace path should have search chunks.
+pub fn is_search_indexable_path(path: &str) -> bool {
+    !is_engine_runtime_path(path)
 }
 
 /// A memory document stored in the database.
@@ -323,6 +328,10 @@ mod tests {
             "engine/.runtime/leases/id.json",
         ] {
             assert!(
+                is_engine_runtime_path(path),
+                "path should be runtime: {path}"
+            );
+            assert!(
                 !is_search_indexable_path(path),
                 "path should be excluded: {path}"
             );
@@ -335,6 +344,10 @@ mod tests {
             "engine/projects/id/project.json",
             "engine/.runtime-notes.md",
         ] {
+            assert!(
+                !is_engine_runtime_path(path),
+                "path should not be runtime: {path}"
+            );
             assert!(
                 is_search_indexable_path(path),
                 "path should be indexed: {path}"

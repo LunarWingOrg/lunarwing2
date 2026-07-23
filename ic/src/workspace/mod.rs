@@ -54,7 +54,8 @@ mod search;
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{
     DocumentVersion, IDENTITY_PATHS, MemoryChunk, MemoryDocument, VersionSummary, WorkspaceEntry,
-    is_identity_path, is_search_indexable_path, merge_workspace_entries, paths,
+    is_engine_runtime_path, is_identity_path, is_search_indexable_path, merge_workspace_entries,
+    paths,
 };
 pub use embedding_cache::{CachedEmbeddingProvider, EmbeddingCacheConfig};
 pub use embeddings::{
@@ -1811,7 +1812,7 @@ impl Workspace {
 }
 
 /// Normalize a file path (remove leading/trailing slashes, collapse //).
-fn normalize_path(path: &str) -> String {
+pub(crate) fn normalize_path(path: &str) -> String {
     let path = path.trim().trim_matches('/');
     // Collapse multiple slashes
     let mut result = String::new();
