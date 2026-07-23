@@ -38,3 +38,30 @@ fn parsed_skills() -> &'static Vec<(String, String)> {
 pub fn load_bundled_skills() -> &'static [(String, String)] {
     parsed_skills()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cavepony_is_bundled_and_parseable() {
+        let (_, content) = load_bundled_skills()
+            .iter()
+            .find(|(name, _)| name == "cavepony")
+            .expect("Cavepony skill should be embedded");
+        let parsed = crate::skills::parser::parse_skill_md(content)
+            .expect("embedded Cavepony skill should parse");
+
+        assert_eq!(parsed.manifest.name, "cavepony");
+        assert_eq!(parsed.manifest.version, "0.3.0");
+        assert_eq!(parsed.manifest.activation.max_context_tokens, 1800);
+        assert!(
+            parsed
+                .manifest
+                .activation
+                .keywords
+                .iter()
+                .any(|keyword| keyword == "cavepony")
+        );
+    }
+}
