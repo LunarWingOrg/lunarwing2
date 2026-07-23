@@ -2466,6 +2466,26 @@ mod tests {
     }
 
     #[test]
+    fn structured_action_output_is_bounded() {
+        assert!(eval_python_bool(
+            r#"len(format_action_output("x" * 9000)) == MAX_ACTION_OUTPUT_CHARS"#
+        ));
+        assert!(eval_python_bool(
+            r#"format_action_output("small") == "small""#
+        ));
+    }
+
+    #[test]
+    fn persisted_action_output_is_sanitized() {
+        assert!(eval_python_bool(
+            r#"len(sanitize_action_results([{"role": "ActionResult", "content": "x" * 9000}])[0]["content"]) == MAX_ACTION_OUTPUT_CHARS"#
+        ));
+        assert!(eval_python_bool(
+            r#"sanitize_action_results([{"role": "User", "content": "x" * 9000}])[0]["content"] == "x" * 9000"#
+        ));
+    }
+
+    #[test]
     fn orchestrator_wire_reattaches_transient_parts_without_serializing_bytes() {
         let mut thread = Thread::new(
             "inspect image",

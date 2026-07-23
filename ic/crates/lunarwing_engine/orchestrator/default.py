@@ -25,6 +25,13 @@
 #   config   - thread config dict
 
 
+# Conservative context limits. Structured action results use same cap as
+# CodeAct output so one tool cannot poison persisted inference history.
+CHARS_PER_TOKEN = 4
+MESSAGE_OVERHEAD_CHARS = 4
+MAX_ACTION_OUTPUT_CHARS = 8000
+
+
 # ── Helper functions (self-modifiable glue) ──────────────────
 # Defined before run_loop so they are in scope when called.
 
@@ -186,6 +193,25 @@ def format_output(result, max_chars=8000):
         text = "[code executed, no output]"
 
     return text
+
+
+def format_action_output(output, max_chars=MAX_ACTION_OUTPUT_CHARS):
+    """Bound structured action output before storing it in LLM history."""
+    text = str(output)
+    marker = "\n... (tool output truncated)"
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= len(marker):
+        return marker[:max_chars]
+    return text[:max_chars - len(marker)] + marker
+
+
+def sanitize_action_results(messages):
+    """Repair oversized action results already present in persisted state."""
+    for msg in messages:
+        if msg.get("role") in ("ActionResult", "action_result"):
+            msg["content"] = format_action_output(msg.get("content", ""))
+    return messages
 
 
 def format_docs(docs):
@@ -400,17 +426,19 @@ def ensure_working_messages(state, context):
     """Initialize the mutable orchestrator transcript."""
     existing = state.get("working_messages")
     if isinstance(existing, list):
-        return existing
+        return sanitize_action_results(existing)
     if isinstance(context, list):
         state["working_messages"] = list(context)
     else:
         state["working_messages"] = []
-    return state["working_messages"]
+    return sanitize_action_results(state["working_messages"])
 
 
 def append_message(messages, role, content, action_name=None, action_call_id=None,
                    action_calls=None, transient_content_id=None):
     """Append a normalized message to the working transcript."""
+    if role in ("ActionResult", "action_result"):
+        content = format_action_output(content)
     msg = {"role": role, "content": content}
     if action_name is not None:
         msg["action_name"] = action_name
@@ -800,6 +828,3 @@ def run_loop(context, goal, actions, state, config):
 # Entry point: call run_loop with injected context variables
 result = run_loop(context, goal, actions, state, config)
 FINAL(result)
-# Conservative fallback heuristic matching the old Rust-side estimator.
-CHARS_PER_TOKEN = 4
-MESSAGE_OVERHEAD_CHARS = 4
