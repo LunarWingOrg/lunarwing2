@@ -87,7 +87,8 @@ After=network.target
 [Service]
 Type=forking
 ExecStart=/usr/bin/tmux -L weechat-<name> new-session -d -s weechat '/usr/bin/weechat --dir /home/<name>/.config/weechat'
-ExecStop=/usr/bin/tmux -L weechat-<name> kill-session -t weechat
+ExecStop=<repo>/ic/scripts/lunarwing-weechat-stop.sh --weechat-home /home/<name>/.config/weechat --tmux-socket weechat-<name> --session weechat
+TimeoutStopSec=30
 EnvironmentFile=<env_dir>/weechat.env
 Restart=on-failure
 RestartSec=5
@@ -97,6 +98,15 @@ WantedBy=default.target
 ```
 
 Uses `Type=forking` because tmux daemonizes after creating the session.
+
+`ExecStop` sends `/upgrade -quit` via the WeeChat FIFO so WeeChat saves its
+session (buffers, lines, connections) before exiting. On next start, WeeChat
+restores the saved session. Falls back to `tmux kill-session` if the FIFO is
+unavailable or the graceful stop times out. `TimeoutStopSec=30` gives the
+graceful stop time to complete.
+
+The bootstrap sets `weechat.look.save_layout_on_exit buffers` so which buffers
+were open is persisted across restarts.
 
 **`lunarwing-weechat-adapter-<name>.service`**
 
@@ -135,7 +145,7 @@ Init scripts are installed to `/etc/init.d/` with conf.d files in `/etc/conf.d/`
 
 **`/etc/init.d/lunarwing-weechat-<name>`**
 
-Runs WeeChat in a tmux session via `start-stop-daemon`. The `start()` function loads `env/weechat.env` (containing only `RELAY_PASSWORD`) before launching tmux, so the WeeChat process inherits the credential. `stop()` kills the session with `tmux kill-session`. Configurable via conf.d variables: `weechat_user`, `weechat_group`, `weechat_home`, `weechat_env_file`.
+Runs WeeChat in a tmux session via `start-stop-daemon`. The `start()` function loads `env/weechat.env` (containing only `RELAY_PASSWORD`) before launching tmux, so the WeeChat process inherits the credential. `stop()` invokes `lunarwing-weechat-stop.sh` as the tenant user (via `su`) to send `/upgrade -quit` via the WeeChat FIFO, saving buffers and session state before exit. Falls back to `tmux kill-session` if the helper is missing. Configurable via conf.d variables: `weechat_user`, `weechat_group`, `weechat_home`, `weechat_env_file`, `weechat_stop_helper`.
 
 Dependency wiring:
 

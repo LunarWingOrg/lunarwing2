@@ -301,6 +301,14 @@ else
   failures=$((failures + 1))
 fi
 
+# stop() runs the helper as the tenant user (su drop) so tmux socket is found
+if grep -q 'su.*weechat_stop_helper' "$rc_file"; then
+  echo "  PASS: OpenRC stop() invokes helper as tenant user via su"
+else
+  echo "  FAIL: OpenRC stop() does not invoke helper as tenant user"
+  failures=$((failures + 1))
+fi
+
 # stop() still has a tmux kill-session fallback for when the helper is missing
 if grep -q 'kill-session -t weechat' "$rc_file"; then
   echo "  PASS: OpenRC stop() retains tmux kill-session fallback"
