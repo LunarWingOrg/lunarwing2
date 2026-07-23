@@ -17,6 +17,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Ensure the wasm target is present on the *active* toolchain. Because we cd'd
+# into the workspace above, rust-toolchain.toml selects the pinned build
+# toolchain here, so the target lands on exactly the toolchain the cargo builds
+# below use — not the caller's default toolchain, which is what caused
+# "the wasm32-wasip2 target may not be installed" during tenant builds.
+if ! rustup target list --installed 2>/dev/null | grep -q wasm32-wasip2; then
+    echo "==> Installing wasm32-wasip2 target for the active toolchain..."
+    rustup target add wasm32-wasip2
+fi
+
 BUILD_TOOLS=true
 BUILD_CHANNELS=true
 FAILED=()
