@@ -16,7 +16,7 @@
 7. [x] CHPAR-006 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 8. [x] CHPAR-007 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 9. [x] CHPAR-008 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
-10. [ ] create a file in docs/ops with simple overview of the documents within docs/proposals - nothing detailed. just a simple list of the files which exist in docs/proposals
+10. [x] create a file in docs/ops with simple overview of the documents within docs/proposals - nothing detailed. just a simple list of the files which exist in docs/proposals
 11. [ ] create a file in docs/ops with simple overview of the documents within docs/architecture - nothing detailed. just a simple list of the files which exist in docs/architecture
 12. [X] CHPAR-011 item from docs/plans/ENGINE_V2_CHANNEL_PARITY_WORK_ITEMS_2026-07-18.md
 13. [x] Take a look at docs/proposals/IRONCLAW_ADDITION_CANDIDATES.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/README.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-1.0.0-rc.1-port-analysis.md and docs/proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-reborn-port-analysis.md - Identify the top 2 HIGHEST PRIORITY things to implement from candidate additions. Create a single document under docs/proposals to plan these 2 additions.
