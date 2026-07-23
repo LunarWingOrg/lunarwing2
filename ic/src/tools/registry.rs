@@ -605,11 +605,12 @@ impl ToolRegistry {
         self.register_sync(Arc::new(ToolAuthTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolActivateTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolDeactivateTool::new(Arc::clone(&manager))));
+        self.register_sync(Arc::new(ToolUpdateTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolListTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolRemoveTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolUpgradeTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ExtensionInfoTool::new(manager)));
-        tracing::debug!("Registered 9 extension management tools");
+        tracing::debug!("Registered 10 extension management tools");
     }
 
     /// Register skill management tools (list, search, install, remove).

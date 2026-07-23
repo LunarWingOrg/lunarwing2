@@ -543,6 +543,34 @@ pub async fn persist_mcp_server(
     Ok(())
 }
 
+/// Update an existing MCP server configuration in place on disk, preserving
+/// the current `enabled` state.
+pub async fn update_mcp_server(
+    name: &str,
+    new_config: McpServerConfig,
+) -> Result<McpServerConfig, ConfigError> {
+    if name != new_config.name {
+        return Err(ConfigError::InvalidConfig {
+            reason: format!(
+                "Server name mismatch: path name '{name}' does not match config name '{}'",
+                new_config.name
+            ),
+        });
+    }
+    new_config.validate()?;
+    let _config_guard = acquire_mcp_config_write_guard().await?;
+    let mut servers = load_mcp_servers().await?;
+    let existing = servers.get_mut(name).ok_or_else(|| ConfigError::ServerNotFound {
+        name: name.to_string(),
+    })?;
+    let preserved_enabled = existing.enabled;
+    *existing = new_config.clone();
+    existing.enabled = preserved_enabled;
+    let updated = existing.clone();
+    save_mcp_servers(&servers).await?;
+    Ok(updated)
+}
+
 /// Remove an MCP server by name.
 pub async fn remove_mcp_server(name: &str) -> Result<(), ConfigError> {
     let _config_guard = acquire_mcp_config_write_guard().await?;
@@ -590,6 +618,27 @@ pub async fn toggle_mcp_server_enabled(name: &str) -> Result<McpServerConfig, Co
     let server = server.clone();
     save_mcp_servers(&servers).await?;
     Ok(server)
+}
+
+/// Update an existing MCP server configuration on disk (in-place, preserving enabled state).
+///
+/// The new config must have the same `name` as the existing server. If the
+/// existing server is currently enabled, the updated config retains that
+/// enabled state — only the transport/url/headers/oauth fields are replaced.
+pub async fn update_mcp_server_disk(new_config: McpServerConfig) -> Result<McpServerConfig, ConfigError> {
+    new_config.validate()?;
+    let _guard = acquire_mcp_config_write_guard().await?;
+    let mut servers = load_mcp_servers().await?;
+    let existing = servers
+        .get(&new_config.name)
+        .ok_or_else(|| ConfigError::ServerNotFound {
+            name: new_config.name.clone(),
+        })?;
+    let mut updated = new_config;
+    updated.enabled = existing.enabled;
+    servers.upsert(updated.clone());
+    save_mcp_servers(&servers).await?;
+    Ok(updated)
 }
 
 /// Disable a disk-backed server only if its configuration has not changed.
@@ -703,6 +752,34 @@ pub async fn persist_mcp_server_db(
     .await
 }
 
+/// Update an existing DB-backed MCP server in place, preserving `enabled`.
+pub async fn update_mcp_server_db(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    name: &str,
+    new_config: McpServerConfig,
+) -> Result<McpServerConfig, ConfigError> {
+    if name != new_config.name {
+        return Err(ConfigError::InvalidConfig {
+            reason: format!(
+                "Server name mismatch: path name '{name}' does not match config name '{}'",
+                new_config.name
+            ),
+        });
+    }
+    new_config.validate()?;
+    mutate_mcp_servers_db(store, user_id, |servers| {
+        let existing = servers.get_mut(name).ok_or_else(|| ConfigError::ServerNotFound {
+            name: name.to_string(),
+        })?;
+        let preserved_enabled = existing.enabled;
+        *existing = new_config.clone();
+        existing.enabled = preserved_enabled;
+        Ok(existing.clone())
+    })
+    .await
+}
+
 /// Remove an MCP server by name (DB-backed).
 pub async fn remove_mcp_server_db(
     store: &dyn crate::db::Database,
@@ -754,6 +831,31 @@ pub async fn toggle_mcp_server_enabled_db(
             })?;
         server.enabled = !server.enabled;
         Ok(server.clone())
+    })
+    .await
+}
+
+/// Update an existing MCP server configuration in the database (in-place, preserving enabled state).
+///
+/// Uses optimistic concurrency control. The new config must have the same
+/// `name` as the existing server. If the existing server is currently enabled,
+/// the updated config retains that enabled state.
+pub async fn update_mcp_server_db(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    new_config: McpServerConfig,
+) -> Result<McpServerConfig, ConfigError> {
+    new_config.validate()?;
+    mutate_mcp_servers_db(store, user_id, |servers| {
+        let existing = servers
+            .get(&new_config.name)
+            .ok_or_else(|| ConfigError::ServerNotFound {
+                name: new_config.name.clone(),
+            })?;
+        let mut updated = new_config.clone();
+        updated.enabled = existing.enabled;
+        servers.upsert(updated.clone());
+        Ok(updated)
     })
     .await
 }
@@ -1447,5 +1549,37 @@ mod tests {
     fn test_is_localhost_url_rejects_remote() {
         assert!(!is_localhost_url("https://mcp.example.com"));
         assert!(!is_localhost_url("http://192.168.1.1:8080"));
+    }
+
+    #[tokio::test]
+    async fn test_update_mcp_server_preserves_enabled() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp-servers.json");
+
+        let mut file = McpServersFile::default();
+        let mut server = McpServerConfig::new("test", "https://mcp.example.com");
+        server.enabled = false;
+        file.upsert(server);
+        save_mcp_servers_to(&file, &path).await.unwrap();
+
+        let updated = McpServerConfig::new("test", "https://mcp.updated.com");
+        update_mcp_server("test", updated).await.unwrap();
+
+        let loaded = load_mcp_servers_from(&path).await.unwrap();
+        let server = loaded.get("test").unwrap();
+        assert_eq!(server.url, "https://mcp.updated.com");
+        assert!(!server.enabled, "enabled state must be preserved");
+    }
+
+    #[tokio::test]
+    async fn test_update_mcp_server_not_found() {
+        let result = update_mcp_server("nonexistent", McpServerConfig::new("nonexistent", "https://mcp.example.com")).await;
+        assert!(matches!(result, Err(ConfigError::ServerNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_update_mcp_server_name_mismatch() {
+        let result = update_mcp_server("a", McpServerConfig::new("b", "https://mcp.example.com")).await;
+        assert!(matches!(result, Err(ConfigError::InvalidConfig { .. })));
     }
 }

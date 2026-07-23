@@ -78,6 +78,9 @@ pub enum McpCommand {
     /// Add an MCP server
     Add(Box<McpAddArgs>),
 
+    /// Update an existing MCP server's configuration in place
+    Update(Box<McpAddArgs>),
+
     /// Remove an MCP server
     Remove {
         /// Server name to remove
@@ -160,6 +163,7 @@ pub async fn run_mcp_command(
 ) -> anyhow::Result<()> {
     match cmd {
         McpCommand::Add(args) => add_server(*args, config_path, no_db).await,
+        McpCommand::Update(args) => update_server(*args, config_path, no_db).await,
         McpCommand::Remove { name } => remove_server(name, config_path, no_db).await,
         McpCommand::List { verbose } => list_servers(verbose, config_path, no_db).await,
         McpCommand::Auth { name, user } => auth_server(name, user, config_path, no_db).await,
@@ -305,6 +309,99 @@ async fn add_server(
 
     println!();
 
+    Ok(())
+}
+
+/// Update an existing MCP server's configuration in place, preserving enabled state.
+async fn update_server(
+    args: McpAddArgs,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
+    let McpAddArgs {
+        name,
+        url,
+        transport,
+        command,
+        cmd_args,
+        env,
+        socket,
+        headers,
+        client_id,
+        auth_url,
+        token_url,
+        scopes,
+        description,
+    } = args;
+
+    let transport_lower = transport.to_lowercase();
+
+    let mut config = match transport_lower.as_str() {
+        "stdio" => {
+            let cmd = command
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--command is required for stdio transport"))?;
+            let env_map: HashMap<String, String> = env.into_iter().collect();
+            McpServerConfig::new_stdio(&name, &cmd, cmd_args.clone(), env_map)
+        }
+        "unix" => {
+            let socket_path = socket
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--socket is required for unix transport"))?;
+            McpServerConfig::new_unix(&name, &socket_path)
+        }
+        "http" => {
+            let url_val = url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("URL is required for http transport"))?;
+            McpServerConfig::new(&name, url_val)
+        }
+        other => {
+            anyhow::bail!(
+                "Unknown transport type '{}'. Supported: http, stdio, unix",
+                other
+            );
+        }
+    };
+
+    if !headers.is_empty() {
+        let headers_map: HashMap<String, String> = headers.into_iter().collect();
+        config = config.with_headers(headers_map);
+    }
+
+    if let Some(desc) = description {
+        config = config.with_description(desc);
+    }
+
+    if let Some(client_id) = client_id {
+        if transport_lower != "http" {
+            anyhow::bail!("OAuth authentication is only supported with http transport");
+        }
+        let mut oauth = OAuthConfig::new(client_id);
+        if let (Some(auth), Some(token)) = (auth_url, token_url) {
+            oauth = oauth.with_endpoints(auth, token);
+        }
+        if let Some(scopes_str) = scopes {
+            let scope_list: Vec<String> = scopes_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
+            oauth = oauth.with_scopes(scope_list);
+        }
+        config = config.with_oauth(oauth);
+    }
+
+    let db = connect_db(config_path, no_db).await?;
+    if let Some(db) = db.as_ref() {
+        config::load_mcp_servers_from_db_or_migrate(db.store.as_ref(), &db.owner_id).await?;
+        config::update_mcp_server_db(db.store.as_ref(), &db.owner_id, &name, config).await?;
+    } else {
+        config::update_mcp_server(&name, config).await?;
+    }
+
+    println!();
+    println!("  ✓ Updated MCP server '{}'", name);
+    println!();
     Ok(())
 }
 

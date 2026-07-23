@@ -480,6 +480,10 @@ pub async fn start_server(
             post(extensions_remove_handler),
         )
         .route(
+            "/api/extensions/{name}/update",
+            post(extensions_update_handler),
+        )
+        .route(
             "/api/extensions/{name}/setup",
             get(extensions_setup_handler).post(extensions_setup_submit_handler),
         )
@@ -2417,6 +2421,33 @@ async fn extensions_remove_handler(
     ))?;
 
     match ext_mgr.remove(&name, &user.user_id).await {
+        Ok(message) => Ok(Json(ActionResponse::ok(message))),
+        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
+    }
+}
+
+async fn extensions_update_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateExtensionRequest>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let ext_mgr = state.extension_manager.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Extension manager not available (secrets store required)".to_string(),
+    ))?;
+
+    let existing = ext_mgr
+        .get_mcp_server_pub(&name, &user.user_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    let new_config = match req.build_mcp_config(&existing) {
+        Ok(config) => config,
+        Err(e) => return Ok(Json(ActionResponse::fail(e))),
+    };
+
+    match ext_mgr.update_mcp(&name, new_config, &user.user_id).await {
         Ok(message) => Ok(Json(ActionResponse::ok(message))),
         Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
     }

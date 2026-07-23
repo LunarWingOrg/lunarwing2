@@ -886,6 +886,138 @@ impl InstallExtensionRequest {
     }
 }
 
+/// Request body for `POST /api/extensions/{name}/update`.
+///
+/// All fields are optional — only provided fields are applied. The `name` in
+/// the path identifies the server; the body must not change it.
+#[derive(Debug, Deserialize)]
+pub struct UpdateExtensionRequest {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl UpdateExtensionRequest {
+    /// Build a full `McpServerConfig` from the update request, using fields
+    /// from `existing` as defaults for any field not supplied.
+    pub fn build_mcp_config(
+        &self,
+        existing: &crate::tools::mcp::McpServerConfig,
+    ) -> Result<crate::tools::mcp::McpServerConfig, String> {
+        use crate::tools::mcp::config::EffectiveTransport;
+
+        let transport_str = self.transport.as_deref();
+        let (effective_transport, url) = match (&existing.effective_transport(), transport_str) {
+            (EffectiveTransport::Stdio { .. }, Some("http")) | (_, Some("http")) => {
+                let url = self
+                    .url
+                    .clone()
+                    .or_else(|| {
+                        if existing.url.is_empty() {
+                            None
+                        } else {
+                            Some(existing.url.clone())
+                        }
+                    })
+                    .ok_or_else(|| "URL is required for http transport".to_string())?;
+                (EffectiveTransport::Http, url)
+            }
+            (_, Some("stdio")) => {
+                let command = self
+                    .command
+                    .clone()
+                    .ok_or_else(|| "Command is required for stdio transport".to_string())?;
+                let args = if self.args.is_empty() {
+                    match &existing.transport {
+                        Some(crate::tools::mcp::config::McpTransportConfig::Stdio { args, .. }) => {
+                            args.clone()
+                        }
+                        _ => Vec::new(),
+                    }
+                } else {
+                    self.args.clone()
+                };
+                let env = if self.env.is_empty() {
+                    match &existing.transport {
+                        Some(crate::tools::mcp::config::McpTransportConfig::Stdio { env, .. }) => {
+                            env.clone()
+                        }
+                        _ => std::collections::HashMap::new(),
+                    }
+                } else {
+                    self.env.clone()
+                };
+                return Ok(crate::tools::mcp::McpServerConfig::new_stdio(
+                    &existing.name,
+                    &command,
+                    args,
+                    env,
+                ));
+            }
+            (_, Some(other)) => {
+                return Err(format!("Unsupported transport '{other}'"));
+            }
+            (EffectiveTransport::Http, None) => {
+                let url = self
+                    .url
+                    .clone()
+                    .or_else(|| {
+                        if existing.url.is_empty() {
+                            None
+                        } else {
+                            Some(existing.url.clone())
+                        }
+                    })
+                    .ok_or_else(|| "URL is required for http transport".to_string())?;
+                (EffectiveTransport::Http, url)
+            }
+            (EffectiveTransport::Stdio { command, args, env }, None) => {
+                let cmd = self.command.as_deref().unwrap_or(command);
+                let a = if self.args.is_empty() {
+                    args.to_vec()
+                } else {
+                    self.args.clone()
+                };
+                let e = if self.env.is_empty() {
+                    env.clone()
+                } else {
+                    self.env.clone()
+                };
+                return Ok(crate::tools::mcp::McpServerConfig::new_stdio(
+                    &existing.name,
+                    cmd,
+                    a,
+                    e,
+                ));
+            }
+            (EffectiveTransport::Unix { socket_path }, None) => {
+                return Ok(crate::tools::mcp::McpServerConfig::new_unix(
+                    &existing.name,
+                    socket_path,
+                ));
+            }
+        };
+
+        let _ = effective_transport;
+        let mut config = crate::tools::mcp::McpServerConfig::new(&existing.name, &url);
+        if let Some(desc) = &self.description {
+            config = config.with_description(desc);
+        } else if let Some(desc) = &existing.description {
+            config = config.with_description(desc);
+        }
+        Ok(config)
+    }
+}
+
 // --- Extension Setup ---
 
 #[derive(Debug, Serialize)]

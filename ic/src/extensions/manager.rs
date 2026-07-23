@@ -958,6 +958,77 @@ impl ExtensionManager {
         Ok(message)
     }
 
+    /// Update an installed MCP server's configuration in-place (command, args, env,
+    /// url, headers, oauth, description).  If the server is currently active, the
+    /// runtime is restarted with the new configuration.  The enabled state is
+    /// preserved; registry precedence and approval rules are unchanged because the
+    /// same name and config record are updated atomically.
+    pub async fn update_mcp(
+        &self,
+        name: &str,
+        new_config: McpServerConfig,
+        user_id: &str,
+    ) -> Result<String, ExtensionError> {
+        Self::validate_extension_name(name)?;
+        if name != new_config.name {
+            return Err(ExtensionError::Other(
+                "MCP server name cannot be changed via update".to_string(),
+            ));
+        }
+        let kind = self.determine_installed_kind(name, user_id).await?;
+        if kind != ExtensionKind::McpServer {
+            return Err(ExtensionError::Other(format!(
+                "Only MCP servers can be updated; '{name}' is a {kind}"
+            )));
+        }
+
+        let _lifecycle_guard = self.lock_mcp_lifecycle(name).await;
+
+        let was_active = self
+            .active_mcp_servers
+            .read()
+            .await
+            .get(name)
+            .is_some_and(|runtime| runtime.owner_id == user_id);
+
+        let updated = self.update_mcp_server_config(new_config, user_id).await?;
+
+        if was_active {
+            let stopped = self.stop_mcp_runtime(name, user_id).await;
+            tracing::info!(
+                server = %name,
+                unloaded = stopped.tool_names.len(),
+                "Restarting MCP server after config update"
+            );
+            let server = self.set_mcp_enabled(name, user_id, updated.enabled).await?;
+            match self.activate_mcp_locked(name, user_id, server).await {
+                Ok(result) => {
+                    let mut message = format!(
+                        "Updated MCP server '{name}'. Server restarted with {} tool(s).",
+                        result.tools_loaded.len()
+                    );
+                    if let Some(warning) = stopped.cleanup_warning {
+                        message.push_str(&format!(" Cleanup warning: {warning}"));
+                    }
+                    Ok(message)
+                }
+                Err(error) => {
+                    let mut message = format!(
+                        "Updated MCP server '{name}' config, but restart failed: {error}"
+                    );
+                    if let Some(warning) = stopped.cleanup_warning {
+                        message.push_str(&format!(" Cleanup warning: {warning}"));
+                    }
+                    Err(ExtensionError::Other(message))
+                }
+            }
+        } else {
+            Ok(format!(
+                "Updated MCP server '{name}'. Changes will take effect when the server is activated."
+            ))
+        }
+    }
+
     /// Atomically toggle an MCP server and apply the corresponding runtime transition.
     pub async fn toggle_mcp(&self, name: &str, user_id: &str) -> Result<String, ExtensionError> {
         Self::validate_extension_name(name)?;
@@ -1578,8 +1649,7 @@ impl ExtensionManager {
     }
 
     /// Get detailed info about an installed extension (version, wit_version, host compatibility).
-    pub async fn extension_info(
-        &self,
+    pub async fn extension_info(        &self,
         name: &str,
         user_id: &str,
     ) -> Result<serde_json::Value, ExtensionError> {
@@ -1685,6 +1755,16 @@ impl ExtensionManager {
         })
     }
 
+    /// Public accessor used by the web handler to load an MCP server config
+    /// before building the update request.
+    pub async fn get_mcp_server_pub(
+        &self,
+        name: &str,
+        user_id: &str,
+    ) -> Result<McpServerConfig, crate::tools::mcp::config::ConfigError> {
+        self.get_mcp_server(name, user_id).await
+    }
+
     async fn add_mcp_server(
         &self,
         config: McpServerConfig,
@@ -1708,6 +1788,23 @@ impl ExtensionManager {
             crate::tools::mcp::config::remove_mcp_server_db(store.as_ref(), user_id, name).await
         } else {
             crate::tools::mcp::config::remove_mcp_server(name).await
+        }
+    }
+
+    async fn update_mcp_server_config(
+        &self,
+        new_config: McpServerConfig,
+        user_id: &str,
+    ) -> Result<McpServerConfig, crate::tools::mcp::config::ConfigError> {
+        if let Some(ref store) = self.store {
+            crate::tools::mcp::config::update_mcp_server_db(
+                store.as_ref(),
+                user_id,
+                new_config,
+            )
+            .await
+        } else {
+            crate::tools::mcp::config::update_mcp_server_disk(new_config).await
         }
     }
 
@@ -2007,6 +2104,77 @@ impl ExtensionManager {
                 "MCP server '{name}' installed with {transport} transport. Run activate to connect."
             ),
         })
+    }
+
+    /// Update an installed MCP server's configuration in place.
+    ///
+    /// If the server is currently active, the runtime is stopped first so
+    /// that the new configuration takes effect on next activation. The
+    /// `enabled` flag is preserved from the existing config.
+    pub async fn update_mcp_config(
+        &self,
+        name: &str,
+        new_config: McpServerConfig,
+        user_id: &str,
+    ) -> Result<String, ExtensionError> {
+        Self::validate_extension_name(name)?;
+        if name != new_config.name {
+            return Err(ExtensionError::Config(format!(
+                "Server name mismatch: cannot update '{name}' with config named '{}'",
+                new_config.name
+            )));
+        }
+        new_config
+            .validate()
+            .map_err(|e| ExtensionError::Config(e.to_string()))?;
+
+        let _lifecycle_guard = self.lock_mcp_lifecycle(name).await;
+
+        let kind = self.determine_installed_kind(name, user_id).await?;
+        if kind != ExtensionKind::McpServer {
+            return Err(ExtensionError::Other(format!(
+                "Only MCP servers can be updated in place; '{name}' is a {kind}"
+            )));
+        }
+
+        let was_active = self.active_mcp_servers.read().await.contains_key(name);
+        if was_active {
+            self.stop_mcp_runtime(name, user_id).await;
+        }
+
+        let updated = if let Some(ref store) = self.store {
+            crate::tools::mcp::config::update_mcp_server_db(
+                store.as_ref(),
+                user_id,
+                name,
+                new_config,
+            )
+            .await
+        } else {
+            crate::tools::mcp::config::update_mcp_server(name, new_config).await
+        }
+        .map_err(|e| ExtensionError::Config(e.to_string()))?;
+
+        let transport_label = match updated.effective_transport() {
+            crate::tools::mcp::config::EffectiveTransport::Http => "HTTP",
+            crate::tools::mcp::config::EffectiveTransport::Stdio { .. } => "stdio",
+            crate::tools::mcp::config::EffectiveTransport::Unix { .. } => "Unix socket",
+        };
+
+        let mut message = format!("Updated MCP server '{name}' ({transport_label})");
+        if was_active {
+            message.push_str("; active runtime stopped — run activate to reconnect");
+        }
+        if updated.enabled {
+            message.push_str("; server remains enabled");
+        } else {
+            message.push_str("; server remains disabled");
+        }
+
+        tracing::info!(server = %name, transport = transport_label, "Updated MCP server config");
+        self.broadcast_extension_status(user_id, name, "updated", Some(&message))
+            .await;
+        Ok(message)
     }
 
     async fn install_wasm_tool_from_url(
