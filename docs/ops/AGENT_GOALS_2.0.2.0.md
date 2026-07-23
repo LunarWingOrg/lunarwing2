@@ -103,7 +103,7 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
 9. [ ] dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the branch: rarity/item-20-20260722-1501
 10. [x] update onboard ui to correspond with changes in codebase since v2.0.0.0 - surely some things have been broken at this point - in particular, kawarimi is likely broken now due to new 7z encryption
 11. [ ] review recent changes in onboard ui and see if there are issues
-12. [ ] come up with a plan to create proper CI/CD in our gitlab. put it in docs/proposals
+12. [x] come up with a plan to create proper CI/CD in our gitlab. put it in docs/proposals. Completed 2026-07-23: `docs/proposals/GITLAB_CI_CD_PLAN.md`.
 13. [ ] follow up from item 12. work on script or build pipeline for this. in its own directory in the repo
 14. [ ] review kawarimi adapter (item 15)
 15. [ ] review darkirc key exchange implementation
