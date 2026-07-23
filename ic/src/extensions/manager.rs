@@ -2042,7 +2042,10 @@ impl ExtensionManager {
 
         let _lifecycle_guard = self.lock_mcp_lifecycle(name).await;
 
-        let existing = self.get_mcp_server(name, user_id).await?;
+        let existing = self
+            .get_mcp_server(name, user_id)
+            .await
+            .map_err(|e| ExtensionError::Config(e.to_string()))?;
         new_config.name = existing.name.clone();
         new_config.enabled = existing.enabled;
         if new_config.oauth.is_none() {

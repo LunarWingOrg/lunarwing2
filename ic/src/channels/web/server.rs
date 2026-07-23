@@ -2331,7 +2331,7 @@ async fn extensions_update_handler(
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    let mut new_config = match req.transport.as_deref() {
+    let new_config = match req.transport.as_deref() {
         Some("stdio") => {
             let command = req.command.as_deref().ok_or_else(|| {
                 (

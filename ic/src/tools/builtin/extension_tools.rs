@@ -1101,7 +1101,7 @@ mod tests {
         );
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("name").is_some());
-        assert_eq!(schema[\"required\"], serde_json::json!(["name"]));
+        assert_eq!(schema["required"], serde_json::json!(["name"]));
     }
 
     #[test]
