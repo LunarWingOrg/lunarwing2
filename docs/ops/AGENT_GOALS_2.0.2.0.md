@@ -56,7 +56,7 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
     - Native execution on an `aarch64` host was not available in this worktree; the shared architecture path and resource calculations are covered by the shell harness.
     </details>
     
-8. [ ] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
+8. [x] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. Reference branches for prior/failed attempts: `faility/failed-partial-old-item-3-20260711-0601` and `slopmcp1/codex/upgrade/v2.0.0.0`.
     <details>
     <summary><b>✅ DONE (verified 2026-07-21) — Foundational: first-class host-local stdio MCP installation</b></summary>
     Confirmed present in code with references:
@@ -88,7 +88,13 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
       - Done (added 2026-07-21): reports transport (http/stdio/unix) + enabled state per server, resolves stdio commands through PATH (without executing), and flags enabled stdio servers whose command is missing on PATH. Helpers: `preflight_mcp_server`, `resolve_command_in_path`, `is_executable` in `ic/src/cli/doctor.rs`. Unit tests cover PATH resolution and stdio-disabled missing-command behavior.
       - Intentionally still excluded: spawning the server or running an actual MCP handshake during install — install remains separate from execution.
 
-    - ❌ **In-place configuration updates — NOT STARTED.** Let users edit command/args/env/url without remove+reinstall; if active, require explicit restart confirmation; preserve registry precedence + approval rules. (Only add/remove/toggle/auth/test exist today.) - there is some incomplete work on the branch: rarity/item-19-20260723-0415
+    - ✅ **In-place configuration updates — DONE (2026-07-23).**
+      - `ExtensionManager::update_mcp` persists a new config, stops active runtime if needed, and reactivates; preserves enabled state, OAuth credentials, and headers from the existing server.
+      - `ToolUpdateTool` (conversational `tool_update`) builds a merged config from user params + existing server, validates, and delegates to `update_mcp`.
+      - `lunarwing mcp update <name> [url] [--transport] [--command] [--arg] [--env]` applies an offline config patch to disk; suggests toggle commands for a live restart.
+      - `POST /api/extensions/{name}/update` web handler accepts partial config overwrites.
+      - `tool_update` is in the autonomous denylist, permissions `AskEachTime`, and schema-validator test suite.
+      - No remove+reinstall required. Enabled state, OAuth, and headers are preserved across updates.
 
     - ✅ **Focused integration coverage — DONE (2026-07-22).**
       - Done: `mcp_extension_lifecycle` e2e (search → install → activate → use) + `mcp_compat/{transport,auth,oauth}` tests — all HTTP mock (`ic/tests/e2e_advanced_traces.rs:511`, `ic/tests/mcp_compat/`).
