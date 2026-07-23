@@ -64,6 +64,7 @@ fn seeded_default_permission_canonical(canonical_tool_name: &str) -> Option<Perm
         | "tool_auth"
         | "tool_activate"
         | "tool_deactivate"
+        | "tool_update"
         | "tool_remove"
         | "tool_upgrade"
         | "skill_install"
