@@ -4958,7 +4958,7 @@ function resolveSkillProposal(docId, kind, action) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({kind: kind}),
   }).then(function(resp) {
-    if (resp && resp.ok === false) {
+    if (resp && resp.success === false) {
       showToast(resp.message || I18n.t('skills.patchActionFailed'), 'error');
     } else {
       showToast(resp && resp.message ? resp.message : I18n.t('skills.patchActionOk'), 'success');
