@@ -58,7 +58,7 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
     **Defer for now:** worker-local MCP, automatic npm/pip install, secret injection through process env, general runtime-adapter refactor, gateway integration, automatic crash restart — each materially increases the security/lifecycle surface.
     </details>
 8. [x] (S) dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the branch: rarity/item-20-20260722-1501
-9. [ ] review recent changes in onboard ui and see if there are issues
+9. [x] review recent changes in onboard ui and see if there are issues
 10. [x] (S) review kawarimi adapter (item 15)
 11. [x] (S) review darkirc key exchange implementation
 12. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
