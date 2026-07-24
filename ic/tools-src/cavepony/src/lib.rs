@@ -7,7 +7,6 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use regex::{Captures, Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 wit_bindgen::generate!({
@@ -156,7 +155,7 @@ struct SubstitutionDictionary {
 }
 
 struct CompiledSubstitution {
-    pattern: Regex,
+    pattern: Vec<String>,
     replacement: String,
 }
 
@@ -287,10 +286,8 @@ fn expand(text: &str) -> String {
 
 fn apply_phrase_tokens(text: &str) -> String {
     let mut result = text.to_string();
-    for (pattern, token) in phrase_patterns() {
-        result = pattern
-            .replace_all(&result, regex::NoExpand(token.as_str()))
-            .into_owned();
+    for mapping in phrase_mappings() {
+        result = replace_bounded_literal(&result, &mapping.phrase, &mapping.token);
     }
     result
 }
@@ -298,12 +295,7 @@ fn apply_phrase_tokens(text: &str) -> String {
 fn apply_substitutions(text: &str, substitutions: &[CompiledSubstitution]) -> String {
     let mut result = text.to_string();
     for substitution in substitutions {
-        result = substitution
-            .pattern
-            .replace_all(&result, |captures: &Captures<'_>| {
-                preserve_initial_case(&captures[0], &substitution.replacement)
-            })
-            .into_owned();
+        result = replace_bounded_pattern(&result, &substitution.pattern, &substitution.replacement);
     }
     result
 }
@@ -320,56 +312,47 @@ fn preserve_initial_case(source: &str, replacement: &str) -> String {
 
 fn drop_filler(text: &str) -> String {
     let mut result = text.to_string();
-    for pattern in filler_patterns() {
-        result = pattern.replace_all(&result, "").into_owned();
+    for (phrase, allow_bang) in [
+        ("sure", true),
+        ("absolutely", true),
+        ("thank you", false),
+        ("thanks", false),
+        ("would you mind", false),
+        ("could you", false),
+        ("would you", false),
+        ("if you could", false),
+        ("if you would", false),
+    ] {
+        let require_end_boundary = !matches!(phrase, "sure" | "absolutely");
+        result = remove_bounded_phrase(&result, phrase, require_end_boundary, allow_bang, false);
     }
     result
 }
 
 fn drop_articles(text: &str) -> String {
-    static ARTICLES: OnceLock<Regex> = OnceLock::new();
-    static JUST: OnceLock<Regex> = OnceLock::new();
-
-    // Safety: these hardcoded regex literals are covered by unit tests.
-    let articles = ARTICLES.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:a|an|the)\s+").expect("hardcoded Cavepony article regex must compile")
-    });
-    let just = JUST.get_or_init(|| {
-        Regex::new(r"(?i)\bjust\b\s*").expect("hardcoded Cavepony filler regex must compile")
-    });
-    let result = articles.replace_all(text, "");
-    just.replace_all(&result, "").into_owned()
+    let mut result = text.to_string();
+    for article in ["a", "an", "the"] {
+        result = remove_bounded_phrase(&result, article, true, false, true);
+    }
+    remove_bounded_phrase(&result, "just", true, false, false)
 }
 
 fn abbreviate_ultra(text: &str) -> String {
-    static TO_BE: OnceLock<Regex> = OnceLock::new();
-    // Safety: this hardcoded regex literal is covered by unit tests.
-    let to_be = TO_BE.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:am|is|are|was|were|be|been|being)\s+")
-            .expect("hardcoded Cavepony to-be regex must compile")
-    });
-    let mut result = to_be.replace_all(text, "").into_owned();
-    for (pattern, replacement) in ultra_patterns() {
-        result = pattern.replace_all(&result, *replacement).into_owned();
+    let mut result = text.to_string();
+    for word in ["am", "is", "are", "was", "were", "be", "been", "being"] {
+        result = remove_bounded_phrase(&result, word, true, false, true);
+    }
+    for (word, replacement) in ultra_patterns() {
+        result = replace_bounded_literal(&result, word, replacement);
     }
     result
 }
 
 fn cleanup_segment(text: &str) -> String {
-    static SPACES: OnceLock<Regex> = OnceLock::new();
-    static BEFORE_PUNCTUATION: OnceLock<Regex> = OnceLock::new();
-    // Safety: these hardcoded regex literals are covered by unit tests.
-    let spaces = SPACES.get_or_init(|| {
-        Regex::new(r"[ \t]{2,}").expect("hardcoded Cavepony whitespace regex must compile")
-    });
-    let before_punctuation = BEFORE_PUNCTUATION.get_or_init(|| {
-        Regex::new(r"[ \t]+([,.;:!?])").expect("hardcoded Cavepony punctuation regex must compile")
-    });
-
     let preserve_leading = text.chars().next().is_some_and(char::is_whitespace);
     let preserve_trailing = text.chars().next_back().is_some_and(char::is_whitespace);
-    let collapsed = spaces.replace_all(text, " ");
-    let collapsed = before_punctuation.replace_all(&collapsed, "$1");
+    let collapsed = collapse_horizontal_whitespace(text);
+    let collapsed = remove_whitespace_before_punctuation(&collapsed);
     let trimmed = collapsed.trim();
     if trimmed.is_empty() {
         return if preserve_leading || preserve_trailing {
@@ -386,6 +369,194 @@ fn cleanup_segment(text: &str) -> String {
     result.push_str(trimmed);
     if preserve_trailing {
         result.push(' ');
+    }
+    result
+}
+
+fn replace_bounded_literal(text: &str, literal: &str, replacement: &str) -> String {
+    replace_bounded_matches(text, replacement, false, |start| {
+        bounded_literal_end(text, start, literal)
+    })
+}
+
+fn replace_bounded_pattern(text: &str, pattern: &[String], replacement: &str) -> String {
+    replace_bounded_matches(text, replacement, true, |start| {
+        bounded_pattern_end(text, start, pattern)
+    })
+}
+
+fn replace_bounded_matches<F>(
+    text: &str,
+    replacement: &str,
+    preserve_case: bool,
+    mut match_end: F,
+) -> String
+where
+    F: FnMut(usize) -> Option<usize>,
+{
+    let mut result = String::with_capacity(text.len());
+    let mut copied_through = 0;
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        if let Some(end) = match_end(cursor) {
+            result.push_str(&text[copied_through..cursor]);
+            if preserve_case {
+                result.push_str(&preserve_initial_case(&text[cursor..end], replacement));
+            } else {
+                result.push_str(replacement);
+            }
+            cursor = end;
+            copied_through = end;
+        } else {
+            cursor += text[cursor..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    result.push_str(&text[copied_through..]);
+    result
+}
+
+fn bounded_literal_end(text: &str, start: usize, literal: &str) -> Option<usize> {
+    let end = leading_bounded_literal_end(text, start, literal)?;
+    if text[end..].chars().next().is_some_and(is_word_character) {
+        return None;
+    }
+    Some(end)
+}
+
+fn leading_bounded_literal_end(text: &str, start: usize, literal: &str) -> Option<usize> {
+    if text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(is_word_character)
+    {
+        return None;
+    }
+    literal_match_end(text, start, literal)
+}
+
+fn literal_match_end(text: &str, start: usize, literal: &str) -> Option<usize> {
+    let mut cursor = start;
+    for expected in literal.chars() {
+        let actual = text[cursor..].chars().next()?;
+        if !characters_equal_ignoring_case(actual, expected) {
+            return None;
+        }
+        cursor += actual.len_utf8();
+    }
+    Some(cursor)
+}
+
+fn characters_equal_ignoring_case(left: char, right: char) -> bool {
+    if !right.is_ascii_alphabetic() {
+        return left == right;
+    }
+    let lower = right.to_ascii_lowercase();
+    left == lower
+        || left == lower.to_ascii_uppercase()
+        || (lower == 'k' && left == 'K')
+        || (lower == 's' && left == 'ſ')
+}
+
+fn bounded_pattern_end(text: &str, start: usize, pattern: &[String]) -> Option<usize> {
+    if text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(is_word_character)
+    {
+        return None;
+    }
+
+    let mut cursor = start;
+    for (index, part) in pattern.iter().enumerate() {
+        if index > 0 {
+            let whitespace_start = cursor;
+            while let Some(character) = text[cursor..]
+                .chars()
+                .next()
+                .filter(|character| character.is_whitespace())
+            {
+                cursor += character.len_utf8();
+            }
+            if cursor == whitespace_start {
+                return None;
+            }
+        }
+        cursor = literal_match_end(text, cursor, part)?;
+    }
+
+    text[cursor..]
+        .chars()
+        .next()
+        .is_none_or(|character| !is_word_character(character))
+        .then_some(cursor)
+}
+
+fn remove_bounded_phrase(
+    text: &str,
+    phrase: &str,
+    require_end_boundary: bool,
+    allow_bang: bool,
+    require_trailing_whitespace: bool,
+) -> String {
+    replace_bounded_matches(text, "", false, |start| {
+        let mut end = if require_end_boundary {
+            bounded_literal_end(text, start, phrase)?
+        } else {
+            leading_bounded_literal_end(text, start, phrase)?
+        };
+        if allow_bang && text[end..].starts_with('!') {
+            end += 1;
+        }
+        let whitespace_start = end;
+        while let Some(character) = text[end..]
+            .chars()
+            .next()
+            .filter(|character| character.is_whitespace())
+        {
+            end += character.len_utf8();
+        }
+        if require_trailing_whitespace && end == whitespace_start {
+            return None;
+        }
+        Some(end)
+    })
+}
+
+fn collapse_horizontal_whitespace(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if !matches!(character, ' ' | '\t') {
+            result.push(character);
+            continue;
+        }
+
+        let mut run = 1;
+        while characters
+            .next_if(|candidate| matches!(candidate, ' ' | '\t'))
+            .is_some()
+        {
+            run += 1;
+        }
+        if run == 1 {
+            result.push(character);
+        } else {
+            result.push(' ');
+        }
+    }
+    result
+}
+
+fn remove_whitespace_before_punctuation(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(character, ',' | '.' | ';' | ':' | '!' | '?') {
+            while result.ends_with([' ', '\t']) {
+                result.pop();
+            }
+        }
+        result.push(character);
     }
     result
 }
@@ -447,23 +618,12 @@ fn substitution_dictionary(source: &str) -> SubstitutionDictionary {
         .expect("embedded Cavepony substitution dictionary must be valid JSON")
 }
 
-fn phrase_patterns() -> &'static [(Regex, String)] {
-    static PATTERNS: OnceLock<Vec<(Regex, String)>> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
+fn phrase_mappings() -> &'static [TokenMapping] {
+    static MAPPINGS: OnceLock<Vec<TokenMapping>> = OnceLock::new();
+    MAPPINGS.get_or_init(|| {
         let mut mappings = token_dictionary().mappings;
-        mappings.sort_by(|left, right| right.phrase.len().cmp(&left.phrase.len()));
+        mappings.sort_by_key(|mapping| std::cmp::Reverse(mapping.phrase.len()));
         mappings
-            .into_iter()
-            .map(|mapping| {
-                // Safety: phrase text is escaped before joining hardcoded boundaries.
-                let pattern =
-                    RegexBuilder::new(&format!(r"\b{}\b", regex::escape(&mapping.phrase)))
-                        .case_insensitive(true)
-                        .build()
-                        .expect("escaped embedded Cavepony phrase regex must compile");
-                (pattern, mapping.token)
-            })
-            .collect()
     })
 }
 
@@ -476,7 +636,7 @@ fn expansion_mappings() -> &'static [TokenMapping] {
             .into_iter()
             .filter(|mapping| seen.insert(mapping.token.clone()))
             .collect();
-        mappings.sort_by(|left, right| right.token.len().cmp(&left.token.len()));
+        mappings.sort_by_key(|mapping| std::cmp::Reverse(mapping.token.len()));
         mappings
     })
 }
@@ -501,70 +661,70 @@ fn compile_substitutions(dictionary: SubstitutionDictionary) -> Vec<CompiledSubs
     dictionary
         .substitutions
         .into_iter()
-        .map(|substitution| CompiledSubstitution {
-            // Safety: patterns are repository-controlled and compile in unit tests.
-            pattern: RegexBuilder::new(&substitution.pattern)
-                .case_insensitive(true)
-                .build()
-                .expect("embedded Cavepony substitution regex must compile"),
-            replacement: substitution.replacement,
+        .map(|substitution| {
+            let pattern = substitution
+                .pattern
+                .strip_prefix(r"\b")
+                .and_then(|pattern| pattern.strip_suffix(r"\b"))
+                .filter(|pattern| !pattern.is_empty())
+                .expect("embedded Cavepony substitutions must use non-empty word boundaries");
+            let parts: Vec<_> = pattern.split(r"\s+").map(str::to_string).collect();
+            assert!(
+                parts.iter().all(|part| {
+                    !part.is_empty()
+                        && !part.chars().any(|character| {
+                            matches!(
+                                character,
+                                '\\' | '^'
+                                    | '$'
+                                    | '*'
+                                    | '+'
+                                    | '?'
+                                    | '['
+                                    | ']'
+                                    | '('
+                                    | ')'
+                                    | '{'
+                                    | '}'
+                                    | '|'
+                            )
+                        })
+                }),
+                "embedded Cavepony substitutions must contain only bounded literals and \\s+"
+            );
+            CompiledSubstitution {
+                pattern: parts,
+                replacement: substitution.replacement,
+            }
         })
         .collect()
 }
 
-fn filler_patterns() -> &'static [Regex] {
-    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        [
-            r"(?i)\b(?:sure|absolutely)!?\s*",
-            r"(?i)\b(?:thank you|thanks)\b\s*",
-            r"(?i)\b(?:would you mind|could you|would you|if you could|if you would)\b\s*",
-        ]
-        .into_iter()
-        // Safety: patterns are hardcoded and covered by unit tests.
-        .map(|pattern| Regex::new(pattern).expect("hardcoded Cavepony filler regex must compile"))
-        .collect()
-    })
-}
-
-fn ultra_patterns() -> &'static [(Regex, &'static str)] {
-    static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        [
-            ("because", "bc"),
-            ("approximately", "~"),
-            ("important", "key"),
-            ("problem", "bug"),
-            ("issue", "bug"),
-            ("configuration", "conf"),
-            ("parameter", "param"),
-            ("function", "fn"),
-            ("variable", "var"),
-            ("authentication", "auth"),
-            ("information", "info"),
-            ("application", "app"),
-            ("environment", "env"),
-            ("repository", "repo"),
-            ("developer", "dev"),
-            ("development", "dev"),
-            ("production", "prod"),
-            ("database", "db"),
-            ("request", "req"),
-            ("response", "res"),
-            ("document", "doc"),
-            ("reference", "ref"),
-        ]
-        .into_iter()
-        .map(|(word, replacement)| {
-            // Safety: words are escaped before joining hardcoded boundaries.
-            let pattern = RegexBuilder::new(&format!(r"\b{}\b", regex::escape(word)))
-                .case_insensitive(true)
-                .build()
-                .expect("hardcoded Cavepony abbreviation regex must compile");
-            (pattern, replacement)
-        })
-        .collect()
-    })
+fn ultra_patterns() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("because", "bc"),
+        ("approximately", "~"),
+        ("important", "key"),
+        ("problem", "bug"),
+        ("issue", "bug"),
+        ("configuration", "conf"),
+        ("parameter", "param"),
+        ("function", "fn"),
+        ("variable", "var"),
+        ("authentication", "auth"),
+        ("information", "info"),
+        ("application", "app"),
+        ("environment", "env"),
+        ("repository", "repo"),
+        ("developer", "dev"),
+        ("development", "dev"),
+        ("production", "prod"),
+        ("database", "db"),
+        ("request", "req"),
+        ("response", "res"),
+        ("document", "doc"),
+        ("reference", "ref"),
+    ]
 }
 
 fn replace_token(text: &str, token: &str, phrase: &str) -> String {
@@ -603,7 +763,29 @@ fn token_boundaries_match(text: &str, start: usize, end: usize, token: &str) -> 
 }
 
 fn is_word_character(character: char) -> bool {
-    character.is_alphanumeric() || character == '_'
+    static WORD: OnceLock<regex_syntax::hir::ClassUnicode> = OnceLock::new();
+    let word = WORD.get_or_init(|| {
+        let hir = regex_syntax::Parser::new()
+            .parse(r"\w")
+            .expect("hardcoded Unicode Perl word class must parse");
+        match hir.kind() {
+            regex_syntax::hir::HirKind::Class(regex_syntax::hir::Class::Unicode(class)) => {
+                class.clone()
+            }
+            _ => unreachable!("Unicode Perl word class must parse to a Unicode class"),
+        }
+    });
+    word.ranges()
+        .binary_search_by(|range| {
+            if range.end() < character {
+                std::cmp::Ordering::Less
+            } else if range.start() > character {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 fn is_symbol_boundary(character: char) -> bool {
@@ -813,7 +995,7 @@ mod tests {
     #[test]
     fn dictionaries_load_and_patterns_compile() {
         assert!(token_dictionary().mappings.len() > 80);
-        assert!(phrase_patterns().len() > 80);
+        assert!(phrase_mappings().len() > 80);
         assert!(pony_substitutions().len() > 80);
         assert!(canterlot_substitutions().len() > 90);
     }
@@ -828,6 +1010,17 @@ mod tests {
             compress("due to the fact that rain", Mode::Tokens),
             "∵ rain"
         );
+        assert_eq!(compress("Actually useful", Mode::Tokens), "act useful");
+        assert_eq!(compress("Kind of useful", Mode::Tokens), "~ useful");
+        assert_eq!(
+            compress("actually\u{301} useful", Mode::Tokens),
+            "actually\u{301} useful"
+        );
+        assert_eq!(
+            compress("actually\u{200c} useful", Mode::Tokens),
+            "actually\u{200c} useful"
+        );
+        assert_eq!(compress("ı think", Mode::Tokens), "ı think");
     }
 
     #[test]
@@ -845,6 +1038,7 @@ mod tests {
     fn pony_mode_applies_pony_and_full_compression() {
         let result = compress("The human and the woman use their hands", Mode::Pony);
         assert_eq!(result, "pony and mare use their hooves");
+        assert_eq!(compress("New\tYork", Mode::Pony), "Manehattan");
     }
 
     #[test]
@@ -862,6 +1056,7 @@ mod tests {
             Mode::Ultra,
         );
         assert_eq!(result, "auth conf not ready bc db unavailable");
+        assert_eq!(compress("Authentication works", Mode::Ultra), "auth works");
     }
 
     #[test]

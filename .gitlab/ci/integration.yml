@@ -15,6 +15,17 @@ shell-harnesses:
   script:
     - bash .gitlab/scripts/shell-harnesses.sh
 
+cavepony-wasm:
+  extends: .rust-job
+  stage: test
+  needs:
+    - rust-check-default
+  timeout: 30m
+  script:
+    - rustup target add --toolchain 1.96.1 wasm32-wasip2
+    - bash .gitlab/scripts/cargo-ci.sh build -j6 --release --target wasm32-wasip2 --manifest-path tools-src/cavepony/Cargo.toml
+    - bash .gitlab/scripts/cargo-ci.sh test -j6 --locked --test wit_compat cavepony_component_actions_fit_ten_million_fuel -- --exact
+
 # Owner: architecture maintainers. Block after current heuristic violations are fixed.
 architecture-boundaries:
   extends:
