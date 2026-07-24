@@ -6,7 +6,7 @@
 **Open TODOs (v2.0.2.0) — To be done before release**
 
 ---
-1. [ ] Bump crate versions. they are at 2.0.1. we bump to 2.0.2
+1. [x] Bump crate versions. they are at 2.0.1. we bump to 2.0.2
 2. [x] (S) Go over proposals
 3. [x] (S) get back to previous refactor mt admin idea. see the section of docs/proposals/MT-ADMIN-DECOMPOSITION.md — review notes section of: `docs/ops/KUMOGAKURE_RECENT_REV_T.md` - you will NOT begin ANY work on this yet. you will simply edit the document already created under docs/proposals called `MT-ADMIN-DECOMPOSITION.md`
 4. [x] (S) continue to work on kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. SEE: SECTION: hermes_kawarimi — review notes in docs/ops/KUMOGAKURE_RECENT_REV_T.md for suggestedm improvements/concerns
