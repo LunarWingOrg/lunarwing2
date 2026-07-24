@@ -141,6 +141,32 @@ fn assert_artifact_is_fresh(artifact: &Path, source_dir: &Path) {
     }
 }
 
+fn assert_cavepony_release_version(source_dir: &Path, expected: &str) {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let registry: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root.join("registry/tools/cavepony-tool.json"))
+            .expect("read Cavepony registry manifest"),
+    )
+    .expect("parse Cavepony registry manifest");
+    let capabilities: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(source_dir.join("cavepony-tool.capabilities.json"))
+            .expect("read Cavepony capabilities"),
+    )
+    .expect("parse Cavepony capabilities");
+    let cargo_manifest: toml::Value = toml::from_str(
+        &std::fs::read_to_string(source_dir.join("Cargo.toml"))
+            .expect("read Cavepony Cargo manifest"),
+    )
+    .expect("parse Cavepony Cargo manifest");
+
+    assert_eq!(registry["version"].as_str(), Some(expected));
+    assert_eq!(capabilities["version"].as_str(), Some(expected));
+    assert_eq!(
+        cargo_manifest["package"]["version"].as_str(),
+        Some(expected)
+    );
+}
+
 /// Parse registry manifests to discover all WASM extensions.
 fn discover_extensions() -> Vec<DiscoveredExtension> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -446,7 +472,14 @@ async fn cavepony_component_actions_fit_ten_million_fuel() {
         .into_iter()
         .find(|extension| extension.name == "cavepony-tool")
         .expect("Cavepony registry entry should exist");
+    if let Ok(expected) = std::env::var("CAVEPONY_EXPECTED_VERSION") {
+        assert_cavepony_release_version(&extension.source_dir, &expected);
+    }
     let Some(wasm_path) = find_wasm_artifact(&extension.source_dir, &extension.crate_name) else {
+        assert!(
+            !matches!(std::env::var("CAVEPONY_WASM_REQUIRED").as_deref(), Ok("1")),
+            "Cavepony WASM artifact must exist in this test environment"
+        );
         eprintln!("SKIP: Cavepony WASM artifact not built");
         return;
     };
