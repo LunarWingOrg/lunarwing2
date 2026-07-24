@@ -6,7 +6,6 @@
 #
 # Prerequisites:
 #   rustup target add wasm32-wasip2
-#   cargo install cargo-component --locked
 #
 # Usage:
 #   ./scripts/build-wasm-extensions.sh           # build all
@@ -41,9 +40,11 @@ build_extension() {
     local manifest_path="$1"
     local source_dir
     local crate_name
+    local artifact
 
     source_dir=$(jq -r '.source.dir' "$manifest_path")
     crate_name=$(jq -r '.source.crate_name' "$manifest_path")
+    artifact="$source_dir/target/wasm32-wasip2/release/${crate_name//-/_}.wasm"
     local name
     name=$(basename "$manifest_path" .json)
 
@@ -53,8 +54,14 @@ build_extension() {
     fi
 
     echo "  BUILD $name ($crate_name) from $source_dir"
-    if ! cargo component build --release --target wasm32-wasip2 --manifest-path "$source_dir/Cargo.toml" 2>&1; then
+    rm -f "$artifact"
+    if ! cargo build --release --target wasm32-wasip2 --manifest-path "$source_dir/Cargo.toml" 2>&1; then
         echo "  FAIL $name"
+        FAILED+=("$name")
+        return 1
+    fi
+    if [[ ! -f "$artifact" ]]; then
+        echo "  FAIL $name (expected artifact missing: $artifact)"
         FAILED+=("$name")
         return 1
     fi
