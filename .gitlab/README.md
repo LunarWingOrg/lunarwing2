@@ -12,8 +12,8 @@ yet activate one verified CI artifact safely.
 - Branch, tag, schedule, API, trigger, and manual pipelines remain supported.
 - Required jobs are interruptible and receive no production credentials.
 - Cargo always runs through `scripts/cargo-ci.sh`, with CPU affinity `0-5` and
-  at most six build jobs. Rust test cases run serially because many mutate the
-  process environment.
+  at most two build jobs to bound peak memory. Rust test cases run serially
+  because many mutate the process environment.
 - PostgreSQL integration, WASM, browser, standalone-crate, package, release,
   and deployment jobs remain deferred until their prerequisites in the plan
   are fixed.

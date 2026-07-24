@@ -1583,7 +1583,7 @@ ensure_rootless_prereqs() {
 }
 
 # Idempotent: install/verify the tenant user's WASM build toolchain (rustup,
-# stable default, wasm32-wasip1/wasip2 targets, cargo-component, wasm-tools).
+# stable default, and the wasm32-wasip2 target).
 # Called from create_tenant_user (add-tenant) and as a build-tenant --with-wasm
 # preflight, so a partial install (network hiccup, killed add-tenant) is
 # repaired instead of silently disabling WASM builds forever.
@@ -1614,25 +1614,19 @@ ensure_tenant_wasm_toolchain() {
       || say "WARNING: failed to set default toolchain for $name" >&2
   fi
 
-  # Ensure WASM targets and cargo-component are installed
+  # First-party extensions use wit-bindgen and compile directly to Preview 2.
   say "ensuring WASM toolchain for $name ..."
-  sudo -u "$name" bash -c "${cargo_src} ${repo_cd}rustup target add wasm32-wasip1 wasm32-wasip2 2>&1" || true
-  if ! sudo -u "$name" bash -c "${cargo_src} command -v cargo-component" &>/dev/null; then
-    say "installing cargo-component and wasm-tools for $name ..."
-    sudo -u "$name" bash -c "${cargo_src} cargo install cargo-component wasm-tools --locked 2>&1" || true
-  fi
+  sudo -u "$name" bash -c "${cargo_src} ${repo_cd}rustup target add wasm32-wasip2 2>&1" || true
 
   # Final verification — loud, actionable, never fatal.
   local missing=()
-  sudo -u "$name" bash -c "${cargo_src} command -v cargo-component" &>/dev/null || missing+=("cargo-component")
   sudo -u "$name" bash -c "${cargo_src} ${repo_cd}rustup target list --installed 2>/dev/null | grep -q wasm32-wasip2" \
     || missing+=("wasm32-wasip2 target")
   if ((${#missing[@]} > 0)); then
     say "" >&2
     say "WARNING: WASM toolchain incomplete for $name — missing: ${missing[*]}" >&2
     say "         WASM extensions will NOT build. To fix, run:" >&2
-    say "           sudo -u $name bash -lc 'rustup target add wasm32-wasip1 wasm32-wasip2'" >&2
-    say "           sudo -u $name bash -lc 'cargo install cargo-component wasm-tools --locked'" >&2
+    say "           sudo -u $name bash -lc 'rustup target add wasm32-wasip2'" >&2
     say "         then re-run: $0 build-tenant $name --with-wasm" >&2
     say "" >&2
     return 1
@@ -1802,6 +1796,7 @@ build_tenant() {
   local with_pebble="${4:-false}"
   local with_opencode="${5:-false}"
   local with_toolchains="${6:-false}"
+  local require_wasm="${7:-false}"
   local repo
   repo="$(tenant_repo "$name")"
 
@@ -1824,12 +1819,25 @@ build_tenant() {
     if [[ "$with_wasm" == "true" ]]; then
       if ensure_tenant_wasm_toolchain "$name"; then
         say "building WASM extensions for $name ..."
-        sudo -u "$name" bash -c "$cargo_env cd '$repo' && bash scripts/build-wasm-extensions.sh" \
-          || say "WARNING: WASM extension build reported errors for $name (some extensions may be missing; re-run '$0 build-tenant $name --with-wasm' after fixing)" >&2
+        local wasm_build_ok="true"
+        if ! sudo -u "$name" bash -c "$cargo_env cd '$repo' && bash scripts/build-wasm-extensions.sh"; then
+          if [[ "$require_wasm" == "true" ]]; then
+            die "WASM extension build failed for $name; refusing to install stale artifacts"
+          fi
+          say "WARNING: WASM extension build reported errors for $name (some extensions may be missing; re-run '$0 build-tenant $name --with-wasm' after fixing)" >&2
+          wasm_build_ok="false"
+        fi
 
-        say "installing WASM extensions for $name ..."
-        install_wasm_tenant "$name"
+        if [[ "$wasm_build_ok" == "true" ]]; then
+          say "installing WASM extensions for $name ..."
+          install_wasm_tenant "$name"
+        else
+          say "WARNING: skipping WASM install for $name; existing installed artifacts were preserved" >&2
+        fi
       else
+        if [[ "$require_wasm" == "true" ]]; then
+          die "WASM toolchain incomplete for $name; refusing to continue upgrade"
+        fi
         say "WARNING: skipping WASM build for $name (toolchain incomplete — see above)" >&2
       fi
     fi
@@ -1838,7 +1846,7 @@ build_tenant() {
     say ""
     say "Reminder: set your LLM provider API key (if applicable to your backend) in $(tenant_env_dir "$name")/lunarwing.env"
     say "  e.g.  LLM_API_KEY=sk-..."
-  ) 200>"$BUILD_LOCK"
+  ) 200>"$BUILD_LOCK" || return $?
 
   if [[ "$with_nanocode" == "true" ]]; then
     say ""
@@ -6738,8 +6746,7 @@ upgrade_tenant() {
   [[ -d "$repo/migrations" ]] || die "ic/migrations missing after checkout — wrong ref? Aborting before build."
   say "  now at: $("${tgit[@]}" describe --tags --always 2>/dev/null)"
 
-  build_tenant "$name" "true"
-  install_wasm_tenant "$name"
+  build_tenant "$name" "true" "false" "false" "false" "false" "true"
 
   if [[ "$do_render" == "true" ]]; then
     render_tenant_units "$name"

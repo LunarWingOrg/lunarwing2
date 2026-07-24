@@ -342,16 +342,21 @@ mod tests {
             .expect("Failed to send request");
         assert_eq!(response.status(), 200, "Server should be listening");
 
-        // Try to restart on an invalid address (port 1 typically requires elevated privileges)
-        let invalid_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        // Occupy an ephemeral port so the replacement bind fails regardless of
+        // whether the test process has permission to bind privileged ports.
+        let occupied_listener =
+            StdTcpListener::bind("127.0.0.1:0").expect("Failed to occupy test port");
+        let occupied_addr = occupied_listener
+            .local_addr()
+            .expect("Failed to get occupied address");
 
         // Attempt bind (should fail); server state is untouched because we
         // never call install_listener on failure.
         let app = server
             .merged_router_clone()
             .expect("Router should exist after start()");
-        let result = tokio::net::TcpListener::bind(invalid_addr).await;
-        assert!(result.is_err(), "Bind to privileged port should fail");
+        let result = tokio::net::TcpListener::bind(occupied_addr).await;
+        assert!(result.is_err(), "Bind to occupied port should fail");
         // `app` is dropped — server state unchanged (rollback by construction)
         drop(app);
 

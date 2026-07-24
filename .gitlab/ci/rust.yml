@@ -4,7 +4,7 @@ rust-check-default:
   needs:
     - cargo-metadata
   script:
-    - bash .gitlab/scripts/cargo-ci.sh check -j6 --locked
+    - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked
 
 rust-check-postgres:
   extends: .rust-job
@@ -12,7 +12,7 @@ rust-check-postgres:
   needs:
     - cargo-metadata
   script:
-    - bash .gitlab/scripts/cargo-ci.sh check -j6 --locked --no-default-features --features postgres
+    - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --no-default-features --features postgres
 
 rust-check-libsql:
   extends: .rust-job
@@ -20,7 +20,7 @@ rust-check-libsql:
   needs:
     - cargo-metadata
   script:
-    - bash .gitlab/scripts/cargo-ci.sh check -j6 --locked --no-default-features --features libsql
+    - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --no-default-features --features libsql
 
 rust-check-all-features:
   extends: .rust-job
@@ -28,7 +28,7 @@ rust-check-all-features:
   needs:
     - cargo-metadata
   script:
-    - bash .gitlab/scripts/cargo-ci.sh check -j6 --locked --all-features
+    - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --all-features
 
 # Owner: core maintainers. Block after one clean runner baseline proves zero warnings.
 rust-clippy-all:
@@ -40,7 +40,7 @@ rust-clippy-all:
     - cargo-metadata
   timeout: 60m
   script:
-    - bash .gitlab/scripts/cargo-ci.sh clippy -j6 --locked --all --benches --tests --examples --all-features -- -D warnings
+    - bash .gitlab/scripts/cargo-ci.sh clippy -j2 --locked --all --benches --tests --examples --all-features -- -D warnings
 
 rust-test-lib:
   extends: .rust-job
@@ -52,7 +52,7 @@ rust-test-lib:
     LUNARWING_CLOUD_AUTH_URL: "http://127.0.0.1"
     LUNARWING_CLOUD_BASE_URL: "http://127.0.0.1"
   script:
-    - bash .gitlab/scripts/cargo-ci.sh test -j6 --locked --workspace --lib -- --test-threads=1
+    - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --workspace --lib -- --test-threads=1
 
 rust-test-libsql:
   extends: .rust-job
@@ -64,4 +64,5 @@ rust-test-libsql:
     LUNARWING_CLOUD_AUTH_URL: "http://127.0.0.1"
     LUNARWING_CLOUD_BASE_URL: "http://127.0.0.1"
   script:
-    - bash .gitlab/scripts/cargo-ci.sh test -j6 --locked --no-default-features --features libsql --no-fail-fast -- --test-threads=1
+    # libSQL's full test link exceeds the 16 GB runner limit with six concurrent rustc jobs.
+    - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --no-default-features --features libsql --no-fail-fast -- --test-threads=1
