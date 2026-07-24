@@ -25,6 +25,7 @@ pub const AUTONOMOUS_TOOL_DENYLIST: &[&str] = &[
     "tool_auth",
     "tool_activate",
     "tool_deactivate",
+    "tool_update",
     "tool_remove",
     "tool_upgrade",
     "skill_install",

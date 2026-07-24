@@ -73,6 +73,32 @@ pub struct McpAddArgs {
     pub description: Option<String>,
 }
 
+/// Arguments for the `mcp update` subcommand.
+#[derive(Args, Debug, Clone)]
+pub struct McpUpdateArgs {
+    /// Server name to update
+    pub name: String,
+
+    /// New server URL (http transport)
+    pub url: Option<String>,
+
+    /// Transport type: http, stdio. If omitted, keeps existing transport.
+    #[arg(long)]
+    pub transport: Option<String>,
+
+    /// New command to run (stdio transport)
+    #[arg(long)]
+    pub command: Option<String>,
+
+    /// New command arguments (stdio transport, can be repeated)
+    #[arg(long = "arg", num_args = 0..)]
+    pub cmd_args: Option<Vec<String>>,
+
+    /// New environment variables (stdio transport, KEY=VALUE format, can be repeated)
+    #[arg(long = "env", value_parser = parse_env_var, num_args = 0..)]
+    pub env: Option<Vec<(String, String)>>,
+}
+
 #[derive(Subcommand, Debug, Clone)]
 pub enum McpCommand {
     /// Add an MCP server
@@ -136,6 +162,9 @@ pub enum McpCommand {
         #[arg(long)]
         offline: bool,
     },
+
+    /// Update an MCP server's configuration in-place
+    Update(Box<McpUpdateArgs>),
 }
 
 fn parse_header(s: &str) -> Result<(String, String), String> {
@@ -184,6 +213,7 @@ pub async fn run_mcp_command(
             )
             .await
         }
+        McpCommand::Update(args) => update_server(*args, config_path, no_db).await,
     }
 }
 
@@ -625,6 +655,125 @@ async fn test_server(
     println!();
 
     Ok(())
+}
+
+/// Update an MCP server's configuration in-place.
+async fn update_server(
+    args: McpUpdateArgs,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
+    let db = connect_db(config_path, no_db).await?;
+    let servers = load_servers(db.as_ref()).await?;
+    let existing = servers
+        .get(&args.name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", args.name))?;
+
+    let new_config = build_update_config(&args, &existing)?;
+    new_config.validate()?;
+
+    if let Some(db) = db.as_ref() {
+        crate::tools::mcp::config::persist_mcp_server_db(
+            db.store.as_ref(),
+            &db.owner_id,
+            new_config,
+            true,
+        )
+        .await?;
+    } else {
+        crate::tools::mcp::config::persist_mcp_server(new_config, true).await?;
+    }
+
+    println!();
+    println!("  ✓ Updated MCP server '{}'", args.name);
+    println!();
+    println!("    The change will take effect when LunarWing next starts.");
+    println!(
+        "    Use 'lunarwing mcp toggle {} --disable && lunarwing mcp toggle {} --enable' to restart it live.",
+        args.name, args.name
+    );
+    println!();
+
+    Ok(())
+}
+
+fn build_update_config(
+    args: &McpUpdateArgs,
+    existing: &McpServerConfig,
+) -> Result<McpServerConfig, anyhow::Error> {
+    let transport = args
+        .transport
+        .as_deref()
+        .map(str::to_lowercase)
+        .or_else(|| match existing.effective_transport() {
+            EffectiveTransport::Http => Some("http".to_string()),
+            EffectiveTransport::Stdio { .. } => Some("stdio".to_string()),
+            EffectiveTransport::Unix { .. } => Some("unix".to_string()),
+        });
+
+    match transport.as_deref() {
+        Some("stdio") => {
+            let cmd = args
+                .command
+                .as_deref()
+                .or_else(|| match existing.effective_transport() {
+                    EffectiveTransport::Stdio { command, .. } => Some(command),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow::anyhow!("--command is required for stdio transport"))?;
+            let new_args = args
+                .cmd_args
+                .clone()
+                .or_else(|| match existing.effective_transport() {
+                    EffectiveTransport::Stdio { args, .. } => Some(args.to_vec()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let new_env = args
+                .env
+                .clone()
+                .map(|v| v.into_iter().collect())
+                .or_else(|| match existing.effective_transport() {
+                    EffectiveTransport::Stdio { env, .. } => Some(env.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let mut config = McpServerConfig::new_stdio(&existing.name, cmd, new_args, new_env);
+            config.enabled = existing.enabled;
+            Ok(config)
+        }
+        Some("http") => {
+            let url = args
+                .url
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&existing.url);
+            let mut config = McpServerConfig::new(&existing.name, url);
+            config.enabled = existing.enabled;
+            config.oauth = existing.oauth.clone();
+            config.headers = existing.headers.clone();
+            config.description = existing.description.clone();
+            Ok(config)
+        }
+        Some("unix") => {
+            let socket_path = match existing.effective_transport() {
+                EffectiveTransport::Unix { socket_path } => socket_path.to_string(),
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Cannot update to unix transport without an existing socket path"
+                    ));
+                }
+            };
+            let mut config = McpServerConfig::new_unix(&existing.name, &socket_path);
+            config.enabled = existing.enabled;
+            Ok(config)
+        }
+        Some(other) => Err(anyhow::anyhow!(
+            "Unknown transport type '{other}'. Supported: http, stdio, unix"
+        )),
+        None => Err(anyhow::anyhow!("Could not determine transport type")),
+    }
 }
 
 /// Toggle server enabled/disabled state.

@@ -7,13 +7,13 @@
 
 ---
 1. [x] Bump crate versions. they are at 2.0.1. we bump to 2.0.2
-2. [x] (S) Go over proposals
+2. [x] (S) Go over proposals defer
 3. [x] (S) get back to previous refactor mt admin idea. see the section of docs/proposals/MT-ADMIN-DECOMPOSITION.md — review notes section of: `docs/ops/KUMOGAKURE_RECENT_REV_T.md` - you will NOT begin ANY work on this yet. you will simply edit the document already created under docs/proposals called `MT-ADMIN-DECOMPOSITION.md`
 4. [x] (S) continue to work on kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. SEE: SECTION: hermes_kawarimi — review notes in docs/ops/KUMOGAKURE_RECENT_REV_T.md for suggestedm improvements/concerns
 5. [x] (S) work on weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued. FEEDBACK FROM LAST TIME: 19:34:19 wrench │ ### Verdict
 One real bug found: OpenRC weechat stop() invokes the helper as root instead of the tenant user, which will fail to find the tmux socket. Medium severity — the graceful stop silently becomes a no-op on OpenRC, though the old kill-session behavior would also be broken (same root-cause: missing su). The systemd path is unaffected. Otherwise: solid feature work. The weechat buffer restore is well-designed (proper wrapper script, good fallback chain, both init systems covered, renderer tests). The test-deferral approach is pragmatic and well-documented. You may attempt to use the following work from failed/partial work on these salvaged, incomplete branches: { rarity/item-16-20260722-1201 } { rarity/item-16-20260722-2123 } { rarity/item-16-20260723-0000 }
 6. [x] (S) Inspect status of cargo crates
-7. [ ] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. Reference the branch here for prior/failed/unverified attempt: rarity/item-8-20260723-0855
+7. [x] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. In-place configuration updates were completed on 2026-07-24. Reference the branch here for prior/failed/unverified attempt: rarity/item-8-20260723-0855
     <details>
     <summary><b>✅ DONE (verified 2026-07-21) — Foundational: first-class host-local stdio MCP installation</b></summary>
     Confirmed present in code with references:
@@ -45,7 +45,7 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
       - Done (added 2026-07-21): reports transport (http/stdio/unix) + enabled state per server, resolves stdio commands through PATH (without executing), and flags enabled stdio servers whose command is missing on PATH. Helpers: `preflight_mcp_server`, `resolve_command_in_path`, `is_executable` in `ic/src/cli/doctor.rs`. Unit tests cover PATH resolution and stdio-disabled missing-command behavior.
       - Intentionally still excluded: spawning the server or running an actual MCP handshake during install — install remains separate from execution.
 
-    - ❌ **In-place configuration updates — NOT STARTED.** Let users edit command/args/env/url without remove+reinstall; if active, require explicit restart confirmation; preserve registry precedence + approval rules. (Only add/remove/toggle/auth/test exist today.) - there is some incomplete work on the branch: rarity/item-19-20260723-0415
+    - ✅ **In-place configuration updates — DONE (2026-07-24).** Let users edit command/args/env/url without remove+reinstall; if active, require explicit restart confirmation; preserve registry precedence + approval rules. (Only add/remove/toggle/auth/test exist today.) - there is some incomplete work on the branch: rarity/item-19-20260723-0415
 
     - ✅ **Focused integration coverage — DONE (2026-07-22).**
       - Done: `mcp_extension_lifecycle` e2e (search → install → activate → use) + `mcp_compat/{transport,auth,oauth}` tests — all HTTP mock (`ic/tests/e2e_advanced_traces.rs:511`, `ic/tests/mcp_compat/`).
@@ -58,10 +58,10 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
     **Defer for now:** worker-local MCP, automatic npm/pip install, secret injection through process env, general runtime-adapter refactor, gateway integration, automatic crash restart — each materially increases the security/lifecycle surface.
     </details>
 8. [x] (S) dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the branch: rarity/item-20-20260722-1501
-9. [ ] review recent changes in onboard ui and see if there are issues
+9. [x] review recent changes in onboard ui and see if there are issues
 10. [x] (S) review kawarimi adapter (item 15)
 11. [x] (S) review darkirc key exchange implementation
-12. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
+12. [x] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
 13. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
 14. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
 15. [ ] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs

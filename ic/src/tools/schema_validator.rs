@@ -616,6 +616,29 @@ mod tests {
                 }),
             ),
             (
+                "tool_update",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "MCP server name to update" },
+                        "transport": {
+                            "type": "string",
+                            "enum": ["http", "stdio"],
+                            "description": "New transport type"
+                        },
+                        "url": { "type": "string", "description": "New URL (http)" },
+                        "command": { "type": "string", "description": "New command (stdio)" },
+                        "args": { "type": "array", "items": {"type": "string"}, "description": "New arguments (stdio)" },
+                        "env": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                            "description": "New environment (stdio)"
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            ),
+            (
                 "tool_list",
                 serde_json::json!({
                     "type": "object",

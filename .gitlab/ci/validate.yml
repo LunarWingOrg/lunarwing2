@@ -16,7 +16,7 @@ shell-syntax:
     - bash .gitlab/scripts/shell-syntax.sh
 
 python-syntax:
-  extends: .lint-job
+  extends: .shell-job
   stage: validate
   needs: []
   script:
