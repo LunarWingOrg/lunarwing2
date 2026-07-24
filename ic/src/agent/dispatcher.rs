@@ -78,11 +78,32 @@ impl Agent {
             None
         };
 
-        // Select and prepare active skills (if skills system is enabled)
-        let active_skills = self.select_active_skills(&message.content);
+        // Select and prepare active skills (if skills system is enabled).
+        let cavepony_activation = self.resolve_cavepony_activation(message).await;
+        let active_skills = self.select_active_skills(&message.content, cavepony_activation);
+        let cavepony_skill_active = active_skills.iter().any(|skill| {
+            skill.name() == "cavepony"
+                && matches!(&skill.source, crate::skills::SkillSource::Bundled(_))
+        });
+        if matches!(
+            cavepony_activation,
+            crate::skills::cavepony::CaveponyActivation::Turn(_)
+        ) && !cavepony_skill_active
+        {
+            return Ok(AgenticLoopResult::Response(
+                "Cavepony is unavailable under current skill settings.".to_string(),
+            ));
+        }
+        let cavepony_instruction = match cavepony_activation {
+            crate::skills::cavepony::CaveponyActivation::Bypass => {
+                cavepony_activation.prompt_instruction()
+            }
+            _ if cavepony_skill_active => cavepony_activation.prompt_instruction(),
+            _ => None,
+        };
 
         // Build skill context block
-        let skill_context = if !active_skills.is_empty() {
+        let skill_context = if !active_skills.is_empty() || cavepony_instruction.is_some() {
             let mut context_parts = Vec::new();
             for skill in &active_skills {
                 let trust_label = match skill.trust {
@@ -113,13 +134,18 @@ impl Agent {
                     safe_name, safe_version, trust_label, safe_content, suffix,
                 ));
             }
+            if let Some(instruction) = cavepony_instruction {
+                context_parts.push(instruction);
+            }
             Some(context_parts.join("\n\n"))
         } else {
             None
         };
 
         // Reflex fast-path: check for compiled patterns before invoking LLM
-        if let Some(tool_name) = self.reflex_router.try_route(&message.content).await {
+        if !cavepony_skill_active
+            && let Some(tool_name) = self.reflex_router.try_route(&message.content).await
+        {
             tracing::info!("Reflex fast-path: routing to compiled tool '{}'", tool_name);
             let mut job_ctx =
                 JobContext::with_user(&message.user_id, "reflex", "Reflex fast-path execution")

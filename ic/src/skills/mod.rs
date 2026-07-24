@@ -17,6 +17,7 @@
 pub mod attenuation;
 pub mod bundled;
 pub mod catalog;
+pub mod cavepony;
 pub mod gating;
 pub mod parser;
 pub mod registry;

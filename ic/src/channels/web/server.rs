@@ -157,6 +157,9 @@ pub struct ActiveConfigSnapshot {
     pub llm_backend: String,
     pub llm_model: String,
     pub enabled_channels: Vec<String>,
+    pub skills_enabled: bool,
+    pub skills_max_active: usize,
+    pub skills_max_context_tokens: usize,
 }
 
 /// Per-user rate limiter that maintains a separate sliding window per user_id.
@@ -2921,6 +2924,9 @@ async fn gateway_status_handler(
         llm_backend: state.active_config.llm_backend.clone(),
         llm_model: state.active_config.llm_model.clone(),
         enabled_channels: state.active_config.enabled_channels.clone(),
+        skills_enabled: state.active_config.skills_enabled,
+        skills_max_active: state.active_config.skills_max_active,
+        skills_max_context_tokens: state.active_config.skills_max_context_tokens,
         channel_health,
     })
 }
@@ -2957,6 +2963,9 @@ struct GatewayStatusResponse {
     llm_backend: String,
     llm_model: String,
     enabled_channels: Vec<String>,
+    skills_enabled: bool,
+    skills_max_active: usize,
+    skills_max_context_tokens: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     channel_health: Option<std::collections::HashMap<String, ChannelHealthEntry>>,
 }

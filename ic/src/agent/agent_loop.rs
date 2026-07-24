@@ -418,10 +418,61 @@ impl Agent {
         self.deps.skill_catalog.as_ref()
     }
 
+    pub(super) async fn resolve_cavepony_activation(
+        &self,
+        message: &IncomingMessage,
+    ) -> crate::skills::cavepony::CaveponyActivation {
+        use crate::skills::cavepony::{
+            CAVEPONY_MODE_SETTING_KEY, CaveponyActivation, CaveponyDirective, CaveponyMode,
+        };
+
+        if let Some(directive) = CaveponyDirective::parse(&message.content) {
+            return CaveponyActivation::from_directive(directive);
+        }
+
+        // Persistent preferences are created by the authenticated web UI. External
+        // channel user_id values can represent rooms or channel-specific actors.
+        if message.channel != "gateway" {
+            return CaveponyActivation::Automatic;
+        }
+
+        let Some(store) = self.store() else {
+            return CaveponyActivation::Automatic;
+        };
+
+        match store
+            .get_setting(&message.user_id, CAVEPONY_MODE_SETTING_KEY)
+            .await
+        {
+            Ok(Some(value)) => match CaveponyMode::from_setting_value(&value) {
+                Some(mode) => CaveponyActivation::Persistent(mode),
+                None => {
+                    tracing::warn!(
+                        user_id = %message.user_id,
+                        setting = CAVEPONY_MODE_SETTING_KEY,
+                        "Ignoring invalid Cavepony mode setting"
+                    );
+                    CaveponyActivation::Automatic
+                }
+            },
+            Ok(None) => CaveponyActivation::Automatic,
+            Err(error) => {
+                tracing::warn!(
+                    user_id = %message.user_id,
+                    setting = CAVEPONY_MODE_SETTING_KEY,
+                    %error,
+                    "Could not load Cavepony mode setting"
+                );
+                CaveponyActivation::Automatic
+            }
+        }
+    }
+
     /// Select active skills for a message using deterministic prefiltering.
     pub(super) fn select_active_skills(
         &self,
         message_content: &str,
+        cavepony_activation: crate::skills::cavepony::CaveponyActivation,
     ) -> Vec<crate::skills::LoadedSkill> {
         if let Some(registry) = self.skill_registry() {
             let guard = match registry.read() {
@@ -433,11 +484,12 @@ impl Agent {
             };
             let available = guard.skills();
             let skills_cfg = &self.deps.skills_config;
-            let selected = crate::skills::prefilter_skills(
+            let selected = crate::skills::cavepony::select_with_activation(
                 message_content,
                 available,
                 skills_cfg.max_active_skills,
                 skills_cfg.max_context_tokens,
+                cavepony_activation,
             );
 
             if !selected.is_empty() {
@@ -1841,12 +1893,99 @@ mod tests {
 
     use tokio::sync::Notify;
 
+    #[cfg(feature = "libsql")]
+    use super::Agent;
     use super::{
         abort_and_wait, chat_tool_execution_metadata, resolve_routine_notification_user,
         should_fallback_routine_notification, truncate_for_preview,
     };
+    #[cfg(feature = "libsql")]
+    use crate::channels::ChannelManager;
     use crate::channels::IncomingMessage;
+    #[cfg(feature = "libsql")]
+    use crate::config::AgentConfig;
     use crate::error::ChannelError;
+
+    #[cfg(feature = "libsql")]
+    async fn cavepony_test_agent() -> (Agent, Arc<dyn crate::db::Database>, tempfile::TempDir) {
+        let (db, temp_dir) = crate::testing::test_db().await;
+        let harness = crate::testing::TestHarnessBuilder::new()
+            .with_db(Arc::clone(&db))
+            .build()
+            .await;
+        let agent = Agent::new(
+            AgentConfig::for_testing(),
+            harness.deps,
+            Arc::new(ChannelManager::new()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        (agent, db, temp_dir)
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn persistent_cavepony_mode_is_scoped_by_user() {
+        use crate::skills::cavepony::{
+            CAVEPONY_MODE_SETTING_KEY, CaveponyActivation, CaveponyMode,
+        };
+
+        let (agent, db, _temp_dir) = cavepony_test_agent().await;
+        db.set_setting(
+            "alice",
+            CAVEPONY_MODE_SETTING_KEY,
+            &serde_json::json!("full"),
+        )
+        .await
+        .expect("persist Cavepony preference");
+
+        let alice = IncomingMessage::new("gateway", "alice", "hello");
+        let bob = IncomingMessage::new("gateway", "bob", "hello");
+        let external = IncomingMessage::new("xmpp", "alice", "hello");
+        assert_eq!(
+            agent.resolve_cavepony_activation(&alice).await,
+            CaveponyActivation::Persistent(CaveponyMode::Full)
+        );
+        assert_eq!(
+            agent.resolve_cavepony_activation(&bob).await,
+            CaveponyActivation::Automatic
+        );
+        assert_eq!(
+            agent.resolve_cavepony_activation(&external).await,
+            CaveponyActivation::Automatic
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn cavepony_turn_directive_overrides_persistent_mode() {
+        use crate::skills::cavepony::{
+            CAVEPONY_MODE_SETTING_KEY, CaveponyActivation, CaveponyMode,
+        };
+
+        let (agent, db, _temp_dir) = cavepony_test_agent().await;
+        db.set_setting(
+            "alice",
+            CAVEPONY_MODE_SETTING_KEY,
+            &serde_json::json!("full"),
+        )
+        .await
+        .expect("persist Cavepony preference");
+
+        let override_message = IncomingMessage::new("gateway", "alice", "/cavepony ultra");
+        let bypass_message = IncomingMessage::new("gateway", "alice", "/normal");
+        assert_eq!(
+            agent.resolve_cavepony_activation(&override_message).await,
+            CaveponyActivation::Turn(CaveponyMode::Ultra)
+        );
+        assert_eq!(
+            agent.resolve_cavepony_activation(&bypass_message).await,
+            CaveponyActivation::Bypass
+        );
+    }
 
     #[tokio::test]
     async fn abort_and_wait_drops_the_active_handler_before_returning() {

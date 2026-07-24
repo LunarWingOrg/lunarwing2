@@ -53,7 +53,7 @@ mod tests {
             .expect("embedded Cavepony skill should parse");
 
         assert_eq!(parsed.manifest.name, "cavepony");
-        assert_eq!(parsed.manifest.version, "0.3.0");
+        assert_eq!(parsed.manifest.version, "0.3.1");
         assert_eq!(parsed.manifest.activation.max_context_tokens, 1800);
         assert!(
             parsed

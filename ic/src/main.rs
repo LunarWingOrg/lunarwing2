@@ -747,6 +747,9 @@ async fn async_main() -> anyhow::Result<()> {
                 llm_backend: config.llm.backend.to_string(),
                 llm_model: active_model,
                 enabled_channels: enabled,
+                skills_enabled: config.skills.enabled,
+                skills_max_active: config.skills.max_active_skills,
+                skills_max_context_tokens: config.skills.max_context_tokens,
             });
         }
         if config.sandbox.enabled {
