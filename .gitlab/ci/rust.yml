@@ -64,4 +64,5 @@ rust-test-libsql:
     LUNARWING_CLOUD_AUTH_URL: "http://127.0.0.1"
     LUNARWING_CLOUD_BASE_URL: "http://127.0.0.1"
   script:
-    - bash .gitlab/scripts/cargo-ci.sh test -j6 --locked --no-default-features --features libsql --no-fail-fast -- --test-threads=1
+    # libSQL's full test link exceeds the 16 GB runner limit with six concurrent rustc jobs.
+    - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --no-default-features --features libsql --no-fail-fast -- --test-threads=1
