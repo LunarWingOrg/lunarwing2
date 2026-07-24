@@ -22,7 +22,7 @@
 #
 # Flow (--apply):
 #   gates -> backup(DB + env + ports + caps) -> stop -> fetch+checkout TARGET ->
-#   build-tenant --with-wasm -> install-wasm -> patch-env -> weechat pre-flight GATE
+#   build-tenant --with-wasm --require-wasm -> install-wasm -> patch-env -> weechat pre-flight GATE
 #   -> start (refinery applies V21 on boot) -> remove stale weechat unit -> verify.
 # Rollback steps are printed at the end.
 #
@@ -205,8 +205,8 @@ sudo -u "$TENANT" git -c safe.directory="$HOME_DIR" -C "$HOME_DIR" checkout "$TA
   || die "V21 migration missing from checkout — wrong ref? Aborting before build."
 say "  now at: $(sudo -u "$TENANT" git -c safe.directory="$HOME_DIR" -C "$HOME_DIR" describe --tags --always)"
 
-banner "4/9  build-tenant --with-wasm  (binary + bridge + refreshed capabilities.json)"
-"$MT" build-tenant "$TENANT" --with-wasm
+banner "4/9  build-tenant --with-wasm --require-wasm  (binary + bridge + refreshed capabilities.json)"
+"$MT" build-tenant "$TENANT" --with-wasm --require-wasm
 
 banner "5/9  install-wasm  (installs caps with the new env-source fields)"
 "$MT" install-wasm "$TENANT"
@@ -269,7 +269,7 @@ cat <<EOF
        cp -a $BACKUP_DIR/lunarwing.env.bak $ENV_FILE
        cp -a $BACKUP_DIR/weechat.capabilities.json.bak $CAPS_FILE
   5) rebuild + start:
-       sudo $MT build-tenant $TENANT --with-wasm
+       sudo $MT build-tenant $TENANT --with-wasm --require-wasm
        sudo $MT start-tenant $TENANT
 
   NOTE: never delete/recreate $PG_CONTAINER — kageho's live data is in its

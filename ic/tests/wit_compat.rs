@@ -465,6 +465,7 @@ async fn cavepony_component_actions_fit_ten_million_fuel() {
     let tool = WasmToolWrapper::new(runtime, prepared, Capabilities::default());
     let compression_input =
         "The authentication configuration is not ready because the database is unavailable";
+    let pony_input = "The human and the woman use their hands in New York";
     let cases = vec![
         serde_json::json!({"action": "expand", "text": "❤ help"}),
         serde_json::json!({"action": "stats", "text": compression_input, "mode": "ultra"}),
@@ -476,11 +477,12 @@ async fn cavepony_component_actions_fit_ten_million_fuel() {
                 "text": compression_input,
                 "mode": "ultra"
         }),
-        serde_json::json!({"action": "compress", "text": compression_input, "mode": "pony"}),
+        serde_json::json!({"action": "compress", "text": pony_input, "mode": "pony"}),
         serde_json::json!({"action": "compress", "text": compression_input, "mode": "canterlot"}),
     ];
 
     let mut ultra_result = None;
+    let mut pony_result = None;
     for params in cases {
         let label = format!("{}:{}", params["action"], params["mode"]);
         let output = tool
@@ -490,11 +492,18 @@ async fn cavepony_component_actions_fit_ten_million_fuel() {
         if output.result["mode"] == "ultra" && output.result["action"] == "compress" {
             ultra_result = output.result["text"].as_str().map(str::to_string);
         }
+        if output.result["mode"] == "pony" && output.result["action"] == "compress" {
+            pony_result = output.result["text"].as_str().map(str::to_string);
+        }
     }
 
     assert_eq!(
         ultra_result.as_deref(),
         Some("auth conf not ready bc db unavailable")
+    );
+    assert_eq!(
+        pony_result.as_deref(),
+        Some("pony and mare use their hooves in Manehattan")
     );
 }
 

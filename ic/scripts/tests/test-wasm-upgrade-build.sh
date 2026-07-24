@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ADMIN_SCRIPT="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
-BUILD_SCRIPT="$SCRIPT_DIR/../build-wasm-extensions.sh"
+TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ADMIN_SCRIPT="$TEST_DIR/../lunarwing-mt-admin.sh"
+BUILD_SCRIPT="$TEST_DIR/../build-wasm-extensions.sh"
 
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
@@ -85,6 +85,15 @@ else
   pass 'failed WASM build removes stale source artifact'
 fi
 
+mv "$fixture/build/ic/tools-src/demo" "$fixture/build/ic/tools-src/demo-missing"
+if PATH="$fixture/bin:$PATH" \
+  bash "$fixture/build/ic/scripts/build-wasm-extensions.sh" --tools >/dev/null 2>&1; then
+  fail 'WASM builder should fail when registered source is missing'
+else
+  pass 'WASM builder rejects missing registered source'
+fi
+mv "$fixture/build/ic/tools-src/demo-missing" "$fixture/build/ic/tools-src/demo"
+
 # shellcheck disable=SC1090
 source "$ADMIN_SCRIPT"
 mkdir -p "$fixture/tenant/repo/bridges/xmpp-bridge" "$fixture/tenant/env"
@@ -118,11 +127,46 @@ if build_tenant fixture true >/dev/null 2>&1 && [[ ! -e "$fixture/installed" ]];
 else
   fail 'non-strict tenant build installed stale WASM after build error'
 fi
+if output="$(build_tenant fixture false false false false false true 2>&1)"; then
+  fail 'strict WASM mode should require --with-wasm'
+elif [[ "$output" == *'--require-wasm requires --with-wasm'* ]]; then
+  pass 'strict WASM mode rejects missing --with-wasm'
+else
+  fail 'strict WASM mode returned the wrong validation error'
+fi
 # shellcheck disable=SC2016
 if grep -Fq 'build_tenant "$name" "true" "false" "false" "false" "false" "true"' "$ADMIN_SCRIPT"; then
   pass 'upgrade-tenant requires successful WASM build'
 else
   fail 'upgrade-tenant does not enable strict WASM build mode'
+fi
+# shellcheck disable=SC2016
+if grep -Fq -- '--require-wasm)' "$ADMIN_SCRIPT" \
+  && grep -Fq '"$with_toolchains" "$require_wasm"' "$ADMIN_SCRIPT"; then
+  pass 'build-tenant CLI forwards strict WASM mode'
+else
+  fail 'build-tenant CLI does not forward strict WASM mode'
+fi
+
+for wrapper in \
+  upgrade-tenant.sh \
+  upgrade-tenant-version.sh \
+  upgrade-tenant-kageho.sh \
+  upgrade-tenant-starforce.sh \
+  upgrade-tenant-sunburst.sh; do
+  if grep -Eq 'build-tenant.*--with-wasm.*--require-wasm' "$TEST_DIR/../$wrapper"; then
+    pass "$wrapper requires a fresh WASM build"
+  else
+    fail "$wrapper allows stale WASM artifacts"
+  fi
+done
+
+if output="$(bash "$TEST_DIR/../upgrade-tenant.sh" fixture --skip-build 2>&1)"; then
+  fail 'live upgrade should reject --skip-build'
+elif [[ "$output" == *'--skip-build is unsafe for live upgrades'* ]]; then
+  pass 'live upgrade cannot bypass fresh WASM build'
+else
+  fail 'live --skip-build returned the wrong validation error'
 fi
 
 if [[ "$failures" -ne 0 ]]; then

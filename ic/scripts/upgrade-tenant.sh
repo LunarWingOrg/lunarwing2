@@ -38,7 +38,7 @@
 #     --keep-rootful       Runbook B: stay rootful, reuse existing PG (no migrate)
 #     --with-nanocode      also (re)build the nanocode worker
 #     --with-pebble        also (re)build the pebble worker
-#     --skip-build         tenant clone is already at --target and built
+#     --skip-build         dry-run planning only; live upgrades require a fresh WASM build
 #     --prune-old-root     (standalone) delete the orphaned v1.1.0 root-store PG
 #                          container AFTER the tenant is migrated + verified
 #     --dry-run            print the plan; make no changes
@@ -87,6 +87,7 @@ run() {
 }
 
 [[ -n "$TENANT" ]] || die "usage: $0 <tenant> [--keep-rootful] [--target <ref>] [--dry-run] [--yes]"
+$SKIP_BUILD && ! $DRY_RUN && die "--skip-build is unsafe for live upgrades; fresh WASM artifacts are required"
 [[ "$(id -u)" -eq 0 ]] || die "run as root (sudo) — mt-admin needs root"
 command -v jq >/dev/null 2>&1 || die "jq required"
 
@@ -278,7 +279,7 @@ else
   fi
   run sudo -u "$TENANT" git -C "$LWROOT" fetch --tags --prune
   run sudo -u "$TENANT" git -C "$LWROOT" checkout "$TARGET_REF"
-  build_args=(build-tenant "$TENANT" --with-wasm)
+  build_args=(build-tenant "$TENANT" --with-wasm --require-wasm)
   $WITH_NANOCODE && build_args+=(--with-nanocode)
   $WITH_PEBBLE  && build_args+=(--with-pebble)
   run mt "${build_args[@]}"
@@ -370,7 +371,7 @@ say ""
 say "ROLLBACK for '$TENANT':"
 say "    sudo $MT stop-tenant $TENANT"
 say "    sudo -u $TENANT git -C $LWROOT checkout $PRIOR_REV"
-say "    sudo $MT build-tenant $TENANT --with-wasm"
+say "    sudo $MT build-tenant $TENANT --with-wasm --require-wasm"
 if [[ "$KEEP_ROOTFUL" == false ]]; then
 say "    # start the preserved old root container (still has original data):"
 say "    sudo LUNARWING_MT_ROOTLESS=false $MT start-tenant $TENANT"
@@ -379,4 +380,3 @@ say "    sudo LUNARWING_MT_ROOTLESS=false $MT restart-tenant $TENANT"
 fi
 say "    # env backup: $BACKUP_DIR/${TENANT}-env.$STAMP   ports: $BACKUP_DIR/ports.json.$STAMP"
 [[ -n "$DUMP" ]] && say "    # DB dump:  $DUMP"
-

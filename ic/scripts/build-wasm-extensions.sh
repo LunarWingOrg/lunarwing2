@@ -49,8 +49,9 @@ build_extension() {
     name=$(basename "$manifest_path" .json)
 
     if [ ! -d "$source_dir" ]; then
-        echo "  SKIP $name (source dir $source_dir not found)"
-        return 0
+        echo "  FAIL $name (source dir $source_dir not found)"
+        FAILED+=("$name")
+        return 1
     fi
 
     echo "  BUILD $name ($crate_name) from $source_dir"
