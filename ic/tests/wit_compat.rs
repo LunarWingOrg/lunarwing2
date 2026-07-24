@@ -12,7 +12,11 @@
 //! CI runs the build script before these tests.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use lunarwing::context::JobContext;
+use lunarwing::tools::Tool;
+use lunarwing::tools::wasm::{Capabilities, WasmRuntimeConfig, WasmToolRuntime, WasmToolWrapper};
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
@@ -101,6 +105,40 @@ fn find_wasm_artifact(source_dir: &Path, crate_name: &str) -> Option<PathBuf> {
     }
 
     None
+}
+
+fn assert_artifact_is_fresh(artifact: &Path, source_dir: &Path) {
+    let artifact_modified = std::fs::metadata(artifact)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or_else(|error| panic!("failed to inspect {}: {error}", artifact.display()));
+    let mut sources: Vec<_> = [
+        "Cargo.toml",
+        "LICENSE",
+        "src/lib.rs",
+        "token-dict.json",
+        "pony-dict.json",
+        "canterlot-dict.json",
+    ]
+    .into_iter()
+    .map(|relative| source_dir.join(relative))
+    .collect();
+    sources.push(source_dir.join("../../wit/tool.wit"));
+    let lockfile = source_dir.join("Cargo.lock");
+    if lockfile.exists() {
+        sources.push(lockfile);
+    }
+
+    for source in sources {
+        let source_modified = std::fs::metadata(&source)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or_else(|error| panic!("failed to inspect {}: {error}", source.display()));
+        assert!(
+            artifact_modified >= source_modified,
+            "{} is stale; rebuild Cavepony after modifying {}",
+            artifact.display(),
+            source.display()
+        );
+    }
 }
 
 /// Parse registry manifests to discover all WASM extensions.
@@ -399,6 +437,64 @@ fn wit_compat_tool_components_compile_and_instantiate() {
         failures.is_empty(),
         "WIT compatibility failures for tools:\n{}",
         failures.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn cavepony_component_actions_fit_ten_million_fuel() {
+    let extension = discover_extensions()
+        .into_iter()
+        .find(|extension| extension.name == "cavepony-tool")
+        .expect("Cavepony registry entry should exist");
+    let Some(wasm_path) = find_wasm_artifact(&extension.source_dir, &extension.crate_name) else {
+        eprintln!("SKIP: Cavepony WASM artifact not built");
+        return;
+    };
+    assert_artifact_is_fresh(&wasm_path, &extension.source_dir);
+    let wasm_bytes = std::fs::read(&wasm_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", wasm_path.display()));
+    let mut runtime_config = WasmRuntimeConfig::default();
+    runtime_config.default_limits.fuel = 10_000_000;
+    let runtime = Arc::new(
+        WasmToolRuntime::new(runtime_config).expect("Cavepony WASM runtime should initialize"),
+    );
+    let prepared = runtime
+        .prepare("cavepony-tool", &wasm_bytes, None)
+        .await
+        .expect("Cavepony component should prepare");
+    let tool = WasmToolWrapper::new(runtime, prepared, Capabilities::default());
+    let compression_input =
+        "The authentication configuration is not ready because the database is unavailable";
+    let cases = vec![
+        serde_json::json!({"action": "expand", "text": "❤ help"}),
+        serde_json::json!({"action": "stats", "text": compression_input, "mode": "ultra"}),
+        serde_json::json!({"action": "compress", "text": compression_input, "mode": "tokens"}),
+        serde_json::json!({"action": "compress", "text": compression_input, "mode": "lite"}),
+        serde_json::json!({"action": "compress", "text": compression_input, "mode": "full"}),
+        serde_json::json!({
+                "action": "compress",
+                "text": compression_input,
+                "mode": "ultra"
+        }),
+        serde_json::json!({"action": "compress", "text": compression_input, "mode": "pony"}),
+        serde_json::json!({"action": "compress", "text": compression_input, "mode": "canterlot"}),
+    ];
+
+    let mut ultra_result = None;
+    for params in cases {
+        let label = format!("{}:{}", params["action"], params["mode"]);
+        let output = tool
+            .execute(params, &JobContext::default())
+            .await
+            .unwrap_or_else(|error| panic!("Cavepony {label} trapped: {error}"));
+        if output.result["mode"] == "ultra" && output.result["action"] == "compress" {
+            ultra_result = output.result["text"].as_str().map(str::to_string);
+        }
+    }
+
+    assert_eq!(
+        ultra_result.as_deref(),
+        Some("auth conf not ready bc db unavailable")
     );
 }
 
