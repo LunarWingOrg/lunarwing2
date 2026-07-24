@@ -476,6 +476,10 @@ pub async fn start_server(
             post(extensions_toggle_handler),
         )
         .route(
+            "/api/extensions/{name}/update",
+            post(extensions_update_handler),
+        )
+        .route(
             "/api/extensions/{name}/remove",
             post(extensions_remove_handler),
         )
@@ -2348,6 +2352,71 @@ async fn project_file_handler(
         return (StatusCode::NOT_FOUND, "Not found").into_response();
     }
     serve_project_file(&project_id, &path).await
+}
+
+/// Check that a project directory belongs to a job owned by the given user.
+/// Returns false if the store is unavailable or the project is not found.
+async fn verify_project_ownership(state: &GatewayState, project_id: &str, user_id: &str) -> bool {
+    let Some(ref store) = state.store else {
+        return false;
+    };
+    // The project_id is a sandbox job UUID used as the directory name.
+    let Ok(job_id) = project_id.parse::<uuid::Uuid>() else {
+        return false;
+    };
+    match store.get_sandbox_job(job_id).await {
+        Ok(Some(job)) => job.user_id == user_id,
+        _ => false,
+    }
+}
+
+async fn extensions_update_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Path(name): Path<String>,
+    Json(req): Json<InstallExtensionRequest>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let ext_mgr = state.extension_manager.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Extension manager not available (secrets store required)".to_string(),
+    ))?;
+
+    let existing = ext_mgr
+        .get_mcp_server_pub(&name, &user.user_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    let new_config = match req.transport.as_deref() {
+        Some("stdio") => {
+            let command = req.command.as_deref().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "command is required for stdio transport".to_string(),
+                )
+            })?;
+            crate::tools::mcp::McpServerConfig::new_stdio(&name, command, req.args.clone(), req.env.clone())
+        }
+        _ => {
+            let url = req
+                .url
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&existing.url);
+            crate::tools::mcp::McpServerConfig::new(&name, url)
+        }
+    };
+
+    if let Err(e) = new_config.validate() {
+        return Ok(Json(ActionResponse::fail(e.to_string())));
+    }
+
+    match ext_mgr
+        .update_mcp(&name, new_config, &user.user_id)
+        .await
+    {
+        Ok(message) => Ok(Json(ActionResponse::ok(message))),
+        Err(error) => Ok(Json(ActionResponse::fail(error.to_string()))),
+    }
 }
 
 /// Check that a project directory belongs to a job owned by the given user.

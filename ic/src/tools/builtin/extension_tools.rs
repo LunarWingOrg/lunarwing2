@@ -522,6 +522,171 @@ impl Tool for ToolDeactivateTool {
     }
 }
 
+// ── tool_update ──────────────────────────────────────────────────────────
+
+pub struct ToolUpdateTool {
+    manager: Arc<ExtensionManager>,
+}
+
+impl ToolUpdateTool {
+    pub fn new(manager: Arc<ExtensionManager>) -> Self {
+        Self { manager }
+    }
+
+    fn build_config(
+        params: &serde_json::Value,
+        existing: &McpServerConfig,
+    ) -> Result<McpServerConfig, ToolError> {
+        use crate::tools::mcp::config::EffectiveTransport;
+
+        let transport = params.get("transport").and_then(|v| v.as_str());
+        match transport {
+            Some("stdio") => {
+                let command = params
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        ToolError::InvalidParameters(
+                            "MCP server command is required for stdio transport".to_string(),
+                        )
+                    })?;
+                let args = params
+                    .get("args")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let env = params
+                    .get("env")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                Ok(McpServerConfig::new_stdio(&existing.name, command, args, env))
+            }
+            Some("http") => {
+                let url = params
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&existing.url);
+                Ok(McpServerConfig::new(&existing.name, url))
+            }
+            Some(other) => Err(ToolError::InvalidParameters(format!(
+                "Unsupported MCP transport '{other}'"
+            ))),
+            None => match existing.effective_transport() {
+                EffectiveTransport::Stdio { command, args, env } => {
+                    let cmd = params
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(command);
+                    let a = params
+                        .get("args")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_else(|| args.to_vec());
+                    let e = params
+                        .get("env")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_else(|| env.clone());
+                    Ok(McpServerConfig::new_stdio(&existing.name, cmd, a, e))
+                }
+                EffectiveTransport::Http => {
+                    let url = params
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&existing.url);
+                    Ok(McpServerConfig::new(&existing.name, url))
+                }
+                EffectiveTransport::Unix { socket_path } => {
+                    Ok(McpServerConfig::new_unix(&existing.name, socket_path))
+                }
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ToolUpdateTool {
+    fn name(&self) -> &str {
+        "tool_update"
+    }
+
+    fn description(&self) -> &str {
+        "Update an installed MCP server's configuration in-place (command, args, env, or url) \
+         without removing and reinstalling it. If the server is active, it is restarted with \
+         the new configuration. Enabled state and credentials are preserved."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Installed MCP server name to update"
+                },
+                "transport": {
+                    "type": "string",
+                    "enum": ["http", "stdio"],
+                    "description": "New transport type. If omitted, keeps the existing transport."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "New URL (http transport)"
+                },
+                "command": {
+                    "type": "string",
+                    "description": "New executable command (stdio transport)"
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "New command arguments (stdio transport)"
+                },
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "New non-secret environment variables (stdio transport)"
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = std::time::Instant::now();
+        let name = require_str(&params, "name")?;
+
+        let existing = self
+            .manager
+            .get_mcp_server_pub(name, &ctx.user_id)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+        let new_config = Self::build_config(&params, &existing)?;
+        new_config
+            .validate()
+            .map_err(|e| ToolError::InvalidParameters(e.to_string()))?;
+
+        let message = self
+            .manager
+            .update_mcp(name, new_config, &ctx.user_id)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+        Ok(ToolOutput::success(
+            serde_json::json!({"name": name, "message": message}),
+            start.elapsed(),
+        ))
+    }
+
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
+    }
+}
+
 // ── tool_list ────────────────────────────────────────────────────────────
 
 pub struct ToolListTool {
