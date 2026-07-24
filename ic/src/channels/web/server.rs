@@ -2378,7 +2378,12 @@ async fn extensions_update_handler(
                     "command is required for stdio transport".to_string(),
                 )
             })?;
-            crate::tools::mcp::McpServerConfig::new_stdio(&name, command, req.args.clone(), req.env.clone())
+            crate::tools::mcp::McpServerConfig::new_stdio(
+                &name,
+                command,
+                req.args.clone(),
+                req.env.clone(),
+            )
         }
         _ => {
             let url = req
@@ -2394,10 +2399,7 @@ async fn extensions_update_handler(
         return Ok(Json(ActionResponse::fail(e.to_string())));
     }
 
-    match ext_mgr
-        .update_mcp(&name, new_config, &user.user_id)
-        .await
-    {
+    match ext_mgr.update_mcp(&name, new_config, &user.user_id).await {
         Ok(message) => Ok(Json(ActionResponse::ok(message))),
         Err(error) => Ok(Json(ActionResponse::fail(error.to_string()))),
     }

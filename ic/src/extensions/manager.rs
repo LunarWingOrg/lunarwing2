@@ -2072,8 +2072,7 @@ impl ExtensionManager {
             self.stop_mcp_runtime(name, user_id).await;
         }
 
-        self.persist_mcp_config(new_config.clone(), user_id)
-            .await?;
+        self.persist_mcp_config(new_config.clone(), user_id).await?;
 
         let message = if was_active && new_config.enabled {
             match self
@@ -2084,9 +2083,9 @@ impl ExtensionManager {
                     "Updated and reactivated MCP server '{name}'; {}",
                     result.message
                 ),
-                Err(e) => format!(
-                    "Updated MCP server '{name}' config but reactivation failed: {e}"
-                ),
+                Err(e) => {
+                    format!("Updated MCP server '{name}' config but reactivation failed: {e}")
+                }
             }
         } else {
             format!("Updated MCP server '{name}' configuration")
@@ -2107,8 +2106,7 @@ impl ExtensionManager {
             crate::tools::mcp::config::persist_mcp_server_db(store.as_ref(), user_id, config, true)
                 .await
         } else {
-            crate::tools::mcp::config::persist_mcp_server(config, true)
-                .await
+            crate::tools::mcp::config::persist_mcp_server(config, true).await
         }
         .map_err(|e| ExtensionError::Config(e.to_string()))
     }

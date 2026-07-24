@@ -558,7 +558,12 @@ impl ToolUpdateTool {
                     .get("env")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
-                Ok(McpServerConfig::new_stdio(&existing.name, command, args, env))
+                Ok(McpServerConfig::new_stdio(
+                    &existing.name,
+                    command,
+                    args,
+                    env,
+                ))
             }
             Some("http") => {
                 let url = params
