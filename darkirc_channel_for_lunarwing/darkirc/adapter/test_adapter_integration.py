@@ -117,17 +117,34 @@ async def _http(method, host, port, path, token=None, body=None, raw_content_len
         writer.write(body if isinstance(body, bytes) else body.encode())
     await writer.drain()
     data = b""
-    while True:
-        chunk = await reader.read(4096)
-        if not chunk:
-            break
-        data += chunk
+    try:
+        while True:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            data += chunk
+    except ConnectionResetError:
+        # Early 400/413 responses may reset after the complete response is sent
+        # because rejected request bytes remain unread.
+        pass
     writer.close()
     try:
         await writer.wait_closed()
     except Exception:
         pass
-    head, _, payload = data.partition(b"\r\n\r\n")
+    head, separator, payload = data.partition(b"\r\n\r\n")
+    if not separator:
+        raise AssertionError("incomplete HTTP response headers")
+    response_headers = {}
+    for line in head.split(b"\r\n")[1:]:
+        key, colon, value = line.partition(b":")
+        if colon:
+            response_headers[key.strip().lower()] = value.strip()
+    content_length = int(response_headers.get(b"content-length", b"0"))
+    if len(payload) != content_length:
+        raise AssertionError(
+            f"incomplete HTTP response body: expected {content_length}, got {len(payload)}"
+        )
     status = int(head.split()[1])
     try:
         return status, json.loads(payload)
