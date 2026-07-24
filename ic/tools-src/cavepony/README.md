@@ -1,7 +1,7 @@
 # Cavepony WASM Tool
 
-Rust/WASM port of Cavepony v0.3.0 for LunarWing. The tool performs local text
-transforms with no host capabilities.
+Rust/WASM port of Cavepony v0.3.0 for LunarWing. Tool release 0.3.1 performs
+local text transforms with no host capabilities.
 
 ## Actions
 
@@ -16,6 +16,10 @@ All modes are lossy: shared tokens expand to their first canonical phrase,
 case is not encoded, and text already containing a token is ambiguous.
 Canterlot preserves v0.3.0's ordered substitutions, including substitutions
 that can further expand words introduced by an earlier rule.
+
+Release 0.3.1 uses bounded literal matching instead of compiling dictionary
+regexes inside each fresh WASM instance, keeping short requests in every action
+within the 10-million-fuel compatibility budget.
 
 Token counts use LunarWing's coarse four-bytes-per-token estimate. Actual token
 counts depend on model and tokenizer; Unicode symbols can cost more than one
