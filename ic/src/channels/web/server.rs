@@ -2354,22 +2354,6 @@ async fn project_file_handler(
     serve_project_file(&project_id, &path).await
 }
 
-/// Check that a project directory belongs to a job owned by the given user.
-/// Returns false if the store is unavailable or the project is not found.
-async fn verify_project_ownership(state: &GatewayState, project_id: &str, user_id: &str) -> bool {
-    let Some(ref store) = state.store else {
-        return false;
-    };
-    // The project_id is a sandbox job UUID used as the directory name.
-    let Ok(job_id) = project_id.parse::<uuid::Uuid>() else {
-        return false;
-    };
-    match store.get_sandbox_job(job_id).await {
-        Ok(Some(job)) => job.user_id == user_id,
-        _ => false,
-    }
-}
-
 async fn extensions_update_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,

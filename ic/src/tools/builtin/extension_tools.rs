@@ -1105,6 +1105,25 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_update_schema() {
+        use crate::tools::tool::ApprovalRequirement;
+        let tool = ToolUpdateTool {
+            manager: test_manager_stub(),
+        };
+        assert_eq!(tool.name(), "tool_update");
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::UnlessAutoApproved
+        );
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"].get("name").is_some());
+        assert!(schema["properties"].get("transport").is_some());
+        assert!(schema["properties"].get("command").is_some());
+        assert!(schema["properties"].get("args").is_some());
+        assert_eq!(schema["required"], serde_json::json!(["name"]));
+    }
+
+    #[test]
     fn test_tool_list_schema() {
         use crate::tools::tool::ApprovalRequirement;
         let tool = ToolListTool {
