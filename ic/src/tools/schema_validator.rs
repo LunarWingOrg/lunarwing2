@@ -629,7 +629,11 @@ mod tests {
                         "url": { "type": "string", "description": "New URL (http)" },
                         "command": { "type": "string", "description": "New command (stdio)" },
                         "args": { "type": "array", "items": {"type": "string"}, "description": "New arguments (stdio)" },
-                        "env": { "type": "object", "description": "New environment (stdio)" }
+                        "env": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                            "description": "New environment (stdio)"
+                        }
                     },
                     "required": ["name"]
                 }),

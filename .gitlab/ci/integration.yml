@@ -7,7 +7,7 @@ python-unit:
     - python3 .gitlab/scripts/python_tests.py
 
 shell-harnesses:
-  extends: .shell-job
+  extends: .python-job
   stage: test
   needs:
     - shell-syntax

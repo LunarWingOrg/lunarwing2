@@ -10,6 +10,22 @@ TMP_ROOT="$(mktemp -d)"
 foreign_parent_env=""
 trap 'rm -rf "$TMP_ROOT"; [[ -z "$foreign_parent_env" ]] || rm -f "$foreign_parent_env"' EXIT
 
+test_user=""
+test_group=""
+if [[ "$EUID" -eq 0 ]]; then
+  test_user=nobody
+  test_group="$(id -gn "$test_user")"
+  chown "$test_user:$test_group" "$TMP_ROOT"
+fi
+
+run_env_exec() {
+  if [[ -n "$test_user" ]]; then
+    runuser -u "$test_user" -- bash "$ENV_EXEC" "$@"
+  else
+    bash "$ENV_EXEC" "$@"
+  fi
+}
+
 [[ -f "$ENV_EXEC" ]] || {
   printf 'OpenRC tenant env launcher is missing\n' >&2
   exit 1
@@ -20,8 +36,9 @@ env_file="$TMP_ROOT/darkirc-adapter.env"
 literal="\$(touch $marker)"
 printf 'DARKIRC_ADAPTER_SECRET=%s\n' "$literal" >"$env_file"
 chmod 0600 "$env_file"
+[[ -z "$test_user" ]] || chown "$test_user:$test_group" "$env_file"
 
-value="$(bash "$ENV_EXEC" --env-file "$env_file" -- \
+value="$(run_env_exec --env-file "$env_file" -- \
   /bin/sh -c 'printf %s "$DARKIRC_ADAPTER_SECRET"')"
 [[ "$value" == "$literal" ]] || {
   printf 'OpenRC env launcher did not preserve the literal secret value\n' >&2
@@ -32,7 +49,12 @@ value="$(bash "$ENV_EXEC" --env-file "$env_file" -- \
   exit 1
 }
 
-if command -v unshare >/dev/null 2>&1 && unshare -Ur true >/dev/null 2>&1; then
+if [[ "$EUID" -eq 0 ]]; then
+  if bash "$ENV_EXEC" --env-file "$env_file" -- /bin/true >/dev/null 2>&1; then
+    printf 'OpenRC env launcher accepted execution as root\n' >&2
+    exit 1
+  fi
+elif command -v unshare >/dev/null 2>&1 && unshare -Ur true >/dev/null 2>&1; then
   if unshare -Ur bash "$ENV_EXEC" --env-file "$env_file" -- /bin/true \
     >/dev/null 2>&1; then
     printf 'OpenRC env launcher accepted execution as root\n' >&2
@@ -41,7 +63,7 @@ if command -v unshare >/dev/null 2>&1 && unshare -Ur true >/dev/null 2>&1; then
 fi
 
 printf 'DARKIRC_REALNAME="LunarWing DarkIRC Bridge"\n' >"$env_file"
-value="$(bash "$ENV_EXEC" --env-file "$env_file" -- \
+value="$(run_env_exec --env-file "$env_file" -- \
   /bin/sh -c 'printf %s "$DARKIRC_REALNAME"')"
 [[ "$value" == 'LunarWing DarkIRC Bridge' ]] || {
   printf 'OpenRC env launcher did not preserve quoted dotenv semantics\n' >&2
@@ -49,26 +71,26 @@ value="$(bash "$ENV_EXEC" --env-file "$env_file" -- \
 }
 
 printf 'INVALID-NAME=value\n' >"$env_file"
-if bash "$ENV_EXEC" --env-file "$env_file" -- /bin/true >/dev/null 2>&1; then
+if run_env_exec --env-file "$env_file" -- /bin/true >/dev/null 2>&1; then
   printf 'OpenRC env launcher accepted an invalid variable name\n' >&2
   exit 1
 fi
 
 printf 'SAFE="unterminated\n' >"$env_file"
-if bash "$ENV_EXEC" --env-file "$env_file" -- /bin/true >/dev/null 2>&1; then
+if run_env_exec --env-file "$env_file" -- /bin/true >/dev/null 2>&1; then
   printf 'OpenRC env launcher accepted an unterminated quoted value\n' >&2
   exit 1
 fi
 
 printf 'SAFE=value\n' >"$env_file"
 chmod 0400 "$env_file"
-if bash "$ENV_EXEC" --env-file "$env_file" -- /bin/true >/dev/null 2>&1; then
+if run_env_exec --env-file "$env_file" -- /bin/true >/dev/null 2>&1; then
   printf 'OpenRC env launcher accepted a non-0600 env file\n' >&2
   exit 1
 fi
 
 chmod 0644 "$env_file"
-if bash "$ENV_EXEC" --env-file "$env_file" -- /bin/true >/dev/null 2>&1; then
+if run_env_exec --env-file "$env_file" -- /bin/true >/dev/null 2>&1; then
   printf 'OpenRC env launcher accepted a group/world-readable env file\n' >&2
   exit 1
 fi
@@ -78,7 +100,10 @@ mkdir "$unsafe_parent"
 chmod 0755 "$unsafe_parent"
 printf 'SAFE=value\n' >"$unsafe_parent/service.env"
 chmod 0600 "$unsafe_parent/service.env"
-if bash "$ENV_EXEC" --env-file "$unsafe_parent/service.env" -- /bin/true \
+if [[ -n "$test_user" ]]; then
+  chown "$test_user:$test_group" "$unsafe_parent" "$unsafe_parent/service.env"
+fi
+if run_env_exec --env-file "$unsafe_parent/service.env" -- /bin/true \
   >/dev/null 2>&1; then
   printf 'OpenRC env launcher accepted an accessible parent directory\n' >&2
   exit 1
@@ -90,8 +115,11 @@ mkdir "$real_parent"
 chmod 0700 "$real_parent"
 printf 'SAFE=value\n' >"$real_parent/service.env"
 chmod 0600 "$real_parent/service.env"
+if [[ -n "$test_user" ]]; then
+  chown "$test_user:$test_group" "$real_parent" "$real_parent/service.env"
+fi
 ln -s "$real_parent" "$symlink_parent"
-if bash "$ENV_EXEC" --env-file "$symlink_parent/service.env" -- /bin/true \
+if run_env_exec --env-file "$symlink_parent/service.env" -- /bin/true \
   >/dev/null 2>&1; then
   printf 'OpenRC env launcher followed a symlinked parent directory\n' >&2
   exit 1
@@ -101,27 +129,25 @@ printf 'SAFE=value\n' >"$env_file"
 chmod 0600 "$env_file"
 symlink_env="$TMP_ROOT/symlink.env"
 ln -s "$env_file" "$symlink_env"
-if bash "$ENV_EXEC" --env-file "$symlink_env" -- /bin/true >/dev/null 2>&1; then
+if run_env_exec --env-file "$symlink_env" -- /bin/true >/dev/null 2>&1; then
   printf 'OpenRC env launcher followed a symlinked env file\n' >&2
   exit 1
 fi
 
 hardlink_env="$TMP_ROOT/hardlink.env"
 ln "$env_file" "$hardlink_env"
-if bash "$ENV_EXEC" --env-file "$hardlink_env" -- /bin/true >/dev/null 2>&1; then
+if run_env_exec --env-file "$hardlink_env" -- /bin/true >/dev/null 2>&1; then
   printf 'OpenRC env launcher accepted a multiply-linked env file\n' >&2
   exit 1
 fi
 
-if [[ "$EUID" -ne 0 ]]; then
-  foreign_parent_env="$(mktemp /tmp/lunarwing-openrc-env.XXXXXX)"
-  printf 'SAFE=value\n' >"$foreign_parent_env"
-  chmod 0600 "$foreign_parent_env"
-  if bash "$ENV_EXEC" --env-file "$foreign_parent_env" -- /bin/true \
-    >/dev/null 2>&1; then
-    printf 'OpenRC env launcher accepted a parent owned by another user\n' >&2
-    exit 1
-  fi
+foreign_parent_env="$(mktemp /tmp/lunarwing-openrc-env.XXXXXX)"
+printf 'SAFE=value\n' >"$foreign_parent_env"
+chmod 0600 "$foreign_parent_env"
+if run_env_exec --env-file "$foreign_parent_env" -- /bin/true \
+  >/dev/null 2>&1; then
+  printf 'OpenRC env launcher accepted a parent owned by another user\n' >&2
+  exit 1
 fi
 
 # shellcheck source=../lunarwing-mt-admin.sh

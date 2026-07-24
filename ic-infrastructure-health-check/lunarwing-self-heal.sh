@@ -431,7 +431,9 @@ load_state() {
     # the flap circuit-breaker, and max-retries escalation never accumulate across
     # ticks. The type-guard makes empty/whitespace/non-object all fail into the
     # corrupt-rename path below and recover with a fresh {} on the next tick.
-    if parsed="$(jq -e 'if type=="object" then . else error end' "$STATE_FILE" 2>/dev/null)"; then
+    if [[ -s "$STATE_FILE" ]] \
+        && parsed="$(jq -e 'if type=="object" then . else error end' "$STATE_FILE" 2>/dev/null)" \
+        && [[ -n "$parsed" ]]; then
         printf '%s' "$parsed"
     else
         # State file is corrupt (truncated write, disk error, etc.). Preserve it

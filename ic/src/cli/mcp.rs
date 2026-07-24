@@ -762,7 +762,7 @@ fn build_update_config(
                 _ => {
                     return Err(anyhow::anyhow!(
                         "Cannot update to unix transport without an existing socket path"
-                    ))
+                    ));
                 }
             };
             let mut config = McpServerConfig::new_unix(&existing.name, &socket_path);
