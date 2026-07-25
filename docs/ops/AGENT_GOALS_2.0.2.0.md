@@ -62,7 +62,7 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
 10. [x] (S) review kawarimi adapter (item 15)
 11. [x] (S) review darkirc key exchange implementation
 12. [x] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
-13. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+13. [x] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
 14. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
 15. [ ] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
 16. [ ] update docs/README.md
