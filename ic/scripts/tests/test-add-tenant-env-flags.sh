@@ -144,6 +144,55 @@ assert_eq "rerun preserves DARKIRC_ADAPTER_SECRET" \
   "$(envval DARKIRC_ADAPTER_SECRET)" "preserved-darkirc-fixture"
 DARKIRC_FIXTURE_ENABLED=false
 
+echo "=== XMPP_JID preservation tests ==="
+
+# Regression: re-running add-tenant without --xmpp-jid/--xmpp-domain must NOT
+# reset a live tenant's JID to the <name>@xmpp.localhost default. Doing so
+# repoints the daemon at a domain that resolves nowhere; the bridge then sits in
+# an endless connect-retry while /v1/status still reports configured+running.
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant "fixture-tenant@xmpp.sobe.world"
+assert_eq "first write honours explicit JID" \
+  "$(envval XMPP_JID)" "fixture-tenant@xmpp.sobe.world"
+
+# Re-run with NO jid argument -> must preserve, not default to xmpp.localhost.
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "rerun preserves XMPP_JID" \
+  "$(envval XMPP_JID)" "fixture-tenant@xmpp.sobe.world"
+
+# Re-run with an empty-string jid (how the dispatcher passes "flag absent").
+write_tenant_lunarwing_env fixture-tenant ""
+assert_eq "empty-arg rerun preserves XMPP_JID" \
+  "$(envval XMPP_JID)" "fixture-tenant@xmpp.sobe.world"
+
+# The bridge env writer must preserve from lunarwing.env too.
+rm -f "$MT_FIXTURE/env/xmpp-bridge.env"
+write_tenant_bridge_env fixture-tenant
+assert_eq "bridge writer preserves XMPP_JID" \
+  "$(grep -m1 '^XMPP_JID=' "$MT_FIXTURE/env/xmpp-bridge.env" | cut -d= -f2-)" \
+  "fixture-tenant@xmpp.sobe.world"
+
+# An explicit JID still wins over the stored one (intentional re-point).
+write_tenant_lunarwing_env fixture-tenant "fixture-tenant@xmpp.example.net"
+assert_eq "explicit JID overrides stored" \
+  "$(envval XMPP_JID)" "fixture-tenant@xmpp.example.net"
+
+# First-ever write with no stored value falls back to the localhost default.
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "first write defaults to xmpp.localhost" \
+  "$(envval XMPP_JID)" "fixture-tenant@xmpp.localhost"
+
+# resolve_tenant_xmpp_jid unit checks.
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+assert_eq "resolver: no file -> default" \
+  "$(resolve_tenant_xmpp_jid fixture-tenant "")" "fixture-tenant@xmpp.localhost"
+printf 'XMPP_JID=stored@xmpp.sobe.world\n' >"$MT_FIXTURE/env/lunarwing.env"
+assert_eq "resolver: stored wins over default" \
+  "$(resolve_tenant_xmpp_jid fixture-tenant "")" "stored@xmpp.sobe.world"
+assert_eq "resolver: explicit wins over stored" \
+  "$(resolve_tenant_xmpp_jid fixture-tenant "cli@xmpp.example.net")" "cli@xmpp.example.net"
+
 echo "=== write_tenant_bridge_env fixture tests ==="
 
 # The bridge writer reads XMPP_BRIDGE_TOKEN / XMPP_PASSWORD from the daemon env.
