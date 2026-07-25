@@ -1,6 +1,6 @@
 # XMPP/WASM polling can stop delivering messages
 
-> **Status: PARTIALLY-FIXED (verified against `51ae5a8` on 2026-07-20).**
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-07-25).**
 > Poll-loop crashes and stalls now have supervision and health reporting. A
 > bounded queue can still leave a poll task awaiting delivery if downstream
 > consumption stalls or sustained ingress exceeds its drain rate; that
@@ -61,7 +61,7 @@ a failure criterion.
   (`ic/src/channels/wasm/wrapper.rs:5609-5655`).
 - Channel health is aggregated by `ChannelManager`
   (`ic/src/channels/manager.rs:210-220`) and exposed by the gateway
-  (`ic/src/channels/web/server.rs:2746-2856`).
+  (`ic/src/channels/web/server.rs:2887-2961`).
 - The watchdog has optional deep channel-health checks on systemd and OpenRC
   (`ic/scripts/lunarwing-watchdog.sh:60-88` and
   `ic/scripts/lunarwing-watchdog-openrc.sh:60-88`).
