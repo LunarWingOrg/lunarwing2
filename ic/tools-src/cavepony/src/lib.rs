@@ -1,8 +1,9 @@
 //! Cavepony Rust/WASM tool for LunarWing.
 //!
-//! Ports Cavepony v0.3.0's phrase tokens and style dictionaries while keeping
-//! code, quoted text, and URLs outside transformation. No host capabilities are
-//! imported beyond the standard WIT interface.
+//! Ports Cavepony v0.3.0's phrase tokens and style dictionaries, plus a local
+//! Tony Soprano-inspired mode, while keeping code, quoted text, and URLs outside
+//! transformation. No host capabilities are imported beyond the standard WIT
+//! interface.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -39,9 +40,9 @@ const SCHEMA: &str = r#"{
     },
     "mode": {
       "type": "string",
-      "enum": ["tokens", "lite", "full", "ultra", "pony", "canterlot"],
+      "enum": ["tokens", "lite", "full", "ultra", "pony", "canterlot", "tony-soprano"],
       "default": "full",
-      "description": "Compression style. Ignored by expand. tokens only replaces known phrases; canterlot expands prose."
+      "description": "Compression or speech style. Ignored by expand. tokens only replaces known phrases; canterlot expands prose; tony-soprano applies contractions and blunt phrasing."
     }
   },
   "required": ["action", "text"],
@@ -71,7 +72,7 @@ impl tool::Guest for CaveponyTool {
     }
 
     fn description() -> String {
-        "Compress, expand, or measure prose with Cavepony. Modes: tokens (phrase tokens only), lite, full, ultra, pony, and canterlot. Fenced code, inline code, double-quoted text, and HTTP(S) URLs remain unchanged. Expansion restores canonical token phrases only; destructive compression and pony substitutions are not reversible. Token counts are model-independent estimates."
+        "Compress, expand, or measure prose with Cavepony. Modes: tokens (phrase tokens only), lite, full, ultra, pony, canterlot, and tony-soprano. Fenced code, inline code, quoted text, and HTTP(S) URLs remain unchanged. Expansion restores canonical token phrases only; destructive compression and style substitutions are not reversible. Token counts are model-independent estimates."
             .to_string()
     }
 }
@@ -91,6 +92,7 @@ enum Mode {
     Ultra,
     Pony,
     Canterlot,
+    TonySoprano,
 }
 
 impl Mode {
@@ -102,8 +104,9 @@ impl Mode {
             "ultra" => Ok(Self::Ultra),
             "pony" => Ok(Self::Pony),
             "canterlot" => Ok(Self::Canterlot),
+            "tony-soprano" => Ok(Self::TonySoprano),
             other => Err(format!(
-                "Invalid mode '{other}': expected tokens, lite, full, ultra, pony, or canterlot"
+                "Invalid mode '{other}': expected tokens, lite, full, ultra, pony, canterlot, or tony-soprano"
             )),
         }
     }
@@ -116,6 +119,7 @@ impl Mode {
             Self::Ultra => "ultra",
             Self::Pony => "pony",
             Self::Canterlot => "canterlot",
+            Self::TonySoprano => "tony-soprano",
         }
     }
 
@@ -191,7 +195,7 @@ fn execute_inner(params_json: &str) -> Result<String, String> {
                 "lossy": true,
                 "uses_destructive_rules": mode.uses_destructive_rules(),
                 "stats": metrics(&params.text, &result),
-                "expansion_scope": "Expansion is canonical, not an exact round trip: shared or preexisting tokens, case, destructive transforms, and pony transforms are lossy."
+                "expansion_scope": "Expansion is canonical, not an exact round trip: shared or preexisting tokens, case, destructive transforms, and style transforms are lossy."
             })
         }
         "expand" => {
@@ -251,6 +255,12 @@ fn compress(text: &str, mode: Mode) -> String {
         return transform_preserving_literals(text, |segment| {
             let pony = apply_substitutions(segment, pony_substitutions());
             apply_substitutions(&pony, canterlot_substitutions())
+        });
+    }
+
+    if mode == Mode::TonySoprano {
+        return transform_preserving_literals(text, |segment| {
+            apply_substitutions(segment, tony_soprano_substitutions())
         });
     }
 
@@ -657,6 +667,15 @@ fn canterlot_substitutions() -> &'static [CompiledSubstitution] {
     })
 }
 
+fn tony_soprano_substitutions() -> &'static [CompiledSubstitution] {
+    static SUBSTITUTIONS: OnceLock<Vec<CompiledSubstitution>> = OnceLock::new();
+    SUBSTITUTIONS.get_or_init(|| {
+        compile_substitutions(substitution_dictionary(include_str!(
+            "../tony-soprano-dict.json"
+        )))
+    })
+}
+
 fn compile_substitutions(dictionary: SubstitutionDictionary) -> Vec<CompiledSubstitution> {
     dictionary
         .substitutions
@@ -1002,6 +1021,7 @@ mod tests {
         assert!(phrase_mappings().len() > 80);
         assert!(pony_substitutions().len() > 80);
         assert!(canterlot_substitutions().len() > 90);
+        assert!(tony_soprano_substitutions().len() > 50);
     }
 
     #[test]
@@ -1050,6 +1070,15 @@ mod tests {
         assert_eq!(
             compress("Hello, you need help with a broken app", Mode::Canterlot),
             "This humble pony's splendid stallion, one discover it rather essential to provide assistance to with a in a state of disrepair application"
+        );
+    }
+
+    #[test]
+    fn tony_soprano_mode_applies_contractions_and_blunt_phrasing() {
+        let input = "This problem is very bad because we are going to lose money. Keep `going to` and \"very bad\".";
+        assert_eq!(
+            compress(input, Mode::TonySoprano),
+            "This situation is a real mess 'cause we're gonna lose money. Keep `going to` and \"very bad\"."
         );
     }
 
@@ -1167,6 +1196,9 @@ mod tests {
         let schema: serde_json::Value = serde_json::from_str(SCHEMA).expect("schema should parse");
         assert_eq!(schema["required"], serde_json::json!(["action", "text"]));
         assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["properties"]["mode"]["enum"]
+            .as_array()
+            .is_some_and(|modes| modes.contains(&serde_json::json!("tony-soprano"))));
         assert_eq!(
             schema["properties"]["text"]["maxLength"],
             MAX_INPUT_CHARACTERS

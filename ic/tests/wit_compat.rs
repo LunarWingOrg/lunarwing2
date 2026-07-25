@@ -118,6 +118,7 @@ fn assert_artifact_is_fresh(artifact: &Path, source_dir: &Path) {
         "token-dict.json",
         "pony-dict.json",
         "canterlot-dict.json",
+        "tony-soprano-dict.json",
     ]
     .into_iter()
     .map(|relative| source_dir.join(relative))
@@ -499,6 +500,8 @@ async fn cavepony_component_actions_fit_ten_million_fuel() {
     let compression_input =
         "The authentication configuration is not ready because the database is unavailable";
     let pony_input = "The human and the woman use their hands in New York";
+    let tony_input =
+        "This problem is very bad because we are going to lose money. Keep `going to`.";
     let cases = vec![
         serde_json::json!({"action": "expand", "text": "❤ help"}),
         serde_json::json!({"action": "stats", "text": compression_input, "mode": "ultra"}),
@@ -512,10 +515,12 @@ async fn cavepony_component_actions_fit_ten_million_fuel() {
         }),
         serde_json::json!({"action": "compress", "text": pony_input, "mode": "pony"}),
         serde_json::json!({"action": "compress", "text": compression_input, "mode": "canterlot"}),
+        serde_json::json!({"action": "compress", "text": tony_input, "mode": "tony-soprano"}),
     ];
 
     let mut ultra_result = None;
     let mut pony_result = None;
+    let mut tony_result = None;
     for params in cases {
         let label = format!("{}:{}", params["action"], params["mode"]);
         let output = tool
@@ -528,6 +533,9 @@ async fn cavepony_component_actions_fit_ten_million_fuel() {
         if output.result["mode"] == "pony" && output.result["action"] == "compress" {
             pony_result = output.result["text"].as_str().map(str::to_string);
         }
+        if output.result["mode"] == "tony-soprano" && output.result["action"] == "compress" {
+            tony_result = output.result["text"].as_str().map(str::to_string);
+        }
     }
 
     assert_eq!(
@@ -537,6 +545,10 @@ async fn cavepony_component_actions_fit_ten_million_fuel() {
     assert_eq!(
         pony_result.as_deref(),
         Some("pony and mare use their hooves in Manehattan")
+    );
+    assert_eq!(
+        tony_result.as_deref(),
+        Some("This situation is a real mess 'cause we're gonna lose money. Keep `going to`.")
     );
 }
 
