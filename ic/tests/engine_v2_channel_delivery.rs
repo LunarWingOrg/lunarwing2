@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::routing::post;
+use axum::{Json, Router};
 use futures::StreamExt;
 use rust_decimal::Decimal;
 use tokio::sync::Notify;
@@ -936,6 +938,133 @@ async fn assert_xmpp_mixed_attachment_case() {
     lunarwing::bridge::reset_engine_state().await;
 }
 
+async fn assert_xmpp_lunarvision_enrichment_case(case_name: &str) {
+    async fn analyze(Json(request): Json<serde_json::Value>) -> Json<serde_json::Value> {
+        assert_eq!(request["mode"], "auto");
+        assert_eq!(
+            request["prompt"],
+            "Describe the image, including visible text and relevant visual context."
+        );
+        Json(serde_json::json!({
+            "mode_used": "hybrid",
+            "ocr": {"full_text": "LUNARVISION_OCR_SENTINEL"},
+            "vision": {
+                "description": "LUNARVISION_DESCRIPTION_SENTINEL",
+                "prompt_answer": null
+            },
+            "meta": {"backends_used": ["tesseract", "qwen3vl"], "latency_ms": 1}
+        }))
+    }
+
+    lunarwing::bridge::reset_engine_state().await;
+    let app = Router::new().route("/v1/vision/analyze", post(analyze));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind LunarVision integration fixture");
+    let address = listener.local_addr().expect("read fixture address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve LunarVision integration fixture");
+    });
+    let middleware = Arc::new(
+        lunarwing::vision_enrichment::VisionEnrichmentMiddleware::new(
+            &format!("http://{address}"),
+            None,
+        )
+        .expect("build LunarVision middleware"),
+    );
+    let provider = Arc::new(CapturingMultimodalLlm::default());
+    let llm: Arc<dyn LlmProvider> = provider.clone();
+    let rig = TestRigBuilder::new()
+        .with_channel_name("xmpp")
+        .with_llm(llm)
+        .with_vision_enrichment(middleware)
+        .build()
+        .await;
+    let scope = Uuid::new_v4().to_string();
+    let mut message = IncomingMessage::new("xmpp", "test-user", "inspect this image")
+        .with_conversation_scope(scope.clone())
+        .with_metadata(serde_json::json!({"xmpp_target": "alice@example.org"}));
+    message.attachments.push(incoming_attachment(
+        AttachmentKind::Image,
+        "image/png",
+        "lunarvision.png",
+        vec![1, 2, 3],
+        None,
+    ));
+
+    rig.send_incoming(message).await;
+    let responses = rig.wait_for_responses(1, Duration::from_secs(10)).await;
+    assert_eq!(responses.len(), 1);
+    let expected_response = if case_name == "legacy" {
+        format!("```repl\nFINAL('{TERMINAL_RESPONSE}')\n```")
+    } else {
+        TERMINAL_RESPONSE.to_string()
+    };
+    assert_eq!(responses[0].content, expected_response);
+
+    let provider_message = captured_user_message(&provider, "lunarvision.png");
+    assert!(
+        provider_message
+            .content
+            .contains("LUNARVISION_OCR_SENTINEL")
+    );
+    assert!(
+        provider_message
+            .content
+            .contains("LUNARVISION_DESCRIPTION_SENTINEL")
+    );
+    assert!(
+        provider_message
+            .content
+            .contains("untrusted attachment content")
+    );
+    assert_eq!(provider_message.content_parts.len(), 1);
+    match &provider_message.content_parts[0] {
+        ContentPart::ImageUrl { image_url } => {
+            assert_eq!(image_url.url, "data:image/png;base64,AQID");
+        }
+        other => panic!("expected provider-native image content, got {other:?}"),
+    }
+    assert!(!provider_message.content.contains("data:image"));
+    assert!(!provider_message.content.contains("private.example"));
+
+    let conversation_id = if case_name == "legacy" {
+        let (_, thread_id) = rig
+            .session_manager()
+            .resolve_thread("test-user", "xmpp", Some(&scope))
+            .await;
+        thread_id
+    } else {
+        rig.database()
+            .get_or_create_scoped_conversation("xmpp", "test-user", &scope)
+            .await
+            .expect("scoped conversation should resolve")
+    };
+    let history = rig
+        .database()
+        .list_conversation_messages(conversation_id)
+        .await
+        .expect("history should load");
+    let persisted = history
+        .iter()
+        .find(|entry| entry.role == "user" && entry.content.contains("LUNARVISION_OCR_SENTINEL"))
+        .unwrap_or_else(|| panic!("{case_name} history should contain enriched user text"));
+    assert!(
+        persisted
+            .content
+            .contains("LUNARVISION_DESCRIPTION_SENTINEL")
+    );
+    assert!(!persisted.content.contains("data:image"));
+    assert!(!persisted.content.contains("AQID"));
+    assert!(!persisted.content.contains("private.example"));
+
+    rig.shutdown_and_wait().await;
+    server.abort();
+    lunarwing::bridge::reset_engine_state().await;
+}
+
 async fn assert_attachment_secret_scan_case() {
     lunarwing::bridge::reset_engine_state().await;
 
@@ -1456,6 +1585,10 @@ async fn engine_v2_channel_delivery_matrix() {
     env.set_channels(Some("xmpp"));
     assert_xmpp_image_only_attachment_case().await;
     assert_xmpp_mixed_attachment_case().await;
+    assert_xmpp_lunarvision_enrichment_case("engine-v2").await;
+    env.set_channels(None);
+    assert_xmpp_lunarvision_enrichment_case("legacy").await;
+    env.set_channels(Some("xmpp"));
     assert_attachment_secret_scan_case().await;
     assert_hook_case(HookBehavior::Modify, Some("modified-by-hook")).await;
     assert_hook_case(HookBehavior::Reject, None).await;

@@ -49,7 +49,7 @@ fn validate_image_format(body: &[u8]) -> Result<(), String> {
 #[test]
 fn test_base64_decoding() {
     use base64::Engine;
-    
+
     let original = b"Hello, World!";
     let encoded = base64::engine::general_purpose::STANDARD.encode(original);
     let decoded = base64::engine::general_purpose::STANDARD
@@ -66,7 +66,7 @@ fn test_error_response_format() {
         "detail": "Supported formats: PNG, JPEG, WebP, TIFF",
         "code": 415
     });
-    
+
     assert_eq!(error_json["error"], "unsupported_media_type");
     assert_eq!(error_json["code"], 415);
 }

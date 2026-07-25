@@ -265,6 +265,7 @@ impl GatewayWorkflowHarness {
                 http_interceptor: None,
                 transcription: None,
                 document_extraction: None,
+                vision_enrichment: None,
                 sandbox_readiness: lunarwing::agent::SandboxReadiness::DisabledByConfig,
                 builder: None,
                 llm_backend: "lunarwing_cloud".to_string(),

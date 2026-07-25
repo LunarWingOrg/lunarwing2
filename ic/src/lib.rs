@@ -77,6 +77,7 @@ pub mod tools;
 pub mod tracing_fmt;
 pub mod tunnel;
 pub mod util;
+pub mod vision_enrichment;
 pub mod webhooks;
 pub mod worker;
 pub mod workspace;

@@ -218,12 +218,14 @@ echo "=== import-tenant auto owner-scope migration ==="
 rm -f "$tmp/mt-admin.log" "$tmp/scope-migrated"
 cat >"$tmp/home/kawarimi/lunarwing/env/lunarwing.env" <<'ENV'
 SECRETS_MASTER_KEY=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+VISION_AUTH_TOKEN=target-vision-token
 ENV
 cat >"$tmp/home/kawarimi/lunarwing/env/xmpp-bridge.env" <<'ENV'
 XMPP_JID=throwaway@example.test
 ENV
 cat >"$tmp/home/kawarimi/lunarwing/env/vision.env" <<'ENV'
 VL_MODEL=throwaway
+LUNARWING_AUTH_TOKEN=target-vision-token
 ENV
 auto_output="$(
   PATH="$tmp/bin:$PATH" \
@@ -238,12 +240,15 @@ auto_output="$(
   exit "$status"
 }
 assert_file_contains "auto-migrates default owner scope" "$tmp/mt-admin.log" "migrate-owner-scope kawarimi --from default"
+assert_file_contains "import keeps target sidecar token" "$tmp/home/kawarimi/lunarwing/env/vision.env" "LUNARWING_AUTH_TOKEN=target-vision-token"
+assert_file_contains "import keeps matching daemon token" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "VISION_AUTH_TOKEN=target-vision-token"
+assert_file_not_contains "import ignores carried sidecar token" "$tmp/home/kawarimi/lunarwing/env/vision.env" "LUNARWING_AUTH_TOKEN=vision-token"
 
 echo "=== export-tenant vision manifest coverage ==="
 assert_file_contains "export writes a vision manifest" "$EXPORT_SRC" "manifest-vision.env"
 assert_file_contains "export carries VL_URL" "$EXPORT_SRC" "VL_URL"
 assert_file_contains "export carries VL_MODEL" "$EXPORT_SRC" "VL_MODEL"
-assert_file_contains "export carries vision auth token" "$EXPORT_SRC" "LUNARWING_AUTH_TOKEN"
+assert_file_not_contains "export does not carry host-local vision auth token" "$EXPORT_SRC" "VISION_KEYS=(VL_URL VL_MODEL LUNARWING_AUTH_TOKEN)"
 
 echo "=== encrypted bundle passphrase safety ==="
 passphrase="correct-horse-battery-staple"

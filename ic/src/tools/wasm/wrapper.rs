@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use secrecy::{ExposeSecret, SecretString};
 use wasmtime::Store;
 use wasmtime::component::{Linker, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -84,6 +85,73 @@ struct ResolvedHostCredential {
     query_params: HashMap<String, String>,
     /// Raw secret value for redaction in error messages.
     secret_value: String,
+    /// Optional exact URL prefix. Used for host-managed local credentials that
+    /// must not be sent to another service on the same host.
+    url_prefix: Option<String>,
+}
+
+/// Host-owned Bearer credential scoped to one configured service origin.
+#[derive(Clone)]
+struct ScopedBearerCredential {
+    host: String,
+    endpoint_prefix: String,
+    token: SecretString,
+}
+
+impl ScopedBearerCredential {
+    fn new(service_url: &str, token: SecretString) -> Option<Self> {
+        if token.expose_secret().is_empty() {
+            return None;
+        }
+        let url = url::Url::parse(service_url).ok()?;
+        if url.scheme() != "http"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+        {
+            return None;
+        }
+        let host = url.host_str()?.to_ascii_lowercase();
+        let allowed_host = match url.host()? {
+            url::Host::Domain(domain) => {
+                domain.eq_ignore_ascii_case("localhost")
+                    || domain.eq_ignore_ascii_case("host.containers.internal")
+            }
+            url::Host::Ipv4(address) => address.is_loopback(),
+            url::Host::Ipv6(address) => address.is_loopback(),
+        };
+        if !allowed_host {
+            return None;
+        }
+        Some(Self {
+            host,
+            endpoint_prefix: format!("{}/v1/", url.origin().ascii_serialization()),
+            token,
+        })
+    }
+
+    fn resolve(&self) -> ResolvedHostCredential {
+        let token = self.token.expose_secret();
+        ResolvedHostCredential {
+            host_patterns: vec![self.host.clone()],
+            headers: HashMap::from([("Authorization".to_string(), format!("Bearer {token}"))]),
+            query_params: HashMap::new(),
+            secret_value: token.to_string(),
+            url_prefix: Some(self.endpoint_prefix.clone()),
+        }
+    }
+}
+
+fn url_matches_scoped_prefix(request_url: &str, allowed_prefix: &str) -> bool {
+    let (Ok(request), Ok(allowed)) = (
+        url::Url::parse(request_url),
+        url::Url::parse(allowed_prefix),
+    ) else {
+        return false;
+    };
+    request.origin() == allowed.origin() && request.path().starts_with(allowed.path())
 }
 
 /// Workspace reader backed by pre-loaded data.
@@ -257,6 +325,13 @@ impl StoreData {
             if !matches {
                 continue;
             }
+            if cred
+                .url_prefix
+                .as_ref()
+                .is_some_and(|prefix| !url_matches_scoped_prefix(url, prefix))
+            {
+                continue;
+            }
 
             // Merge injected headers (host credentials take precedence)
             for (key, value) in &cred.headers {
@@ -389,6 +464,12 @@ impl lunarwing::agent::host::Host for StoreData {
         if let Some(host) = extract_host_from_url(&url) {
             self.inject_host_credentials(&host, &mut headers, &mut url);
         }
+        let bypass_proxy = self.host_credentials.iter().any(|credential| {
+            credential
+                .url_prefix
+                .as_ref()
+                .is_some_and(|prefix| url_matches_scoped_prefix(&url, prefix))
+        });
 
         // Get the max response size from capabilities (default 10MB).
         let max_response_bytes = self
@@ -476,9 +557,15 @@ impl lunarwing::agent::host::Host for StoreData {
         });
 
         let result = rt.block_on(async {
-            let client = reqwest::Client::builder()
+            let client_builder = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
+                .redirect(reqwest::redirect::Policy::none());
+            let client_builder = if bypass_proxy {
+                client_builder.no_proxy()
+            } else {
+                client_builder
+            };
+            let client = client_builder
                 .build()
                 .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
@@ -733,6 +820,9 @@ pub struct WasmToolWrapper {
     /// Injected credentials for HTTP requests (e.g., OAuth tokens).
     /// Keys are placeholder names like "GOOGLE_ACCESS_TOKEN".
     credentials: HashMap<String, String>,
+    /// Host-owned credential for canonical local sidecars. Never serialized
+    /// into WASM context; converted to request headers inside host boundary.
+    scoped_bearer_credential: Option<ScopedBearerCredential>,
     /// Secrets store for resolving host-based credential injection.
     /// Used in execute() to pre-decrypt secrets before WASM runs.
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
@@ -967,6 +1057,19 @@ impl WasmToolWrapper {
         prepared: Arc<PreparedModule>,
         capabilities: Capabilities,
     ) -> Self {
+        let scoped_bearer_credential = if matches!(
+            prepared.name.as_str(),
+            "vision-analyze" | "vision-analyze-tool"
+        ) {
+            crate::config::env_or_override("VISION_AUTH_TOKEN").and_then(|token| {
+                let service_url = crate::config::env_or_override("VISION_SERVICE_URL")
+                    .unwrap_or_else(|| "http://127.0.0.1:8088".to_string());
+                ScopedBearerCredential::new(&service_url, SecretString::from(token))
+            })
+        } else {
+            None
+        };
+
         Self {
             description: prepared.description.clone(),
             schemas: WasmToolSchemas::new(prepared.schema.clone()),
@@ -974,6 +1077,7 @@ impl WasmToolWrapper {
             prepared,
             capabilities,
             credentials: HashMap::new(),
+            scoped_bearer_credential,
             secrets_store: None,
             oauth_refresh: None,
             http_interceptor: None,
@@ -1310,7 +1414,10 @@ impl Tool for WasmToolWrapper {
                 resolution.missing_required.join(", ")
             )));
         }
-        let host_credentials = resolution.resolved;
+        let mut host_credentials = resolution.resolved;
+        if let Some(credential) = &self.scoped_bearer_credential {
+            host_credentials.push(credential.resolve());
+        }
 
         // Serialize context for WASM
         let context_json = serde_json::to_string(ctx).ok();
@@ -1347,6 +1454,7 @@ impl Tool for WasmToolWrapper {
                 description,
                 schemas,
                 credentials,
+                scoped_bearer_credential: None,
                 secrets_store: None, // Not needed in blocking task
                 oauth_refresh: None, // Already used above for pre-refresh
                 http_interceptor: self.http_interceptor.clone(),
@@ -1783,6 +1891,7 @@ async fn resolve_host_credentials(
             headers: injected.headers,
             query_params: injected.query_params,
             secret_value: secret.expose().to_string(),
+            url_prefix: None,
         });
     }
 
@@ -2468,6 +2577,7 @@ mod tests {
             },
             query_params: HashMap::new(),
             secret_value: TEST_BEARER_TOKEN_123.to_string(),
+            url_prefix: None,
         }];
 
         let store_data = StoreData::new(
@@ -2494,6 +2604,45 @@ mod tests {
     }
 
     #[test]
+    fn test_scoped_vision_credential_matches_only_configured_origin_and_v1_path() {
+        use crate::tools::wasm::wrapper::{ScopedBearerCredential, StoreData};
+        use secrecy::SecretString;
+        use std::collections::HashMap;
+
+        let credential = ScopedBearerCredential::new(
+            "http://LOCALHOST:8088",
+            SecretString::from(TEST_BEARER_TOKEN_123.to_string()),
+        )
+        .expect("valid local vision credential")
+        .resolve();
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            HashMap::new(),
+            vec![credential],
+        );
+
+        let mut headers = HashMap::new();
+        let mut url = "http://localhost:8088/v1/vision/analyze".to_string();
+        store_data.inject_host_credentials("localhost", &mut headers, &mut url);
+        assert_eq!(
+            headers.get("Authorization"),
+            Some(&format!("Bearer {TEST_BEARER_TOKEN_123}"))
+        );
+
+        for denied_url in [
+            "http://localhost:8089/v1/vision/analyze",
+            "http://localhost:8088/vision/analyze",
+            "http://localhost:8088/v1evil/vision/analyze",
+        ] {
+            let mut denied_headers = HashMap::new();
+            let mut denied_url = denied_url.to_string();
+            store_data.inject_host_credentials("localhost", &mut denied_headers, &mut denied_url);
+            assert!(!denied_headers.contains_key("Authorization"));
+        }
+    }
+
+    #[test]
     fn test_inject_host_credentials_query_params() {
         use crate::tools::wasm::wrapper::{ResolvedHostCredential, StoreData};
         use std::collections::HashMap;
@@ -2507,6 +2656,7 @@ mod tests {
                 q
             },
             secret_value: "secret123".to_string(),
+            url_prefix: None,
         }];
 
         let store_data = StoreData::new(
@@ -2533,6 +2683,7 @@ mod tests {
             headers: HashMap::new(),
             query_params: HashMap::new(),
             secret_value: "super-secret-token".to_string(),
+            url_prefix: None,
         }];
 
         let store_data = StoreData::new(

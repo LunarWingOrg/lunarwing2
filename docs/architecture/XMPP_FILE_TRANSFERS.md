@@ -56,6 +56,11 @@ Inbound (user sends file):
     -> Bridge enqueue_message() base64-encodes into BridgeMessage
     -> WASM channel on_poll() decodes, calls store_attachment_data()
     -> Host reconstructs IncomingAttachment for agent processing
+    -> Supervised agent user-input task calls VisionEnrichmentMiddleware
+         POST loopback /v1/vision/analyze with host-side Bearer auth
+         store bounded OCR/VL result in attachment.extracted_text
+    -> Legacy and Engine V2 context includes extracted text
+    -> Original bytes still reach provider-native multimodal input
 ```
 
 ## Inbound File Transfer Details
@@ -105,6 +110,10 @@ The WASM XMPP channel (`ic/channels-src/xmpp/src/lib.rs`) decodes inbound attach
 | Download timeout | 30 seconds | XmppChannel (reqwest client) |
 | Per-attachment store | 20 MB | WASM host (`store_attachment_data`) |
 | Total attachment store per callback | 50 MB | WASM host |
+| Decoded image size for LunarVision enrichment | 10 MB | VisionEnrichmentMiddleware + OCR sidecar |
+| Concurrent LunarVision analyses | 2 | VisionEnrichmentMiddleware |
+| LunarVision request timeout | 45 seconds | VisionEnrichmentMiddleware |
+| LunarVision response / extracted text | 1 MB / 100,000 bytes | VisionEnrichmentMiddleware |
 | Upload PUT timeout | 120 seconds | XmppChannel (outbound) |
 
 ## Files
@@ -117,6 +126,7 @@ The WASM XMPP channel (`ic/channels-src/xmpp/src/lib.rs`) decodes inbound attach
 | WASM XMPP channel (decode + emit) | `ic/channels-src/xmpp/src/lib.rs` |
 | WIT interface (InboundAttachment, store-attachment-data) | `ic/wit/channel.wit` |
 | WASM host (attachment storage + validation) | `ic/src/channels/wasm/host.rs` |
+| Automatic image OCR/VL enrichment | `ic/src/vision_enrichment.rs` |
 
 ## Supported Attachment Types
 
@@ -159,6 +169,9 @@ Encrypted file shares are handled end-to-end:
 - Inbound downloads fetch sender-supplied URLs. There is currently **no SSRF guard** on this path: private, loopback, link-local, and metadata addresses are not blocked, and `ALLOW_PRIVATE_IPS` does not change that because the downloader never calls the config URL validator. Deployments must enforce outbound network controls. A future phase can reuse `config/helpers.rs::validate_base_url`, whose strict mode rejects internal addresses and whose `ALLOW_PRIVATE_IPS=1` mode permits parseable HTTP(S) URLs; its blocking DNS resolution must run through `spawn_blocking` if called from this async hot path.
 - Size limits are enforced during streaming, and the per-stanza URL count and download concurrency are bounded, so a crafted stanza cannot exhaust memory or stall the connection.
 - The local bridge HTTP surface rejects non-loopback clients. When `XMPP_BRIDGE_TOKEN` is configured, it also requires Bearer authentication before configure, poll, and send operations.
+- Automatic LunarVision requests accept only `http://localhost` or loopback-IP base URLs, disable redirects and environment proxies, inject configured `VISION_AUTH_TOKEN` from `SecretString`, and cap both sidecar response and model-visible extraction sizes. An incompatible URL disables this automatic path without aborting daemon startup. The accepted message's text is never forwarded to the sidecar; a fixed prompt drives analysis. Enrichment runs inside normal message timeout supervision after inbound hooks.
+- Explicit `vision-analyze` WASM calls receive that token only inside the host HTTP boundary, scoped to the configured sidecar origin and `/v1/` path; the credential is not serialized into WASM context or sent through an environment proxy.
+- LunarVision failures are fail-open only for enrichment: original image bytes remain on the existing multimodal path, while credentials and source URLs remain excluded from model-visible text.
 
 ## Implementation Status
 
@@ -168,5 +181,6 @@ Implemented and unit-tested (`cargo test channels::xmpp`); the standalone `xmpp-
 2. **Download hardening** — bounded concurrency, per-stanza URL cap, streaming size enforcement.
 3. **Encrypted media** — `aesgcm://` (XEP-0454) download + AES-256-GCM decrypt; decrypted-body URL re-parsing.
 4. **Filename robustness** — `filename_from_url` (no longer drops extensionless/opaque names).
+5. **Automatic LunarVision enrichment** — bounded OCR/VL preprocessing with optional host-side Bearer auth, shared by legacy and Engine V2 while preserving original multimodal image input.
 
-**Remaining:** live end-to-end validation against a real server (e.g. Conversations/Gajim → agent over a working XEP-0363 host); an optional SSRF guard.
+**Remaining:** live end-to-end validation against a real server (e.g. Conversations/Gajim → agent over a working XEP-0363 host); an inbound-download SSRF guard. These remain file-transfer hardening work, not gaps in LunarVision routing.

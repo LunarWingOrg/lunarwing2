@@ -934,6 +934,25 @@ async fn async_main() -> anyhow::Result<()> {
         .recording_handle
         .as_ref()
         .map(|r| r.http_interceptor());
+    let vision_enrichment = config
+        .vision_service_url
+        .as_deref()
+        .and_then(|url| {
+            match lunarwing::vision_enrichment::VisionEnrichmentMiddleware::new(
+                url,
+                config.vision_auth_token.clone(),
+            ) {
+                Ok(middleware) => Some(Arc::new(middleware)),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Automatic XMPP LunarVision enrichment disabled; configured vision tool remains available"
+                    );
+                    None
+                }
+            }
+        })
+        ;
     // Clone context_manager for the reaper before it's moved into Agent::new()
     let reaper_context_manager = Arc::clone(&components.context_manager);
 
@@ -969,6 +988,7 @@ async fn async_main() -> anyhow::Result<()> {
         document_extraction: Some(Arc::new(
             lunarwing::document_extraction::DocumentExtractionMiddleware::new(),
         )),
+        vision_enrichment,
         sandbox_readiness: if !config.sandbox.enabled {
             lunarwing::agent::routine_engine::SandboxReadiness::DisabledByConfig
         } else if docker_status.is_ok() {

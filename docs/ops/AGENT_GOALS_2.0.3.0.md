@@ -65,7 +65,7 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
 13. [ ] go over release notes for 2.0.2.0 and see what else still needs to be added to next release, see documents about this if unsure of each item. put list of suggestions and missing things or half-implemented things and put into a new doc in docs/ops
 14. [ ] Refactor mt admin, see documents about this if unsure
 15. [ ] XMPP file transfer — remaining polish (further hardening), see documents about this if unsure
-16. [ ] Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure
+16. [x] Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure
 17. [ ] Gut proprietary tunnel providers and add support for netbird
 18. [ ] review darkirc key exchange implementation
 19. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
