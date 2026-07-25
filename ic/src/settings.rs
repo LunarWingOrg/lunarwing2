@@ -2284,7 +2284,7 @@ timeout_ms = 300000
         );
         assert_eq!(
             restored.tunnel.provider,
-            Some("ngrok".to_string()),
+            Some("netbird".to_string()),
             "tunnel.provider lost"
         );
         assert!(restored.channels.http_enabled, "http_enabled lost");
