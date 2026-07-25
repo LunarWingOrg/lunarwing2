@@ -1,17 +1,22 @@
 # E2E test bugs and retired fixtures
 
 > **Overall status: PARTIALLY-FIXED / one item UNVERIFIED (verified against
-> `51ae5a8` on 2026-07-20).** The bootstrap and tool-execution failures are
-> resolved in the current test/code paths. The old Gmail OAuth fixture was
-> retired. The clipboard test remains in the suite, but its former permission
-> diagnosis is not supported by the current test and has not been reproduced.
+> current source on 2026-07-25).** The tool-execution failure is resolved in
+> the current test/code paths. The old Gmail OAuth fixture was retired. The
+> bootstrap greeting production path is fixed, but both E2E assertions are
+> currently `#[ignore]`'d due to a harness timing race. The clipboard test
+> remains in the suite, but its former permission diagnosis is not supported
+> by the current test and has not been reproduced.
 
 This consolidates the four `BUG-e2e-*` reports. Status is per section so a
 resolved test does not get reported as an active production failure.
 
 ## 1. Bootstrap greeting tests
 
-**Status: FIXED (static verification; test execution not run).**
+**Status: PARTIAL (static verification; test execution not run).** The
+production bootstrap path persists and broadcasts the greeting correctly, but
+both E2E tests that assert it are currently `#[ignore]`'d because the greeting
+broadcast races with test-channel readiness in the rig.
 
 ### Former failure
 
@@ -36,12 +41,17 @@ race; the current explicit gateway broadcast resolves that divergence.
 - `TestRigBuilder::with_bootstrap()` preserves the pending flag and installs a
   gateway-named test channel
   (`ic/tests/support/test_rig.rs:540-543,705-709,895-905`).
-- The two tests now wait for and assert the static greeting at
-  `ic/tests/e2e_advanced_traces.rs:752-776` and `:786-859`; the source text is
-  `ic/src/workspace/seeds/GREETING.md`.
+- The two tests remain at `ic/tests/e2e_advanced_traces.rs:760-786` and
+  `:804-870`, but both carry `#[ignore = "known-deferred: bootstrap greeting
+  broadcast races with test channel readiness; see
+  docs/proposals/CARGO_TESTS_FIX.md"]` (`:761`, `:805`). The greeting text
+  source is `ic/src/workspace/seeds/GREETING.md`.
 
-The old DB/SSE-only hypothesis and startup-ordering workaround are therefore
-historical, not current action items.
+The production broadcast is sound and the underlying `seed_if_empty()` ->
+`bootstrap_pending` -> `take_bootstrap_pending()` flow is unit-tested in
+`src/workspace/mod.rs`. The race is a test-harness timing issue, not a
+production regression. The old DB/SSE-only hypothesis and startup-ordering
+workaround are historical, not current action items.
 
 ## 2. Clipboard copy test
 
@@ -152,3 +162,5 @@ current chat/MCP/extension/tool scenarios. The current Python environment has
 neither importable `pytest` nor `playwright`, so collection did not begin and no
 test body, browser, daemon, build, or Cargo command ran. The clipboard status
 remains unverified because this environment does not provide the E2E runtime.
+Re-verified on 2026-07-25; the bootstrap tests' `#[ignore]` markers were
+confirmed against `ic/tests/e2e_advanced_traces.rs`.

@@ -44,7 +44,7 @@ daemon-wide ingestion stall, but it does not provide concurrent ordinary turns.
   awaits the worker result directly (`ic/src/tools/builtin/job.rs:810-858`).
   The active task remains the current turn until completion, timeout, or
   interruption (`ic/src/agent/agent_loop.rs:972-1034`).
-- The default agent message timeout is 400 seconds
+- The default agent message timeout is 630 seconds
   (`ic/src/settings.rs:667-668`), so a long worker can consume most of a turn.
 - The `wait=false` path dispatches immediately and starts a completion monitor
   (`ic/src/tools/builtin/job.rs:502-533,859-910`).
