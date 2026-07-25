@@ -2233,6 +2233,25 @@ _env_existing() {  # <env_file> <KEY>
   sed -n "s/^$2=//p" "$1" | head -1
 }
 
+# Resolve a tenant's XMPP JID: an explicit <jid> wins; else PRESERVE the one
+# already in lunarwing.env; else fall back to <name>@xmpp.localhost (first-time
+# provision). lunarwing.env is the authoritative source — the bridge binary
+# reads only XMPP_BRIDGE_{BIND,TOKEN,MAX_MESSAGES} and receives the JID from the
+# daemon via POST /v1/configure, so a JID lost here silently repoints the tenant.
+# Without this, re-running add-tenant without --xmpp-domain/--xmpp-jid reset a
+# live tenant to the non-resolving xmpp.localhost default and the bridge sat in
+# an endless connect-retry while /v1/status still reported configured+running.
+resolve_tenant_xmpp_jid() {  # <name> [explicit_jid]
+  local name="$1" explicit="${2:-}"
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  local existing
+  existing="$(_env_existing "$(tenant_env_dir "$name")/lunarwing.env" XMPP_JID)"
+  printf '%s\n' "${existing:-$name@xmpp.localhost}"
+}
+
 # Build the XMPP_ALLOW_FROM comma-separated value: owner JID first, then any
 # extra JIDs from --xmpp-allow-from (comma-separated), deduped (owner JID and
 # duplicate extras collapse), surrounding whitespace trimmed. <owner_jid> may
@@ -2488,7 +2507,10 @@ _write_weechat_env() {  # <tenant> <relay_password>
 
 write_tenant_lunarwing_env() {
   local name="$1"
-  local xmpp_jid="${2:-$name@xmpp.localhost}"
+  # Empty $2 means "caller supplied none" -> preserve an existing JID (see
+  # resolve_tenant_xmpp_jid); only a first write falls back to xmpp.localhost.
+  local xmpp_jid
+  xmpp_jid="$(resolve_tenant_xmpp_jid "$name" "${2:-}")"
   local xmpp_password="${3:-}"   # resolved below (preserve an existing one on re-run)
   local tensorzero_url="${4:-$DEFAULT_TENSORZERO_URL}"
   local llm_api_key="${5:-}"
@@ -2712,7 +2734,10 @@ ENVEOF
 
 write_tenant_bridge_env() {
   local name="$1"
-  local xmpp_jid="${2:-$name@xmpp.localhost}"
+  # Same preservation rule as write_tenant_lunarwing_env: keep the daemon's JID
+  # rather than resetting this file to the xmpp.localhost default on a re-run.
+  local xmpp_jid
+  xmpp_jid="$(resolve_tenant_xmpp_jid "$name" "${2:-}")"
   local xmpp_password="${3:-}"
   local xmpp_allow_from="${4:-}"
 
@@ -6304,7 +6329,7 @@ remove_health_pipeline() {
 add_tenant() {
   local name="$1"
   local docker_group="${2:-false}"
-  local xmpp_jid="${3:-$name@xmpp.localhost}"
+  local xmpp_jid="${3:-}"   # resolved below (preserve an existing one on re-run)
   local xmpp_password="${4:-}"
   local tensorzero_url="${5:-$DEFAULT_TENSORZERO_URL}"
   local gotify_url="${6:-$DEFAULT_GOTIFY_URL}"
@@ -6341,8 +6366,18 @@ add_tenant() {
       die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/weechat-/weechat-adapter-); choose another name" ;;
   esac
 
+  # Resolve after sanitize_name so a preserved/default JID keys off the real name.
+  local xmpp_jid_prev
+  xmpp_jid_prev="$(_env_existing "$(tenant_env_dir "$name")/lunarwing.env" XMPP_JID)"
+  xmpp_jid="$(resolve_tenant_xmpp_jid "$name" "$xmpp_jid")"
+
   say "=== Adding tenant: $name ==="
   say ""
+  if [[ -n "$xmpp_jid_prev" && "$xmpp_jid" == "$xmpp_jid_prev" ]]; then
+    say "preserving existing XMPP JID: $xmpp_jid"
+  elif [[ -n "$xmpp_jid_prev" && "$xmpp_jid" != "$xmpp_jid_prev" ]]; then
+    say "WARNING: changing XMPP JID: $xmpp_jid_prev -> $xmpp_jid (bridge restart required)" >&2
+  fi
 
   ports_registry_init
   local base_port workers_json
@@ -7228,13 +7263,14 @@ main() {
         esac
       done
       [[ -n "$name" ]] || die "usage: add-tenant <name> [--docker-group] [--xmpp-jid <jid>]"
-      [[ -n "$xmpp_jid" ]] || xmpp_jid="$(sanitize_name "$name")@xmpp.localhost"
+      # Leave empty when --xmpp-jid is absent: add_tenant preserves the tenant's
+      # existing JID and only defaults to <name>@xmpp.localhost on a first write.
       add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode"
       ;;
 
     add-tenants)
       require_root
-      local names_csv="" docker_group="false" xmpp_domain="xmpp.localhost" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" with_nanocode="false" with_pebble="false" with_opencode="false"
+      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" with_nanocode="false" with_pebble="false" with_opencode="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -7277,7 +7313,10 @@ main() {
         sname="$(sanitize_name "$(echo "$raw_name" | xargs)")"
         [[ -n "$sname" ]] || continue
         say ""
-        add_tenant "$sname" "$docker_group" "${sname}@${xmpp_domain}" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode"
+        # Empty --xmpp-domain -> empty JID, so add_tenant preserves an existing one.
+        local sjid=""
+        if [[ -n "$xmpp_domain" ]]; then sjid="${sname}@${xmpp_domain}"; fi
+        add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode"
       done
       ;;
 
