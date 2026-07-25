@@ -28,13 +28,8 @@ impl TunnelConfig {
         let public_url = optional_env("TUNNEL_URL")?
             .or_else(|| settings.tunnel.public_url.clone().filter(|s| !s.is_empty()));
 
-        if let Some(ref url) = public_url
-            && !url.starts_with("https://")
-        {
-            return Err(ConfigError::InvalidValue {
-                key: "TUNNEL_URL".to_string(),
-                message: "must start with https:// (webhooks require HTTPS)".to_string(),
-            });
+        if let Some(ref url) = public_url {
+            validate_public_url(url)?;
         }
 
         // Resolve managed tunnel provider config.
@@ -48,6 +43,13 @@ impl TunnelConfig {
         } else {
             Some(crate::tunnel::TunnelProviderConfig {
                 provider: provider_name.clone(),
+                netbird: Some(crate::tunnel::NetBirdTunnelConfig {
+                    custom_domain: optional_env("TUNNEL_NETBIRD_CUSTOM_DOMAIN")?
+                        .or_else(|| settings.tunnel.netbird_custom_domain.clone()),
+                    name_prefix: optional_env("TUNNEL_NETBIRD_NAME_PREFIX")?
+                        .or_else(|| settings.tunnel.netbird_name_prefix.clone())
+                        .unwrap_or_else(|| "lunarwing".to_string()),
+                }),
                 cloudflare: optional_env("TUNNEL_CF_TOKEN")?
                     .or_else(|| settings.tunnel.cf_token.clone())
                     .map(|token| crate::tunnel::CloudflareTunnelConfig { token }),
@@ -105,12 +107,22 @@ impl TunnelConfig {
     }
 }
 
+pub(crate) fn validate_public_url(url: &str) -> Result<(), ConfigError> {
+    if !url.starts_with("https://") {
+        return Err(ConfigError::InvalidValue {
+            key: "TUNNEL_URL".to_string(),
+            message: "must start with https:// (webhooks require HTTPS)".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::tunnel::TunnelConfig;
     use crate::tunnel::{
-        CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TailscaleTunnelConfig,
-        TunnelProviderConfig,
+        CloudflareTunnelConfig, CustomTunnelConfig, NetBirdTunnelConfig, NgrokTunnelConfig,
+        TailscaleTunnelConfig, TunnelProviderConfig,
     };
 
     // ── Default ─────────────────────────────────────────────────────
@@ -140,6 +152,7 @@ mod tests {
             public_url: None,
             provider: Some(TunnelProviderConfig {
                 provider: "cloudflare".to_string(),
+                netbird: None,
                 cloudflare: Some(CloudflareTunnelConfig {
                     token: "cf-tok".to_string(),
                 }),
@@ -157,6 +170,7 @@ mod tests {
             public_url: Some("https://example.com".to_string()),
             provider: Some(TunnelProviderConfig {
                 provider: "ngrok".to_string(),
+                netbird: None,
                 cloudflare: None,
                 tailscale: None,
                 ngrok: Some(NgrokTunnelConfig {
@@ -242,9 +256,30 @@ mod tests {
     // ── TunnelProviderConfig field coverage ─────────────────────────
 
     #[test]
+    fn provider_config_netbird() {
+        let netbird = NetBirdTunnelConfig {
+            custom_domain: Some("lunarwing.example.com".to_string()),
+            name_prefix: "lunarwing".to_string(),
+        };
+        assert_eq!(
+            netbird.custom_domain.as_deref(),
+            Some("lunarwing.example.com")
+        );
+        assert_eq!(netbird.name_prefix, "lunarwing");
+    }
+
+    #[test]
+    fn provider_config_netbird_defaults() {
+        let netbird = NetBirdTunnelConfig::default();
+        assert!(netbird.custom_domain.is_none());
+        assert_eq!(netbird.name_prefix, "lunarwing");
+    }
+
+    #[test]
     fn provider_config_cloudflare() {
         let p = TunnelProviderConfig {
             provider: "cloudflare".to_string(),
+            netbird: None,
             cloudflare: Some(CloudflareTunnelConfig {
                 token: "cf-secret".to_string(),
             }),

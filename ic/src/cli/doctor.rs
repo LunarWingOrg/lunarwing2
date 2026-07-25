@@ -138,25 +138,10 @@ pub async fn run_doctor_command() -> anyhow::Result<()> {
         &mut skipped,
     );
 
+    let (tunnel_name, tunnel_result) = check_tunnel_provider(&settings).await;
     check(
-        "cloudflared",
-        check_binary("cloudflared", &["--version"]),
-        &mut passed,
-        &mut failed,
-        &mut skipped,
-    );
-
-    check(
-        "ngrok",
-        check_binary("ngrok", &["version"]),
-        &mut passed,
-        &mut failed,
-        &mut skipped,
-    );
-
-    check(
-        "tailscale",
-        check_binary("tailscale", &["version"]),
+        tunnel_name,
+        tunnel_result,
         &mut passed,
         &mut failed,
         &mut skipped,
@@ -690,6 +675,113 @@ async fn check_docker_daemon() -> CheckResult {
 
 // ── External binary ─────────────────────────────────────────
 
+async fn check_tunnel_provider(settings: &Settings) -> (&'static str, CheckResult) {
+    let static_url = crate::config::helpers::env_or_override("TUNNEL_URL")
+        .or_else(|| settings.tunnel.public_url.clone());
+    if let Some(url) = static_url.filter(|url| !url.is_empty()) {
+        let result = match crate::config::validate_public_url(&url) {
+            Ok(()) => CheckResult::Pass("static URL configured".to_string()),
+            Err(error) => CheckResult::Fail(error.to_string()),
+        };
+        return ("Tunnel provider", result);
+    }
+
+    let provider = crate::config::helpers::env_or_override("TUNNEL_PROVIDER")
+        .or_else(|| settings.tunnel.provider.clone());
+
+    match provider.as_deref() {
+        Some("netbird") => ("netbird", check_netbird().await),
+        Some("cloudflare") => ("cloudflared", check_binary("cloudflared", &["--version"])),
+        Some("ngrok") => ("ngrok", check_binary("ngrok", &["version"])),
+        Some("tailscale") => ("tailscale", check_binary("tailscale", &["version"])),
+        Some("custom") => {
+            let command = crate::config::helpers::env_or_override("TUNNEL_CUSTOM_COMMAND")
+                .or_else(|| settings.tunnel.custom_command.clone());
+            if command.is_some_and(|command| !command.trim().is_empty()) {
+                (
+                    "Tunnel provider",
+                    CheckResult::Pass("custom command configured".into()),
+                )
+            } else {
+                (
+                    "Tunnel provider",
+                    CheckResult::Fail("custom provider has no command".into()),
+                )
+            }
+        }
+        Some("none") | None => (
+            "Tunnel provider",
+            CheckResult::Skip("not configured".into()),
+        ),
+        Some(other) => (
+            "Tunnel provider",
+            CheckResult::Fail(format!("unknown provider: {other}")),
+        ),
+    }
+}
+
+async fn check_netbird() -> CheckResult {
+    check_netbird_available(crate::skills::gating::binary_exists("netbird")).await
+}
+
+async fn check_netbird_available(binary_available: bool) -> CheckResult {
+    if !binary_available {
+        return CheckResult::Fail("netbird not found in PATH".to_string());
+    }
+
+    let version = match run_external_command("netbird", &["version"]).await {
+        Ok(version) => version,
+        Err(detail) => return CheckResult::Fail(format!("netbird version failed: {detail}")),
+    };
+
+    let expose = run_external_command("netbird", &["expose", "--help"]).await;
+    if let Err(detail) = expose {
+        return CheckResult::Fail(format!(
+            "{version}; `netbird expose` unavailable: {detail}. Upgrade NetBird"
+        ));
+    }
+
+    match run_external_command("netbird", &["status", "--check", "startup"]).await {
+        Ok(_) => CheckResult::Pass(format!("{version}; expose available; peer connected")),
+        Err(detail) => CheckResult::Fail(format!(
+            "{version}; peer not ready: {detail}. Connect it to the management server"
+        )),
+    }
+}
+
+async fn run_external_command(name: &str, args: &[&str]) -> Result<String, String> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new(name)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("{name} command timed out after 5s"))?
+    .map_err(|error| error.to_string())?;
+    let detail = first_command_line(&output);
+    if output.status.success() {
+        Ok(detail)
+    } else {
+        Err(detail)
+    }
+}
+
+fn first_command_line(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stderr
+        .lines()
+        .chain(stdout.lines())
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("no output")
+        .to_string()
+}
+
 fn check_binary(name: &str, args: &[&str]) -> CheckResult {
     match std::process::Command::new(name)
         .args(args)
@@ -722,6 +814,49 @@ fn check_binary(name: &str, args: &[&str]) -> CheckResult {
 mod tests {
     use crate::cli::doctor::*;
 
+    struct TunnelEnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl TunnelEnvGuard {
+        fn clear() -> Self {
+            let keys = ["TUNNEL_URL", "TUNNEL_PROVIDER", "TUNNEL_CUSTOM_COMMAND"];
+            let previous = keys
+                .into_iter()
+                .map(|key| (key, std::env::var(key).ok()))
+                .collect();
+            // SAFETY: Callers hold the shared environment lock.
+            unsafe {
+                for key in keys {
+                    std::env::remove_var(key);
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for TunnelEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: Guard is dropped while caller still holds environment lock.
+            unsafe {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_tunnel_without_env(settings: &Settings) -> (&'static str, CheckResult) {
+        let _mutex = crate::config::helpers::lock_env();
+        let _env = TunnelEnvGuard::clear();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(check_tunnel_provider(settings))
+    }
+
     #[test]
     fn check_binary_finds_sh() {
         match check_binary("sh", &["-c", "echo ok"]) {
@@ -739,6 +874,47 @@ mod tests {
                 format_result(&other)
             ),
         }
+    }
+
+    #[test]
+    fn tunnel_provider_skips_when_unconfigured() {
+        let settings = Settings::default();
+        let (_, result) = check_tunnel_without_env(&settings);
+        assert!(matches!(result, CheckResult::Skip(_)));
+    }
+
+    #[test]
+    fn tunnel_provider_accepts_configured_custom_command() {
+        let mut settings = Settings::default();
+        settings.tunnel.provider = Some("custom".to_string());
+        settings.tunnel.custom_command = Some("example-tunnel {port}".to_string());
+        let (_, result) = check_tunnel_without_env(&settings);
+        assert!(matches!(result, CheckResult::Pass(_)));
+    }
+
+    #[test]
+    fn tunnel_provider_prefers_static_url() {
+        let mut settings = Settings::default();
+        settings.tunnel.public_url = Some("https://static.example.com".to_string());
+        settings.tunnel.provider = Some("netbird".to_string());
+        let (name, result) = check_tunnel_without_env(&settings);
+        assert_eq!(name, "Tunnel provider");
+        assert!(matches!(result, CheckResult::Pass(detail) if detail.contains("static URL")));
+    }
+
+    #[test]
+    fn tunnel_provider_rejects_invalid_static_url() {
+        let mut settings = Settings::default();
+        settings.tunnel.public_url = Some("http://static.example.com".to_string());
+        settings.tunnel.provider = Some("netbird".to_string());
+        let (_, result) = check_tunnel_without_env(&settings);
+        assert!(matches!(result, CheckResult::Fail(detail) if detail.contains("HTTPS")));
+    }
+
+    #[tokio::test]
+    async fn configured_netbird_missing_binary_fails() {
+        let result = check_netbird_available(false).await;
+        assert!(matches!(result, CheckResult::Fail(detail) if detail.contains("not found")));
     }
 
     #[test]

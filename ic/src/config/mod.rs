@@ -59,6 +59,7 @@ pub use self::skills::SkillsConfig;
 pub use self::ssh::{SshConfig, SshHostEntry};
 pub use self::transcription::TranscriptionConfig;
 pub use self::tunnel::TunnelConfig;
+pub(crate) use self::tunnel::validate_public_url;
 pub use self::wasm::WasmConfig;
 pub use self::workspace::WorkspaceConfig;
 pub use crate::llm::config::{LlmConfig, LunarWingCloudConfig, RegistryProviderConfig};
