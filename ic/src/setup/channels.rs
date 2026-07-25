@@ -116,6 +116,16 @@ pub async fn setup_tunnel(settings: &Settings) -> Result<TunnelSettings, Channel
         print_info("Current tunnel configuration:");
         let t = &settings.tunnel;
         match t.provider.as_deref() {
+            Some("netbird") => {
+                print_info("  Provider:  NetBird Reverse Proxy");
+                if let Some(ref domain) = t.netbird_custom_domain {
+                    print_info(&format!("  Domain:    {}", domain));
+                }
+                print_info(&format!(
+                    "  Prefix:    {}",
+                    t.netbird_name_prefix.as_deref().unwrap_or("lunarwing")
+                ));
+            }
             Some("ngrok") => {
                 print_info("  Provider:  ngrok");
                 if let Some(ref domain) = t.ngrok_domain {
@@ -177,6 +187,7 @@ pub async fn setup_tunnel(settings: &Settings) -> Result<TunnelSettings, Channel
     }
 
     let options = &[
+        "NetBird       - self-hosted-capable Reverse Proxy",
         "ngrok         - managed tunnel, starts automatically",
         "Cloudflare    - cloudflared tunnel, starts automatically",
         "Tailscale     - Tailscale Funnel/Serve, starts automatically",
@@ -187,13 +198,90 @@ pub async fn setup_tunnel(settings: &Settings) -> Result<TunnelSettings, Channel
     let choice = select_one("Select tunnel provider:", options)?;
 
     match choice {
-        0 => setup_tunnel_ngrok(),
-        1 => setup_tunnel_cloudflare().await,
-        2 => setup_tunnel_tailscale(),
-        3 => setup_tunnel_custom(),
-        4 => setup_tunnel_static(),
+        0 => setup_tunnel_netbird().await,
+        1 => setup_tunnel_ngrok(),
+        2 => setup_tunnel_cloudflare().await,
+        3 => setup_tunnel_tailscale(),
+        4 => setup_tunnel_custom(),
+        5 => setup_tunnel_static(),
         _ => Ok(TunnelSettings::default()),
     }
+}
+
+async fn setup_tunnel_netbird() -> Result<TunnelSettings, ChannelSetupError> {
+    let netbird_found = crate::skills::gating::binary_exists("netbird");
+    if !netbird_found {
+        print_error("netbird not found in PATH.");
+        print_info("Install current NetBird client: https://docs.netbird.io/how-to/installation");
+        if !confirm("Continue and install NetBird later?", false)? {
+            return Err(ChannelSetupError::Validation(
+                "netbird binary not found. Install it and re-run setup.".to_string(),
+            ));
+        }
+    } else {
+        let expose_supported = netbird_command_succeeds(&["expose", "--help"]).await;
+        if !expose_supported {
+            print_error("Installed NetBird client does not support `netbird expose`.");
+            if !confirm("Continue and upgrade NetBird later?", false)? {
+                return Err(ChannelSetupError::Validation(
+                    "NetBird client with `netbird expose` support is required.".to_string(),
+                ));
+            }
+        }
+
+        let ready = netbird_command_succeeds(&["status", "--check", "startup"]).await;
+        if !ready {
+            print_warning("NetBird peer is not connected yet.");
+            print_info(
+                "Enroll it against your self-hosted management server before starting LunarWing.",
+            );
+        }
+    }
+
+    println!();
+    print_info("Self-hosted NetBird requires:");
+    print_info("  - NetBird Reverse Proxy deployed behind Traefik TLS passthrough");
+    print_info("  - wildcard proxy DNS and TLS configured");
+    print_info("  - Peer Expose enabled for this peer's group");
+    print_info("LunarWing will not enroll, disconnect, or reconfigure the NetBird peer.");
+    println!();
+
+    let custom_domain = optional_input(
+        "Verified custom domain",
+        Some("recommended for stable production callbacks; optional"),
+    )?;
+    let name_prefix = optional_input("Service name prefix", Some("default: lunarwing"))?;
+    if let Some(ref prefix) = name_prefix {
+        crate::tunnel::validate_netbird_name_prefix(prefix)
+            .map_err(|error| ChannelSetupError::Validation(error.to_string()))?;
+    }
+
+    print_warning("Without NetBird-layer authentication, generated URL is publicly reachable.");
+    print_info("LunarWing webhook signatures and gateway bearer authentication remain required.");
+    print_success("NetBird Reverse Proxy configured. Tunnel will start automatically at boot.");
+
+    Ok(TunnelSettings {
+        provider: Some("netbird".to_string()),
+        netbird_custom_domain: custom_domain,
+        netbird_name_prefix: name_prefix,
+        ..Default::default()
+    })
+}
+
+async fn netbird_command_succeeds(args: &[&str]) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::process::Command::new("netbird")
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await,
+        Ok(Ok(status)) if status.success()
+    )
 }
 
 fn setup_tunnel_ngrok() -> Result<TunnelSettings, ChannelSetupError> {
@@ -1253,6 +1341,12 @@ mod tests {
     #[test]
     fn test_validate_cloudflare_token_empty() {
         assert!(!validate_cloudflare_token_format(""));
+    }
+
+    #[test]
+    fn test_validate_netbird_name_prefix() {
+        assert!(crate::tunnel::validate_netbird_name_prefix("lunarwing").is_ok());
+        assert!(crate::tunnel::validate_netbird_name_prefix("bad prefix").is_err());
     }
 
     #[tokio::test]

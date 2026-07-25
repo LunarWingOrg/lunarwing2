@@ -1,10 +1,11 @@
 //! Tunnel abstraction for exposing the agent to the internet.
 //!
-//! Wraps external tunnel binaries (cloudflared, ngrok, tailscale, etc.) behind
+//! Wraps external tunnel binaries (NetBird, cloudflared, ngrok, etc.) behind
 //! a common trait. The gateway starts a tunnel after binding its local port
 //! and stops it on shutdown.
 //!
 //! Supported providers:
+//! - **netbird** - self-hosted-capable Reverse Proxy via `netbird expose`
 //! - **cloudflare** - Zero Trust tunnels via `cloudflared`
 //! - **tailscale** - `tailscale serve` (tailnet) or `tailscale funnel` (public)
 //! - **ngrok** - instant public URLs via `ngrok`
@@ -13,12 +14,15 @@
 
 mod cloudflare;
 mod custom;
+mod netbird;
 mod ngrok;
 mod none;
 mod tailscale;
 
 pub use cloudflare::CloudflareTunnel;
 pub use custom::CustomTunnel;
+pub use netbird::NetBirdTunnel;
+pub(crate) use netbird::validate_name_prefix as validate_netbird_name_prefix;
 pub use ngrok::NgrokTunnel;
 pub use none::NoneTunnel;
 pub use tailscale::TailscaleTunnel;
@@ -89,6 +93,65 @@ pub(crate) async fn kill_shared(proc: &SharedProcess) -> Result<()> {
     Ok(())
 }
 
+/// Ask a shared process to exit, then force-kill it after `grace`.
+pub(crate) async fn terminate_shared(
+    proc: &SharedProcess,
+    grace: std::time::Duration,
+) -> Result<()> {
+    let Some(mut tunnel_process) = proc.lock().await.take() else {
+        return Ok(());
+    };
+    terminate_child(&mut tunnel_process.child, grace).await
+}
+
+pub(crate) async fn terminate_child(
+    child: &mut tokio::process::Child,
+    grace: std::time::Duration,
+) -> Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+
+    if let Err(error) = request_termination(child) {
+        tracing::warn!("Failed to request graceful tunnel shutdown: {error}");
+        child.kill().await?;
+        child.wait().await?;
+        return Ok(());
+    }
+
+    match tokio::time::timeout(grace, child.wait()).await {
+        Ok(result) => {
+            result?;
+        }
+        Err(_) => {
+            child.kill().await?;
+            child.wait().await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn request_termination(child: &mut tokio::process::Child) -> Result<()> {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    if let Some(id) = child.id() {
+        let pid = i32::try_from(id).map_err(|_| anyhow::anyhow!("child PID exceeds i32"))?;
+        match kill(Pid::from_raw(pid), Signal::SIGTERM) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn request_termination(child: &mut tokio::process::Child) -> Result<()> {
+    child.start_kill()?;
+    Ok(())
+}
+
 // ── Configuration types ──────────────────────────────────────────
 
 /// Provider-specific config for Cloudflare tunnels.
@@ -116,6 +179,24 @@ pub struct NgrokTunnelConfig {
     pub domain: Option<String>,
 }
 
+/// Provider-specific config for NetBird Reverse Proxy tunnels.
+#[derive(Debug, Clone)]
+pub struct NetBirdTunnelConfig {
+    /// Optional verified custom domain. Auto-assigned cluster domain otherwise.
+    pub custom_domain: Option<String>,
+    /// Prefix for NetBird's generated ephemeral service name.
+    pub name_prefix: String,
+}
+
+impl Default for NetBirdTunnelConfig {
+    fn default() -> Self {
+        Self {
+            custom_domain: None,
+            name_prefix: "lunarwing".to_string(),
+        }
+    }
+}
+
 /// Provider-specific config for custom tunnel commands.
 #[derive(Debug, Clone, Default)]
 pub struct CustomTunnelConfig {
@@ -130,8 +211,9 @@ pub struct CustomTunnelConfig {
 /// Full tunnel configuration.
 #[derive(Debug, Clone, Default)]
 pub struct TunnelProviderConfig {
-    /// Provider name: "none", "cloudflare", "tailscale", "ngrok", "custom".
+    /// Provider name: "none", "netbird", "cloudflare", "tailscale", "ngrok", "custom".
     pub provider: String,
+    pub netbird: Option<NetBirdTunnelConfig>,
     pub cloudflare: Option<CloudflareTunnelConfig>,
     pub tailscale: Option<TailscaleTunnelConfig>,
     pub ngrok: Option<NgrokTunnelConfig>,
@@ -144,6 +226,14 @@ pub struct TunnelProviderConfig {
 pub fn create_tunnel(config: &TunnelProviderConfig) -> Result<Option<Box<dyn Tunnel>>> {
     match config.provider.as_str() {
         "none" | "" => Ok(None),
+
+        "netbird" => {
+            let netbird = config.netbird.as_ref().cloned().unwrap_or_default();
+            Ok(Some(Box::new(NetBirdTunnel::new(
+                netbird.custom_domain,
+                netbird.name_prefix,
+            )?)))
+        }
 
         "cloudflare" => {
             let cf = config.cloudflare.as_ref().ok_or_else(|| {
@@ -179,7 +269,7 @@ pub fn create_tunnel(config: &TunnelProviderConfig) -> Result<Option<Box<dyn Tun
         }
 
         other => bail!(
-            "Unknown tunnel provider: \"{other}\". Valid: none, cloudflare, tailscale, ngrok, custom"
+            "Unknown tunnel provider: \"{other}\". Valid: none, netbird, cloudflare, tailscale, ngrok, custom"
         ),
     }
 }
@@ -290,6 +380,29 @@ mod tests {
             ..Default::default()
         };
         assert_tunnel_err(&cfg, "Unknown tunnel provider");
+    }
+
+    #[test]
+    fn factory_netbird_defaults_ok() {
+        let cfg = TunnelProviderConfig {
+            provider: "netbird".into(),
+            ..Default::default()
+        };
+        let tunnel = create_tunnel(&cfg).unwrap().unwrap();
+        assert_eq!(tunnel.name(), "netbird");
+    }
+
+    #[test]
+    fn factory_netbird_rejects_invalid_prefix() {
+        let cfg = TunnelProviderConfig {
+            provider: "netbird".into(),
+            netbird: Some(NetBirdTunnelConfig {
+                custom_domain: None,
+                name_prefix: "Invalid Prefix".into(),
+            }),
+            ..Default::default()
+        };
+        assert_tunnel_err(&cfg, "NetBird name prefix");
     }
 
     #[test]

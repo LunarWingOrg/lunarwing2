@@ -178,7 +178,7 @@ pub struct ExtensionManager {
     hooks: Option<Arc<HookRegistry>>,
     pending_auth: RwLock<HashMap<(String, String), PendingAuth>>,
     /// Tunnel URL for webhook configuration and remote OAuth callbacks.
-    tunnel_url: Option<String>,
+    tunnel_url: std::sync::RwLock<Option<String>>,
     user_id: String,
     /// Optional database store for DB-backed MCP config.
     store: Option<Arc<dyn crate::db::Database>>,
@@ -298,7 +298,7 @@ impl ExtensionManager {
             tool_registry,
             hooks,
             pending_auth: RwLock::new(HashMap::new()),
-            tunnel_url,
+            tunnel_url: std::sync::RwLock::new(tunnel_url),
             user_id,
             store,
             active_channel_names: RwLock::new(HashSet::new()),
@@ -309,6 +309,20 @@ impl ExtensionManager {
             gateway_mode: std::sync::atomic::AtomicBool::new(false),
             gateway_base_url: RwLock::new(None),
         }
+    }
+
+    /// Update URL discovered from a managed tunnel after application assembly.
+    pub fn set_tunnel_url(&self, tunnel_url: Option<String>) {
+        if let Ok(mut current) = self.tunnel_url.write() {
+            *current = tunnel_url;
+        }
+    }
+
+    fn current_tunnel_url(&self) -> Option<String> {
+        self.tunnel_url
+            .read()
+            .ok()
+            .and_then(|current| current.clone())
     }
 
     /// Enable gateway mode so OAuth flows return auth URLs to the frontend
@@ -337,7 +351,7 @@ impl ExtensionManager {
         if crate::cli::oauth_defaults::use_gateway_callback() {
             return true;
         }
-        self.tunnel_url
+        self.current_tunnel_url()
             .as_ref()
             .filter(|u| !u.is_empty())
             .and_then(|raw| url::Url::parse(raw).ok())
@@ -366,7 +380,7 @@ impl ExtensionManager {
             return Some(format!("{}/oauth/callback", base));
         }
         // Fall back to tunnel_url
-        self.tunnel_url
+        self.current_tunnel_url()
             .as_ref()
             .filter(|u| !u.is_empty())
             .and_then(|raw| {
@@ -3877,8 +3891,9 @@ impl ExtensionManager {
         // Inject runtime config (tunnel_url, webhook_secret, owner_id)
         {
             let resolved_owner_id = owner_id.or(self.current_channel_owner_id(&channel_name).await);
+            let tunnel_url = self.current_tunnel_url();
             let mut config_updates = build_wasm_channel_runtime_config_updates(
-                self.tunnel_url.as_deref(),
+                tunnel_url.as_deref(),
                 webhook_secret.as_deref(),
                 resolved_owner_id,
             );
@@ -3899,7 +3914,7 @@ impl ExtensionManager {
                 channel_arc.update_config(config_updates).await;
                 tracing::info!(
                     channel = %channel_name,
-                    has_tunnel = self.tunnel_url.is_some(),
+                    has_tunnel = tunnel_url.is_some(),
                     has_webhook_secret = webhook_secret.is_some(),
                     "Injected runtime config into hot-activated channel"
                 );
@@ -4094,8 +4109,9 @@ impl ExtensionManager {
             .as_ref()
             .and_then(|f| f.hmac_secret_name().map(|s| s.to_string()));
 
+        let tunnel_url = self.current_tunnel_url();
         let mut config_updates = build_wasm_channel_runtime_config_updates(
-            self.tunnel_url.as_deref(),
+            tunnel_url.as_deref(),
             None,
             self.current_channel_owner_id(name).await,
         );
@@ -7132,6 +7148,32 @@ done
         unsafe {
             if let Some(val) = original {
                 std::env::set_var("IRONCLAW_OAUTH_CALLBACK_URL", val);
+            }
+        }
+    }
+
+    #[test]
+    fn managed_tunnel_url_can_be_set_after_construction() {
+        let _guard = crate::config::helpers::lock_env();
+        let original = std::env::var("IRONCLAW_OAUTH_CALLBACK_URL").ok();
+        unsafe {
+            std::env::remove_var("IRONCLAW_OAUTH_CALLBACK_URL");
+        }
+
+        let manager = make_manager_with_tunnel(None);
+        manager.set_tunnel_url(Some("https://managed.example.com".to_string()));
+        assert!(manager.should_use_gateway_mode());
+        assert_eq!(
+            manager.current_tunnel_url().as_deref(),
+            Some("https://managed.example.com")
+        );
+
+        manager.set_tunnel_url(None);
+        assert!(manager.current_tunnel_url().is_none());
+
+        unsafe {
+            if let Some(value) = original {
+                std::env::set_var("IRONCLAW_OAUTH_CALLBACK_URL", value);
             }
         }
     }

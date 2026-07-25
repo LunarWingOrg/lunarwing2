@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Standalone test harness for WeeChat service rendering (Todo 2).
 # Verifies: dedicated weechat.env (RELAY_PASSWORD only, mode 0600),
-# systemd EnvironmentFile= path, OpenRC post-drop env loading, tmux command
-# preservation, and renderer helper extraction.
+# systemd EnvironmentFile= path, OpenRC post-drop env loading, conditional
+# session-restore startup, tmux command preservation, and renderer helpers.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,6 +51,7 @@ tenant_env_dir()      { echo "$MT_FIXTURE/$1/lunarwing/env"; }
 tenant_state_dir()    { echo "$MT_FIXTURE/$1/lunarwing/state"; }
 tenant_run_dir()      { echo "$MT_FIXTURE/$1/lunarwing/run"; }
 tenant_log_dir()      { echo "$MT_FIXTURE/$1/lunarwing/logs"; }
+tenant_lw_root()      { echo "$MT_FIXTURE/$1/lunarwing"; }
 tenant_weechat_home() { printf '%s/.config/weechat' "$(tenant_home "$1")"; }
 
 # Stub ports_get to return deterministic ports.
@@ -173,11 +174,13 @@ else
   echo "  PASS: systemd does not point at lunarwing.env"
 fi
 
-# Preserves tmux start command with weechat --dir
-if grep -q 'tmux.*new-session.*weechat.*--dir' "$unit_file"; then
-  echo "  PASS: systemd preserves tmux + weechat --dir command"
+# Starts tmux through the helper that conditionally adds WeeChat --upgrade.
+if grep -q 'ExecStart=.*tmux.*new-session.*lunarwing-weechat-start.sh' "$unit_file" \
+  && grep -q 'ExecStart=.*--weechat-bin' "$unit_file" \
+  && grep -q 'ExecStart=.*--weechat-home' "$unit_file"; then
+  echo "  PASS: systemd starts WeeChat through session-restore helper"
 else
-  echo "  FAIL: systemd missing tmux weechat command"
+  echo "  FAIL: systemd missing session-restore start helper"
   failures=$((failures + 1))
 fi
 
@@ -289,12 +292,14 @@ else
   failures=$((failures + 1))
 fi
 
-# Preserves tmux command for starting weechat (same tmux invocation as systemd)
+# Preserves tmux command while routing startup through the restore helper.
 if grep -q 'weechat_command:=.*tmux' "$rc_file" \
-  && grep -q 'new-session.*weechat.*--dir' "$rc_file"; then
-  echo "  PASS: OpenRC preserves tmux + weechat --dir start"
+  && grep -q 'weechat_start_helper' "$rc_file" \
+  && grep -q 'new-session' "$rc_file" \
+  && grep -q 'weechat_start_helper.*--weechat-home' "$rc_file"; then
+  echo "  PASS: OpenRC starts WeeChat through session-restore helper"
 else
-  echo "  FAIL: OpenRC missing tmux weechat start"
+  echo "  FAIL: OpenRC missing session-restore start helper"
   failures=$((failures + 1))
 fi
 
@@ -317,12 +322,39 @@ else
   failures=$((failures + 1))
 fi
 
+if grep -qF 'eend "${stop_rc}"' "$rc_file" \
+  && grep -qF 'return "${stop_rc}"' "$rc_file"; then
+  echo "  PASS: OpenRC stop() propagates helper failure"
+else
+  echo "  FAIL: OpenRC stop() hides helper failure"
+  failures=$((failures + 1))
+fi
+
 # stop() still has a tmux kill-session fallback for when the helper is missing
 if grep -q 'kill-session -t weechat' "$rc_file"; then
   echo "  PASS: OpenRC stop() retains tmux kill-session fallback"
 else
   echo "  FAIL: OpenRC stop() missing tmux kill-session fallback"
   failures=$((failures + 1))
+fi
+
+echo "=== OpenRC tenant stop propagation ==="
+
+function rc-service {
+  if [[ "$1" == "lunarwing-weechat-render-test" && "$2" == "status" ]]; then
+    return 0
+  fi
+  if [[ "$1" == "lunarwing-weechat-render-test" && "$2" == "stop" ]]; then
+    return 1
+  fi
+  return 1
+}
+
+if stop_tenant_openrc "render-test" >/dev/null 2>&1; then
+  echo "  FAIL: stop_tenant_openrc hides WeeChat stop failure"
+  failures=$((failures + 1))
+else
+  echo "  PASS: stop_tenant_openrc propagates WeeChat stop failure"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────

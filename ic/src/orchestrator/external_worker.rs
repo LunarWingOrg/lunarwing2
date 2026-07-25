@@ -674,6 +674,8 @@ pub struct WorkerConnectionPool {
     idle_timeout: Duration,
 }
 
+const POOLED_CONNECTION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 impl WorkerConnectionPool {
     pub fn new(max_idle_per_endpoint: usize, idle_timeout: Duration) -> Self {
         Self {
@@ -730,6 +732,70 @@ impl WorkerConnectionPool {
 }
 
 // ── WebSocket task runner ───────────────────────────────────────────
+
+async fn probe_pooled_connection(
+    mut conn: PooledConnection,
+    worker_name: &str,
+) -> Option<PooledConnection> {
+    use tokio_tungstenite::tungstenite;
+
+    let ping = Envelope::new("ping", serde_json::json!({}));
+    let payload = match serde_json::to_string(&ping) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!("Failed to serialize pool probe for '{worker_name}': {error}");
+            return None;
+        }
+    };
+
+    if let Err(error) = conn
+        .stream
+        .send(tungstenite::Message::Text(payload.into()))
+        .await
+    {
+        tracing::debug!("Discarding closed pooled connection for '{worker_name}': {error}");
+        return None;
+    }
+
+    let healthy = tokio::time::timeout(POOLED_CONNECTION_PROBE_TIMEOUT, async {
+        loop {
+            let message = match conn.stream.next().await {
+                Some(Ok(message)) => message,
+                Some(Err(error)) => {
+                    tracing::debug!(
+                        "Discarding broken pooled connection for '{worker_name}': {error}"
+                    );
+                    return false;
+                }
+                None => return false,
+            };
+
+            if message.is_close() {
+                return false;
+            }
+            if message.is_ping() || message.is_pong() {
+                continue;
+            }
+
+            let Ok(text) = message.to_text() else {
+                return false;
+            };
+            let Ok(envelope) = serde_json::from_str::<Envelope>(text) else {
+                return false;
+            };
+            return envelope.msg_type == "pong";
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    if healthy {
+        Some(conn)
+    } else {
+        tracing::debug!("Pooled connection probe failed for '{worker_name}'; reconnecting");
+        None
+    }
+}
 
 async fn connect_and_handshake(
     url: &str,
@@ -868,18 +934,23 @@ async fn run_external_task(
 ) -> Result<ExternalTaskResult, OrchestratorError> {
     use tokio_tungstenite::tungstenite;
 
-    // Try pooled connection first, fall back to fresh
-    let (mut write, mut read, worker_id, from_pool) =
-        if let Some(pooled) = pool.try_acquire(pool_key).await {
-            tracing::debug!("Reusing pooled connection for '{worker_name}'");
-            let wid = pooled.worker_id.clone();
-            let (w, r) = pooled.stream.split();
-            (w, r, wid, true)
-        } else {
-            let (stream, wid) = connect_and_handshake(url, auth_token, worker_name).await?;
-            let (w, r) = stream.split();
-            (w, r, wid, false)
-        };
+    // Probe pooled connections before dispatch so a worker restart cannot leave
+    // the next task attempting to use a dead WebSocket.
+    let pooled = match pool.try_acquire(pool_key).await {
+        Some(conn) => probe_pooled_connection(conn, worker_name).await,
+        None => None,
+    };
+
+    let (mut write, mut read, worker_id, from_pool) = if let Some(pooled) = pooled {
+        tracing::debug!("Reusing pooled connection for '{worker_name}'");
+        let wid = pooled.worker_id.clone();
+        let (w, r) = pooled.stream.split();
+        (w, r, wid, true)
+    } else {
+        let (stream, wid) = connect_and_handshake(url, auth_token, worker_name).await?;
+        let (w, r) = stream.split();
+        (w, r, wid, false)
+    };
 
     let source = if from_pool { "pooled" } else { "new" };
     tracing::info!(

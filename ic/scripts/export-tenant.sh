@@ -27,8 +27,8 @@
 # relay) are intentionally NOT carried — the new host mints fresh, self-consistent
 # ones (gateway UI / external webhook senders re-auth after cutover). Host-specific
 # LLM/worker base URLs are carried ONLY when they point at non-loopback custom
-# endpoints; obsolete host-local proxy URLs are discarded. Vision sidecar ports are regenerated, but
-# a custom VL_URL/VL_MODEL and sidecar auth token are carried when vision.env exists.
+# endpoints; obsolete host-local proxy URLs are discarded. Vision sidecar ports and
+# its host-local auth token are regenerated; only custom VL_URL/VL_MODEL values move.
 #
 # SECURITY: the bundle contains SECRETS_MASTER_KEY + the XMPP password. It is 0600,
 # root-owned, in a 0700 dir. Transfer over ssh; delete from both hosts after verify.
@@ -277,7 +277,7 @@ banner "3/5  Secrets + config manifest"
 BRIDGE_KEYS=(XMPP_JID XMPP_PASSWORD XMPP_DM_POLICY XMPP_ALLOW_FROM_JSON
              XMPP_ALLOW_ROOMS_JSON XMPP_ENCRYPTED_ROOMS_JSON XMPP_DEVICE_ID
              XMPP_ALLOW_PLAINTEXT_FALLBACK)
-VISION_KEYS=(VL_URL VL_MODEL LUNARWING_AUTH_TOKEN)
+VISION_KEYS=(VL_URL VL_MODEL)
 
 # Append KEY=line from <src> to <dest> if present (CR-stripped). The `if` form (not
 # `&& printf`) keeps a missing last key from making the function return non-zero
@@ -290,7 +290,7 @@ copy_key() {  # <src> <dest> <key>
 if $DRY_RUN; then
   note "[dry-run] would extract ${#LW_KEYS[@]}+ keys from lunarwing.env (incl. SECRETS_MASTER_KEY) and ${#BRIDGE_KEYS[@]} from xmpp-bridge.env; intra-host tokens are NOT carried"
   if [[ -f "$VISION_ENVF" ]]; then
-    note "[dry-run] would extract ${#VISION_KEYS[@]} keys from vision.env (VL_URL, VL_MODEL, LUNARWING_AUTH_TOKEN)"
+    note "[dry-run] would extract ${#VISION_KEYS[@]} keys from vision.env (VL_URL, VL_MODEL; auth token regenerated on target)"
   else
     note "[dry-run] no vision.env at $VISION_ENVF — no vision manifest would be written"
   fi
