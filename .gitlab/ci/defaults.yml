@@ -59,7 +59,7 @@ variables:
     - bash .gitlab/scripts/bootstrap-rust.sh
   cache:
     key:
-      prefix: "rust-1.92-dependencies"
+      prefix: "rust-1.96.1-dependencies"
       files:
         - ic/Cargo.lock
     paths:
