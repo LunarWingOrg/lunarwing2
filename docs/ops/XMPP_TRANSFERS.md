@@ -1,8 +1,11 @@
 # XMPP File Transfer Methods — Quick Reference
 
-## Update 2026-06-27
+## Update 2026-07-25
 
-* agent was able to recieve a picture and analyze file meta data. next: hook this up into K.E.R.S. and LunarVision!!!
+Inbound XMPP images now pass through automatic LunarVision OCR/VL enrichment
+when `VISION_SERVICE_URL` is configured. Enrichment uses the per-tenant
+`VISION_AUTH_TOKEN` when configured, fails open to the existing multimodal image path, and never
+persists raw image data or encrypted-media source URLs in text history.
 
 ### docs/ops/XMPP_TRANSFERS.md
 
@@ -37,6 +40,7 @@ XMPP supports multiple file transfer methods, each with different tradeoffs in t
 | Bounded concurrency | ✅ Implemented | 4 concurrent downloads max |
 | Size cap | ✅ Implemented | 20MB limit per file |
 | Unit tests | ✅ Implemented | `ic/src/channels/xmpp/mod.rs` |
+| Automatic LunarVision enrichment | ✅ Implemented | Host-side Bearer auth when configured; OCR/VL text plus original image |
 
 ### ⏳ Pending
 
@@ -68,6 +72,8 @@ XMPP Client → XMPP Bridge → Agent
     │  5. Attach to IncomingMessage
     │              │            │
     │              └───────────→│ 6. Process attachment
+    │                           │ 7. LunarVision OCR/VL enrichment (images, if configured)
+    │                           │ 8. Preserve original image for multimodal LLM input
 ```
 
 ### Code Locations
@@ -78,6 +84,8 @@ XMPP Client → XMPP Bridge → Agent
 - **HTTP download:** `download_oob_file()` (with `read_capped_body`)
 - **Bridge message:** `BridgeMessage` (base64-encoded attachments)
 - **WASM channel:** `on_poll()` decodes and calls `store_attachment_data()`
+- **LunarVision enrichment:** `ic/src/vision_enrichment.rs`
+- **Agent integration:** supervised user-input handling in `ic/src/agent/agent_loop.rs`
 
 ---
 
@@ -88,6 +96,9 @@ XMPP Client → XMPP Bridge → Agent
 - [x] AES-GCM decryption
 - [x] HTTP download with size cap
 - [x] Concurrent download limits
+- [x] Authenticated LunarVision request and OCR/VL context injection
+- [x] LunarVision failure preserves provider-native multimodal fallback
+- [x] Explicit `vision-analyze` tool auth scoped to configured sidecar origin
 
 ### Phase 2: End-to-End Validation (⏳ Pending)
 - [ ] Test with Conversations (Android)
@@ -145,4 +156,3 @@ Component "files.example.com" "http_upload"
 ---
 
 *Glory is for admirals. Uptime is forever.*
-

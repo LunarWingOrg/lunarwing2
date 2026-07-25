@@ -242,6 +242,8 @@ pub struct AgentDeps {
     pub transcription: Option<Arc<crate::llm::transcription::TranscriptionMiddleware>>,
     /// Document text extraction middleware for PDF, DOCX, PPTX, etc.
     pub document_extraction: Option<Arc<crate::document_extraction::DocumentExtractionMiddleware>>,
+    /// Automatic LunarVision enrichment for inbound XMPP images.
+    pub vision_enrichment: Option<Arc<crate::vision_enrichment::VisionEnrichmentMiddleware>>,
     /// Sandbox readiness state for full-job routine dispatch.
     pub sandbox_readiness: crate::agent::routine_engine::SandboxReadiness,
     /// Software builder for self-repair tool rebuilding.
@@ -1472,6 +1474,23 @@ impl Agent {
                 _ => {} // Continue, fail-open errors already logged in registry
             }
         }
+
+        // Image analysis can involve remote VL inference. Keep it inside the
+        // supervised message task and run it only after inbound hooks accept
+        // ordinary user input, so the channel loop remains responsive.
+        let mut enriched_message = None;
+        if matches!(&submission, Submission::UserInput { .. })
+            && let Some(vision_enrichment) = &self.deps.vision_enrichment
+            && message
+                .attachments
+                .iter()
+                .any(|attachment| attachment.kind == crate::channels::AttachmentKind::Image)
+        {
+            let mut candidate = message.clone();
+            vision_enrichment.process(&mut candidate).await;
+            enriched_message = Some(candidate);
+        }
+        let message = enriched_message.as_ref().unwrap_or(message);
 
         // Engine V2 (parallel deployment, Strategy C): when ENGINE_V2=true, route
         // eligible channels' user input and controls through the v2 engine

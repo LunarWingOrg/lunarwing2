@@ -2,6 +2,14 @@
 
 Lightweight OCR and vision analysis sidecar service for LunarWing. Provides a REST API for text extraction (Tesseract) and vision-language understanding (Qwen3-VL) with smart routing.
 
+Inbound XMPP images are automatically sent to the versioned
+`/v1/vision/analyze` endpoint when the daemon has `VISION_SERVICE_URL`
+configured. The daemon applies `VISION_AUTH_TOKEN` at the host boundary when set,
+injects bounded OCR/VL text into attachment context, and preserves original
+image bytes for provider-native multimodal handling.
+The explicit `vision-analyze` WASM tool uses the same host-injected credential,
+scoped to the configured sidecar origin and versioned API path.
+
 ## Quick Start
 
 ```bash
@@ -194,7 +202,8 @@ OCR_PORT=8088 ./ic-ocr /tmp/screenshot.png
 - WebP
 - TIFF
 
-Max payload size: 10MB
+Maximum decoded image size: 10MB. The HTTP request-body limit includes room
+for base64 expansion and JSON framing; decoded bytes are checked separately.
 
 ## Error Responses
 

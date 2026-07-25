@@ -31,6 +31,8 @@ pub(crate) mod workspace;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, Once};
 
+use secrecy::SecretString;
+
 use crate::error::ConfigError;
 use crate::settings::Settings;
 
@@ -90,6 +92,8 @@ pub struct Config {
     /// Populated from the `VISION_SERVICE_URL` env var (written per-tenant by the MT admin
     /// script). `None` on deployments without a sidecar; the tool falls back to its default.
     pub vision_service_url: Option<String>,
+    /// Bearer token for authenticated LunarVision sidecar requests.
+    pub vision_auth_token: Option<SecretString>,
     pub database: DatabaseConfig,
     pub llm: LlmConfig,
     pub embeddings: EmbeddingsConfig,
@@ -134,6 +138,7 @@ impl Config {
         Self {
             owner_id: "default".to_string(),
             vision_service_url: None,
+            vision_auth_token: None,
             database: DatabaseConfig {
                 backend: DatabaseBackend::LibSql,
                 url: secrecy::SecretString::from("unused://test".to_string()),
@@ -328,6 +333,8 @@ impl Config {
         let vision_service_url = self::helpers::optional_env("VISION_SERVICE_URL")?
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        let vision_auth_token =
+            self::helpers::optional_env("VISION_AUTH_TOKEN")?.map(SecretString::from);
 
         let tunnel = TunnelConfig::resolve(settings)?;
         let channels = ChannelsConfig::resolve(settings, &owner_id)?;
@@ -341,6 +348,7 @@ impl Config {
         Ok(Self {
             owner_id: owner_id.clone(),
             vision_service_url,
+            vision_auth_token,
             database: DatabaseConfig::resolve()?,
             llm: LlmConfig::resolve(settings)?,
             embeddings: EmbeddingsConfig::resolve(settings)?,

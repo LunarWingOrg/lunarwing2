@@ -269,13 +269,14 @@ acquire_import_passphrase() {
 # Inject KEY=value lines from a manifest into a live env file, backslash-safe (awk
 # ENVIRON, not -v) and CR-tolerant; preserves the live file's inode/owner/mode. The
 # read loop's `|| [[ -n "$line" ]]` keeps a final line without a trailing newline.
-inject_keys() {  # <manifest> <live_env>
-  local man="$1" live="$2" line key tmp
+inject_keys() {  # <manifest> <live_env> [skip_key]
+  local man="$1" live="$2" skip_key="${3:-}" line key tmp
   [[ -f "$man" && -f "$live" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     [[ "$line" == *=* ]] || continue
     key="${line%%=*}"
+    [[ -n "$skip_key" && "$key" == "$skip_key" ]] && continue
     grep -qxF "$line" "$live" 2>/dev/null && continue
     tmp="$(mktemp)"
     if grep -q "^${key}=" "$live"; then
@@ -508,15 +509,17 @@ $WITH_VISION && run "$MT" build-vision-sidecar
 banner "3/7  Inject carried secrets + config"
 if $DRY_RUN; then
   note "[dry-run] would inject manifest-lunarwing.env -> $ENVF and manifest-bridge.env -> $BRIDGE_ENVF (incl. SECRETS_MASTER_KEY, XMPP password, XMPP/LLM config)"
-  [[ -s "$WORK/manifest-vision.env" ]] && note "[dry-run] would inject manifest-vision.env -> $VISION_ENVF (VL_URL, VL_MODEL, LUNARWING_AUTH_TOKEN)"
+  [[ -s "$WORK/manifest-vision.env" ]] && note "[dry-run] would inject manifest-vision.env -> $VISION_ENVF (VL_URL and VL_MODEL; target-generated auth token retained)"
 else
   inject_keys "$WORK/manifest-lunarwing.env" "$ENVF"
   [[ -f "$WORK/manifest-bridge.env" ]] && inject_keys "$WORK/manifest-bridge.env" "$BRIDGE_ENVF"
   if [[ -s "$WORK/manifest-vision.env" ]]; then
     [[ -f "$VISION_ENVF" ]] || die "bundle carries vision config, but target mt-admin did not render $VISION_ENVF"
-    inject_keys "$WORK/manifest-vision.env" "$VISION_ENVF"
+    # Vision auth is host-local. Old bundles may carry it, but add-tenant has
+    # already generated a matching target-sidecar/daemon pair; never split it.
+    inject_keys "$WORK/manifest-vision.env" "$VISION_ENVF" LUNARWING_AUTH_TOKEN
     chown "$TENANT:$TENANT" "$VISION_ENVF" 2>/dev/null || true
-    note "vision.env carried config injected"
+    note "vision.env carried config injected (target-generated auth retained)"
   fi
   chown "$TENANT:$TENANT" "$ENVF" "$BRIDGE_ENVF" 2>/dev/null || true
   # Verify the master key landed VERBATIM — without putting the value on argv
