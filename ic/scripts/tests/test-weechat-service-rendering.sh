@@ -284,11 +284,10 @@ else
   echo "  PASS: OpenRC does not read tenant-controlled WeeChat env content as root"
 fi
 
-if grep -qF 'command_user="${weechat_user}:${weechat_group}"' "$rc_file" \
-  && grep -qF -- '--user "${weechat_user}"' "$rc_file"; then
-  echo "  PASS: OpenRC retains tenant privilege-drop configuration"
+if grep -qF 'command_user="${weechat_user}:${weechat_group}"' "$rc_file"; then
+  echo "  PASS: OpenRC retains tenant privilege-drop configuration (command_user)"
 else
-  echo "  FAIL: OpenRC missing tenant privilege-drop configuration"
+  echo "  FAIL: OpenRC missing command_user privilege-drop"
   failures=$((failures + 1))
 fi
 
@@ -312,14 +311,25 @@ else
   failures=$((failures + 1))
 fi
 
-# stop() runs the helper under the tenant UID with argv boundaries preserved.
-if grep -qF 'start-stop-daemon --start --user "${weechat_user}"' "$rc_file" \
+# stop() drops to the tenant UID via --chuid (not --user, which only filters by
+# owner and would leave the helper running as root, unable to reach the
+# uid-scoped tmux socket). argv boundaries preserved via -- separator.
+if grep -qF 'start-stop-daemon --start' "$rc_file" \
+  && grep -qF -- '--chuid "${weechat_user}:${weechat_group}"' "$rc_file" \
   && grep -qF -- '--exec "${weechat_stop_helper}" --' "$rc_file" \
   && grep -qF 'unset RC_SVCNAME' "$rc_file"; then
-  echo "  PASS: OpenRC stop() invokes helper under tenant UID"
+  echo "  PASS: OpenRC stop() drops to tenant UID via --chuid"
 else
-  echo "  FAIL: OpenRC stop() does not invoke helper under tenant UID"
+  echo "  FAIL: OpenRC stop() does not properly drop to tenant UID (--chuid missing)"
   failures=$((failures + 1))
+fi
+
+# stop() must NOT use --user alone (filter-only, no privilege drop)
+if grep -Eq 'start-stop-daemon[[:space:]]+--start[[:space:]]+--user' "$rc_file"; then
+  echo "  FAIL: OpenRC stop() uses --user (filter-only, does not drop UID)"
+  failures=$((failures + 1))
+else
+  echo "  PASS: OpenRC stop() does not use filter-only --user"
 fi
 
 if grep -qF 'eend "${stop_rc}"' "$rc_file" \

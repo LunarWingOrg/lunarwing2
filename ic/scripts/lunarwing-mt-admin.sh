@@ -5444,13 +5444,15 @@ start() {
 stop() {
     ebegin "Stopping WeeChat ($name)"
     # Graceful: /upgrade -quit via FIFO saves buffers before exit; falls back
-    # to tmux kill-session if the FIFO is unavailable or times out. Run under
-    # the tenant UID because tmux sockets are UID-scoped.
+    # to tmux kill-session if the FIFO is unavailable or times out. Must run
+    # under the tenant UID because tmux sockets are UID-scoped. --chuid drops
+    # privileges before exec; --user only filters by owner and would leave the
+    # helper running as root, unable to reach the tenant's tmux socket.
     if [ -x "\${weechat_stop_helper}" ]; then
         (
-            # Avoid registering this one-shot helper as a service daemon.
             unset RC_SVCNAME
-            start-stop-daemon --start --user "\${weechat_user}" \\
+            start-stop-daemon --start \\
+                --chuid "\${weechat_user}:\${weechat_group}" \\
                 --exec "\${weechat_stop_helper}" -- \\
                 --weechat-home "\${weechat_home}" \\
                 --tmux-socket "weechat-${name}" \\
@@ -5461,7 +5463,8 @@ stop() {
     else
         (
             unset RC_SVCNAME
-            start-stop-daemon --start --user "\${weechat_user}" \\
+            start-stop-daemon --start \\
+                --chuid "\${weechat_user}:\${weechat_group}" \\
                 --exec "\${weechat_command}" -- \\
                 -L "weechat-${name}" kill-session -t weechat
         ) >/dev/null 2>&1
