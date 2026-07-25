@@ -111,7 +111,7 @@ if ! $APPLY; then
   say "        1. back up state/channels + env to $HOME_DIR/backups/"
   say "        2. git pull -> staging   (HARD-STOPS if the repo is dirty; use --skip-pull"
   say "           after you reconcile your hand-edits)"
-  say "        3. build-tenant --with-wasm   (OVERWRITES installed capabilities.json —"
+  say "        3. build-tenant --with-wasm --require-wasm   (OVERWRITES installed capabilities.json —"
   say "           resets the config block; the env tier then injects the ports)"
   say "        4. patch-env  (adds WS_ADAPTER_URL=http://127.0.0.1:$adapter_port)"
   say "        5. pre-flight GATE, type-to-confirm, restart-tenant, verify"
@@ -157,8 +157,8 @@ grep -q 'pub env: Option' "$SCHEMA_FILE" 2>/dev/null \
   || die "tenant repo missing the fix ($SCHEMA_FILE). Get $HOME_DIR onto staging, then re-run."
 say "  ok"
 
-banner "4/7  build-tenant --with-wasm  (this OVERWRITES the installed capabilities.json)"
-"$MT" build-tenant "$TENANT" --with-wasm
+banner "4/7  build-tenant --with-wasm --require-wasm  (this OVERWRITES the installed capabilities.json)"
+"$MT" build-tenant "$TENANT" --with-wasm --require-wasm
 
 banner "5/7  patch-env  (adds WS_ADAPTER_URL=http://127.0.0.1:$adapter_port)"
 "$MT" patch-env "$TENANT"

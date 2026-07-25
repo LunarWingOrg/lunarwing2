@@ -501,6 +501,8 @@ impl Agent {
                 "Skills:\n",
                 "  /skills             List installed skills\n",
                 "  /skills search <q>  Search ClawHub registry\n",
+                "  /cavepony [mode]    Use Cavepony for this turn\n",
+                "  /normal             Bypass Cavepony for this turn\n",
                 "\n",
                 "Agent:\n",
                 "  /heartbeat        Run heartbeat check\n",

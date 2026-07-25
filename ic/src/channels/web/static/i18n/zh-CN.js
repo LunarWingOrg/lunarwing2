@@ -13,6 +13,17 @@ I18n.register('zh-CN', {
   
   // 聊天
   'chat.inputPlaceholder': '输入消息或 / 以使用命令...',
+  'chat.caveponyMode': 'Cavepony 回复模式',
+  'chat.caveponyOff': 'Cavepony：关闭',
+  'chat.caveponyLite': 'Cavepony：精简',
+  'chat.caveponyFull': 'Cavepony：完整',
+  'chat.caveponyUltra': 'Cavepony：极简',
+  'chat.caveponyPony': 'Cavepony：小马',
+  'chat.caveponyCanterlot': 'Cavepony：坎特洛特',
+  'chat.caveponySaved': 'Cavepony 偏好已保存',
+  'chat.caveponySaveFailed': '无法保存 Cavepony 偏好：{message}',
+  'chat.caveponySaving': '正在保存 Cavepony 偏好...',
+  'chat.caveponyUnavailable': '当前技能设置下 Cavepony 不可用',
   
   // 重启弹窗
   'restart.title': '重启 LunarWing 实例',
@@ -317,6 +328,8 @@ I18n.register('zh-CN', {
   'cmd.version.desc': '显示版本信息',
   'cmd.tools.desc': '列出可用工具',
   'cmd.skills.desc': '列出已安装的 AI 技能',
+  'cmd.cavepony.desc': '本轮使用 Cavepony',
+  'cmd.normal.desc': '本轮暂时停用 Cavepony',
   'cmd.model.desc': '显示或切换 LLM 模型',
   'cmd.threadNew.desc': '创建新对话线程',
   

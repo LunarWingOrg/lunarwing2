@@ -374,7 +374,9 @@ impl Agent {
             ..message.clone()
         };
 
-        if let Some(intent) = self.router.route_command(&temp_message) {
+        let is_cavepony_directive =
+            crate::skills::cavepony::CaveponyDirective::parse(content).is_some();
+        if !is_cavepony_directive && let Some(intent) = self.router.route_command(&temp_message) {
             // Explicit command like /status, /job, /list - handle directly
             return self.handle_job_or_command(intent, message).await;
         }

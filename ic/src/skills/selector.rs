@@ -43,6 +43,23 @@ pub fn prefilter_skills<'a>(
     max_candidates: usize,
     max_context_tokens: usize,
 ) -> Vec<&'a LoadedSkill> {
+    prefilter_skills_excluding(
+        message,
+        available_skills,
+        max_candidates,
+        max_context_tokens,
+        None,
+    )
+}
+
+/// Select candidate skills while excluding one reserved skill from scoring.
+pub(crate) fn prefilter_skills_excluding<'a>(
+    message: &str,
+    available_skills: &'a [LoadedSkill],
+    max_candidates: usize,
+    max_context_tokens: usize,
+    excluded_name: Option<&str>,
+) -> Vec<&'a LoadedSkill> {
     if available_skills.is_empty() || message.is_empty() {
         return vec![];
     }
@@ -52,6 +69,9 @@ pub fn prefilter_skills<'a>(
     let mut scored: Vec<ScoredSkill<'a>> = available_skills
         .iter()
         .filter_map(|skill| {
+            if excluded_name.is_some_and(|name| skill.name() == name) {
+                return None;
+            }
             let score = score_skill(skill, &message_lower, message);
             if score > 0 {
                 Some(ScoredSkill { skill, score })
@@ -72,22 +92,7 @@ pub fn prefilter_skills<'a>(
         if result.len() >= max_candidates {
             break;
         }
-        let declared_tokens = entry.skill.manifest.activation.max_context_tokens;
-        // Rough token estimate: ~0.25 tokens per byte (~4 bytes per token for English prose)
-        let approx_tokens = (entry.skill.prompt_content.len() as f64 * 0.25) as usize;
-        let raw_cost = if approx_tokens > declared_tokens * 2 {
-            tracing::warn!(
-                "Skill '{}' declares max_context_tokens={} but prompt is ~{} tokens; using actual estimate",
-                entry.skill.name(),
-                declared_tokens,
-                approx_tokens,
-            );
-            approx_tokens
-        } else {
-            declared_tokens
-        };
-        // Enforce a minimum token cost so max_context_tokens=0 can't bypass budgeting
-        let token_cost = raw_cost.max(1);
+        let token_cost = skill_context_token_cost(entry.skill);
         if token_cost <= budget_remaining {
             budget_remaining -= token_cost;
             result.push(entry.skill);
@@ -95,6 +100,26 @@ pub fn prefilter_skills<'a>(
     }
 
     result
+}
+
+pub(crate) fn skill_context_token_cost(skill: &LoadedSkill) -> usize {
+    let declared_tokens = skill.manifest.activation.max_context_tokens;
+    // Rough token estimate: ~0.25 tokens per byte (~4 bytes per token for English prose)
+    let approx_tokens = (skill.prompt_content.len() as f64 * 0.25) as usize;
+    let raw_cost = if approx_tokens > declared_tokens * 2 {
+        tracing::warn!(
+            "Skill '{}' declares max_context_tokens={} but prompt is ~{} tokens; using actual estimate",
+            skill.name(),
+            declared_tokens,
+            approx_tokens,
+        );
+        approx_tokens
+    } else {
+        declared_tokens
+    };
+
+    // Enforce a minimum token cost so max_context_tokens=0 can't bypass budgeting.
+    raw_cost.max(1)
 }
 
 /// Score a skill against a user message.

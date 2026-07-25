@@ -99,6 +99,10 @@ let stagedImages = [];
 let authFlowPending = false;
 let _ghostSuggestion = '';
 let currentSettingsSubtab = 'inference';
+let caveponyMode = '';
+let caveponyAvailable = false;
+let caveponyPreferenceSaving = false;
+const CAVEPONY_MODES = { lite: true, full: true, ultra: true, pony: true, canterlot: true };
 
 // --- Frame-coalesced rendering state ---
 let _streamBuffer = '';
@@ -135,6 +139,8 @@ const SLASH_COMMANDS = [
   { cmd: '/version',    desc: 'Show version info' },
   { cmd: '/tools',      desc: 'List available tools' },
   { cmd: '/skills',     desc: 'List installed skills' },
+  { cmd: '/cavepony',   desc: 'Use Cavepony for this turn' },
+  { cmd: '/normal',     desc: 'Bypass Cavepony for this turn' },
   { cmd: '/model',      desc: 'Show or switch the LLM model' },
   { cmd: '/thread new', desc: 'Create a new conversation thread' },
 ];
@@ -199,6 +205,7 @@ function authenticate() {
       loadThreads();
       loadMemoryTree();
       loadJobs();
+      loadCaveponyMode();
       // Apply URL log_level param if present, otherwise just sync the dropdown
       if (urlLogLevel) {
         setServerLogLevel(urlLogLevel);
@@ -268,6 +275,111 @@ function apiFetch(path, options) {
     if (res.status === 204) return null;
     return res.json();
   });
+}
+
+function normalizeCaveponyMode(mode) {
+  return typeof mode === 'string' && CAVEPONY_MODES[mode] ? mode : '';
+}
+
+function applyCaveponyMode(mode) {
+  caveponyMode = normalizeCaveponyMode(mode);
+  const select = document.getElementById('cavepony-mode-select');
+  if (!select) return;
+  select.value = caveponyMode;
+  select.classList.toggle('active', caveponyMode !== '');
+}
+
+function applyCaveponyAvailability(available) {
+  caveponyAvailable = available;
+  const select = document.getElementById('cavepony-mode-select');
+  const status = document.getElementById('cavepony-mode-status');
+  if (!select) return;
+  select.disabled = !available || caveponyPreferenceSaving;
+  select.classList.toggle('unavailable', !available);
+  select.title = available ? '' : I18n.t('chat.caveponyUnavailable');
+  if (status) {
+    status.textContent = caveponyPreferenceSaving
+      ? I18n.t('chat.caveponySaving')
+      : available ? '' : I18n.t('chat.caveponyUnavailable');
+    status.hidden = available && !caveponyPreferenceSaving;
+  }
+}
+
+function refreshCaveponyAvailabilityText() {
+  applyCaveponyAvailability(caveponyAvailable);
+}
+
+function loadCaveponyMode() {
+  const select = document.getElementById('cavepony-mode-select');
+  if (!select) return;
+  select.disabled = true;
+  const settingRequest = apiFetch('/api/settings/' + encodeURIComponent('skills.cavepony_mode'))
+    .catch((err) => {
+      if (err.status === 404) return null;
+      throw err;
+    });
+  const availabilityRequest = Promise.all([
+    apiFetch('/api/gateway/status'),
+    apiFetch('/api/skills'),
+  ]).then((results) => {
+    const status = results[0] || {};
+    const skills = results[1] && results[1].skills ? results[1].skills : [];
+    const cavepony = skills.find((skill) => skill.name === 'cavepony' && skill.bundled === true);
+    return Boolean(
+      cavepony
+      && status.skills_enabled
+      && status.skills_max_active > 0
+      && status.skills_max_context_tokens >= cavepony.max_context_tokens
+    );
+  }).catch((err) => {
+    console.warn('Could not determine Cavepony availability:', err);
+    return false;
+  });
+  Promise.all([settingRequest, availabilityRequest])
+    .then((results) => {
+      const setting = results[0];
+      applyCaveponyMode(setting && setting.value);
+      applyCaveponyAvailability(results[1]);
+    })
+    .catch((err) => {
+      console.warn('Could not load Cavepony preference:', err);
+      applyCaveponyMode('');
+      applyCaveponyAvailability(false);
+    });
+}
+
+function saveCaveponyMode(requestedMode) {
+  if (!caveponyAvailable || caveponyPreferenceSaving) return;
+  const select = document.getElementById('cavepony-mode-select');
+  const sendBtn = document.getElementById('send-btn');
+  const previousMode = caveponyMode;
+  const nextMode = normalizeCaveponyMode(requestedMode);
+  applyCaveponyMode(nextMode);
+  caveponyPreferenceSaving = true;
+  select.disabled = true;
+  if (sendBtn) sendBtn.disabled = true;
+  const status = document.getElementById('cavepony-mode-status');
+  if (status) {
+    status.textContent = I18n.t('chat.caveponySaving');
+    status.hidden = false;
+  }
+
+  const options = nextMode
+    ? { method: 'PUT', body: { value: nextMode } }
+    : { method: 'DELETE' };
+  apiFetch('/api/settings/' + encodeURIComponent('skills.cavepony_mode'), options)
+    .then(() => showToast(I18n.t('chat.caveponySaved'), 'success'))
+    .catch((err) => {
+      applyCaveponyMode(previousMode);
+      showToast(I18n.t('chat.caveponySaveFailed', { message: err.message }), 'error');
+    })
+    .finally(() => {
+      caveponyPreferenceSaving = false;
+      applyCaveponyAvailability(caveponyAvailable);
+      if (sendBtn && !currentThreadIsReadOnly && !authFlowPending && !_sendCooldown) {
+        sendBtn.disabled = false;
+      }
+    });
 }
 
 // --- Restart Feature ---
@@ -681,6 +793,10 @@ function clearSuggestionChips() {
 // --- Chat ---
 
 function sendMessage() {
+  if (caveponyPreferenceSaving) {
+    showToast(I18n.t('chat.caveponySaving'), 'info');
+    return;
+  }
   clearSuggestionChips();
   removeWelcomeCard();
   const input = document.getElementById('chat-input');
@@ -745,7 +861,7 @@ function sendMessage() {
 }
 
 function enableChatInput() {
-  if (currentThreadIsReadOnly || authFlowPending) return;
+  if (currentThreadIsReadOnly || authFlowPending || caveponyPreferenceSaving) return;
   const input = document.getElementById('chat-input');
   const btn = document.getElementById('send-btn');
   if (input) {
@@ -6254,6 +6370,7 @@ document.getElementById('thread-new-btn').addEventListener('click', () => create
 document.getElementById('thread-toggle-btn').addEventListener('click', () => toggleThreadSidebar());
 document.getElementById('assistant-thread').addEventListener('click', () => switchToAssistant());
 document.getElementById('send-btn').addEventListener('click', () => sendMessage());
+document.getElementById('cavepony-mode-select').addEventListener('change', (e) => saveCaveponyMode(e.target.value));
 document.getElementById('memory-edit-btn').addEventListener('click', () => startMemoryEdit());
 document.getElementById('memory-save-btn').addEventListener('click', () => saveMemoryEdit());
 document.getElementById('memory-cancel-btn').addEventListener('click', () => cancelMemoryEdit());

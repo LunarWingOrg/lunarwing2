@@ -763,6 +763,10 @@ fn token_boundaries_match(text: &str, start: usize, end: usize, token: &str) -> 
 }
 
 fn is_word_character(character: char) -> bool {
+    if character.is_ascii() {
+        return character.is_ascii_alphanumeric() || character == '_';
+    }
+
     static WORD: OnceLock<regex_syntax::hir::ClassUnicode> = OnceLock::new();
     let word = WORD.get_or_init(|| {
         let hir = regex_syntax::Parser::new()

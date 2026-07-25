@@ -307,6 +307,7 @@ Commands:
 
   build-tenant <name>             Build binaries for one tenant (OOM-safe flock)
     --with-wasm                    Also build WASM extensions
+    --require-wasm                 Fail instead of preserving stale WASM (requires --with-wasm)
     --with-nanocode                Also build the nanocode worker Docker image
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
@@ -1799,6 +1800,10 @@ build_tenant() {
   local require_wasm="${7:-false}"
   local repo
   repo="$(tenant_repo "$name")"
+
+  if [[ "$require_wasm" == "true" && "$with_wasm" != "true" ]]; then
+    die "--require-wasm requires --with-wasm"
+  fi
 
   [[ -d "$repo" ]] || die "repo not found at $repo; run add-tenant first"
 
@@ -7182,10 +7187,11 @@ main() {
 
     build-tenant)
       require_root
-      local name="" with_wasm="false" with_nanocode="false" with_pebble="false" with_opencode="false" with_toolchains="false"
+      local name="" with_wasm="false" require_wasm="false" with_nanocode="false" with_pebble="false" with_opencode="false" with_toolchains="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --with-wasm)       with_wasm="true"; shift ;;
+          --require-wasm)    require_wasm="true"; shift ;;
           --with-nanocode)   with_nanocode="true"; shift ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
@@ -7198,8 +7204,9 @@ main() {
             ;;
         esac
       done
-      [[ -n "$name" ]] || die "usage: build-tenant <name> [--with-wasm] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-toolchains]"
-      build_tenant "$(sanitize_name "$name")" "$with_wasm" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_toolchains"
+      [[ -n "$name" ]] || die "usage: build-tenant <name> [--with-wasm] [--require-wasm] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-toolchains]"
+      [[ "$require_wasm" != "true" || "$with_wasm" == "true" ]] || die "--require-wasm requires --with-wasm"
+      build_tenant "$(sanitize_name "$name")" "$with_wasm" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_toolchains" "$require_wasm"
       ;;
 
     build-all)

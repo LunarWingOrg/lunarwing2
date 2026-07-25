@@ -18,6 +18,9 @@ shell-harnesses:
 cavepony-wasm:
   extends: .rust-job
   stage: test
+  variables:
+    CAVEPONY_EXPECTED_VERSION: "0.3.2"
+    CAVEPONY_WASM_REQUIRED: "1"
   needs:
     - rust-check-default
   timeout: 30m

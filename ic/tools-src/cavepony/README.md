@@ -1,6 +1,6 @@
 # Cavepony WASM Tool
 
-Rust/WASM port of Cavepony v0.3.0 for LunarWing. Tool release 0.3.1 performs
+Rust/WASM port of Cavepony v0.3.0 for LunarWing. Tool release 0.3.2 performs
 local text transforms with no host capabilities.
 
 ## Actions
@@ -20,6 +20,9 @@ that can further expand words introduced by an earlier rule.
 Release 0.3.1 uses bounded literal matching instead of compiling dictionary
 regexes inside each fresh WASM instance, keeping short requests in every action
 within the 10-million-fuel compatibility budget.
+
+Release 0.3.2 handles ASCII word boundaries without initializing or searching
+the Unicode word class, keeping Pony substitutions inside that same budget.
 
 Token counts use LunarWing's coarse four-bytes-per-token estimate. Actual token
 counts depend on model and tokenizer; Unicode symbols can cost more than one

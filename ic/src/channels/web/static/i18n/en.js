@@ -13,6 +13,17 @@ I18n.register('en', {
   
   // Chat
   'chat.inputPlaceholder': 'Message or / for commands...',
+  'chat.caveponyMode': 'Cavepony response mode',
+  'chat.caveponyOff': 'Cavepony: Off',
+  'chat.caveponyLite': 'Cavepony: Lite',
+  'chat.caveponyFull': 'Cavepony: Full',
+  'chat.caveponyUltra': 'Cavepony: Ultra',
+  'chat.caveponyPony': 'Cavepony: Pony',
+  'chat.caveponyCanterlot': 'Cavepony: Canterlot',
+  'chat.caveponySaved': 'Cavepony preference saved',
+  'chat.caveponySaveFailed': 'Could not save Cavepony preference: {message}',
+  'chat.caveponySaving': 'Saving Cavepony preference...',
+  'chat.caveponyUnavailable': 'Cavepony is unavailable under current skill settings',
   
   // Restart Modal
   'restart.title': 'Restart LunarWing Instance',
@@ -317,6 +328,8 @@ I18n.register('en', {
   'cmd.version.desc': 'Show version info',
   'cmd.tools.desc': 'List available tools',
   'cmd.skills.desc': 'List installed skills',
+  'cmd.cavepony.desc': 'Use Cavepony for this turn',
+  'cmd.normal.desc': 'Bypass Cavepony for this turn',
   'cmd.model.desc': 'Show or switch LLM model',
   'cmd.threadNew.desc': 'Create new conversation thread',
   

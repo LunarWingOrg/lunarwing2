@@ -30,6 +30,23 @@ rust-check-all-features:
   script:
     - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --all-features
 
+wasm-channel-test-artifacts:
+  extends: .rust-job
+  stage: check
+  needs:
+    - cargo-metadata
+  timeout: 30m
+  script:
+    - rustup target add --toolchain 1.96.1 wasm32-wasip2
+    - bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --release --target wasm32-wasip2 --manifest-path channels-src/xmpp/Cargo.toml
+    - cp ic/channels-src/xmpp/target/wasm32-wasip2/release/xmpp_channel.wasm ic/channels-src/xmpp/xmpp.wasm
+    - bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --release --target wasm32-wasip2 --manifest-path ../lunarwing_weechat_wss/weechat_relay/Cargo.toml
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - ic/channels-src/xmpp/xmpp.wasm
+      - lunarwing_weechat_wss/weechat_relay/target/wasm32-wasip2/release/weechat_relay_channel.wasm
+
 # Owner: core maintainers. Block after one clean runner baseline proves zero warnings.
 rust-clippy-all:
   extends:
@@ -46,7 +63,10 @@ rust-test-lib:
   extends: .rust-job
   stage: test
   needs:
-    - rust-check-default
+    - job: rust-check-default
+      artifacts: false
+    - job: wasm-channel-test-artifacts
+      artifacts: true
   timeout: 60m
   variables:
     LUNARWING_CLOUD_AUTH_URL: "http://127.0.0.1"
@@ -58,11 +78,15 @@ rust-test-libsql:
   extends: .rust-job
   stage: test
   needs:
-    - rust-check-libsql
+    - job: rust-check-libsql
+      artifacts: false
+    - job: wasm-channel-test-artifacts
+      artifacts: true
   timeout: 60m
   variables:
     LUNARWING_CLOUD_AUTH_URL: "http://127.0.0.1"
     LUNARWING_CLOUD_BASE_URL: "http://127.0.0.1"
+    CARGO_PROFILE_TEST_DEBUG: "0"
   script:
-    # libSQL's full test link exceeds the 16 GB runner limit with six concurrent rustc jobs.
-    - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --no-default-features --features libsql --no-fail-fast -- --test-threads=1
+    # libSQL's full test link approaches the 16 GB runner limit; serialize rustc and omit debug info.
+    - bash .gitlab/scripts/cargo-ci.sh test -j1 --locked --no-default-features --features libsql --no-fail-fast -- --test-threads=1
