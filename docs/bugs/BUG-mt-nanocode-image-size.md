@@ -1,6 +1,6 @@
 # Multi-tenant Nanocode image distribution is too large
 
-> **Status: STILL-OPEN (verified against `51ae5a8` on 2026-07-20).** The worker
+> **Status: STILL-OPEN (verified against current source on 2026-07-25).** The worker
 > image build and healthcheck issues from the 1.1.4 systemd pass are fixed, but
 > the Nanocode image remains large and is copied into each rootless tenant store.
 
@@ -14,11 +14,11 @@ capacity issue, not a correctness failure in the worker protocol.
 ## Current evidence
 
 - `_ensure_tenant_image` still distributes images with `save | load` and warns
-  that large images can take minutes (`ic/scripts/lunarwing-mt-admin.sh:606-649`).
+  that large images can take minutes (`ic/scripts/lunarwing-mt-admin.sh:625-668`).
 - `start_tenant_nanocode` calls that helper before starting the worker
-  (`ic/scripts/lunarwing-mt-admin.sh:3709-3727`).
+  (`ic/scripts/lunarwing-mt-admin.sh:3764-3783`).
 - The image Dockerfile installs a broad runtime/toolchain package set
-  (`lunarcode4lunarwing/Dockerfile:45-120`), and no slim/shared-image or
+  (`lunarcode4lunarwing/Dockerfile:70-116`), and no slim/shared-image or
   additional-image-store mechanism is implemented in this tree.
 
 The exact 6 GB measurement is host/image-version dependent and is retained as
@@ -37,4 +37,4 @@ historical context, not duplicate open bugs.
 
 Status is based on current script/Dockerfile inspection and the retained
 systemd validation record. No image build, container run, or Cargo command was
-performed in this pass.
+performed in this pass. Re-verified on 2026-07-25 with updated line references.

@@ -1,6 +1,6 @@
 # Multi-tenant external-worker configuration
 
-> **Status: PARTIALLY-FIXED (verified against `51ae5a8` on 2026-07-20).**
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-07-25).**
 > Tenant provisioning now generates Nanocode, Pebble, and OpenCode endpoint
 > blocks. In-memory settings merges preserve their bearer tokens, but a later
 > full TOML rewrite (for example `/model`) still omits `auth_token` and can make
@@ -18,10 +18,10 @@ Fresh tenants previously lacked `[[sandbox.external_workers]]`, so
 `config.toml`. The current generator is idempotent and writes the per-tenant WSS
 URL, timeout, and gateway token:
 
-- `ensure_external_worker_config` (`ic/scripts/lunarwing-mt-admin.sh:2841-2904`)
-- `add-tenant` calls it for Nanocode, Pebble, and OpenCode (`:6272-6274`)
-- retrofit calls are present in `patch-env` (`:3314-3319,7393-7408`)
-- TOML shape is covered by `ic/src/config/sandbox.rs:451-512`
+- `ensure_external_worker_config` (`ic/scripts/lunarwing-mt-admin.sh:2896-2959`)
+- `add-tenant` calls it for Nanocode, Pebble, and OpenCode (`:6356-6358`)
+- retrofit calls are present in `patch-env` (`:3372-3374`)
+- TOML shape is covered by `ic/src/config/sandbox.rs:454-512`
 
 The generated shape remains:
 
@@ -39,8 +39,8 @@ that value as `AGENT_AUTH_TOKEN`.
 
 Worker selection is separate from config generation: `--with-*` flags persist
 selection and the start path gates workers on that selection
-(`lunarwing-mt-admin.sh:6246-6249,6569-6584`; parser/build paths at
-`:6992-7136`). An endpoint block alone does not build or start a worker.
+(`lunarwing-mt-admin.sh:6308,6332,7087-7089`; parser/build paths at
+`:7185-7202`). An endpoint block alone does not build or start a worker.
 
 ## 2. Auth-token loss on settings rewrites
 
@@ -78,4 +78,5 @@ closed until a round-trip test and runtime auth check exist.
 The provisioning status was verified by current shell call sites and in-tree
 config tests. The persistence status was derived from the current serde
 attributes, post-merge fixup, and save/load call path; no Cargo command, daemon
-restart, or worker connection was run.
+restart, or worker connection was run. Re-verified on 2026-07-25 with updated
+`lunarwing-mt-admin.sh` line references.

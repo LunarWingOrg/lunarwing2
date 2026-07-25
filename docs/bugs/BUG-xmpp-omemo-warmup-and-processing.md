@@ -1,6 +1,6 @@
 # XMPP OMEMO fallback spam and processing stall
 
-> **Status: UNVERIFIED (checked against `51ae5a8` on 2026-07-20).** The
+> **Status: UNVERIFIED (checked against current source on 2026-07-25).** The
 > historical fallback-spam symptom has not been reproduced against the current
 > bridge and no current source path proves that it is resolved. The separate
 > stuck `Processing`-thread failure has a current static fix and is recorded
