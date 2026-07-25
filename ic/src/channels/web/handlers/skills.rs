@@ -37,6 +37,8 @@ pub async fn skills_list_handler(
             version: s.manifest.version.clone(),
             trust: s.trust.to_string(),
             source: format!("{:?}", s.source),
+            bundled: matches!(&s.source, crate::skills::SkillSource::Bundled(_)),
+            max_context_tokens: s.manifest.activation.max_context_tokens,
             keywords: s.manifest.activation.keywords.clone(),
         })
         .collect();
@@ -107,6 +109,8 @@ pub async fn skills_search_handler(
                 version: s.manifest.version.clone(),
                 trust: s.trust.to_string(),
                 source: format!("{:?}", s.source),
+                bundled: matches!(&s.source, crate::skills::SkillSource::Bundled(_)),
+                max_context_tokens: s.manifest.activation.max_context_tokens,
                 keywords: s.manifest.activation.keywords.clone(),
             })
             .collect()

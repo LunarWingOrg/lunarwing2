@@ -38,6 +38,10 @@ function switchLanguage(lang) {
     
     // Update language menu active state
     updateLanguageMenu();
+
+    if (typeof refreshCaveponyAvailabilityText === 'function') {
+      refreshCaveponyAvailabilityText();
+    }
     
     // Close menu
     const menu = document.getElementById('language-menu');
@@ -71,4 +75,3 @@ document.addEventListener('click', (e) => {
     }
   }
 });
-

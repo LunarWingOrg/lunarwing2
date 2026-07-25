@@ -1033,6 +1033,8 @@ pub struct SkillInfo {
     pub version: String,
     pub trust: String,
     pub source: String,
+    pub bundled: bool,
+    pub max_context_tokens: usize,
     pub keywords: Vec<String>,
 }
 

@@ -128,7 +128,7 @@ Key characteristics:
 - **Compact output metadata**: between code steps, only a summary is added to chat context (e.g. `"[code output] stdout (4532 chars): The results show..."`) to prevent context bloat
 - **Explicit termination**: `FINAL(answer)` or `FINAL_VAR(name)` for output
 - **Resource limits**: user CodeAct blocks default to a 30s timeout, 64MB memory,
-  and 1M allocations. The orchestrator VM has a separate 300s/128MB/5M budget.
+  and 1M allocations. The orchestrator VM has a separate 600s/128MB/5M budget.
   Monty execution is wrapped in `catch_unwind` for panic safety.
 
 ### Python Orchestrator

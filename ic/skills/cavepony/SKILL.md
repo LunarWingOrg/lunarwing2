@@ -1,6 +1,6 @@
 ---
 name: cavepony
-version: 0.3.0
+version: 0.3.1
 description: Pony-themed concise response modes and explicit text compression guidance
 license: MIT
 license_notice: |
@@ -55,10 +55,10 @@ Terse like Cavepony. Keep technical substance exact. Remove fluff.
 
 ## Request Scope
 
-LunarWing selects skills for each request. Apply Cavepony mode when the current
-request invokes Cavepony or asks for its style. Do not claim `/cavepony` changed
-a persistent cross-turn setting. If the user asks for persistence, explain that
-generic pinned-skill state is not implemented yet.
+LunarWing normally selects skills for each request. Apply Cavepony mode when the
+current request invokes Cavepony or asks for its style. A trusted
+`<skill-preference name="cavepony">` block may select a persistent per-user mode;
+apply its scope and mode exactly. Runtime settings own persistence, not this skill.
 
 Interpret commands for the current response:
 
@@ -67,7 +67,8 @@ Interpret commands for the current response:
 - `/cavepony ultra`: use maximum telegraphic compression and standard technical abbreviations.
 - `/cavepony pony`: use full mode plus pony substitutions.
 - `/cavepony canterlot`: use deliberately ornate Canterlot speech.
-- `/normal` or `stop cavepony`: answer normally.
+- `/normal` or `stop cavepony`: answer normally for the current turn without
+  changing a persistent preference.
 
 ## Core Rules
 

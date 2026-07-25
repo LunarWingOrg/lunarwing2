@@ -5,7 +5,7 @@
 #
 # Flow:
 #   baseline pre-flight -> backup(env + installed caps) -> git status check ->
-#   git pull (staging) -> verify fix in repo -> build-tenant --with-wasm ->
+#   git pull (staging) -> verify fix in repo -> build-tenant --with-wasm --require-wasm ->
 #   patch-env -> pre-flight GATE -> restart-tenant -> verify
 #
 # It backs up the env file and the installed weechat.capabilities.json first,
@@ -92,8 +92,8 @@ grep -q 'pub env: Option' "$SCHEMA_FILE" 2>/dev/null \
   || die "tenant repo is missing the fix ($SCHEMA_FILE). Update $HOME_DIR to staging, then re-run."
 say "  ok: capabilities_schema.rs has the env field"
 
-banner "5/7  build-tenant --with-wasm  (rebuilds binary + refreshes installed capabilities.json)"
-"$MT" build-tenant "$TENANT" --with-wasm
+banner "5/7  build-tenant --with-wasm --require-wasm  (rebuilds binary + refreshes installed capabilities.json)"
+"$MT" build-tenant "$TENANT" --with-wasm --require-wasm
 
 banner "6/7  patch-env  (adds WS_ADAPTER_URL=http://127.0.0.1:$adapter_port)"
 "$MT" patch-env "$TENANT"

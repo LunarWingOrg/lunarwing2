@@ -352,7 +352,7 @@ SearchConfig {
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `EMBEDDING_ENABLED` | `false` | Enable semantic embeddings |
-| `EMBEDDING_PROVIDER` | `openai` | Provider: `openai`, `openai_compatible`, `lunarwing_cloud`, or `ollama` |
+| `EMBEDDING_PROVIDER` | `lunarwing_cloud` | Provider: `openai`, `openai_compatible`, `lunarwing_cloud`, or `ollama` |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model name |
 | `EMBEDDING_DIMENSION` | Auto-inferred | Override embedding dimension |
 | `EMBEDDING_CACHE_SIZE` | `10000` | LRU cache capacity (min 1) |

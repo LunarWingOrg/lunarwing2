@@ -175,6 +175,16 @@
             <textarea id="chat-input" data-i18n="chat.inputPlaceholder" data-i18n-attr="placeholder" placeholder="Message or / for commands..." rows="1"></textarea>
             <div id="ghost-text" class="ghost-text"></div>
           </div>
+          <label class="sr-only" for="cavepony-mode-select" data-i18n="chat.caveponyMode">Cavepony response mode</label>
+          <select id="cavepony-mode-select" class="cavepony-mode-select" aria-describedby="cavepony-mode-status" disabled>
+            <option value="" data-i18n="chat.caveponyOff">Cavepony: Off</option>
+            <option value="lite" data-i18n="chat.caveponyLite">Cavepony: Lite</option>
+            <option value="full" data-i18n="chat.caveponyFull">Cavepony: Full</option>
+            <option value="ultra" data-i18n="chat.caveponyUltra">Cavepony: Ultra</option>
+            <option value="pony" data-i18n="chat.caveponyPony">Cavepony: Pony</option>
+            <option value="canterlot" data-i18n="chat.caveponyCanterlot">Cavepony: Canterlot</option>
+          </select>
+          <span id="cavepony-mode-status" class="cavepony-mode-status" role="status" aria-live="polite" hidden></span>
           <input type="file" id="image-file-input" accept="image/*" multiple style="display:none">
           <button id="attach-btn" class="attach-btn" data-i18n="chat.attachImages" data-i18n-attr="title" title="Attach images"
             aria-label="Attach images">&#x1F4CE;</button>

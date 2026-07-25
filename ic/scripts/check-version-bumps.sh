@@ -136,6 +136,22 @@ extract_json_version_base() {
     git show "$BASE_REF:$(repo_file_path "$file")" 2>/dev/null | jq -r '.version // empty' 2>/dev/null || true
 }
 
+find_registry_file() {
+    local registry_dir="$1"
+    local source_dir="$2"
+    local registry_file
+
+    for registry_file in "$registry_dir"/*.json; do
+        [[ -f "$registry_file" ]] || continue
+        if [[ "$(jq -r '.source.dir // empty' "$registry_file" 2>/dev/null)" == "$source_dir" ]]; then
+            printf '%s' "$registry_file"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # Return 0 if $1 (new) is strictly greater than $2 (old) via sort -V, or old is empty.
 version_was_bumped() {
     local new="$1"
@@ -234,12 +250,12 @@ if [[ -n "$TOOL_NAMES" ]]; then
 fi
 
 for tool in $TOOL_NAMES; do
-    REGISTRY_FILE="registry/tools/${tool}.json"
+    SOURCE_DIR="tools-src/${tool}"
     echo ""
-    echo "  --- tools-src/${tool}/ changed ---"
+    echo "  --- ${SOURCE_DIR}/ changed ---"
 
-    if [[ ! -f "$REGISTRY_FILE" ]]; then
-        echo "  ERROR: ${REGISTRY_FILE} is required for tools-src/${tool}/."
+    if ! REGISTRY_FILE=$(find_registry_file "registry/tools" "$SOURCE_DIR"); then
+        echo "  ERROR: registry/tools entry with source.dir '${SOURCE_DIR}' is required."
         ERRORS=$((ERRORS + 1))
         continue
     fi
@@ -250,7 +266,7 @@ for tool in $TOOL_NAMES; do
     echo "  Registry version: ${OLD_VER:-<none>} -> ${NEW_VER:-<missing>}"
 
     if ! version_was_bumped "${NEW_VER}" "${OLD_VER}"; then
-        echo "  ERROR: ${REGISTRY_FILE} version was not bumped (${OLD_VER} -> ${NEW_VER:-<missing>}). Bump the version when changing tools-src/${tool}/."
+        echo "  ERROR: ${REGISTRY_FILE} version was not bumped (${OLD_VER} -> ${NEW_VER:-<missing>}). Bump the version when changing ${SOURCE_DIR}/."
         ERRORS=$((ERRORS + 1))
     else
         echo "  OK: version bumped."
@@ -267,12 +283,12 @@ if [[ -n "$CHANNEL_NAMES" ]]; then
 fi
 
 for channel in $CHANNEL_NAMES; do
-    REGISTRY_FILE="registry/channels/${channel}.json"
+    SOURCE_DIR="channels-src/${channel}"
     echo ""
-    echo "  --- channels-src/${channel}/ changed ---"
+    echo "  --- ${SOURCE_DIR}/ changed ---"
 
-    if [[ ! -f "$REGISTRY_FILE" ]]; then
-        echo "  ERROR: ${REGISTRY_FILE} is required for channels-src/${channel}/."
+    if ! REGISTRY_FILE=$(find_registry_file "registry/channels" "$SOURCE_DIR"); then
+        echo "  ERROR: registry/channels entry with source.dir '${SOURCE_DIR}' is required."
         ERRORS=$((ERRORS + 1))
         continue
     fi
@@ -283,7 +299,7 @@ for channel in $CHANNEL_NAMES; do
     echo "  Registry version: ${OLD_VER:-<none>} -> ${NEW_VER:-<missing>}"
 
     if ! version_was_bumped "${NEW_VER}" "${OLD_VER}"; then
-        echo "  ERROR: ${REGISTRY_FILE} version was not bumped (${OLD_VER} -> ${NEW_VER:-<missing>}). Bump the version when changing channels-src/${channel}/."
+        echo "  ERROR: ${REGISTRY_FILE} version was not bumped (${OLD_VER} -> ${NEW_VER:-<missing>}). Bump the version when changing ${SOURCE_DIR}/."
         ERRORS=$((ERRORS + 1))
     else
         echo "  OK: version bumped."

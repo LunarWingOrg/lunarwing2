@@ -111,7 +111,7 @@ on_apply_exit() {
     say "    1) sudo $MT stop-tenant $TENANT"
     say "    2) sudo -u $TENANT git -c safe.directory=$HOME_DIR -C $HOME_DIR checkout ${cur_rev:-<rev>}"
     say "    3) docker start $PG_CONTAINER && docker exec -i $PG_CONTAINER pg_restore -U $PG_USER -d $PG_DB --clean --if-exists < \"${NEWEST_DUMP:-<dump>}\""
-    say "    4) sudo $MT build-tenant $TENANT --with-wasm && sudo $MT render-units $TENANT && sudo $MT start-tenant $TENANT"
+    say "    4) sudo $MT build-tenant $TENANT --with-wasm --require-wasm && sudo $MT render-units $TENANT && sudo $MT start-tenant $TENANT"
     say "  NEVER delete/recreate $PG_CONTAINER — data is in its writable layer (no named volume pre-1.1.4)."
   fi
   exit $rc
@@ -351,8 +351,8 @@ apply_core_steps() {
   [[ -d "$HOME_DIR/ic/migrations" ]] || die "ic/migrations missing from checkout — wrong ref? Aborting before build."
   say "  now at: $(sudo -u "$TENANT" git -c safe.directory="$HOME_DIR" -C "$HOME_DIR" describe --tags --always)"
 
-  banner "4/10  build-tenant --with-wasm"
-  "$MT" build-tenant "$TENANT" --with-wasm
+  banner "4/10  build-tenant --with-wasm --require-wasm"
+  "$MT" build-tenant "$TENANT" --with-wasm --require-wasm
 
   banner "5/10  install-wasm"
   "$MT" install-wasm "$TENANT"
@@ -432,7 +432,7 @@ apply_modern() {
          docker start $PG_CONTAINER
          docker exec -i $PG_CONTAINER pg_restore -U $PG_USER -d $PG_DB --clean --if-exists < "$NEWEST_DUMP"
     4) env/caps (only if diverged): cp -a $BACKUP_DIR/lunarwing.env.bak $ENV_FILE ; cp -a $BACKUP_DIR/weechat.capabilities.json.bak $CAPS_FILE
-    5) sudo $MT build-tenant $TENANT --with-wasm && sudo $MT render-units $TENANT && sudo $MT start-tenant $TENANT
+    5) sudo $MT build-tenant $TENANT --with-wasm --require-wasm && sudo $MT render-units $TENANT && sudo $MT start-tenant $TENANT
   NEVER delete/recreate $PG_CONTAINER — data is in its writable layer (no named volume pre-1.1.4).
 EOF
 }
@@ -473,7 +473,7 @@ print_rollback_legacy() {
          docker start $PG_CONTAINER
          docker exec -i $PG_CONTAINER pg_restore -U $PG_USER -d $PG_DB --clean --if-exists < "$NEWEST_DUMP"
     4) env/caps (only if diverged): cp -a $BACKUP_DIR/lunarwing.env.bak $ENV_FILE ; cp -a $BACKUP_DIR/weechat.capabilities.json.bak $CAPS_FILE
-    5) sudo $MT build-tenant $TENANT --with-wasm && sudo $MT render-units $TENANT && sudo $MT start-tenant $TENANT
+    5) sudo $MT build-tenant $TENANT --with-wasm --require-wasm && sudo $MT render-units $TENANT && sudo $MT start-tenant $TENANT
   NEVER delete/recreate $PG_CONTAINER — data is in its writable layer (no named volume pre-1.1.4).
 EOF
 }
