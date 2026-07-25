@@ -37,8 +37,8 @@ pub struct EffectBridgeAdapter {
     tools: Arc<ToolRegistry>,
     safety: Arc<SafetyLayer>,
     hooks: Arc<HookRegistry>,
-    /// Tools the user has approved with "always" (persists within session).
-    auto_approved: RwLock<HashSet<String>>,
+    /// Per-user tools approved with "always" for this process lifetime.
+    auto_approved: RwLock<HashSet<(String, String)>>,
     /// DB-backed settings store for persisted `tool_permissions.*` checks.
     settings_store: RwLock<Option<Arc<dyn SettingsStore + Send + Sync>>>,
     /// Per-step tool call counter (reset externally between steps).
@@ -70,17 +70,20 @@ impl EffectBridgeAdapter {
         }
     }
 
-    /// Mark a tool as auto-approved (user said "always").
-    pub async fn auto_approve_tool(&self, tool_name: &str) {
+    /// Mark a tool as auto-approved for one user (user said "always").
+    pub async fn auto_approve_tool(&self, user_id: &str, tool_name: &str) {
         self.auto_approved
             .write()
             .await
-            .insert(tool_name.to_string());
+            .insert((user_id.to_string(), tool_name.to_string()));
     }
 
     /// Revoke auto-approve for a tool (rollback on resume failure).
-    pub async fn revoke_auto_approve(&self, tool_name: &str) {
-        self.auto_approved.write().await.remove(tool_name);
+    pub async fn revoke_auto_approve(&self, user_id: &str, tool_name: &str) {
+        self.auto_approved
+            .write()
+            .await
+            .remove(&(user_id.to_string(), tool_name.to_string()));
     }
 
     /// Set the settings store used for persisted `tool_permissions.*` checks.
@@ -172,34 +175,46 @@ impl EffectBridgeAdapter {
         }
     }
 
-    async fn is_tool_auto_approved(&self, user_id: &str, lookup_name: &str) -> bool {
-        if self.auto_approved.read().await.contains(lookup_name) {
-            return true;
-        }
-
-        let Some(store) = self.settings_store().await else {
-            return false;
-        };
-
-        for key in permission_setting_keys(lookup_name) {
-            match store.get_setting(user_id, &key).await {
-                Ok(Some(value)) => {
-                    return permission_state_from_value(&value)
-                        .is_some_and(|state| state == PermissionState::AlwaysAllow);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::debug!(
-                        user_id,
-                        tool = lookup_name,
-                        %error,
-                        "engine v2: failed to read persisted tool permission"
-                    );
+    async fn tool_permission_state(
+        &self,
+        user_id: &str,
+        lookup_name: &str,
+    ) -> Option<PermissionState> {
+        let mut persisted = None;
+        if let Some(store) = self.settings_store().await {
+            for key in permission_setting_keys(lookup_name) {
+                match store.get_setting(user_id, &key).await {
+                    Ok(Some(value)) => {
+                        persisted = permission_state_from_value(&value);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::debug!(
+                            user_id,
+                            tool = lookup_name,
+                            %error,
+                            "engine v2: failed to read persisted tool permission"
+                        );
+                    }
                 }
             }
         }
 
-        false
+        // Persisted settings are the source of truth and can revoke an earlier
+        // process-lifetime approval by changing it to AskEachTime or Disabled.
+        if persisted.is_some() {
+            return persisted;
+        }
+        if self
+            .auto_approved
+            .read()
+            .await
+            .contains(&(user_id.to_string(), lookup_name.to_string()))
+        {
+            return Some(PermissionState::AlwaysAllow);
+        }
+        persisted
     }
 
     fn coerce_to_u64(v: &serde_json::Value) -> Option<u64> {
@@ -530,6 +545,18 @@ impl EffectBridgeAdapter {
             .get_resolved_for_user(action_name, &context.user_id)
             .await
         {
+            let permission_state = self
+                .tool_permission_state(&context.user_id, lookup_name)
+                .await;
+            if permission_state == Some(PermissionState::Disabled) {
+                return Err(EngineError::LeaseDenied {
+                    reason: format!(
+                        "Tool '{}' is disabled for this user in tool permissions.",
+                        action_name
+                    ),
+                });
+            }
+
             // ── Human delay / supervision mode ──
             // When supervised_mode is enabled on the thread, gate EVERY action
             // through human approval, regardless of the tool's tier.
@@ -570,9 +597,7 @@ impl EffectBridgeAdapter {
                     }
                 }
                 ApprovalRequirement::UnlessAutoApproved => {
-                    let is_approved = self
-                        .is_tool_auto_approved(&context.user_id, lookup_name)
-                        .await;
+                    let is_approved = permission_state == Some(PermissionState::AlwaysAllow);
                     if !is_approved && !approval_already_granted {
                         // Credential presence alone does NOT bypass approval.
                         // Credentials indicate the call *can* be authenticated,
@@ -1016,9 +1041,7 @@ fn extract_credential_name(error_msg: &str) -> Option<String> {
 fn is_v1_only_tool(name: &str) -> bool {
     matches!(
         name,
-        "create_job"
-            | "create-job"
-            | "cancel_job"
+        "cancel_job"
             | "cancel-job"
             | "build_software"
             | "build-software"
@@ -1172,9 +1195,10 @@ mod tests {
     async fn auto_approve_tracks_tools() {
         let adapter = make_adapter();
 
-        assert!(!adapter.auto_approved.read().await.contains("shell"));
-        adapter.auto_approve_tool("shell").await;
-        assert!(adapter.auto_approved.read().await.contains("shell"));
+        let key = ("alice".to_string(), "shell".to_string());
+        assert!(!adapter.auto_approved.read().await.contains(&key));
+        adapter.auto_approve_tool("alice", "shell").await;
+        assert!(adapter.auto_approved.read().await.contains(&key));
     }
 
     #[tokio::test]
@@ -1333,6 +1357,53 @@ FINAL(echoed + "|" + http_result["error"])"#,
             supervised_mode: false,
             supervised_timeout_secs: 300,
         }
+    }
+
+    #[tokio::test]
+    async fn session_auto_approval_is_user_scoped() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalTestTool)).await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        adapter.auto_approve_tool("alice", "approval_test").await;
+
+        let mut alice_ctx = exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_alice"));
+        alice_ctx.user_id = "alice".to_string();
+        let alice_result = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &alice_ctx,
+            )
+            .await;
+        assert!(matches!(
+            alice_result,
+            Ok(ActionResult {
+                is_error: false,
+                ..
+            })
+        ));
+
+        let mut bob_ctx = exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_bob"));
+        bob_ctx.user_id = "bob".to_string();
+        let bob_result = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &bob_ctx,
+            )
+            .await;
+        assert!(matches!(bob_result, Err(EngineError::GatePaused { .. })));
     }
 
     #[tokio::test]
@@ -1704,6 +1775,88 @@ FINAL(echoed + "|" + http_result["error"])"#,
         );
     }
 
+    #[tokio::test]
+    async fn persisted_disabled_permission_denies_execution() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalTestTool)).await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.approval_test",
+                &serde_json::json!("disabled"),
+            )
+            .await
+            .expect("persist setting");
+        adapter
+            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+
+        let result = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_disabled")),
+            )
+            .await;
+        assert!(matches!(result, Err(EngineError::LeaseDenied { .. })));
+    }
+
+    #[tokio::test]
+    async fn persisted_ask_each_time_revokes_session_auto_approval() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalTestTool)).await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        adapter
+            .auto_approve_tool("test_user", "approval_test")
+            .await;
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.approval_test",
+                &serde_json::json!("ask_each_time"),
+            )
+            .await
+            .expect("persist setting");
+        adapter
+            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+
+        let result = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &exec_ctx(
+                    lunarwing_engine::ThreadId::new(),
+                    Some("call_ask_each_time"),
+                ),
+            )
+            .await;
+        assert!(matches!(result, Err(EngineError::GatePaused { .. })));
+    }
+
     // ── extract_credential_name tests ──────────────────────────
 
     #[test]
@@ -1756,6 +1909,42 @@ FINAL(echoed + "|" + http_result["error"])"#,
         assert!(!is_v1_only_tool("mission_fire"));
         assert!(!is_v1_only_tool("http"));
         assert!(!is_v1_only_tool("web_search"));
+    }
+
+    #[test]
+    fn create_job_is_not_v1_only() {
+        assert!(!is_v1_only_tool("create_job"));
+        assert!(!is_v1_only_tool("create-job"));
+        assert!(is_v1_only_tool("cancel_job"));
+        assert!(is_v1_only_tool("cancel-job"));
+    }
+
+    #[tokio::test]
+    async fn engine_v2_exposes_create_job_action() {
+        use crate::context::ContextManager;
+        use crate::tools::builtin::{CancelJobTool, CreateJobTool};
+
+        let tools = Arc::new(ToolRegistry::new());
+        let manager = Arc::new(ContextManager::new(5));
+        tools
+            .register(Arc::new(CreateJobTool::new(Arc::clone(&manager))))
+            .await;
+        tools.register(Arc::new(CancelJobTool::new(manager))).await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&lunarwing_safety::SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+
+        let actions = EffectExecutor::available_actions(&adapter, &[])
+            .await
+            .expect("available actions");
+        let names: Vec<_> = actions.iter().map(|action| action.name.as_str()).collect();
+        assert!(names.contains(&"create_job"));
+        assert!(!names.contains(&"cancel_job"));
     }
 
     // ── is_v1_auth_tool tests ─────────────────────────────────
@@ -2104,7 +2293,9 @@ FINAL(echoed + "|" + http_result["error"])"#,
 
         // Auto-approve the tool — in a NON-supervised context this would
         // bypass approval entirely.
-        adapter.auto_approve_tool("approval_test").await;
+        adapter
+            .auto_approve_tool("test_user", "approval_test")
+            .await;
 
         let thread_id = lunarwing_engine::ThreadId::new();
         let result = adapter
@@ -2192,7 +2383,9 @@ FINAL(echoed + "|" + http_result["error"])"#,
             Arc::new(HookRegistry::default()),
         );
 
-        adapter.auto_approve_tool("approval_test").await;
+        adapter
+            .auto_approve_tool("test_user", "approval_test")
+            .await;
 
         let thread_id = lunarwing_engine::ThreadId::new();
         let result = adapter

@@ -178,6 +178,7 @@ RUN ln -s /app/opencode/node_modules /app/node_modules
 # `docker build` and only surfaces as a module-resolution error when the bridge
 # starts inside the running container.
 RUN cd /app && bun -e 'import("@opencode-ai/sdk/v2").then(m => { if (typeof m.createOpencodeClient !== "function") { console.error("FATAL: @opencode-ai/sdk/v2 resolved but is missing createOpencodeClient"); process.exit(1) } }).catch(e => { console.error("FATAL: cannot import @opencode-ai/sdk/v2 —", e.message); process.exit(1) })'
+RUN cd /app && bun scripts/opencode_result_test.ts && bun scripts/opencode_task_executor_test.ts
 
 # ── XDG directories for opencode state ────────────────────────
 RUN mkdir -p /home/opencode/.local/share/opencode \

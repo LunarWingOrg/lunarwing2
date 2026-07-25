@@ -400,6 +400,7 @@ pub struct TestRigBuilder {
     mcp_server_configs: Vec<McpServerConfig>,
     skills_to_seed: Vec<(String, String)>,
     extra_channels: Vec<Box<dyn lunarwing::channels::Channel>>,
+    vision_enrichment: Option<Arc<lunarwing::vision_enrichment::VisionEnrichmentMiddleware>>,
 }
 
 impl TestRigBuilder {
@@ -423,6 +424,7 @@ impl TestRigBuilder {
             mcp_server_configs: Vec::new(),
             skills_to_seed: Vec::new(),
             extra_channels: Vec::new(),
+            vision_enrichment: None,
         }
     }
 
@@ -470,6 +472,15 @@ impl TestRigBuilder {
     /// Add a real channel alongside the in-process capture channel.
     pub fn with_channel(mut self, channel: Box<dyn lunarwing::channels::Channel>) -> Self {
         self.extra_channels.push(channel);
+        self
+    }
+
+    /// Enable automatic LunarVision preprocessing in the test agent.
+    pub fn with_vision_enrichment(
+        mut self,
+        middleware: Arc<lunarwing::vision_enrichment::VisionEnrichmentMiddleware>,
+    ) -> Self {
+        self.vision_enrichment = Some(middleware);
         self
     }
 
@@ -595,6 +606,7 @@ impl TestRigBuilder {
             mcp_server_configs,
             skills_to_seed,
             extra_channels,
+            vision_enrichment,
         } = self;
 
         // 1. Create temp dir and seed skill fixtures before AppBuilder discovery.
@@ -886,6 +898,7 @@ impl TestRigBuilder {
             http_interceptor,
             transcription: None,
             document_extraction: None,
+            vision_enrichment,
             sandbox_readiness: lunarwing::agent::SandboxReadiness::Available, // tests don't use real Docker
             builder: None,
             llm_backend: "lunarwing_cloud".to_string(),

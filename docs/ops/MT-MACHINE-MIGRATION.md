@@ -45,7 +45,7 @@ match the old host's.
 | XMPP rooms / allowlist / encrypted-rooms / plaintext-fallback, OMEMO device id, `LLM_API_KEY`/`MODEL` | env (+ bridge `*_JSON`) | **Yes** — operator config |
 | `LLM_BASE_URL`, `NANOCODE_BASE_URL`, `OPENCODE_BASE_URL` | env | **Only when non-loopback/custom** — obsolete host-local proxy URLs are not carried |
 | `NANOCODE_MODEL`, `OPENCODE_MODEL` | env | **Yes** — worker model overrides |
-| Vision sidecar VL backend/model + auth token | `env/vision.env` | **Yes, when present** — `VL_URL`, `VL_MODEL`, and `LUNARWING_AUTH_TOKEN` are carried in `manifest-vision.env`; vision ports remain host-specific and regenerated |
+| Vision sidecar VL backend/model | `env/vision.env` | **Yes, when present** — `VL_URL` and `VL_MODEL` are carried in `manifest-vision.env`; vision ports and the host-local sidecar/daemon auth token are regenerated together |
 | Gateway / HTTP **bind address** (`GATEWAY_HOST`, `HTTP_HOST`) | env | **Yes** — operator config (e.g. `0.0.0.0` for remote access vs the `127.0.0.1` default), so your binding choice survives the migration. The **ports** (`GATEWAY_PORT`/`HTTP_PORT`) are NOT carried — they're host-specific and regenerated. (If you bound to a host-specific NIC IP rather than `0.0.0.0`/`127.0.0.1`, review it on the new host.) |
 | Gateway / bridge / webhook / relay tokens | env | **No** — the new host mints fresh, self-consistent ones (keeps `config.toml`'s worker auth aligned). **Gateway-UI and external-webhook clients re-authenticate after cutover.** |
 | `state/config.toml` (external-worker ports/tokens) | `state/` | **No** — host-specific; the new host's `add-tenant` writes the correct one |
@@ -163,7 +163,9 @@ Runs `add-tenant --no-health` → `build-tenant` → injects the carried secrets
 daemon. `--with-opencode` and `--with-toolchains` are passed through to
 `build-tenant`. `--with-vision` builds the LunarVision sidecar image before start; if
 the bundle contains `manifest-vision.env`, import injects the carried `VL_URL`,
-`VL_MODEL`, and sidecar auth token into the target `vision.env`. Docker/podman
+`VL_MODEL` into the target `vision.env`. Import deliberately ignores auth tokens
+from older bundles so the target-generated `LUNARWING_AUTH_TOKEN` and daemon
+`VISION_AUTH_TOKEN` remain matched. Docker/podman
 group membership is a target-host choice and is not exported from the source host.
 `--old-stopped` confirms the old side is down (export already stopped it);
 omit `--start` to **stage** without starting, or omit `--old-stopped` to be prompted

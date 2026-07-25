@@ -1082,7 +1082,14 @@ impl Tool for CreateJobTool {
     }
 
     fn description(&self) -> &str {
-        if self.sandbox_enabled() {
+        if self.has_external_workers() {
+            "Create and execute a tracked job using a local backend, Docker sandbox, or configured \
+             external worker. When the user requests an external worker, call this create_job tool \
+             directly and set mode to the exact worker name from the mode schema (for example \
+             'opencode'). External workers are job execution backends, not extensions, MCP servers, \
+             skills, routines, or SSH hosts; do not search for or install them. Put the complete task \
+             in description. wait defaults to true."
+        } else if self.sandbox_enabled() {
             "Create and execute a job. The job runs in a sandboxed Docker container with its own \
              sub-agent that has shell, file read/write, list_dir, and apply_patch tools. Use this \
              whenever the user asks you to build, create, or work on something. The task \
@@ -1131,19 +1138,35 @@ impl Tool for CreateJobTool {
             }
 
             if self.has_external_workers() {
-                let names = self
+                let mut names = self
                     .external_worker_manager
                     .as_ref()
                     .map(|m| m.worker_names())
                     .unwrap_or_default();
-                let mode_desc = format!(
-                    "Job execution mode. 'worker' for Docker container (default), \
-                     or a named external worker: {}.",
-                    names.join(", ")
-                );
+                names.sort_unstable();
+                let mut modes = vec!["worker".to_string()];
+                modes.extend(names.iter().map(|name| (*name).to_string()));
+                let mode_desc = if self.sandbox_enabled() {
+                    format!(
+                        "Execution backend. Use 'worker' for the Docker sandbox, or set the exact \
+                         external worker name: {}. External workers are built-in job backends, not \
+                         extensions or MCP servers; call create_job directly instead of searching \
+                         or installing anything.",
+                        names.join(", ")
+                    )
+                } else {
+                    format!(
+                        "Execution backend. Omit mode for a local tracked job, or set the exact \
+                         external worker name: {}. To use an external worker such as opencode, call \
+                         create_job directly with that name; do not search extensions, MCP servers, \
+                         skills, routines, or SSH hosts.",
+                        names.join(", ")
+                    )
+                };
                 props["mode"] = serde_json::json!({
                     "type": "string",
-                    "description": mode_desc
+                    "description": mode_desc,
+                    "enum": modes
                 });
             }
 
@@ -1250,6 +1273,10 @@ impl Tool for CreateJobTool {
         } else {
             self.execute_local(title, description, ctx).await
         }
+    }
+
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
     }
 
     fn requires_sanitization(&self) -> bool {
@@ -1898,6 +1925,39 @@ mod tests {
         assert!(props.contains_key("description")); // safety: test
         assert!(!props.contains_key("wait")); // safety: test
         assert!(!props.contains_key("mode")); // safety: test
+    }
+
+    #[test]
+    fn external_worker_schema_guides_direct_opencode_dispatch() {
+        use crate::config::{ExternalWorkerConfig, LoadBalanceStrategy};
+
+        let manager = Arc::new(ContextManager::new(5));
+        let workers = Arc::new(ExternalWorkerManager::new(vec![ExternalWorkerConfig {
+            name: "opencode".to_string(),
+            url: "ws://127.0.0.1:20007/ws/agent".to_string(),
+            auth_token: None,
+            timeout_ms: 300_000,
+            endpoints: vec![],
+            load_balance: LoadBalanceStrategy::default(),
+        }]));
+        let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
+
+        assert!(
+            tool.description()
+                .contains("call this create_job tool directly")
+        );
+        assert!(tool.description().contains("not extensions, MCP servers"));
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::UnlessAutoApproved
+        );
+
+        let schema = tool.parameters_schema();
+        let mode = &schema["properties"]["mode"];
+        assert_eq!(mode["enum"], serde_json::json!(["worker", "opencode"]));
+        let description = mode["description"].as_str().expect("mode description");
+        assert!(description.contains("create_job directly"));
+        assert!(description.contains("opencode"));
     }
 
     #[test]

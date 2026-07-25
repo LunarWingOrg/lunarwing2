@@ -1874,10 +1874,13 @@ pub async fn resolve_gate(
             let prior_permission = if always {
                 state
                     .effect_adapter
-                    .auto_approve_tool(&pending.action_name)
+                    .auto_approve_tool(&pending.user_id, &pending.action_name)
                     .await;
                 if let Some(registry_name) = legacy_extension_alias(&pending.action_name) {
-                    state.effect_adapter.auto_approve_tool(&registry_name).await;
+                    state
+                        .effect_adapter
+                        .auto_approve_tool(&pending.user_id, &registry_name)
+                        .await;
                 }
                 persist_always_allow(state, &pending).await
             } else {
@@ -1896,12 +1899,12 @@ pub async fn resolve_gate(
             if always && result.is_err() {
                 state
                     .effect_adapter
-                    .revoke_auto_approve(&pending.action_name)
+                    .revoke_auto_approve(&pending.user_id, &pending.action_name)
                     .await;
                 if let Some(registry_name) = legacy_extension_alias(&pending.action_name) {
                     state
                         .effect_adapter
-                        .revoke_auto_approve(&registry_name)
+                        .revoke_auto_approve(&pending.user_id, &registry_name)
                         .await;
                 }
                 revert_always_allow(state, &pending, prior_permission).await;

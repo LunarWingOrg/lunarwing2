@@ -286,9 +286,17 @@ pub struct TunnelSettings {
     #[serde(default)]
     pub public_url: Option<String>,
 
-    /// Managed tunnel provider: "ngrok", "cloudflare", "tailscale", "custom".
+    /// Managed tunnel provider: "netbird", "ngrok", "cloudflare", "tailscale", "custom".
     #[serde(default)]
     pub provider: Option<String>,
+
+    /// Verified custom domain used by `netbird expose`.
+    #[serde(default)]
+    pub netbird_custom_domain: Option<String>,
+
+    /// Prefix for NetBird's generated ephemeral service name.
+    #[serde(default)]
+    pub netbird_name_prefix: Option<String>,
 
     /// Cloudflare tunnel token.
     #[serde(default)]
@@ -2033,9 +2041,9 @@ timeout_ms = 300000
     fn tunnel_settings_round_trip() {
         let settings = Settings {
             tunnel: TunnelSettings {
-                provider: Some("ngrok".to_string()),
-                ngrok_token: Some("tok_abc123".to_string()),
-                ngrok_domain: Some("my.ngrok.dev".to_string()),
+                provider: Some("netbird".to_string()),
+                netbird_custom_domain: Some("lunarwing.example.com".to_string()),
+                netbird_name_prefix: Some("lunarwing".to_string()),
                 ..Default::default()
             },
             ..Default::default()
@@ -2044,28 +2052,38 @@ timeout_ms = 300000
         // JSON round-trip
         let json = serde_json::to_string(&settings).unwrap();
         let restored: Settings = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.tunnel.provider, Some("ngrok".to_string()));
-        assert_eq!(restored.tunnel.ngrok_token, Some("tok_abc123".to_string()));
+        assert_eq!(restored.tunnel.provider, Some("netbird".to_string()));
         assert_eq!(
-            restored.tunnel.ngrok_domain,
-            Some("my.ngrok.dev".to_string())
+            restored.tunnel.netbird_custom_domain,
+            Some("lunarwing.example.com".to_string())
+        );
+        assert_eq!(
+            restored.tunnel.netbird_name_prefix,
+            Some("lunarwing".to_string())
         );
         assert!(restored.tunnel.public_url.is_none());
 
         // DB map round-trip
         let map = settings.to_db_map();
         let from_db = Settings::from_db_map(&map);
-        assert_eq!(from_db.tunnel.provider, Some("ngrok".to_string()));
-        assert_eq!(from_db.tunnel.ngrok_token, Some("tok_abc123".to_string()));
+        assert_eq!(from_db.tunnel.provider, Some("netbird".to_string()));
+        assert_eq!(
+            from_db.tunnel.netbird_custom_domain,
+            Some("lunarwing.example.com".to_string())
+        );
 
         // get/set round-trip
         let mut s = Settings::default();
-        s.set("tunnel.provider", "cloudflare").unwrap();
-        s.set("tunnel.cf_token", "cf_tok_xyz").unwrap();
-        s.set("tunnel.ts_funnel", "true").unwrap();
-        assert_eq!(s.tunnel.provider, Some("cloudflare".to_string()));
-        assert_eq!(s.tunnel.cf_token, Some("cf_tok_xyz".to_string()));
-        assert!(s.tunnel.ts_funnel);
+        s.set("tunnel.provider", "netbird").unwrap();
+        s.set("tunnel.netbird_custom_domain", "lw.example.com")
+            .unwrap();
+        s.set("tunnel.netbird_name_prefix", "lunarwing").unwrap();
+        assert_eq!(s.tunnel.provider, Some("netbird".to_string()));
+        assert_eq!(
+            s.tunnel.netbird_custom_domain,
+            Some("lw.example.com".to_string())
+        );
+        assert_eq!(s.tunnel.netbird_name_prefix, Some("lunarwing".to_string()));
     }
 
     /// Simulates the wizard recovery scenario:
@@ -2194,8 +2212,8 @@ timeout_ms = 300000
                 base_url: None,
             },
             tunnel: TunnelSettings {
-                provider: Some("ngrok".to_string()),
-                ngrok_token: Some("tok_xxx".to_string()),
+                provider: Some("netbird".to_string()),
+                netbird_name_prefix: Some("lunarwing".to_string()),
                 ..Default::default()
             },
             channels: ChannelSettings {

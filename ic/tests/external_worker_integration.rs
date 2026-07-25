@@ -56,6 +56,9 @@ enum MockBehavior {
         progress: Vec<String>,
         output: String,
     },
+    /// Return one successful result, then drop the socket without a close
+    /// frame. A pooled client must detect this before dispatching another task.
+    SuccessThenDisconnect { output: String },
     /// Send `ready`, then on `task_request`: a single failed result.
     Failed { error: String },
     /// Send `ready`, read `task_request`, then never reply (drives a timeout).
@@ -265,8 +268,19 @@ async fn handle_connection(
             Some(Ok(m)) if !m.is_close() => m,
             _ => break, // client closed / errored
         };
-        // Acknowledge that we consumed the request (don't need to parse it).
-        let _ = req.to_text();
+        let Ok(req_text) = req.to_text() else {
+            break;
+        };
+        let Ok(req_envelope) = serde_json::from_str::<serde_json::Value>(req_text) else {
+            break;
+        };
+        if req_envelope.get("type").and_then(|value| value.as_str()) == Some("ping") {
+            let pong = envelope("pong", serde_json::json!({}));
+            if ws.send(Message::Text(pong.into())).await.is_err() {
+                return;
+            }
+            continue;
+        }
 
         match behavior {
             MockBehavior::Success {
@@ -310,6 +324,20 @@ async fn handle_connection(
                 );
                 let _ = ws.send(Message::Text(r.into())).await;
                 return; // failed tasks are not pooled
+            }
+            MockBehavior::SuccessThenDisconnect { ref output } => {
+                let r = envelope(
+                    "task_result",
+                    serde_json::json!({
+                        "task_id": "t",
+                        "status": "success",
+                        "output": output,
+                        "error": null,
+                        "duration_ms": 5,
+                    }),
+                );
+                let _ = ws.send(Message::Text(r.into())).await;
+                return;
             }
             MockBehavior::Hang => {
                 // Never reply; the client will time out or be cancelled. Hold
@@ -623,6 +651,42 @@ async fn connection_pool_reuse_across_sequential_tasks() {
         1,
         "expected pool reuse (1 connection), got {}",
         conn_count.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn stale_pooled_connection_reconnects_before_next_task() {
+    let (url, conn_count) = spawn_mock_worker_async(MockBehavior::SuccessThenDisconnect {
+        output: "ok".to_string(),
+    })
+    .await;
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)]);
+
+    for task in ["first", "second"] {
+        let result = timeout(
+            TEST_BOUND,
+            mgr.execute_task(
+                Uuid::new_v4(),
+                "mock",
+                task,
+                Some(5_000),
+                true,
+                TaskContext::default(),
+            ),
+        )
+        .await
+        .expect("task timed out")
+        .expect("task errored")
+        .expect("expected result");
+
+        assert_eq!(result.status, ExternalTaskStatus::Success);
+        assert_eq!(result.output, "ok");
+    }
+
+    assert_eq!(
+        conn_count.load(Ordering::SeqCst),
+        2,
+        "second task should reconnect after pooled socket closes"
     );
 }
 

@@ -8,10 +8,12 @@ use dashmap::DashMap;
 use governor::{Quota, RateLimiter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use warp::{Filter, Rejection, Reply};
 use warp::http::StatusCode;
+use warp::{Filter, Rejection, Reply};
 
-const MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
+const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
+// Base64 expands image bytes by roughly 4/3; leave room for JSON fields.
+const MAX_BODY_SIZE: u64 = (MAX_IMAGE_SIZE as u64 * 4 / 3) + (64 * 1024);
 const CACHE_TTL_SECS: u64 = 300;
 const CACHE_MAX_ENTRIES: usize = 10000;
 const CACHE_FILE_EXT: &str = ".cache";
@@ -37,7 +39,13 @@ struct Config {
 struct AppState {
     config: Config,
     cache: Arc<DashMap<String, CachedResponse>>,
-    rate_limiter: Arc<governor::RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::QuantaClock>>,
+    rate_limiter: Arc<
+        governor::RateLimiter<
+            governor::state::NotKeyed,
+            governor::state::InMemoryState,
+            governor::clock::QuantaClock,
+        >,
+    >,
     metrics: Arc<Metrics>,
     start_time: Instant,
     tesseract_version: String,
@@ -65,7 +73,9 @@ impl CachedResponse {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        if now <= self.created_at_nanos { return 0; }
+        if now <= self.created_at_nanos {
+            return 0;
+        }
         ((now - self.created_at_nanos) / 1_000_000_000) as u64
     }
 }
@@ -73,11 +83,13 @@ impl CachedResponse {
 fn cache_file_path(cache_dir: &Option<PathBuf>, key: &str) -> Option<PathBuf> {
     let dir = cache_dir.as_ref()?;
     let safe_name = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.as_bytes());
-    Some(dir.join(format!("safe_name{CACHE_FILE_EXT}")))
+    Some(dir.join(format!("{safe_name}{CACHE_FILE_EXT}")))
 }
 
 fn persist_cache_entry(cache_dir: &Option<PathBuf>, key: &str, entry: &CachedResponse) {
-    let Some(path) = cache_file_path(cache_dir, key) else { return };
+    let Some(path) = cache_file_path(cache_dir, key) else {
+        return;
+    };
     if let Ok(json) = serde_json::to_string(entry) {
         let _ = std::fs::write(&path, json);
     }
@@ -97,13 +109,21 @@ fn load_cache_entry(cache_dir: &Option<PathBuf>, key: &str) -> Option<String> {
 
 fn load_cache_from_disk(cache: &DashMap<String, CachedResponse>, cache_dir: &Option<PathBuf>) {
     let Some(dir) = cache_dir else { return };
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if !name_str.ends_with(CACHE_FILE_EXT) { continue; }
-        let Ok(data) = std::fs::read_to_string(entry.path()) else { continue };
-        let Ok(cached): std::result::Result<CachedResponse, _> = serde_json::from_str(&data) else { continue };
+        if !name_str.ends_with(CACHE_FILE_EXT) {
+            continue;
+        }
+        let Ok(data) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(cached): std::result::Result<CachedResponse, _> = serde_json::from_str(&data) else {
+            continue;
+        };
         if cached.age_secs() < CACHE_TTL_SECS {
             cache.insert(name_str.to_string(), cached);
         } else {
@@ -161,16 +181,24 @@ impl Default for Metrics {
             errors_unsupported_media: Default::default(),
             vl_tokens_used: Default::default(),
             vl_fallback_count: Default::default(),
-            ocr_duration_buckets: (0..13).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            ocr_duration_buckets: (0..13)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             ocr_duration_sum_ms: Default::default(),
             ocr_duration_count: Default::default(),
-            vision_duration_buckets: (0..13).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            vision_duration_buckets: (0..13)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             vision_duration_sum_ms: Default::default(),
             vision_duration_count: Default::default(),
-            tesseract_confidence_buckets: (0..10).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            tesseract_confidence_buckets: (0..10)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             tesseract_confidence_sum: Default::default(),
             tesseract_confidence_count: Default::default(),
-            paddleocr_confidence_buckets: (0..10).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            paddleocr_confidence_buckets: (0..10)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             paddleocr_confidence_sum: Default::default(),
             paddleocr_confidence_count: Default::default(),
         }
@@ -178,12 +206,32 @@ impl Default for Metrics {
 }
 
 const DURATION_BUCKETS: [f64; 13] = [
-    0.001, 0.005, 0.01, 0.025, 0.05, 0.1,
-    0.25, 0.5, 1.0, 2.5, 5.0, 10.0, f64::INFINITY,
+    0.001,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    f64::INFINITY,
 ];
 
 const CONFIDENCE_BUCKETS: [f64; 10] = [
-    0.3, 0.5, 0.7, 0.8, 0.85, 0.9, 0.95, 0.99, 1.0, f64::INFINITY,
+    0.3,
+    0.5,
+    0.7,
+    0.8,
+    0.85,
+    0.9,
+    0.95,
+    0.99,
+    1.0,
+    f64::INFINITY,
 ];
 
 fn record_histogram(buckets: &[std::sync::atomic::AtomicU64], value: f64, boundaries: &[f64]) {
@@ -197,33 +245,122 @@ fn record_histogram(buckets: &[std::sync::atomic::AtomicU64], value: f64, bounda
 impl Clone for Metrics {
     fn clone(&self) -> Self {
         Self {
-            total_requests: std::sync::atomic::AtomicU64::new(self.total_requests.load(std::sync::atomic::Ordering::Relaxed)),
-            ocr_requests: std::sync::atomic::AtomicU64::new(self.ocr_requests.load(std::sync::atomic::Ordering::Relaxed)),
-            vision_requests: std::sync::atomic::AtomicU64::new(self.vision_requests.load(std::sync::atomic::Ordering::Relaxed)),
-            cache_hits: std::sync::atomic::AtomicU64::new(self.cache_hits.load(std::sync::atomic::Ordering::Relaxed)),
-            cache_misses: std::sync::atomic::AtomicU64::new(self.cache_misses.load(std::sync::atomic::Ordering::Relaxed)),
-            rate_limited: std::sync::atomic::AtomicU64::new(self.rate_limited.load(std::sync::atomic::Ordering::Relaxed)),
-            avg_latency_ms: std::sync::atomic::AtomicU64::new(self.avg_latency_ms.load(std::sync::atomic::Ordering::Relaxed)),
-            errors_unauthorized: std::sync::atomic::AtomicU64::new(self.errors_unauthorized.load(std::sync::atomic::Ordering::Relaxed)),
-            errors_bad_request: std::sync::atomic::AtomicU64::new(self.errors_bad_request.load(std::sync::atomic::Ordering::Relaxed)),
-            errors_ocr_engine: std::sync::atomic::AtomicU64::new(self.errors_ocr_engine.load(std::sync::atomic::Ordering::Relaxed)),
-            errors_rate_limited: std::sync::atomic::AtomicU64::new(self.errors_rate_limited.load(std::sync::atomic::Ordering::Relaxed)),
-            errors_internal: std::sync::atomic::AtomicU64::new(self.errors_internal.load(std::sync::atomic::Ordering::Relaxed)),
-            errors_unsupported_media: std::sync::atomic::AtomicU64::new(self.errors_unsupported_media.load(std::sync::atomic::Ordering::Relaxed)),
-            vl_tokens_used: std::sync::atomic::AtomicU64::new(self.vl_tokens_used.load(std::sync::atomic::Ordering::Relaxed)),
-            vl_fallback_count: std::sync::atomic::AtomicU64::new(self.vl_fallback_count.load(std::sync::atomic::Ordering::Relaxed)),
-            ocr_duration_buckets: self.ocr_duration_buckets.iter().map(|a| std::sync::atomic::AtomicU64::new(a.load(std::sync::atomic::Ordering::Relaxed))).collect(),
-            ocr_duration_sum_ms: std::sync::atomic::AtomicU64::new(self.ocr_duration_sum_ms.load(std::sync::atomic::Ordering::Relaxed)),
-            ocr_duration_count: std::sync::atomic::AtomicU64::new(self.ocr_duration_count.load(std::sync::atomic::Ordering::Relaxed)),
-            vision_duration_buckets: self.vision_duration_buckets.iter().map(|a| std::sync::atomic::AtomicU64::new(a.load(std::sync::atomic::Ordering::Relaxed))).collect(),
-            vision_duration_sum_ms: std::sync::atomic::AtomicU64::new(self.vision_duration_sum_ms.load(std::sync::atomic::Ordering::Relaxed)),
-            vision_duration_count: std::sync::atomic::AtomicU64::new(self.vision_duration_count.load(std::sync::atomic::Ordering::Relaxed)),
-            tesseract_confidence_buckets: self.tesseract_confidence_buckets.iter().map(|a| std::sync::atomic::AtomicU64::new(a.load(std::sync::atomic::Ordering::Relaxed))).collect(),
-            tesseract_confidence_sum: std::sync::atomic::AtomicU64::new(self.tesseract_confidence_sum.load(std::sync::atomic::Ordering::Relaxed)),
-            tesseract_confidence_count: std::sync::atomic::AtomicU64::new(self.tesseract_confidence_count.load(std::sync::atomic::Ordering::Relaxed)),
-            paddleocr_confidence_buckets: self.paddleocr_confidence_buckets.iter().map(|a| std::sync::atomic::AtomicU64::new(a.load(std::sync::atomic::Ordering::Relaxed))).collect(),
-            paddleocr_confidence_sum: std::sync::atomic::AtomicU64::new(self.paddleocr_confidence_sum.load(std::sync::atomic::Ordering::Relaxed)),
-            paddleocr_confidence_count: std::sync::atomic::AtomicU64::new(self.paddleocr_confidence_count.load(std::sync::atomic::Ordering::Relaxed)),
+            total_requests: std::sync::atomic::AtomicU64::new(
+                self.total_requests
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            ocr_requests: std::sync::atomic::AtomicU64::new(
+                self.ocr_requests.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            vision_requests: std::sync::atomic::AtomicU64::new(
+                self.vision_requests
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            cache_hits: std::sync::atomic::AtomicU64::new(
+                self.cache_hits.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            cache_misses: std::sync::atomic::AtomicU64::new(
+                self.cache_misses.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            rate_limited: std::sync::atomic::AtomicU64::new(
+                self.rate_limited.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            avg_latency_ms: std::sync::atomic::AtomicU64::new(
+                self.avg_latency_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            errors_unauthorized: std::sync::atomic::AtomicU64::new(
+                self.errors_unauthorized
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            errors_bad_request: std::sync::atomic::AtomicU64::new(
+                self.errors_bad_request
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            errors_ocr_engine: std::sync::atomic::AtomicU64::new(
+                self.errors_ocr_engine
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            errors_rate_limited: std::sync::atomic::AtomicU64::new(
+                self.errors_rate_limited
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            errors_internal: std::sync::atomic::AtomicU64::new(
+                self.errors_internal
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            errors_unsupported_media: std::sync::atomic::AtomicU64::new(
+                self.errors_unsupported_media
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            vl_tokens_used: std::sync::atomic::AtomicU64::new(
+                self.vl_tokens_used
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            vl_fallback_count: std::sync::atomic::AtomicU64::new(
+                self.vl_fallback_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            ocr_duration_buckets: self
+                .ocr_duration_buckets
+                .iter()
+                .map(|a| {
+                    std::sync::atomic::AtomicU64::new(a.load(std::sync::atomic::Ordering::Relaxed))
+                })
+                .collect(),
+            ocr_duration_sum_ms: std::sync::atomic::AtomicU64::new(
+                self.ocr_duration_sum_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            ocr_duration_count: std::sync::atomic::AtomicU64::new(
+                self.ocr_duration_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            vision_duration_buckets: self
+                .vision_duration_buckets
+                .iter()
+                .map(|a| {
+                    std::sync::atomic::AtomicU64::new(a.load(std::sync::atomic::Ordering::Relaxed))
+                })
+                .collect(),
+            vision_duration_sum_ms: std::sync::atomic::AtomicU64::new(
+                self.vision_duration_sum_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            vision_duration_count: std::sync::atomic::AtomicU64::new(
+                self.vision_duration_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            tesseract_confidence_buckets: self
+                .tesseract_confidence_buckets
+                .iter()
+                .map(|a| {
+                    std::sync::atomic::AtomicU64::new(a.load(std::sync::atomic::Ordering::Relaxed))
+                })
+                .collect(),
+            tesseract_confidence_sum: std::sync::atomic::AtomicU64::new(
+                self.tesseract_confidence_sum
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            tesseract_confidence_count: std::sync::atomic::AtomicU64::new(
+                self.tesseract_confidence_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            paddleocr_confidence_buckets: self
+                .paddleocr_confidence_buckets
+                .iter()
+                .map(|a| {
+                    std::sync::atomic::AtomicU64::new(a.load(std::sync::atomic::Ordering::Relaxed))
+                })
+                .collect(),
+            paddleocr_confidence_sum: std::sync::atomic::AtomicU64::new(
+                self.paddleocr_confidence_sum
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            paddleocr_confidence_count: std::sync::atomic::AtomicU64::new(
+                self.paddleocr_confidence_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
         }
     }
 }
@@ -265,9 +402,15 @@ struct VisionAnalyzeRequest {
     detail_level: String,
 }
 
-fn default_mode() -> String { "auto".to_string() }
-fn default_ocr_lang() -> String { "eng".to_string() }
-fn default_detail_level() -> String { "medium".to_string() }
+fn default_mode() -> String {
+    "auto".to_string()
+}
+fn default_ocr_lang() -> String {
+    "eng".to_string()
+}
+fn default_detail_level() -> String {
+    "medium".to_string()
+}
 
 #[derive(Debug, Serialize)]
 struct VisionAnalyzeResponse {
@@ -319,6 +462,8 @@ enum AppError {
     UnsupportedMediaType(String),
     #[error("Bad request: {0}")]
     BadRequest(String),
+    #[error("Decoded image is {actual} bytes; limit is {limit} bytes")]
+    PayloadTooLarge { actual: usize, limit: usize },
     #[error("OCR engine failure: {0}")]
     OcrEngineFailure(String),
     #[error("Rate limit exceeded")]
@@ -331,56 +476,91 @@ impl warp::reject::Reject for AppError {}
 
 async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
     let (code, error_response) = if err.is_not_found() {
-        (StatusCode::NOT_FOUND, ErrorResponse {
-            error: "not_found".to_string(),
-            detail: "Resource not found".to_string(),
-            code: 404,
-        })
+        (
+            StatusCode::NOT_FOUND,
+            ErrorResponse {
+                error: "not_found".to_string(),
+                detail: "Resource not found".to_string(),
+                code: 404,
+            },
+        )
     } else if let Some(_) = err.find::<warp::reject::PayloadTooLarge>() {
-        (StatusCode::PAYLOAD_TOO_LARGE, ErrorResponse {
-            error: "payload_too_large".to_string(),
-            detail: "Request body exceeds 10MB limit".to_string(),
-            code: 413,
-        })
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorResponse {
+                error: "payload_too_large".to_string(),
+                detail: format!("Encoded request body exceeds {MAX_BODY_SIZE} byte limit"),
+                code: 413,
+            },
+        )
     } else if let Some(e) = err.find::<AppError>() {
         match e {
-            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, ErrorResponse {
-                error: "unauthorized".to_string(),
-                detail: e.to_string(),
-                code: 401,
-            }),
-            AppError::UnsupportedMediaType(_) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, ErrorResponse {
-                error: "unsupported_media_type".to_string(),
-                detail: e.to_string(),
-                code: 415,
-            }),
-            AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, ErrorResponse {
-                error: "bad_request".to_string(),
-                detail: e.to_string(),
-                code: 400,
-            }),
-            AppError::OcrEngineFailure(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorResponse {
-                error: "ocr_engine_failure".to_string(),
-                detail: e.to_string(),
-                code: 500,
-            }),
-            AppError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, ErrorResponse {
-                error: "rate_limited".to_string(),
-                detail: e.to_string(),
-                code: 429,
-            }),
-            AppError::InternalError => (StatusCode::INTERNAL_SERVER_ERROR, ErrorResponse {
-                error: "internal_error".to_string(),
-                detail: e.to_string(),
-                code: 500,
-            }),
+            AppError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                ErrorResponse {
+                    error: "unauthorized".to_string(),
+                    detail: e.to_string(),
+                    code: 401,
+                },
+            ),
+            AppError::UnsupportedMediaType(_) => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                ErrorResponse {
+                    error: "unsupported_media_type".to_string(),
+                    detail: e.to_string(),
+                    code: 415,
+                },
+            ),
+            AppError::BadRequest(_) => (
+                StatusCode::BAD_REQUEST,
+                ErrorResponse {
+                    error: "bad_request".to_string(),
+                    detail: e.to_string(),
+                    code: 400,
+                },
+            ),
+            AppError::PayloadTooLarge { .. } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorResponse {
+                    error: "payload_too_large".to_string(),
+                    detail: e.to_string(),
+                    code: 413,
+                },
+            ),
+            AppError::OcrEngineFailure(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse {
+                    error: "ocr_engine_failure".to_string(),
+                    detail: e.to_string(),
+                    code: 500,
+                },
+            ),
+            AppError::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorResponse {
+                    error: "rate_limited".to_string(),
+                    detail: e.to_string(),
+                    code: 429,
+                },
+            ),
+            AppError::InternalError => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse {
+                    error: "internal_error".to_string(),
+                    detail: e.to_string(),
+                    code: 500,
+                },
+            ),
         }
     } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, ErrorResponse {
-            error: "internal_error".to_string(),
-            detail: "Internal server error".to_string(),
-            code: 500,
-        })
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorResponse {
+                error: "internal_error".to_string(),
+                detail: "Internal server error".to_string(),
+                code: 500,
+            },
+        )
     };
 
     let json = warp::reply::json(&error_response);
@@ -399,7 +579,10 @@ fn rate_limit_filter(state: AppState) -> impl Filter<Extract = (), Error = Rejec
                 match state.rate_limiter.check() {
                     Ok(()) => Ok(()),
                     Err(_) => {
-                        state.metrics.rate_limited.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        state
+                            .metrics
+                            .rate_limited
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         Err(warp::reject::custom(AppError::RateLimited))
                     }
                 }
@@ -415,38 +598,51 @@ fn auth_filter(config: Config) -> impl Filter<Extract = (), Error = Rejection> +
             async move {
                 match expected {
                     None => Ok(()),
-                    Some(token) => {
-                        match auth {
-                            Some(header) if header.starts_with("Bearer ") => {
-                                let provided = header.trim_start_matches("Bearer ");
-                                if provided == token {
-                                    Ok(())
-                                } else {
-                                    Err(warp::reject::custom(AppError::Unauthorized))
-                                }
+                    Some(token) => match auth {
+                        Some(header) if header.starts_with("Bearer ") => {
+                            let provided = header.trim_start_matches("Bearer ");
+                            if provided == token {
+                                Ok(())
+                            } else {
+                                Err(warp::reject::custom(AppError::Unauthorized))
                             }
-                            _ => Err(warp::reject::custom(AppError::Unauthorized)),
                         }
-                    }
+                        _ => Err(warp::reject::custom(AppError::Unauthorized)),
+                    },
                 }
             }
         })
         .untuple_one()
 }
 
-fn validate_image_format(body: &[u8]) -> Result<(), AppError> {
+fn image_mime_type(body: &[u8]) -> Result<&'static str, AppError> {
     if body.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Ok(())
+        Ok("image/png")
     } else if body.starts_with(b"\xff\xd8\xff") {
-        Ok(())
+        Ok("image/jpeg")
     } else if body.len() > 12 && body.starts_with(b"RIFF") && &body[8..12] == b"WEBP" {
-        Ok(())
+        Ok("image/webp")
     } else if body.starts_with(b"II\x2a\x00") || body.starts_with(b"MM\x00\x2a") {
-        Ok(())
+        Ok("image/tiff")
     } else {
         Err(AppError::UnsupportedMediaType(
-            "Supported formats: PNG, JPEG, WebP, TIFF".to_string()
+            "Supported formats: PNG, JPEG, WebP, TIFF".to_string(),
         ))
+    }
+}
+
+fn validate_image_format(body: &[u8]) -> Result<(), AppError> {
+    image_mime_type(body).map(|_| ())
+}
+
+fn validate_image_size(body: &[u8]) -> Result<(), AppError> {
+    if body.len() > MAX_IMAGE_SIZE {
+        Err(AppError::PayloadTooLarge {
+            actual: body.len(),
+            limit: MAX_IMAGE_SIZE,
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -462,7 +658,8 @@ async fn run_tesseract(image_bytes: &[u8], lang: &str) -> Result<OcrResult, AppE
     let output = tokio::process::Command::new("tesseract")
         .arg(temp_file.path())
         .arg("stdout")
-        .arg("-l").arg(lang)
+        .arg("-l")
+        .arg(lang)
         .output()
         .await
         .map_err(|e| AppError::OcrEngineFailure(e.to_string()))?;
@@ -472,9 +669,7 @@ async fn run_tesseract(image_bytes: &[u8], lang: &str) -> Result<OcrResult, AppE
         return Err(AppError::OcrEngineFailure(stderr.to_string()));
     }
 
-    let text = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_string();
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
     let confidence = estimate_confidence(&text);
 
@@ -509,22 +704,27 @@ async fn run_paddleocr(image_bytes: &[u8]) -> Result<OcrResult, AppError> {
         .map_err(|e| AppError::OcrEngineFailure(e.to_string()))?;
 
     let output = tokio::process::Command::new("paddleocr")
-        .arg("--image_dir").arg(temp_file.path())
-        .arg("--use_angle_cls").arg("true")
-        .arg("--lang").arg("en")
-        .arg("--show_log").arg("false")
+        .arg("--image_dir")
+        .arg(temp_file.path())
+        .arg("--use_angle_cls")
+        .arg("true")
+        .arg("--lang")
+        .arg("en")
+        .arg("--show_log")
+        .arg("false")
         .output()
         .await
         .map_err(|e| AppError::OcrEngineFailure(format!("PaddleOCR not available: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::OcrEngineFailure(format!("PaddleOCR failed: {}", stderr)));
+        return Err(AppError::OcrEngineFailure(format!(
+            "PaddleOCR failed: {}",
+            stderr
+        )));
     }
 
-    let text = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_string();
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
     let confidence = estimate_confidence(&text).min(0.95);
 
@@ -539,16 +739,26 @@ async fn run_paddleocr(image_bytes: &[u8]) -> Result<OcrResult, AppError> {
     })
 }
 
-async fn run_ocr_with_fallback(image_bytes: &[u8], lang: &str, enable_paddle: bool) -> Result<OcrResult, AppError> {
+async fn run_ocr_with_fallback(
+    image_bytes: &[u8],
+    lang: &str,
+    enable_paddle: bool,
+) -> Result<OcrResult, AppError> {
     let result = run_tesseract(image_bytes, lang).await?;
 
     if result.avg_confidence < 0.7 && enable_paddle {
-        tracing::info!("Tesseract confidence {:.2} < 0.7, trying PaddleOCR fallback", result.avg_confidence);
+        tracing::info!(
+            "Tesseract confidence {:.2} < 0.7, trying PaddleOCR fallback",
+            result.avg_confidence
+        );
         match run_paddleocr(image_bytes).await {
             Ok(paddle_result) => {
                 if paddle_result.avg_confidence > result.avg_confidence {
-                    tracing::info!("PaddleOCR confidence {:.2} better than Tesseract {:.2}, using PaddleOCR",
-                        paddle_result.avg_confidence, result.avg_confidence);
+                    tracing::info!(
+                        "PaddleOCR confidence {:.2} better than Tesseract {:.2}, using PaddleOCR",
+                        paddle_result.avg_confidence,
+                        result.avg_confidence
+                    );
                     return Ok(paddle_result);
                 }
             }
@@ -561,7 +771,12 @@ async fn run_ocr_with_fallback(image_bytes: &[u8], lang: &str, enable_paddle: bo
     Ok(result)
 }
 
-fn generate_cache_key(image_b64: &str, prompt: &Option<String>, mode: &str, detail_level: &str) -> String {
+fn generate_cache_key(
+    image_b64: &str,
+    prompt: &Option<String>,
+    mode: &str,
+    detail_level: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(image_b64.as_bytes());
     hasher.update(mode.as_bytes());
@@ -603,10 +818,6 @@ fn store_cache(
     cache.insert(key, entry);
 
     if cache.len() > CACHE_MAX_ENTRIES {
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         cache.retain(|_, v| {
             let age = v.age_secs();
             age < CACHE_TTL_SECS
@@ -671,7 +882,11 @@ fn classify_task_type(user_prompt: &Option<String>, mode: &str) -> VlTaskType {
     }
 }
 
-fn build_vl_prompt(user_prompt: &Option<String>, detail_level: &str, task: VlTaskType) -> (String, bool) {
+fn build_vl_prompt(
+    user_prompt: &Option<String>,
+    detail_level: &str,
+    task: VlTaskType,
+) -> (String, bool) {
     match task {
         VlTaskType::Answer => match user_prompt {
             Some(p) if !p.trim().is_empty() => (p.clone(), true),
@@ -696,11 +911,27 @@ fn should_use_vl(ocr_result: &OcrResult, prompt: &Option<String>, mode: &str) ->
         "auto" => {
             if let Some(p) = prompt {
                 let p_lower = p.to_lowercase();
-                let vl_keywords = ["describe", "compare", "which", "looks", "color", "best", "scene", "style", "vibe"];
-                let ocr_keywords = ["read", "say", "text", "says", "what does", "extract", "error", "log", "code"];
+                let vl_keywords = [
+                    "describe", "compare", "which", "looks", "color", "best", "scene", "style",
+                    "vibe",
+                ];
+                let ocr_keywords = [
+                    "read",
+                    "say",
+                    "text",
+                    "says",
+                    "what does",
+                    "extract",
+                    "error",
+                    "log",
+                    "code",
+                ];
 
                 let vl_score = vl_keywords.iter().filter(|&&k| p_lower.contains(k)).count();
-                let ocr_score = ocr_keywords.iter().filter(|&&k| p_lower.contains(k)).count();
+                let ocr_score = ocr_keywords
+                    .iter()
+                    .filter(|&&k| p_lower.contains(k))
+                    .count();
 
                 if vl_score > ocr_score {
                     return true;
@@ -719,8 +950,16 @@ fn should_use_vl(ocr_result: &OcrResult, prompt: &Option<String>, mode: &str) ->
     }
 }
 
-async fn run_vl(image_b64: &str, prompt: &str, config: &Config, max_tokens: u32) -> Result<(VisionResult, Option<u32>), AppError> {
-    let vl_url = config.vl_url.as_ref()
+async fn run_vl(
+    image_b64: &str,
+    image_mime_type: &str,
+    prompt: &str,
+    config: &Config,
+    max_tokens: u32,
+) -> Result<(VisionResult, Option<u32>), AppError> {
+    let vl_url = config
+        .vl_url
+        .as_ref()
         .ok_or_else(|| AppError::InternalError)?;
 
     let timeout = Duration::from_secs(config.vl_timeout_secs);
@@ -738,7 +977,7 @@ async fn run_vl(image_b64: &str, prompt: &str, config: &Config, max_tokens: u32)
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": format!("data:image/png;base64,{})", image_b64)
+                            "url": image_data_url(image_mime_type, image_b64)
                         }
                     },
                     {
@@ -751,7 +990,8 @@ async fn run_vl(image_b64: &str, prompt: &str, config: &Config, max_tokens: u32)
         "max_tokens": max_tokens
     });
 
-    let mut request = client.post(vl_url)
+    let mut request = client
+        .post(vl_url)
         .header("Content-Type", "application/json")
         .json(&request_body);
 
@@ -759,17 +999,22 @@ async fn run_vl(image_b64: &str, prompt: &str, config: &Config, max_tokens: u32)
         request = request.header("Authorization", format!("Bearer {}", key));
     }
 
-    let response = request.send()
+    let response = request
+        .send()
         .await
         .map_err(|e| AppError::OcrEngineFailure(format!("VL request failed: {}", e)))?;
 
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(AppError::OcrEngineFailure(format!("VL API error {}: {}", status, text)));
+        return Err(AppError::OcrEngineFailure(format!(
+            "VL API error {}: {}",
+            status, text
+        )));
     }
 
-    let json: serde_json::Value = response.json()
+    let json: serde_json::Value = response
+        .json()
         .await
         .map_err(|e| AppError::OcrEngineFailure(format!("VL JSON parse error: {}", e)))?;
 
@@ -779,9 +1024,7 @@ async fn run_vl(image_b64: &str, prompt: &str, config: &Config, max_tokens: u32)
         .to_string();
 
     // Extract token usage from the API response
-    let tokens_used = json["usage"]["total_tokens"]
-        .as_u64()
-        .map(|t| t as u32);
+    let tokens_used = json["usage"]["total_tokens"].as_u64().map(|t| t as u32);
 
     Ok((
         VisionResult {
@@ -790,6 +1033,10 @@ async fn run_vl(image_b64: &str, prompt: &str, config: &Config, max_tokens: u32)
         },
         tokens_used,
     ))
+}
+
+fn image_data_url(mime_type: &str, image_b64: &str) -> String {
+    format!("data:{mime_type};base64,{image_b64}")
 }
 
 async fn vision_analyze_handler(
@@ -803,10 +1050,12 @@ async fn vision_analyze_handler(
 
     let image_bytes = base64::engine::general_purpose::STANDARD
         .decode(&req.image)
-        .map_err(|e| warp::reject::custom(AppError::BadRequest(format!("Invalid base64: {}", e))))?;
+        .map_err(|e| {
+            warp::reject::custom(AppError::BadRequest(format!("Invalid base64: {}", e)))
+        })?;
 
-    validate_image_format(&image_bytes)
-        .map_err(warp::reject::custom)?;
+    validate_image_size(&image_bytes).map_err(warp::reject::custom)?;
+    let image_mime_type = image_mime_type(&image_bytes).map_err(warp::reject::custom)?;
 
     let cache_dir = if state.config.cache_persist {
         state.config.cache_dir.clone()
@@ -818,18 +1067,25 @@ async fn vision_analyze_handler(
     if state.config.enable_cache {
         let cache_key = generate_cache_key(&req.image, &req.prompt, &req.mode, &req.detail_level);
         if let Some(cached) = check_cache(&state.cache, &cache_key, &cache_dir) {
-            state.metrics.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .metrics
+                .cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(warp::reply::json(&serde_json::json!({
                 "cached": true,
                 "response": serde_json::from_str::<serde_json::Value>(&cached).unwrap_or_default()
             })));
         }
-        state.metrics.cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state
+            .metrics
+            .cache_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    let ocr_result = run_ocr_with_fallback(&image_bytes, &req.ocr_lang, state.config.enable_paddleocr)
-        .await
-        .map_err(warp::reject::custom)?;
+    let ocr_result =
+        run_ocr_with_fallback(&image_bytes, &req.ocr_lang, state.config.enable_paddleocr)
+            .await
+            .map_err(warp::reject::custom)?;
 
     let use_vl = should_use_vl(&ocr_result, &req.prompt, &req.mode);
 
@@ -839,7 +1095,15 @@ async fn vision_analyze_handler(
         let task = classify_task_type(&req.prompt, &req.mode);
         let (vl_prompt, is_question) = build_vl_prompt(&req.prompt, &req.detail_level, task);
         let max_tokens = task.max_tokens();
-        match run_vl(&req.image, &vl_prompt, &state.config, max_tokens).await {
+        match run_vl(
+            &req.image,
+            image_mime_type,
+            &vl_prompt,
+            &state.config,
+            max_tokens,
+        )
+        .await
+        {
             Ok((mut result, tokens)) => {
                 if is_question {
                     result.prompt_answer = Some(result.description.clone());
@@ -849,7 +1113,10 @@ async fn vision_analyze_handler(
             }
             Err(e) => {
                 tracing::warn!("VL failed, falling back to OCR only: {}", e);
-                state.metrics.vl_fallback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                state
+                    .metrics
+                    .vl_fallback_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 None
             }
         }
@@ -858,7 +1125,11 @@ async fn vision_analyze_handler(
     };
 
     let mode_used = if vision_result.is_some() {
-        if req.mode == "auto" { "hybrid" } else { "describe" }
+        if req.mode == "auto" {
+            "hybrid"
+        } else {
+            "describe"
+        }
     } else {
         "text"
     };
@@ -892,24 +1163,40 @@ async fn vision_analyze_handler(
         }
     }
 
-    state.metrics.total_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    state.metrics.vision_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .metrics
+        .total_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .metrics
+        .vision_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     update_avg_latency(&state.metrics, elapsed);
-    record_histogram(&state.metrics.vision_duration_buckets, elapsed as f64 / 1000.0, &DURATION_BUCKETS);
-    state.metrics.vision_duration_sum_ms.fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
-    state.metrics.vision_duration_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    record_histogram(
+        &state.metrics.vision_duration_buckets,
+        elapsed as f64 / 1000.0,
+        &DURATION_BUCKETS,
+    );
+    state
+        .metrics
+        .vision_duration_sum_ms
+        .fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+    state
+        .metrics
+        .vision_duration_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(t) = tokens_used {
-        state.metrics.vl_tokens_used.fetch_add(t as u64, std::sync::atomic::Ordering::Relaxed);
+        state
+            .metrics
+            .vl_tokens_used
+            .fetch_add(t as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     Ok(warp::reply::json(&response))
 }
 
-async fn ocr_handler(
-    body: bytes::Bytes,
-    state: AppState,
-) -> Result<impl Reply, Rejection> {
+async fn ocr_handler(body: bytes::Bytes, state: AppState) -> Result<impl Reply, Rejection> {
     let start = Instant::now();
 
     let req: OcrRequest = serde_json::from_slice(&body)
@@ -917,14 +1204,17 @@ async fn ocr_handler(
 
     let image_bytes = base64::engine::general_purpose::STANDARD
         .decode(&req.image)
-        .map_err(|e| warp::reject::custom(AppError::BadRequest(format!("Invalid base64: {}", e))))?;
+        .map_err(|e| {
+            warp::reject::custom(AppError::BadRequest(format!("Invalid base64: {}", e)))
+        })?;
 
-    validate_image_format(&image_bytes)
-        .map_err(warp::reject::custom)?;
+    validate_image_size(&image_bytes).map_err(warp::reject::custom)?;
+    validate_image_format(&image_bytes).map_err(warp::reject::custom)?;
 
-    let ocr_result = run_ocr_with_fallback(&image_bytes, &req.ocr_lang, state.config.enable_paddleocr)
-        .await
-        .map_err(warp::reject::custom)?;
+    let ocr_result =
+        run_ocr_with_fallback(&image_bytes, &req.ocr_lang, state.config.enable_paddleocr)
+            .await
+            .map_err(warp::reject::custom)?;
 
     let elapsed = start.elapsed().as_millis() as u64;
 
@@ -939,16 +1229,42 @@ async fn ocr_handler(
         elapsed_ms: elapsed,
     };
 
-    state.metrics.total_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    state.metrics.ocr_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .metrics
+        .total_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .metrics
+        .ocr_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     update_avg_latency(&state.metrics, elapsed);
-    record_histogram(&state.metrics.ocr_duration_buckets, elapsed as f64 / 1000.0, &DURATION_BUCKETS);
-    state.metrics.ocr_duration_sum_ms.fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
-    state.metrics.ocr_duration_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    record_histogram(&state.metrics.tesseract_confidence_buckets, ocr_result.avg_confidence as f64, &CONFIDENCE_BUCKETS);
-    state.metrics.tesseract_confidence_sum.fetch_add((ocr_result.avg_confidence * 1000.0) as u64, std::sync::atomic::Ordering::Relaxed);
-    state.metrics.tesseract_confidence_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    record_histogram(
+        &state.metrics.ocr_duration_buckets,
+        elapsed as f64 / 1000.0,
+        &DURATION_BUCKETS,
+    );
+    state
+        .metrics
+        .ocr_duration_sum_ms
+        .fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+    state
+        .metrics
+        .ocr_duration_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    record_histogram(
+        &state.metrics.tesseract_confidence_buckets,
+        ocr_result.avg_confidence as f64,
+        &CONFIDENCE_BUCKETS,
+    );
+    state.metrics.tesseract_confidence_sum.fetch_add(
+        (ocr_result.avg_confidence * 1000.0) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    state
+        .metrics
+        .tesseract_confidence_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     Ok(warp::reply::json(&response))
 }
@@ -958,18 +1274,24 @@ async fn ocr_handler(
 fn update_avg_latency(metrics: &Metrics, latency_ms: u64) {
     let alpha: f64 = 0.1;
     loop {
-        let current = metrics.avg_latency_ms.load(std::sync::atomic::Ordering::Relaxed) as f64;
+        let current = metrics
+            .avg_latency_ms
+            .load(std::sync::atomic::Ordering::Relaxed) as f64;
         let new_val = if current == 0.0 {
             latency_ms as f64
         } else {
             current * (1.0 - alpha) + (latency_ms as f64) * alpha
         };
-        if metrics.avg_latency_ms.compare_exchange(
-            current as u64,
-            new_val as u64,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        ).is_ok() {
+        if metrics
+            .avg_latency_ms
+            .compare_exchange(
+                current as u64,
+                new_val as u64,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
             break;
         }
     }
@@ -1001,20 +1323,45 @@ struct MetricsResponse {
 }
 
 async fn metrics_handler(state: AppState) -> Result<impl Reply, Rejection> {
-    let total = state.metrics.total_requests.load(std::sync::atomic::Ordering::Relaxed);
-    let cache_hits = state.metrics.cache_hits.load(std::sync::atomic::Ordering::Relaxed);
-    let cache_misses = state.metrics.cache_misses.load(std::sync::atomic::Ordering::Relaxed);
+    let total = state
+        .metrics
+        .total_requests
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let cache_hits = state
+        .metrics
+        .cache_hits
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let cache_misses = state
+        .metrics
+        .cache_misses
+        .load(std::sync::atomic::Ordering::Relaxed);
     let total_cache = cache_hits + cache_misses;
 
     let response = MetricsResponse {
         total_requests: total,
-        ocr_requests: state.metrics.ocr_requests.load(std::sync::atomic::Ordering::Relaxed),
-        vision_requests: state.metrics.vision_requests.load(std::sync::atomic::Ordering::Relaxed),
+        ocr_requests: state
+            .metrics
+            .ocr_requests
+            .load(std::sync::atomic::Ordering::Relaxed),
+        vision_requests: state
+            .metrics
+            .vision_requests
+            .load(std::sync::atomic::Ordering::Relaxed),
         cache_hits,
         cache_misses,
-        rate_limited: state.metrics.rate_limited.load(std::sync::atomic::Ordering::Relaxed),
-        cache_hit_rate: if total_cache > 0 { cache_hits as f32 / total_cache as f32 } else { 0.0 },
-        avg_latency_ms: state.metrics.avg_latency_ms.load(std::sync::atomic::Ordering::Relaxed),
+        rate_limited: state
+            .metrics
+            .rate_limited
+            .load(std::sync::atomic::Ordering::Relaxed),
+        cache_hit_rate: if total_cache > 0 {
+            cache_hits as f32 / total_cache as f32
+        } else {
+            0.0
+        },
+        avg_latency_ms: state
+            .metrics
+            .avg_latency_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
     };
 
     Ok(warp::reply::json(&response))
@@ -1031,88 +1378,278 @@ async fn prometheus_metrics_handler(state: AppState) -> Result<impl Reply, Rejec
 
     use std::fmt::Write;
 
-    writeln!(buf, "# HELP lunarvision_requests_total Total requests by endpoint and status.").unwrap();
+    writeln!(
+        buf,
+        "# HELP lunarvision_requests_total Total requests by endpoint and status."
+    )
+    .unwrap();
     writeln!(buf, "# TYPE lunarvision_requests_total counter").unwrap();
-    writeln!(buf, "lunarvision_requests_total{{endpoint=\"ocr\",status=\"success\"}} {}", m.ocr_requests.load(o)).unwrap();
-    writeln!(buf, "lunarvision_requests_total{{endpoint=\"vision\",status=\"success\"}} {}", m.vision_requests.load(o)).unwrap();
+    writeln!(
+        buf,
+        "lunarvision_requests_total{{endpoint=\"ocr\",status=\"success\"}} {}",
+        m.ocr_requests.load(o)
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "lunarvision_requests_total{{endpoint=\"vision\",status=\"success\"}} {}",
+        m.vision_requests.load(o)
+    )
+    .unwrap();
 
     writeln!(buf, "# HELP lunarvision_cache_hits_total Cache hits.").unwrap();
     writeln!(buf, "# TYPE lunarvision_cache_hits_total counter").unwrap();
     writeln!(buf, "lunarvision_cache_hits_total {}", m.cache_hits.load(o)).unwrap();
     writeln!(buf, "# HELP lunarvision_cache_misses_total Cache misses.").unwrap();
     writeln!(buf, "# TYPE lunarvision_cache_misses_total counter").unwrap();
-    writeln!(buf, "lunarvision_cache_misses_total {}", m.cache_misses.load(o)).unwrap();
-    writeln!(buf, "# HELP lunarvision_rate_limited_total Requests rejected by rate limiter.").unwrap();
+    writeln!(
+        buf,
+        "lunarvision_cache_misses_total {}",
+        m.cache_misses.load(o)
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "# HELP lunarvision_rate_limited_total Requests rejected by rate limiter."
+    )
+    .unwrap();
     writeln!(buf, "# TYPE lunarvision_rate_limited_total counter").unwrap();
-    writeln!(buf, "lunarvision_rate_limited_total {}", m.rate_limited.load(o)).unwrap();
-    writeln!(buf, "# HELP lunarvision_vl_tokens_used_total Total tokens consumed by VL backend.").unwrap();
+    writeln!(
+        buf,
+        "lunarvision_rate_limited_total {}",
+        m.rate_limited.load(o)
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "# HELP lunarvision_vl_tokens_used_total Total tokens consumed by VL backend."
+    )
+    .unwrap();
     writeln!(buf, "# TYPE lunarvision_vl_tokens_used_total counter").unwrap();
-    writeln!(buf, "lunarvision_vl_tokens_used_total {}", m.vl_tokens_used.load(o)).unwrap();
-    writeln!(buf, "# HELP lunarvision_vl_fallback_total VL failures that fell back to OCR only.").unwrap();
+    writeln!(
+        buf,
+        "lunarvision_vl_tokens_used_total {}",
+        m.vl_tokens_used.load(o)
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "# HELP lunarvision_vl_fallback_total VL failures that fell back to OCR only."
+    )
+    .unwrap();
     writeln!(buf, "# TYPE lunarvision_vl_fallback_total counter").unwrap();
-    writeln!(buf, "lunarvision_vl_fallback_total {}", m.vl_fallback_count.load(o)).unwrap();
+    writeln!(
+        buf,
+        "lunarvision_vl_fallback_total {}",
+        m.vl_fallback_count.load(o)
+    )
+    .unwrap();
 
     writeln!(buf, "# HELP lunarvision_errors_total Errors by type.").unwrap();
     writeln!(buf, "# TYPE lunarvision_errors_total counter").unwrap();
-    writeln!(buf, "lunarvision_errors_total{{type=\"unauthorized\"}} {}", m.errors_unauthorized.load(o)).unwrap();
-    writeln!(buf, "lunarvision_errors_total{{type=\"bad_request\"}} {}", m.errors_bad_request.load(o)).unwrap();
-    writeln!(buf, "lunarvision_errors_total{{type=\"ocr_engine_failure\"}} {}", m.errors_ocr_engine.load(o)).unwrap();
-    writeln!(buf, "lunarvision_errors_total{{type=\"rate_limited\"}} {}", m.errors_rate_limited.load(o)).unwrap();
-    writeln!(buf, "lunarvision_errors_total{{type=\"unsupported_media\"}} {}", m.errors_unsupported_media.load(o)).unwrap();
-    writeln!(buf, "lunarvision_errors_total{{type=\"internal\"}} {}", m.errors_internal.load(o)).unwrap();
+    writeln!(
+        buf,
+        "lunarvision_errors_total{{type=\"unauthorized\"}} {}",
+        m.errors_unauthorized.load(o)
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "lunarvision_errors_total{{type=\"bad_request\"}} {}",
+        m.errors_bad_request.load(o)
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "lunarvision_errors_total{{type=\"ocr_engine_failure\"}} {}",
+        m.errors_ocr_engine.load(o)
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "lunarvision_errors_total{{type=\"rate_limited\"}} {}",
+        m.errors_rate_limited.load(o)
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "lunarvision_errors_total{{type=\"unsupported_media\"}} {}",
+        m.errors_unsupported_media.load(o)
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "lunarvision_errors_total{{type=\"internal\"}} {}",
+        m.errors_internal.load(o)
+    )
+    .unwrap();
 
     let cache_hits = m.cache_hits.load(o);
     let cache_misses = m.cache_misses.load(o);
     let total_cache = cache_hits + cache_misses;
 
-    writeln!(buf, "# HELP lunarvision_cache_hit_ratio Cache effectiveness (hits / total lookups).").unwrap();
+    writeln!(
+        buf,
+        "# HELP lunarvision_cache_hit_ratio Cache effectiveness (hits / total lookups)."
+    )
+    .unwrap();
     writeln!(buf, "# TYPE lunarvision_cache_hit_ratio gauge").unwrap();
-    writeln!(buf, "lunarvision_cache_hit_ratio {}", if total_cache > 0 { cache_hits as f64 / total_cache as f64 } else { 0.0 }).unwrap();
-    writeln!(buf, "# HELP lunarvision_cache_entries Current entries in the response cache.").unwrap();
+    writeln!(
+        buf,
+        "lunarvision_cache_hit_ratio {}",
+        if total_cache > 0 {
+            cache_hits as f64 / total_cache as f64
+        } else {
+            0.0
+        }
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "# HELP lunarvision_cache_entries Current entries in the response cache."
+    )
+    .unwrap();
     writeln!(buf, "# TYPE lunarvision_cache_entries gauge").unwrap();
     writeln!(buf, "lunarvision_cache_entries {}", state.cache.len()).unwrap();
-    writeln!(buf, "# HELP lunarvision_vl_available VL backend configured (1) or not (0).").unwrap();
+    writeln!(
+        buf,
+        "# HELP lunarvision_vl_available VL backend configured (1) or not (0)."
+    )
+    .unwrap();
     writeln!(buf, "# TYPE lunarvision_vl_available gauge").unwrap();
-    writeln!(buf, "lunarvision_vl_available {}", if state.config.vl_url.is_some() { 1 } else { 0 }).unwrap();
+    writeln!(
+        buf,
+        "lunarvision_vl_available {}",
+        if state.config.vl_url.is_some() { 1 } else { 0 }
+    )
+    .unwrap();
     writeln!(buf, "# HELP lunarvision_uptime_seconds Service uptime.").unwrap();
     writeln!(buf, "# TYPE lunarvision_uptime_seconds gauge").unwrap();
-    writeln!(buf, "lunarvision_uptime_seconds {}", state.start_time.elapsed().as_secs()).unwrap();
-    writeln!(buf, "# HELP lunarvision_avg_latency_ms Exponential moving average request latency.").unwrap();
+    writeln!(
+        buf,
+        "lunarvision_uptime_seconds {}",
+        state.start_time.elapsed().as_secs()
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "# HELP lunarvision_avg_latency_ms Exponential moving average request latency."
+    )
+    .unwrap();
     writeln!(buf, "# TYPE lunarvision_avg_latency_ms gauge").unwrap();
-    writeln!(buf, "lunarvision_avg_latency_ms {}", m.avg_latency_ms.load(o)).unwrap();
-    writeln!(buf, "# HELP lunarvision_rate_limit_per_second Configured rate limit.").unwrap();
+    writeln!(
+        buf,
+        "lunarvision_avg_latency_ms {}",
+        m.avg_latency_ms.load(o)
+    )
+    .unwrap();
+    writeln!(
+        buf,
+        "# HELP lunarvision_rate_limit_per_second Configured rate limit."
+    )
+    .unwrap();
     writeln!(buf, "# TYPE lunarvision_rate_limit_per_second gauge").unwrap();
-    writeln!(buf, "lunarvision_rate_limit_per_second {}", state.config.rate_limit_per_second).unwrap();
+    writeln!(
+        buf,
+        "lunarvision_rate_limit_per_second {}",
+        state.config.rate_limit_per_second
+    )
+    .unwrap();
 
     for (endpoint, buckets, sum, count) in [
-        ("ocr", &m.ocr_duration_buckets, &m.ocr_duration_sum_ms, &m.ocr_duration_count),
-        ("vision", &m.vision_duration_buckets, &m.vision_duration_sum_ms, &m.vision_duration_count),
+        (
+            "ocr",
+            &m.ocr_duration_buckets,
+            &m.ocr_duration_sum_ms,
+            &m.ocr_duration_count,
+        ),
+        (
+            "vision",
+            &m.vision_duration_buckets,
+            &m.vision_duration_sum_ms,
+            &m.vision_duration_count,
+        ),
     ] {
-        writeln!(buf, "# HELP lunarvision_request_duration_seconds Request latency distribution.").unwrap();
+        writeln!(
+            buf,
+            "# HELP lunarvision_request_duration_seconds Request latency distribution."
+        )
+        .unwrap();
         writeln!(buf, "# TYPE lunarvision_request_duration_seconds histogram").unwrap();
         for (i, &le) in DURATION_BUCKETS.iter().enumerate() {
-            let le_str = if le.is_infinite() { "+Inf".to_string() } else { le.to_string() };
+            let le_str = if le.is_infinite() {
+                "+Inf".to_string()
+            } else {
+                le.to_string()
+            };
             writeln!(buf, "lunarvision_request_duration_seconds_bucket{{endpoint=\"{endpoint}\",le=\"{le_str}\"}} {}", buckets[i].load(o)).unwrap();
         }
-        writeln!(buf, "lunarvision_request_duration_seconds_sum{{endpoint=\"{endpoint}\"}} {}", sum.load(o) as f64 / 1000.0).unwrap();
-        writeln!(buf, "lunarvision_request_duration_seconds_count{{endpoint=\"{endpoint}\"}} {}", count.load(o)).unwrap();
+        writeln!(
+            buf,
+            "lunarvision_request_duration_seconds_sum{{endpoint=\"{endpoint}\"}} {}",
+            sum.load(o) as f64 / 1000.0
+        )
+        .unwrap();
+        writeln!(
+            buf,
+            "lunarvision_request_duration_seconds_count{{endpoint=\"{endpoint}\"}} {}",
+            count.load(o)
+        )
+        .unwrap();
     }
 
     for (engine, buckets, sum, count) in [
-        ("tesseract", &m.tesseract_confidence_buckets, &m.tesseract_confidence_sum, &m.tesseract_confidence_count),
-        ("paddleocr", &m.paddleocr_confidence_buckets, &m.paddleocr_confidence_sum, &m.paddleocr_confidence_count),
+        (
+            "tesseract",
+            &m.tesseract_confidence_buckets,
+            &m.tesseract_confidence_sum,
+            &m.tesseract_confidence_count,
+        ),
+        (
+            "paddleocr",
+            &m.paddleocr_confidence_buckets,
+            &m.paddleocr_confidence_sum,
+            &m.paddleocr_confidence_count,
+        ),
     ] {
-        writeln!(buf, "# HELP lunarvision_ocr_confidence OCR engine confidence distribution.").unwrap();
+        writeln!(
+            buf,
+            "# HELP lunarvision_ocr_confidence OCR engine confidence distribution."
+        )
+        .unwrap();
         writeln!(buf, "# TYPE lunarvision_ocr_confidence histogram").unwrap();
         for (i, &le) in CONFIDENCE_BUCKETS.iter().enumerate() {
-            let le_str = if le.is_infinite() { "+Inf".to_string() } else { le.to_string() };
-            writeln!(buf, "lunarvision_ocr_confidence_bucket{{engine=\"{engine}\",le=\"{le_str}\"}} {}", buckets[i].load(o)).unwrap();
+            let le_str = if le.is_infinite() {
+                "+Inf".to_string()
+            } else {
+                le.to_string()
+            };
+            writeln!(
+                buf,
+                "lunarvision_ocr_confidence_bucket{{engine=\"{engine}\",le=\"{le_str}\"}} {}",
+                buckets[i].load(o)
+            )
+            .unwrap();
         }
-        writeln!(buf, "lunarvision_ocr_confidence_sum{{engine=\"{engine}\"}} {}", sum.load(o) as f64 / 1000.0).unwrap();
-        writeln!(buf, "lunarvision_ocr_confidence_count{{engine=\"{engine}\"}} {}", count.load(o)).unwrap();
+        writeln!(
+            buf,
+            "lunarvision_ocr_confidence_sum{{engine=\"{engine}\"}} {}",
+            sum.load(o) as f64 / 1000.0
+        )
+        .unwrap();
+        writeln!(
+            buf,
+            "lunarvision_ocr_confidence_count{{engine=\"{engine}\"}} {}",
+            count.load(o)
+        )
+        .unwrap();
     }
 
-    Ok(warp::reply::with_header(buf, "Content-Type", "text/plain; version=0.0.4; charset=utf-8"))
+    Ok(warp::reply::with_header(
+        buf,
+        "Content-Type",
+        "text/plain; version=0.0.4; charset=utf-8",
+    ))
 }
 
 async fn openapi_handler() -> Result<impl Reply, Rejection> {
@@ -1254,10 +1791,18 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(30);
-    let enable_paddleocr = std::env::var("ENABLE_PADDLEOCR").map(|v| v == "1" || v == "true").unwrap_or(false);
-    let enable_cache = std::env::var("ENABLE_CACHE").map(|v| v == "1" || v == "true").unwrap_or(true);
-    let enable_prometheus = std::env::var("ENABLE_PROMETHEUS").map(|v| v == "1" || v == "true").unwrap_or(true);
-    let cache_persist = std::env::var("CACHE_PERSIST").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let enable_paddleocr = std::env::var("ENABLE_PADDLEOCR")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    let enable_cache = std::env::var("ENABLE_CACHE")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(true);
+    let enable_prometheus = std::env::var("ENABLE_PROMETHEUS")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(true);
+    let cache_persist = std::env::var("CACHE_PERSIST")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
     let cache_dir = std::env::var("CACHE_DIR").ok().map(PathBuf::from);
     let rate_limit_per_second = std::env::var("RATE_LIMIT_PER_SECOND")
         .ok()
@@ -1280,7 +1825,10 @@ async fn main() {
         rate_limit_per_second,
     };
 
-    let quota = Quota::per_second(std::num::NonZeroU32::new(rate_limit_per_second).unwrap_or(std::num::NonZeroU32::new(10).unwrap()));
+    let quota = Quota::per_second(
+        std::num::NonZeroU32::new(rate_limit_per_second)
+            .unwrap_or(std::num::NonZeroU32::new(10).unwrap()),
+    );
     let rate_limiter = Arc::new(RateLimiter::direct(quota));
 
     let start_time = Instant::now();
@@ -1410,11 +1958,67 @@ async fn main() {
         .recover(handle_rejection);
 
     tracing::info!("Starting Vision Service on port {}", config.port);
-    tracing::info!("PaddleOCR fallback: {}, Cache: {}, Rate limit: {}/s",
-        config.enable_paddleocr, config.enable_cache, config.rate_limit_per_second);
+    tracing::info!(
+        "PaddleOCR fallback: {}, Cache: {}, Rate limit: {}/s",
+        config.enable_paddleocr,
+        config.enable_cache,
+        config.rate_limit_per_second
+    );
 
     let _ = health_state; // keep alive for the duration of main
-    warp::serve(routes)
-        .run(([0, 0, 0, 0], config.port))
-        .await;
+    warp::serve(routes).run(([0, 0, 0, 0], config.port)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_size_limit_applies_to_decoded_bytes() {
+        let max_size = vec![0; MAX_IMAGE_SIZE];
+        let oversized = vec![0; MAX_IMAGE_SIZE + 1];
+        assert!(validate_image_size(&max_size).is_ok());
+        assert!(matches!(
+            validate_image_size(&oversized),
+            Err(AppError::PayloadTooLarge { .. })
+        ));
+        assert!(MAX_BODY_SIZE > MAX_IMAGE_SIZE as u64);
+    }
+
+    #[test]
+    fn vl_data_url_uses_detected_mime_without_trailing_delimiter() {
+        assert_eq!(
+            image_data_url("image/jpeg", "AQID"),
+            "data:image/jpeg;base64,AQID"
+        );
+    }
+
+    #[test]
+    fn image_format_detection_returns_matching_mime_type() {
+        assert_eq!(
+            image_mime_type(b"\x89PNG\r\n\x1a\n").expect("detect PNG"),
+            "image/png"
+        );
+        assert_eq!(
+            image_mime_type(b"\xff\xd8\xff").expect("detect JPEG"),
+            "image/jpeg"
+        );
+        assert_eq!(
+            image_mime_type(b"RIFF\x00\x00\x00\x00WEBP\x00").expect("detect WebP"),
+            "image/webp"
+        );
+        assert_eq!(
+            image_mime_type(b"II\x2a\x00").expect("detect TIFF"),
+            "image/tiff"
+        );
+    }
+
+    #[test]
+    fn persistent_cache_paths_are_key_specific() {
+        let temp_dir = tempfile::tempdir().expect("create cache directory");
+        let cache_dir = Some(temp_dir.path().to_path_buf());
+        let first = cache_file_path(&cache_dir, "first").expect("first cache path");
+        let second = cache_file_path(&cache_dir, "second").expect("second cache path");
+        assert_ne!(first, second);
+    }
 }
