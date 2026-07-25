@@ -1,10 +1,11 @@
 # Bug tracker
 
-Reconciled against source revision `51ae5a8` on **2026-07-20**. All 38 Markdown
-documents in this tracker (36 report/pointer files plus two README files) were
-checked against current source, scripts, tests, and reachable Git history.
-Closely related reports remain grouped; their original filenames and technical
-evidence are named in the canonical documents.
+Reconciled against current source on **2026-07-25** (prior pass against revision
+`51ae5a8` on 2026-07-20). All 38 Markdown documents in this tracker (36
+report/pointer files plus two README files) were checked against current source,
+scripts, tests, and reachable Git history. Closely related reports remain
+grouped; their original filenames and technical evidence are named in the
+canonical documents.
 
 **Status vocabulary:** `FIXED` means the current tree contains the stated fix;
 `OPEN` means the issue remains; `PARTIAL` means a fix covers only part of the
@@ -19,7 +20,7 @@ Some superseded files remain as compatibility pointers, including pointers in
 | Document | Status | Current finding | Verification |
 |---|---|---|---|
 | [BUG-agent-worker-lifecycle.md](BUG-agent-worker-lifecycle.md) | PARTIAL | `wait=true` still occupies the originating turn; priority interrupts are handled and ordinary messages are deferred in a bounded FIFO; the old completion race is fixed | `job.rs`, `agent_loop.rs`, `dispatch.rs`, `job_monitor.rs`, interrupt regressions; source-only |
-| [BUG-e2e-test-bugs.md](BUG-e2e-test-bugs.md) | PARTIAL | Bootstrap/tool tests fixed; Gmail OAuth fixture retired; clipboard test remains unverified | `agent_loop.rs`, E2E scenarios; current environment lacks both Pytest and Playwright |
+| [BUG-e2e-test-bugs.md](BUG-e2e-test-bugs.md) | PARTIAL | Bootstrap/tool tests fixed; Gmail OAuth fixture retired; bootstrap E2E tests are now `#[ignore]`'d (harness race); clipboard test remains unverified | `agent_loop.rs`, E2E scenarios; current environment lacks both Pytest and Playwright |
 | [BUG-external-worker-config-persistence.md](BUG-external-worker-config-persistence.md) | PARTIAL | Provisioning and in-memory token merges work; full TOML rewrites can still drop worker bearer tokens | `lunarwing-mt-admin.sh`, `settings.rs`, `commands.rs`, `config/sandbox.rs` |
 | [BUG-mt-nanocode-image-size.md](BUG-mt-nanocode-image-size.md) | OPEN | Large Nanocode image is copied per tenant with `save|load` | `lunarwing-mt-admin.sh:606-649,3709-3727`, Dockerfile |
 | [BUG-kawarimi-import-flag-parity.md](BUG-kawarimi-import-flag-parity.md) | OPEN | Import rejects an explicit `--with-wasm` although it adds the flag internally | `ic/scripts/import-tenant.sh:51-69,283-289`; fresh related flag harness |
