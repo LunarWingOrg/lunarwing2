@@ -5,6 +5,9 @@
 
 **Open TODOs (v2.0.3.0) — To be done before release**
 
+### Rares = odd (1, 3, 5, 7, ...)
+### AJ = even (2, 4, 6, 8, ...)
+
 ---
 1. [x] Bump crate versions. they are at 2.0.2. we need bump to 2.0.3
 2. [x] check cicd logic and suggest improvements in a new doc in docs/ops
@@ -13,9 +16,7 @@
 5. [x] (S) get back to previous refactor mt admin idea. see the section of docs/proposals/MT-ADMIN-DECOMPOSITION.md — review notes section of: `docs/ops/KUMOGAKURE_RECENT_REV_T.md` - you will NOT begin ANY work on this yet. you will simply edit the document already created under docs/proposals called `MT-ADMIN-DECOMPOSITION.md`
 <<<<<<< docs/ops/AGENT_GOALS_2.0.3.0.md
 6. [x] continue to work on kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. SEE: SECTION: hermes_kawarimi — review notes in docs/ops/KUMOGAKURE_RECENT_REV_T.md for suggestedm improvements/concerns
-7. [x] Work on weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued. FEEDBACK FROM LAST TIME: 19:34:19 wrench │ ### Verdict
->>>>>>> docs/ops/AGENT_GOALS_2.0.3.0.md
-One real bug found: OpenRC weechat stop() invokes the helper as root instead of the tenant user, which will fail to find the tmux socket. Medium severity — the graceful stop silently becomes a no-op on OpenRC, though the old kill-session behavior would also be broken (same root-cause: missing su). The systemd path is unaffected. Otherwise: solid feature work. The weechat buffer restore is well-designed (proper wrapper script, good fallback chain, both init systems covered, renderer tests). The test-deferral approach is pragmatic and well-documented. You may attempt to use the following work from failed/partial work on these salvaged, incomplete branches: { rarity/item-16-20260722-1201 } { rarity/item-16-20260722-2123 } { rarity/item-16-20260723-0000 }
+7. [x] Work on weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued. FEEDBACK FROM LAST TIME: 19:34:19 wrench │ ### Verdict: One real bug found: OpenRC weechat stop() invokes the helper as root instead of the tenant user, which will fail to find the tmux socket. Medium severity — the graceful stop silently becomes a no-op on OpenRC, though the old kill-session behavior would also be broken (same root-cause: missing su). The systemd path is unaffected. Otherwise: solid feature work. The weechat buffer restore is well-designed (proper wrapper script, good fallback chain, both init systems covered, renderer tests). The test-deferral approach is pragmatic and well-documented. You may attempt to use the following work from failed/partial work on these salvaged, incomplete branches: { rarity/item-16-20260722-1201 } { rarity/item-16-20260722-2123 } { rarity/item-16-20260723-0000 }
 8. [x] Inspect status of cargo crates. Suggest ones that should be updated. put in a file. — see `docs/ops/CRATE_AUDIT_v2.0.3.0.md`
 9. [x] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. In-place configuration updates were completed on 2026-07-24. Reference the branch here for prior/failed/unverified attempt: rarity/item-8-20260723-0855
     <details>
@@ -63,12 +64,12 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
     </details>
 10. [ ] dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the branch: rarity/item-20-20260722-1501
 11. [x] review recent changes in onboard ui and see if there are issues
-12. [ ] review kawarimi adapter (item 15)
-13. [ ] go over release notes for 2.0.2.0 and see what else still needs to be added to next release, see documents about this if unsure of each item
+12. [ ] review kawarimi adapter. make improvements (only if necessary)
+13. [ ] go over release notes for 2.0.2.0 and see what else still needs to be added to next release, see documents about this if unsure of each item. create new doc under docs/proposals for items that should be included in 2.0.3.0 (you must focus on enginev2 related fixes/polishing)
 14. [ ] Refactor mt admin, see documents about this if unsure
-15. [ ] XMPP file transfer — remaining polish (further hardening), see documents about this if unsure
-16. [ ] Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure
-17. [ ] Gut proprietary tunnel providers and add support for netbird
+15. [ ] Review recent work on XMPP file transfer — remaining polish (further hardening), see documents about this if unsure. create new doc detailing findings in docs/ops
+16. [ ] Review recent work on Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure. create new doc detailing findings in docs/ops
+17. [ ] Review recent changes for: Gut proprietary tunnel providers and add support for netbird. improve if necessary
 18. [ ] review darkirc key exchange implementation
 19. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
 20. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
@@ -79,7 +80,6 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
 25. [ ] update docs/README.md
 26. [ ] update README.md at repo root
 27. [ ] come up with codename ideas for release. put into doc.
-28. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.3.0 explaining all relevant changes since v2.0.2.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.3.0.md and should be written to the ROOT of the repo
-29. [ ] Improve accuracy of the first draft of release notes (from previous task) - RELEASE-v2.0.3.0.md
+28. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.3.0 explaining all relevant changes since v2.0.2.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.3.0.md and should be written to the ROOT of the repo. When complete with draft, move on to another task, which is: Improve accuracy of the first draft of release notes (from previous task) - RELEASE-v2.0.3.0.md
 
 ---
