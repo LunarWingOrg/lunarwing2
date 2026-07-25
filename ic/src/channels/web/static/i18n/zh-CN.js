@@ -20,6 +20,7 @@ I18n.register('zh-CN', {
   'chat.caveponyUltra': 'Cavepony：极简',
   'chat.caveponyPony': 'Cavepony：小马',
   'chat.caveponyCanterlot': 'Cavepony：坎特洛特',
+  'chat.caveponyTonySoprano': 'Cavepony：托尼·索普拉诺',
   'chat.caveponySaved': 'Cavepony 偏好已保存',
   'chat.caveponySaveFailed': '无法保存 Cavepony 偏好：{message}',
   'chat.caveponySaving': '正在保存 Cavepony 偏好...',
