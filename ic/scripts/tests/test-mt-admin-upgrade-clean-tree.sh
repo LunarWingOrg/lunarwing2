@@ -11,6 +11,7 @@ repo="$fixture/repo"
 lockfile="$repo/ic/channels-src/xmpp/Cargo.lock"
 tracked_file="$repo/README.md"
 failures=0
+fail_checkout=false
 
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1"; failures=$((failures + 1)); }
@@ -18,6 +19,15 @@ fail() { printf 'FAIL: %s\n' "$1"; failures=$((failures + 1)); }
 sudo() {
   [[ "${1:-}" == "-u" ]] || return 64
   shift 2
+  if [[ "$fail_checkout" == "true" && "${1:-}" == "git" ]]; then
+    local arg
+    for arg in "$@"; do
+      if [[ "$arg" == "checkout" ]]; then
+        printf 'fatal: simulated checkout failure\n' >&2
+        return 128
+      fi
+    done
+  fi
   "$@"
 }
 
@@ -48,9 +58,7 @@ git -C "$fixture/target-work" -c user.name=fixture -c user.email=fixture@example
 git -C "$fixture/target-work" push -q origin invalid-layout
 fixture_invalid_commit="$(git -C "$fixture/target-work" rev-parse HEAD)"
 git -C "$repo" push -q origin HEAD:refs/heads/moving
-git -C "$repo" branch busy
-git -C "$repo" worktree add -q "$fixture/busy-worktree" busy
-git -C "$repo" push -q origin busy
+git -C "$repo" push -q origin HEAD:refs/heads/checkout-failure
 
 printf 'build-regenerated lock\n' >"$lockfile"
 mkdir -p "$repo/env" "$repo/opencode-workspace" "$repo/state"
@@ -158,15 +166,17 @@ else
   fail "upgrade target-collision error lacked details: $output"
 fi
 
-if output="$(upgrade_tenant fixture busy '' false false 2>&1)"; then
-  fail 'upgrade should reject target branch used by another worktree'
+fail_checkout=true
+if output="$(upgrade_tenant fixture checkout-failure '' false false 2>&1)"; then
+  fail 'upgrade should reject failed checkout'
 elif [[ ! -e "$stopped_marker" || ! -e "$restarted_marker" ]]; then
-  fail 'upgrade did not restart tenant after checkout ref update failed'
-elif [[ "$output" == *'already used by worktree'* && "$output" == *'previous tenant version restarted'* ]]; then
+  fail 'upgrade did not restart tenant after checkout failed'
+elif [[ "$output" == *'simulated checkout failure'* && "$output" == *'previous tenant version restarted'* ]]; then
   pass 'actual checkout failure restarts previous tenant version'
 else
-  fail "upgrade checkout-ref error lacked recovery result: $output"
+  fail "upgrade checkout error lacked recovery result: $output"
 fi
+fail_checkout=false
 
 rm -f "$stopped_marker" "$restarted_marker"
 move_ref_on_stop=true
