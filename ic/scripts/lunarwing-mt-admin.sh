@@ -342,10 +342,10 @@ Commands:
   render-units <name>             Re-render a tenant's service units from the current
                                   generator (no restart; applies init-script changes)
   upgrade-tenant <name> --target <ref>
-                                  In-place upgrade: backup, stop, git fetch + checkout
-                                  <ref> (as the tenant user), rebuild with WASM,
-                                  re-render units, patch env, start. Long-running —
-                                  run inside tmux.
+                                  In-place upgrade: backup, fetch, clean-tree gate,
+                                  stop, checkout <ref> (as tenant user), rebuild
+                                  with WASM, re-render units, patch env, start.
+                                  Long-running — run inside tmux.
     --source-repo <path>           Point the tenant's git origin at this repo first
     --no-backup                    Skip the pre-upgrade Postgres backup
     --skip-render                  Keep existing unit files (run render-units later;
@@ -6701,12 +6701,90 @@ restart_tenant() {
   start_tenant "$name"
 }
 
-# In-place tenant upgrade: composes the verified sequence (backup -> stop ->
-# fetch/checkout as the tenant user -> rebuild with WASM -> re-render units ->
-# patch env -> start). The verbs it calls dispatch OpenRC/systemd themselves,
-# so this works on any supported init system. See
+# Cargo builds can refresh tracked lockfiles in nested standalone crates. Restore
+# them only when they are the sole tracked changes; otherwise preserve everything
+# and fail. Untracked tenant runtime directories do not block checkout.
+prepare_tenant_checkout() {
+  local name="$1" lw_root="$2" target_ref="$3"
+  local tgit=(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root")
+  local dirty dirty_locks staged_changes other_unstaged checkout_error
+
+  if ! dirty="$("${tgit[@]}" status --short --untracked-files=no)"; then
+    die "failed to inspect tracked changes in $lw_root"
+  fi
+  if [[ -n "$dirty" ]]; then
+    if ! dirty_locks="$("${tgit[@]}" diff --name-only -- ':(glob)**/Cargo.lock')" \
+      || ! staged_changes="$("${tgit[@]}" diff --cached --name-only)" \
+      || ! other_unstaged="$("${tgit[@]}" diff --name-only -- . ':(exclude,glob)**/Cargo.lock')"; then
+      die "failed to classify tracked changes in $lw_root"
+    fi
+
+    if [[ -n "$dirty_locks" && -z "$staged_changes" && -z "$other_unstaged" ]]; then
+      say "restoring build-regenerated Cargo.lock files before checkout:"
+      while IFS= read -r lockfile; do
+        say "  $lockfile"
+      done <<<"$dirty_locks"
+      "${tgit[@]}" restore --worktree -- ':(glob)**/Cargo.lock' \
+        || die "failed to restore build-regenerated Cargo.lock files"
+    fi
+
+    if ! dirty="$("${tgit[@]}" status --short --untracked-files=no)"; then
+      die "failed to inspect tracked changes in $lw_root"
+    fi
+  fi
+  if [[ -n "$dirty" ]]; then
+    say "tracked changes still present in tenant checkout:"
+    while IFS= read -r changed; do
+      say "  $changed"
+    done <<<"$dirty"
+    die "checkout $lw_root has tracked changes; commit or stash them, then re-run (tenant was not stopped)"
+  fi
+
+  if ! checkout_error="$("${tgit[@]}" read-tree --dry-run -m -u HEAD "$target_ref" 2>&1)"; then
+    say "target checkout preflight failed:"
+    while IFS= read -r detail; do
+      say "  $detail"
+    done <<<"$checkout_error"
+    die "checkout $target_ref would not be safe (tenant was not stopped)"
+  fi
+}
+
+recover_failed_tenant_checkout() {
+  local name="$1" lw_root="$2" target="$3" previous_commit="$4"
+  local tgit=(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root")
+  local current_commit dirty
+
+  if current_commit="$("${tgit[@]}" rev-parse --verify HEAD 2>/dev/null)" \
+    && dirty="$("${tgit[@]}" status --short --untracked-files=no 2>/dev/null)" \
+    && [[ "$current_commit" == "$previous_commit" && -z "$dirty" ]]; then
+    say "checkout failed before changing tracked tree; restarting previous tenant version ..."
+    if (start_tenant "$name"); then
+      die "git checkout $target failed; previous tenant version restarted"
+    fi
+    die "git checkout $target failed; tracked tree is unchanged but automatic tenant restart failed"
+  fi
+
+  die "git checkout $target failed after repository state changed; tenant remains stopped for inspection"
+}
+
+# In-place tenant upgrade: composes the verified sequence (backup -> fetch ->
+# clean-tree gate -> stop -> checkout as the tenant user -> rebuild with WASM ->
+# re-render units -> patch env -> start). The verbs it calls dispatch
+# OpenRC/systemd themselves, so this works on any supported init system. See
 # docs/ops/TENANT-RENAME-MIGRATION-1.1.9.md for the 1.1.9 rename specifics.
 upgrade_tenant() {
+  local name="$1"
+  local upgrade_lock_fd
+  say "acquiring tenant upgrade lock ..."
+  exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
+    || die "failed to open tenant upgrade lock"
+  flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
+  upgrade_tenant_locked "$@"
+  flock -u "$upgrade_lock_fd" || die "failed to release tenant upgrade lock"
+  exec {upgrade_lock_fd}>&-
+}
+
+upgrade_tenant_locked() {
   local name="$1" target="$2" source_repo="$3" do_backup="$4" do_render="$5"
   local lw_root repo
   lw_root="$(tenant_lw_root "$name")"
@@ -6738,18 +6816,41 @@ upgrade_tenant() {
     || "${tgit[@]}" rev-parse --verify --quiet "origin/${target}^{commit}" >/dev/null 2>&1 \
     || die "target ref '$target' not found after fetch (need a branch, tag, or commit reachable from origin)"
 
+  local checkout_ref target_commit
+  checkout_ref="$target"
+  if "${tgit[@]}" rev-parse --verify --quiet "refs/remotes/origin/$target" >/dev/null 2>&1; then
+    checkout_ref="origin/$target"
+  fi
+  target_commit="$("${tgit[@]}" rev-parse --verify "${checkout_ref}^{commit}")" \
+    || die "failed to resolve target ref '$target'"
+
+  local build_lock_fd migrations_type previous_commit
+  say "acquiring build lock for checkout ..."
+  exec {build_lock_fd}>"$BUILD_LOCK" || die "failed to open build lock for checkout"
+  flock -x "$build_lock_fd" || die "failed to acquire build lock for checkout"
+  prepare_tenant_checkout "$name" "$lw_root" "$target_commit"
+  migrations_type="$("${tgit[@]}" cat-file -t "${target_commit}:ic/migrations" 2>/dev/null || true)"
+  [[ "$migrations_type" == "tree" ]] \
+    || die "target ref '$target' has no ic/migrations directory (tenant was not stopped)"
+
+  previous_commit="$("${tgit[@]}" rev-parse --verify HEAD)" \
+    || die "failed to record current tenant commit"
   stop_tenant "$name"
 
-  say "checking out $target (as $name) ..."
-  if "${tgit[@]}" rev-parse --verify --quiet "refs/remotes/origin/$target" >/dev/null 2>&1; then
-    # Branch on origin: (re)create the local branch on it so repeat upgrades
-    # of the same branch move forward instead of reusing a stale local tip.
-    "${tgit[@]}" checkout -B "$target" "origin/$target" || die "git checkout $target failed"
+  say "checking out $target at $target_commit (as $name) ..."
+  if [[ "$checkout_ref" != "$target" ]]; then
+    # Branch on origin: (re)create the local branch on the pinned fetched
+    # commit so concurrent ref updates cannot change the deployed source.
+    "${tgit[@]}" checkout -B "$target" "$target_commit" \
+      || recover_failed_tenant_checkout "$name" "$lw_root" "$target" "$previous_commit"
   else
-    "${tgit[@]}" checkout "$target" || die "git checkout $target failed"
+    "${tgit[@]}" checkout "$target_commit" \
+      || recover_failed_tenant_checkout "$name" "$lw_root" "$target" "$previous_commit"
   fi
-  [[ -d "$repo/migrations" ]] || die "ic/migrations missing after checkout — wrong ref? Aborting before build."
+  [[ -d "$repo/migrations" ]] || die "ic/migrations missing after checkout — wrong ref?"
   say "  now at: $("${tgit[@]}" describe --tags --always 2>/dev/null)"
+  flock -u "$build_lock_fd" || die "failed to release build lock after checkout"
+  exec {build_lock_fd}>&-
 
   build_tenant "$name" "true" "false" "false" "false" "false" "true"
 
