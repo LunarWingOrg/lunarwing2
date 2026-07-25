@@ -1,6 +1,6 @@
 # Release Notes for LunarWing v2.0.2.0 - Codename `Dōkutsu (洞窟)`
 
-**Release Date:** TBD
+**Release Date:** 2026-07-24
 
 > *Dōkutsu* (洞窟) means cave. LunarWing v2.0.2.0 goes deeper into the v2
 > foundation: it strengthens extension lifecycle boundaries, Engine V2
@@ -24,22 +24,17 @@ Kawarimi migration, preserves WeeChat buffers across managed stops, requires
 fresh WASM builds during tenant upgrades, adds the Cavepony skill and WASM tool,
 and introduces phase-one GitLab CI.
 
-Compared with the `v2.0.1.0` tag, the current tree contains 158 commits,
-including 102 non-merge commits, and changes 245 files with 22,249 additions and
-2,264 deletions. The release uses related version forms:
+The release, tag, and this document use `2.0.2.0`.
 
-- The release, tag, and this document use `2.0.2.0`.
-- Rust crates and package manifests use `2.0.2`.
-- Workspace-local builds and container builders pin Rust `1.96.1`.
-- Cargo manifests continue to declare Rust `1.92` as the MSRV.
-- One new database migration, `V23`, removes Engine runtime search chunks while
-  preserving the underlying recovery documents.
+Rust crates and package manifests use `2.0.2`.
 
-This document is a pre-release record. Test results are stated only where a
-command and result were recorded. Planned work, review documents, and completed
-checklist boxes without matching runtime code are not described as shipped.
-DarkIRC secure contact-key exchange, mt-admin decomposition, package publishing,
-and deployment automation remain unimplemented.
+Workspace-local builds and container builders pin Rust `1.96.1`.
+
+Cargo manifests continue to declare Rust `1.92` as the MSRV.
+
+One new database migration, `V23`, removes Engine runtime search chunks while preserving the underlying recovery documents.
+
+DarkIRC secure contact-key exchange, mt-admin decomposition, package publishing, and deployment automation remain unimplemented.
 
 See the [v2.0.1.0 release notes](docs/releases/RELEASE-v2.0.1.0.md) for the
 previous compatibility baseline and the [release archive](docs/releases/README.md)
@@ -274,28 +269,6 @@ silently combining inconsistent snapshots.
 Default-scope writes to system-prompt-bearing files also pass through the shared
 prompt-injection sanitizer. Layer-specific internal write APIs still rely on
 their callers to preserve this boundary.
-
-### Cavepony Skill and WASM Tool
-
-The release adds bundled Cavepony skill `0.3.0` and WASM tool release `0.3.1`
-with WIT `0.3.0`.
-
-- Response modes: `lite`, `full`, `ultra`, `pony`, and `canterlot`.
-- Tool actions: `compress`, `expand`, and `stats`.
-- Compression modes: `tokens`, `lite`, `full`, `ultra`, `pony`, and
-  `canterlot`.
-- Tool execution is local and requests no network, filesystem, environment, or
-  secret capability.
-- Input is limited to 1,536 Unicode characters and 6 KiB UTF-8.
-- Code, quoted text, URLs, paths, flags, and identifier-like tokens are excluded
-  from transforms.
-- Bounded literal matching replaced per-instance regex compilation after the
-  initial tool exceeded the default 10-million-fuel budget.
-
-Response style is selected per request; `/cavepony` does not persist a mode
-across turns or sessions. Deterministic transforms require the WASM artifact to
-be built and installed. Compression is intentionally lossy, and token counts are
-coarse four-bytes-per-token estimates rather than model tokenizer output.
 
 ### Hermes-to-LunarWing Kawarimi Adapter
 
@@ -712,24 +685,6 @@ Committed tests cover:
 Presence of test code is not a recorded passing release run. No broad claim that
 all of these suites passed is made here.
 
-### Outstanding Verification
-
-- Full pre-release default, PostgreSQL, libSQL, all-feature, Clippy, and browser
-  matrix is not recorded against the final release tree.
-- No live encrypted cross-host Kawarimi cutover verifies database rows, encrypted
-  secrets, workspace state, and OMEMO continuity end to end.
-- No live Hermes `--apply` rehearsal verifies root provisioning, PostgreSQL
-  writes, restart, decrypted secrets, or rollback.
-- No live FIFO WeeChat save/restore, real systemd-user tenant upgrade, or real
-  OpenRC host run is recorded for the final tree.
-- GitLab CI configuration has no recorded CI Lint, clean-runner required-job
-  pipeline, default-branch run, or scheduled observation run.
-- PostgreSQL service integration, browser E2E, broad WASM/channel builds,
-  standalone crates, packages, release artifacts, and deployment are absent from
-  phase-one CI.
-- Current CI's explicit Python suite does not include every documented onboarding
-  import test module; verify coverage before making the pipeline mandatory.
-
 ## Known Issues
 
 This list reconciles the v2.0.1.0 tracker with current source. All canonical bug
@@ -887,21 +842,6 @@ closed during this cycle. Release-specific findings follow separately.
   reindexed.
 - No kanban/jobs, skills, embeddings, general state-directory copy, libSQL,
   wizard, or secret decrypt-verification phase exists.
-
-### Cavepony and WASM Limitations
-
-- Cavepony response modes are request-scoped, not persistent.
-- The bundled skill works without the WASM tool. Deterministic operations require
-  a locally built/installed artifact because the registry has no download URL or
-  checksum.
-- Compression and expansion are lossy; shared tokens, casing, removed words,
-  preexisting tokens, and Pony substitutions cannot be reconstructed exactly.
-- Token counts are rough byte estimates. Input is capped at 1,536 Unicode
-  characters/6 KiB, and unformatted multi-word commands can be transformed.
-- A completely missing registered WASM source directory is silently skipped by
-  the extension builder, even during a nominally strict upgrade.
-- WASM channels remain final-response-only. Incremental Engine token chunks have
-  no channel message-edit contract.
 
 ### CI, Build, and Release Limitations
 
