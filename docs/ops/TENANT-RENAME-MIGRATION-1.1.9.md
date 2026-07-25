@@ -42,19 +42,28 @@ no operator action — workers and daemon negotiate automatically.
    ic/scripts/lunarwing-mt-admin.sh upgrade-tenant <tenant> --target <ref>
    ```
 
-   This composes the full verified sequence: backup → stop → `git fetch`
-   + checkout `<ref>` as the tenant user → rebuild with WASM →
-   `render-units` → `patch-env` → start, and warns if any unit still
-   embeds a pre-rename path afterwards. Pass `--skip-render` to defer the
-   unit rewrite (old units keep working through the compat symlinks —
+   This composes the full verified sequence: backup → `git fetch` → restore
+   unstaged, build-generated `Cargo.lock` changes when they are the only tracked
+   changes → require the tracked tree clean → validate target layout → stop →
+   checkout `<ref>` as the tenant user → rebuild with WASM → `render-units` →
+   `patch-env` → start. Fetched target resolves to an immutable commit, and the
+   build lock covers the clean-tree gate through checkout. Per-tenant upgrade
+   lock serializes full operation through restart.
+   Dirty tracked files abort before the tenant stops and remain untouched;
+   untracked runtime directories are ignored unless the target ref would
+   overwrite one of their paths. That collision also aborts before stop. The
+   old version is restarted automatically when checkout fails without changing
+   the tracked tree. The command warns if any unit still embeds a pre-rename
+   path afterwards. Pass `--skip-render` to defer unit rewrite (old units keep
+   working through the compat symlinks —
    there is no breakage window), `--no-backup` to skip the Postgres dump,
    `--source-repo <path>` to retarget the tenant's git origin first.
 
    Equivalent manual sequence, if you prefer the individual verbs:
-   `backup-tenant` → `stop-tenant` → (as the tenant user)
-   `git fetch --tags --prune && git checkout <ref>` →
-   `build-tenant <t> --with-wasm` → `render-units <t>` →
-   `patch-env <t>` → `start-tenant <t>`.
+   `backup-tenant` → (as the tenant user) `git fetch --tags --prune` →
+   resolve tracked changes and verify the tracked tree is clean →
+   `stop-tenant` → `git checkout <ref>` → `build-tenant <t> --with-wasm` →
+   `render-units <t>` → `patch-env <t>` → `start-tenant <t>`.
 3. **If you deferred the unit rewrite** (`--skip-render`), run it at any
    convenient time afterwards:
 
