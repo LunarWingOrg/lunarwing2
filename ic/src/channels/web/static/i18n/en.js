@@ -20,6 +20,7 @@ I18n.register('en', {
   'chat.caveponyUltra': 'Cavepony: Ultra',
   'chat.caveponyPony': 'Cavepony: Pony',
   'chat.caveponyCanterlot': 'Cavepony: Canterlot',
+  'chat.caveponyTonySoprano': 'Cavepony: Tony Soprano',
   'chat.caveponySaved': 'Cavepony preference saved',
   'chat.caveponySaveFailed': 'Could not save Cavepony preference: {message}',
   'chat.caveponySaving': 'Saving Cavepony preference...',
