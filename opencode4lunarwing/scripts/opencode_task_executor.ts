@@ -12,6 +12,7 @@ import {
   type TaskResult,
   DEFAULT_TIMEOUT_MS,
 } from "./lunarwing_runtime"
+import { extractAssistantText, opencodeErrorMessage } from "./opencode_result"
 import { expandWorkspacePath } from "./workspace_path"
 
 const OPENCODE_HOST = process.env.OPENCODE_SERVE_HOST || "127.0.0.1"
@@ -46,6 +47,7 @@ export async function executeTask(
   onProgress: ProgressCallback,
   onResult: ResultCallback,
   abortSignal?: AbortSignal,
+  sdkOverride?: OpencodeClient,
 ): Promise<void> {
   const startTime = Date.now()
   const timeoutMs = request.timeout_ms ?? DEFAULT_TIMEOUT_MS
@@ -63,7 +65,7 @@ export async function executeTask(
     }
   }
 
-  const sdk = createSdk(workDir)
+  const sdk = sdkOverride ?? createSdk(workDir)
   let sessionID: string | undefined
   let output = ""
   let timedOut = false
@@ -76,18 +78,21 @@ export async function executeTask(
   }, timeoutMs)
 
   try {
-    const sessionResult = await sdk.session.create({
-      title: `lunarwing-opencode-${request.task_id}`,
-      permission: [
-        { permission: "edit", action: "allow", pattern: "*" },
-        { permission: "bash", action: "allow", pattern: "*" },
-        { permission: "read", action: "allow", pattern: "*" },
-        { permission: "write", action: "allow", pattern: "*" },
-        { permission: "question", action: "deny", pattern: "*" },
-        { permission: "plan_enter", action: "deny", pattern: "*" },
-        { permission: "plan_exit", action: "deny", pattern: "*" },
-      ],
-    })
+    const sessionResult = await sdk.session.create(
+      {
+        title: `lunarwing-opencode-${request.task_id}`,
+        permission: [
+          { permission: "edit", action: "allow", pattern: "*" },
+          { permission: "bash", action: "allow", pattern: "*" },
+          { permission: "read", action: "allow", pattern: "*" },
+          { permission: "write", action: "allow", pattern: "*" },
+          { permission: "question", action: "deny", pattern: "*" },
+          { permission: "plan_enter", action: "deny", pattern: "*" },
+          { permission: "plan_exit", action: "deny", pattern: "*" },
+        ],
+      },
+      { throwOnError: true },
+    )
 
     sessionID = sessionResult.data?.id
     if (!sessionID) {
@@ -96,10 +101,20 @@ export async function executeTask(
 
     const events = await sdk.event.subscribe()
 
-    const promptPromise = sdk.session.prompt({
-      sessionID,
-      parts: [{ type: "text", text: request.prompt }],
-    })
+    // Attach rejection handling immediately so a provider/API error cannot
+    // become an unhandled rejection while the SSE loop is still draining.
+    const promptPromise = sdk.session
+      .prompt(
+        {
+          sessionID,
+          parts: [{ type: "text", text: request.prompt }],
+        },
+        { throwOnError: true },
+      )
+      .then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error }),
+      )
 
     for await (const event of events.stream) {
       if (abortSignal?.aborted || timedOut) break
@@ -131,12 +146,23 @@ export async function executeTask(
             done: false,
           })
         }
+
+        if (part.type === "tool" && part.state?.status === "error") {
+          const toolName = part.tool || "unknown"
+          const delta = `[${toolName}] ERROR: ${part.state.error}`
+          output += delta + "\n"
+          onProgress({
+            task_id: request.task_id,
+            delta,
+            done: false,
+          })
+        }
       }
 
       if (event.type === "session.error") {
         if (event.properties.sessionID !== sessionID) continue
         const err = event.properties.error
-        const errMsg = err?.data?.message || err?.name || "Unknown error"
+        const errMsg = opencodeErrorMessage(err)
         output += `ERROR: ${errMsg}\n`
         sawSessionError = true
         if (!sessionErrorMsg) sessionErrorMsg = errMsg
@@ -151,26 +177,40 @@ export async function executeTask(
         // falls through to here and is denied, so the task does nothing. Count
         // denials so we fail loudly below instead of reporting a false success.
         deniedPermissions++
-        await sdk.permission.reply({
-          requestID: event.properties.id,
-          reply: "reject",
-        })
+        await sdk.permission.reply(
+          {
+            requestID: event.properties.id,
+            reply: "reject",
+          },
+          { throwOnError: true },
+        )
+      }
+
+      if (event.type === "permission.v2.asked") {
+        if (event.properties.sessionID !== sessionID) continue
+        deniedPermissions++
+        await sdk.v2.session.permission.reply(
+          {
+            sessionID,
+            requestID: event.properties.id,
+            reply: "reject",
+          },
+          { throwOnError: true },
+        )
       }
 
       if (
-        event.type === "session.status" &&
-        event.properties.sessionID === sessionID &&
-        event.properties.status?.type === "idle"
+        (event.type === "session.status" &&
+          event.properties.sessionID === sessionID &&
+          event.properties.status?.type === "idle") ||
+        (event.type === "session.idle" && event.properties.sessionID === sessionID)
       ) {
         break
       }
     }
 
-    await promptPromise.catch(() => {})
-
-    const durationMs = Date.now() - startTime
-
     if (timedOut) {
+      const durationMs = Date.now() - startTime
       onResult({
         task_id: request.task_id,
         status: "error",
@@ -182,6 +222,7 @@ export async function executeTask(
     }
 
     if (abortSignal?.aborted) {
+      const durationMs = Date.now() - startTime
       onResult({
         task_id: request.task_id,
         status: "cancelled",
@@ -191,6 +232,19 @@ export async function executeTask(
       })
       return
     }
+
+    const promptOutcome = await promptPromise
+    if ("error" in promptOutcome) throw promptOutcome.error
+
+    const promptData = promptOutcome.result.data
+    const assistantError = promptData?.info.error
+    if (assistantError) {
+      throw new Error(opencodeErrorMessage(assistantError))
+    }
+
+    const canonicalOutput = extractAssistantText(promptData?.parts)
+    const resultOutput = canonicalOutput || output.trim()
+    const durationMs = Date.now() - startTime
 
     // Honest result: a session error must not be reported as success.
     if (sawSessionError) {
@@ -206,11 +260,11 @@ export async function executeTask(
 
     // If every permission was denied and the task produced no output, it did
     // nothing — report that instead of a silent "success".
-    if (deniedPermissions > 0 && !output.trim()) {
+    if (deniedPermissions > 0 && !resultOutput) {
       onResult({
         task_id: request.task_id,
         status: "error",
-        output: output.trim(),
+        output: resultOutput,
         error:
           `Task performed no actions: ${deniedPermissions} permission request(s) ` +
           `were denied by the worker permission policy (the session permission ` +
@@ -220,16 +274,27 @@ export async function executeTask(
       return
     }
 
+    if (!resultOutput) {
+      onResult({
+        task_id: request.task_id,
+        status: "error",
+        output: "",
+        error: "opencode completed without assistant text or tool output",
+        duration_ms: durationMs,
+      })
+      return
+    }
+
     onResult({
       task_id: request.task_id,
       status: "success",
-      output: output.trim(),
+      output: resultOutput,
       error: null,
       duration_ms: durationMs,
     })
   } catch (err) {
     const durationMs = Date.now() - startTime
-    const errorMsg = err instanceof Error ? err.message : String(err)
+    const errorMsg = opencodeErrorMessage(err)
     onResult({
       task_id: request.task_id,
       status: "error",
