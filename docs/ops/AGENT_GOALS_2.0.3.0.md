@@ -71,7 +71,7 @@
 12. [ ] go over release notes for 2.0.2.0 and see what else still needs to be added to next release, see documents about this if unsure of each item. put list of suggestions and missing things or half-implemented things and put into a new doc in docs/ops
 13. [ ] XMPP file transfer — remaining polish (further hardening), see documents about this if unsure
 14. [x] Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure
-15. [ ] Review already present changes for following item: Gut proprietary tunnel providers and add support for netbird - improve if necessary
+15. [ ] Review already present changes for following item: Gut proprietary tunnel providers and add support for netbird - improve if necessary. some of our changes broke CI/CD tests so fix those as well
 16. [ ] review darkirc key exchange implementation
 17. [ ] do a repeat of item 3 basically. different name for document.
 18. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
