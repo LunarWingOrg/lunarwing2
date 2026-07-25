@@ -62,7 +62,7 @@ One real bug found: OpenRC weechat stop() invokes the helper as root instead of 
 10. [ ] dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the branch: rarity/item-20-20260722-1501
 11. [x] review recent changes in onboard ui and see if there are issues
 12. [ ] review kawarimi adapter (item 15)
-13. [ ] go over release notes for 2.0.2.0 and see what else still needs to be added to next release, see documents about this if unsure of each item
+13. [ ] go over release notes for 2.0.2.0 and see what else still needs to be added to next release, see documents about this if unsure of each item. put list of suggestions and missing things or half-implemented things and put into a new doc in docs/ops
 14. [ ] Refactor mt admin, see documents about this if unsure
 15. [ ] XMPP file transfer — remaining polish (further hardening), see documents about this if unsure
 16. [ ] Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure
