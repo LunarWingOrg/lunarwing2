@@ -6,7 +6,7 @@
 **Open TODOs (v2.0.3.0) — To be done before release**
 
 ---
-1. [ ] Bump crate versions. they are at 2.0.2. we need bump to 2.0.3
+1. [x] Bump crate versions. they are at 2.0.2. we need bump to 2.0.3
 2. [ ] check cicd logic and suggest improvements in a new doc in docs/ops
 3. [ ] suggest items that should be added to goals list that arent. put in a new doc in docs/ops
 4. [x] (S) Go over proposals defer
