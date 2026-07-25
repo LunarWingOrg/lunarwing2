@@ -86,7 +86,7 @@ After=network.target
 
 [Service]
 Type=forking
-ExecStart=/usr/bin/tmux -L weechat-<name> new-session -d -s weechat '/usr/bin/weechat --dir /home/<name>/.config/weechat'
+ExecStart=/usr/bin/tmux -L weechat-<name> new-session -d -s weechat '<repo>/ic/scripts/lunarwing-weechat-start.sh --weechat-bin /usr/bin/weechat --weechat-home /home/<name>/.config/weechat'
 ExecStop=<repo>/ic/scripts/lunarwing-weechat-stop.sh --weechat-home /home/<name>/.config/weechat --tmux-socket weechat-<name> --session weechat
 TimeoutStopSec=30
 EnvironmentFile=<env_dir>/weechat.env
@@ -99,14 +99,26 @@ WantedBy=default.target
 
 Uses `Type=forking` because tmux daemonizes after creating the session.
 
-`ExecStop` sends `/upgrade -quit` through the WeeChat FIFO so WeeChat saves its
-session, including open buffers, lines, and connections. WeeChat restores that
-session on its next start. If the FIFO is unavailable or graceful shutdown
-times out, the helper falls back to `tmux kill-session`. `TimeoutStopSec=30`
-allows the graceful stop to finish.
+`ExecStop` writes the exact FIFO record `*/upgrade -quit`, causing WeeChat to
+save open buffers, lines, connections, and session state into `*.upgrade` files.
+The stop helper ignores FIFOs outside the target tmux pane's live process tree
+and bounds the write so an unread pipe cannot hang shutdown. Missing FIFO,
+failed write, or a graceful-exit timeout falls back to `tmux kill-session`;
+failure to terminate the session is reported as an error. `TimeoutStopSec=30`
+bounds the whole stop path.
+
+`ExecStart` runs `lunarwing-weechat-start.sh`. It adds WeeChat's `--upgrade`
+flag when `weechat.upgrade` exists, consuming the saved session and reopening
+its buffers. With no saved session, it starts normally. This startup half is
+required: `/upgrade -quit` alone only writes state for a later `--upgrade` run.
 
 Automatic bootstrap sets `weechat.look.save_layout_on_exit buffers`, preserving
-the open-buffer layout across restarts.
+buffer ordering as a fallback. Layout saving alone does not reopen buffers or
+restore their lines.
+
+Existing tenants must run `lunarwing-mt-admin.sh render-units <name>` after
+upgrading, before relying on `restart-tenant`, so installed units reference both
+helpers.
 
 **`lunarwing-weechat-adapter-<name>.service`**
 
@@ -145,7 +157,14 @@ Init scripts are installed to `/etc/init.d/` with conf.d files in `/etc/conf.d/`
 
 **`/etc/init.d/lunarwing-weechat-<name>`**
 
-Runs WeeChat in a tmux session via `start-stop-daemon`. The `start()` function loads `env/weechat.env` (containing only `RELAY_PASSWORD`) before launching tmux, so the WeeChat process inherits the credential. `stop()` runs `lunarwing-weechat-stop.sh` under the tenant UID with `start-stop-daemon`, allowing access to the UID-scoped tmux socket. The helper sends `/upgrade -quit` through the WeeChat FIFO to save buffers and session state, then falls back to `tmux kill-session` if needed. Configurable via conf.d variables: `weechat_user`, `weechat_group`, `weechat_home`, `weechat_env_file`, `weechat_stop_helper`.
+Runs WeeChat in a tmux session via `start-stop-daemon`. The `start()` function
+loads `env/weechat.env` (containing only `RELAY_PASSWORD`) after dropping
+privileges, then runs `lunarwing-weechat-start.sh` so saved upgrade state is
+restored. `stop()` runs `lunarwing-weechat-stop.sh` under the tenant UID, which
+can access the UID-scoped tmux socket and FIFO. Its bounded graceful path and
+destructive fallback match systemd behavior. Configurable via conf.d variables:
+`weechat_user`, `weechat_group`, `weechat_home`, `weechat_env_file`,
+`weechat_start_helper`, and `weechat_stop_helper`.
 
 Dependency wiring:
 

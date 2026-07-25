@@ -10,7 +10,7 @@ against the current codebase and running configurations.
 > discrepancies have been resolved. It describes the implementation-branch state
 > and does not claim a production release or deployment.
 
-**Re-verified:** 2026-07-15 against the WeeChat relay auto-bootstrap implementation branch.
+**Re-verified:** 2026-07-25 against the WeeChat session-restoration implementation.
 
 ## Summary
 
@@ -35,6 +35,9 @@ material issues identified in the original audit have been addressed:
 4. **Misattributed citation:** `setup.rs:540-541` was cited for "WASM channel
    sends directly to relay" but those lines are test-config field definitions,
    not relay-sending code.
+5. **Managed session restoration (resolved):** Both init systems now stop through
+   the tenant-owned FIFO using `*/upgrade -quit` and start through a wrapper that
+   adds `--upgrade` when saved state exists. Blocked FIFO writes are bounded.
 
 ## Component Map
 
@@ -99,13 +102,14 @@ repo). On a typical deployment, operators will use the full path
 | Claim in infodump | Status | Evidence |
 |---|---|---|
 | Units installed to `~/.config/systemd/user/` | ✅ Verified | Standard systemd user-unit path |
-| WeeChat unit uses `Type=forking` | ✅ Verified | [`ic/scripts/lunarwing-mt-admin.sh:4740`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
-| `ExecStart` uses `tmux -L weechat-<name> new-session -d -s weechat` | ✅ Verified | line 4741 |
-| `ExecStop` uses `tmux -L weechat-<name> kill-session -t weechat` | ✅ Verified | line 4742 |
-| Adapter unit has `PartOf=lunarwing-<name>.service` | ✅ Verified | line 4756 |
-| Adapter has `Requires=` on WeeChat unit | ✅ Verified | line 4755 |
-| `EnvironmentFile=<env_dir>/lunarwing.env` | ✅ Verified | line 4761 |
-| `WorkingDirectory=<repo>/lunarwing_weechat_wss/weechat_relay` | ✅ Verified | line 4760 |
+| WeeChat unit uses `Type=forking` | ✅ Verified | `_render_weechat_systemd_unit` |
+| `ExecStart` uses tmux plus `lunarwing-weechat-start.sh` | ✅ Verified | `_render_weechat_systemd_unit` |
+| Start helper adds `--upgrade` only when `weechat.upgrade` exists | ✅ Verified | `ic/scripts/lunarwing-weechat-start.sh` |
+| `ExecStop` uses `lunarwing-weechat-stop.sh` | ✅ Verified | `_render_weechat_systemd_unit` |
+| Adapter unit has `PartOf=lunarwing-<name>.service` | ✅ Verified | `render_tenant_systemd_units` |
+| Adapter has `Requires=` on WeeChat unit | ✅ Verified | `render_tenant_systemd_units` |
+| `EnvironmentFile=<env_dir>/lunarwing.env` | ✅ Verified | `render_tenant_systemd_units` |
+| `WorkingDirectory=<repo>/lunarwing_weechat_wss/weechat_relay` | ✅ Verified | `render_tenant_systemd_units` |
 
 **⚠ Naming discrepancy discovered:**
 
@@ -114,8 +118,8 @@ the OpenRC init script as `weechat-<name>`. The **actual rendered names** are:
 
 | Infodump name | Actual rendered name | Rendered at |
 |---|---|---|
-| `weechat-<name>.service` | `lunarwing-weechat-<name>.service` | `lunarwing-mt-admin.sh:4734` |
-| `weechat-<name>` (OpenRC) | `lunarwing-weechat-<name>` | `lunarwing-mt-admin.sh:5362` |
+| `weechat-<name>.service` | `lunarwing-weechat-<name>.service` | `_render_weechat_systemd_unit` |
+| `weechat-<name>` (OpenRC) | `lunarwing-weechat-<name>` | `_render_weechat_openrc_unit` |
 
 The `lunarwing-` prefix is present on all WeeChat service names. The adapter
 unit name (`lunarwing-weechat-adapter-<name>`) is correct in the infodump.
@@ -128,7 +132,7 @@ After=... weechat-<name>.service lunarwing-weechat-adapter-<name>.service
 Wants=... weechat-<name>.service lunarwing-weechat-adapter-<name>.service
 ```
 
-The actual rendered unit ([line 4858-4859](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh)):
+The actual unit rendered by `render_tenant_systemd_units`:
 
 ```ini
 After=... lunarwing-weechat-<name>.service lunarwing-weechat-adapter-<name>.service
@@ -151,20 +155,20 @@ correct `lunarwing-weechat-<name>` naming throughout.**
 | Claim | Status | Evidence |
 |---|---|---|
 | Init scripts in `/etc/init.d/` | ✅ Standard OpenRC layout | Not contradicted by codebase |
-| WeeChat OpenRC init script name | ⚠ **`lunarwing-weechat-<name>`, not `weechat-<name>`** | [`ic/scripts/lunarwing-mt-admin.sh:5362`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
-| Adapter OpenRC init script name | ✅ `lunarwing-weechat-adapter-<name>` | line 5406 |
-| `lunarwing_rc_need` includes WeeChat services | ✅ Verified | [`ic/scripts/lunarwing-mt-admin.sh:5544`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/scripts/lunarwing-mt-admin.sh) |
-| `before lunarwing-<name>` ordering | ✅ Standard supervise-daemon pattern in rendered OpenRC services | lines 5384-5385, 5443-5444 |
+| WeeChat OpenRC init script name | ⚠ **`lunarwing-weechat-<name>`, not `weechat-<name>`** | `_render_weechat_openrc_unit` |
+| Adapter OpenRC init script name | ✅ `lunarwing-weechat-adapter-<name>` | `render_tenant_openrc_units` |
+| `lunarwing_rc_need` includes WeeChat services | ✅ Verified | `render_tenant_openrc_units` |
+| `before lunarwing-<name>` ordering | ✅ Standard supervise-daemon pattern in rendered OpenRC services | `_render_weechat_openrc_unit`, `render_tenant_openrc_units` |
 
 **Same naming discrepancy as systemd:** The infodump's OpenRC `depend()` blocks
 and conf.d examples reference `weechat-<name>` where the actual rendered
 services use `lunarwing-weechat-<name>`. For example:
 
 - Infodump `depend()`: `need net weechat-<name>`
-- Actual rendered: `need net lunarwing-weechat-<name>` (line 5443)
+- Actual rendered: `need net lunarwing-weechat-<name>`
 
 - Infodump `lunarwing_rc_need`: `weechat-<name> lunarwing-weechat-adapter-<name>`
-- Actual rendered: `lunarwing-weechat-<name> lunarwing-weechat-adapter-<name>` (line 5544)
+- Actual rendered: `lunarwing-weechat-<name> lunarwing-weechat-adapter-<name>`
 
 ## Known-Issue: `LUNARWING_BASE_DIR` and Pairing Approve
 
