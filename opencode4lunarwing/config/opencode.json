@@ -2,10 +2,11 @@
   "$schema": "https://opencode.ai/config.json",
   "model": "tensorzero/tensorzero::function_name::lunarwing",
   "plugin": [
-    "opencode-agent-identity",
-    "opencode-agent-memory",
+    "opencode-mem",
+    "opencode-caveman",
     "opencode-agent-skills",
-    "oh-my-openagent"
+    "envsitter-guard",
+    "opentmux"
   ],
   "provider": {
     "tensorzero": {
