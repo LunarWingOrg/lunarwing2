@@ -196,6 +196,10 @@ libsignal-protocol = { path = "vendor/libsignal-protocol" }
 # OpenClaw import (feature gated)
 json5 = { version = "0.4", optional = true }
 
+# Unix process signalling for graceful tunnel shutdown
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["signal", "process"] }
+
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"

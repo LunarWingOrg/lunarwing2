@@ -385,6 +385,9 @@ async fn async_main() -> anyhow::Result<()> {
     // ── Tunnel setup ───────────────────────────────────────────────────
 
     let (config, active_tunnel) = lunarwing::tunnel::start_managed_tunnel(config).await;
+    if let Some(extension_manager) = components.extension_manager.as_ref() {
+        extension_manager.set_tunnel_url(config.tunnel.public_url.clone());
+    }
 
     // ── Orchestrator / container job manager ────────────────────────────
 

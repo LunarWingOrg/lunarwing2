@@ -47,7 +47,7 @@ This document tracks feature parity between LunarWing (Rust implementation) and 
 | Bonjour/mDNS discovery | ✅ | ❌ | |
 | Tailscale integration | ✅ | ❌ | |
 | Health check endpoints | ✅ | ✅ | /api/health + /api/gateway/status + /healthz + /readyz, with channel-backed readiness probes |
-| `doctor` diagnostics | ✅ | 🚧 | 16 checks: settings, LLM, DB, embeddings, routines, gateway, MCP, skills, secrets, service, Docker daemon, tunnel binaries |
+| `doctor` diagnostics | ✅ | 🚧 | Settings, LLM, DB, embeddings, routines, gateway, MCP, skills, secrets, service, Docker daemon, configured tunnel provider |
 | Agent event broadcast | ✅ | 🚧 | SSE broadcast manager exists (SseManager) but tool/job-state events not fully wired |
 | Channel health monitor | ✅ | ❌ | Auto-restart with configurable interval |
 | Presence system | ✅ | ❌ | Beacons on connect, system presence for agents |

@@ -422,9 +422,11 @@ key first, then falls back to the standard env var.
 3. Registry channels (`registry/channels/*.json`, download-first with source fallback)
 
 **Tunnel setup** (`setup_tunnel`):
-- Options: ngrok, Cloudflare Tunnel, localtunnel, custom URL
+- Options: NetBird Reverse Proxy, ngrok, Cloudflare Tunnel, Tailscale, custom command, static URL
 - Validates HTTPS requirement
-- Stored in `self.settings.tunnel.public_url`
+- Managed provider config is stored in `self.settings.tunnel`; runtime URL is populated after launch
+- NetBird assumes an operator-enrolled peer and never stores setup keys or runs `netbird up/down`
+- Self-hosted NetBird requirements are documented in `docs/guides/NETBIRD_TUNNEL.md`
 
 **WASM channel setup** (`setup_wasm_channel`):
 - Reads `capabilities.json` for `setup.required_secrets`
@@ -645,7 +647,7 @@ pub struct Settings {
     pub embeddings: EmbeddingsSettings,      // enabled, provider, model
 
     // Step 6: Channels
-    pub tunnel: TunnelSettings,              // provider, public_url
+    pub tunnel: TunnelSettings,              // provider, public_url, provider options
     pub channels: ChannelSettings,           // http config, xmpp owner, etc.
 
     // Step 7: Heartbeat
