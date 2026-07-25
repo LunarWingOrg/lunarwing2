@@ -393,11 +393,18 @@ Neither is suitable on an untrusted network.
 
 ### WeeChat Buffer Preservation
 
+> **Correction recorded for v2.0.3.0:** v2.0.2 attempted this handoff but did
+> not complete it reliably. Its FIFO payload was `*:/upgrade -quit` rather than
+> WeeChat's required `*/upgrade -quit`, and startup omitted `--upgrade`. The
+> v2.0.3.0 implementation corrects both halves, bounds stale-FIFO writes, and
+> verifies a real stop/restore cycle. Do not copy the v2.0.2 payload.
+
 Managed WeeChat shutdown now attempts to preserve open buffers, lines,
 connections, and session state:
 
 - fresh bootstrap sets `weechat.look.save_layout_on_exit buffers`;
-- `lunarwing-weechat-stop.sh` writes `*:/upgrade -quit` to the WeeChat FIFO;
+- `lunarwing-weechat-stop.sh` attempted the handoff with the malformed FIFO
+  record identified in the correction above;
 - the helper waits up to 20 seconds for graceful exit;
 - missing FIFO or stalled exit falls back to `tmux kill-session`;
 - systemd user units use the helper in `ExecStop` with `TimeoutStopSec=30`; and
@@ -405,8 +412,10 @@ connections, and session state:
   tmux socket.
 
 Existing non-empty WeeChat configurations remain preserved and do not receive
-the new setting automatically. Set it manually and `/save` when desired.
-Existing tenants must re-render units to replace the old direct-kill stop action.
+the layout setting automatically. Full session restoration requires the
+v2.0.3.0 corrected stop/start handoff; layout saving alone is insufficient.
+Tenants with pre-v2.0.2 units must re-render to replace direct kill. Tenants with
+v2.0.2 units must re-render again on v2.0.3 so startup uses the restore helper.
 
 ### Strict WASM Upgrade Builds
 
@@ -588,9 +597,9 @@ removed.
 12. **Prepare Rust and WASM before stopping tenants.** Rustup-backed builds select
     Rust `1.96.1`; upgrades need `wasm32-wasip2`. A strict WASM failure after
     checkout can leave the tenant stopped.
-13. **Re-render existing WeeChat units.** This installs the graceful stop helper.
-    Existing non-empty WeeChat configs also need
-    `weechat.look.save_layout_on_exit buffers` set and saved manually.
+13. **Re-render existing WeeChat units.** On v2.0.3 this installs both corrected
+    session helpers. `weechat.look.save_layout_on_exit buffers` remains a useful
+    ordering fallback, but it does not replace the upgrade-state handoff.
 14. **Do not rely on `build-lunarwing.sh --wasm`.** It is a no-op. Run
     `ic/scripts/build-wasm-extensions.sh` or use mt-admin's strict upgrade path.
 15. **Rename saved onboarding endpoint state.** `tensorzero_url` was replaced by

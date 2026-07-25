@@ -5043,10 +5043,12 @@ EOF
 # it. Falls back to tmux kill-session if the graceful stop fails.
 _render_weechat_systemd_unit() {  # <tenant> <out_dir>
   local name="$1" out_dir="$2"
-  local weechat_home env_dir stop_helper
+  local weechat_home env_dir start_helper stop_helper weechat_binary
   weechat_home="$(tenant_weechat_home "$name")"
   env_dir="$(tenant_env_dir "$name")"
+  start_helper="$(tenant_lw_root "$name")/ic/scripts/lunarwing-weechat-start.sh"
   stop_helper="$(tenant_lw_root "$name")/ic/scripts/lunarwing-weechat-stop.sh"
+  weechat_binary="$(command -v weechat)"
   cat >"$out_dir/lunarwing-weechat-${name}.service" <<EOF
 [Unit]
 Description=WeeChat IRC client ($name)
@@ -5054,7 +5056,7 @@ After=network.target
 
 [Service]
 Type=forking
-ExecStart=$(command -v tmux) -L weechat-${name} new-session -d -s weechat '$(command -v weechat) --dir ${weechat_home}'
+ExecStart=$(command -v tmux) -L weechat-${name} new-session -d -s weechat '$start_helper --weechat-bin $weechat_binary --weechat-home ${weechat_home}'
 ExecStop=$stop_helper --weechat-home ${weechat_home} --tmux-socket weechat-${name} --session weechat
 TimeoutStopSec=30
 EnvironmentFile=$env_dir/weechat.env
@@ -5366,7 +5368,8 @@ _render_weechat_openrc_unit() {  # <tenant> <out_file>
   env_dir="$(tenant_env_dir "$name")"
   run_dir="$(tenant_run_dir "$name")"
   log_dir="$(tenant_log_dir "$name")"
-  local stop_helper
+  local start_helper stop_helper
+  start_helper="$(tenant_lw_root "$name")/ic/scripts/lunarwing-weechat-start.sh"
   stop_helper="$(tenant_lw_root "$name")/ic/scripts/lunarwing-weechat-stop.sh"
   cat >"$out_file" <<INITEOF
 #!/sbin/openrc-run
@@ -5386,12 +5389,13 @@ description="WeeChat IRC client ($name)"
 : "\${weechat_openrc_env_exec:=$OPENRC_ENV_EXEC}"
 : "\${weechat_command:=$(command -v tmux)}"
 : "\${weechat_binary:=$(command -v weechat)}"
+: "\${weechat_start_helper:=$start_helper}"
 : "\${weechat_stop_helper:=$stop_helper}"
 
 command="\${weechat_openrc_env_exec}"
-command_args="--env-file \${weechat_env_file} -- \${weechat_command} -L weechat-${name} new-session -d -s weechat '\${weechat_binary} --dir \${weechat_home}'"
+command_args="--env-file \${weechat_env_file} -- \${weechat_command} -L weechat-${name} new-session -d -s weechat '\${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}'"
 command_user="\${weechat_user}:\${weechat_group}"
-required_files="\${weechat_openrc_env_exec} \${weechat_command} \${weechat_binary} \${weechat_env_file}"
+required_files="\${weechat_openrc_env_exec} \${weechat_command} \${weechat_binary} \${weechat_start_helper} \${weechat_env_file}"
 
 depend() {
     need net
@@ -5407,7 +5411,8 @@ start() {
     start-stop-daemon --start --background --user "\${weechat_user}" \\
         --exec "\${weechat_openrc_env_exec}" -- \\
         --env-file "\${weechat_env_file}" -- "\${weechat_command}" \\
-        -L weechat-${name} new-session -d -s weechat "\${weechat_binary} --dir \${weechat_home}"
+        -L weechat-${name} new-session -d -s weechat \
+        "\${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}"
     eend \$?
 }
 
@@ -5426,16 +5431,19 @@ stop() {
                 --tmux-socket "weechat-${name}" \\
                 --session weechat \\
                 --timeout 20
-        ) || true
+        )
+        stop_rc=\$?
     else
         (
             unset RC_SVCNAME
             start-stop-daemon --start --user "\${weechat_user}" \\
                 --exec "\${weechat_command}" -- \\
                 -L "weechat-${name}" kill-session -t weechat
-        ) >/dev/null 2>&1 || true
+        ) >/dev/null 2>&1
+        stop_rc=\$?
     fi
-    eend 0
+    eend "\${stop_rc}"
+    return "\${stop_rc}"
 }
 INITEOF
   chmod 0755 "$out_file"
@@ -6041,7 +6049,12 @@ stop_tenant_openrc() {
   rc-service "xmpp-bridge-${name}" stop 2>/dev/null || true
   rc-service "lunarwing-proxy-${name}" stop 2>/dev/null || true
   rc-service "lunarwing-weechat-adapter-${name}" stop 2>/dev/null || true
-  rc-service "lunarwing-weechat-${name}" stop 2>/dev/null || true
+  if rc-service "lunarwing-weechat-${name}" status >/dev/null 2>&1; then
+    if ! rc-service "lunarwing-weechat-${name}" stop; then
+      say "failed to stop lunarwing-weechat-${name}; refusing to continue"
+      return 1
+    fi
+  fi
   rc-service "lunarwing-darkirc-adapter-${name}" stop 2>/dev/null || true
   rc-service "lunarwing-darkirc-${name}" stop 2>/dev/null || true
   # Worker babysitters: stop the supervisors so they don't respawn the stopped containers.

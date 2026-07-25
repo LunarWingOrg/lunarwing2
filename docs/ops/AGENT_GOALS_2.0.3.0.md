@@ -12,8 +12,15 @@
 4. [x] (S) Go over proposals defer
 5. [x] (S) get back to previous refactor mt admin idea. see the section of docs/proposals/MT-ADMIN-DECOMPOSITION.md — review notes section of: `docs/ops/KUMOGAKURE_RECENT_REV_T.md` - you will NOT begin ANY work on this yet. you will simply edit the document already created under docs/proposals called `MT-ADMIN-DECOMPOSITION.md`
 6. [ ] continue to work on kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. SEE: SECTION: hermes_kawarimi — review notes in docs/ops/KUMOGAKURE_RECENT_REV_T.md for suggestedm improvements/concerns
-7. [ ] Work on weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued. FEEDBACK FROM LAST TIME: 19:34:19 wrench │ ### Verdict
-One real bug found: OpenRC weechat stop() invokes the helper as root instead of the tenant user, which will fail to find the tmux socket. Medium severity — the graceful stop silently becomes a no-op on OpenRC, though the old kill-session behavior would also be broken (same root-cause: missing su). The systemd path is unaffected. Otherwise: solid feature work. The weechat buffer restore is well-designed (proper wrapper script, good fallback chain, both init systems covered, renderer tests). The test-deferral approach is pragmatic and well-documented. You may attempt to use the following work from failed/partial work on these salvaged, incomplete branches: { rarity/item-16-20260722-1201 } { rarity/item-16-20260722-2123 } { rarity/item-16-20260723-0000 }
+7. [x] Work on WeeChat to reopen buffers reliably after host reboot or `restart-tenant`.
+   Completed 2026-07-25: corrected FIFO command framing to `*/upgrade -quit`,
+   added conditional `--upgrade` startup, rejected stale FIFOs, bounded blocked
+   FIFO writes, retained explicit destructive fallback, and made fallback failure
+   visible. systemd and OpenRC render the same start/stop helpers; OpenRC invokes
+   them under the tenant UID. Focused helper and renderer tests pass. A real
+   WeeChat 4.7.2 cycle restored an IRC server buffer and consumed all generated
+   `*.upgrade` files. Prior salvage branches were not cherry-picked because HEAD
+   already contained their OpenRC UID fix in safer argv-preserving form.
 8. [ ] Inspect status of cargo crates. Suggest ones that should be updated. put in a file.
 9. [x] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. In-place configuration updates were completed on 2026-07-24. Reference the branch here for prior/failed/unverified attempt: rarity/item-8-20260723-0855
     <details>

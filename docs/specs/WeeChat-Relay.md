@@ -35,6 +35,30 @@ Automatically provision a working WeeChat HTTP API relay for newly created Lunar
     (`ProvisionRequest.no_weechat_bootstrap`), and the OpenRC bulk provisioner
     (`ENABLE_WEECHAT_BOOTSTRAP`).
 
+## Managed session preservation
+
+12. Managed shutdown sends the exact FIFO record `*/upgrade -quit`. The leading
+    `*` selects the current buffer for FIFO input; `/upgrade -quit` writes
+    `*.upgrade` session files and exits. `*:/upgrade -quit` is invalid and must
+    never be used because the colon changes the command payload.
+13. The stop helper selects only a FIFO whose PID suffix names a live process
+    in the target tmux pane's process tree. FIFO writes are bounded so a stale
+    pipe with no reader cannot hang OpenRC shutdown or `restart-tenant`.
+14. After a successful FIFO write, the helper waits for WeeChat to exit. Missing
+    FIFO, write failure, or graceful-exit timeout emits a warning and falls back
+    to `tmux kill-session`. A surviving tmux session is an error, not success.
+15. Persistent service units start through `lunarwing-weechat-start.sh`. The
+    helper adds `--upgrade` when `<weechat-home>/weechat.upgrade` exists and
+    otherwise performs a normal `--dir <weechat-home>` start.
+16. The systemd user unit and OpenRC service use the same start and stop helpers.
+    OpenRC invokes both paths under the tenant UID because tmux sockets and FIFO
+    files are tenant-owned.
+17. `weechat.look.save_layout_on_exit buffers` preserves layout ordering as a
+    fallback. It does not replace the `/upgrade -quit` and `--upgrade` handoff
+    required to reopen buffers with their session content.
+18. Existing tenants must re-render service units after upgrading LunarWing so
+    their units reference the managed start and stop helpers.
+
 ## Security invariants
 
 - Never place the resolved relay password in argv, a shell command string, stdout/stderr, logs, rendered unit text, test evidence, or `relay.conf`.
@@ -54,6 +78,11 @@ Automatically provision a working WeeChat HTTP API relay for newly created Lunar
 - Use TDD with standalone Bash harnesses that source the admin script and stub root/service operations.
 - Cover happy path, empty destination, existing-config conflict, missing password, missing WeeChat binary, invocation failure, malformed generated config, promotion failure, cleanup, and secret non-disclosure.
 - Render both systemd and OpenRC outputs into fixture directories and assert canonical service names and minimal environment loading.
+- Assert the exact `*/upgrade -quit` FIFO payload, bounded blocked-FIFO fallback,
+  conditional `--upgrade` startup, and failure when destructive fallback cannot
+  terminate the tmux session.
+- Exercise a real WeeChat cycle when available: create a buffer, stop, verify
+  `*.upgrade` files, start, verify the files are consumed and the buffer returns.
 - Extend the read-only WeeChat preflight with relay config, loopback, registry-port, password-expression, and minimal-env checks without printing secrets.
 - Provide an opt-in installed-WeeChat smoke test that uses `/tmp/opencode`, a dummy credential, and an ephemeral port; it must leave no process, listener, or temporary artifact.
 - Final verification requires plan-compliance, code-quality/security, real-QA, and scope-fidelity approval.
