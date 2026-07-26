@@ -23,7 +23,7 @@
 //!     └── steps/{thread_id}.json
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
@@ -67,6 +67,8 @@ pub struct HybridStore {
     conversations: RwLock<HashMap<ConversationId, ConversationSurface>>,
     leases: RwLock<HashMap<LeaseId, CapabilityLease>>,
     missions: RwLock<HashMap<MissionId, Mission>>,
+    /// Tracks every workspace path found for each mission, including legacy duplicates.
+    mission_paths: RwLock<HashMap<MissionId, HashSet<String>>>,
     docs: RwLock<HashMap<DocId, MemoryDoc>>,
     /// Tracks current workspace path for each doc so renames can delete the old file.
     doc_paths: RwLock<HashMap<DocId, String>>,
@@ -83,6 +85,7 @@ impl HybridStore {
             conversations: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
             missions: RwLock::new(HashMap::new()),
+            mission_paths: RwLock::new(HashMap::new()),
             docs: RwLock::new(HashMap::new()),
             doc_paths: RwLock::new(HashMap::new()),
             workspace,
@@ -415,6 +418,21 @@ impl HybridStore {
         }
     }
 
+    async fn persist_mission_json(&self, path: &str, mission: &Mission) -> Result<(), EngineError> {
+        let Some(ws) = self.workspace.as_ref() else {
+            return Ok(());
+        };
+        let json = serde_json::to_string_pretty(mission).map_err(|error| EngineError::Store {
+            reason: format!("failed to serialize mission {}: {error}", mission.id),
+        })?;
+        ws.write(path, &json)
+            .await
+            .map_err(|error| EngineError::Store {
+                reason: format!("failed to persist mission {}: {error}", mission.id),
+            })?;
+        Ok(())
+    }
+
     /// Load missions from within each project directory.
     ///
     /// Scans `engine/projects/*/missions/*/mission.json`.
@@ -424,6 +442,7 @@ impl HybridStore {
             Err(_) => return,
         };
 
+        let mut loaded = Vec::new();
         for proj_entry in project_dirs {
             if !proj_entry.is_directory {
                 continue;
@@ -441,13 +460,27 @@ impl HybridStore {
                 if let Ok(doc) = ws.read(&mission_file).await {
                     match serde_json::from_str::<Mission>(&doc.content) {
                         Ok(mission) => {
-                            self.missions.write().await.insert(mission.id, mission);
+                            loaded.push((mission_file, mission));
                         }
                         Err(e) => {
                             debug!(path = %mission_file, "failed to parse mission: {e}")
                         }
                     }
                 }
+            }
+        }
+
+        // Stable path ordering resolves equal timestamps deterministically.
+        loaded.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let mut missions = self.missions.write().await;
+        let mut paths = self.mission_paths.write().await;
+        for (path, mission) in loaded {
+            paths.entry(mission.id).or_default().insert(path);
+            let replace = missions
+                .get(&mission.id)
+                .is_none_or(|current| mission.updated_at >= current.updated_at);
+            if replace {
+                missions.insert(mission.id, mission);
             }
         }
     }
@@ -1221,12 +1254,51 @@ impl Store for HybridStore {
 
     async fn save_mission(&self, mission: &Mission) -> Result<(), EngineError> {
         let proj_slug = self.project_slug(mission.project_id).await;
+        let new_path = mission_path(&proj_slug, &mission.name, mission.id);
+        self.persist_mission_json(&new_path, mission).await?;
+
+        let stale_paths = {
+            let mut paths = self.mission_paths.write().await;
+            let tracked = paths.entry(mission.id).or_default();
+            tracked.insert(new_path.clone());
+            tracked
+                .iter()
+                .filter(|path| path.as_str() != new_path)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut first_error = None;
+        if let Some(ws) = self.workspace.as_ref() {
+            for stale_path in stale_paths {
+                let result = match ws.exists(&stale_path).await {
+                    Ok(true) => ws.delete(&stale_path).await,
+                    Ok(false) => Ok(()),
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(()) => {
+                        if let Some(paths) = self.mission_paths.write().await.get_mut(&mission.id) {
+                            paths.remove(&stale_path);
+                        }
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(EngineError::Store {
+                reason: format!(
+                    "failed to remove stale mission {} path: {error}",
+                    mission.id
+                ),
+            });
+        }
+
         self.missions
             .write()
             .await
             .insert(mission.id, mission.clone());
-        self.persist_json(mission_path(&proj_slug, &mission.name, mission.id), mission)
-            .await;
         Ok(())
     }
 
@@ -1276,36 +1348,250 @@ impl Store for HybridStore {
         id: MissionId,
         status: MissionStatus,
     ) -> Result<(), EngineError> {
-        let updated = {
-            let mut missions = self.missions.write().await;
-            if let Some(mission) = missions.get_mut(&id) {
-                mission.status = status;
-                mission.updated_at = chrono::Utc::now();
-                Some(mission.clone())
-            } else {
-                None
-            }
-        };
-        if let Some(mission) = updated.as_ref() {
-            let proj_slug = self.project_slug(mission.project_id).await;
-            self.persist_json(mission_path(&proj_slug, &mission.name, id), mission)
-                .await;
+        let updated = self.missions.read().await.get(&id).cloned();
+        if let Some(mut mission) = updated {
+            mission.status = status;
+            mission.updated_at = chrono::Utc::now();
+            self.save_mission(&mission).await?;
         }
         Ok(())
     }
 
     async fn delete_mission(&self, id: MissionId) -> Result<(), EngineError> {
-        let removed = {
-            let mut missions = self.missions.write().await;
-            missions.remove(&id)
-        };
-        if let (Some(mission), Some(ws)) = (removed, self.workspace.as_ref()) {
+        let mission = self.missions.read().await.get(&id).cloned();
+        let mut paths = self
+            .mission_paths
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(mission) = mission.as_ref() {
             let proj_slug = self.project_slug(mission.project_id).await;
-            let dir = mission_dir(&proj_slug, &mission.name, id);
-            if let Err(e) = ws.delete(&dir).await {
-                tracing::debug!(mission_id = %id, "failed to delete mission from workspace: {e}");
+            paths.insert(mission_path(&proj_slug, &mission.name, id));
+        }
+        let mut first_error = None;
+        if let Some(ws) = self.workspace.as_ref() {
+            for path in paths {
+                let result = match ws.exists(&path).await {
+                    Ok(true) => ws.delete(&path).await,
+                    Ok(false) => Ok(()),
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(()) => {
+                        if let Some(paths) = self.mission_paths.write().await.get_mut(&id) {
+                            paths.remove(&path);
+                        }
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
             }
         }
+        if let Some(error) = first_error {
+            return Err(EngineError::Store {
+                reason: format!("failed to delete persisted mission {id}: {error}"),
+            });
+        }
+        self.missions.write().await.remove(&id);
+        self.mission_paths.write().await.remove(&id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mission_delete_path_targets_persisted_document() {
+        let id = MissionId::new();
+        let path = mission_path("default--project", "Daily report", id);
+        assert!(path.ends_with("/mission.json"));
+        assert_eq!(
+            path,
+            format!(
+                "{}/mission.json",
+                mission_dir("default--project", "Daily report", id)
+            )
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn renamed_then_deleted_mission_does_not_reload_from_workspace() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("mission-delete.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "mission-delete-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "delete project", "test");
+        let mut mission = Mission::new(
+            project.id,
+            "test-user",
+            "delete me",
+            "test deletion",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+        let stale_mission = mission.clone();
+        let original_path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        assert!(
+            workspace
+                .exists(&mission_path(
+                    &store.project_slug(project.id).await,
+                    &mission.name,
+                    mission.id,
+                ))
+                .await
+                .expect("mission existence")
+        );
+
+        mission.name = "renamed mission".into();
+        mission.updated_at = chrono::Utc::now() + chrono::Duration::seconds(1);
+        store.save_mission(&mission).await.expect("rename mission");
+        assert!(
+            !workspace
+                .exists(&original_path)
+                .await
+                .expect("old path existence")
+        );
+
+        // Simulate legacy duplicate left by an older rename implementation.
+        workspace
+            .write(
+                &original_path,
+                &serde_json::to_string_pretty(&stale_mission).unwrap(),
+            )
+            .await
+            .expect("write stale duplicate");
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded.load_state_from_workspace().await;
+        assert_eq!(
+            reloaded
+                .load_mission(mission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "renamed mission"
+        );
+
+        reloaded
+            .delete_mission(mission.id)
+            .await
+            .expect("delete mission");
+
+        let final_reload = HybridStore::new(Some(workspace));
+        final_reload.load_state_from_workspace().await;
+        assert!(
+            final_reload
+                .load_mission(mission.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn mission_write_failure_does_not_commit_create_or_secret_rotation() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = Arc::new(
+            LibSqlBackend::new_local(&temp_dir.path().join("mission-write.db"))
+                .await
+                .expect("libsql backend"),
+        );
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "mission-write-test",
+            Arc::clone(&backend) as Arc<dyn Database>,
+        ));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "write project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "secure hook",
+            "test rotation",
+            lunarwing_engine::MissionCadence::Webhook {
+                path: "secure".into(),
+                secret: Some("old-secret".into()),
+            },
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+
+        let connection = backend.connect().await.expect("connection");
+        connection
+            .execute(
+                "ALTER TABLE memory_documents RENAME TO unavailable_memory_documents",
+                (),
+            )
+            .await
+            .expect("disable workspace writes");
+
+        let failed_create = Mission::new(
+            project.id,
+            "test-user",
+            "must not appear",
+            "failed create",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        assert!(store.save_mission(&failed_create).await.is_err());
+        assert!(
+            store
+                .load_mission(failed_create.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let mut rotated = mission.clone();
+        rotated.cadence = lunarwing_engine::MissionCadence::Webhook {
+            path: "secure".into(),
+            secret: Some("new-secret".into()),
+        };
+        rotated.updated_at = chrono::Utc::now() + chrono::Duration::seconds(1);
+        assert!(store.save_mission(&rotated).await.is_err());
+        let stored = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(matches!(
+            stored.cadence,
+            lunarwing_engine::MissionCadence::Webhook { path, secret }
+                if path == "secure" && secret.as_deref() == Some("old-secret")
+        ));
+
+        connection
+            .execute(
+                "ALTER TABLE unavailable_memory_documents RENAME TO memory_documents",
+                (),
+            )
+            .await
+            .expect("restore workspace writes");
+        let reloaded = HybridStore::new(Some(workspace));
+        reloaded.load_state_from_workspace().await;
+        let stored = reloaded.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(matches!(
+            stored.cadence,
+            lunarwing_engine::MissionCadence::Webhook { path, secret }
+                if path == "secure" && secret.as_deref() == Some("old-secret")
+        ));
     }
 }

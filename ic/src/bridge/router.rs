@@ -807,10 +807,13 @@ async fn reconcile_pending_gate_state(
     let gate_keys: HashSet<_> = restored_gates.iter().map(PendingGate::key).collect();
 
     for gate in &restored_gates {
-        let thread = store
-            .load_thread(gate.thread_id)
-            .await
-            .map_err(|e| engine_err("load thread", e))?;
+        let thread = match store.load_thread(gate.thread_id).await {
+            Ok(thread) => thread,
+            Err(error) => {
+                tracing::warn!(thread_id = %gate.thread_id, %error, "failed to inspect pending-gate thread");
+                continue;
+            }
+        };
         let Some(thread) = thread else {
             let _ = pending_gates.discard(&gate.key()).await;
             continue;
@@ -828,10 +831,13 @@ async fn reconcile_pending_gate_state(
         .await
         .map_err(|e| engine_err("list all projects", e))?;
     for project in projects {
-        let threads = store
-            .list_all_threads(project.id)
-            .await
-            .map_err(|e| engine_err("list all threads", e))?;
+        let threads = match store.list_all_threads(project.id).await {
+            Ok(threads) => threads,
+            Err(error) => {
+                tracing::warn!(project_id = %project.id, %error, "failed to list threads during pending-gate reconciliation");
+                continue;
+            }
+        };
         for mut thread in threads {
             if thread.state != lunarwing_engine::ThreadState::Waiting {
                 continue;
@@ -851,14 +857,45 @@ async fn reconcile_pending_gate_state(
                 debug!(thread_id = %thread.id, error = %e, "failed to reconcile waiting thread");
                 continue;
             }
-            store
-                .save_thread(&thread)
-                .await
-                .map_err(|e| engine_err("save reconciled thread", e))?;
+            if let Err(error) = store.save_thread(&thread).await {
+                tracing::warn!(thread_id = %thread.id, %error, "failed to save reconciled waiting thread");
+            }
         }
     }
 
     Ok(())
+}
+
+async fn fail_threads_for_expired_gates(
+    store: &Arc<dyn Store>,
+    pending_gates: &crate::gate::store::PendingGateStore,
+    expired_gates: &[PendingGate],
+) {
+    for gate in expired_gates {
+        let key = gate.key();
+        let Some(mut thread) = store.load_thread(gate.thread_id).await.ok().flatten() else {
+            continue;
+        };
+        if thread.state != lunarwing_engine::ThreadState::Waiting
+            || !thread.is_owned_by(&gate.user_id)
+        {
+            continue;
+        }
+        pending_gates
+            .run_if_absent(&key, || async {
+                if let Err(error) = thread.transition_to(
+                    lunarwing_engine::ThreadState::Failed,
+                    Some("pending gate expired".into()),
+                ) {
+                    debug!(thread_id = %thread.id, %error, "failed to expire waiting thread");
+                    return;
+                }
+                if let Err(error) = store.save_thread(&thread).await {
+                    tracing::warn!(thread_id = %thread.id, %error, "failed to save expired waiting thread");
+                }
+            })
+            .await;
+    }
 }
 
 async fn fail_orphaned_waiting_thread_if_needed(
@@ -1036,7 +1073,8 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                     "properties": {
                         "name": {"type": "string", "description": "Short name for the mission/routine"},
                         "goal": {"type": "string", "description": "What this mission should accomplish each run"},
-                        "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds"},
+                        "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'webhook:<path>', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds"},
+                        "webhook_secret": {"type": "string", "description": "Required non-empty secret for webhook cadence. Never returned by mission APIs."},
                         "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl']). Defaults to current channel."}
                     },
                     "required": ["name", "goal"]
@@ -1100,6 +1138,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                         "name": {"type": "string", "description": "New name"},
                         "goal": {"type": "string", "description": "New goal"},
                         "cadence": {"type": "string", "description": "New cadence: 'manual', 'hourly', 'daily', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds"},
+                        "webhook_secret": {"type": "string", "description": "Replacement webhook secret. Existing secret is retained when omitted."},
                         "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl'])"},
                         "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited)"},
                         "success_criteria": {"type": "string", "description": "Criteria for declaring mission complete"}
@@ -1206,11 +1245,13 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     if let Err(e) = mission_manager.bootstrap_all_projects().await {
         debug!("engine v2: bootstrap_all_projects failed: {e}");
     }
-    if let Err(e) = mission_manager
-        .resume_recoverable_threads(&agent.deps.owner_id)
-        .await
-    {
+    if let Err(e) = mission_manager.resume_recoverable_threads().await {
         debug!("engine v2: resume_recoverable_threads failed: {e}");
+    }
+    if let Some(budget) = crate::channels::budget::budget_for_channel("darkirc") {
+        mission_manager
+            .set_channel_context(budget.channel, budget.prompt_guidance())
+            .await;
     }
     if let Err(e) = thread_manager.resume_background_threads(project_id).await {
         debug!("engine v2: resume_background_threads failed: {e}");
@@ -1222,6 +1263,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     {
         let mut notification_rx = mission_manager.subscribe_notifications();
         let channels = Arc::clone(&agent.channels);
+        let hooks = Arc::clone(agent.hooks());
         let sse_ref = agent.deps.sse_tx.clone();
         let db_ref = agent.deps.store.clone();
         tokio::spawn(async move {
@@ -1231,6 +1273,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                         handle_mission_notification(
                             &notif,
                             &channels,
+                            &hooks,
                             sse_ref.as_ref(),
                             db_ref.as_ref(),
                         )
@@ -1339,7 +1382,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         start_skill_update_sweep(owner_id.clone());
     }
 
-    start_pending_gate_sweep(sweep_gates);
+    start_pending_gate_sweep(sweep_gates, store_dyn);
 
     Ok(())
 }
@@ -2618,9 +2661,13 @@ async fn handle_with_engine_inner(
         .as_ref()
         .ok_or_else(|| engine_err("init", "engine state is empty"))?;
 
-    let expired_gates = state.pending_gates.expire_stale().await;
-    if expired_gates > 0 {
-        debug!(expired_gates, "engine v2: removed expired pending gates");
+    let expired_gates = state.pending_gates.drain_expired().await;
+    if !expired_gates.is_empty() {
+        debug!(
+            expired_gates = expired_gates.len(),
+            "engine v2: removed expired pending gates"
+        );
+        fail_threads_for_expired_gates(&state.store, &state.pending_gates, &expired_gates).await;
     }
 
     debug!(
@@ -3246,6 +3293,7 @@ fn interpret_message_event(role: &str, content_preview: &str) -> Option<&'static
 async fn handle_mission_notification(
     notif: &lunarwing_engine::MissionNotification,
     channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    hooks: &Arc<crate::hooks::HookRegistry>,
     sse: Option<&Arc<SseManager>>,
     db: Option<&Arc<dyn Database>>,
 ) {
@@ -3256,12 +3304,27 @@ async fn handle_mission_notification(
     let full_text = format!("**[{}]** {text}", notif.mission_name);
 
     for channel_name in &notif.notify_channels {
-        // Send via channel broadcast (proactive, no incoming message required)
+        let event = crate::hooks::HookEvent::Outbound {
+            user_id: notif.user_id.clone(),
+            channel: channel_name.clone(),
+            content: full_text.clone(),
+            thread_id: Some(notif.thread_id.to_string()),
+        };
+        let outbound_text = match hooks.run(&event).await {
+            Err(error) => {
+                tracing::warn!(channel = %channel_name, %error, "BeforeOutbound hook blocked mission notification");
+                continue;
+            }
+            Ok(crate::hooks::HookOutcome::Continue {
+                modified: Some(content),
+            }) => content,
+            _ => full_text.clone(),
+        };
         if let Err(e) = channels
             .broadcast(
                 channel_name,
                 &notif.user_id,
-                OutgoingResponse::text(&full_text),
+                OutgoingResponse::text(outbound_text),
             )
             .await
         {
@@ -3594,6 +3657,22 @@ fn cadence_type_label(cadence: &lunarwing_engine::types::mission::MissionCadence
     }
 }
 
+fn public_cadence_json(
+    cadence: &lunarwing_engine::types::mission::MissionCadence,
+) -> serde_json::Value {
+    use lunarwing_engine::types::mission::MissionCadence;
+
+    match cadence {
+        MissionCadence::Webhook { path, secret } => serde_json::json!({
+            "Webhook": {
+                "path": path,
+                "secret_configured": secret.as_deref().is_some_and(|value| !value.is_empty()),
+            }
+        }),
+        _ => serde_json::to_value(cadence).unwrap_or(serde_json::Value::Null),
+    }
+}
+
 fn thread_to_info(t: &lunarwing_engine::Thread) -> EngineThreadInfo {
     EngineThreadInfo {
         id: t.id.to_string(),
@@ -3911,7 +3990,7 @@ pub async fn get_engine_mission(
         return Ok(None);
     }
 
-    let cadence_json = serde_json::to_value(&m.cadence).unwrap_or(serde_json::Value::Null);
+    let cadence_json = public_cadence_json(&m.cadence);
 
     // Load thread summaries for the spawned threads table
     let mut threads = Vec::new();
@@ -4671,16 +4750,23 @@ fn start_skill_update_sweep(user_id: String) {
 /// Background task that periodically sweeps expired pending gates.
 ///
 /// Without this, a thread waiting on an expired gate blocks until
-/// the next ingress triggers cleanup via `expire_stale()`.
-fn start_pending_gate_sweep(pending_gates: Arc<crate::gate::store::PendingGateStore>) {
+/// the next ingress triggers cleanup via `drain_expired()`.
+fn start_pending_gate_sweep(
+    pending_gates: Arc<crate::gate::store::PendingGateStore>,
+    store: Arc<dyn Store>,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(PENDING_GATE_SWEEP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let removed = pending_gates.expire_stale().await;
-            if removed > 0 {
-                debug!(removed, "background sweep removed expired pending gates");
+            let expired = pending_gates.drain_expired().await;
+            if !expired.is_empty() {
+                debug!(
+                    removed = expired.len(),
+                    "background sweep removed expired pending gates"
+                );
+                fail_threads_for_expired_gates(&store, &pending_gates, &expired).await;
             }
         }
     });
@@ -4944,8 +5030,8 @@ async fn migrate_legacy_user_ids(store: &Arc<dyn lunarwing_engine::Store>, owner
 mod tests {
     use super::*;
     use std::sync::LazyLock;
-    use tokio::sync::Mutex as TokioMutex;
-    use tokio::sync::RwLock as TokioRwLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::{Mutex as TokioMutex, Notify, RwLock as TokioRwLock};
 
     static ENGINE_STATE_TEST_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
 
@@ -4953,6 +5039,9 @@ mod tests {
         conversations: TokioRwLock<Vec<lunarwing_engine::ConversationSurface>>,
         threads: TokioRwLock<HashMap<lunarwing_engine::ThreadId, lunarwing_engine::Thread>>,
         docs: TokioRwLock<HashMap<lunarwing_engine::DocId, lunarwing_engine::MemoryDoc>>,
+        block_next_thread_load: AtomicBool,
+        thread_load_started: Notify,
+        continue_thread_load: Notify,
     }
 
     impl TestStore {
@@ -4961,6 +5050,9 @@ mod tests {
                 conversations: TokioRwLock::new(Vec::new()),
                 threads: TokioRwLock::new(HashMap::new()),
                 docs: TokioRwLock::new(HashMap::new()),
+                block_next_thread_load: AtomicBool::new(false),
+                thread_load_started: Notify::new(),
+                continue_thread_load: Notify::new(),
             }
         }
     }
@@ -4978,6 +5070,10 @@ mod tests {
             &self,
             id: lunarwing_engine::ThreadId,
         ) -> Result<Option<lunarwing_engine::Thread>, lunarwing_engine::EngineError> {
+            if self.block_next_thread_load.swap(false, Ordering::SeqCst) {
+                self.thread_load_started.notify_one();
+                self.continue_thread_load.notified().await;
+            }
             Ok(self.threads.read().await.get(&id).cloned())
         }
         async fn list_threads(
@@ -5039,7 +5135,34 @@ mod tests {
         async fn list_all_projects(
             &self,
         ) -> Result<Vec<lunarwing_engine::Project>, lunarwing_engine::EngineError> {
-            Ok(vec![])
+            let project_ids: HashSet<_> = self
+                .threads
+                .read()
+                .await
+                .values()
+                .map(|thread| thread.project_id)
+                .collect();
+            Ok(project_ids
+                .into_iter()
+                .map(|id| {
+                    let mut project = lunarwing_engine::Project::new("test-user", "test", "test");
+                    project.id = id;
+                    project
+                })
+                .collect())
+        }
+        async fn list_all_threads(
+            &self,
+            project_id: lunarwing_engine::ProjectId,
+        ) -> Result<Vec<lunarwing_engine::Thread>, lunarwing_engine::EngineError> {
+            Ok(self
+                .threads
+                .read()
+                .await
+                .values()
+                .filter(|thread| thread.project_id == project_id)
+                .cloned()
+                .collect())
         }
         async fn save_conversation(
             &self,
@@ -5211,6 +5334,181 @@ mod tests {
             panic!("expected a thread-scoped gate");
         };
         assert_eq!(gate.thread_id, thread_b);
+    }
+
+    #[tokio::test]
+    async fn expired_gate_sweep_fails_waiting_thread_without_ingress() {
+        let store = Arc::new(TestStore::new());
+        let store_dyn: Arc<dyn Store> = store.clone();
+        let gates = crate::gate::store::PendingGateStore::in_memory();
+        let project_id = lunarwing_engine::ProjectId::new();
+        let mut thread = lunarwing_engine::Thread::new(
+            "waiting",
+            lunarwing_engine::ThreadType::Foreground,
+            project_id,
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread
+            .transition_to(lunarwing_engine::ThreadState::Running, None)
+            .unwrap();
+        thread
+            .transition_to(lunarwing_engine::ThreadState::Waiting, None)
+            .unwrap();
+        store.save_thread(&thread).await.unwrap();
+
+        let mut gate = sample_pending_gate(
+            "alice",
+            thread.id,
+            lunarwing_engine::ResumeKind::Approval {
+                allow_always: false,
+            },
+        );
+        gate.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        gates.insert(gate).await.unwrap();
+        let expired = gates.drain_expired().await;
+        assert_eq!(expired.len(), 1);
+        fail_threads_for_expired_gates(&store_dyn, &gates, &expired).await;
+
+        let saved = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert_eq!(saved.state, lunarwing_engine::ThreadState::Failed);
+    }
+
+    #[tokio::test]
+    async fn expired_gate_sweep_does_not_fail_unrelated_waiting_thread() {
+        let store = Arc::new(TestStore::new());
+        let store_dyn: Arc<dyn Store> = store.clone();
+        let gates = crate::gate::store::PendingGateStore::in_memory();
+        let project_id = lunarwing_engine::ProjectId::new();
+        let mut expired_thread = lunarwing_engine::Thread::new(
+            "expired",
+            lunarwing_engine::ThreadType::Foreground,
+            project_id,
+            "alice",
+            ThreadConfig::default(),
+        );
+        let mut unrelated_thread = lunarwing_engine::Thread::new(
+            "unrelated",
+            lunarwing_engine::ThreadType::Foreground,
+            project_id,
+            "alice",
+            ThreadConfig::default(),
+        );
+        for thread in [&mut expired_thread, &mut unrelated_thread] {
+            thread
+                .transition_to(lunarwing_engine::ThreadState::Running, None)
+                .unwrap();
+            thread
+                .transition_to(lunarwing_engine::ThreadState::Waiting, None)
+                .unwrap();
+            store.save_thread(thread).await.unwrap();
+        }
+        let mut expired_gate = sample_pending_gate(
+            "alice",
+            expired_thread.id,
+            lunarwing_engine::ResumeKind::Approval {
+                allow_always: false,
+            },
+        );
+        expired_gate.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        gates.insert(expired_gate).await.unwrap();
+        gates
+            .insert(sample_pending_gate(
+                "alice",
+                unrelated_thread.id,
+                lunarwing_engine::ResumeKind::Approval {
+                    allow_always: false,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let expired = gates.drain_expired().await;
+        fail_threads_for_expired_gates(&store_dyn, &gates, &expired).await;
+
+        assert_eq!(
+            store
+                .load_thread(unrelated_thread.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            lunarwing_engine::ThreadState::Waiting
+        );
+        assert!(
+            gates
+                .peek(&PendingGateKey {
+                    user_id: unrelated_thread.user_id.clone(),
+                    thread_id: unrelated_thread.id,
+                })
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_gate_sweep_does_not_fail_thread_with_replacement_gate() {
+        let store = Arc::new(TestStore::new());
+        let store_dyn: Arc<dyn Store> = store.clone();
+        let gates = Arc::new(crate::gate::store::PendingGateStore::in_memory());
+        let mut thread = lunarwing_engine::Thread::new(
+            "replaced",
+            lunarwing_engine::ThreadType::Foreground,
+            lunarwing_engine::ProjectId::new(),
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread
+            .transition_to(lunarwing_engine::ThreadState::Running, None)
+            .unwrap();
+        thread
+            .transition_to(lunarwing_engine::ThreadState::Waiting, None)
+            .unwrap();
+        store.save_thread(&thread).await.unwrap();
+
+        let mut expired_gate = sample_pending_gate(
+            "alice",
+            thread.id,
+            lunarwing_engine::ResumeKind::Approval {
+                allow_always: false,
+            },
+        );
+        expired_gate.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        gates.insert(expired_gate).await.unwrap();
+        let expired = gates.drain_expired().await;
+
+        store.block_next_thread_load.store(true, Ordering::SeqCst);
+        let sweep_store = Arc::clone(&store_dyn);
+        let sweep_gates = Arc::clone(&gates);
+        let sweep = tokio::spawn(async move {
+            fail_threads_for_expired_gates(&sweep_store, &sweep_gates, &expired).await;
+        });
+        store.thread_load_started.notified().await;
+        let replacement = sample_pending_gate(
+            "alice",
+            thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let replacement_id = replacement.request_id;
+        gates.insert(replacement).await.unwrap();
+        store.continue_thread_load.notify_one();
+        sweep.await.unwrap();
+
+        assert_eq!(
+            store.load_thread(thread.id).await.unwrap().unwrap().state,
+            lunarwing_engine::ThreadState::Waiting
+        );
+        assert_eq!(
+            gates
+                .peek(&PendingGateKey {
+                    user_id: "alice".into(),
+                    thread_id: thread.id,
+                })
+                .await
+                .unwrap()
+                .request_id,
+            replacement_id.to_string()
+        );
     }
 
     #[tokio::test]
@@ -5826,6 +6124,20 @@ mod tests {
         assert!(thread_event_to_app_events(&event, "thread-1").is_empty());
     }
 
+    #[test]
+    fn public_webhook_cadence_never_exposes_secret() {
+        let cadence = lunarwing_engine::MissionCadence::Webhook {
+            path: "build-ready".into(),
+            secret: Some("do-not-return-this".into()),
+        };
+        let public = public_cadence_json(&cadence);
+
+        assert_eq!(public["Webhook"]["path"], "build-ready");
+        assert_eq!(public["Webhook"]["secret_configured"], true);
+        assert!(!public.to_string().contains("do-not-return-this"));
+        assert!(public["Webhook"].get("secret").is_none());
+    }
+
     #[tokio::test]
     async fn mission_notification_broadcasts_once_to_the_owner_scope() {
         use crate::testing::RecordingBroadcastChannel;
@@ -5843,12 +6155,41 @@ mod tests {
             is_error: false,
         };
 
-        handle_mission_notification(&notification, &manager, None, None).await;
+        let hooks = Arc::new(crate::hooks::HookRegistry::new());
+        handle_mission_notification(&notification, &manager, &hooks, None, None).await;
 
         let captured = captures.lock().await;
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].0, "owner-scope");
         assert_eq!(captured[0].1.content, "**[daily-review]** mission complete");
+    }
+
+    #[tokio::test]
+    async fn mission_notification_runs_darkirc_outbound_budget_hook() {
+        use crate::testing::RecordingBroadcastChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (channel, captures) = RecordingBroadcastChannel::new("darkirc");
+        manager.add(Box::new(channel)).await;
+        let hooks = Arc::new(crate::hooks::HookRegistry::new());
+        crate::hooks::register_bundled_hooks(&hooks).await;
+        let notification = lunarwing_engine::MissionNotification {
+            mission_id: lunarwing_engine::MissionId::new(),
+            mission_name: "long-report".to_string(),
+            thread_id: lunarwing_engine::ThreadId::new(),
+            user_id: "owner-scope".to_string(),
+            notify_channels: vec!["darkirc".to_string()],
+            response: Some("x".repeat(10_000)),
+            is_error: false,
+        };
+
+        handle_mission_notification(&notification, &manager, &hooks, None, None).await;
+
+        let captured = captures.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0].1.content.len() <= crate::channels::budget::DARKIRC_BUDGET.hard_max_bytes()
+        );
     }
 
     #[tokio::test]

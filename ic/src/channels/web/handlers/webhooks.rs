@@ -51,6 +51,15 @@ fn validate_webhook_secret(
     Ok(())
 }
 
+fn parse_mission_webhook_payload(body: &[u8]) -> Result<serde_json::Value, (StatusCode, String)> {
+    serde_json::from_slice(body).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Webhook body must be valid JSON".to_string(),
+        )
+    })
+}
+
 /// Handle incoming webhook POST to `/api/webhooks/{path}`.
 ///
 /// This endpoint is **public** (no gateway auth token required) but protected
@@ -142,7 +151,7 @@ pub async fn mission_webhook_handler(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+    let payload = parse_mission_webhook_payload(&body)?;
 
     let fired = fire_engine_webhook_mission(&path, secret.as_deref(), payload)
         .await
@@ -164,6 +173,12 @@ pub async fn mission_webhook_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_mission_webhook_json_maps_to_bad_request() {
+        let result = parse_mission_webhook_payload(b"not-json");
+        assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
 
     /// Routines with `secret: None` must be rejected with 403.
     #[test]

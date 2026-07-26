@@ -56,6 +56,8 @@ pub struct MissionUpdate {
     pub notify_channels: Option<Vec<String>>,
     pub max_threads_per_day: Option<u32>,
     pub success_criteria: Option<String>,
+    /// Replacement webhook secret. Never emitted in mission responses or logs.
+    pub webhook_secret: Option<String>,
 }
 
 /// Manages mission lifecycle and thread spawning.
@@ -68,6 +70,8 @@ pub struct MissionManager {
     fire_locks: Arc<MissionLockRegistry>,
     /// Broadcast channel for mission outcome notifications.
     notification_tx: tokio::sync::broadcast::Sender<MissionNotification>,
+    /// Host-provided prompt guidance keyed by channel name.
+    channel_contexts: RwLock<HashMap<String, String>>,
 }
 
 fn normalize_cron_expression(expression: &str) -> String {
@@ -147,6 +151,7 @@ impl MissionManager {
             active: RwLock::new(Vec::new()),
             fire_locks: Arc::new(Mutex::new(HashMap::new())),
             notification_tx,
+            channel_contexts: RwLock::new(HashMap::new()),
         }
     }
 
@@ -155,6 +160,18 @@ impl MissionManager {
     /// The bridge uses this to route mission results to channels.
     pub fn subscribe_notifications(&self) -> tokio::sync::broadcast::Receiver<MissionNotification> {
         self.notification_tx.subscribe()
+    }
+
+    /// Register host-specific delivery guidance for mission-created threads.
+    pub async fn set_channel_context(
+        &self,
+        channel: impl Into<String>,
+        context: impl Into<String>,
+    ) {
+        self.channel_contexts
+            .write()
+            .await
+            .insert(channel.into(), context.into());
     }
 
     /// Populate the active mission index from persisted mission state.
@@ -227,6 +244,7 @@ impl MissionManager {
         cadence: MissionCadence,
         notify_channels: Vec<String>,
     ) -> Result<MissionId, EngineError> {
+        validate_webhook_cadence(&cadence)?;
         let mut mission = Mission::new(project_id, user_id, name, goal, cadence);
         mission.notify_channels = notify_channels;
         refresh_next_fire_at(&mut mission, Utc::now())?;
@@ -254,7 +272,9 @@ impl MissionManager {
                 reason: format!("mission {id} not found"),
             })?;
 
-        if !mission.owner_id().is_shared() && !mission.is_owned_by(user_id) {
+        let can_update = mission.is_owned_by(user_id)
+            || (mission.owner_id().is_shared() && is_shared_owner(user_id));
+        if !can_update {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
                 entity: format!("mission {id}"),
@@ -267,10 +287,32 @@ impl MissionManager {
         if let Some(goal) = updates.goal {
             mission.goal = goal;
         }
-        if let Some(cadence) = updates.cadence {
+        if let Some(mut cadence) = updates.cadence {
+            if let MissionCadence::Webhook { secret, .. } = &mut cadence
+                && secret.is_none()
+                && let MissionCadence::Webhook {
+                    secret: existing_secret,
+                    ..
+                } = &mission.cadence
+            {
+                *secret = existing_secret.clone();
+            }
             mission.cadence = cadence;
             refresh_next_fire_at(&mut mission, Utc::now())?;
         }
+        if let Some(secret) = updates.webhook_secret {
+            let MissionCadence::Webhook {
+                secret: mission_secret,
+                ..
+            } = &mut mission.cadence
+            else {
+                return Err(EngineError::Effect {
+                    reason: "webhook_secret requires webhook cadence".into(),
+                });
+            };
+            *mission_secret = Some(secret);
+        }
+        validate_webhook_cadence(&mission.cadence)?;
         if let Some(channels) = updates.notify_channels {
             mission.notify_channels = channels;
         }
@@ -289,15 +331,13 @@ impl MissionManager {
 
     /// Pause an active mission. No new threads will be spawned.
     ///
-    /// For shared missions, the caller (web handler) must
-    /// verify admin role before calling this. The engine only checks ownership.
+    /// Shared missions require the caller to present a shared owner identity.
     pub async fn pause_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
         let lock = mission_lock(&self.fire_locks, id).await;
         let _guard = lock.lock().await;
-        // Validate ownership. Shared missions require admin role (checked by caller).
         if let Some(mission) = self.store.load_mission(id).await?
-            && !mission.is_owned_by(user_id)
-            && !mission.owner_id().is_shared()
+            && !(mission.is_owned_by(user_id)
+                || mission.owner_id().is_shared() && is_shared_owner(user_id))
         {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
@@ -314,8 +354,7 @@ impl MissionManager {
 
     /// Resume a paused mission.
     ///
-    /// For shared missions, the caller (web handler) must
-    /// verify admin role before calling this. The engine only checks ownership.
+    /// Shared missions require the caller to present a shared owner identity.
     pub async fn resume_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
         let lock = mission_lock(&self.fire_locks, id).await;
         let _guard = lock.lock().await;
@@ -326,7 +365,9 @@ impl MissionManager {
             .ok_or_else(|| EngineError::Store {
                 reason: format!("mission {id} not found"),
             })?;
-        if !mission.is_owned_by(user_id) && !mission.owner_id().is_shared() {
+        if !(mission.is_owned_by(user_id)
+            || mission.owner_id().is_shared() && is_shared_owner(user_id))
+        {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
                 entity: format!("mission {id}"),
@@ -358,8 +399,7 @@ impl MissionManager {
 
     /// Complete a mission after verifying caller ownership.
     ///
-    /// For shared missions, the caller (web handler) must verify admin role.
-    /// The engine only checks ownership.
+    /// Shared missions require the caller to present a shared owner identity.
     pub async fn complete_mission_with_owner(
         &self,
         id: MissionId,
@@ -368,8 +408,8 @@ impl MissionManager {
         let lock = mission_lock(&self.fire_locks, id).await;
         let _guard = lock.lock().await;
         if let Some(mission) = self.store.load_mission(id).await?
-            && !mission.is_owned_by(user_id)
-            && !mission.owner_id().is_shared()
+            && !(mission.is_owned_by(user_id)
+                || mission.owner_id().is_shared() && is_shared_owner(user_id))
         {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
@@ -388,9 +428,9 @@ impl MissionManager {
     ///
     /// Unlike `complete_mission`, this removes the record from persistence
     /// entirely. Because deletion is irreversible, shared missions require the
-    /// caller to present the shared owner id — only the admin-aware bridge path
-    /// (`resolve_mission_user_id` with `is_admin=true`) supplies it. The tool
-    /// path passes the user's own id and therefore cannot delete shared missions.
+    /// caller to present the shared owner id. Current tool path passes user's
+    /// own id, so it cannot delete shared missions without an authenticated
+    /// admin surface in host application.
     pub async fn delete_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
         let lock = mission_lock(&self.fire_locks, id).await;
         let _guard = lock.lock().await;
@@ -503,13 +543,24 @@ impl MissionManager {
         let meta_prompt = build_meta_prompt(&mission, &project_docs, &trigger_payload);
 
         // Spawn thread with meta-prompt as initial user message
+        let channel_context = {
+            let contexts = self.channel_contexts.read().await;
+            mission
+                .notify_channels
+                .iter()
+                .find_map(|channel| contexts.get(channel).cloned())
+        };
+        let thread_config = ThreadConfig {
+            channel_context,
+            ..ThreadConfig::default()
+        };
         let thread_id = self
             .thread_manager
             .spawn_thread(
                 &meta_prompt,
                 ThreadType::Mission,
                 mission.project_id,
-                ThreadConfig::default(),
+                thread_config,
                 None,
                 user_id,
             )
@@ -529,20 +580,27 @@ impl MissionManager {
     }
 
     /// Resume suspended checkpointed mission threads after restart.
-    pub async fn resume_recoverable_threads(
-        &self,
-        user_id: &str,
-    ) -> Result<Vec<ThreadId>, EngineError> {
+    pub async fn resume_recoverable_threads(&self) -> Result<Vec<ThreadId>, EngineError> {
         let mut resumed = Vec::new();
 
         for mission_id in self.active.read().await.clone() {
-            let Some(mission) = self.store.load_mission(mission_id).await? else {
-                continue;
+            let mission = match self.store.load_mission(mission_id).await {
+                Ok(Some(mission)) => mission,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(%mission_id, %error, "failed to load mission during thread recovery");
+                    continue;
+                }
             };
 
             for &thread_id in mission.thread_history.iter().rev() {
-                let Some(thread) = self.store.load_thread(thread_id).await? else {
-                    continue;
+                let thread = match self.store.load_thread(thread_id).await {
+                    Ok(Some(thread)) => thread,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        warn!(%mission_id, %thread_id, %error, "failed to load recoverable mission thread");
+                        continue;
+                    }
                 };
                 if thread.thread_type != ThreadType::Mission
                     || thread.state != crate::types::thread::ThreadState::Suspended
@@ -553,9 +611,14 @@ impl MissionManager {
                     continue;
                 }
 
-                self.thread_manager
-                    .resume_thread(thread_id, user_id.to_string(), None, None, None)
-                    .await?;
+                if let Err(error) = self
+                    .thread_manager
+                    .resume_thread(thread_id, thread.user_id.clone(), None, None, None)
+                    .await
+                {
+                    warn!(%mission_id, %thread_id, %error, "failed to resume mission thread");
+                    continue;
+                }
                 self.spawn_mission_outcome_watcher(mission_id, thread_id);
                 resumed.push(thread_id);
             }
@@ -630,9 +693,13 @@ impl MissionManager {
         let mut spawned = Vec::new();
 
         for mid in active_ids {
-            let mission = match self.store.load_mission(mid).await? {
-                Some(m) if m.status == MissionStatus::Active => m,
-                _ => continue,
+            let mission = match self.store.load_mission(mid).await {
+                Err(error) => {
+                    warn!(mission_id = %mid, %error, "failed to load system-event mission");
+                    continue;
+                }
+                Ok(Some(m)) if m.status == MissionStatus::Active => m,
+                Ok(_) => continue,
             };
 
             // Only fire missions owned by this user (per-user learning missions)
@@ -649,8 +716,14 @@ impl MissionManager {
                 _ => false,
             };
 
-            if matches && let Some(tid) = self.fire_mission(mid, user_id, payload.clone()).await? {
-                spawned.push(tid);
+            if matches {
+                match self.fire_mission(mid, user_id, payload.clone()).await {
+                    Ok(Some(tid)) => spawned.push(tid),
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(mission_id = %mid, %error, "failed to fire system-event mission");
+                    }
+                }
             }
         }
 
@@ -675,9 +748,13 @@ impl MissionManager {
         let lower = event_text.to_lowercase();
 
         for mid in active_ids {
-            let mission = match self.store.load_mission(mid).await? {
-                Some(m) if m.status == MissionStatus::Active => m,
-                _ => continue,
+            let mission = match self.store.load_mission(mid).await {
+                Err(error) => {
+                    warn!(mission_id = %mid, %error, "failed to load channel-event mission");
+                    continue;
+                }
+                Ok(Some(m)) if m.status == MissionStatus::Active => m,
+                Ok(_) => continue,
             };
 
             if !mission.is_owned_by(user_id) && !mission.owner_id().is_shared() {
@@ -691,8 +768,14 @@ impl MissionManager {
                 _ => false,
             };
 
-            if matches && let Some(tid) = self.fire_mission(mid, user_id, payload.clone()).await? {
-                spawned.push(tid);
+            if matches {
+                match self.fire_mission(mid, user_id, payload.clone()).await {
+                    Ok(Some(tid)) => spawned.push(tid),
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(mission_id = %mid, %error, "failed to fire channel-event mission");
+                    }
+                }
             }
         }
 
@@ -719,9 +802,13 @@ impl MissionManager {
         let mut spawned = Vec::new();
 
         for mid in active_ids {
-            let mission = match self.store.load_mission(mid).await? {
-                Some(m) if m.status == MissionStatus::Active => m,
-                _ => continue,
+            let mission = match self.store.load_mission(mid).await {
+                Err(error) => {
+                    warn!(mission_id = %mid, %error, "failed to load webhook mission");
+                    continue;
+                }
+                Ok(Some(m)) if m.status == MissionStatus::Active => m,
+                Ok(_) => continue,
             };
 
             let matches = match &mission.cadence {
@@ -744,11 +831,15 @@ impl MissionManager {
 
             if matches {
                 let user_id = mission.owner_id().as_user_id().to_string();
-                if let Some(tid) = self
+                match self
                     .fire_mission(mid, &user_id, Some(payload.clone()))
-                    .await?
+                    .await
                 {
-                    spawned.push(tid);
+                    Ok(Some(tid)) => spawned.push(tid),
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(mission_id = %mid, %error, "failed to fire webhook mission");
+                    }
                 }
             }
         }
@@ -1355,6 +1446,17 @@ impl MissionManager {
     }
 }
 
+fn validate_webhook_cadence(cadence: &MissionCadence) -> Result<(), EngineError> {
+    if let MissionCadence::Webhook { secret, .. } = cadence
+        && secret.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(EngineError::Effect {
+            reason: "webhook cadence requires non-empty webhook_secret".into(),
+        });
+    }
+    Ok(())
+}
+
 // ── Meta-prompt generation ───────────────────────────────────
 
 /// B-1: from a failed thread, collect the skills that were active AND are
@@ -1935,6 +2037,7 @@ mod tests {
         missions: tokio::sync::RwLock<HashMap<MissionId, Mission>>,
         docs: tokio::sync::RwLock<Vec<MemoryDoc>>,
         mission_load_delay: Duration,
+        failing_mission_loads: tokio::sync::RwLock<Vec<MissionId>>,
     }
 
     impl TestStore {
@@ -1944,6 +2047,7 @@ mod tests {
                 missions: tokio::sync::RwLock::new(HashMap::new()),
                 docs: tokio::sync::RwLock::new(Vec::new()),
                 mission_load_delay: Duration::ZERO,
+                failing_mission_loads: tokio::sync::RwLock::new(Vec::new()),
             }
         }
 
@@ -2052,6 +2156,11 @@ mod tests {
             Ok(())
         }
         async fn load_mission(&self, id: MissionId) -> Result<Option<Mission>, EngineError> {
+            if self.failing_mission_loads.read().await.contains(&id) {
+                return Err(EngineError::Store {
+                    reason: format!("injected mission load failure for {id}"),
+                });
+            }
             let mission = self.missions.read().await.get(&id).cloned();
             if !self.mission_load_delay.is_zero() {
                 tokio::time::sleep(self.mission_load_delay).await;
@@ -2402,6 +2511,366 @@ mod tests {
             mgr.get_mission(id).await.unwrap().unwrap().next_fire_at,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn shared_mission_update_requires_shared_owner_identity() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let mission = Mission::new(
+            ProjectId::new(),
+            shared_owner_id(),
+            "shared hook",
+            "keep secure",
+            MissionCadence::Webhook {
+                path: "original".into(),
+                secret: Some("original-secret".into()),
+            },
+        );
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        let result = mgr
+            .update_mission(
+                id,
+                "ordinary-user",
+                MissionUpdate {
+                    cadence: Some(MissionCadence::Webhook {
+                        path: "hijacked".into(),
+                        secret: Some("hijacked-secret".into()),
+                    }),
+                    ..MissionUpdate::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(EngineError::AccessDenied { .. })));
+
+        mgr.update_mission(
+            id,
+            shared_owner_id(),
+            MissionUpdate {
+                name: Some("admin updated".into()),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.load_mission(id).await.unwrap().unwrap().name,
+            "admin updated"
+        );
+
+        mgr.update_mission(
+            id,
+            crate::types::LEGACY_SHARED_OWNER_ID,
+            MissionUpdate {
+                name: Some("legacy admin updated".into()),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_mission_lifecycle_requires_shared_owner_identity() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let mission = Mission::new(
+            ProjectId::new(),
+            shared_owner_id(),
+            "shared lifecycle",
+            "admin only",
+            MissionCadence::Manual,
+        );
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        assert!(matches!(
+            mgr.pause_mission(id, "ordinary-user").await,
+            Err(EngineError::AccessDenied { .. })
+        ));
+        mgr.pause_mission(id, shared_owner_id()).await.unwrap();
+        assert!(matches!(
+            mgr.resume_mission(id, "ordinary-user").await,
+            Err(EngineError::AccessDenied { .. })
+        ));
+        mgr.resume_mission(id, shared_owner_id()).await.unwrap();
+        assert!(matches!(
+            mgr.complete_mission_with_owner(id, "ordinary-user").await,
+            Err(EngineError::AccessDenied { .. })
+        ));
+        mgr.complete_mission_with_owner(id, shared_owner_id())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn webhook_update_retains_or_replaces_secret_and_can_fire() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "hook",
+                "process hook",
+                MissionCadence::Webhook {
+                    path: "before".into(),
+                    secret: Some("first-secret".into()),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        mgr.update_mission(
+            id,
+            "test-user",
+            MissionUpdate {
+                cadence: Some(MissionCadence::Webhook {
+                    path: "after".into(),
+                    secret: None,
+                }),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mgr.fire_webhook_mission("after", Some("first-secret"), serde_json::json!({}))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        mgr.update_mission(
+            id,
+            "test-user",
+            MissionUpdate {
+                webhook_secret: Some("second-secret".into()),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            mgr.fire_webhook_mission("after", Some("first-secret"), serde_json::json!({}))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            mgr.fire_webhook_mission("after", Some("second-secret"), serde_json::json!({}))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_create_and_update_reject_missing_or_empty_secret() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+
+        for secret in [None, Some(String::new())] {
+            let result = mgr
+                .create_mission(
+                    project,
+                    "test-user",
+                    "invalid hook",
+                    "must reject",
+                    MissionCadence::Webhook {
+                        path: "hook".into(),
+                        secret,
+                    },
+                    Vec::new(),
+                )
+                .await;
+            assert!(result.is_err());
+        }
+
+        let id = mgr
+            .create_mission(
+                project,
+                "test-user",
+                "manual",
+                "switch cadence",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let result = mgr
+            .update_mission(
+                id,
+                "test-user",
+                MissionUpdate {
+                    cadence: Some(MissionCadence::Webhook {
+                        path: "hook".into(),
+                        secret: None,
+                    }),
+                    ..MissionUpdate::default()
+                },
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn webhook_dispatch_isolates_broken_mission_loads() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+        let broken = mgr
+            .create_mission(
+                project,
+                "test-user",
+                "broken",
+                "broken",
+                MissionCadence::Webhook {
+                    path: "hook".into(),
+                    secret: Some("secret".into()),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        mgr.create_mission(
+            project,
+            "test-user",
+            "healthy",
+            "healthy",
+            MissionCadence::Webhook {
+                path: "hook".into(),
+                secret: Some("secret".into()),
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        store.failing_mission_loads.write().await.push(broken);
+
+        let fired = mgr
+            .fire_webhook_mission("hook", Some("secret"), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(fired.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn channel_event_dispatch_isolates_broken_mission_loads() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+        let broken = mgr
+            .create_mission(
+                project,
+                "test-user",
+                "broken",
+                "broken",
+                MissionCadence::OnEvent {
+                    event_pattern: "deploy".into(),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        mgr.create_mission(
+            project,
+            "test-user",
+            "healthy",
+            "healthy",
+            MissionCadence::OnEvent {
+                event_pattern: "deploy".into(),
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        store.failing_mission_loads.write().await.push(broken);
+
+        let fired = mgr
+            .fire_on_channel_event("deploy ready", "test-user", None)
+            .await
+            .unwrap();
+        assert_eq!(fired.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mission_thread_uses_known_notification_channel_context() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        mgr.set_channel_context("darkirc", "keep response short")
+            .await;
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "guided",
+                "use channel constraints",
+                MissionCadence::Manual,
+                vec!["darkirc".into()],
+            )
+            .await
+            .unwrap();
+
+        let thread_id = mgr
+            .fire_mission(id, "test-user", None)
+            .await
+            .unwrap()
+            .unwrap();
+        let thread = store.load_thread(thread_id).await.unwrap().unwrap();
+        assert_eq!(
+            thread.config.channel_context.as_deref(),
+            Some("keep response short")
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_uses_each_thread_owner_and_isolates_failures() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+
+        let mut broken_mission =
+            Mission::new(project, "alice", "broken", "broken", MissionCadence::Manual);
+        let mut healthy_mission =
+            Mission::new(project, "bob", "healthy", "healthy", MissionCadence::Manual);
+        let mut thread = Thread::new(
+            "resume",
+            ThreadType::Mission,
+            project,
+            "bob",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.metadata = serde_json::json!({
+            "runtime_checkpoint": {
+                "persisted_state": {},
+                "nudge_count": 0,
+                "consecutive_errors": 0,
+                "compaction_count": 0
+            }
+        });
+        thread.transition_to(ThreadState::Suspended, None).unwrap();
+        healthy_mission.record_thread(thread.id);
+        broken_mission.record_thread(ThreadId::new());
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&broken_mission).await.unwrap();
+        store.save_mission(&healthy_mission).await.unwrap();
+        mgr.bootstrap_project(project).await.unwrap();
+        store
+            .failing_mission_loads
+            .write()
+            .await
+            .push(broken_mission.id);
+
+        let resumed = mgr.resume_recoverable_threads().await.unwrap();
+        assert_eq!(resumed, vec![thread.id]);
     }
 
     #[tokio::test]
@@ -2902,7 +3371,7 @@ mod tests {
                 "Triage incoming issues",
                 MissionCadence::Webhook {
                     path: "github".into(),
-                    secret: None,
+                    secret: Some("test-secret".into()),
                 },
                 Vec::new(),
             )

@@ -256,6 +256,10 @@ impl EffectBridgeAdapter {
             .get("success_criteria")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        let webhook_secret = params
+            .get("webhook_secret")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         Ok(lunarwing_engine::MissionUpdate {
             name,
             goal,
@@ -263,6 +267,7 @@ impl EffectBridgeAdapter {
             notify_channels,
             max_threads_per_day,
             success_criteria,
+            webhook_secret,
         })
     }
 
@@ -343,7 +348,10 @@ impl EffectBridgeAdapter {
                     } else {
                         vec![]
                     };
-                match parse_cadence(cadence_str) {
+                let webhook_secret = params
+                    .get("webhook_secret")
+                    .and_then(serde_json::Value::as_str);
+                match parse_cadence_with_secret(cadence_str, webhook_secret) {
                     Ok(cadence) => match mgr
                         .create_mission(
                             context.project_id,
@@ -1025,6 +1033,22 @@ fn parse_cadence(
     ))
 }
 
+fn parse_cadence_with_secret(
+    value: &str,
+    webhook_secret: Option<&str>,
+) -> Result<lunarwing_engine::types::mission::MissionCadence, EngineError> {
+    let mut cadence = parse_cadence(value)?;
+    if let lunarwing_engine::MissionCadence::Webhook { secret, .. } = &mut cadence {
+        let provided = webhook_secret
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                invalid_cadence(value, "webhook cadence requires non-empty webhook_secret")
+            })?;
+        *secret = Some(provided.to_string());
+    }
+    Ok(cadence)
+}
+
 /// Extract credential name from an authentication_required error message.
 ///
 /// The HTTP tool returns errors like:
@@ -1147,6 +1171,17 @@ mod tests {
             parse_cadence("webhook:Build/Ready").expect("webhook cadence"),
             lunarwing_engine::MissionCadence::Webhook { path, .. }
                 if path == "Build/Ready"
+        ));
+    }
+
+    #[test]
+    fn webhook_cadence_requires_and_retains_explicit_secret() {
+        assert!(parse_cadence_with_secret("webhook:Build/Ready", None).is_err());
+        assert!(matches!(
+            parse_cadence_with_secret("webhook:Build/Ready", Some("secret-value"))
+                .expect("webhook cadence"),
+            lunarwing_engine::MissionCadence::Webhook { path, secret }
+                if path == "Build/Ready" && secret.as_deref() == Some("secret-value")
         ));
     }
 
