@@ -147,7 +147,17 @@ rg -n '127\.0\.0\.1:8088' ../ic-infrastructure-health-check/health-lunarvision.s
 # (8088 as single-node *fallback after* ports-registry discovery is OK; sole/default-without-registry path must stay documented.)
 ```
 
-Exceptions: comments/docs forbidding the pattern; init helpers **inside** `scripts/lunarwing-mt-admin.sh` (e.g. `_systemctl_user`); infrastructure-health tooling that already abstracts user units / OpenRC / ports.json correctly.
+Exceptions: comments/docs forbidding the pattern; init helpers **inside** the mt-admin family — `scripts/lunarwing-mt-admin.sh` and `scripts/mt-admin-lib/*.sh` (e.g. `_systemctl_user`, now in `mt-admin-lib/units-systemd.sh`); infrastructure-health tooling that already abstracts user units / OpenRC / ports.json correctly.
+
+### mt-admin is a composition root plus libraries
+
+As of 2026-07-25 `scripts/lunarwing-mt-admin.sh` is a ~900-line composition root (constants, `usage()`, `selfcheck()`, `main()`) that sources 13 libraries from `scripts/mt-admin-lib/`. Everything above still applies to the family as a whole; additionally:
+
+- **Entry point is unchanged.** Always invoke `scripts/lunarwing-mt-admin.sh` (or `LUNARWING_MT_ADMIN`). Never source or execute a `mt-admin-lib/*.sh` directly — they assume the root's constants and `set -euo pipefail`.
+- **Init-system rendering and tenant service calls belong in `units-systemd.sh` / `units-openrc.sh`.** `_systemctl_user` is the only sanctioned exit point to `systemctl --user`; do not add tenant `systemctl` calls to any other library.
+- **Put new code in the library that owns the concern**, not in the root. The root should only gain a constant, a `usage()` line, and a dispatcher case. Add the new function's name to `selfcheck`'s expected list if it's a public entry point.
+- **Source-text assertions in tests must search the whole family**, not just the root — see `admin_grep` in `scripts/tests/test-wasm-upgrade-build.sh`. A grep against only `lunarwing-mt-admin.sh` will silently pass once a function moves.
+- **`scripts/check-mt-admin.sh` gates the family**: shellcheck `-x` on the root (authoritative), a scoped per-library pass, and `selfcheck`. It must stay green.
 
 ## Docs, Parity, and Testing
 

@@ -18,9 +18,11 @@ Fresh tenants previously lacked `[[sandbox.external_workers]]`, so
 `config.toml`. The current generator is idempotent and writes the per-tenant WSS
 URL, timeout, and gateway token:
 
-- `ensure_external_worker_config` (`ic/scripts/lunarwing-mt-admin.sh:2896-2959`)
-- `add-tenant` calls it for Nanocode, Pebble, and OpenCode (`:6356-6358`)
-- retrofit calls are present in `patch-env` (`:3372-3374`)
+- `ensure_external_worker_config` (`ic/scripts/mt-admin-lib/worker-config.sh:34-97`)
+- `add-tenant` calls it for Nanocode, Pebble, and OpenCode
+  (`ic/scripts/mt-admin-lib/tenant-lifecycle.sh:95-97`)
+- retrofit calls are present in `patch-env`
+  (`ic/scripts/mt-admin-lib/env-generation.sh:824-826`)
 - TOML shape is covered by `ic/src/config/sandbox.rs:454-512`
 
 The generated shape remains:
@@ -39,8 +41,9 @@ that value as `AGENT_AUTH_TOKEN`.
 
 Worker selection is separate from config generation: `--with-*` flags persist
 selection and the start path gates workers on that selection
-(`lunarwing-mt-admin.sh:6308,6332,7087-7089`; parser/build paths at
-`:7185-7202`). An endpoint block alone does not build or start a worker.
+(`ic/scripts/mt-admin-lib/tenant-lifecycle.sh:402` via `tenant_worker_enabled`;
+flag parsing in the `lunarwing-mt-admin.sh` dispatcher). An endpoint block alone
+does not build or start a worker.
 
 ## 2. Auth-token loss on settings rewrites
 

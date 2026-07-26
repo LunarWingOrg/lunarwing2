@@ -14,6 +14,15 @@
 3. [x] suggest items that should be added to goals list that arent. put in a new doc in docs/ops
 4. [x] (S) Go over proposals defer
 5. [x] (S) get back to previous refactor mt admin idea. see the section of docs/proposals/MT-ADMIN-DECOMPOSITION.md — review notes section of: `docs/ops/KUMOGAKURE_RECENT_REV_T.md` - you will NOT begin ANY work on this yet. you will simply edit the document already created under docs/proposals called `MT-ADMIN-DECOMPOSITION.md`
+    - **Implementation landed 2026-07-25** (beyond the doc-only scope above, on
+      explicit go-ahead): `lunarwing-mt-admin.sh` split 7748 → 910 lines behind
+      13 libraries in `ic/scripts/mt-admin-lib/`. Pure line-range moves,
+      verified by `declare -f` equivalence for all 209 functions, byte-identical
+      unit rendering for all 4 live tenants, and identical read-only command
+      output. Adds the `selfcheck` subcommand and
+      `ic/scripts/tests/test-ports-registry-lib.sh` (41 assertions); fixes 8
+      pre-existing `SC2155` findings that had `check-mt-admin.sh` red at `HEAD`.
+      See §0 of `docs/proposals/MT-ADMIN-DECOMPOSITION.md`.
 <<<<<<< docs/ops/AGENT_GOALS_2.0.3.0.md
 6. [x] continue to work on kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. SEE: SECTION: hermes_kawarimi — review notes in docs/ops/KUMOGAKURE_RECENT_REV_T.md for suggestedm improvements/concerns
 7. [x] Work on weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued. FEEDBACK FROM LAST TIME: 19:34:19 wrench │ ### Verdict: One real bug found: OpenRC weechat stop() invokes the helper as root instead of the tenant user, which will fail to find the tmux socket. Medium severity — the graceful stop silently becomes a no-op on OpenRC, though the old kill-session behavior would also be broken (same root-cause: missing su). The systemd path is unaffected. Otherwise: solid feature work. The weechat buffer restore is well-designed (proper wrapper script, good fallback chain, both init systems covered, renderer tests). The test-deferral approach is pragmatic and well-documented. You may attempt to use the following work from failed/partial work on these salvaged, incomplete branches: { rarity/item-16-20260722-1201 } { rarity/item-16-20260722-2123 } { rarity/item-16-20260723-0000 }

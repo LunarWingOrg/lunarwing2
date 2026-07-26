@@ -5,6 +5,15 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ADMIN_SCRIPT="$TEST_DIR/../lunarwing-mt-admin.sh"
 BUILD_SCRIPT="$TEST_DIR/../build-wasm-extensions.sh"
 
+# mt-admin is a composition root plus mt-admin-lib/*.sh. Source-text assertions
+# below must search the whole family, not just the root, or they silently pass
+# (or fail) when a function moves between libraries.
+mapfile -t ADMIN_SOURCES < <(printf '%s\n' "$ADMIN_SCRIPT" "$TEST_DIR"/../mt-admin-lib/*.sh)
+
+admin_grep() {  # <grep-args...> — fixed-string search across root + libraries
+  grep -Fq "$@" -- "${ADMIN_SOURCES[@]}"
+}
+
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 failures=0
@@ -135,14 +144,14 @@ else
   fail 'strict WASM mode returned the wrong validation error'
 fi
 # shellcheck disable=SC2016
-if grep -Fq 'build_tenant "$name" "true" "false" "false" "false" "false" "true"' "$ADMIN_SCRIPT"; then
+if admin_grep 'build_tenant "$name" "true" "false" "false" "false" "false" "true"'; then
   pass 'upgrade-tenant requires successful WASM build'
 else
   fail 'upgrade-tenant does not enable strict WASM build mode'
 fi
 # shellcheck disable=SC2016
-if grep -Fq -- '--require-wasm)' "$ADMIN_SCRIPT" \
-  && grep -Fq '"$with_toolchains" "$require_wasm"' "$ADMIN_SCRIPT"; then
+if admin_grep -- '--require-wasm)' \
+  && admin_grep '"$with_toolchains" "$require_wasm"'; then
   pass 'build-tenant CLI forwards strict WASM mode'
 else
   fail 'build-tenant CLI does not forward strict WASM mode'

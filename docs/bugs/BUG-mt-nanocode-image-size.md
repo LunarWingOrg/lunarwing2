@@ -14,9 +14,10 @@ capacity issue, not a correctness failure in the worker protocol.
 ## Current evidence
 
 - `_ensure_tenant_image` still distributes images with `save | load` and warns
-  that large images can take minutes (`ic/scripts/lunarwing-mt-admin.sh:625-668`).
+  that large images can take minutes
+  (`ic/scripts/mt-admin-lib/detect.sh:190-233`).
 - `start_tenant_nanocode` calls that helper before starting the worker
-  (`ic/scripts/lunarwing-mt-admin.sh:3764-3783`).
+  (`ic/scripts/mt-admin-lib/containers.sh:22-172`).
 - The image Dockerfile installs a broad runtime/toolchain package set
   (`lunarcode4lunarwing/Dockerfile:70-116`), and no slim/shared-image or
   additional-image-store mechanism is implemented in this tree.
@@ -38,3 +39,8 @@ historical context, not duplicate open bugs.
 Status is based on current script/Dockerfile inspection and the retained
 systemd validation record. No image build, container run, or Cargo command was
 performed in this pass. Re-verified on 2026-07-25 with updated line references.
+
+Line references re-pointed on 2026-07-25 after `lunarwing-mt-admin.sh` was split
+into `ic/scripts/mt-admin-lib/` (see §0 of
+`docs/proposals/MT-ADMIN-DECOMPOSITION.md`). The split moved code without
+changing it, so the finding itself is unaffected.

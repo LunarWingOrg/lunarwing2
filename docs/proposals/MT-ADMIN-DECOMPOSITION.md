@@ -1,15 +1,112 @@
 # Decomposing `lunarwing-mt-admin.sh` — Proposal
 
-> **Current status (2026-07-22, rev `HEAD`): PROPOSAL — reviewed, ready for implementation.**
-> This is a design document. No code changes are made in this proposal; it
-> describes how the monolithic multi-tenant admin script could be broken into
-> at least four separately-sourced bash libraries, and what the migration
-> path looks like.
+> **Current status (2026-07-25): IMPLEMENTED — see §0 for what actually landed.**
+> The decomposition described below has been carried out, going further than
+> the proposal's four-required/six-total plan: **13 libraries**, with the
+> composition root reduced from 7748 to ~900 lines. §0 records the delivered
+> layout and how it differs from the plan; the rest of the document is
+> preserved as the original design rationale.
 >
 > **Review history:** Reviewed in `docs/ops/KUMOGAKURE_RECENT_REV_T.md`
 > (2026-07-21). Verdict: "solid proposal, ready for sun to greenlight
-> implementation." This revision incorporates the review feedback (see
+> implementation." That revision incorporated the review feedback (see
 > §5.1 Test Surface, §10.1 Updated Recommendations, and the 3a/3b note in §4).
+
+---
+
+## 0. What Actually Landed (2026-07-25)
+
+The split went further than the plan below. Rather than stopping at the four
+required libraries (~4800-line root), everything except the constants block,
+`usage()`, `selfcheck()`, and `main()` was moved out, giving **13 libraries**
+behind a **910-line** composition root — an 88% reduction from 7748 lines.
+
+```
+ic/scripts/
+├── lunarwing-mt-admin.sh      910   constants, usage(), selfcheck(), main() dispatcher
+└── mt-admin-lib/
+    ├── 00-common.sh           207   say/die/require_cmd, ports lock, token+name gen,
+    │                                tenant path primitives, config-hash tracking,
+    │                                feature-flag + PG password readers, render_template
+    ├── detect.sh              239   init-system + container-runtime detection, _ctr
+    ├── ports-registry.sh      633   ports.json schema, v2..v11 ladder, alloc/dealloc
+    ├── tenant-build.sh        718   user lifecycle, repo clone, cargo + worker images, WASM
+    ├── env-generation.sh      828   lunarwing/bridge/proxy/darkirc env, WeeChat relay,
+    │                                XMPP allow-lists, patch-env
+    ├── worker-config.sh       513   external-worker config.toml, SSH harness, secret
+    │                                upload, Gotify/pebble/nanocode/opencode config
+    ├── owner-scope.sh         267   one-shot owner_id rekey migration (psql)
+    ├── containers.sh          667   nanocode/opencode/pebble/vision sidecar lifecycle
+    ├── postgres.sh            353   per-tenant PG container + backup/restore/rotate
+    ├── units-systemd.sh       553   systemd units + quadlets, _systemctl_user boundary
+    ├── units-openrc.sh       1041   OpenRC init scripts, conf.d, worker/babysitter/vision
+    ├── health-pipeline.sh     238   host-global health/self-heal install + removal
+    └── tenant-lifecycle.sh    897   add/remove/start/stop/restart/upgrade/status/doctor
+```
+
+**Deviations from the plan below, and why:**
+
+- **13 libraries, not 6.** §10.1 already argued `tenant-lifecycle.sh` shouldn't
+  be deferred; once that was in, the remaining large blocks (container
+  lifecycle §8.3, user/build, worker-config/SSH, postgres, owner-scope §8.2)
+  split along the same section banners with no extra risk, since every step is
+  a pure line-range move.
+- **`main()` stayed in the root**, as §10.1 and §8.6 recommended.
+- **`usage()` stayed in the root** rather than moving to `tenant-lifecycle.sh`;
+  it documents the dispatcher, so it belongs beside it. §8.4's table-generation
+  idea remains open.
+- **Two libraries carry module-level state, not just functions.** `detect.sh`
+  owns `INIT_SYSTEM`, `RUNTIME_STATE_FILE`, `CONTAINER_RT`, `MT_ROOTLESS`, and
+  `QUADLET_OK` (memoisation slots for its own probes); `containers.sh` owns
+  `VISION_SIDECAR_*`. Both moved with their sections instead of being hoisted
+  into the root, keeping each next to its only consumers. Load order is still
+  not load-bearing: no library executes anything at source time.
+- **The vision unit renderers were split from the vision section.**
+  `render_vision_openrc_unit` went to `units-openrc.sh` and
+  `render_vision_quadlet` to `units-systemd.sh`, so all init-system rendering
+  lives behind the two unit libraries. The remaining vision functions
+  (`build_vision_sidecar_image`, `write_tenant_vision_env`,
+  `start_tenant_vision`, `stop_tenant_vision`) stayed in `containers.sh`.
+- **`open question 1` resolved as "sibling directory."** `mt-admin-lib/` lives
+  next to the root in the repo and resolves via `SCRIPT_DIR`, so the
+  `LUNARWING_MT_ADMIN` override keeps working unchanged. Nothing invokes a
+  tenant-local copy of mt-admin, so no install-path change was needed.
+- **`open question 2` resolved as `0644`** with a "sourced by …; do not execute
+  directly" banner, as the proposal leaned.
+- **`open question 3` delivered** as the `selfcheck` subcommand: it asserts 57
+  representative symbols across the 13 libraries are defined after sourcing,
+  needs no root, and runs as the first `doctor` check.
+
+**Equivalence evidence.** The move was verified, not assumed:
+
+| Check | Result |
+|---|---|
+| `declare -f` for all 209 functions, before vs after | byte-identical (only the 8 intentional `SC2155` splits and the new `selfcheck` differ) |
+| Global variable set after sourcing | identical apart from the new `MT_ADMIN_LIB_DIR` |
+| Rendered systemd units for all 4 live tenants (16 files) | byte-identical |
+| `help`/`list-tenants`/`tokens`/`status`/`list-backups`/`doctor` output | identical apart from the new `selfcheck` lines |
+| Source-time side effects per library | none: functions and constants only |
+| `check-mt-admin.sh` | green (it was **red at `HEAD`** — 8 pre-existing `SC2155` findings, now fixed) |
+| Existing CI shell harnesses | all pass; `test-wasm-upgrade-build.sh` needed its source-text greps widened to the library set |
+
+**New test surface:** `ic/scripts/tests/test-ports-registry-lib.sh` — the first
+per-library harness from §5.1 (41 assertions over the v1→v11 migration ladder,
+allocation, feature enablement, queries, and deallocation against a fixture
+registry). Picked up automatically by `.gitlab/scripts/shell-harnesses.sh`.
+
+**Correction to §8.1.** The proposal calls `remove_health_pipeline` dead code.
+It isn't: `remove_tenant` calls it (now `tenant-lifecycle.sh:232`) when the
+last tenant is removed, retiring the host-global schedule. What's actually
+absent is an operator-facing `remove-health` subcommand, so the pipeline can
+only be retired as a side effect of removing the final tenant. That's still
+worth a follow-up, but as an added subcommand, not a dead-code cleanup.
+
+**Still open from §8:** the `start_tenant_sidecar` dispatch idea (§8.3),
+`usage()` table generation (§8.4), and the `mt-admin-cmd/` per-subcommand
+lookup (§8.6). §8.2 (owner-scope) and §8.5 (worker/babysitter helpers) are
+done — both landed as part of this split.
+
+---
 
 **Date:** 2026-07-21
 **Origin:** Item #14 of `docs/ops/AGENT_GOALS_2.0.2.0.md` — "refactor mt admin idea. write up a doc on how we can break mt admin setup monolithic megascript (8000 lines of bash rn) into AT LEAST FOUR SEPERATE PARTS. put it in docs/proposals".
