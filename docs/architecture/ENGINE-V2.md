@@ -358,6 +358,14 @@ the agent's outer outbound handler, which applies `BeforeOutbound`, suppresses
 empty responses, persists compatibility history, and calls
 `ChannelManager::respond()` once with the original incoming metadata.
 
+Rate-metered channels (DarkIRC) carry a host-side message budget
+(`ic/src/channels/budget.rs`). The bridge injects the budget's guidance into
+new engine threads via `ThreadConfig::channel_context` (rendered as a
+"Channel Constraints" system-prompt section — the engine crate stays
+channel-neutral), and the bundled `BeforeOutbound` hook
+(`builtin.channel_message_budget`) truncates over-budget terminal responses at
+a UTF-8-safe boundary with an explicit continuation marker before delivery.
+
 Approval, authentication, interrupt, clear, and new-thread controls use the
 same user and engine-conversation scope as ordinary input. This includes
 non-UUID DarkIRC and WeeChat scope keys. Approval and auth prompts are statuses;

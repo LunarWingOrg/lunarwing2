@@ -27,6 +27,7 @@
 //! WASM channels allow dynamic loading of channel implementations at runtime.
 //! See the [`wasm`] module for details.
 
+pub mod budget;
 mod channel;
 mod http;
 mod manager;

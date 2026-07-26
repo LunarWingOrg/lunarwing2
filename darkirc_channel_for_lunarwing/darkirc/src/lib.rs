@@ -42,6 +42,8 @@ use lunarwing::agent::channel_host::{self, EmittedMessage};
 #[derive(Debug, Deserialize)]
 struct AdapterPollResponse {
     messages: Vec<AdapterMessage>,
+    #[serde(default)]
+    batch_id: Option<String>,
 }
 
 // A single inbound DM from the adapter.
@@ -61,6 +63,11 @@ struct AdapterMessage {
 struct AdapterSendRequest {
     to: String,
     text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdapterAckRequest<'a> {
+    batch_id: &'a str,
 }
 
 // === Channel Configuration ===
@@ -183,11 +190,18 @@ fn tenant_id_path() -> String {
     "state/tenant_id".to_string() // Global, not tenant-specific
 }
 
-// Max UTF-8 bytes per IRC message chunk.
-// Conservative under the 512-byte IRC protocol limit.
-// Mirrors the Python adapter's `MAX_IRC_MESSAGE_BYTES` default (env: `DARKIRC_MAX_MESSAGE_BYTES`);
-// update both sides together if you change one.
+// Max UTF-8 bytes for a single-message status line (conservative under the
+// 512-byte IRC frame). IRC chunking of full responses is owned by the
+// adapter (`darkirc_adapter.py`), which splits, numbers, and paces chunks
+// from its outbox — this constant only sizes `truncate_for_status`.
 const MAX_IRC_MESSAGE_BYTES: usize = 400;
+
+// Max UTF-8 bytes per POST /send request body. The adapter caps request
+// bodies at 64 KiB (`ADAPTER_MAX_BODY_BYTES`); staying well under that
+// (including JSON envelope overhead) keeps every request accepted. The
+// adapter re-splits each part into paced IRC chunks, so this split is a
+// safety valve for pathologically long responses — NOT IRC chunking.
+const ADAPTER_SEND_MAX_BYTES: usize = 30_000;
 
 // === Channel Implementation ===
 
@@ -341,10 +355,16 @@ impl Guest for DarkircChannel {
 
         // Ack the batch so the adapter can drop it (M4: at-least-once delivery —
         // if we crash before this ack, the next /poll re-serves the same batch).
-        let ack_url = format!("{}/ack", adapter_url);
-        if let Err(e) =
-            channel_host::http_request("POST", &ack_url, &headers_json, None, Some(5_000))
-        {
+        // Legacy responses without batch_id fail safe: process messages but do
+        // not send an unscoped ACK that could clear a newer adapter batch.
+        let Some(batch_id) = poll_response.batch_id.as_deref() else {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                "Adapter poll response omitted batch_id; batch left unacked",
+            );
+            return;
+        };
+        if let Err(e) = adapter_ack(&adapter_url, batch_id) {
             channel_host::log(
                 channel_host::LogLevel::Warn,
                 &format!(
@@ -509,7 +529,7 @@ fn handle_inbound_dm(msg: &AdapterMessage) {
     }
 
     // --- Emit to agent ---
-    let principal = darkirc_principal(&nick);
+    let principal = darkirc_principal(nick);
     let metadata = DarkircMessageMetadata {
         nick: nick.clone(),
         principal: Some(principal.clone()),
@@ -563,46 +583,46 @@ fn send_response_to_nick(nick: &str, content: &str) -> Result<(), String> {
         .filter(|s| !s.is_empty())
         .unwrap_or_default();
 
-    let chunks = split_message(content, MAX_IRC_MESSAGE_BYTES);
-    let mut successful_chunks = 0;
-    let mut last_error = None;
+    // The adapter owns IRC chunking, numbering, and pacing; hand it the whole
+    // response in one request. Splitting here only guards the adapter's HTTP
+    // body cap for pathologically long responses. Each /send returns as soon
+    // as the adapter has queued the message, so this stays far inside the
+    // host's callback timeout even for long replies.
+    let parts = split_message(content, ADAPTER_SEND_MAX_BYTES);
+    let total = parts.len();
 
-    for chunk in &chunks {
-        match adapter_send(&adapter_url, nick, chunk) {
-            Ok(()) => {
-                successful_chunks += 1;
-            }
-            Err(e) => {
-                channel_host::log(
-                    channel_host::LogLevel::Warn,
-                    &format!(
-                        "Failed to send chunk {} to '{}': {}",
-                        successful_chunks + 1,
-                        nick,
-                        e
-                    ),
-                );
-                last_error = Some(e);
-            }
+    for (index, part) in parts.iter().enumerate() {
+        if let Err(e) = adapter_send(&adapter_url, nick, part) {
+            // Report honestly: a failed part means the recipient sees a gap.
+            // Partial delivery must surface as an error, not success.
+            channel_host::log(
+                channel_host::LogLevel::Error,
+                &format!(
+                    "Failed to queue part {}/{} for '{}': {}",
+                    index + 1,
+                    total,
+                    nick,
+                    e
+                ),
+            );
+            return Err(format!(
+                "queued {} of {} part(s) to '{}', then failed: {}",
+                index, total, nick, e
+            ));
         }
     }
 
     channel_host::log(
         channel_host::LogLevel::Debug,
         &format!(
-            "Sent {} of {} chunk(s) to '{}' ({} chars total)",
-            successful_chunks,
-            chunks.len(),
+            "Queued {} part(s) to '{}' ({} chars total)",
+            total,
             nick,
             content.len(),
         ),
     );
 
-    if successful_chunks > 0 {
-        Ok(())
-    } else {
-        Err(last_error.unwrap_or_else(|| "Failed to send any chunks".to_string()))
-    }
+    Ok(())
 }
 
 // Send a DM via the adapter.
@@ -623,16 +643,31 @@ fn adapter_send(adapter_url: &str, to: &str, text: &str) -> Result<(), String> {
     let response =
         channel_host::http_request("POST", &url, &headers_json, Some(&payload), Some(5_000))?;
 
-    if response.status == 503 {
-        return Err("IRC not connected".to_string());
+    match response.status {
+        // 200 = queued (outbox adapter) or sent (legacy adapter); 202 kept
+        // for forward compatibility with explicit async-accepted semantics.
+        200 | 202 => Ok(()),
+        429 => Err("adapter outbox full (message rejected, not queued)".to_string()),
+        503 => Err("IRC not connected".to_string()),
+        status => {
+            let body_str = String::from_utf8_lossy(&response.body);
+            Err(format!("HTTP {}: {}", status, body_str))
+        }
     }
+}
 
-    if response.status != 200 {
-        let body_str = String::from_utf8_lossy(&response.body);
-        return Err(format!("HTTP {}: {}", response.status, body_str));
+fn adapter_ack(adapter_url: &str, batch_id: &str) -> Result<(), String> {
+    let url = format!("{}/ack", adapter_url);
+    let payload = serde_json::to_vec(&AdapterAckRequest { batch_id })
+        .map_err(|e| format!("serialize error: {}", e))?;
+    let headers_json = serde_json::json!({"Content-Type": "application/json"}).to_string();
+    let response =
+        channel_host::http_request("POST", &url, &headers_json, Some(&payload), Some(5_000))?;
+    if response.status == 200 {
+        Ok(())
+    } else {
+        Err(format!("HTTP {}", response.status))
     }
-
-    Ok(())
 }
 
 // === Utilities ===
@@ -644,7 +679,7 @@ fn split_message(text: &str, max_bytes: usize) -> Vec<String> {
     let normalized = text.replace('\r', "\n");
     let text_ref: &str = &normalized;
 
-    if text_ref.as_bytes().len() <= max_bytes {
+    if text_ref.len() <= max_bytes {
         return vec![text_ref.to_string()];
     }
 
@@ -652,7 +687,7 @@ fn split_message(text: &str, max_bytes: usize) -> Vec<String> {
     let mut remaining = text_ref;
 
     while !remaining.is_empty() {
-        if remaining.as_bytes().len() <= max_bytes {
+        if remaining.len() <= max_bytes {
             chunks.push(remaining.to_string());
             break;
         }
@@ -666,7 +701,7 @@ fn split_message(text: &str, max_bytes: usize) -> Vec<String> {
                 continue;
             }
             // Check byte length
-            if remaining[..end].as_bytes().len() <= max_bytes {
+            if remaining[..end].len() <= max_bytes {
                 break;
             }
             end -= 1;
@@ -757,7 +792,7 @@ mod tests {
         // 1. Byte limit: every chunk fits within max_bytes
         //    (unless a single char exceeds it ─ then that chunk is as small as possible)
         for (i, chunk) in chunks.iter().enumerate() {
-            let byte_len = chunk.as_bytes().len();
+            let byte_len = chunk.len();
             // A chunk may exceed max_bytes only if it's a single character
             let single_char = chunk.len() == 1;
             assert!(
@@ -973,6 +1008,36 @@ mod tests {
         assert_split_invariants(&chunks, text, 1);
     }
 
+    // ── Adapter-owned chunking (regression: dropped tails of long replies) ──
+
+    #[test]
+    fn responses_under_adapter_body_cap_are_sent_in_one_request() {
+        // The WASM layer used to pre-split at the 400-byte IRC budget and POST
+        // one request per chunk; combined with the adapter's blocking paced
+        // /send, chunks 2+ timed out and long replies lost their tail. IRC
+        // chunking is now delegated to the adapter's outbox: anything under
+        // ADAPTER_SEND_MAX_BYTES must go out as a single /send request.
+        let text = "word ".repeat(1_000); // 5 KB — far over the IRC frame size
+        let parts = split_message(&text, ADAPTER_SEND_MAX_BYTES);
+        assert_eq!(
+            parts.len(),
+            1,
+            "IRC chunking must be delegated to the adapter"
+        );
+    }
+
+    #[test]
+    fn oversized_responses_split_under_adapter_body_cap() {
+        // Safety valve: parts must stay under the adapter's 64 KiB body cap.
+        let text = "word ".repeat(20_000); // ~100 KB
+        let parts = split_message(&text, ADAPTER_SEND_MAX_BYTES);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            assert!(part.len() <= ADAPTER_SEND_MAX_BYTES);
+        }
+        assert_split_invariants(&parts, &text, ADAPTER_SEND_MAX_BYTES);
+    }
+
     // ── Status truncation tests (H1 regression: multibyte UTF-8) ──
 
     #[test]
@@ -1056,6 +1121,7 @@ mod tests {
     #[test]
     fn test_parse_poll_response() {
         let json = r#"{
+            "batch_id": "opaque-batch-token",
             "messages": [
                 {"from": "alice", "text": "hello", "ts": "2026-03-05T12:00:00Z"},
                 {"from": "bob", "text": "hey there", "ts": "2026-03-05T12:01:00Z"}
@@ -1065,6 +1131,7 @@ mod tests {
         assert_eq!(resp.messages.len(), 2);
         assert_eq!(resp.messages[0].from, "alice");
         assert_eq!(resp.messages[1].text, "hey there");
+        assert_eq!(resp.batch_id.as_deref(), Some("opaque-batch-token"));
     }
 
     #[test]
@@ -1074,6 +1141,25 @@ mod tests {
         }"#;
         let resp: AdapterPollResponse = serde_json::from_str(json).unwrap();
         assert!(resp.messages.is_empty());
+        assert!(resp.batch_id.is_none());
+    }
+
+    #[test]
+    fn legacy_poll_without_batch_id_fails_safe() {
+        let resp: AdapterPollResponse =
+            serde_json::from_str(r#"{"messages":[{"from":"alice","text":"hello","ts":"now"}]}"#)
+                .unwrap();
+        assert_eq!(resp.messages.len(), 1);
+        assert!(resp.batch_id.is_none());
+    }
+
+    #[test]
+    fn ack_request_serializes_exact_batch_id() {
+        let json = serde_json::to_string(&AdapterAckRequest {
+            batch_id: "opaque-batch-token",
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"batch_id":"opaque-batch-token"}"#);
     }
 
     #[test]

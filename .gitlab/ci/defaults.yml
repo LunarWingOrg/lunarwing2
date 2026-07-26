@@ -68,6 +68,28 @@ variables:
       - .ci-cache/cargo/git/db/
     policy: pull-push
 
+# MSRV check uses a separate cache namespace so future primary-toolchain bumps
+# do not contaminate artifacts built with the declared minimum toolchain.
+# rust-toolchain.toml is moved aside so rustup selects the image rustc.
+.rust-msrv-job:
+  image:
+    name: "docker.io/library/rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663"
+  tags:
+    - "$CI_RUST_RUNNER_TAG"
+  before_script:
+    - bash .gitlab/scripts/bootstrap-msrv.sh
+    - mv ic/rust-toolchain.toml ic/rust-toolchain.toml.disabled
+  cache:
+    key:
+      prefix: "rust-1.96.1-msrv"
+      files:
+        - ic/Cargo.lock
+    paths:
+      - .ci-cache/cargo/registry/index/
+      - .ci-cache/cargo/registry/cache/
+      - .ci-cache/cargo/git/db/
+    policy: pull-push
+
 .gitleaks-job:
   image:
     name: "docker.io/zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"

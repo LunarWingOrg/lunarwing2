@@ -36,7 +36,7 @@ Tenant A                                 Tenant B
 
 2. **Adapter Environment** (Task 2)
    - `write_tenant_darkirc_adapter_env()` generates `$TENANT_ENV_DIR/darkirc-adapter.env`
-   - Contains: `DARKIRC_HOST=127.0.0.1`, `DARKIRC_PORT=$darkirc_irc_port` (the tenant's own daemon IRC port from the registry), `DARKIRC_NICK=$TENANT-bridge`, `DARKIRC_USER=$TENANT`, `DARKIRC_REALNAME=LunarWing DarkIRC Bridge ($TENANT)`, `ADAPTER_HOST=127.0.0.1`, `ADAPTER_PORT=$darkirc_adapter_port`, `ADAPTER_SECRET=$TOKEN`, `ADAPTER_LOG_LEVEL=INFO`
+   - Contains: `DARKIRC_HOST=127.0.0.1`, `DARKIRC_PORT=$darkirc_irc_port` (the tenant's own daemon IRC port from the registry), `DARKIRC_NICK=$TENANT-bridge`, `DARKIRC_USER=$TENANT`, `DARKIRC_REALNAME=LunarWing DarkIRC Bridge ($TENANT)`, `ADAPTER_HOST=127.0.0.1`, `ADAPTER_PORT=$darkirc_adapter_port`, `ADAPTER_SECRET=$TOKEN`, `ADAPTER_OUTBOX_JOURNAL=/home/$TENANT/lunarwing/state/darkirc-outbox.json`, `ADAPTER_LOG_LEVEL=INFO`
    - The `ADAPTER_SECRET` is read back from `lunarwing.env` (`DARKIRC_ADAPTER_SECRET`) so it is preserved on re-run; a new token is generated only when absent
    - `DARKIRC_ADAPTER_SECRET` is injected into `lunarwing.env` for the WASM channel side
 

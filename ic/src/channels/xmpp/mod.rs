@@ -20,7 +20,7 @@ use uuid::Uuid;
 use xmpp_parsers::caps::{self, Caps};
 use xmpp_parsers::data_forms::{DataForm, DataFormType, Field, FieldType};
 use xmpp_parsers::disco::{
-    DiscoInfoQuery, DiscoInfoResult, DiscoItemsQuery, DiscoItemsResult, Feature, Identity,
+    DiscoInfoQuery, DiscoInfoResult, DiscoItemsQuery, DiscoItemsResult, Identity,
 };
 use xmpp_parsers::eme::ExplicitMessageEncryption;
 use xmpp_parsers::hashes::Algo;
@@ -404,11 +404,13 @@ fn lunarwing_disco_info() -> DiscoInfoResult {
     DiscoInfoResult {
         node: None,
         identities: vec![Identity::new("client", "bot", "", "LunarWing")],
-        features: vec![
-            Feature::new(ns::DISCO_INFO),
-            Feature::new(ns::OOB),
-            Feature::new(ns::PING),
-        ],
+        features: [
+            ns::DISCO_INFO.to_string(),
+            ns::OOB.to_string(),
+            ns::PING.to_string(),
+        ]
+        .into_iter()
+        .collect(),
         extensions: vec![],
     }
 }
@@ -544,11 +546,7 @@ async fn fetch_room_capabilities(
         name: "xmpp".into(),
         reason: format!("failed to parse room disco#info payload: {e}"),
     })?;
-    let features: HashSet<String> = disco
-        .features
-        .into_iter()
-        .map(|feature| feature.var)
-        .collect();
+    let features: HashSet<String> = disco.features.into_iter().collect();
     Ok((
         features.contains("muc_nonanonymous"),
         features.contains("muc_membersonly"),
@@ -2508,7 +2506,7 @@ async fn discover_http_upload_service(
         })?;
 
     let has_upload_feature =
-        |info: &DiscoInfoResult| info.features.iter().any(|f| f.var == ns::HTTP_UPLOAD);
+        |info: &DiscoInfoResult| info.features.iter().any(|f| *f == ns::HTTP_UPLOAD);
 
     // 1. The server domain itself may host the upload service.
     if let Ok(info) = disco_info_result(
@@ -3430,7 +3428,7 @@ mod tests {
                 let result = DiscoInfoResult::try_from(payload.expect("payload"))
                     .expect("valid disco#info result");
                 assert!(result.identities.iter().any(|i| i.category == "client"));
-                let vars: Vec<&str> = result.features.iter().map(|f| f.var.as_str()).collect();
+                let vars: Vec<&str> = result.features.iter().map(String::as_str).collect();
                 assert!(vars.contains(&ns::DISCO_INFO));
                 assert!(vars.contains(&ns::OOB));
             }
