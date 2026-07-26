@@ -40,6 +40,7 @@ use crate::types::error::EngineError;
 use crate::types::event::{EventKind, ThreadEvent, summarize_params};
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
+use crate::types::provenance::Provenance;
 use crate::types::shared_owner_id;
 use crate::types::step::{ActionCall, LlmResponse, StepId, TokenUsage};
 use crate::types::thread::{Thread, ThreadState};
@@ -940,7 +941,7 @@ async fn handle_execute_action(
         .and_then(|actions| actions.into_iter().find(|a| a.name == name));
 
     if let Some(ref ad) = action_def {
-        match policy.evaluate(ad, &lease, &[]) {
+        match policy.evaluate_with_provenance(ad, &lease, &[], &Provenance::LlmGenerated) {
             crate::capability::policy::PolicyDecision::Deny { reason } => {
                 let output = serde_json::json!({"error": format!("Denied: {reason}")});
                 emit_and_record(
@@ -1219,7 +1220,7 @@ async fn handle_execute_actions_parallel(
             .and_then(|actions| actions.into_iter().find(|a| a.name == pc.name));
 
         if let Some(ref ad) = action_def {
-            match policy.evaluate(ad, &lease, &[]) {
+            match policy.evaluate_with_provenance(ad, &lease, &[], &Provenance::LlmGenerated) {
                 crate::capability::policy::PolicyDecision::Deny { reason } => {
                     let output = serde_json::json!({"error": format!("Denied: {reason}")});
                     let result_json = serde_json::json!({

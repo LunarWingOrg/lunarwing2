@@ -15,6 +15,7 @@ use crate::traits::effect::{EffectExecutor, ThreadExecutionContext};
 use crate::types::capability::CapabilityLease;
 use crate::types::error::EngineError;
 use crate::types::event::EventKind;
+use crate::types::provenance::Provenance;
 use crate::types::step::{ActionCall, ActionResult};
 use crate::types::thread::Thread;
 
@@ -109,7 +110,12 @@ pub async fn execute_action_calls(
             .find(|a| a.name == call.action_name);
 
         if let Some(ref action_def) = action_def {
-            let decision = policy.evaluate(action_def, &lease, capability_policies);
+            let decision = policy.evaluate_with_provenance(
+                action_def,
+                &lease,
+                capability_policies,
+                &Provenance::LlmGenerated,
+            );
             match decision {
                 PolicyDecision::Deny { reason } => {
                     let error_result = ActionResult {
