@@ -16,6 +16,13 @@
 > items below are targeted hardening, parity fixes, and low-risk gaps — not a
 > rearchitecture. The 2026-07-26 refresh adds findings on build-thread
 > divergence, `rust-toolchain.toml`, coverage, and checkout depth.
+>
+> **2026-07-26 update (item #16):** The P0, P1, and documentation-parity P2
+> findings below are now addressed on branch `aj/item-16-20260726-1500`.
+> Each finding heading carries a `**Status:**` line recording the fix. The
+> validator (`validate_config.py`) now enforces README↔defaults image digest
+> parity and `rust-toolchain.toml` channel agreement, so the drift classes
+> cannot recur silently.
 
 ## 1. Current pipeline summary (verified)
 
@@ -47,6 +54,11 @@ This is a solid Phase 1. The following sections list issues by priority.
 
 ### P0 — Stale README image digest vs. actual image (must fix)
 
+**Status (2026-07-26): FIXED.** `.gitlab/README.md` config.toml example and
+Pinned images list now cite `rust:1.96.1-bookworm@sha256:a339861a…`.
+`validate_config.py` asserts the README digest matches `defaults.yml` and
+rejects stale Rust image tags, so this drift class is now CI-enforced.
+
 `.gitlab/README.md:121` instructs operators to configure the runner
 `config.toml` with:
 
@@ -74,6 +86,12 @@ guarantee the pipeline relies on.
 
 ### P0 — README claims MSRV 1.92, CI pins 1.96.1, no MSRV verification
 
+**Status (2026-07-26): FIXED.** Workspace declarations were raised to the
+supported `1.96.1` toolchain. New observational `rust-msrv-check` job runs
+`cargo check --locked` on `rust:1.96.1-bookworm`, default-branch and schedule
+only. `rust-toolchain.toml` is moved aside for the job so rustup selects the
+image rustc. Becomes blocking once MSRV is confirmed green. Closes plan §15.5.
+
 `ic/Cargo.toml:15` declares `rust-version = "1.92"` and `AGENTS.md` lists
 MSRV 1.92, but the only Rust job uses 1.96.1. Nothing in CI proves the crate
 still builds on its declared MSRV. The plan explicitly flags this
@@ -83,13 +101,20 @@ now also exists: `ic/rust-toolchain.toml` hardcodes `channel = "1.96.1"`,
 so the 1.92/1.96 split is now visible in four places: `Cargo.toml`,
 `AGENTS.md`, `rust-toolchain.toml`, and `.gitlab/ci/defaults.yml`.
 
-**Suggested fix:** add one scheduled (non-MR) `rust-msrv-check` job using
+**Original suggested fix:** add one scheduled (non-MR) `rust-msrv-check` job using
 `rust:1.92-bookworm` that runs `cargo check --locked` on the default feature
 set. Keep it observational until green, then make it required on the default
 branch. This is low-cost and directly closes the reconciliation item from
 the plan.
 
 ### P1 — Parallel Cargo jobs can overlap on `0-5` within one runner host
+
+**Status (2026-07-26): DOCUMENTED.** The `limit = 1` constraint is now
+recorded as a hard requirement in the README "Required jobs" section and as
+a verification item in the §6 activation evidence checklist. A
+`resource_group:` was not added because the runner-host `limit = 1` already
+prevents overlap and the project does not rely on GitLab-side concurrency
+control for correctness.
 
 `cargo-ci.sh` pins `taskset -c 0-5`, and the README correctly notes a per-host
 job limit of one Rust job. However that constraint lives only in the README,
@@ -107,6 +132,11 @@ host (e.g. misconfigured `limit = 2`), the two `taskset -c 0-5` processes will
   the README rather than leaving it as prose.
 
 ### P1 — `validate_config.py` does not detect this class of drift
+
+**Status (2026-07-26): FIXED.** `validate_config.py` now extracts the Rust
+image tag+digest from `defaults.yml`, asserts the same digest appears in
+`.gitlab/README.md`, and flags any stale Rust image tag. The P0 image drift
+above would now fail `ci-config`.
 
 `validate_config.py` checks image digest pinning and direct `cargo` usage, but
 does not check that the image digest referenced in `README.md` matches the one
@@ -164,6 +194,10 @@ needs it, lift it into the shared artifact producer. No change needed today.
 
 ### P2 — All Cargo jobs use `-j2`, diverging from project and plan standard
 
+**Status (2026-07-26): DOCUMENTED.** README "Required jobs" section now
+records that CI uses `-j2` (libSQL `-j1`) to stay within 16 GB during
+four-way parallel check, distinct from the local-dev `-j6` budget in AGENTS.md.
+
 Every Rust job in `.gitlab/ci/rust.yml` and `.gitlab/ci/integration.yml` runs
 `cargo-ci.sh <cmd> -j2` (libsql uses `-j1`). The project standard in
 `AGENTS.md` and the plan (§8.2, §10) is `-j6` bounded by `taskset -c 0-5`.
@@ -186,6 +220,12 @@ local-dev budget, not the CI budget. No YAML change required; this is a
 documentation parity fix so the two standards do not look contradictory.
 
 ### P2 — `rust-toolchain.toml` is a third toolchain pin not covered by `validate_config.py`
+
+**Status (2026-07-26): FIXED.** `validate_config.py` now parses the `channel`
+from `ic/rust-toolchain.toml` and asserts it equals the Rust image tag in
+`defaults.yml`. Three-way drift (Cargo.toml `rust-version` ↔ image ↔
+toolchain.toml) is now caught at the `ci-config` job; the Cargo.toml MSRV is
+additionally exercised by `rust-msrv-check`.
 
 `ic/rust-toolchain.toml` hardcodes `channel = "1.96.1"`. `bootstrap-rust.sh`
 re-verifies `rustc 1.96.1` at runtime, and `defaults.yml` pins the
@@ -246,7 +286,7 @@ rather than an oversight.
 | 8.5 Path-triggered standalone crates matrix | Not present | 17 standalone lockfiles exist (see §5 below). Currently the core `ic/Cargo.lock` does not validate them. Plan defers to Phase 2; reasonable, but see suggestion in §5. |
 | 8.6 Strict WASM (`build-wasm-extensions.sh --strict`) | Partial | `wasm-channel-test-artifacts` builds two channels directly; the strict-mode flag described in the plan is not exercised. `cavepony-wasm` also builds directly but additionally asserts `CAVEPONY_EXPECTED_VERSION` and runs the `wit_compat` test, so it is stricter than the channel artifact job. |
 | 10.1 Coverage reporting | Not present | `ic/scripts/coverage.sh` and `ic/codecov.yml` exist but no CI job invokes them. Plan defers coverage to Phase 2 with a measured baseline; correct to defer, but the gap is now explicit. |
-| 15.5 Toolchain reconciliation (1.92 vs 1.96) | **Unresolved** | See P0 above — this is the one Phase 0 item still visibly open. Now compounded by `ic/rust-toolchain.toml` (see P2 above). |
+| 15.5 Toolchain reconciliation (1.92 vs 1.96) | **RESOLVED 2026-07-26** | Workspace MSRV raised to 1.96.1; `rust-msrv-check` validates that declared minimum; `validate_config.py` enforces README ↔ defaults.yml ↔ rust-toolchain.toml tag agreement. The MSRV job remains observational until one green run, after which it becomes blocking. |
 
 ---
 
@@ -309,8 +349,8 @@ path-triggered matrix in plan §8.5 and catches the most common failure.
 
 ## 6. Documentation / metadata suggestions
 
-- `.gitlab/README.md` §"Pinned images" lists Rust 1.92 and cargo-deny 0.20.2;
-  `defaults.yml` uses Rust 1.96.1. Reconcile (P0 above).
+- `.gitlab/README.md` §"Pinned images" and `defaults.yml` now agree on Rust
+  1.96.1; the obsolete Rust 1.92 image pin was removed.
 - The "Required jobs" list in the README does not mention `cavepony-wasm`,
   `python-unit`, or `shell-harnesses` by name in its prose summary, though
   they are required. Consider enumerating them for operator clarity.
@@ -322,26 +362,30 @@ path-triggered matrix in plan §8.5 and catches the most common failure.
 
 ## 7. Recommended next actions (ordered)
 
-1. **(P0)** Reconcile `.gitlab/README.md` Rust image digest with
-   `defaults.yml` (1.96.1, hash `a339861a…`).
-2. **(P0)** Add an observational MSRV check job on Rust 1.92 to close plan
-   §15.5. Now also reconcile `ic/rust-toolchain.toml` channel.
-3. **(P1)** Extend `validate_config.py` to assert README image digest ==
-   `defaults.yml` image digest, preventing future drift.
-4. **(P1)** Make the one-Rust-job-per-host constraint explicit (README
-   checklist or `resource_group`).
-5. **(P2)** Extend `validate_config.py` to parse
-   `ic/rust-toolchain.toml` channel and assert it matches the Rust image tag.
-6. **(P2)** Document in `.gitlab/README.md` that CI uses `-j2` (libSQL
-   `-j1`) by design, distinct from the local-dev `-j6` standard.
+1. **(STATUS: DONE 2026-07-26)** Reconcile `.gitlab/README.md` Rust image
+   digest with `defaults.yml` (1.96.1, hash `a339861a…`). Enforced by
+   validator; obsolete 1.92 digest removed after raising the declared MSRV.
+2. **(STATUS: DONE 2026-07-26)** Add an observational MSRV check job on Rust
+   1.96.1 to close plan §15.5 after raising workspace declarations; also
+   reconcile `ic/rust-toolchain.toml` channel (validator now asserts match
+   with image tag).
+3. **(STATUS: DONE 2026-07-26)** Extend `validate_config.py` to assert
+   README image digest == `defaults.yml` image digest, preventing future
+   drift. Also asserts toolchain.toml channel match (~50 lines).
+4. **(STATUS: DONE 2026-07-26)** One-Rust-job-per-host constraint now explicit
+   in README required jobs and activation checklist (`limit = 1` hard req).
+5. **(STATUS: DONE 2026-07-26)** Toolchain.toml now validated automatically;
+   covered in item 3 above.
+6. **(STATUS: DONE 2026-07-26)** CI `-j2`/`-j1` rationale documented in
+   README "Required jobs"; local-dev `-j6` remains in AGENTS.md.
 7. **(Phase 2)** Add `standalone-cargo-metadata` observational job for the 17
-   non-core lockfiles.
+    non-core lockfiles.
 8. **(Phase 2)** Add a `docs-links` job; several other goals items depend on
-   doc accuracy.
+    doc accuracy.
 9. **(Phase 2)** Add coverage reporting once a measured baseline is captured.
 10. *(Defer)* PostgreSQL integration, package/release, and CD remain correctly
-    gated behind their plan prerequisites; do not advance without the mt-admin
-    artifact-activation work.
+     gated behind their plan prerequisites; do not advance without the mt-admin
+     artifact-activation work.
 
 ---
 

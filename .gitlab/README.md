@@ -33,8 +33,8 @@ runners.
 
 Pinned images:
 
-- Rust 1.92 Bookworm OCI index:
-  `sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2`
+- Rust 1.96.1 Bookworm OCI index (primary and MSRV jobs):
+  `sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663`
 - Python 3.12 slim Bookworm OCI index:
   `sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b`
 - Gitleaks 8.30.1 OCI index:
@@ -52,7 +52,15 @@ Pinned images:
 - Workspace library tests and hermetic libSQL tests.
 - Explicit onboarding, web, Kawarimi, and DarkIRC Python suites with zero skips.
 - Fixture-only shell harnesses for mt-admin rendering, build policy, and health.
+- `python-unit`, `shell-harnesses`, and `cavepony-wasm` (cavepony version assert
+  + `wit_compat` test) are all required jobs; failures block merge.
 - cargo-deny and redacted current-tree Gitleaks scans.
+- One Rust job per runner host: `limit = 1` in runner `config.toml` is a hard
+  constraint, verified in the activation checklist (§6). Parallel jobs contend for
+  CPUs 0-5 with no in-pipeline guard.
+- CI parallelism is intentional: `-j2` (libSQL `-j1`) caps peak memory within
+  the 16 GB runner for four-way check jobs; `-j6` in AGENTS.md is the local-dev
+  budget. Lower debug info for libSQL link jobs avoids OOM near 16 GB.
 
 Known false-positive Gitleaks findings are listed by exact fingerprint in
 `/.gitleaksignore`. Broad path or rule exclusions are forbidden.
@@ -64,6 +72,8 @@ Known false-positive Gitleaks findings are listed by exact fingerprint in
 
 These run on default-branch and scheduled pipelines with `allow_failure: true`:
 
+- `rust-msrv-check`: becomes blocking once the declared MSRV (1.96.1) is confirmed
+  green, closing the plan §15.5 reconciliation.
 - `rust-clippy-all`: becomes blocking after a clean-runner baseline passes.
 - `architecture-boundaries`: becomes blocking after current heuristic and real
   violations are fixed.
@@ -118,7 +128,7 @@ this repository:
   limit = 1
 
   [runners.docker]
-    image = "docker.io/library/rust:1.92-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2"
+    image = "docker.io/library/rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663"
     privileged = false
     cpuset_cpus = "0-5"
     memory = "16g"
@@ -240,12 +250,19 @@ Record these results in the MR before making the pipeline mandatory:
 - Exact GitLab and GitLab Runner versions.
 - Runner executor, tags, protected status, CPU/RAM/disk limits, and network
   policy.
+- Confirmation that `limit = 1` is set in each Rust runner's `config.toml`
+  (prevents CPU 0-5 contention between parallel Rust jobs on one host).
 - CI Lint result and merged-YAML review.
 - One MR commit with exactly one pipeline.
 - One fully green required-job pipeline on clean runners.
 - One default-branch pipeline and one manual schedule run.
 - Confirmation that protected variables/runners were absent from MR jobs.
-- Current durations and cache hit rates for each Rust job.
+- Current durations and cache hit rates for each Rust job. The plan's Phase 1
+  exit criteria (see `docs/proposals/GITLAB_CI_CD_PLAN.md`) require warm-cache
+  p95 ≤ 30 min; record this so subsequent phases can compare.
+
+Phase 1 scope and exit criteria are defined in
+`docs/proposals/GITLAB_CI_CD_PLAN.md`; this README is the operator runbook.
 
 ## Local validation
 

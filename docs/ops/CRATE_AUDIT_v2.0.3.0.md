@@ -46,7 +46,7 @@ WASM tools use independent versioning (sandboxed plugins, not tied to the daemon
 | `llm-context-tool` | 0.1.0 | `ic/tools-src/llm-context/Cargo.toml` |
 | `multica-bridge-tool` | 0.1.0 | `ic/tools-src/multica-bridge/Cargo.toml` |
 
-Toolchain: `rust-version = "1.92"` (`ic/Cargo.toml`), matches MSRV in AGENTS.md.
+Toolchain: `rust-version = "1.96.1"` (`ic/Cargo.toml`), matches MSRV in AGENTS.md.
 
 ---
 
