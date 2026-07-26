@@ -3428,7 +3428,7 @@ mod tests {
                 let result = DiscoInfoResult::try_from(payload.expect("payload"))
                     .expect("valid disco#info result");
                 assert!(result.identities.iter().any(|i| i.category == "client"));
-                let vars: Vec<&str> = result.features.iter().map(|f| f.var.as_str()).collect();
+                let vars: Vec<&str> = result.features.iter().map(String::as_str).collect();
                 assert!(vars.contains(&ns::DISCO_INFO));
                 assert!(vars.contains(&ns::OOB));
             }
