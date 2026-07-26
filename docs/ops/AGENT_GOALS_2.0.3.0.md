@@ -10,7 +10,7 @@
 
 ---
 1. [x] Bump crate versions. they are at 2.0.2. we need bump to 2.0.3
-2. [x] check cicd logic and suggest improvements in a new doc in docs/ops
+2. [ ] check cicd logic and suggest improvements in doc in docs/ops - this doc is outdated: docs/ops/CICD_LOGIC_REVIEW.md - so worth updating....
 3. [x] suggest items that should be added to goals list that arent. put in a new doc in docs/ops
 4. [x] (S) Go over proposals defer
 5. [x] (S) get back to previous refactor mt admin idea. see the section of docs/proposals/MT-ADMIN-DECOMPOSITION.md — review notes section of: `docs/ops/KUMOGAKURE_RECENT_REV_T.md` - you will NOT begin ANY work on this yet. you will simply edit the document already created under docs/proposals called `MT-ADMIN-DECOMPOSITION.md`
