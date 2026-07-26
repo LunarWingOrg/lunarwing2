@@ -74,6 +74,8 @@ The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Bu
 
 Agent-facing dispatch uses `create_job(title: "...", description: "...", mode: "opencode")` in both legacy and Engine V2 chat paths. `opencode` is a named job execution backend, not an extension, MCP server, skill, routine, or SSH host; no registry search or installation is involved.
 
+Multi-tenant worker configuration sets the task deadline to `300000ms` (5 minutes). This replaces the 30-second default used by a bare local `create_job`; configured external workers do not use that local default. Synchronous results include both `duration_ms` and effective `timeout_ms`. Engine V2 has a 600-second deadline for the whole orchestration call, so an external action receives somewhat less than 600 seconds and higher worker deadlines cannot complete synchronously.
+
 ## OpenCode Worker (old section)
 
 Bun-based upstream opencode agent (sst/opencode). Runs opencode headless server internally (port 4096) with a TypeScript bridge to the WebSocket protocol. Health on 8443, WebSocket on 9090.
