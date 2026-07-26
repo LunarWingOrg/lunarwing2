@@ -119,7 +119,9 @@ Confirmed transitive deadwood shed by the update (removals): `pathdiff`, `wasip3
 
 ## Advisory Status (`deny.toml`)
 
-`cargo-deny` is not currently installed on the dev VM, so a live advisory scan was not run for this audit. The `deny.toml` ignore list was inspected manually:
+> **Update (2026-07-26, item #14):** `cargo-deny` 0.20.2 is now installed on the dev VM. A live `cargo deny check advisories` run confirmed that the two formerly ignored hickory advisories (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`) are cleared by the item #10 `tokio-xmpp` 6 upgrade. Their ignores remain removed from `deny.toml`; the remaining five clusters are still legitimately blocked upstream and stay ignored.
+
+A live advisory scan was run (`cargo deny check advisories`, cargo-deny 0.20.2) after the dependency upgrades and ignore cleanup. Advisory results:
 
 | Advisory | Ignored reason | Status |
 |----------|----------------|--------|
