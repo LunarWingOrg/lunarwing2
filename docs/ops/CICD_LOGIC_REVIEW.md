@@ -5,15 +5,17 @@
 > `docs/ops/AGENT_GOALS_2.0.3.0.md`. It is **review only**; it does not change
 > CI files.
 >
-> **Scope reviewed on 2026-07-25:** `.gitlab-ci.yml`, `.gitlab/ci/*.yml`,
-> `.gitlab/scripts/*`, `.gitlab/README.md`, and the originating plan
+> **Scope reviewed on 2026-07-25, refreshed 2026-07-26:**
+> `.gitlab-ci.yml`, `.gitlab/ci/*.yml`, `.gitlab/scripts/*`,
+> `.gitlab/README.md`, `ic/rust-toolchain.toml`, and the originating plan
 > `docs/proposals/GITLAB_CI_CD_PLAN.md`. All findings are verified against the
 > current tree at that date.
 >
 > **Overall assessment:** The implemented Phase 1 pipeline is well-structured,
 > secret-free, properly DAG'd, digest-pinned, and faithful to the plan. The
 > items below are targeted hardening, parity fixes, and low-risk gaps — not a
-> rearchitecture.
+> rearchitecture. The 2026-07-26 refresh adds findings on build-thread
+> divergence, `rust-toolchain.toml`, coverage, and checkout depth.
 
 ## 1. Current pipeline summary (verified)
 
@@ -24,8 +26,9 @@
 - **Required (blocking) jobs:** `ci-config`, `shell-syntax`, `python-syntax`,
   `registry-json`, `version-policy`, `panic-policy`, `rustfmt`,
   `cargo-metadata`, four-shape `cargo check` matrix, `rust-test-lib`,
-  `rust-test-libsql`, `python-unit`, `shell-harnesses`, `cavepony-wasm`,
-  `cargo-deny`, `secret-detection`.
+  `rust-test-libsql`, `python-unit`, `shell-harnesses`, `cavepony-wasm`
+  (cavepony version assert + `wit_compat` test), `cargo-deny`,
+  `secret-detection`, and tag-only `release-version`.
 - **Observational (`allow_failure`) jobs:** `rust-clippy-all`,
   `architecture-boundaries`, `shellcheck`, `secret-history`.
 - **Toolchain pin:** Rust **1.96.1** Bookworm, digest-pinned
@@ -75,13 +78,16 @@ guarantee the pipeline relies on.
 MSRV 1.92, but the only Rust job uses 1.96.1. Nothing in CI proves the crate
 still builds on its declared MSRV. The plan explicitly flags this
 (`docs/proposals/GITLAB_CI_CD_PLAN.md` §15.5: "Pin one supported Rust
-toolchain and reconcile 1.92 versus 1.96 docs/builds").
+toolchain and reconcile 1.92 versus 1.96 docs/builds"). A third pin location
+now also exists: `ic/rust-toolchain.toml` hardcodes `channel = "1.96.1"`,
+so the 1.92/1.96 split is now visible in four places: `Cargo.toml`,
+`AGENTS.md`, `rust-toolchain.toml`, and `.gitlab/ci/defaults.yml`.
 
 **Suggested fix:** add one scheduled (non-MR) `rust-msrv-check` job using
 `rust:1.92-bookworm` that runs `cargo check --locked` on the default feature
 set. Keep it observational until green, then make it required on the default
-branch. This is low-cost and directly closes the reconciliation item from the
-plan.
+branch. This is low-cost and directly closes the reconciliation item from
+the plan.
 
 ### P1 — Parallel Cargo jobs can overlap on `0-5` within one runner host
 
@@ -156,6 +162,73 @@ for reuse. If any later job needs the cavepony wasm it would rebuild.
 document that `cavepony-wasm` is intentionally self-contained. If a future job
 needs it, lift it into the shared artifact producer. No change needed today.
 
+### P2 — All Cargo jobs use `-j2`, diverging from project and plan standard
+
+Every Rust job in `.gitlab/ci/rust.yml` and `.gitlab/ci/integration.yml` runs
+`cargo-ci.sh <cmd> -j2` (libsql uses `-j1`). The project standard in
+`AGENTS.md` and the plan (§8.2, §10) is `-j6` bounded by `taskset -c 0-5`.
+The `-j2` choice keeps peak memory well under the 16 GB runner cap, which is
+correct for a memory-constrained shared runner, but the rationale lives only
+in commit `afc423b` ("Limit GitLab Rust jobs to two build workers") — not in
+any README, plan exit criterion, or named variable.
+
+**Why it matters:** without a documented link between `-j2`, the 16 GB cap,
+and the four parallel check jobs, an operator who bumps runner RAM or
+misreads the plan's `-j6` guidance will silently re-introduce OOM risk or
+leave performance on the table. The cache key also does not encode the job
+parallelism, so a flip between `-j2` and `-j6` would not invalidate cached
+metadata.
+
+**Suggested fix:** add one sentence to `.gitlab/README.md` §"Required jobs"
+recording that CI intentionally uses `-j2` (libSQL `-j1`) to stay within
+16 GB during four-way parallel check, and that `-j6` from `AGENTS.md` is the
+local-dev budget, not the CI budget. No YAML change required; this is a
+documentation parity fix so the two standards do not look contradictory.
+
+### P2 — `rust-toolchain.toml` is a third toolchain pin not covered by `validate_config.py`
+
+`ic/rust-toolchain.toml` hardcodes `channel = "1.96.1"`. `bootstrap-rust.sh`
+re-verifies `rustc 1.96.1` at runtime, and `defaults.yml` pins the
+`1.96.1-bookworm` image, so the three agree today. But
+`.gitlab/scripts/validate_config.py` only checks image digests and direct
+`cargo` usage; it does not parse `rust-toolchain.toml` or assert its channel
+matches the image. If someone bumps the image without bumping the
+toolchain file (or vice versa), `rustup` will silently select a different
+toolchain inside `ic/` than the one `bootstrap-rust.sh` asserts.
+
+**Suggested fix:** extend `validate_config.py` to read the `channel` from
+`ic/rust-toolchain.toml` and assert it equals the Rust image tag in
+`defaults.yml`. ~10 lines; closes a three-way drift class permanently.
+
+### P3 — `GIT_DEPTH: "0"` clones full history on every job
+
+`.gitlab/ci/defaults.yml:14` sets `GIT_DEPTH: "0"`, forcing a full clone for
+every job, including the four `rust-check-*` jobs that only need the working
+tree plus `Cargo.lock`. This is required for `version-policy` and
+`panic-policy` (diff against base SHA) and for `secret-history`, but it is
+unnecessary for `rustfmt`, `cargo-metadata`, the four `cargo check` jobs,
+`cargo-deny`, `python-unit`, `shell-harnesses`, and `secret-detection`.
+
+**Suggested fix:** leave `GIT_DEPTH: "0"` as the default (correct for the
+policy jobs), but consider setting a shallow `GIT_DEPTH` (e.g. `"50"`) on
+the pure-build jobs via job-level `variables:` once the runner is live and
+clone time is measured. Low priority; measure first per the plan's exit
+criteria (warm-cache p95 ≤ 30 min).
+
+### P3 — Dummy `LUNARWING_CLOUD_*` URLs in test jobs
+
+`rust-test-lib` and `rust-test-libsql` set `LUNARWING_CLOUD_AUTH_URL` and
+`LUNARWING_CLOUD_BASE_URL` to `http://127.0.0.1` (no path, no port). This is
+a safe placeholder that prevents real network egress, but the security
+review in §4 below does not mention it. If a future test starts treating a
+non-200 from `127.0.0.1` as a hard failure, the job will break with a
+confusing connection-refused rather than a clear "cloud mock missing"
+message.
+
+**Suggested fix:** no change needed today; record in §4 that these variables
+are intentional placeholders so the security review is complete. If the
+tests grow a real cloud mock, switch the URL to a named fixture service.
+
 ---
 
 ## 3. Parity gaps vs. the plan (Phase 1 scope)
@@ -170,9 +243,10 @@ rather than an oversight.
 | 8.1 `python-static` (Pyright/Ruff) | Not present | Plan marks "Phase 2 blocking". OK to defer. |
 | 8.1 `docs-links` (internal Markdown link check) | Not present | Plan marks "Phase 2 blocking". Consider adding; `docs/` is large and link rot is visible in other review tasks (e.g. goals items #19–#24). |
 | 8.3 PostgreSQL integration job | Not present | Plan defers to Phase 2 with pgvector service. Confirmed deferred in README. |
-| 8.5 Path-triggered standalone crates matrix | Not present | Eight standalone lockfiles exist (see §5 below). Currently the core `ic/Cargo.lock` does not validate them. Plan defers to Phase 2; reasonable, but see suggestion in §5. |
-| 8.6 Strict WASM (`build-wasm-extensions.sh --strict`) | Partial | `wasm-channel-test-artifacts` builds two channels directly; the strict-mode flag described in the plan is not exercised. |
-| 15.5 Toolchain reconciliation (1.92 vs 1.96) | **Unresolved** | See P0 above — this is the one Phase 0 item still visibly open. |
+| 8.5 Path-triggered standalone crates matrix | Not present | 17 standalone lockfiles exist (see §5 below). Currently the core `ic/Cargo.lock` does not validate them. Plan defers to Phase 2; reasonable, but see suggestion in §5. |
+| 8.6 Strict WASM (`build-wasm-extensions.sh --strict`) | Partial | `wasm-channel-test-artifacts` builds two channels directly; the strict-mode flag described in the plan is not exercised. `cavepony-wasm` also builds directly but additionally asserts `CAVEPONY_EXPECTED_VERSION` and runs the `wit_compat` test, so it is stricter than the channel artifact job. |
+| 10.1 Coverage reporting | Not present | `ic/scripts/coverage.sh` and `ic/codecov.yml` exist but no CI job invokes them. Plan defers coverage to Phase 2 with a measured baseline; correct to defer, but the gap is now explicit. |
+| 15.5 Toolchain reconciliation (1.92 vs 1.96) | **Unresolved** | See P0 above — this is the one Phase 0 item still visibly open. Now compounded by `ic/rust-toolchain.toml` (see P2 above). |
 
 ---
 
@@ -202,15 +276,23 @@ Reviewed `.gitlab/scripts/*.sh` and `*.py` for the runtime invariants in
 observational. This is the correct split — current-tree is blocking, history
 is advisory until triaged. No change needed; recorded as correct.
 
+**Second observation (added 2026-07-26):** `rust-test-lib` and
+`rust-test-libsql` set `LUNARWING_CLOUD_AUTH_URL` and
+`LUNARWING_CLOUD_BASE_URL` to `http://127.0.0.1`. These are safe placeholders
+that prevent real cloud egress, not secrets. Recorded here so the security
+review is complete; see P3 above for the related test-clarity note.
+
 No security weaknesses found in the CI logic itself.
 
 ---
 
 ## 5. Standalone crate coverage observation
 
-There are **18** `Cargo.lock` files in the repo (verified), of which only
-`ic/Cargo.lock` is validated by `cargo-metadata` and used as a cache key.
-Standalone deployable crates with their own lockfiles — e.g.
+There are **17** `Cargo.lock` files outside the core workspace (verified
+2026-07-26; `ic/vendor/libsignal-protocol/Cargo.lock` is vendored source, not
+a deployable crate, and is excluded), of which only `ic/Cargo.lock` is
+validated by `cargo-metadata` and used as a cache key. Standalone deployable
+crates with their own lockfiles — e.g.
 `ic/bridges/xmpp-bridge/Cargo.lock`,
 `lunarwing_weechat_wss/weechat_relay/Cargo.lock`,
 `darkirc_channel_for_lunarwing/darkirc/Cargo.lock`,
@@ -243,18 +325,23 @@ path-triggered matrix in plan §8.5 and catches the most common failure.
 1. **(P0)** Reconcile `.gitlab/README.md` Rust image digest with
    `defaults.yml` (1.96.1, hash `a339861a…`).
 2. **(P0)** Add an observational MSRV check job on Rust 1.92 to close plan
-   §15.5.
+   §15.5. Now also reconcile `ic/rust-toolchain.toml` channel.
 3. **(P1)** Extend `validate_config.py` to assert README image digest ==
    `defaults.yml` image digest, preventing future drift.
 4. **(P1)** Make the one-Rust-job-per-host constraint explicit (README
    checklist or `resource_group`).
-5. **(Phase 2)** Add `standalone-cargo-metadata` observational job for the 17
+5. **(P2)** Extend `validate_config.py` to parse
+   `ic/rust-toolchain.toml` channel and assert it matches the Rust image tag.
+6. **(P2)** Document in `.gitlab/README.md` that CI uses `-j2` (libSQL
+   `-j1`) by design, distinct from the local-dev `-j6` standard.
+7. **(Phase 2)** Add `standalone-cargo-metadata` observational job for the 17
    non-core lockfiles.
-6. **(Phase 2)** Add a `docs-links` job; several other goals items depend on
+8. **(Phase 2)** Add a `docs-links` job; several other goals items depend on
    doc accuracy.
-7. *(Defer)* PostgreSQL integration, package/release, and CD remain correctly
-   gated behind their plan prerequisites; do not advance without the mt-admin
-   artifact-activation work.
+9. **(Phase 2)** Add coverage reporting once a measured baseline is captured.
+10. *(Defer)* PostgreSQL integration, package/release, and CD remain correctly
+    gated behind their plan prerequisites; do not advance without the mt-admin
+    artifact-activation work.
 
 ---
 
@@ -265,9 +352,19 @@ path-triggered matrix in plan §8.5 and catches the most common failure.
 - Every image is digest-pinned; `validate_config.py` enforces it.
 - `cargo-ci.sh` centralizes the `taskset -c 0-5` rule — no direct `cargo`
   calls leak through (and the validator catches any that do).
+- `bootstrap-rust.sh` hard-asserts `rustc 1.96.1` at runtime; a mismatched
+  image exits nonzero before any build runs.
 - Observational jobs each carry an `Owner:` line and a removal condition in
   the YAML, matching the plan's "no permanent `allow_failure`" rule.
 - No secrets, no Docker socket, no tenant access in any MR job — consistent
   with `AGENTS.md` security invariants.
 - Gitleaks uses exact fingerprints in `/.gitleaksignore`; broad rule
   exclusions are forbidden (per README). Good discipline.
+- `release-version` job is correctly tag-gated (`$CI_COMMIT_TAG =~ /^v/`)
+  and validates tag syntax, protection, crate-version mapping, codename, and
+  release-note presence before any tag can be promoted.
+- `cavepony-wasm` asserts `CAVEPONY_EXPECTED_VERSION` at build time and runs
+  the `wit_compat` test, giving the WASM tool path a version + ABI check the
+  channel artifact job lacks.
+- Dummy `LUNARWING_CLOUD_*` URLs in test jobs prevent real cloud egress; safe
+  by construction.
