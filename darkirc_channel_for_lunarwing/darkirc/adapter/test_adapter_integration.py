@@ -4,10 +4,11 @@ Integration test for darkirc_adapter.py (T4).
 
 Stands up a mock IRC server + the real adapter (subprocess), then drives the
 adapter's HTTP API to verify the DarkIRC security/robustness cluster:
-  - /health responds
+  - /health responds (and reports outbox depth)
   - /poll serves inbound DMs; /ack clears them (no duplicate on next poll)
   - /poll WITHOUT /ack re-serves the batch (M4 at-least-once redelivery)
-  - /send forwards a PRIVMSG to the IRC server
+  - /send queues, then a paced background drain forwards PRIVMSGs to IRC
+  - long /send bodies arrive as multiple numbered "[i/N]" chunks, in order
   - wrong bearer token -> 401 (M6 auth enforced)
   - oversized body -> 413 (M5 body cap)
   - malformed Content-Length -> 400
@@ -177,6 +178,8 @@ class AdapterIntegrationTest(unittest.IsolatedAsyncioTestCase):
             ADAPTER_PORT=str(self.http_port),
             ADAPTER_SECRET=self.secret,
             ADAPTER_LOG_LEVEL="WARNING",
+            # Fast pacing so multi-chunk delivery tests finish quickly.
+            DARKIRC_PRIVMSG_INTERVAL="0.1",
         )
         self.proc = subprocess.Popen(
             [sys.executable, ADAPTER],
@@ -252,18 +255,59 @@ class AdapterIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(m["text"] == "redeliver me" for m in body2["messages"]))
 
     async def test_send_forwards_privmsg(self):
-        s, _ = await self.H(
+        s, body = await self.H(
             "POST", "/send", token=self.secret,
             body=json.dumps({"to": "someone", "text": "hi there"}).encode(),
         )
         self.assertEqual(s, 200)
-        # The mock IRC recorded the PRIVMSG the adapter forwarded.
+        # /send is asynchronous now: it queues and the drain task delivers.
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["chunks"], 1)
         for _ in range(30):
             if any("hi there" in p for p in self.irc.sent_privmsgs):
                 break
             await asyncio.sleep(0.2)
         else:
             self.fail("adapter did not forward PRIVMSG to IRC server")
+
+    async def test_health_reports_outbox(self):
+        s, body = await self.H("GET", "/health", token=self.secret)
+        self.assertEqual(s, 200)
+        self.assertIn("outbox", body)
+
+    async def test_long_send_arrives_as_numbered_chunks_in_order(self):
+        # ~1300 bytes -> multiple chunks at the 400-byte budget. The old
+        # blocking /send stalled the HTTP response for the whole paced
+        # delivery; the outbox returns immediately and delivers all chunks.
+        text = " ".join(f"word{i}" for i in range(200))
+        s, body = await self.H(
+            "POST", "/send", token=self.secret,
+            body=json.dumps({"to": "someone", "text": text}).encode(),
+        )
+        self.assertEqual(s, 200)
+        self.assertEqual(body["status"], "queued")
+        self.assertGreater(body["chunks"], 1)
+
+        expected = body["chunks"]
+        for _ in range(100):
+            got = [p for p in self.irc.sent_privmsgs if "word" in p]
+            if len(got) >= expected:
+                break
+            await asyncio.sleep(0.2)
+        else:
+            self.fail(
+                f"expected {expected} chunks, got "
+                f"{len([p for p in self.irc.sent_privmsgs if 'word' in p])}"
+            )
+
+        got = [p for p in self.irc.sent_privmsgs if "word" in p]
+        # Every chunk numbered and in order: [1/N], [2/N], ...
+        for i, line in enumerate(got[:expected], start=1):
+            self.assertIn(f":[{i}/{expected}] ", line)
+        # No payload lost across the chunk boundary: all words present.
+        joined = " ".join(got)
+        self.assertIn("word0", joined)
+        self.assertIn("word199", joined)
 
 
 if __name__ == "__main__":

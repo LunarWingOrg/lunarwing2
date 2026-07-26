@@ -2692,6 +2692,12 @@ async fn handle_with_engine_inner(
         if crate::llm::user_signals_execution_intent(content) {
             config.require_action_attempt = true;
         }
+        // Rate-metered channels (DarkIRC): inject delivery-constraint guidance
+        // into the engine system prompt so replies fit the transport. The
+        // engine crate is channel-neutral; the budget lives host-side.
+        if let Some(budget) = crate::channels::budget::budget_for_channel(&message.channel) {
+            config.channel_context = Some(budget.prompt_guidance());
+        }
         // Supervised mode: opt-in via env (set by --supervised CLI flag or
         // explicit config). Forces every tool action through human approval
         // regardless of the tool's normal tier.

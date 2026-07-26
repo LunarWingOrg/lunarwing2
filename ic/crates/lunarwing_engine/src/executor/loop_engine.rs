@@ -270,6 +270,15 @@ impl ExecutionLoop {
                 None => codeact_prompt,
             };
 
+            // Append channel delivery constraints (if the host supplied them)
+            // so replies fit the originating channel's transport limits.
+            let system_prompt = match self.thread.config.channel_context.as_deref() {
+                Some(context) if !context.trim().is_empty() => {
+                    format!("{system_prompt}\n\n## Channel Constraints\n\n{context}\n")
+                }
+                _ => system_prompt,
+            };
+
             // Skill selection and injection happens in the Python orchestrator
             // via __list_skills__() host function — not here in Rust.
 
@@ -692,6 +701,46 @@ mod tests {
     }
 
     // ── Tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn channel_context_is_injected_into_system_prompt() {
+        // Regression: DarkIRC replies ignored the transport's byte/pacing
+        // budget because the engine system prompt had no channel constraints.
+        let config = ThreadConfig {
+            channel_context: Some("- Max ~400 bytes per message; plain text only.".to_string()),
+            ..ThreadConfig::default()
+        };
+        let (mut exec, _signal_tx) = make_loop(vec![text_response("ok")], Vec::new(), config).await;
+        exec.run().await.expect("run should complete");
+
+        let system = exec
+            .thread
+            .messages
+            .iter()
+            .find(|m| m.role == crate::types::message::MessageRole::System)
+            .expect("system message must exist");
+        assert!(system.content.contains("## Channel Constraints"));
+        assert!(system.content.contains("Max ~400 bytes"));
+    }
+
+    #[tokio::test]
+    async fn no_channel_context_means_no_constraints_section() {
+        let (mut exec, _signal_tx) = make_loop(
+            vec![text_response("ok")],
+            Vec::new(),
+            ThreadConfig::default(),
+        )
+        .await;
+        exec.run().await.expect("run should complete");
+
+        let system = exec
+            .thread
+            .messages
+            .iter()
+            .find(|m| m.role == crate::types::message::MessageRole::System)
+            .expect("system message must exist");
+        assert!(!system.content.contains("## Channel Constraints"));
+    }
 
     #[tokio::test]
     async fn orchestrator_uses_native_text_stream_and_broadcasts_deltas() {

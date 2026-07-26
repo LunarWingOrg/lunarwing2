@@ -165,6 +165,14 @@ pub struct ThreadConfig {
     pub depth: u32,
     /// Maximum recursion depth for rlm_query() sub-calls.
     pub max_depth: u32,
+
+    // ── Channel delivery constraints ──
+    /// Delivery-constraint guidance appended to the system prompt at thread
+    /// creation. Set by the host bridge for rate-metered channels (e.g.
+    /// DarkIRC's bounded, paced messages); `None` for unconstrained channels.
+    /// The engine itself is channel-neutral — it only relays this text.
+    #[serde(default)]
+    pub channel_context: Option<String>,
 }
 
 impl Default for ThreadConfig {
@@ -186,6 +194,7 @@ impl Default for ThreadConfig {
             compaction_threshold: 0.85,
             depth: 0,
             max_depth: 1,
+            channel_context: None,
         }
     }
 }
@@ -494,5 +503,42 @@ mod tests {
         )
         .with_parent(parent.id);
         assert_eq!(child.parent_id, Some(parent.id));
+    }
+
+    #[test]
+    fn thread_config_without_channel_context_still_deserializes() {
+        // ThreadConfig is persisted with threads; configs serialized before
+        // `channel_context` existed must keep deserializing (serde default).
+        let legacy = serde_json::json!({
+            "max_iterations": 50,
+            "max_duration": null,
+            "enable_tool_intent_nudge": true,
+            "max_tool_intent_nudges": 2,
+            "max_tokens_total": null,
+            "max_consecutive_errors": null,
+            "max_budget_usd": null,
+            "model_context_limit": 128000,
+            "enable_compaction": false,
+            "compaction_threshold": 0.85,
+            "depth": 0,
+            "max_depth": 1
+        });
+        let config: ThreadConfig =
+            serde_json::from_value(legacy).expect("legacy config must deserialize");
+        assert!(config.channel_context.is_none());
+    }
+
+    #[test]
+    fn thread_config_channel_context_round_trips() {
+        let config = ThreadConfig {
+            channel_context: Some("- keep replies under 400 bytes".to_string()),
+            ..ThreadConfig::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let parsed: ThreadConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            parsed.channel_context.as_deref(),
+            Some("- keep replies under 400 bytes")
+        );
     }
 }

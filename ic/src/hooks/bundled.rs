@@ -138,8 +138,14 @@ pub async fn register_bundled_hooks(registry: &Arc<HookRegistry>) -> HookRegistr
         .register_with_priority(Arc::new(AuditLogHook), 25)
         .await;
 
+    // Runs after declarative content rules (priority 100) so it enforces the
+    // budget on the final content, and before fire-and-forget webhooks (300).
+    registry
+        .register_with_priority(Arc::new(ChannelMessageBudgetHook), 250)
+        .await;
+
     HookRegistrationSummary {
-        hooks: 1,
+        hooks: 2,
         outbound_webhooks: 0,
         errors: 0,
     }
@@ -274,6 +280,53 @@ impl Hook for AuditLogHook {
             user_id = %event_user_id(event),
             "Lifecycle hook event"
         );
+
+        Ok(HookOutcome::ok())
+    }
+}
+
+/// Built-in enforcement of per-channel outbound message budgets.
+///
+/// Rate-metered channels (DarkIRC) can only deliver a bounded number of
+/// paced chunks per reply. Prompt guidance asks the agent to stay within the
+/// budget; this hook is the deterministic backstop when the model overshoots:
+/// it truncates the reply at a UTF-8-safe natural boundary and appends a
+/// continuation marker, so the channel never floods and the recipient sees an
+/// explicit cut instead of a silently missing tail.
+struct ChannelMessageBudgetHook;
+
+const BEFORE_OUTBOUND_ONLY: [HookPoint; 1] = [HookPoint::BeforeOutbound];
+
+#[async_trait]
+impl Hook for ChannelMessageBudgetHook {
+    fn name(&self) -> &str {
+        "builtin.channel_message_budget"
+    }
+
+    fn hook_points(&self) -> &[HookPoint] {
+        &BEFORE_OUTBOUND_ONLY
+    }
+
+    async fn execute(
+        &self,
+        event: &HookEvent,
+        _ctx: &HookContext,
+    ) -> Result<HookOutcome, HookError> {
+        if let HookEvent::Outbound {
+            channel, content, ..
+        } = event
+            && let Some(budget) = crate::channels::budget::budget_for_channel(channel)
+            && let Some(truncated) = budget.enforce(content)
+        {
+            tracing::info!(
+                channel = %channel,
+                original_bytes = content.len(),
+                delivered_bytes = truncated.len(),
+                hard_max_bytes = budget.hard_max_bytes(),
+                "Outbound response exceeded channel message budget; truncated"
+            );
+            return Ok(HookOutcome::modify(truncated));
+        }
 
         Ok(HookOutcome::ok())
     }
@@ -907,6 +960,67 @@ mod tests {
             content: content.to_string(),
             thread_id: None,
         }
+    }
+
+    fn outbound_event(channel: &str, content: &str) -> HookEvent {
+        HookEvent::Outbound {
+            user_id: "user-1".to_string(),
+            channel: channel.to_string(),
+            content: content.to_string(),
+            thread_id: None,
+        }
+    }
+
+    // ---- Channel message budget enforcement (bundled hook) ----
+
+    #[tokio::test]
+    async fn budget_hook_truncates_over_budget_darkirc_response() {
+        // Regression: replies far over DarkIRC's paced-delivery budget used to
+        // pass through unmodified and lose their tail inside the channel.
+        let registry = Arc::new(HookRegistry::new());
+        register_bundled_hooks(&registry).await;
+
+        let budget = crate::channels::budget::budget_for_channel("darkirc").unwrap();
+        let long = "word ".repeat(2_000); // 10 KB >> hard budget
+
+        let result = registry
+            .run(&outbound_event("darkirc", &long))
+            .await
+            .unwrap();
+        match result {
+            HookOutcome::Continue {
+                modified: Some(value),
+            } => {
+                assert!(value.len() <= budget.hard_max_bytes());
+                assert!(value.contains("truncated"));
+            }
+            other => panic!("expected truncated output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_hook_passes_short_darkirc_response() {
+        let registry = Arc::new(HookRegistry::new());
+        register_bundled_hooks(&registry).await;
+
+        let result = registry
+            .run(&outbound_event("darkirc", "short reply"))
+            .await
+            .unwrap();
+        assert!(matches!(result, HookOutcome::Continue { modified: None }));
+    }
+
+    #[tokio::test]
+    async fn budget_hook_ignores_unconstrained_channels() {
+        let registry = Arc::new(HookRegistry::new());
+        register_bundled_hooks(&registry).await;
+
+        let long = "word ".repeat(2_000);
+        let result = registry
+            .run(&outbound_event("gateway", &long))
+            .await
+            .unwrap();
+        assert!(matches!(result, HookOutcome::Continue { modified: None }));
     }
 
     #[test]
