@@ -182,20 +182,22 @@ implementation effort.
 
 ## Priority 3 — Hardening and Polish (nice to have for 2.0.3.0)
 
-### 3.1 Add `memory_search` truncation flag
+### 3.1 Add `memory_search` truncation flag — **DONE (2026-07-26)**
 
 **Release note (Known Issues, Memory):**
 > `memory_search` emits a budget-limited ranked prefix but no total-match count
 > or explicit truncation flag; callers cannot distinguish a complete search from
 > an output-budget truncation.
 
-**Proposed fix:**
-- Add `truncated: bool` and `total_matches: Option<usize>` to the search result
-  type.
-- **Effort:** Small-Medium.
-- **Risk:** Low — additive change to return type.
+**Implemented:**
+- Added `truncated: bool` and `total_matches: usize` to `build_memory_search_output`
+  in `ic/src/tools/builtin/memory.rs`.
+- The tool now reports whether results were dropped due to output budget and the
+  total number of matches found before truncation.
+- Web API `MemorySearchResponse` also updated with `total_matches` and `truncated`.
+- **Effort:** Small.
 
-### 3.2 Add per-server MCP lifecycle timeout controls
+### 3.2 Add per-server MCP lifecycle timeout controls — **DEFERRED**
 
 **Release note (Known Issues, MCP):**
 > Per-server startup/request/shutdown timeout controls are not implemented.
@@ -207,23 +209,20 @@ implementation effort.
 - **Risk:** Low.
 - **Note:** This overlaps with item #9 work. Coordinate with that track.
 
-### 3.3 Improve mission ticker fault isolation
+### 3.3 Improve mission ticker fault isolation — **DONE (2026-07-26)**
 
 **Release note (Known Issues, Engine):**
 > One malformed or failed mission can abort later work in the current ticker
 > cycle.
 
-**Verified (2026-07-26):**
-- The `tick()` method at `mission.rs:1093` iterates active missions; a failure
-  on one mission returns early from the entire tick, skipping remaining missions.
-
-**Proposed fix:**
-- Wrap each mission's fire attempt in its own error boundary within the loop so
-  one failure does not abort the tick.
+**Implemented:**
+- Wrapped each mission's `load_mission` and `fire_mission_inner` calls in the
+  `tick()` method (`mission.rs`) with individual error boundaries. A failure on
+  one mission is logged via `tracing::warn!` and the loop continues to the next
+  mission instead of aborting via `?`.
 - **Effort:** Small.
-- **Risk:** None.
 
-### 3.4 Add soft-timeout cleanup for overlapping agent turns
+### 3.4 Add soft-timeout cleanup for overlapping agent turns — **DEFERRED**
 
 **Release note (Known Issues, Engine):**
 > Soft agent timeout suppresses late output but allows the timed-out task to run
@@ -273,7 +272,7 @@ v2.0.3.0 polish cycle:
 |---|---|---|---|
 | P1 (Security) | 1.1, 1.2, 1.3 | Small-Medium | Yes |
 | P2 (Reliability) | 2.1, 2.2, 2.3, 2.4 | Medium-Large | Yes for 2.1, 2.3, 2.4; 2.2 if DB capacity exists |
-| P3 (Polish) | 3.1–3.5 | Small-Large | Pick 3.1 and 3.3 as low-risk quick wins |
+| P3 (Polish) | 3.1–3.5 | Small-Large | 3.1 ✓ and 3.3 ✓ done; 3.2, 3.4 deferred; 3.5 deferred to v2.0.4.0 |
 | P4 (Defer) | — | — | No |
 
 ### Recommended minimal set for 2.0.3.0
