@@ -1283,6 +1283,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         })
         .unwrap_or_else(lunarwing_skills::catalog::shared_catalog);
 
+    let sweep_gates = Arc::clone(&pending_gates);
     *guard = Some(EngineState {
         thread_manager,
         conversation_manager,
@@ -1303,7 +1304,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         start_skill_update_sweep(owner_id.clone());
     }
 
-    start_pending_gate_sweep(Arc::clone(&pending_gates));
+    start_pending_gate_sweep(sweep_gates);
 
     Ok(())
 }
