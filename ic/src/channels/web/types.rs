@@ -652,6 +652,8 @@ pub struct MemorySearchRequest {
 #[derive(Debug, Serialize)]
 pub struct MemorySearchResponse {
     pub results: Vec<SearchHit>,
+    pub total_matches: usize,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Serialize)]

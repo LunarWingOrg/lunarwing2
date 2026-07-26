@@ -150,22 +150,41 @@ fn memory_tool_revision(params: &serde_json::Value) -> Result<Option<&str>, Tool
     }
 }
 
-fn memory_search_output_value(query: &str, results: &[serde_json::Value]) -> serde_json::Value {
+fn memory_search_output_value(
+    query: &str,
+    results: &[serde_json::Value],
+    total_matches: usize,
+    truncated: bool,
+) -> serde_json::Value {
     serde_json::json!({
         "query": query,
         "results": results,
         "result_count": results.len(),
+        "total_matches": total_matches,
+        "truncated": truncated,
     })
 }
 
-fn memory_search_output_len(query: &str, results: &[serde_json::Value]) -> usize {
-    pretty_json_len(&memory_search_output_value(query, results))
+fn memory_search_output_len(
+    query: &str,
+    results: &[serde_json::Value],
+    total_matches: usize,
+    truncated: bool,
+) -> usize {
+    pretty_json_len(&memory_search_output_value(
+        query,
+        results,
+        total_matches,
+        truncated,
+    ))
 }
 
 /// Build a complete, valid JSON result within the Engine action-result budget.
 fn build_memory_search_output(query: &str, results: Vec<SearchResult>) -> serde_json::Value {
+    let total_matches = results.len();
     let query = truncate_for_json(query, MAX_MEMORY_SEARCH_QUERY_JSON_BYTES);
     let mut output_results = Vec::with_capacity(results.len());
+    let mut truncated = false;
 
     for result in results {
         let path = truncate_for_json(&result.document_path, MAX_MEMORY_PATH_JSON_BYTES);
@@ -180,9 +199,11 @@ fn build_memory_search_output(query: &str, results: Vec<SearchResult>) -> serde_
 
         // An empty JSON string occupies two bytes. The remaining whole-output
         // budget can therefore be assigned exactly to this result's content.
-        let empty_output_len = memory_search_output_len(&query, &output_results);
+        let empty_output_len =
+            memory_search_output_len(&query, &output_results, total_matches, truncated);
         if empty_output_len > MAX_MEMORY_TOOL_OUTPUT_BYTES {
             output_results.pop();
+            truncated = true;
             break;
         }
         let content_budget = (MAX_MEMORY_TOOL_OUTPUT_BYTES - empty_output_len + 2)
@@ -190,17 +211,19 @@ fn build_memory_search_output(query: &str, results: Vec<SearchResult>) -> serde_
         let content = truncate_for_json(&result.content, content_budget);
         if content.is_empty() && !result.content.is_empty() {
             output_results.pop();
+            truncated = true;
             break;
         }
 
         let last = output_results.len() - 1;
         output_results[last]["content"] = serde_json::Value::String(content);
         debug_assert!(
-            memory_search_output_len(&query, &output_results) <= MAX_MEMORY_TOOL_OUTPUT_BYTES
+            memory_search_output_len(&query, &output_results, total_matches, truncated)
+                <= MAX_MEMORY_TOOL_OUTPUT_BYTES
         );
     }
 
-    memory_search_output_value(&query, &output_results)
+    memory_search_output_value(&query, &output_results, total_matches, truncated)
 }
 
 // ── WorkspaceResolver ──────────────────────────────────────────────
@@ -1118,6 +1141,8 @@ mod tests {
 
         assert_eq!(output["query"], "useful");
         assert_eq!(output["result_count"], 1);
+        assert_eq!(output["total_matches"], 1);
+        assert_eq!(output["truncated"], false);
         assert_eq!(output["results"][0]["content"], "small useful memory");
         assert_eq!(output["results"][0]["path"], "notes/example.md");
     }
@@ -1164,6 +1189,8 @@ mod tests {
         assert!(encoded.len() <= MAX_MEMORY_TOOL_OUTPUT_BYTES);
         assert!(!emitted.is_empty());
         assert_eq!(output["result_count"], emitted.len());
+        assert_eq!(output["total_matches"], 20);
+        assert_eq!(output["truncated"], true);
         assert_eq!(emitted[0]["path"], "notes/0.md");
         for (index, result) in emitted.iter().enumerate() {
             assert_eq!(result["path"], format!("notes/{index}.md"));
