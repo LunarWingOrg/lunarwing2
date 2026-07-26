@@ -19,7 +19,7 @@
 8. [x] Inspect status of cargo crates. Suggest ones that should be updated. put in a file. — see `docs/ops/CRATE_AUDIT_v2.0.3.0.md`
 9. [x] implement priorirty 1 items in docs/proposals/ENGINE_V2_POLISH_v2.0.3.0.md
 10. [ ] implement tier 1 updates in docs/ops/CRATE_AUDIT_v2.0.3.0.md
-11. [ ] implement priority 2 items in docs/proposals/ENGINE_V2_POLISH_v2.0.3.0.md
+11. [x] implement priority 2 items in docs/proposals/ENGINE_V2_POLISH_v2.0.3.0.md
 12. [ ] implement tier 2 updates in docs/ops/CRATE_AUDIT_v2.0.3.0.md
 13. [ ] implement priority 3 items in docs/proposals/ENGINE_V2_POLISH_v2.0.3.0.md
 14. [ ] take look at Advisory Status (`deny.toml`) in docs/ops/CRATE_AUDIT_v2.0.3.0.md and install cargo-deny using rustup, cargo, then remove items marked as `now unblocked`
