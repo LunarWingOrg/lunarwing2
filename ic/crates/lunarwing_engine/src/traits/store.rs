@@ -211,4 +211,22 @@ pub trait Store: Send + Sync {
             reason: format!("Store::list_all_missions not implemented for project '{project_id}'"),
         })
     }
+
+    /// List all active missions across all projects/users.
+    ///
+    /// Used by startup bootstrap to load missions that don't belong to the
+    /// configured owner project. Default implementation iterates all known
+    /// projects.
+    async fn list_all_active_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
+        let mut missions = Vec::new();
+        let projects = self.list_all_projects().await?;
+        for project in projects {
+            match self.list_all_missions(project.id).await {
+                Ok(p_missions) => missions.extend(p_missions),
+                Err(_) => continue,
+            }
+        }
+        missions.retain(|m| m.status == MissionStatus::Active);
+        Ok(missions)
+    }
 }

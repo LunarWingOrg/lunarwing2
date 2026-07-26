@@ -1170,6 +1170,9 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     if let Err(e) = mission_manager.bootstrap_project(project_id).await {
         debug!("engine v2: bootstrap_project failed: {e}");
     }
+    if let Err(e) = mission_manager.bootstrap_all_projects().await {
+        debug!("engine v2: bootstrap_all_projects failed: {e}");
+    }
     if let Err(e) = mission_manager
         .resume_recoverable_threads(&agent.deps.owner_id)
         .await

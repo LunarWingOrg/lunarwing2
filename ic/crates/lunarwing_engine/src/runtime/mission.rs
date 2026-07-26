@@ -160,6 +160,28 @@ impl MissionManager {
     pub async fn bootstrap_project(&self, project_id: ProjectId) -> Result<usize, EngineError> {
         // System operation: load all missions for the project regardless of user.
         let missions = self.store.list_all_missions(project_id).await?;
+        self.bootstrap_from_missions(missions).await
+    }
+
+    /// Load all active missions across all projects into the active index.
+    ///
+    /// After `bootstrap_project` loads the primary project's missions, this
+    /// adds missions from other projects/users that would otherwise remain
+    /// inactive after restart.
+    pub async fn bootstrap_all_projects(&self) -> Result<usize, EngineError> {
+        let missions = self.store.list_all_active_missions_global().await?;
+        let existing: Vec<MissionId> = self.active.read().await.clone();
+        let new_missions: Vec<Mission> = missions
+            .into_iter()
+            .filter(|m| !existing.contains(&m.id))
+            .collect();
+        self.bootstrap_from_missions(new_missions).await
+    }
+
+    async fn bootstrap_from_missions(
+        &self,
+        missions: Vec<Mission>,
+    ) -> Result<usize, EngineError> {
         let mut active_ids = Vec::new();
         for mut mission in missions {
             if mission.status != MissionStatus::Active {
@@ -187,8 +209,13 @@ impl MissionManager {
         }
 
         let count = active_ids.len();
-        *self.active.write().await = active_ids;
-        debug!(project_id = ?project_id, active_missions = count, "bootstrapped active missions");
+        let mut active = self.active.write().await;
+        for id in &active_ids {
+            if !active.contains(id) {
+                active.push(*id);
+            }
+        }
+        debug!(active_missions = count, "bootstrapped missions");
         Ok(count)
     }
 
