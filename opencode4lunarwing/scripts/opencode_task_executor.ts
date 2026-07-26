@@ -68,14 +68,19 @@ export async function executeTask(
   const sdk = sdkOverride ?? createSdk(workDir)
   let sessionID: string | undefined
   let output = ""
-  let timedOut = false
   let sawSessionError = false
   let sessionErrorMsg = ""
   let deniedPermissions = 0
 
-  const timeout = setTimeout(() => {
-    timedOut = true
-  }, timeoutMs)
+  type StopReason = "timeout" | "cancelled"
+  let resolveStop: (reason: StopReason) => void = () => {}
+  const stopPromise = new Promise<StopReason>((resolve) => {
+    resolveStop = resolve
+  })
+  const timeout = setTimeout(() => resolveStop("timeout"), timeoutMs)
+  const handleAbort = () => resolveStop("cancelled")
+  abortSignal?.addEventListener("abort", handleAbort, { once: true })
+  if (abortSignal?.aborted) handleAbort()
 
   try {
     const sessionResult = await sdk.session.create(
@@ -116,8 +121,20 @@ export async function executeTask(
         (error: unknown) => ({ error }),
       )
 
-    for await (const event of events.stream) {
-      if (abortSignal?.aborted || timedOut) break
+    const eventIterator = events.stream[Symbol.asyncIterator]()
+    let stopReason: StopReason | undefined
+
+    while (!stopReason) {
+      const next = await Promise.race([
+        stopPromise.then((reason) => ({ kind: "stop" as const, reason })),
+        eventIterator.next().then((result) => ({ kind: "event" as const, result })),
+      ])
+      if (next.kind === "stop") {
+        stopReason = next.reason
+        break
+      }
+      if (next.result.done) break
+      const event = next.result.value
 
       if (event.type === "message.part.updated") {
         const part = event.properties.part
@@ -209,25 +226,21 @@ export async function executeTask(
       }
     }
 
-    if (timedOut) {
-      const durationMs = Date.now() - startTime
-      onResult({
-        task_id: request.task_id,
-        status: "error",
-        output: output.trim(),
-        error: `Task timed out after ${timeoutMs}ms`,
-        duration_ms: durationMs,
-      })
-      return
-    }
+    if (stopReason) {
+      try {
+        await sdk.session.abort({ sessionID }, { throwOnError: true })
+      } catch (error) {
+        console.error("[opencode_task_executor] failed to abort stopped session:", error)
+      }
+      // Do not await return(): a silent SSE iterator may still be blocked in next().
+      void eventIterator.return?.()
 
-    if (abortSignal?.aborted) {
       const durationMs = Date.now() - startTime
       onResult({
         task_id: request.task_id,
-        status: "cancelled",
+        status: stopReason === "timeout" ? "error" : "cancelled",
         output: output.trim(),
-        error: null,
+        error: stopReason === "timeout" ? `Task timed out after ${timeoutMs}ms` : null,
         duration_ms: durationMs,
       })
       return
@@ -304,6 +317,7 @@ export async function executeTask(
     })
   } finally {
     clearTimeout(timeout)
+    abortSignal?.removeEventListener("abort", handleAbort)
     for (const key of injectedKeys) {
       if (savedValues[key] === undefined) {
         delete process.env[key]

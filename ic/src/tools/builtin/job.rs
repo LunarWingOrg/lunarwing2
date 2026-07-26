@@ -30,6 +30,9 @@ use crate::orchestrator::job_manager::{ContainerJobManager, JobMode};
 use crate::secrets::SecretsStore;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
 
+const LONG_JOB_TOOL_TIMEOUT: Duration = Duration::from_secs(660);
+const EXTERNAL_WORKER_TIMEOUT_GRACE: Duration = Duration::from_secs(60);
+
 /// Lazy scheduler reference, filled after Agent::new creates the Scheduler.
 ///
 /// Solves the chicken-and-egg: tools are registered before the Scheduler exists
@@ -197,6 +200,10 @@ impl CreateJobTool {
         self.external_worker_manager
             .as_ref()
             .is_some_and(|m| !m.is_empty())
+    }
+
+    fn external_worker_monitor_timeout(&self, worker_timeout_ms: u64) -> Duration {
+        Duration::from_millis(worker_timeout_ms).saturating_add(EXTERNAL_WORKER_TIMEOUT_GRACE)
     }
 
     /// Parse and validate the `credentials` parameter.
@@ -899,7 +906,7 @@ impl CreateJobTool {
                 )));
             }
 
-            let monitor_timeout = std::time::Duration::from_secs(630);
+            let monitor_timeout = self.external_worker_monitor_timeout(worker_timeout_ms);
             if let (Some(rx), Some(itx)) = (pre_subscribed_rx, &self.inject_tx) {
                 if let Some(route) = monitor_route_from_ctx(ctx) {
                     crate::agent::job_monitor::spawn_job_monitor_with_context(
@@ -1221,8 +1228,13 @@ impl Tool for CreateJobTool {
 
     fn execution_timeout(&self) -> Duration {
         if self.sandbox_enabled() || self.has_external_workers() {
-            // Sandbox polls for up to 10 min; external workers have per-worker timeouts.
-            Duration::from_secs(660)
+            let external_timeout = self
+                .external_worker_manager
+                .as_ref()
+                .and_then(|manager| manager.max_timeout_ms())
+                .map(|timeout_ms| self.external_worker_monitor_timeout(timeout_ms))
+                .unwrap_or_default();
+            LONG_JOB_TOOL_TIMEOUT.max(external_timeout)
         } else {
             Duration::from_secs(30)
         }
@@ -1962,7 +1974,7 @@ mod tests {
             name: "opencode".to_string(),
             url: "ws://127.0.0.1:20007/ws/agent".to_string(),
             auth_token: None,
-            timeout_ms: 300_000,
+            timeout_ms: 900_000,
             endpoints: vec![],
             load_balance: LoadBalanceStrategy::default(),
         }]));
@@ -1974,7 +1986,7 @@ mod tests {
         );
         assert!(tool.description().contains("not extensions, MCP servers"));
         assert!(tool.description().contains("30-second local-job default"));
-        assert_eq!(tool.execution_timeout(), Duration::from_secs(660));
+        assert_eq!(tool.execution_timeout(), Duration::from_secs(960));
         assert_eq!(
             tool.requires_approval(&serde_json::json!({})),
             ApprovalRequirement::UnlessAutoApproved

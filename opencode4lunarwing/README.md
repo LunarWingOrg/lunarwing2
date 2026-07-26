@@ -33,12 +33,18 @@ timeout_ms = 300000
 ```
 
 The agent logs `External workers configured: opencode` on startup.
+`timeout_ms` is the hard task deadline enforced by both LunarWing and this worker.
+On timeout or cancellation, the worker aborts the active OpenCode session instead
+of leaving it running in the container.
 
 ## Usage
 
 ```
 create_job(title: "Fix the tests", description: "Run cargo test and fix failures", mode: "opencode")
 ```
+
+For long tasks, set `wait: false`. LunarWing returns the job ID immediately and
+keeps monitoring worker events without blocking the current conversation turn.
 
 ## Health Endpoints
 
