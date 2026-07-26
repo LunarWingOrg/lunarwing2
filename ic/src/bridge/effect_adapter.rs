@@ -227,7 +227,8 @@ impl EffectBridgeAdapter {
     ) -> Result<lunarwing_engine::MissionUpdate, EngineError> {
         let mut updates = lunarwing_engine::MissionUpdate::default();
         updates.name = params
-            .get("new_name")
+            .get("name")
+            .or_else(|| params.get("new_name"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
         updates.goal = params
