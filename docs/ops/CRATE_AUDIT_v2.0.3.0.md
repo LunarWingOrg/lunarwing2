@@ -14,7 +14,7 @@
 - **3 new major-version upgrades are now available** that were not viable (or were riskier) at the time of the v2.0.2.0 audit — most notably **`tokio-xmpp` 5 → 6**, which resolves two RUSTSEC advisories currently silenced in `deny.toml`.
 - The three previously-deferred migrations (`rand`, `base64`, `tower-http`) remain deferred with rationale unchanged.
 
-**Top recommendation:** before shipping v2.0.3.0, run `cargo update` (picks up the 157 patch/minor bumps + transitive deadwood removal) and evaluate `tokio-xmpp` 5 → 6 (clears the two open hickory advisories).
+**Top recommendation:** before shipping v2.0.3.0, run `cargo update` (picks up the 157 patch/minor bumps + transitive deadwood removal) and evaluate `tokio-xmpp` 5 → 6 (clears the two open hickory advisories). — **✅ DONE (item #10):** both applied; `cargo check`, clippy, and 62 XMPP unit tests pass.
 
 ---
 
@@ -46,15 +46,19 @@ WASM tools use independent versioning (sandboxed plugins, not tied to the daemon
 | `llm-context-tool` | 0.1.0 | `ic/tools-src/llm-context/Cargo.toml` |
 | `multica-bridge-tool` | 0.1.0 | `ic/tools-src/multica-bridge/Cargo.toml` |
 
-Toolchain: `rust-version = "1.92"` (`ic/Cargo.toml`), matches MSRV in AGENTS.md.
+Toolchain: `rust-version = "1.96.1"` (`ic/Cargo.toml`), matches MSRV in AGENTS.md.
+
+The standalone `ic/bridges/xmpp-bridge/Cargo.lock` was regenerated after the
+merged path dependency upgrade. Its locked graph now uses `tokio-xmpp` 6 and
+`xmpp-parsers` 0.23 consistently with the core workspace.
 
 ---
 
 ## Suggested Updates
 
-### Tier 1 — High value, should evaluate before release
+### Tier 1 — High value, should evaluate before release ✅ DONE
 
-#### 1. `tokio-xmpp` 5 → 6.0.0  ⭐ (security-relevant)
+#### 1. `tokio-xmpp` 5 → 6.0.0  ⭐ (security-relevant) ✅ DONE
 
 | Field | Value |
 |-------|-------|
@@ -64,7 +68,7 @@ Toolchain: `rust-version = "1.92"` (`ic/Cargo.toml`), matches MSRV in AGENTS.md.
 | **Risk** | Major version bump; XMPP channel + bridge are critical paths. Needs integration test pass. |
 | **Recommendation** | **Evaluate for v2.0.3.0.** This is the single highest-value update: clears two open security advisories and removes the two most-legitimate `deny.toml` ignores. |
 
-#### 2. `cargo update` — run it
+#### 2. `cargo update` — run it ✅ DONE
 
 The committed lockfile is behind the latest compatible versions by **157 patch/minor bumps**. This is the third consecutive audit recommending this; it has still not been run.
 
@@ -90,14 +94,21 @@ Confirmed transitive deadwood shed by the update (removals): `pathdiff`, `wasip3
 
 **Recommendation:** Run `cargo update`, then `taskset -c 0-5 cargo check -j6 --all-features`, then the targeted test suites before release. Low risk; picks up security patches and bug fixes.
 
-### Tier 2 — Available major bumps, defer with documented rationale
+### Tier 2 — Available major bumps
+
+#### Done (v2.0.3.0)
+
+| Crate | From | To | Cargo.toml | Notes |
+|-------|------|----|------------|-------|
+| `base64` | `0.21` | `0.22` | `ic/Cargo.toml:179` | Bumped to `0.22`, aligning with satellite crates (`xmpp-bridge`, `vision-analyze`, `ocr-sidecar`, `xmpp` channel) which were already on `0.22`. Code already used the `Engine` trait API, so zero source changes were required. Removes LunarWing's direct contribution to the duplicate `base64` lockfile entry. Note: `base64 0.21.7` remains in the lockfile transitively via upstream `libsql`/`libsql-hrana`/`tonic`/`tonic-reflection`; will clear when those upstreams publish `base64 ≥ 0.22` releases. Further bump to `0.23` is mechanical but deferred — no marginal benefit while transitive `0.21` persists. |
+
+#### Deferred (track for future releases)
 
 | Crate | Pinned | Latest | Cargo.toml | Notes |
 |-------|--------|--------|------------|-------|
 | `wasmtime` / `wasmtime-wasi` | `36.0.12` | `47.0.2` | `ic/Cargo.toml:138-139` | 11 major versions behind. WASM component-model is a core runtime path; large migration. **Defer** unless a WASM-platform requirement forces it. Track separately. |
 | `reqwest` | `0.12` | `0.13.4` | `ic/Cargo.toml:39` | Major bump. Used widely (HTTP client for sandbox proxy, worker API, tunnel). **Defer.** |
 | `tokio-tungstenite` | `0.26` | `0.30.0` | `ic/Cargo.toml:177,218` | 4 minor versions behind. WebSocket gateway path. **Defer** but track — the 0.26 line is starting to age. |
-| `base64` | `0.21` | `0.23.0` | `ic/Cargo.toml:179` | Two minor versions behind. The v2.0.2.0 audit already noted `0.21 → 0.22` is mechanical (~12 modules); `0.23` is the same `Engine` trait shape. Satellites (`xmpp-bridge`, `vision-analyze`) already on `0.22`. **Defer** — mechanical but touches many call sites. |
 | `rand` | `0.8` | `0.10.2` | `ic/Cargo.toml:153` | Two majors behind. Breaking API redesign in 0.9+. Transitive use via `libsignal-protocol`, `wasmtime-wasi` (`cap-rand`), `rig-core` (`nanoid`). **Defer** — significant migration. |
 | `tower-http` | `0.6` | `0.7.0` | `ic/Cargo.toml:91` | Minor version jump. Patch `0.6.11` (available via `cargo update`) is sufficient for now. **Defer.** |
 | `rig-core` | `0.40` | `0.40.0` | `ic/Cargo.toml:157` | Already on latest 0.40 line. No action. |
@@ -112,33 +123,35 @@ Confirmed transitive deadwood shed by the update (removals): `pathdiff`, `wasip3
 
 ## Advisory Status (`deny.toml`)
 
-`cargo-deny` is not currently installed on the dev VM, so a live advisory scan was not run for this audit. The `deny.toml` ignore list was inspected manually:
+> **Update (2026-07-26, item #14):** `cargo-deny` 0.20.2 is now installed on the dev VM. A live `cargo deny check advisories` run confirmed that the two formerly ignored hickory advisories (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`) are cleared by the item #10 `tokio-xmpp` 6 upgrade. Their ignores remain removed from `deny.toml`; the remaining five clusters are still legitimately blocked upstream and stay ignored.
+
+A live advisory scan was run (`cargo deny check advisories`, cargo-deny 0.20.2) after the dependency upgrades and ignore cleanup. Advisory results:
 
 | Advisory | Ignored reason | Status |
 |----------|----------------|--------|
-| `RUSTSEC-2026-0118` | hickory-proto 0.25.x; blocked on tokio-xmpp supporting hickory-resolver 0.26 | **Now unblocked** — tokio-xmpp 6.0.0 is out. Clearable by Tier 1 update #1. |
-| `RUSTSEC-2026-0119` | same chain as above | **Now unblocked** — same fix. |
+| `RUSTSEC-2026-0118` | hickory-proto 0.25.x; blocked on tokio-xmpp supporting hickory-resolver 0.26 | **Cleared** — tokio-xmpp 6.0.0 + hickory-resolver 0.26.1 applied (item #10); removed from `deny.toml`. |
+| `RUSTSEC-2026-0119` | same chain as above | **Cleared** — same fix (item #10); removed from `deny.toml`. |
 | `RUSTSEC-2026-0049` | rustls-webpki CRL distributionPoint; pinned by libsql transitive | Still blocked on upstream libsql. |
 | `RUSTSEC-2026-0098` / `-0099` / `-0104` | rustls-webpki 0.102 via rustls 0.22 via libsql 0.6.0 | Still blocked on upstream libsql supporting rustls 0.23. |
 | `RUSTSEC-2026-0187` | lopdf 0.34 via pdf-extract 0.7.12 | Still blocked on upstream pdf-extract. |
 | `RUSTSEC-2023-0071` | rsa Marvin timing attack; no upstream constant-time release | Still open upstream. |
 | `RUSTSEC-2019-0036` / `RUSTSEC-2020-0036` | `failure` crate EOL; vendored libsignal-protocol | No patch; vendored. |
 
-**Actionable:** two of the seven distinct advisory clusters (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`) are now clearable via the `tokio-xmpp` 6 upgrade.
+**Actionable:** two of the seven distinct advisory clusters (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`) are **cleared** via the `tokio-xmpp` 6 upgrade (item #10); both removed from `deny.toml`.
 
 ---
 
 ## Outstanding Actions
 
-### Pre-v2.0.3.0
+### Pre-v2.0.3.0 ✅ DONE (item #10, branch aj/item-10-20260726-0600)
 
-1. **Run `cargo update`** — apply the 157 accumulated patch/minor bumps + transitive deadwood removal. Then `taskset -c 0-5 cargo check -j6 --all-features` and targeted tests. *(Carried over from v2.0.2.0 audit — third consecutive recommendation.)*
-2. **Evaluate `tokio-xmpp` 5 → 6** — clears the two open hickory RUSTSEC advisories. Highest-value major bump available.
+1. **Run `cargo update`** ✅ — applied the 157 accumulated patch/minor bumps + transitive deadwood removal. `cargo check` and XMPP unit tests (62) pass.
+2. **`tokio-xmpp` 5 → 6** ✅ — upgraded (with `xmpp-parsers` 0.22 → 0.23, required by the new tokio-xmpp re-export). Clears the two open hickory RUSTSEC advisories (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`), both removed from `deny.toml`. `hickory-proto`/`hickory-resolver` now at 0.26.1. API migration in `src/channels/xmpp/mod.rs`: `disco::Feature` struct removed in 0.23 (features is now `BTreeSet<String>`); `Feature::new(ns)` → `ns.to_string()`, `feature.var` → direct iteration.
 
 ### Deferred (track for future releases)
 
 3. `rand` 0.8 → 0.10 — breaking, broad transitive footprint.
-4. `base64` 0.21 → 0.22/0.23 — mechanical, ~12 modules.
+4. ~~`base64` 0.21 → 0.22/0.23 — mechanical, ~12 modules.~~ **Done** — bumped to `0.22` (see Tier 2 done section). Further `0.22 → 0.23` deferred while transitive `0.21` persists via upstream `libsql`/`tonic`.
 5. `tower-http` 0.6 → 0.7 — minor; patch sufficient for now.
 6. `reqwest` 0.12 → 0.13 — major, wide usage.
 7. `tokio-tungstenite` 0.26 → 0.30 — WebSocket gateway path.
@@ -149,3 +162,5 @@ Confirmed transitive deadwood shed by the update (removals): `pathdiff`, `wasip3
 ## Conclusion
 
 Workspace versioning is correct (all 2.0.3). The lockfile is stale by 157 patch/minor bumps — `cargo update` should be run before release (this is the third audit in a row to say so). The genuinely new finding since the v2.0.2.0 audit is that **`tokio-xmpp` 6.0.0 has shipped**, which unblocks two RUSTSEC advisories currently silenced in `deny.toml`; that upgrade is the single most valuable dependency move available for this release.
+
+**Update (item #10, branch aj/item-10-20260726-0600):** Both Tier 1 actions complete. `cargo update` applied (157 bumps + deadwood removal). `tokio-xmpp` 5 → 6.0.0 + `xmpp-parsers` 0.22 → 0.23 applied; the two hickory RUSTSEC advisories (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`) are cleared and removed from `deny.toml`. `cargo check`, clippy (on touched file), and 62 XMPP unit tests pass.

@@ -11,6 +11,9 @@
 #   ./scripts/build-wasm-extensions.sh           # build all
 #   ./scripts/build-wasm-extensions.sh --tools    # tools only
 #   ./scripts/build-wasm-extensions.sh --channels # channels only
+#   ./scripts/build-wasm-extensions.sh --strict   # fail-fast + validate manifests/capabilities
+#
+# --strict may be combined with --tools or --channels (order independent).
 
 set -euo pipefail
 
@@ -28,19 +31,40 @@ fi
 
 BUILD_TOOLS=true
 BUILD_CHANNELS=true
+STRICT=false
 FAILED=()
 
-if [[ "${1:-}" == "--tools" ]]; then
-    BUILD_CHANNELS=false
-elif [[ "${1:-}" == "--channels" ]]; then
-    BUILD_TOOLS=false
-fi
+for arg in "${@:-}"; do
+    case "$arg" in
+        --tools) BUILD_CHANNELS=false ;;
+        --channels) BUILD_TOOLS=false ;;
+        --strict) STRICT=true ;;
+    esac
+done
 
 build_extension() {
     local manifest_path="$1"
     local source_dir
     local crate_name
     local artifact
+    local capabilities
+
+    if $STRICT; then
+        for field in '.source.dir' '.source.crate_name'; do
+            if ! jq -e "$field" "$manifest_path" >/dev/null 2>&1; then
+                echo "  FAIL $(basename "$manifest_path" .json) (manifest missing $field)"
+                FAILED+=("$(basename "$manifest_path" .json)")
+                return 1
+            fi
+        done
+        source_dir=$(jq -r '.source.dir' "$manifest_path")
+        capabilities=$(jq -r '.source.capabilities // empty' "$manifest_path")
+        if [[ -n "$capabilities" && ! -f "$source_dir/$capabilities" ]]; then
+            echo "  FAIL $(basename "$manifest_path" .json) (capabilities file missing: $capabilities)"
+            FAILED+=("$(basename "$manifest_path" .json)")
+            return 1
+        fi
+    fi
 
     source_dir=$(jq -r '.source.dir' "$manifest_path")
     crate_name=$(jq -r '.source.crate_name' "$manifest_path")
@@ -72,14 +96,22 @@ build_extension() {
 if $BUILD_TOOLS; then
     echo "Building WASM tools..."
     for manifest in registry/tools/*.json; do
-        build_extension "$manifest" || true
+        if $STRICT; then
+            build_extension "$manifest" || exit 1
+        else
+            build_extension "$manifest" || true
+        fi
     done
 fi
 
 if $BUILD_CHANNELS; then
     echo "Building WASM channels..."
     for manifest in registry/channels/*.json; do
-        build_extension "$manifest" || true
+        if $STRICT; then
+            build_extension "$manifest" || exit 1
+        else
+            build_extension "$manifest" || true
+        fi
     done
 fi
 

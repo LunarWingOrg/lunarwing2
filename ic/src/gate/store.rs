@@ -277,33 +277,56 @@ impl PendingGateStore {
         Ok(count)
     }
 
-    /// Remove all expired gates. Returns the number removed.
-    pub async fn expire_stale(&self) -> usize {
-        let expired_keys = {
-            let mut inner = self.inner.lock().await;
-            let expired_keys: Vec<PendingGateKey> = inner
-                .by_key
-                .iter()
-                .filter(|(_, g)| g.is_expired())
-                .map(|(k, _)| k.clone())
-                .collect();
-            for key in &expired_keys {
-                if let Some(gate) = inner.by_key.remove(key) {
-                    inner.by_request_id.remove(&gate.request_id);
-                }
+    /// Atomically remove and return all expired gates.
+    pub async fn drain_expired(&self) -> Vec<PendingGate> {
+        let mut inner = self.inner.lock().await;
+        let expired_keys: Vec<PendingGateKey> = inner
+            .by_key
+            .iter()
+            .filter(|(_, gate)| gate.is_expired())
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut expired = Vec::with_capacity(expired_keys.len());
+        for key in expired_keys {
+            if let Some(gate) = inner.by_key.remove(&key) {
+                inner.by_request_id.remove(&gate.request_id);
+                expired.push(gate);
             }
-            expired_keys
-        };
-        // Persist removals outside the lock
-        let count = expired_keys.len();
+        }
+
+        // Keep insertion blocked until stale persistence is gone. Otherwise a
+        // replacement can be saved and then deleted by this cleanup.
         if let Some(ref persistence) = self.persistence {
-            for key in &expired_keys {
-                if let Err(e) = persistence.remove(key).await {
+            for gate in &expired {
+                if let Err(e) = persistence.remove(&gate.key()).await {
                     tracing::debug!(error = %e, "failed to remove expired gate from persistence");
                 }
             }
         }
-        count
+        expired
+    }
+
+    /// Run an async operation only while no gate exists for `key`.
+    ///
+    /// Used by expiry reconciliation so replacement insertion cannot race a
+    /// waiting thread's transition to failed.
+    pub(crate) async fn run_if_absent<F, Fut>(&self, key: &PendingGateKey, operation: F) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let inner = self.inner.lock().await;
+        if inner.by_key.contains_key(key) {
+            return false;
+        }
+        operation().await;
+        drop(inner);
+        true
+    }
+
+    /// Remove all expired gates. Returns the number removed.
+    pub async fn expire_stale(&self) -> usize {
+        self.drain_expired().await.len()
     }
 
     /// Check whether a channel name is reserved (WASM cannot register it).
@@ -589,6 +612,20 @@ mod tests {
             thread_id: tid2,
         };
         assert!(store.peek(&key).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_drain_expired_returns_exact_removed_gates() {
+        let store = PendingGateStore::in_memory();
+        let expired = sample_gate_with("alice", ThreadId::new(), "web", -1);
+        let valid = sample_gate_with("bob", ThreadId::new(), "web", 300);
+        store.insert(expired.clone()).await.unwrap();
+        store.insert(valid.clone()).await.unwrap();
+
+        let drained = store.drain_expired().await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].request_id, expired.request_id);
+        assert!(store.peek(&valid.key()).await.is_some());
     }
 
     // ── Concurrency ──────────────────────────────────────────

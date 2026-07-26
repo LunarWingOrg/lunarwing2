@@ -212,6 +212,7 @@ pub async fn memory_search_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let total_matches = results.len();
     let hits: Vec<SearchHit> = results
         .iter()
         .map(|r| SearchHit {
@@ -221,5 +222,9 @@ pub async fn memory_search_handler(
         })
         .collect();
 
-    Ok(Json(MemorySearchResponse { results: hits }))
+    Ok(Json(MemorySearchResponse {
+        results: hits,
+        total_matches,
+        truncated: false,
+    }))
 }

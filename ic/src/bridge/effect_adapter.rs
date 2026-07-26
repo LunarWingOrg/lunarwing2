@@ -225,43 +225,50 @@ impl EffectBridgeAdapter {
     fn mission_updates(
         params: &serde_json::Value,
     ) -> Result<lunarwing_engine::MissionUpdate, EngineError> {
-        let mut updates = lunarwing_engine::MissionUpdate {
-            name: params
-                .get("name")
-                .or_else(|| params.get("new_name"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            goal: params
-                .get("goal")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            cadence: params
-                .get("cadence")
-                .and_then(serde_json::Value::as_str)
-                .map(parse_cadence)
-                .transpose()?,
-            ..Default::default()
-        };
-        if let Some(channels) = params
+        let name = params
+            .get("name")
+            .or_else(|| params.get("new_name"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let goal = params
+            .get("goal")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let cadence = params
+            .get("cadence")
+            .and_then(serde_json::Value::as_str)
+            .map(parse_cadence)
+            .transpose()?;
+        let notify_channels = params
             .get("notify_channels")
             .and_then(serde_json::Value::as_array)
-        {
-            updates.notify_channels = Some(
+            .map(|channels| {
                 channels
                     .iter()
                     .filter_map(|value| value.as_str().map(String::from))
-                    .collect(),
-            );
-        }
-        updates.max_threads_per_day = params
+                    .collect()
+            });
+        let max_threads_per_day = params
             .get("max_threads_per_day")
             .and_then(Self::coerce_to_u64)
             .map(|max| max as u32);
-        updates.success_criteria = params
+        let success_criteria = params
             .get("success_criteria")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        Ok(updates)
+        let webhook_secret = params
+            .get("webhook_secret")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        Ok(lunarwing_engine::MissionUpdate {
+            name,
+            goal,
+            cadence,
+            notify_channels,
+            max_threads_per_day,
+            success_criteria,
+            webhook_secret,
+        })
     }
 
     async fn resolve_mission_id(
@@ -341,7 +348,10 @@ impl EffectBridgeAdapter {
                     } else {
                         vec![]
                     };
-                match parse_cadence(cadence_str) {
+                let webhook_secret = params
+                    .get("webhook_secret")
+                    .and_then(serde_json::Value::as_str);
+                match parse_cadence_with_secret(cadence_str, webhook_secret) {
                     Ok(cadence) => match mgr
                         .create_mission(
                             context.project_id,
@@ -419,7 +429,7 @@ impl EffectBridgeAdapter {
             "mission_delete" => {
                 let id = Self::resolve_mission_id(params, context, mgr).await;
                 match id {
-                    Ok(id) => match mgr.complete_mission_with_owner(id, &context.user_id).await {
+                    Ok(id) => match mgr.delete_mission(id, &context.user_id).await {
                         Ok(()) => Ok(serde_json::json!({"status": "deleted"})),
                         Err(e) => Err(e),
                     },
@@ -1023,6 +1033,22 @@ fn parse_cadence(
     ))
 }
 
+fn parse_cadence_with_secret(
+    value: &str,
+    webhook_secret: Option<&str>,
+) -> Result<lunarwing_engine::types::mission::MissionCadence, EngineError> {
+    let mut cadence = parse_cadence(value)?;
+    if let lunarwing_engine::MissionCadence::Webhook { secret, .. } = &mut cadence {
+        let provided = webhook_secret
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                invalid_cadence(value, "webhook cadence requires non-empty webhook_secret")
+            })?;
+        *secret = Some(provided.to_string());
+    }
+    Ok(cadence)
+}
+
 /// Extract credential name from an authentication_required error message.
 ///
 /// The HTTP tool returns errors like:
@@ -1145,6 +1171,17 @@ mod tests {
             parse_cadence("webhook:Build/Ready").expect("webhook cadence"),
             lunarwing_engine::MissionCadence::Webhook { path, .. }
                 if path == "Build/Ready"
+        ));
+    }
+
+    #[test]
+    fn webhook_cadence_requires_and_retains_explicit_secret() {
+        assert!(parse_cadence_with_secret("webhook:Build/Ready", None).is_err());
+        assert!(matches!(
+            parse_cadence_with_secret("webhook:Build/Ready", Some("secret-value"))
+                .expect("webhook cadence"),
+            lunarwing_engine::MissionCadence::Webhook { path, secret }
+                if path == "Build/Ready" && secret.as_deref() == Some("secret-value")
         ));
     }
 

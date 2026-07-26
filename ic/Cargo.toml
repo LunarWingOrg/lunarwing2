@@ -12,7 +12,7 @@ exclude = [
 name = "lunarwing"
 version = "2.0.3"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.96.1"
 description = "Secure, privacy-first AI agent with XMPP/OMEMO, Gotify, and open-protocol channels"
 authors = ["LunarWing Team"]
 license = "AGPL-3.0-or-later"
@@ -176,14 +176,14 @@ http = "1"
 # External worker WebSocket client
 tokio-tungstenite = "0.26"
 bytes = "1"
-base64 = "0.21"
+base64 = "0.22"
 mime_guess = "2.0.5"
 clap_complete = "4.5.0"
 lru = "0.16.3"
 
 # XMPP channel
-tokio-xmpp = { version = "5", features = ["starttls"] }
-xmpp-parsers = "0.22"
+tokio-xmpp = { version = "6", features = ["starttls"] }
+xmpp-parsers = "0.23"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # HTML to Markdown conversion (feature gated)

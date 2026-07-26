@@ -7,7 +7,7 @@ a simple HTTP API that the LunarWing WASM channel can poll.
 
 Endpoints:
   GET  /poll          → Returns queued inbound DMs as JSON array
-  POST /ack           → Acknowledges the last polled batch (at-least-once)
+  POST /ack           → Acknowledges matching opaque batch_id (at-least-once)
   POST /send          → Queues a DM for paced delivery: {"to":"nick","text":"..."}
   GET  /health        → Health check (inbound queue + outbox depth)
 
@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import sys
 import time
@@ -48,10 +49,10 @@ IRC_REALNAME = os.getenv("DARKIRC_REALNAME", "DarkIRC-LunarWing Bridge")
 HTTP_HOST = os.getenv("ADAPTER_HOST", "127.0.0.1")
 HTTP_PORT = int(os.getenv("ADAPTER_PORT", "6680"))
 
-# Max messages to buffer before dropping oldest
+# Max fresh inbound messages before IRC reads pause and apply TCP backpressure.
 MAX_QUEUE = int(os.getenv("ADAPTER_MAX_QUEUE", "500"))
 
-# Max UTF-8 bytes per IRC message chunk (conservative under 512-byte IRC limit)
+# Max UTF-8 payload bytes; per-target clamp keeps full IRC frame within 450 bytes.
 MAX_IRC_MESSAGE_BYTES = int(os.getenv("DARKIRC_MAX_MESSAGE_BYTES", "400"))
 
 # Minimum seconds between PRIVMSG sends (DarkFi metering requires spacing)
@@ -62,7 +63,7 @@ PRIVMSG_MIN_INTERVAL = float(os.getenv("DARKIRC_PRIVMSG_INTERVAL", "7.0"))
 MAX_OUTBOX = int(os.getenv("ADAPTER_MAX_OUTBOX", "400"))
 
 # Optional JSON file persisting the outbox across adapter restarts.
-# Empty (default) disables journaling.
+# Empty disables journaling; production templates configure a durable path.
 OUTBOX_JOURNAL = os.getenv("ADAPTER_OUTBOX_JOURNAL", "")
 
 # Cap on inbound HTTP request bodies (M5: the hand-rolled reader trusts
@@ -100,6 +101,9 @@ def setup_logging():
 # ---------------------------------------------------------------------------
 
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_IRC_NICK_RE = re.compile(r"^[A-Za-z\[\]\\`_^{|}][A-Za-z0-9\[\]\\`_^{|}-]{0,31}$")
+IRC_FRAME_MAX_BYTES = 450
+NATURAL_BREAK_SLACK_BYTES = 4
 
 
 class IRCClient:
@@ -127,6 +131,8 @@ class IRCClient:
     async def _send(self, line: str):
         if not self._writer:
             raise ConnectionError("not connected")
+        if _CTRL_RE.search(line):
+            raise ValueError("IRC protocol line contains control character")
         log.debug("IRC >>> %s", line)
         try:
             self._writer.write((line + "\r\n").encode("utf-8", errors="replace"))
@@ -188,16 +194,13 @@ class IRCClient:
 
 def _split_message_bytes(text: str, max_bytes: int) -> list:
     """Split text into chunks that fit within max_bytes UTF-8 encoded length,
-    preferring natural break points (newlines, then spaces).
+    preferring spaces close to the byte limit.
     Always preserves character boundaries (no split mid-codepoint).
 
-    Also normalizes line endings: \r\n → \n, and standalone \r → \n,
-    so the output never contains stray \r.
+    IRC controls, including CR/LF, become spaces so no chunk can inject an
+    additional protocol frame.
     """
-    # Normalize CRLF to LF, plus standalone \r (old Mac line endings) to \n.
-    # .replace('\r', '\n') handles both in a single pass: \r\n becomes \n\n,
-    # which is fine for our purposes (we treat newlines as whitespace at split points).
-    text = text.replace('\r', '\n')
+    text = _CTRL_RE.sub(" ", text)
 
     if len(text.encode("utf-8")) <= max_bytes:
         return [text]
@@ -227,16 +230,10 @@ def _split_message_bytes(text: str, max_bytes: int) -> list:
 
         cut = remaining[:lo]
 
-        # Prefer breaking at newline
-        nl = cut.rfind("\n")
-        if nl > 0:
-            chunks.append(cut[:nl])
-            remaining = remaining[nl + 1:]  # skip the newline
-            continue
-
-        # Then at a space
+        # Use a nearby natural break without shrinking chunks enough to violate
+        # the host's six-message budget after numbering prefixes are added.
         sp = cut.rfind(" ")
-        if sp > 0:
+        if sp > 0 and len(cut[sp:].encode("utf-8")) <= NATURAL_BREAK_SLACK_BYTES:
             chunks.append(cut[:sp])
             remaining = remaining[sp + 1:]  # skip the space
             continue
@@ -262,14 +259,19 @@ _last_privmsg_time: float = float("-inf")
 
 def _effective_max_bytes(to: str) -> int:
     """Largest payload keeping 'PRIVMSG <to> :<payload>\\r\\n' within the
-    512-byte IRC frame, capped by MAX_IRC_MESSAGE_BYTES.
+    450-byte conservative IRC frame, capped by MAX_IRC_MESSAGE_BYTES.
 
     With the default 400-byte cap this only bites for pathologically long
     nicks; it lets operators raise DARKIRC_MAX_MESSAGE_BYTES while staying
     frame-safe on the client side.
     """
     frame_overhead = len("PRIVMSG  :") + len(to.encode("utf-8")) + 2  # +CRLF
-    return max(1, min(MAX_IRC_MESSAGE_BYTES, 512 - frame_overhead))
+    return max(1, min(MAX_IRC_MESSAGE_BYTES, IRC_FRAME_MAX_BYTES - frame_overhead))
+
+
+def _valid_irc_target(to: str) -> bool:
+    """Accept direct-message IRC nick syntax only."""
+    return bool(_IRC_NICK_RE.fullmatch(to))
 
 
 def _numbered_chunks(to: str, text: str) -> list:
@@ -301,6 +303,8 @@ def _numbered_chunks(to: str, text: str) -> list:
 
 def enqueue_send(to: str, text: str):
     """Queue a message for paced delivery. Returns (ok, info_dict)."""
+    if not _valid_irc_target(to):
+        return False, {"error": "invalid IRC target"}
     chunks = _numbered_chunks(to, text)
     if len(outbox) + len(chunks) > MAX_OUTBOX:
         return False, {
@@ -310,7 +314,10 @@ def enqueue_send(to: str, text: str):
         }
     for chunk in chunks:
         outbox.append({"to": to, "text": chunk})
-    _journal_save()
+    if not _journal_save():
+        for _ in chunks:
+            outbox.pop()
+        return False, {"error": "outbox journal write failed"}
     return True, {"status": "queued", "chunks": len(chunks), "outbox": len(outbox)}
 
 
@@ -332,24 +339,71 @@ def _journal_load():
             if not isinstance(item, dict):
                 continue
             to, text = item.get("to"), item.get("text")
-            if isinstance(to, str) and isinstance(text, str) and to and text:
-                outbox.append({"to": to, "text": text})
+            if (
+                isinstance(to, str)
+                and isinstance(text, str)
+                and _valid_irc_target(to)
+                and text
+            ):
+                outbox.append({"to": to, "text": _CTRL_RE.sub(" ", text)})
                 restored += 1
     if restored:
         log.info("Outbox journal: restored %d queued chunk(s)", restored)
 
 
 def _journal_save():
-    """Persist the outbox atomically (write-then-rename), if configured."""
+    """Persist outbox with crash-durable same-directory atomic replacement."""
     if not OUTBOX_JOURNAL:
-        return
-    tmp = OUTBOX_JOURNAL + ".tmp"
+        return True
+    parent = os.path.dirname(os.path.abspath(OUTBOX_JOURNAL))
+    basename = os.path.basename(OUTBOX_JOURNAL)
+    tmp = None
+    fd = None
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
+        # O_EXCL plus random name prevents symlink/hardlink replacement races.
+        for _ in range(100):
+            candidate = os.path.join(parent, f".{basename}.{secrets.token_hex(16)}.tmp")
+            try:
+                fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                tmp = candidate
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise OSError("could not allocate unique journal temp file")
+
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = None  # fdopen owns descriptor from here.
             json.dump(list(outbox), fh, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, OUTBOX_JOURNAL)
+        tmp = None
+
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        dir_fd = os.open(parent, dir_flags)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        return True
     except OSError as e:
         log.warning("Outbox journal write failed: %s", e)
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log.warning("Outbox journal temp cleanup failed: %s", e)
 
 
 async def outbox_loop():
@@ -395,6 +449,32 @@ message_queue: deque = deque(maxlen=MAX_QUEUE)
 # Re-served on the next /poll until /ack clears them, so a host crash between
 # poll and processing doesn't lose DMs.
 pending_ack: deque = deque(maxlen=MAX_QUEUE)
+pending_batch_id = None
+
+
+def _poll_messages() -> list:
+    """Return current at-least-once batch without evicting unacked entries."""
+    global pending_batch_id
+    if not pending_ack:
+        while message_queue and len(pending_ack) < MAX_QUEUE:
+            pending_ack.append(message_queue.popleft())
+        if pending_ack:
+            pending_batch_id = secrets.token_urlsafe(24)
+        else:
+            pending_batch_id = None
+    elif pending_batch_id is None:
+        pending_batch_id = secrets.token_urlsafe(24)
+    return list(pending_ack)
+
+
+def _ack_batch(batch_id: str) -> bool:
+    """Clear only batch identified by current opaque token."""
+    global pending_batch_id
+    if not pending_ack or not pending_batch_id or batch_id != pending_batch_id:
+        return False
+    pending_ack.clear()
+    pending_batch_id = None
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +495,11 @@ async def irc_loop():
             delay = 5
 
             while _running:
+                # Stop reading so TCP applies backpressure instead of deque
+                # eviction when host has not drained fresh messages.
+                if len(message_queue) >= MAX_QUEUE:
+                    await asyncio.sleep(0.1)
+                    continue
                 line = await asyncio.wait_for(irc.readline(), timeout=300)
                 if line is None:
                     log.warning("IRC EOF, reconnecting")
@@ -541,17 +626,31 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             })
 
         elif method == "GET" and path == "/poll":
-            # Serve unacked (pending) + fresh; hold the batch until /ack so a
-            # host crash between poll and processing re-delivers rather than
-            # loses (at-least-once).
-            messages = list(pending_ack) + list(message_queue)
-            pending_ack.clear()
-            message_queue.clear()
-            pending_ack.extend(messages)
-            await send_response(writer, 200, {"messages": messages})
+            # Never combine fresh messages with an unacked full batch: bounded
+            # pending_ack would evict old entries. Fresh messages remain queued
+            # until /ack, while IRC input receives TCP backpressure at its cap.
+            messages = _poll_messages()
+            await send_response(writer, 200, {
+                "messages": messages,
+                "batch_id": pending_batch_id,
+            })
 
         elif method == "POST" and path == "/ack":
-            pending_ack.clear()
+            if not body:
+                await send_response(writer, 400, {"error": "empty body"})
+                return
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                await send_response(writer, 400, {"error": "invalid json"})
+                return
+            batch_id = payload.get("batch_id") if isinstance(payload, dict) else None
+            if not isinstance(batch_id, str) or not batch_id:
+                await send_response(writer, 400, {"error": "missing 'batch_id'"})
+                return
+            if not _ack_batch(batch_id):
+                await send_response(writer, 409, {"error": "batch_id does not match pending batch"})
+                return
             await send_response(writer, 200, {"status": "acked"})
 
         elif method == "POST" and path == "/send":
@@ -564,10 +663,20 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 await send_response(writer, 400, {"error": "invalid json"})
                 return
 
-            to = payload.get("to", "").strip()
-            text = payload.get("text", "").strip()
+            if not isinstance(payload, dict):
+                await send_response(writer, 400, {"error": "invalid payload"})
+                return
+            to = payload.get("to", "")
+            text = payload.get("text", "")
 
-            if not to or not text:
+            if not isinstance(to, str) or not isinstance(text, str) or not to or not text:
+                await send_response(writer, 400, {"error": "missing 'to' or 'text'"})
+                return
+            if not _valid_irc_target(to):
+                await send_response(writer, 400, {"error": "invalid IRC target"})
+                return
+            text = text.strip()
+            if not text:
                 await send_response(writer, 400, {"error": "missing 'to' or 'text'"})
                 return
 
@@ -576,7 +685,8 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             # message-loss mode (callers dropped the response on 503).
             ok, info = enqueue_send(to, text)
             if not ok:
-                await send_response(writer, 429, info)
+                status = 429 if info["error"] == "outbox full" else 503
+                await send_response(writer, status, info)
                 return
             info["irc_connected"] = irc.connected
             await send_response(writer, 200, info)

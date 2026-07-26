@@ -237,8 +237,10 @@ class AdapterIntegrationTest(unittest.IsolatedAsyncioTestCase):
         s, body = await self.H("GET", "/poll", token=self.secret)
         self.assertEqual(s, 200)
         self.assertTrue(any(m["text"] == "hello from irc" for m in body["messages"]))
+        self.assertIsInstance(body["batch_id"], str)
         # Ack the batch.
-        s_ack, _ = await self.H("POST", "/ack", token=self.secret)
+        ack_body = json.dumps({"batch_id": body["batch_id"]}).encode()
+        s_ack, _ = await self.H("POST", "/ack", token=self.secret, body=ack_body)
         self.assertEqual(s_ack, 200)
         # Next poll should NOT re-serve the acked message.
         s2, body2 = await self.H("GET", "/poll", token=self.secret)
@@ -253,6 +255,33 @@ class AdapterIntegrationTest(unittest.IsolatedAsyncioTestCase):
         # Do NOT ack. Poll again -> same message re-served (at-least-once).
         _, body2 = await self.H("GET", "/poll", token=self.secret)
         self.assertTrue(any(m["text"] == "redeliver me" for m in body2["messages"]))
+        self.assertEqual(body2["batch_id"], body["batch_id"])
+
+    async def test_stale_and_duplicate_ack_cannot_clear_newer_batch(self):
+        self.irc.inject_dm("first batch")
+        await asyncio.sleep(0.6)
+        _, first = await self.H("GET", "/poll", token=self.secret)
+        first_ack = json.dumps({"batch_id": first["batch_id"]}).encode()
+        status, _ = await self.H("POST", "/ack", token=self.secret, body=first_ack)
+        self.assertEqual(status, 200)
+
+        self.irc.inject_dm("newer batch")
+        await asyncio.sleep(0.6)
+        _, newer = await self.H("GET", "/poll", token=self.secret)
+        self.assertNotEqual(first["batch_id"], newer["batch_id"])
+
+        stale_status, _ = await self.H(
+            "POST", "/ack", token=self.secret, body=first_ack,
+        )
+        self.assertEqual(stale_status, 409)
+        _, redelivered = await self.H("GET", "/poll", token=self.secret)
+        self.assertEqual(redelivered["batch_id"], newer["batch_id"])
+        self.assertTrue(any(m["text"] == "newer batch" for m in redelivered["messages"]))
+
+    async def test_ack_requires_batch_id(self):
+        for body in (None, b"{}", b"not-json"):
+            status, _ = await self.H("POST", "/ack", token=self.secret, body=body)
+            self.assertEqual(status, 400)
 
     async def test_send_forwards_privmsg(self):
         s, body = await self.H(
@@ -269,6 +298,57 @@ class AdapterIntegrationTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.2)
         else:
             self.fail("adapter did not forward PRIVMSG to IRC server")
+
+    async def test_short_multiline_text_stays_in_one_irc_frame(self):
+        before = len(self.irc.sent_privmsgs)
+        s, body = await self.H(
+            "POST", "/send", token=self.secret,
+            body=json.dumps({"to": "someone", "text": "line one\nline two"}).encode(),
+        )
+        self.assertEqual(s, 200)
+        self.assertEqual(body["chunks"], 1)
+        for _ in range(30):
+            if len(self.irc.sent_privmsgs) > before:
+                break
+            await asyncio.sleep(0.2)
+        sent = self.irc.sent_privmsgs[before:]
+        self.assertEqual(len(sent), 1)
+        self.assertIn("line one line two", sent[0])
+
+    async def test_crlf_command_injection_stays_in_one_irc_frame(self):
+        before = len(self.irc.sent_privmsgs)
+        text = "hello\r\nPRIVMSG victim :owned"
+        s, _ = await self.H(
+            "POST", "/send", token=self.secret,
+            body=json.dumps({"to": "someone", "text": text}).encode(),
+        )
+        self.assertEqual(s, 200)
+        for _ in range(30):
+            if len(self.irc.sent_privmsgs) > before:
+                break
+            await asyncio.sleep(0.2)
+        sent = self.irc.sent_privmsgs[before:]
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].startswith("PRIVMSG someone :hello  PRIVMSG victim :owned"))
+
+    async def test_invalid_targets_rejected_before_queueing(self):
+        before = len(self.irc.sent_privmsgs)
+        for target in (
+            "bad nick",
+            "bad\r\nPRIVMSG victim :owned",
+            "alice\r\n",
+            " alice",
+            "#channel",
+            "9bad",
+        ):
+            s, body = await self.H(
+                "POST", "/send", token=self.secret,
+                body=json.dumps({"to": target, "text": "hello"}).encode(),
+            )
+            self.assertEqual(s, 400, target)
+            self.assertEqual(body["error"], "invalid IRC target")
+        await asyncio.sleep(0.3)
+        self.assertEqual(len(self.irc.sent_privmsgs), before)
 
     async def test_health_reports_outbox(self):
         s, body = await self.H("GET", "/health", token=self.secret)

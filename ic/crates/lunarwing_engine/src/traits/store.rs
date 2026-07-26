@@ -153,6 +153,16 @@ pub trait Store: Send + Sync {
         status: MissionStatus,
     ) -> Result<(), EngineError>;
 
+    /// Permanently remove a mission from persistence.
+    ///
+    /// Unlike `update_mission_status(Completed)`, this removes the record
+    /// entirely so it no longer appears in list output.
+    async fn delete_mission(&self, id: MissionId) -> Result<(), EngineError> {
+        Err(EngineError::Store {
+            reason: format!("Store::delete_mission not implemented for mission '{id}'"),
+        })
+    }
+
     /// List missions visible to a user: their own + shared missions.
     ///
     /// Shared learning missions (self-improvement, skill-extraction, etc.) are
@@ -200,5 +210,30 @@ pub trait Store: Send + Sync {
         Err(EngineError::Store {
             reason: format!("Store::list_all_missions not implemented for project '{project_id}'"),
         })
+    }
+
+    /// List all active missions across all projects/users.
+    ///
+    /// Used by startup bootstrap to load missions that don't belong to the
+    /// configured owner project. Default implementation iterates all known
+    /// projects. Per-project load failures are logged and skipped so a
+    /// single broken project doesn't abort the global bootstrap.
+    async fn list_all_active_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
+        let mut missions = Vec::new();
+        let projects = self.list_all_projects().await?;
+        for project in projects {
+            match self.list_all_missions(project.id).await {
+                Ok(p_missions) => missions.extend(p_missions),
+                Err(e) => {
+                    tracing::warn!(
+                        project_id = %project.id,
+                        error = %e,
+                        "list_all_active_missions_global: skipping project with load error"
+                    );
+                }
+            }
+        }
+        missions.retain(|m| m.status == MissionStatus::Active);
+        Ok(missions)
     }
 }
