@@ -90,14 +90,21 @@ Confirmed transitive deadwood shed by the update (removals): `pathdiff`, `wasip3
 
 **Recommendation:** Run `cargo update`, then `taskset -c 0-5 cargo check -j6 --all-features`, then the targeted test suites before release. Low risk; picks up security patches and bug fixes.
 
-### Tier 2 — Available major bumps, defer with documented rationale
+### Tier 2 — Available major bumps
+
+#### Done (v2.0.3.0)
+
+| Crate | From | To | Cargo.toml | Notes |
+|-------|------|----|------------|-------|
+| `base64` | `0.21` | `0.22` | `ic/Cargo.toml:179` | Bumped to `0.22`, aligning with satellite crates (`xmpp-bridge`, `vision-analyze`, `ocr-sidecar`, `xmpp` channel) which were already on `0.22`. Code already used the `Engine` trait API, so zero source changes were required. Removes LunarWing's direct contribution to the duplicate `base64` lockfile entry. Note: `base64 0.21.7` remains in the lockfile transitively via upstream `libsql`/`libsql-hrana`/`tonic`/`tonic-reflection`; will clear when those upstreams publish `base64 ≥ 0.22` releases. Further bump to `0.23` is mechanical but deferred — no marginal benefit while transitive `0.21` persists. |
+
+#### Deferred (track for future releases)
 
 | Crate | Pinned | Latest | Cargo.toml | Notes |
 |-------|--------|--------|------------|-------|
 | `wasmtime` / `wasmtime-wasi` | `36.0.12` | `47.0.2` | `ic/Cargo.toml:138-139` | 11 major versions behind. WASM component-model is a core runtime path; large migration. **Defer** unless a WASM-platform requirement forces it. Track separately. |
 | `reqwest` | `0.12` | `0.13.4` | `ic/Cargo.toml:39` | Major bump. Used widely (HTTP client for sandbox proxy, worker API, tunnel). **Defer.** |
 | `tokio-tungstenite` | `0.26` | `0.30.0` | `ic/Cargo.toml:177,218` | 4 minor versions behind. WebSocket gateway path. **Defer** but track — the 0.26 line is starting to age. |
-| `base64` | `0.21` | `0.23.0` | `ic/Cargo.toml:179` | Two minor versions behind. The v2.0.2.0 audit already noted `0.21 → 0.22` is mechanical (~12 modules); `0.23` is the same `Engine` trait shape. Satellites (`xmpp-bridge`, `vision-analyze`) already on `0.22`. **Defer** — mechanical but touches many call sites. |
 | `rand` | `0.8` | `0.10.2` | `ic/Cargo.toml:153` | Two majors behind. Breaking API redesign in 0.9+. Transitive use via `libsignal-protocol`, `wasmtime-wasi` (`cap-rand`), `rig-core` (`nanoid`). **Defer** — significant migration. |
 | `tower-http` | `0.6` | `0.7.0` | `ic/Cargo.toml:91` | Minor version jump. Patch `0.6.11` (available via `cargo update`) is sufficient for now. **Defer.** |
 | `rig-core` | `0.40` | `0.40.0` | `ic/Cargo.toml:157` | Already on latest 0.40 line. No action. |
@@ -138,7 +145,7 @@ Confirmed transitive deadwood shed by the update (removals): `pathdiff`, `wasip3
 ### Deferred (track for future releases)
 
 3. `rand` 0.8 → 0.10 — breaking, broad transitive footprint.
-4. `base64` 0.21 → 0.22/0.23 — mechanical, ~12 modules.
+4. ~~`base64` 0.21 → 0.22/0.23 — mechanical, ~12 modules.~~ **Done** — bumped to `0.22` (see Tier 2 done section). Further `0.22 → 0.23` deferred while transitive `0.21` persists via upstream `libsql`/`tonic`.
 5. `tower-http` 0.6 → 0.7 — minor; patch sufficient for now.
 6. `reqwest` 0.12 → 0.13 — major, wide usage.
 7. `tokio-tungstenite` 0.26 → 0.30 — WebSocket gateway path.
