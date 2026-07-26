@@ -654,6 +654,98 @@ impl MissionManager {
         Ok(spawned)
     }
 
+    /// Fire all active `OnEvent` missions whose event_pattern matches the
+    /// given event text.
+    ///
+    /// `event_text` is matched against each mission's `event_pattern` using
+    /// substring containment (case-insensitive). The bridge should call this
+    /// when a channel message or external event arrives that should trigger
+    /// event-driven missions.
+    pub async fn fire_on_channel_event(
+        &self,
+        event_text: &str,
+        user_id: &str,
+        payload: Option<serde_json::Value>,
+    ) -> Result<Vec<ThreadId>, EngineError> {
+        let active_ids = self.active.read().await.clone();
+        let mut spawned = Vec::new();
+        let lower = event_text.to_lowercase();
+
+        for mid in active_ids {
+            let mission = match self.store.load_mission(mid).await? {
+                Some(m) if m.status == MissionStatus::Active => m,
+                _ => continue,
+            };
+
+            if !mission.is_owned_by(user_id) && !mission.owner_id().is_shared() {
+                continue;
+            }
+
+            let matches = match &mission.cadence {
+                MissionCadence::OnEvent { event_pattern } => {
+                    lower.contains(&event_pattern.to_lowercase())
+                }
+                _ => false,
+            };
+
+            if matches && let Some(tid) = self.fire_mission(mid, user_id, payload.clone()).await? {
+                spawned.push(tid);
+            }
+        }
+
+        Ok(spawned)
+    }
+
+    /// Fire an active `Webhook`-cadence mission whose path matches the
+    /// given webhook path.
+    ///
+    /// The bridge's webhook ingress should route incoming payloads here.
+    /// Returns spawned thread IDs. Missions with an optional `secret` require
+    /// it to match the provided `secret` argument.
+    pub async fn fire_webhook_mission(
+        &self,
+        path: &str,
+        secret: Option<&str>,
+        payload: serde_json::Value,
+    ) -> Result<Vec<ThreadId>, EngineError> {
+        let active_ids = self.active.read().await.clone();
+        let mut spawned = Vec::new();
+
+        for mid in active_ids {
+            let mission = match self.store.load_mission(mid).await? {
+                Some(m) if m.status == MissionStatus::Active => m,
+                _ => continue,
+            };
+
+            let matches = match &mission.cadence {
+                MissionCadence::Webhook {
+                    path: mission_path,
+                    secret: mission_secret,
+                } => {
+                    mission_path == path
+                        && mission_secret.as_deref() == secret
+                }
+                _ => false,
+            };
+
+            if matches {
+                let user_id = if mission.is_owned_by("") {
+                    mission.user_id.clone()
+                } else {
+                    mission.user_id.clone()
+                };
+                if let Some(tid) = self
+                    .fire_mission(mid, &user_id, Some(payload.clone()))
+                    .await?
+                {
+                    spawned.push(tid);
+                }
+            }
+        }
+
+        Ok(spawned)
+    }
+
     /// Start a background event listener that fires learning missions when
     /// threads complete.
     ///

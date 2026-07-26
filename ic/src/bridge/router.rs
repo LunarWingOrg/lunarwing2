@@ -3922,6 +3922,35 @@ pub async fn fire_engine_mission(mission_id: &str, user_id: &str) -> Result<Opti
     Ok(result.map(|tid| tid.to_string()))
 }
 
+/// Fire Engine V2 `Webhook`-cadence missions matching the given path.
+///
+/// Called by the web gateway's mission webhook endpoint. Returns the number
+/// of missions that fired.
+pub async fn fire_engine_webhook_mission(
+    path: &str,
+    secret: Option<&str>,
+    payload: serde_json::Value,
+) -> Result<usize, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Err(engine_err("not initialized", "engine v2 is not running"));
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Err(engine_err("not initialized", "engine v2 is not running"));
+    };
+
+    let spawned = state
+        .effect_adapter
+        .mission_manager()
+        .await
+        .ok_or_else(|| engine_err("mission", "mission manager not available"))?
+        .fire_webhook_mission(path, secret, payload)
+        .await
+        .map_err(|e| engine_err("fire webhook mission", e))?;
+
+    Ok(spawned.len())
+}
+
 // ── B-1/B-2/B-3: unified skill proposals approval surface ──────────────
 //
 // Generalizes the B-1 patch-only surface into a `kind`-discriminated proposals
