@@ -227,7 +227,8 @@ impl EffectBridgeAdapter {
     ) -> Result<lunarwing_engine::MissionUpdate, EngineError> {
         let mut updates = lunarwing_engine::MissionUpdate::default();
         updates.name = params
-            .get("new_name")
+            .get("name")
+            .or_else(|| params.get("new_name"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
         updates.goal = params
@@ -416,7 +417,7 @@ impl EffectBridgeAdapter {
             "mission_delete" => {
                 let id = Self::resolve_mission_id(params, context, mgr).await;
                 match id {
-                    Ok(id) => match mgr.complete_mission(id).await {
+                    Ok(id) => match mgr.complete_mission_with_owner(id, &context.user_id).await {
                         Ok(()) => Ok(serde_json::json!({"status": "deleted"})),
                         Err(e) => Err(e),
                     },
@@ -2398,5 +2399,34 @@ FINAL(echoed + "|" + http_result["error"])"#,
             .await
             .expect("auto-approved tool should execute when supervision is off");
         assert!(!result.is_error);
+    }
+
+    #[test]
+    fn mission_updates_accepts_name_and_new_name() {
+        let updates = EffectBridgeAdapter::mission_updates(&serde_json::json!({
+            "name": "renamed_via_schema_field"
+        }))
+        .expect("name field should parse");
+        assert_eq!(updates.name.as_deref(), Some("renamed_via_schema_field"));
+
+        let updates_legacy = EffectBridgeAdapter::mission_updates(&serde_json::json!({
+            "new_name": "renamed_via_legacy_field"
+        }))
+        .expect("new_name field should parse for backward compat");
+        assert_eq!(
+            updates_legacy.name.as_deref(),
+            Some("renamed_via_legacy_field")
+        );
+
+        let updates_pref = EffectBridgeAdapter::mission_updates(&serde_json::json!({
+            "name": "schema",
+            "new_name": "legacy"
+        }))
+        .expect("both fields present should parse");
+        assert_eq!(
+            updates_pref.name.as_deref(),
+            Some("schema"),
+            "name field takes precedence over new_name"
+        );
     }
 }

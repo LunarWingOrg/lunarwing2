@@ -331,6 +331,34 @@ impl MissionManager {
         Ok(())
     }
 
+    /// Complete a mission after verifying caller ownership.
+    ///
+    /// For shared missions, the caller (web handler) must verify admin role.
+    /// The engine only checks ownership.
+    pub async fn complete_mission_with_owner(
+        &self,
+        id: MissionId,
+        user_id: &str,
+    ) -> Result<(), EngineError> {
+        let lock = mission_lock(&self.fire_locks, id).await;
+        let _guard = lock.lock().await;
+        if let Some(mission) = self.store.load_mission(id).await?
+            && !mission.is_owned_by(user_id)
+            && !mission.owner_id().is_shared()
+        {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("mission {id}"),
+            });
+        }
+        self.store
+            .update_mission_status(id, MissionStatus::Completed)
+            .await?;
+        self.active.write().await.retain(|mid| *mid != id);
+        debug!(mission_id = %id, "mission completed by {user_id}");
+        Ok(())
+    }
+
     /// Fire a mission — build meta-prompt, spawn thread, process outcome.
     ///
     /// Optional `trigger_payload` carries webhook/event data that triggered this
@@ -3938,5 +3966,34 @@ mod tests {
             collect_prune_candidate_skills(&store, project_id, "alice", &now, quarantine).await;
         assert_eq!(out.len(), 1, "only expired quarantine qualifies: {out:?}");
         assert_eq!(out[0]["name"], "expired-auto-demotion");
+    }
+
+    #[tokio::test]
+    async fn complete_mission_with_owner_rejects_non_owner() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+
+        let id = mgr
+            .create_mission(
+                project_id,
+                "alice",
+                "alice mission",
+                "goal",
+                MissionCadence::Manual,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let err = mgr.complete_mission_with_owner(id, "bob").await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::AccessDenied { .. }),
+            "bob must not complete alice's mission"
+        );
+
+        mgr.complete_mission_with_owner(id, "alice").await.unwrap();
+        let m = mgr.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(m.status, MissionStatus::Completed);
     }
 }
