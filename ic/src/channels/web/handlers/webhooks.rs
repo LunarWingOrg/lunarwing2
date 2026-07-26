@@ -14,6 +14,7 @@ use axum::{
 use subtle::ConstantTimeEq;
 
 use crate::agent::routine::Trigger;
+use crate::bridge::router::fire_engine_webhook_mission;
 use crate::channels::web::server::GatewayState;
 
 /// Validate the webhook secret for a routine.
@@ -115,6 +116,48 @@ pub async fn webhook_trigger_handler(
         "routine_id": routine.id,
         "routine_name": routine.name,
         "run_id": run_id,
+    })))
+}
+
+/// Handle incoming webhook POST to `/api/missions/webhook/{path}`.
+///
+/// This endpoint routes payloads to Engine V2 `Webhook`-cadence missions.
+/// It is **public** (no gateway auth) but protected by per-mission webhook
+/// secrets (validated by the engine layer via constant-time comparison).
+pub async fn mission_webhook_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !state.webhook_rate_limiter.check() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded. Try again shortly.".to_string(),
+        ));
+    }
+
+    let secret = headers
+        .get("x-webhook-secret")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+
+    let fired = fire_engine_webhook_mission(&path, secret.as_deref(), payload)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if fired == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "No Engine V2 mission matches this webhook path".to_string(),
+        ));
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "triggered",
+        "missions_fired": fired,
     })))
 }
 

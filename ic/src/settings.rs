@@ -626,6 +626,12 @@ pub struct AgentSettings {
     /// Max seconds for session pruning (default: 30).
     #[serde(default = "default_session_prune_timeout")]
     pub session_prune_timeout_secs: u64,
+
+    /// Expiry in seconds for pending execution gates (approval/auth).
+    /// Gates older than this are swept by the background cleanup task.
+    /// Default: 1800 (30 minutes).
+    #[serde(default = "default_gate_expiry")]
+    pub pending_gate_expiry_secs: u64,
 }
 
 fn default_agent_name() -> String {
@@ -684,6 +690,10 @@ fn default_session_prune_timeout() -> u64 {
     30
 }
 
+fn default_gate_expiry() -> u64 {
+    1800
+}
+
 fn default_true() -> bool {
     true
 }
@@ -708,6 +718,7 @@ impl Default for AgentSettings {
             session_prune_timeout_secs: default_session_prune_timeout(),
             ws_ping_interval_secs: default_ws_ping_interval(),
             ws_idle_timeout_secs: default_ws_idle_timeout(),
+            pending_gate_expiry_secs: default_gate_expiry(),
         }
     }
 }

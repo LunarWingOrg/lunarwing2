@@ -422,6 +422,10 @@ pub async fn start_server(
         .route(
             "/api/webhooks/{path}",
             post(crate::channels::web::handlers::webhooks::webhook_trigger_handler),
+        )
+        .route(
+            "/api/missions/webhook/{path}",
+            post(crate::channels::web::handlers::webhooks::mission_webhook_handler),
         );
 
     // Protected routes (require auth)
