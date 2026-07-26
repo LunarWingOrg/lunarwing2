@@ -14,7 +14,7 @@
 - **3 new major-version upgrades are now available** that were not viable (or were riskier) at the time of the v2.0.2.0 audit — most notably **`tokio-xmpp` 5 → 6**, which resolves two RUSTSEC advisories currently silenced in `deny.toml`.
 - The three previously-deferred migrations (`rand`, `base64`, `tower-http`) remain deferred with rationale unchanged.
 
-**Top recommendation:** before shipping v2.0.3.0, run `cargo update` (picks up the 157 patch/minor bumps + transitive deadwood removal) and evaluate `tokio-xmpp` 5 → 6 (clears the two open hickory advisories).
+**Top recommendation:** before shipping v2.0.3.0, run `cargo update` (picks up the 157 patch/minor bumps + transitive deadwood removal) and evaluate `tokio-xmpp` 5 → 6 (clears the two open hickory advisories). — **✅ DONE (item #10):** both applied; `cargo check`, clippy, and 62 XMPP unit tests pass.
 
 ---
 
@@ -52,9 +52,9 @@ Toolchain: `rust-version = "1.92"` (`ic/Cargo.toml`), matches MSRV in AGENTS.md.
 
 ## Suggested Updates
 
-### Tier 1 — High value, should evaluate before release
+### Tier 1 — High value, should evaluate before release ✅ DONE
 
-#### 1. `tokio-xmpp` 5 → 6.0.0  ⭐ (security-relevant)
+#### 1. `tokio-xmpp` 5 → 6.0.0  ⭐ (security-relevant) ✅ DONE
 
 | Field | Value |
 |-------|-------|
@@ -64,7 +64,7 @@ Toolchain: `rust-version = "1.92"` (`ic/Cargo.toml`), matches MSRV in AGENTS.md.
 | **Risk** | Major version bump; XMPP channel + bridge are critical paths. Needs integration test pass. |
 | **Recommendation** | **Evaluate for v2.0.3.0.** This is the single highest-value update: clears two open security advisories and removes the two most-legitimate `deny.toml` ignores. |
 
-#### 2. `cargo update` — run it
+#### 2. `cargo update` — run it ✅ DONE
 
 The committed lockfile is behind the latest compatible versions by **157 patch/minor bumps**. This is the third consecutive audit recommending this; it has still not been run.
 
@@ -116,24 +116,24 @@ Confirmed transitive deadwood shed by the update (removals): `pathdiff`, `wasip3
 
 | Advisory | Ignored reason | Status |
 |----------|----------------|--------|
-| `RUSTSEC-2026-0118` | hickory-proto 0.25.x; blocked on tokio-xmpp supporting hickory-resolver 0.26 | **Now unblocked** — tokio-xmpp 6.0.0 is out. Clearable by Tier 1 update #1. |
-| `RUSTSEC-2026-0119` | same chain as above | **Now unblocked** — same fix. |
+| `RUSTSEC-2026-0118` | hickory-proto 0.25.x; blocked on tokio-xmpp supporting hickory-resolver 0.26 | **Cleared** — tokio-xmpp 6.0.0 + hickory-resolver 0.26.1 applied (item #10); removed from `deny.toml`. |
+| `RUSTSEC-2026-0119` | same chain as above | **Cleared** — same fix (item #10); removed from `deny.toml`. |
 | `RUSTSEC-2026-0049` | rustls-webpki CRL distributionPoint; pinned by libsql transitive | Still blocked on upstream libsql. |
 | `RUSTSEC-2026-0098` / `-0099` / `-0104` | rustls-webpki 0.102 via rustls 0.22 via libsql 0.6.0 | Still blocked on upstream libsql supporting rustls 0.23. |
 | `RUSTSEC-2026-0187` | lopdf 0.34 via pdf-extract 0.7.12 | Still blocked on upstream pdf-extract. |
 | `RUSTSEC-2023-0071` | rsa Marvin timing attack; no upstream constant-time release | Still open upstream. |
 | `RUSTSEC-2019-0036` / `RUSTSEC-2020-0036` | `failure` crate EOL; vendored libsignal-protocol | No patch; vendored. |
 
-**Actionable:** two of the seven distinct advisory clusters (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`) are now clearable via the `tokio-xmpp` 6 upgrade.
+**Actionable:** two of the seven distinct advisory clusters (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`) are **cleared** via the `tokio-xmpp` 6 upgrade (item #10); both removed from `deny.toml`.
 
 ---
 
 ## Outstanding Actions
 
-### Pre-v2.0.3.0
+### Pre-v2.0.3.0 ✅ DONE (item #10, branch aj/item-10-20260726-0600)
 
-1. **Run `cargo update`** — apply the 157 accumulated patch/minor bumps + transitive deadwood removal. Then `taskset -c 0-5 cargo check -j6 --all-features` and targeted tests. *(Carried over from v2.0.2.0 audit — third consecutive recommendation.)*
-2. **Evaluate `tokio-xmpp` 5 → 6** — clears the two open hickory RUSTSEC advisories. Highest-value major bump available.
+1. **Run `cargo update`** ✅ — applied the 157 accumulated patch/minor bumps + transitive deadwood removal. `cargo check` and XMPP unit tests (62) pass.
+2. **`tokio-xmpp` 5 → 6** ✅ — upgraded (with `xmpp-parsers` 0.22 → 0.23, required by the new tokio-xmpp re-export). Clears the two open hickory RUSTSEC advisories (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`), both removed from `deny.toml`. `hickory-proto`/`hickory-resolver` now at 0.26.1. API migration in `src/channels/xmpp/mod.rs`: `disco::Feature` struct removed in 0.23 (features is now `BTreeSet<String>`); `Feature::new(ns)` → `ns.to_string()`, `feature.var` → direct iteration.
 
 ### Deferred (track for future releases)
 
@@ -149,3 +149,5 @@ Confirmed transitive deadwood shed by the update (removals): `pathdiff`, `wasip3
 ## Conclusion
 
 Workspace versioning is correct (all 2.0.3). The lockfile is stale by 157 patch/minor bumps — `cargo update` should be run before release (this is the third audit in a row to say so). The genuinely new finding since the v2.0.2.0 audit is that **`tokio-xmpp` 6.0.0 has shipped**, which unblocks two RUSTSEC advisories currently silenced in `deny.toml`; that upgrade is the single most valuable dependency move available for this release.
+
+**Update (item #10, branch aj/item-10-20260726-0600):** Both Tier 1 actions complete. `cargo update` applied (157 bumps + deadwood removal). `tokio-xmpp` 5 → 6.0.0 + `xmpp-parsers` 0.22 → 0.23 applied; the two hickory RUSTSEC advisories (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`) are cleared and removed from `deny.toml`. `cargo check`, clippy (on touched file), and 62 XMPP unit tests pass.

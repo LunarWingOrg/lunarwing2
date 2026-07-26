@@ -182,8 +182,8 @@ clap_complete = "4.5.0"
 lru = "0.16.3"
 
 # XMPP channel
-tokio-xmpp = { version = "5", features = ["starttls"] }
-xmpp-parsers = "0.22"
+tokio-xmpp = { version = "6", features = ["starttls"] }
+xmpp-parsers = "0.23"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # HTML to Markdown conversion (feature gated)
