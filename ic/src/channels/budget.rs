@@ -32,10 +32,11 @@ pub struct ChannelMessageBudget {
     pub hard_max_messages: usize,
 }
 
-/// DarkIRC: 400-byte chunks paced ~7s apart by the adapter.
+/// DarkIRC: 390-byte host chunks fit in at most six 400-byte adapter chunks
+/// after `[i/N] ` numbering prefixes, paced ~7s apart.
 pub const DARKIRC_BUDGET: ChannelMessageBudget = ChannelMessageBudget {
     channel: "darkirc",
-    max_bytes_per_message: 400,
+    max_bytes_per_message: 390,
     min_send_interval_secs: 7,
     recommended_max_messages: 3,
     hard_max_messages: 6,
@@ -198,8 +199,20 @@ mod tests {
     fn prompt_guidance_mentions_the_numbers() {
         let text = DARKIRC_BUDGET.prompt_guidance();
         assert!(text.contains("darkirc"));
-        assert!(text.contains("400"));
+        assert!(text.contains("390"));
         assert!(text.contains("7"));
         assert!(text.contains("Plain text only"));
+    }
+
+    #[test]
+    fn darkirc_hard_budget_fits_six_numbered_adapter_frames() {
+        const ADAPTER_PAYLOAD_BYTES: usize = 400;
+        const NUMBERING_PREFIX_BYTES: usize = 6; // "[6/6] "
+        assert_eq!(DARKIRC_BUDGET.hard_max_bytes(), 2_340);
+        assert!(
+            DARKIRC_BUDGET.hard_max_bytes()
+                <= DARKIRC_BUDGET.hard_max_messages
+                    * (ADAPTER_PAYLOAD_BYTES - NUMBERING_PREFIX_BYTES)
+        );
     }
 }

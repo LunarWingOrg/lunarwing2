@@ -7,7 +7,7 @@ we assert the five invariants that matter for IRC message splitting:
 1. Every chunk ≤ max_bytes (unless a single char exceeds it — unavoidable)
 2. No empty chunks (unless input is empty)
 3. Every chunk is valid UTF‑8 — no mid‑codepoint splits
-4. No stray \r in output — CRLF normalization
+4. No IRC control characters in output
 5. No data loss — all non‑whitespace chars from input appear in output, in order
 """
 
@@ -89,7 +89,7 @@ def test_split_at_space():
 
 
 def test_split_at_newline():
-    """Newline boundaries are preferred over spaces."""
+    """Newlines normalize safely before splitting."""
     text = "line one\nline two\nline three"
     result = _split_message_bytes(text, 15)
     # We no longer assert result[0] == "line one" — that's implementation detail

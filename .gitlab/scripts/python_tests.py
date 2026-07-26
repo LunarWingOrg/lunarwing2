@@ -56,7 +56,7 @@ def main() -> int:
     with import_from(adapter):
         adapter_ok, adapter_total, adapter_skipped = run_suite(
             "DarkIRC adapter",
-            ["test_split", "test_adapter_integration"],
+            ["test_split", "test_adapter_integration", "test_outbox"],
         )
 
     total += adapter_total

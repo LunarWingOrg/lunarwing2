@@ -158,7 +158,11 @@ curl http://127.0.0.1:6680/poll
 | `ADAPTER_HOST` | `127.0.0.1` | HTTP listen address |
 | `ADAPTER_PORT` | `6680` | HTTP listen port |
 | `ADAPTER_SECRET` | (empty) | Bearer token (optional) |
-| `ADAPTER_MAX_QUEUE` | `500` | Max buffered messages |
+| `ADAPTER_MAX_QUEUE` | `500` | Max fresh inbound messages before TCP backpressure |
+| `DARKIRC_MAX_MESSAGE_BYTES` | `400` | Max UTF-8 payload bytes per adapter chunk |
+| `DARKIRC_PRIVMSG_INTERVAL` | `7.0` | Minimum seconds between outbound chunks |
+| `ADAPTER_MAX_OUTBOX` | `400` | Max queued outbound chunks |
+| `ADAPTER_OUTBOX_JOURNAL` | (disabled) | Durable outbox path; production template sets a tenant-local file |
 | `ADAPTER_LOG_LEVEL` | `INFO` | Log verbosity |
 
 ## Capabilities JSON Reference
@@ -237,19 +241,15 @@ Pairing approvals survive restarts (stored in database). They do NOT survive `lu
 
 ## Message Splitting
 
-Long agent responses are split into IRC-sized chunks. The limit is in `src/lib.rs`:
+Engine channel budget asks agents to keep DarkIRC replies within six 390-byte
+messages (2,340 UTF-8 bytes total). Oversized replies are truncated by the
+host's `BeforeOutbound` hook before delivery.
 
-```rust
-let chunks = split_message(&response.content, 450);
-```
-
-And in the adapter `darkirc_adapter.py`:
-
-```python
-for chunk in [text[i:i+450] for i in range(0, len(text), 450)]:
-```
-
-DarkIRC enforces ~512 byte IRC line limit. After protocol overhead, ~450 chars is the safe max. The `split_message` function breaks at newlines and spaces, and handles multi-byte UTF-8 safely.
+WASM channel posts each response to adapter outbox; its 30,000-byte split is
+only an HTTP body safety valve. Adapter owns IRC chunking: it emits UTF-8-safe
+payloads of at most 400 bytes, adds `[i/N]` ordering markers, keeps complete
+IRC frames within 450 bytes, and paces sends at configured interval (default
+seven seconds). CR/LF and other IRC controls are normalized before framing.
 
 ## Troubleshooting
 
@@ -302,4 +302,3 @@ EOF
 ```
 
 The agent cannot write to protected paths like `SOUL.md` directly (security policy). Use the CLI.
-

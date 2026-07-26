@@ -42,6 +42,8 @@ use lunarwing::agent::channel_host::{self, EmittedMessage};
 #[derive(Debug, Deserialize)]
 struct AdapterPollResponse {
     messages: Vec<AdapterMessage>,
+    #[serde(default)]
+    batch_id: Option<String>,
 }
 
 // A single inbound DM from the adapter.
@@ -61,6 +63,11 @@ struct AdapterMessage {
 struct AdapterSendRequest {
     to: String,
     text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdapterAckRequest<'a> {
+    batch_id: &'a str,
 }
 
 // === Channel Configuration ===
@@ -348,10 +355,16 @@ impl Guest for DarkircChannel {
 
         // Ack the batch so the adapter can drop it (M4: at-least-once delivery —
         // if we crash before this ack, the next /poll re-serves the same batch).
-        let ack_url = format!("{}/ack", adapter_url);
-        if let Err(e) =
-            channel_host::http_request("POST", &ack_url, &headers_json, None, Some(5_000))
-        {
+        // Legacy responses without batch_id fail safe: process messages but do
+        // not send an unscoped ACK that could clear a newer adapter batch.
+        let Some(batch_id) = poll_response.batch_id.as_deref() else {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                "Adapter poll response omitted batch_id; batch left unacked",
+            );
+            return;
+        };
+        if let Err(e) = adapter_ack(&adapter_url, batch_id) {
             channel_host::log(
                 channel_host::LogLevel::Warn,
                 &format!(
@@ -640,6 +653,20 @@ fn adapter_send(adapter_url: &str, to: &str, text: &str) -> Result<(), String> {
             let body_str = String::from_utf8_lossy(&response.body);
             Err(format!("HTTP {}: {}", status, body_str))
         }
+    }
+}
+
+fn adapter_ack(adapter_url: &str, batch_id: &str) -> Result<(), String> {
+    let url = format!("{}/ack", adapter_url);
+    let payload = serde_json::to_vec(&AdapterAckRequest { batch_id })
+        .map_err(|e| format!("serialize error: {}", e))?;
+    let headers_json = serde_json::json!({"Content-Type": "application/json"}).to_string();
+    let response =
+        channel_host::http_request("POST", &url, &headers_json, Some(&payload), Some(5_000))?;
+    if response.status == 200 {
+        Ok(())
+    } else {
+        Err(format!("HTTP {}", response.status))
     }
 }
 
@@ -1094,6 +1121,7 @@ mod tests {
     #[test]
     fn test_parse_poll_response() {
         let json = r#"{
+            "batch_id": "opaque-batch-token",
             "messages": [
                 {"from": "alice", "text": "hello", "ts": "2026-03-05T12:00:00Z"},
                 {"from": "bob", "text": "hey there", "ts": "2026-03-05T12:01:00Z"}
@@ -1103,6 +1131,7 @@ mod tests {
         assert_eq!(resp.messages.len(), 2);
         assert_eq!(resp.messages[0].from, "alice");
         assert_eq!(resp.messages[1].text, "hey there");
+        assert_eq!(resp.batch_id.as_deref(), Some("opaque-batch-token"));
     }
 
     #[test]
@@ -1112,6 +1141,25 @@ mod tests {
         }"#;
         let resp: AdapterPollResponse = serde_json::from_str(json).unwrap();
         assert!(resp.messages.is_empty());
+        assert!(resp.batch_id.is_none());
+    }
+
+    #[test]
+    fn legacy_poll_without_batch_id_fails_safe() {
+        let resp: AdapterPollResponse =
+            serde_json::from_str(r#"{"messages":[{"from":"alice","text":"hello","ts":"now"}]}"#)
+                .unwrap();
+        assert_eq!(resp.messages.len(), 1);
+        assert!(resp.batch_id.is_none());
+    }
+
+    #[test]
+    fn ack_request_serializes_exact_batch_id() {
+        let json = serde_json::to_string(&AdapterAckRequest {
+            batch_id: "opaque-batch-token",
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"batch_id":"opaque-batch-token"}"#);
     }
 
     #[test]
