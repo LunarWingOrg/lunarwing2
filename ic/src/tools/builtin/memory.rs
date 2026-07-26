@@ -182,12 +182,14 @@ fn memory_search_output_len(
 /// Build a complete, valid JSON result within the Engine action-result budget.
 fn build_memory_search_output(query: &str, results: Vec<SearchResult>) -> serde_json::Value {
     let total_matches = results.len();
-    let query = truncate_for_json(query, MAX_MEMORY_SEARCH_QUERY_JSON_BYTES);
+    let original_query = query;
+    let query = truncate_for_json(original_query, MAX_MEMORY_SEARCH_QUERY_JSON_BYTES);
     let mut output_results = Vec::with_capacity(results.len());
-    let mut truncated = false;
+    let mut truncated = query != original_query;
 
     for result in results {
         let path = truncate_for_json(&result.document_path, MAX_MEMORY_PATH_JSON_BYTES);
+        truncated |= path != result.document_path;
         let item = serde_json::json!({
             "content": "",
             "score": result.score,
@@ -209,6 +211,7 @@ fn build_memory_search_output(query: &str, results: Vec<SearchResult>) -> serde_
         let content_budget = (MAX_MEMORY_TOOL_OUTPUT_BYTES - empty_output_len + 2)
             .min(MAX_MEMORY_SEARCH_CONTENT_JSON_BYTES);
         let content = truncate_for_json(&result.content, content_budget);
+        truncated |= content != result.content;
         if content.is_empty() && !result.content.is_empty() {
             output_results.pop();
             truncated = true;
@@ -1216,6 +1219,7 @@ mod tests {
 
         assert_eq!(reparsed, output);
         assert!(encoded.len() <= MAX_MEMORY_TOOL_OUTPUT_BYTES);
+        assert_eq!(output["truncated"], true);
         assert!(
             serde_json::to_string(output["query"].as_str().expect("query string"))
                 .expect("serialize query")
