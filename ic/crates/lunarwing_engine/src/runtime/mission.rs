@@ -12,7 +12,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, RwLock};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::memory::RetrievalEngine;
 use crate::runtime::manager::ThreadManager;
@@ -1124,9 +1124,16 @@ impl MissionManager {
         let now = chrono::Utc::now();
 
         for mid in active_ids {
-            let mission = match self.store.load_mission(mid).await? {
-                Some(m) if m.status == MissionStatus::Active => m,
-                _ => continue,
+            // Each mission is processed independently so that a load or fire
+            // failure on one mission does not abort the remaining missions in
+            // this tick cycle.
+            let mission = match self.store.load_mission(mid).await {
+                Ok(Some(m)) if m.status == MissionStatus::Active => m,
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!(mission_id = %mid, error = %e, "mission tick: load failed, skipping");
+                    continue;
+                }
             };
 
             let should_fire = match &mission.cadence {
@@ -1142,12 +1149,21 @@ impl MissionManager {
 
             // Fire cron missions with the mission's own user_id so artifacts
             // are scoped to the correct tenant.
-            if should_fire
-                && let Some(tid) = self
+            if should_fire {
+                match self
                     .fire_mission_inner(mid, &mission.user_id, None, true)
-                    .await?
-            {
-                spawned.push(tid);
+                    .await
+                {
+                    Ok(Some(tid)) => spawned.push(tid),
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            mission_id = %mid,
+                            error = %e,
+                            "mission tick: fire failed, continuing to next mission"
+                        );
+                    }
+                }
             }
         }
 
