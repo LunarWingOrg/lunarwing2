@@ -47,6 +47,22 @@ wasm-channel-test-artifacts:
       - ic/channels-src/xmpp/xmpp.wasm
       - lunarwing_weechat_wss/weechat_relay/target/wasm32-wasip2/release/weechat_relay_channel.wasm
 
+# Owner: core maintainers. Block after MSRV (1.92) is confirmed green and the
+# plan §15.5 reconciliation is closed. Removing this job reopens the
+# Cargo.toml rust-version vs CI toolchain drift gap.
+rust-msrv-check:
+  extends:
+    - .rust-msrv-job
+    - .observational-job
+  stage: check
+  needs:
+    - cargo-metadata
+  timeout: 60m
+  script:
+    - bash .gitlab/scripts/cargo-ci.sh check --locked
+  after_script:
+    - mv ic/rust-toolchain.toml.disabled ic/rust-toolchain.toml || true
+
 # Owner: core maintainers. Block after one clean runner baseline proves zero warnings.
 rust-clippy-all:
   extends:

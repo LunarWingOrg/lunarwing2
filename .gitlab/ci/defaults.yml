@@ -68,6 +68,28 @@ variables:
       - .ci-cache/cargo/git/db/
     policy: pull-push
 
+# Rust 1.92 MSRV check uses a separate image and cannot reuse the 1.96.1 cache
+# namespace; rust-toolchain.toml is moved aside so rustup selects the image
+# rustc instead of overriding it to 1.96.1.
+.rust-msrv-job:
+  image:
+    name: "docker.io/library/rust:1.92-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2"
+  tags:
+    - "$CI_RUST_RUNNER_TAG"
+  before_script:
+    - bash .gitlab/scripts/bootstrap-msrv.sh
+    - mv ic/rust-toolchain.toml ic/rust-toolchain.toml.disabled
+  cache:
+    key:
+      prefix: "rust-1.92-msrv"
+      files:
+        - ic/Cargo.lock
+    paths:
+      - .ci-cache/cargo/registry/index/
+      - .ci-cache/cargo/registry/cache/
+      - .ci-cache/cargo/git/db/
+    policy: pull-push
+
 .gitleaks-job:
   image:
     name: "docker.io/zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"

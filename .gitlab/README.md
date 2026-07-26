@@ -35,6 +35,8 @@ Pinned images:
 
 - Rust 1.96.1 Bookworm OCI index:
   `sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663`
+- Rust 1.92 Bookworm OCI index (MSRV check only):
+  `sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2`
 - Python 3.12 slim Bookworm OCI index:
   `sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b`
 - Gitleaks 8.30.1 OCI index:
@@ -72,6 +74,8 @@ Known false-positive Gitleaks findings are listed by exact fingerprint in
 
 These run on default-branch and scheduled pipelines with `allow_failure: true`:
 
+- `rust-msrv-check`: becomes blocking once the declared MSRV (1.92) is confirmed
+  green, closing the plan §15.5 reconciliation.
 - `rust-clippy-all`: becomes blocking after a clean-runner baseline passes.
 - `architecture-boundaries`: becomes blocking after current heuristic and real
   violations are fixed.
