@@ -2,7 +2,7 @@
 name = "lunarwing_engine"
 version = "2.0.3"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.96.1"
 description = "Unified thread-capability-CodeAct execution engine for LunarWing"
 authors = ["LunarWing Team"]
 license = "AGPL-3.0-or-later"
