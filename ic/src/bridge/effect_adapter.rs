@@ -2400,4 +2400,33 @@ FINAL(echoed + "|" + http_result["error"])"#,
             .expect("auto-approved tool should execute when supervision is off");
         assert!(!result.is_error);
     }
+
+    #[test]
+    fn mission_updates_accepts_name_and_new_name() {
+        let updates = EffectBridgeAdapter::mission_updates(&serde_json::json!({
+            "name": "renamed_via_schema_field"
+        }))
+        .expect("name field should parse");
+        assert_eq!(updates.name.as_deref(), Some("renamed_via_schema_field"));
+
+        let updates_legacy = EffectBridgeAdapter::mission_updates(&serde_json::json!({
+            "new_name": "renamed_via_legacy_field"
+        }))
+        .expect("new_name field should parse for backward compat");
+        assert_eq!(
+            updates_legacy.name.as_deref(),
+            Some("renamed_via_legacy_field")
+        );
+
+        let updates_pref = EffectBridgeAdapter::mission_updates(&serde_json::json!({
+            "name": "schema",
+            "new_name": "legacy"
+        }))
+        .expect("both fields present should parse");
+        assert_eq!(
+            updates_pref.name.as_deref(),
+            Some("schema"),
+            "name field takes precedence over new_name"
+        );
+    }
 }

@@ -3967,4 +3967,33 @@ mod tests {
         assert_eq!(out.len(), 1, "only expired quarantine qualifies: {out:?}");
         assert_eq!(out[0]["name"], "expired-auto-demotion");
     }
+
+    #[tokio::test]
+    async fn complete_mission_with_owner_rejects_non_owner() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+
+        let id = mgr
+            .create_mission(
+                project_id,
+                "alice",
+                "alice mission",
+                "goal",
+                MissionCadence::Manual,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let err = mgr.complete_mission_with_owner(id, "bob").await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::AccessDenied { .. }),
+            "bob must not complete alice's mission"
+        );
+
+        mgr.complete_mission_with_owner(id, "alice").await.unwrap();
+        let m = mgr.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(m.status, MissionStatus::Completed);
+    }
 }
