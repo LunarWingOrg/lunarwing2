@@ -1299,13 +1299,11 @@ impl Store for HybridStore {
             let mut missions = self.missions.write().await;
             missions.remove(&id)
         };
-        if let Some(mission) = removed {
-            if let Some(ws) = self.workspace.as_ref() {
-                let proj_slug = self.project_slug(mission.project_id).await;
-                let dir = mission_dir(&proj_slug, &mission.name, id);
-                if let Err(e) = ws.delete(&dir).await {
-                    tracing::debug!(mission_id = %id, "failed to delete mission from workspace: {e}");
-                }
+        if let (Some(mission), Some(ws)) = (removed, self.workspace.as_ref()) {
+            let proj_slug = self.project_slug(mission.project_id).await;
+            let dir = mission_dir(&proj_slug, &mission.name, id);
+            if let Err(e) = ws.delete(&dir).await {
+                tracing::debug!(mission_id = %id, "failed to delete mission from workspace: {e}");
             }
         }
         Ok(())

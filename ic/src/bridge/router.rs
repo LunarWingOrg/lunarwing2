@@ -122,10 +122,39 @@ fn engine_err(context: &str, e: impl std::fmt::Display) -> Error {
 
 /// Default pending gate expiry duration (30 minutes).
 ///
-/// Configurable via `settings.agent.pending_gate_expiry_secs`.
-/// Gate creation paths use this default; the background sweep
-/// respects the actual `expires_at` on each gate.
+/// Used as the fallback when DB-backed settings can't be loaded. The
+/// live value is `EngineState::pending_gate_expiry`, populated from
+/// `settings.agent.pending_gate_expiry_secs` at engine init.
 const DEFAULT_PENDING_GATE_EXPIRY: chrono::Duration = chrono::Duration::minutes(30);
+
+/// Resolve the configured pending gate expiry from DB-backed settings.
+///
+/// Reads `settings.agent.pending_gate_expiry_secs` (default 1800s). Falls
+/// back to `DEFAULT_PENDING_GATE_EXPIRY` when the DB is unavailable, the
+/// settings load fails, or the configured value is zero/nonsensical.
+async fn resolve_pending_gate_expiry(agent: &Agent) -> chrono::Duration {
+    let Some(db) = agent.deps.store.clone() else {
+        return DEFAULT_PENDING_GATE_EXPIRY;
+    };
+    let owner_id = agent.deps.owner_id.clone();
+    match db.get_all_settings(&owner_id).await {
+        Ok(map) => {
+            let settings = crate::settings::Settings::from_db_map(&map);
+            let secs = settings.agent.pending_gate_expiry_secs;
+            if secs == 0 {
+                return DEFAULT_PENDING_GATE_EXPIRY;
+            }
+            chrono::Duration::seconds(secs as i64)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "engine v2: failed to load pending_gate_expiry_secs from settings, using default"
+            );
+            DEFAULT_PENDING_GATE_EXPIRY
+        }
+    }
+}
 
 /// Convert a local v1 `LoadedSkill` to an `lunarwing_skills::LoadedSkill` for migration.
 ///
@@ -401,7 +430,7 @@ async fn persist_and_notify_thread_gate(
         ),
         resume_kind,
         created_at: chrono::Utc::now(),
-        expires_at: chrono::Utc::now() + DEFAULT_PENDING_GATE_EXPIRY,
+        expires_at: chrono::Utc::now() + state.pending_gate_expiry,
         original_message: None,
         resume_output,
     };
@@ -649,7 +678,7 @@ async fn execute_pending_gate_action(
                 ),
                 resume_kind: *resume_kind,
                 created_at: chrono::Utc::now(),
-                expires_at: chrono::Utc::now() + DEFAULT_PENDING_GATE_EXPIRY,
+                expires_at: chrono::Utc::now() + state.pending_gate_expiry,
                 original_message: None,
                 resume_output: resume_output.map(|value| *value),
             };
@@ -717,6 +746,10 @@ struct EngineState {
     secrets_store: Option<Arc<dyn crate::secrets::SecretsStore + Send + Sync>>,
     /// Centralized auth manager for setup instruction lookup and credential checks.
     auth_manager: Option<Arc<AuthManager>>,
+    /// Configured pending gate expiry, sourced from
+    /// `settings.agent.pending_gate_expiry_secs` at init. Falls back to
+    /// `DEFAULT_PENDING_GATE_EXPIRY` when settings can't be loaded.
+    pending_gate_expiry: chrono::Duration,
 }
 
 /// Global engine state, initialized on first use.
@@ -1284,6 +1317,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         .unwrap_or_else(lunarwing_skills::catalog::shared_catalog);
 
     let sweep_gates = Arc::clone(&pending_gates);
+    let pending_gate_expiry = resolve_pending_gate_expiry(agent).await;
     *guard = Some(EngineState {
         thread_manager,
         conversation_manager,
@@ -1297,6 +1331,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         db: agent.deps.store.clone(),
         secrets_store: agent.tools().secrets_store().cloned(),
         auth_manager,
+        pending_gate_expiry,
     });
     drop(guard);
 
@@ -2670,6 +2705,11 @@ async fn handle_with_engine_inner(
         return Ok(Some(warning));
     }
 
+    // Fire OnEvent-cadence missions matching this channel message.
+    // Runs in the background so the user's message is still processed normally;
+    // matched missions spawn their own threads and notify channels on completion.
+    spawn_on_event_mission_fire(state, message, effective_content);
+
     // Send "Thinking..." status to the channel
     let _ = agent
         .channels
@@ -2969,7 +3009,7 @@ async fn await_thread_outcome(
                 auth_url: None,
             },
             created_at: chrono::Utc::now(),
-            expires_at: chrono::Utc::now() + DEFAULT_PENDING_GATE_EXPIRY,
+            expires_at: chrono::Utc::now() + state.pending_gate_expiry,
             original_message: Some(message.content.clone()),
             resume_output: None,
         };
@@ -3952,6 +3992,38 @@ pub async fn fire_engine_webhook_mission(
     Ok(spawned.len())
 }
 
+/// Fire `OnEvent`-cadence missions matching an inbound channel message.
+///
+/// Called from `handle_with_engine_inner` after safety/policy validation.
+/// Spawns a background task so the user's message continues processing
+/// normally; matched missions spawn their own threads and notify channels
+/// on completion. Failures are logged and never block the caller.
+fn spawn_on_event_mission_fire(state: &EngineState, message: &IncomingMessage, content: &str) {
+    let adapter = Arc::clone(&state.effect_adapter);
+    let event_text = content.to_string();
+    let user_id = message.user_id.clone();
+    let payload = serde_json::json!({
+        "channel": message.channel,
+        "content": content,
+        "user_id": message.user_id,
+    });
+    tokio::spawn(async move {
+        let Some(mgr) = adapter.mission_manager().await else {
+            return;
+        };
+        match mgr
+            .fire_on_channel_event(&event_text, &user_id, Some(payload))
+            .await
+        {
+            Ok(ids) if !ids.is_empty() => {
+                debug!(fired = ids.len(), user_id = %user_id, "fired OnEvent mission(s)");
+            }
+            Ok(_) => {}
+            Err(e) => debug!(error = %e, "failed to fire OnEvent missions"),
+        }
+    });
+}
+
 // ── B-1/B-2/B-3: unified skill proposals approval surface ──────────────
 //
 // Generalizes the B-1 patch-only surface into a `kind`-discriminated proposals
@@ -4594,9 +4666,7 @@ fn start_skill_update_sweep(user_id: String) {
 ///
 /// Without this, a thread waiting on an expired gate blocks until
 /// the next ingress triggers cleanup via `expire_stale()`.
-fn start_pending_gate_sweep(
-    pending_gates: Arc<crate::gate::store::PendingGateStore>,
-) {
+fn start_pending_gate_sweep(pending_gates: Arc<crate::gate::store::PendingGateStore>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(PENDING_GATE_SWEEP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5373,6 +5443,7 @@ mod tests {
             db: None,
             secrets_store: None,
             auth_manager: None,
+            pending_gate_expiry: DEFAULT_PENDING_GATE_EXPIRY,
         }
     }
 
@@ -6578,6 +6649,7 @@ mod tests {
             db: None,
             secrets_store: None,
             auth_manager: None,
+            pending_gate_expiry: DEFAULT_PENDING_GATE_EXPIRY,
         }
     }
 

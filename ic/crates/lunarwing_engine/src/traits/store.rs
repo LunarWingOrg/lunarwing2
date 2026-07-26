@@ -216,14 +216,21 @@ pub trait Store: Send + Sync {
     ///
     /// Used by startup bootstrap to load missions that don't belong to the
     /// configured owner project. Default implementation iterates all known
-    /// projects.
+    /// projects. Per-project load failures are logged and skipped so a
+    /// single broken project doesn't abort the global bootstrap.
     async fn list_all_active_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
         let mut missions = Vec::new();
         let projects = self.list_all_projects().await?;
         for project in projects {
             match self.list_all_missions(project.id).await {
                 Ok(p_missions) => missions.extend(p_missions),
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        project_id = %project.id,
+                        error = %e,
+                        "list_all_active_missions_global: skipping project with load error"
+                    );
+                }
             }
         }
         missions.retain(|m| m.status == MissionStatus::Active);

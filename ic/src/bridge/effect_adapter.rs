@@ -225,41 +225,45 @@ impl EffectBridgeAdapter {
     fn mission_updates(
         params: &serde_json::Value,
     ) -> Result<lunarwing_engine::MissionUpdate, EngineError> {
-        let mut updates = lunarwing_engine::MissionUpdate::default();
-        updates.name = params
+        let name = params
             .get("name")
             .or_else(|| params.get("new_name"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        updates.goal = params
+        let goal = params
             .get("goal")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        updates.cadence = params
+        let cadence = params
             .get("cadence")
             .and_then(serde_json::Value::as_str)
             .map(parse_cadence)
             .transpose()?;
-        if let Some(channels) = params
+        let notify_channels = params
             .get("notify_channels")
             .and_then(serde_json::Value::as_array)
-        {
-            updates.notify_channels = Some(
+            .map(|channels| {
                 channels
                     .iter()
                     .filter_map(|value| value.as_str().map(String::from))
-                    .collect(),
-            );
-        }
-        updates.max_threads_per_day = params
+                    .collect()
+            });
+        let max_threads_per_day = params
             .get("max_threads_per_day")
             .and_then(Self::coerce_to_u64)
             .map(|max| max as u32);
-        updates.success_criteria = params
+        let success_criteria = params
             .get("success_criteria")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        Ok(updates)
+        Ok(lunarwing_engine::MissionUpdate {
+            name,
+            goal,
+            cadence,
+            notify_channels,
+            max_threads_per_day,
+            success_criteria,
+        })
     }
 
     async fn resolve_mission_id(

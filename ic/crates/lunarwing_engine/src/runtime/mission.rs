@@ -19,6 +19,7 @@ use crate::runtime::manager::ThreadManager;
 use crate::runtime::messaging::ThreadOutcome;
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
+use crate::types::is_shared_owner;
 use crate::types::memory::MemoryDoc;
 use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus};
 use crate::types::project::ProjectId;
@@ -178,10 +179,7 @@ impl MissionManager {
         self.bootstrap_from_missions(new_missions).await
     }
 
-    async fn bootstrap_from_missions(
-        &self,
-        missions: Vec<Mission>,
-    ) -> Result<usize, EngineError> {
+    async fn bootstrap_from_missions(&self, missions: Vec<Mission>) -> Result<usize, EngineError> {
         let mut active_ids = Vec::new();
         for mut mission in missions {
             if mission.status != MissionStatus::Active {
@@ -389,18 +387,23 @@ impl MissionManager {
     /// Permanently delete a mission after verifying caller ownership.
     ///
     /// Unlike `complete_mission`, this removes the record from persistence
-    /// entirely. For shared missions, the caller must verify admin role.
-    pub async fn delete_mission(
-        &self,
-        id: MissionId,
-        user_id: &str,
-    ) -> Result<(), EngineError> {
+    /// entirely. Because deletion is irreversible, shared missions require the
+    /// caller to present the shared owner id — only the admin-aware bridge path
+    /// (`resolve_mission_user_id` with `is_admin=true`) supplies it. The tool
+    /// path passes the user's own id and therefore cannot delete shared missions.
+    pub async fn delete_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
         let lock = mission_lock(&self.fire_locks, id).await;
         let _guard = lock.lock().await;
-        if let Some(mission) = self.store.load_mission(id).await?
-            && !mission.is_owned_by(user_id)
-            && !mission.owner_id().is_shared()
-        {
+        let mission = self
+            .store
+            .load_mission(id)
+            .await?
+            .ok_or_else(|| EngineError::Store {
+                reason: format!("mission {id} not found"),
+            })?;
+        let can_delete = mission.is_owned_by(user_id)
+            || (mission.owner_id().is_shared() && is_shared_owner(user_id));
+        if !can_delete {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
                 entity: format!("mission {id}"),
@@ -700,14 +703,18 @@ impl MissionManager {
     /// given webhook path.
     ///
     /// The bridge's webhook ingress should route incoming payloads here.
-    /// Returns spawned thread IDs. Missions with an optional `secret` require
-    /// it to match the provided `secret` argument.
+    /// Returns spawned thread IDs. The webhook secret is compared in
+    /// constant time via `subtle::ConstantTimeEq` to avoid timing attacks.
+    /// Missions without a configured `secret` are not triggerable — they
+    /// are skipped so the public endpoint returns 404 rather than firing
+    /// on an unauthenticated request.
     pub async fn fire_webhook_mission(
         &self,
         path: &str,
         secret: Option<&str>,
         payload: serde_json::Value,
     ) -> Result<Vec<ThreadId>, EngineError> {
+        use subtle::ConstantTimeEq;
         let active_ids = self.active.read().await.clone();
         let mut spawned = Vec::new();
 
@@ -723,17 +730,20 @@ impl MissionManager {
                     secret: mission_secret,
                 } => {
                     mission_path == path
-                        && mission_secret.as_deref() == secret
+                        && match (mission_secret.as_deref(), secret) {
+                            (Some(expected), Some(provided)) => {
+                                bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
+                            }
+                            // No configured secret => not triggerable (defense in depth).
+                            // Configured secret but none provided => reject.
+                            _ => false,
+                        }
                 }
                 _ => false,
             };
 
             if matches {
-                let user_id = if mission.is_owned_by("") {
-                    mission.user_id.clone()
-                } else {
-                    mission.user_id.clone()
-                };
+                let user_id = mission.owner_id().as_user_id().to_string();
                 if let Some(tid) = self
                     .fire_mission(mid, &user_id, Some(payload.clone()))
                     .await?
