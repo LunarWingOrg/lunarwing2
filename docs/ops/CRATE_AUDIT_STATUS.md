@@ -22,14 +22,9 @@ against the current lockfile. The three deferred crates (`rand`, `base64`,
 
 Changes since the 2026-07-12 audit:
 
-- All LunarWing workspace crates advanced from `2.0.0` → `2.0.1`.
-- The committed lockfile is **still behind** the latest compatible versions:
-  a dry-run now reports **155 patch/minor updates**, **14 additions**, and
-  **18 removals** (the previous audit counted ~116 updates).
-- `cargo update` (patch/minor bumps) has **still not been run** against the
-  committed lockfile. Recommendation unchanged: run it before release.
-- `base64` is used directly across many call sites (not just
-  `ssh_hostkeys.rs` as the old info dump stated — see correction below).
+- All LunarWing workspace crates advanced from `2.0.0` → `2.0.1` → `2.0.3`.
+- The committed lockfile was **behind by ~155 updates**; **`cargo update` was applied on 2026-07-26** (commit 94f93ae). The refresh pulled 168 package bumps, including security-relevant updates to `openssl` (0.10.79→0.10.81), `rustls` (0.23.40→0.23.42), `hyper` (1.9→1.11), `http` (1.4→1.4.2), `tokio` (1.52→1.53), and `libc` (0.2.186→0.2.189). Verified with `cargo check` (default + all-features).
+- The three deferred crates (`rand`, `base64`, `tower-http`) remain intentionally held back; their stated rationale is correct. After update, direct `rand` now includes 0.8.7/0.9.5/0.10.2; `tower-http` is now 0.6.11.
 
 ---
 

@@ -26,7 +26,15 @@
 
 ## P0 — Release integrity gaps
 
+> **Status (2026-07-26):** All three P0 items addressed in commit chain
+> `265f4b8` (G3 MSRV), `154461c` (G2 e2e triage), `94f93ae` (G1 cargo update).
+
 ### G1. Run `cargo update` and lockfile reconciliation before tag
+
+**Status: DONE (2026-07-26).** `cargo update` applied (168 package bumps), `ic/Cargo.lock`
+committed. Security-relevant updates pulled (openssl, rustls, hyper, http, tokio, libc).
+Verified via `cargo check` (default + all-features). See `CRATE_AUDIT_STATUS.md` §"Changes
+since the 2026-07-12 audit" for the full list.
 
 `docs/ops/CRATE_AUDIT_STATUS.md` (item #8 deliverable) reports the committed
 `ic/Cargo.lock` is behind by **155 patch/minor bumps, 14 additions, 18
@@ -44,6 +52,11 @@ not track applying the result.
   commit the refreshed `ic/Cargo.lock` before cutting v2.0.3.0."
 
 ### G2. Resolve or explicitly defer the open e2e test failures
+
+**Status: DONE (2026-07-26).** `docs/ops/PRE-RELEASE-TESTING.md` reconciled against
+`docs/bugs/README.md`. Final triage: bootstrap greeting tests are `#[ignore]`'d (harness
+race, not production bug); clipboard test is UNVERIFIED (no reproduced failure); OAuth
+URL tests are FIXED/RETIRED; tool execution timeout is FIXED.
 
 `docs/ops/PRE-RELEASE-TESTING.md` carries unchecked `[ ]` boxes and the
 `docs/bugs/README.md` index lists multiple open e2e failures — most notably
@@ -64,6 +77,11 @@ not track applying the result.
   `docs/bugs/README.md` to reflect the final v2.0.3.0 state."
 
 ### G3. MSRV reconciliation (1.92 declared vs 1.96.1 CI pin)
+
+**Status: DONE (2026-07-26).** `rust-version` bumped to `1.96.1` in all workspace
+`Cargo.toml` files and both `AGENTS.md` files. The CI (`rust-toolchain.toml` and
+`.gitlab/ci/defaults.yml`) already pinned 1.96.1; nobody tested on 1.92. Now all four
+locations agree.
 
 The CI/CD review (item #2 deliverable) calls this out as the one open Phase 0
 item: `ic/Cargo.toml:15` declares `rust-version = "1.92"`, `AGENTS.md` lists

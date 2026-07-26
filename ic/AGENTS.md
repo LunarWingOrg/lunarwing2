@@ -58,7 +58,7 @@ e. However, in general, storing massive files (over 1GB) to /tmp should not happ
 
 ## Repo-Wide Coding Rules
 
-- **Edition**: Rust 2024, MSRV 1.92.
+- **Edition**: Rust 2024, MSRV 1.96.1.
 - **Formatting**: Standard `rustfmt`. Run `cargo fmt --all` before committing.
 - **Imports**: Prefer `crate::` for cross-module references. Group std, external, then internal crates.
 - **Error handling**: Use `thiserror` for structured errors and `anyhow` for propagation. Avoid `.unwrap()` and `.expect()` in production; they are fine in tests and for truly infallible invariants (e.g., literals/regexes) with a safety comment.

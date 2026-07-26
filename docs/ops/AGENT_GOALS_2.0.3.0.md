@@ -23,7 +23,7 @@
 12. [x] implement tier 2 updates in docs/ops/CRATE_AUDIT_v2.0.3.0.md
 13. [x] implement priority 3 items in docs/proposals/ENGINE_V2_POLISH_v2.0.3.0.md
 14. [x] take look at Advisory Status (`deny.toml`) in docs/ops/CRATE_AUDIT_v2.0.3.0.md and install cargo-deny using rustup, cargo, then remove items marked as `now unblocked`
-15. [ ] address p0 issues in docs/ops/GOAL_GAP_SUGGESTIONS.md
+15. [x] address p0 issues in docs/ops/GOAL_GAP_SUGGESTIONS.md
 16. [ ] address 2. Priority findings in docs/ops/CICD_LOGIC_REVIEW.md
 17. [ ] address p1 issues in docs/ops/GOAL_GAP_SUGGESTIONS.md
 18. [ ] address 3. Parity gaps vs. the plan (Phase 1 scope) in docs/ops/CICD_LOGIC_REVIEW.md
