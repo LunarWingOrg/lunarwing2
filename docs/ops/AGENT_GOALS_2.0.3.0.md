@@ -18,7 +18,7 @@
 7. [x] Work on weechat to reopen the buffers it had open the last time it exited in a reliable fashion - after a machine reboot or restart-tenant command is issued. FEEDBACK FROM LAST TIME: 19:34:19 wrench │ ### Verdict: One real bug found: OpenRC weechat stop() invokes the helper as root instead of the tenant user, which will fail to find the tmux socket. Medium severity — the graceful stop silently becomes a no-op on OpenRC, though the old kill-session behavior would also be broken (same root-cause: missing su). The systemd path is unaffected. Otherwise: solid feature work. The weechat buffer restore is well-designed (proper wrapper script, good fallback chain, both init systems covered, renderer tests). The test-deferral approach is pragmatic and well-documented. You may attempt to use the following work from failed/partial work on these salvaged, incomplete branches: { rarity/item-16-20260722-1201 } { rarity/item-16-20260722-2123 } { rarity/item-16-20260723-0000 }
 8. [x] Inspect status of cargo crates. Suggest ones that should be updated. put in a file. — see `docs/ops/CRATE_AUDIT_v2.0.3.0.md`
 9. [x] implement priorirty 1 items in docs/proposals/ENGINE_V2_POLISH_v2.0.3.0.md
-10. [ ] implement tier 1 updates in docs/ops/CRATE_AUDIT_v2.0.3.0.md
+10. [x] implement tier 1 updates in docs/ops/CRATE_AUDIT_v2.0.3.0.md
 11. [ ] implement priority 2 items in docs/proposals/ENGINE_V2_POLISH_v2.0.3.0.md
 12. [ ] implement tier 2 updates in docs/ops/CRATE_AUDIT_v2.0.3.0.md
 13. [ ] implement priority 3 items in docs/proposals/ENGINE_V2_POLISH_v2.0.3.0.md
