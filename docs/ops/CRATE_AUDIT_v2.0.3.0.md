@@ -48,6 +48,10 @@ WASM tools use independent versioning (sandboxed plugins, not tied to the daemon
 
 Toolchain: `rust-version = "1.96.1"` (`ic/Cargo.toml`), matches MSRV in AGENTS.md.
 
+The standalone `ic/bridges/xmpp-bridge/Cargo.lock` was regenerated after the
+merged path dependency upgrade. Its locked graph now uses `tokio-xmpp` 6 and
+`xmpp-parsers` 0.23 consistently with the core workspace.
+
 ---
 
 ## Suggested Updates

@@ -219,26 +219,20 @@ recording that CI intentionally uses `-j2` (libSQL `-j1`) to stay within
 local-dev budget, not the CI budget. No YAML change required; this is a
 documentation parity fix so the two standards do not look contradictory.
 
-### P2 — `rust-toolchain.toml` is a third toolchain pin not covered by `validate_config.py`
+### P2 — Rust version pins can drift independently
 
-**Status (2026-07-26): FIXED.** `validate_config.py` now parses the `channel`
-from `ic/rust-toolchain.toml` and asserts it equals the Rust image tag in
-`defaults.yml`. Three-way drift (Cargo.toml `rust-version` ↔ image ↔
-toolchain.toml) is now caught at the `ci-config` job; the Cargo.toml MSRV is
-additionally exercised by `rust-msrv-check`.
+**Status (2026-07-26): FIXED.** `validate_config.py` now asserts 1.96.1 across
+`ic/Cargo.toml` `rust-version`, `ic/rust-toolchain.toml`, and both `.rust-job`
+and `.rust-msrv-job` image tags. It also requires both jobs to use the same
+digest-pinned image. Four-way version drift is caught by `ci-config`; the
+declared MSRV is additionally exercised by `rust-msrv-check`.
 
-`ic/rust-toolchain.toml` hardcodes `channel = "1.96.1"`. `bootstrap-rust.sh`
-re-verifies `rustc 1.96.1` at runtime, and `defaults.yml` pins the
-`1.96.1-bookworm` image, so the three agree today. But
-`.gitlab/scripts/validate_config.py` only checks image digests and direct
-`cargo` usage; it does not parse `rust-toolchain.toml` or assert its channel
-matches the image. If someone bumps the image without bumping the
-toolchain file (or vice versa), `rustup` will silently select a different
-toolchain inside `ic/` than the one `bootstrap-rust.sh` asserts.
-
-**Suggested fix:** extend `validate_config.py` to read the `channel` from
-`ic/rust-toolchain.toml` and assert it equals the Rust image tag in
-`defaults.yml`. ~10 lines; closes a three-way drift class permanently.
+`ic/Cargo.toml` and `ic/rust-toolchain.toml` declare 1.96.1. `defaults.yml`
+pins both Rust job templates to the same digest-pinned `1.96.1-bookworm`
+image, while `bootstrap-rust.sh` re-verifies `rustc 1.96.1` at runtime.
+`validate_config.py` parses all four declarations, rejects any version other
+than 1.96.1, and rejects primary/MSRV image identity drift. README digest
+parity and generic image-digest checks remain enforced.
 
 ### P3 — `GIT_DEPTH: "0"` clones full history on every job
 
@@ -283,9 +277,9 @@ defer (with plan/README citation) or an implemented/closed gap.
 | 8.1 `docs-links` (internal Markdown link check) | Not present | **Deliberate Phase 2** | Plan §8.1 marks "Phase 2 blocking". `docs/` is large; link rot visible in other review tasks. OK to defer. |
 | 8.3 PostgreSQL integration job | Not present | **Deliberate Phase 2** | Plan §8.3 defers to Phase 2 with pgvector service. README confirms defer. OK. |
 | 8.5 Path-triggered standalone crates matrix | Not present | **Deliberate Phase 2** | 17 standalone lockfiles exist (see §5). Plan §8.5 defers to Phase 2; §5 suggests a cheaper `standalone-cargo-metadata` observation first. OK. |
-| 8.6 Strict WASM (`build-wasm-extensions.sh --strict`) | Implemented | **Done 2026-07-26** | `--strict` flag added: validates manifest fields + capabilities files, fail-fast on error, combines with --tools/--channels. Default non-strict preserves current behavior. Not yet wired into CI YAML (Phase 2). |
+| 8.6 Strict WASM (`build-wasm-extensions.sh --strict`) | Implemented | **Done 2026-07-26** | `--strict` validates manifest fields and capability files relative to `.source.dir`, fails fast, and combines with `--tools`/`--channels`. Fixture regression covers valid/missing capability paths and both selectors without real builds. Default non-strict preserves current behavior. Not yet wired into CI YAML (Phase 2). |
 | 10.1 Coverage reporting | Not present | **Deliberate Phase 2** | `ic/scripts/coverage.sh` and `ic/codecov.yml` exist. Plan §10.1 defers to Phase 2 with measured baseline. README confirms defer. OK. |
-| 15.5 Toolchain reconciliation (1.92 vs 1.96) | Resolved | **Done 2026-07-26** | Workspace MSRV raised to 1.96.1; `rust-msrv-check` validates that declared minimum; `validate_config.py` enforces README ↔ defaults.yml ↔ rust-toolchain.toml tag agreement. The MSRV job remains observational until one green run, after which it becomes blocking. |
+| 15.5 Toolchain reconciliation (1.92 vs 1.96) | Resolved | **Done 2026-07-26** | Workspace MSRV raised to 1.96.1; `rust-msrv-check` validates that declared minimum; `validate_config.py` enforces workspace manifest ↔ toolchain ↔ primary image ↔ MSRV image agreement plus README/digest parity. The MSRV job remains observational until one green run, after which it becomes blocking. |
 
 ---
 
@@ -366,11 +360,12 @@ path-triggered matrix in plan §8.5 and catches the most common failure.
    validator; obsolete 1.92 digest removed after raising the declared MSRV.
 2. **(STATUS: DONE 2026-07-26)** Add an observational MSRV check job on Rust
    1.96.1 to close plan §15.5 after raising workspace declarations; also
-   reconcile `ic/rust-toolchain.toml` channel (validator now asserts match
-   with image tag).
+   reconcile `ic/rust-toolchain.toml` channel (validator now asserts workspace,
+   toolchain, primary image, and MSRV image all remain at 1.96.1).
 3. **(STATUS: DONE 2026-07-26)** Extend `validate_config.py` to assert
    README image digest == `defaults.yml` image digest, preventing future
-   drift. Also asserts toolchain.toml channel match (~50 lines).
+   drift. Also asserts four-way Rust version agreement and primary/MSRV image
+   identity.
 4. **(STATUS: DONE 2026-07-26)** One-Rust-job-per-host constraint now explicit
    in README required jobs and activation checklist (`limit = 1` hard req).
 5. **(STATUS: DONE 2026-07-26)** Toolchain.toml now validated automatically;

@@ -3,6 +3,7 @@
 import pathlib
 import re
 import sys
+import tomllib
 
 import yaml
 
@@ -11,7 +12,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 ROOT_CONFIG = ROOT / ".gitlab-ci.yml"
 README = ROOT / ".gitlab" / "README.md"
 TOOLCHAIN = ROOT / "ic" / "rust-toolchain.toml"
+WORKSPACE_MANIFEST = ROOT / "ic" / "Cargo.toml"
 DEFAULTS = ROOT / ".gitlab" / "ci" / "defaults.yml"
+EXPECTED_RUST_VERSION = "1.96.1"
 EXPECTED_INCLUDES = [
     "/.gitlab/ci/workflow.yml",
     "/.gitlab/ci/defaults.yml",
@@ -42,8 +45,8 @@ def image_name(image: object) -> str | None:
     return None
 
 
-def extract_rust_image(defaults: dict) -> tuple[str, str] | None:
-    rust_job = defaults.get(".rust-job", {})
+def extract_rust_image(defaults: dict, job_name: str) -> tuple[str, str] | None:
+    rust_job = defaults.get(job_name, {})
     if not isinstance(rust_job, dict):
         return None
     image = image_name(rust_job.get("image"))
@@ -100,11 +103,45 @@ def main() -> int:
 
     defaults_path = ROOT / ".gitlab" / "ci" / "defaults.yml"
     defaults = load_yaml(defaults_path)
-    rust_image = extract_rust_image(defaults)
+    rust_image = extract_rust_image(defaults, ".rust-job")
+    msrv_image = extract_rust_image(defaults, ".rust-msrv-job")
     if rust_image is None:
         errors.append("could not extract Rust image tag/digest from defaults.yml .rust-job")
+    if msrv_image is None:
+        errors.append("could not extract Rust image tag/digest from defaults.yml .rust-msrv-job")
+    if WORKSPACE_MANIFEST.is_file():
+        with WORKSPACE_MANIFEST.open("rb") as stream:
+            workspace_manifest = tomllib.load(stream)
+        rust_version = workspace_manifest.get("package", {}).get("rust-version")
+        if rust_version != EXPECTED_RUST_VERSION:
+            errors.append(
+                f"ic/Cargo.toml rust-version {rust_version!r} != expected "
+                f"{EXPECTED_RUST_VERSION!r}"
+            )
     else:
+        errors.append("ic/Cargo.toml missing")
+
+    if rust_image is not None:
         rust_tag, rust_digest = rust_image
+        rust_image_version = rust_tag.split("-")[0]
+        if rust_image_version != EXPECTED_RUST_VERSION:
+            errors.append(
+                f"defaults.yml .rust-job image version {rust_image_version!r} != expected "
+                f"{EXPECTED_RUST_VERSION!r}"
+            )
+
+        if msrv_image is not None:
+            msrv_tag, _ = msrv_image
+            msrv_image_version = msrv_tag.split("-")[0]
+            if msrv_image_version != EXPECTED_RUST_VERSION:
+                errors.append(
+                    f"defaults.yml .rust-msrv-job image version {msrv_image_version!r} != "
+                    f"expected {EXPECTED_RUST_VERSION!r}"
+                )
+            if msrv_image != rust_image:
+                errors.append(
+                    "defaults.yml .rust-msrv-job image tag/digest must match .rust-job"
+                )
 
         readme_text = README.read_text(encoding="utf-8") if README.is_file() else ""
         readme_digests = set(DIGEST_PATTERN.findall(readme_text))
@@ -128,11 +165,10 @@ def main() -> int:
                 errors.append("ic/rust-toolchain.toml missing channel declaration")
             else:
                 channel = channel_match.group(1)
-                toolchain_tag = rust_tag.split("-")[0]
-                if channel != toolchain_tag:
+                if channel != EXPECTED_RUST_VERSION:
                     errors.append(
-                        f"ic/rust-toolchain.toml channel {channel!r} != Rust image tag "
-                        f"{toolchain_tag!r} in defaults.yml"
+                        f"ic/rust-toolchain.toml channel {channel!r} != expected "
+                        f"{EXPECTED_RUST_VERSION!r}"
                     )
         else:
             errors.append("ic/rust-toolchain.toml missing")

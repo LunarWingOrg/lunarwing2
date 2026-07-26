@@ -57,8 +57,9 @@ build_extension() {
                 return 1
             fi
         done
+        source_dir=$(jq -r '.source.dir' "$manifest_path")
         capabilities=$(jq -r '.source.capabilities // empty' "$manifest_path")
-        if [[ -n "$capabilities" && ! -f "$(dirname "$manifest_path")/../$capabilities" ]]; then
+        if [[ -n "$capabilities" && ! -f "$source_dir/$capabilities" ]]; then
             echo "  FAIL $(basename "$manifest_path" .json) (capabilities file missing: $capabilities)"
             FAILED+=("$(basename "$manifest_path" .json)")
             return 1

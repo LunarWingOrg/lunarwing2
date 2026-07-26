@@ -42,6 +42,10 @@ Pinned images:
 - cargo-deny 0.20.2 x86-64 musl archive:
   `sha256:9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f`
 
+`ci-config` enforces Rust 1.96.1 across `ic/Cargo.toml` `rust-version`,
+`ic/rust-toolchain.toml`, and both primary/MSRV image tags. It also requires
+both Rust jobs to use same digest-pinned image and keeps README digest in sync.
+
 ## Required jobs
 
 - CI composition, shell syntax, Python syntax, registry JSON, version policy,
