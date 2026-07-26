@@ -417,7 +417,7 @@ impl EffectBridgeAdapter {
             "mission_delete" => {
                 let id = Self::resolve_mission_id(params, context, mgr).await;
                 match id {
-                    Ok(id) => match mgr.complete_mission(id).await {
+                    Ok(id) => match mgr.complete_mission_with_owner(id, &context.user_id).await {
                         Ok(()) => Ok(serde_json::json!({"status": "deleted"})),
                         Err(e) => Err(e),
                     },

@@ -331,6 +331,34 @@ impl MissionManager {
         Ok(())
     }
 
+    /// Complete a mission after verifying caller ownership.
+    ///
+    /// For shared missions, the caller (web handler) must verify admin role.
+    /// The engine only checks ownership.
+    pub async fn complete_mission_with_owner(
+        &self,
+        id: MissionId,
+        user_id: &str,
+    ) -> Result<(), EngineError> {
+        let lock = mission_lock(&self.fire_locks, id).await;
+        let _guard = lock.lock().await;
+        if let Some(mission) = self.store.load_mission(id).await?
+            && !mission.is_owned_by(user_id)
+            && !mission.owner_id().is_shared()
+        {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("mission {id}"),
+            });
+        }
+        self.store
+            .update_mission_status(id, MissionStatus::Completed)
+            .await?;
+        self.active.write().await.retain(|mid| *mid != id);
+        debug!(mission_id = %id, "mission completed by {user_id}");
+        Ok(())
+    }
+
     /// Fire a mission — build meta-prompt, spawn thread, process outcome.
     ///
     /// Optional `trigger_payload` carries webhook/event data that triggered this
