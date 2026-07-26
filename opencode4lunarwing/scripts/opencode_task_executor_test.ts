@@ -6,13 +6,18 @@ import { executeTask } from "./opencode_task_executor.ts"
 
 interface MockOptions {
   events?: unknown[]
+  pendingEvents?: boolean
   parts?: Array<{ type: string; text?: string }>
   promptError?: Error
 }
 
 function makeSdk(options: MockOptions = {}) {
   let v2Replies = 0
+  let aborts = 0
   const stream = async function* () {
+    if (options.pendingEvents) {
+      await new Promise(() => {})
+    }
     for (const event of options.events ?? [
       { type: "session.idle", properties: { sessionID: "session-1" } },
     ]) {
@@ -31,6 +36,10 @@ function makeSdk(options: MockOptions = {}) {
             parts: options.parts ?? [{ type: "text", text: "done" }],
           },
         }
+      },
+      abort: async () => {
+        aborts++
+        return { data: true }
       },
     },
     event: {
@@ -51,7 +60,7 @@ function makeSdk(options: MockOptions = {}) {
     },
   } as unknown as OpencodeClient
 
-  return { sdk, v2ReplyCount: () => v2Replies }
+  return { sdk, v2ReplyCount: () => v2Replies, abortCount: () => aborts }
 }
 
 async function runTask(sdk: OpencodeClient) {
@@ -101,5 +110,19 @@ const permission = makeSdk({
 const permissionResult = await runTask(permission.sdk)
 assert.equal(permissionResult.status, "success")
 assert.equal(permission.v2ReplyCount(), 1)
+
+const timeout = makeSdk({ pendingEvents: true })
+const timeoutResults: Array<{ status: string; error: string | null }> = []
+await executeTask(
+  { task_id: "task-timeout", prompt: "test", timeout_ms: 10 },
+  () => {},
+  (result) => timeoutResults.push(result),
+  undefined,
+  timeout.sdk,
+)
+assert.equal(timeoutResults.length, 1)
+assert.equal(timeoutResults[0]!.status, "error")
+assert.equal(timeoutResults[0]!.error, "Task timed out after 10ms")
+assert.equal(timeout.abortCount(), 1)
 
 console.log("opencode task executor self-check passed")

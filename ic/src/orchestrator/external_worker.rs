@@ -240,6 +240,10 @@ impl ExternalWorkerManager {
         self.workers.keys().map(|s| s.as_str()).collect()
     }
 
+    pub fn max_timeout_ms(&self) -> Option<u64> {
+        self.workers.values().map(|worker| worker.timeout_ms).max()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.workers.is_empty()
     }
