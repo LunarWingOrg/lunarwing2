@@ -75,7 +75,7 @@
 21. [x] review recent changes in onboard ui and see if there are issues
 22. [ ] review kawarimi adapter. make improvements (only if necessary)
 23. [x] go over release notes for 2.0.2.0 and see what else still needs to be added to next release, see documents about this if unsure of each item. create new doc under docs/proposals for items that should be included in 2.0.3.0 (you must focus on enginev2 related fixes/polishing)
-24. [ ] Refactor mt admin, see documents about this if unsure
+24. [ ] Refactor mt admin. The existing document plans have SERIOUS issues. Therefore, I'm going with a COMPLETELY different plan for this. Please see the following branch: mtadminrefactor/meta4/v2.0.3.0
 25. [ ] Review recent work on XMPP file transfer — remaining polish (further hardening), see documents about this if unsure. create new doc detailing findings in docs/ops
 26. [ ] Review recent work on Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure. create new doc detailing findings in docs/ops
 27. [ ] Review recent changes for: Gut proprietary tunnel providers and add support for netbird. improve if necessary
