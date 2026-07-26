@@ -37,7 +37,7 @@ Start with these deeper docs as needed:
 - Container orchestrator and external workers: `src/orchestrator/`
 - Secrets management: `src/secrets/`
 - Lifecycle hooks: `src/hooks/`
-- Tunnel abstraction (cloudflare, ngrok, tailscale): `src/tunnel/`
+- Tunnel abstraction (netbird, cloudflare, ngrok, tailscale): `src/tunnel/`
 - SKILL.md prompt extensions: `src/skills/`
 - Engine V2 bridge: `src/bridge/`
 - Execution gate and approval pending state: `src/gate/`
