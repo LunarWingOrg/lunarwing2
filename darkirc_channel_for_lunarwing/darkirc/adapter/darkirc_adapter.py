@@ -7,11 +7,20 @@ a simple HTTP API that the LunarWing WASM channel can poll.
 
 Endpoints:
   GET  /poll          → Returns queued inbound DMs as JSON array
-  POST /send          → Sends a DM via IRC: {"to":"nick","text":"..."}
-  GET  /health        → Health check
+  POST /ack           → Acknowledges the last polled batch (at-least-once)
+  POST /send          → Queues a DM for paced delivery: {"to":"nick","text":"..."}
+  GET  /health        → Health check (inbound queue + outbox depth)
 
-This is intentionally minimal — all security, rate limiting, and
-session management happens in the WASM channel / LunarWing host.
+Outbound delivery is asynchronous: /send splits the text into IRC-safe
+chunks, numbers multi-chunk messages ("[i/N] "), and enqueues them into a
+paced outbox. A background task drains one PRIVMSG per
+DARKIRC_PRIVMSG_INTERVAL seconds (DarkFi metering drops messages sent
+faster than that). /send returns as soon as the message is queued
+("status":"queued") — the message is NOT on the wire yet. Chunks queued
+while IRC is disconnected are delivered after reconnection.
+
+Security, session management, and prompt-injection defenses remain in the
+WASM channel / LunarWing host.
 """
 
 import asyncio
@@ -47,8 +56,14 @@ MAX_IRC_MESSAGE_BYTES = int(os.getenv("DARKIRC_MAX_MESSAGE_BYTES", "400"))
 
 # Minimum seconds between PRIVMSG sends (DarkFi metering requires spacing)
 PRIVMSG_MIN_INTERVAL = float(os.getenv("DARKIRC_PRIVMSG_INTERVAL", "7.0"))
-_last_privmsg_time: float = 0.0
-_privmsg_lock = asyncio.Lock()
+
+# Max chunks the paced outbox may hold before /send returns 429. At one chunk
+# per PRIVMSG_MIN_INTERVAL the default 400 chunks ≈ 47 minutes of backlog.
+MAX_OUTBOX = int(os.getenv("ADAPTER_MAX_OUTBOX", "400"))
+
+# Optional JSON file persisting the outbox across adapter restarts.
+# Empty (default) disables journaling.
+OUTBOX_JOURNAL = os.getenv("ADAPTER_OUTBOX_JOURNAL", "")
 
 # Cap on inbound HTTP request bodies (M5: the hand-rolled reader trusts
 # Content-Length via readexactly — without a cap a caller can force unbounded
@@ -134,26 +149,6 @@ class IRCClient:
 
     async def pong(self, token: str):
         await self._send(f"PONG :{token}")
-
-    async def privmsg(self, target: str, text: str):
-        global _last_privmsg_time
-        chunks = _split_message_bytes(text, MAX_IRC_MESSAGE_BYTES)
-        successful_chunks = 0
-
-        for chunk in chunks:
-            async with _privmsg_lock:
-                now = asyncio.get_event_loop().time()
-                elapsed = now - _last_privmsg_time
-                if elapsed < PRIVMSG_MIN_INTERVAL:
-                    await asyncio.sleep(PRIVMSG_MIN_INTERVAL - elapsed)
-                try:
-                    await self._send(f"PRIVMSG {target} :{chunk}")
-                    _last_privmsg_time = asyncio.get_event_loop().time()
-                    successful_chunks += 1
-                except Exception as e:
-                    log.error("Failed to send chunk %d to %s: %s", successful_chunks + 1, target, e)
-
-        log.info("Sent %d of %d chunk(s) to %s", successful_chunks, len(chunks), target)
 
     async def close(self):
         self._connected = False
@@ -251,6 +246,143 @@ def _split_message_bytes(text: str, max_bytes: int) -> list:
         remaining = remaining[lo:]
 
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# Outbound message queue (paced PRIVMSG delivery)
+# ---------------------------------------------------------------------------
+
+# FIFO of {"to": nick, "text": chunk} awaiting delivery. A single global queue
+# keeps overall send order (DarkFi metering applies across all targets) and
+# per-target chunk order.
+outbox: deque = deque()
+# -inf so the first send never waits, regardless of the monotonic clock origin.
+_last_privmsg_time: float = float("-inf")
+
+
+def _effective_max_bytes(to: str) -> int:
+    """Largest payload keeping 'PRIVMSG <to> :<payload>\\r\\n' within the
+    512-byte IRC frame, capped by MAX_IRC_MESSAGE_BYTES.
+
+    With the default 400-byte cap this only bites for pathologically long
+    nicks; it lets operators raise DARKIRC_MAX_MESSAGE_BYTES while staying
+    frame-safe on the client side.
+    """
+    frame_overhead = len("PRIVMSG  :") + len(to.encode("utf-8")) + 2  # +CRLF
+    return max(1, min(MAX_IRC_MESSAGE_BYTES, 512 - frame_overhead))
+
+
+def _numbered_chunks(to: str, text: str) -> list:
+    """Split text for the target, prefixing '[i/N] ' when it needs more than
+    one chunk so recipients can spot missing or out-of-order parts.
+
+    The prefix counts against the per-chunk byte budget: splitting is retried
+    with a growing reserve until every prefixed chunk fits. The reserve uses
+    the widest prefix ('[N/N] ') so every chunk index fits; the loop
+    terminates because the reserve grows monotonically and is bounded by the
+    prefix width for the worst-case chunk count.
+    """
+    budget = _effective_max_bytes(to)
+    chunks = _split_message_bytes(text, budget)
+    if len(chunks) <= 1:
+        return chunks
+
+    reserve = 0
+    while True:
+        prefix_width = len(f"[{len(chunks)}/{len(chunks)}] ".encode("utf-8"))
+        if prefix_width <= reserve:
+            break
+        reserve = prefix_width
+        chunks = _split_message_bytes(text, max(1, budget - reserve))
+
+    total = len(chunks)
+    return [f"[{i}/{total}] {chunk}" for i, chunk in enumerate(chunks, start=1)]
+
+
+def enqueue_send(to: str, text: str):
+    """Queue a message for paced delivery. Returns (ok, info_dict)."""
+    chunks = _numbered_chunks(to, text)
+    if len(outbox) + len(chunks) > MAX_OUTBOX:
+        return False, {
+            "error": "outbox full",
+            "chunks": len(chunks),
+            "outbox": len(outbox),
+        }
+    for chunk in chunks:
+        outbox.append({"to": to, "text": chunk})
+    _journal_save()
+    return True, {"status": "queued", "chunks": len(chunks), "outbox": len(outbox)}
+
+
+def _journal_load():
+    """Restore queued chunks from the journal file, if configured."""
+    if not OUTBOX_JOURNAL:
+        return
+    try:
+        with open(OUTBOX_JOURNAL, "r", encoding="utf-8") as fh:
+            items = json.load(fh)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:
+        log.warning("Outbox journal unreadable, starting empty: %s", e)
+        return
+    restored = 0
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            to, text = item.get("to"), item.get("text")
+            if isinstance(to, str) and isinstance(text, str) and to and text:
+                outbox.append({"to": to, "text": text})
+                restored += 1
+    if restored:
+        log.info("Outbox journal: restored %d queued chunk(s)", restored)
+
+
+def _journal_save():
+    """Persist the outbox atomically (write-then-rename), if configured."""
+    if not OUTBOX_JOURNAL:
+        return
+    tmp = OUTBOX_JOURNAL + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(list(outbox), fh, ensure_ascii=False)
+        os.replace(tmp, OUTBOX_JOURNAL)
+    except OSError as e:
+        log.warning("Outbox journal write failed: %s", e)
+
+
+async def outbox_loop():
+    """Single consumer draining the outbox one paced PRIVMSG at a time.
+
+    Peek-send-pop: a chunk is only removed after the socket write succeeds,
+    so an IRC disconnect retries the same chunk after reconnection instead
+    of dropping it.
+    """
+    global _last_privmsg_time
+    while _running:
+        if not outbox or not irc.connected:
+            await asyncio.sleep(0.5)
+            continue
+
+        now = asyncio.get_running_loop().time()
+        wait = PRIVMSG_MIN_INTERVAL - (now - _last_privmsg_time)
+        if wait > 0:
+            # Re-check running/connected/queue state after the pacing sleep.
+            await asyncio.sleep(wait)
+            continue
+
+        item = outbox[0]
+        try:
+            await irc._send(f"PRIVMSG {item['to']} :{item['text']}")
+        except Exception as e:
+            log.warning("Outbox send failed (will retry): %s", e)
+            await asyncio.sleep(1.0)
+            continue
+        _last_privmsg_time = asyncio.get_running_loop().time()
+        outbox.popleft()
+        _journal_save()
+        log.info("→ DM chunk sent to %s (%d still queued)", item["to"], len(outbox))
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +537,7 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 "irc_connected": irc.connected,
                 "irc_nick": irc.nick,
                 "queue_size": len(message_queue),
+                "outbox": len(outbox),
             })
 
         elif method == "GET" and path == "/poll":
@@ -438,13 +571,15 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 await send_response(writer, 400, {"error": "missing 'to' or 'text'"})
                 return
 
-            if not irc.connected:
-                await send_response(writer, 503, {"error": "irc not connected"})
+            # No irc.connected gate: chunks queued while IRC is down are
+            # delivered after reconnection — rejecting at accept time was a
+            # message-loss mode (callers dropped the response on 503).
+            ok, info = enqueue_send(to, text)
+            if not ok:
+                await send_response(writer, 429, info)
                 return
-
-            await irc.privmsg(to, text)
-            # Logging is handled within privmsg method now
-            await send_response(writer, 200, {"status": "sent"})
+            info["irc_connected"] = irc.connected
+            await send_response(writer, 200, info)
 
         else:
             await send_response(writer, 404, {"error": "not found"})
@@ -491,6 +626,9 @@ async def main():
             "automatically). Without it any local process can read/send DMs."
         )
 
+    # Restore any chunks left queued by a previous run (if journaling enabled)
+    _journal_load()
+
     # Start HTTP server
     server = await asyncio.start_server(
         handle_http, HTTP_HOST, HTTP_PORT
@@ -501,8 +639,9 @@ async def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda: _shutdown())
 
-    # Run IRC loop and HTTP server concurrently
+    # Run IRC loop, paced outbox drain, and HTTP server concurrently
     irc_task = asyncio.create_task(irc_loop())
+    outbox_task = asyncio.create_task(outbox_loop())
 
     async with server:
         await server.serve_forever()
