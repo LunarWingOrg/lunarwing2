@@ -25,7 +25,7 @@
 14. [ ] take look at Advisory Status (`deny.toml`) in docs/ops/CRATE_AUDIT_v2.0.3.0.md and install cargo-deny using rustup, cargo, then remove items marked as `now unblocked`
 15. [ ] address p0 issues in docs/ops/GOAL_GAP_SUGGESTIONS.md
 16. [ ] address 2. Priority findings in docs/ops/CICD_LOGIC_REVIEW.md
-17. [ ] address p1 issues in docs/ops/GOAL_GAP_SUGGESTIONS.md
+17. [x] address p1 issues in docs/ops/GOAL_GAP_SUGGESTIONS.md
 18. [ ] address 3. Parity gaps vs. the plan (Phase 1 scope) in docs/ops/CICD_LOGIC_REVIEW.md
 19. [x] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. In-place configuration updates were completed on 2026-07-24. Reference the branch here for prior/failed/unverified attempt: rarity/item-8-20260723-0855
     <details>
