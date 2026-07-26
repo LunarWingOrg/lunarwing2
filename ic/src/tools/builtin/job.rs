@@ -696,7 +696,7 @@ impl CreateJobTool {
         }
     }
 
-    /// Execute via an external worker (nanocode, codex, etc.).
+    /// Execute via an external worker (nanocode, opencode, etc.).
     async fn execute_external(
         &self,
         task: &str,
@@ -712,6 +712,14 @@ impl CreateJobTool {
                 "External worker execution requires a configured worker manager".to_string(),
             )
         })?;
+        let worker_timeout_ms = ewm
+            .get_worker(worker_name)
+            .map(|config| config.timeout_ms)
+            .ok_or_else(|| {
+                ToolError::ExecutionFailed(format!(
+                    "External worker '{worker_name}' is not configured"
+                ))
+            })?;
 
         let job_id = Uuid::new_v4();
 
@@ -809,7 +817,14 @@ impl CreateJobTool {
 
         if wait {
             match ewm
-                .execute_task(job_id, worker_name, task, None, true, task_context)
+                .execute_task(
+                    job_id,
+                    worker_name,
+                    task,
+                    Some(worker_timeout_ms),
+                    true,
+                    task_context,
+                )
                 .await
             {
                 Ok(Some(result)) => {
@@ -821,6 +836,7 @@ impl CreateJobTool {
                             "worker": worker_name,
                             "output": result.output,
                             "duration_ms": result.duration_ms,
+                            "timeout_ms": worker_timeout_ms,
                         });
                         Ok(ToolOutput::success(output, start.elapsed()))
                     } else {
@@ -858,7 +874,14 @@ impl CreateJobTool {
             }
         } else {
             if let Err(e) = ewm
-                .execute_task(job_id, worker_name, task, None, false, task_context)
+                .execute_task(
+                    job_id,
+                    worker_name,
+                    task,
+                    Some(worker_timeout_ms),
+                    false,
+                    task_context,
+                )
                 .await
             {
                 self.update_status(
@@ -901,6 +924,7 @@ impl CreateJobTool {
                 "job_id": job_id.to_string(),
                 "status": "started",
                 "worker": worker_name,
+                "timeout_ms": worker_timeout_ms,
                 "message": format!(
                     "Task dispatched to external worker '{}'. Use job_events to check progress.",
                     worker_name
@@ -1088,7 +1112,9 @@ impl Tool for CreateJobTool {
              directly and set mode to the exact worker name from the mode schema (for example \
              'opencode'). External workers are job execution backends, not extensions, MCP servers, \
              skills, routines, or SSH hosts; do not search for or install them. Put the complete task \
-             in description. wait defaults to true."
+             in description. wait defaults to true. External worker deadlines come from worker \
+             configuration and are returned as timeout_ms; the 30-second local-job default does \
+             not apply."
         } else if self.sandbox_enabled() {
             "Create and execute a job. The job runs in a sandboxed Docker container with its own \
              sub-agent that has shell, file read/write, list_dir, and apply_patch tools. Use this \
@@ -1947,6 +1973,8 @@ mod tests {
                 .contains("call this create_job tool directly")
         );
         assert!(tool.description().contains("not extensions, MCP servers"));
+        assert!(tool.description().contains("30-second local-job default"));
+        assert_eq!(tool.execution_timeout(), Duration::from_secs(660));
         assert_eq!(
             tool.requires_approval(&serde_json::json!({})),
             ApprovalRequirement::UnlessAutoApproved
