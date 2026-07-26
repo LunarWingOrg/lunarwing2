@@ -3986,7 +3986,10 @@ mod tests {
             .await
             .unwrap();
 
-        let err = mgr.complete_mission_with_owner(id, "bob").await.unwrap_err();
+        let err = mgr
+            .complete_mission_with_owner(id, "bob")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, EngineError::AccessDenied { .. }),
             "bob must not complete alice's mission"
