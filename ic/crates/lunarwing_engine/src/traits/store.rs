@@ -153,6 +153,16 @@ pub trait Store: Send + Sync {
         status: MissionStatus,
     ) -> Result<(), EngineError>;
 
+    /// Permanently remove a mission from persistence.
+    ///
+    /// Unlike `update_mission_status(Completed)`, this removes the record
+    /// entirely so it no longer appears in list output.
+    async fn delete_mission(&self, id: MissionId) -> Result<(), EngineError> {
+        Err(EngineError::Store {
+            reason: format!("Store::delete_mission not implemented for mission '{id}'"),
+        })
+    }
+
     /// List missions visible to a user: their own + shared missions.
     ///
     /// Shared learning missions (self-improvement, skill-extraction, etc.) are

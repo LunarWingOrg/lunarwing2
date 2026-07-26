@@ -359,6 +359,32 @@ impl MissionManager {
         Ok(())
     }
 
+    /// Permanently delete a mission after verifying caller ownership.
+    ///
+    /// Unlike `complete_mission`, this removes the record from persistence
+    /// entirely. For shared missions, the caller must verify admin role.
+    pub async fn delete_mission(
+        &self,
+        id: MissionId,
+        user_id: &str,
+    ) -> Result<(), EngineError> {
+        let lock = mission_lock(&self.fire_locks, id).await;
+        let _guard = lock.lock().await;
+        if let Some(mission) = self.store.load_mission(id).await?
+            && !mission.is_owned_by(user_id)
+            && !mission.owner_id().is_shared()
+        {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("mission {id}"),
+            });
+        }
+        self.store.delete_mission(id).await?;
+        self.active.write().await.retain(|mid| *mid != id);
+        debug!(mission_id = %id, "mission deleted by {user_id}");
+        Ok(())
+    }
+
     /// Fire a mission — build meta-prompt, spawn thread, process outcome.
     ///
     /// Optional `trigger_payload` carries webhook/event data that triggered this

@@ -5010,6 +5010,12 @@ mod tests {
         ) -> Result<(), lunarwing_engine::EngineError> {
             Ok(())
         }
+        async fn delete_mission(
+            &self,
+            _: lunarwing_engine::MissionId,
+        ) -> Result<(), lunarwing_engine::EngineError> {
+            Ok(())
+        }
     }
 
     fn sample_pending_gate(
