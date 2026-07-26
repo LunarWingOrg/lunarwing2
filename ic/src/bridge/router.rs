@@ -120,6 +120,13 @@ fn engine_err(context: &str, e: impl std::fmt::Display) -> Error {
     }
 }
 
+/// Default pending gate expiry duration (30 minutes).
+///
+/// Configurable via `settings.agent.pending_gate_expiry_secs`.
+/// Gate creation paths use this default; the background sweep
+/// respects the actual `expires_at` on each gate.
+const DEFAULT_PENDING_GATE_EXPIRY: chrono::Duration = chrono::Duration::minutes(30);
+
 /// Convert a local v1 `LoadedSkill` to an `lunarwing_skills::LoadedSkill` for migration.
 ///
 /// The local `SkillManifest` does not have a `credentials` field, so the
@@ -394,7 +401,7 @@ async fn persist_and_notify_thread_gate(
         ),
         resume_kind,
         created_at: chrono::Utc::now(),
-        expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+        expires_at: chrono::Utc::now() + DEFAULT_PENDING_GATE_EXPIRY,
         original_message: None,
         resume_output,
     };
@@ -642,7 +649,7 @@ async fn execute_pending_gate_action(
                 ),
                 resume_kind: *resume_kind,
                 created_at: chrono::Utc::now(),
-                expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+                expires_at: chrono::Utc::now() + DEFAULT_PENDING_GATE_EXPIRY,
                 original_message: None,
                 resume_output: resume_output.map(|value| *value),
             };
@@ -1292,6 +1299,8 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     if lunarwing_engine::skill_self_improvement_enabled() {
         start_skill_update_sweep(owner_id.clone());
     }
+
+    start_pending_gate_sweep(Arc::clone(&pending_gates));
 
     Ok(())
 }
@@ -2956,7 +2965,7 @@ async fn await_thread_outcome(
                 auth_url: None,
             },
             created_at: chrono::Utc::now(),
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            expires_at: chrono::Utc::now() + DEFAULT_PENDING_GATE_EXPIRY,
             original_message: Some(message.content.clone()),
             resume_output: None,
         };
@@ -4524,6 +4533,7 @@ fn render_registry_skill_md(
 const SKILL_UPDATE_SWEEP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
 const MAX_SKILL_UPDATE_CHECKS_PER_SWEEP: usize = 64;
+const PENDING_GATE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn start_skill_update_sweep(user_id: String) {
     tokio::spawn(async move {
@@ -4542,6 +4552,26 @@ fn start_skill_update_sweep(user_id: String) {
                 Err(error) => {
                     tracing::warn!(%error, "registry skill update sweep failed");
                 }
+            }
+        }
+    });
+}
+
+/// Background task that periodically sweeps expired pending gates.
+///
+/// Without this, a thread waiting on an expired gate blocks until
+/// the next ingress triggers cleanup via `expire_stale()`.
+fn start_pending_gate_sweep(
+    pending_gates: Arc<crate::gate::store::PendingGateStore>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PENDING_GATE_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let removed = pending_gates.expire_stale().await;
+            if removed > 0 {
+                debug!(removed, "background sweep removed expired pending gates");
             }
         }
     });
@@ -5037,7 +5067,7 @@ mod tests {
             description: "pending gate".into(),
             resume_kind,
             created_at: chrono::Utc::now(),
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            expires_at: chrono::Utc::now() + DEFAULT_PENDING_GATE_EXPIRY,
             original_message: None,
             resume_output: None,
         }
@@ -6129,7 +6159,7 @@ mod tests {
             description: "gate".into(),
             resume_kind,
             created_at: chrono::Utc::now(),
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+            expires_at: chrono::Utc::now() + DEFAULT_PENDING_GATE_EXPIRY,
             original_message: None,
             resume_output: None,
         }
