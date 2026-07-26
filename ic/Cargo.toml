@@ -176,7 +176,7 @@ http = "1"
 # External worker WebSocket client
 tokio-tungstenite = "0.26"
 bytes = "1"
-base64 = "0.21"
+base64 = "0.22"
 mime_guess = "2.0.5"
 clap_complete = "4.5.0"
 lru = "0.16.3"

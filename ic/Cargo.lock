@@ -4400,7 +4400,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.8.9",
- "base64 0.21.7",
+ "base64 0.22.1",
  "blake3",
  "bollard",
  "bytes",
