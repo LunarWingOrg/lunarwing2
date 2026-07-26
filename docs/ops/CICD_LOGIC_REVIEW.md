@@ -274,19 +274,18 @@ tests grow a real cloud mock, switch the URL to a named fixture service.
 ## 3. Parity gaps vs. the plan (Phase 1 scope)
 
 These are items the plan lists under Phase 1 that are **not yet** implemented.
-They are tracked here for visibility; most are intentionally deferred and
-documented as such in `.gitlab/README.md`. Confirm each is a deliberate defer
-rather than an oversight.
+They are tracked here for visibility. Each row is confirmed as either a deliberate
+defer (with plan/README citation) or an implemented/closed gap.
 
-| Plan item (§) | Status in pipeline | Note |
-|---|---|---|
-| 8.1 `python-static` (Pyright/Ruff) | Not present | Plan marks "Phase 2 blocking". OK to defer. |
-| 8.1 `docs-links` (internal Markdown link check) | Not present | Plan marks "Phase 2 blocking". Consider adding; `docs/` is large and link rot is visible in other review tasks (e.g. goals items #19–#24). |
-| 8.3 PostgreSQL integration job | Not present | Plan defers to Phase 2 with pgvector service. Confirmed deferred in README. |
-| 8.5 Path-triggered standalone crates matrix | Not present | 17 standalone lockfiles exist (see §5 below). Currently the core `ic/Cargo.lock` does not validate them. Plan defers to Phase 2; reasonable, but see suggestion in §5. |
-| 8.6 Strict WASM (`build-wasm-extensions.sh --strict`) | Partial | `wasm-channel-test-artifacts` builds two channels directly; the strict-mode flag described in the plan is not exercised. `cavepony-wasm` also builds directly but additionally asserts `CAVEPONY_EXPECTED_VERSION` and runs the `wit_compat` test, so it is stricter than the channel artifact job. |
-| 10.1 Coverage reporting | Not present | `ic/scripts/coverage.sh` and `ic/codecov.yml` exist but no CI job invokes them. Plan defers coverage to Phase 2 with a measured baseline; correct to defer, but the gap is now explicit. |
-| 15.5 Toolchain reconciliation (1.92 vs 1.96) | **RESOLVED 2026-07-26** | Workspace MSRV raised to 1.96.1; `rust-msrv-check` validates that declared minimum; `validate_config.py` enforces README ↔ defaults.yml ↔ rust-toolchain.toml tag agreement. The MSRV job remains observational until one green run, after which it becomes blocking. |
+| Plan item (§) | Status in pipeline | Confirmed defer/implemented | Note |
+|---|---|---|---|
+| 8.1 `python-static` (Pyright/Ruff) | Not present | **Deliberate Phase 2** | Plan §8.1 marks "Phase 2 blocking". README confirms defer. OK. |
+| 8.1 `docs-links` (internal Markdown link check) | Not present | **Deliberate Phase 2** | Plan §8.1 marks "Phase 2 blocking". `docs/` is large; link rot visible in other review tasks. OK to defer. |
+| 8.3 PostgreSQL integration job | Not present | **Deliberate Phase 2** | Plan §8.3 defers to Phase 2 with pgvector service. README confirms defer. OK. |
+| 8.5 Path-triggered standalone crates matrix | Not present | **Deliberate Phase 2** | 17 standalone lockfiles exist (see §5). Plan §8.5 defers to Phase 2; §5 suggests a cheaper `standalone-cargo-metadata` observation first. OK. |
+| 8.6 Strict WASM (`build-wasm-extensions.sh --strict`) | Implemented | **Done 2026-07-26** | `--strict` flag added: validates manifest fields + capabilities files, fail-fast on error, combines with --tools/--channels. Default non-strict preserves current behavior. Not yet wired into CI YAML (Phase 2). |
+| 10.1 Coverage reporting | Not present | **Deliberate Phase 2** | `ic/scripts/coverage.sh` and `ic/codecov.yml` exist. Plan §10.1 defers to Phase 2 with measured baseline. README confirms defer. OK. |
+| 15.5 Toolchain reconciliation (1.92 vs 1.96) | Resolved | **Done 2026-07-26** | Workspace MSRV raised to 1.96.1; `rust-msrv-check` validates that declared minimum; `validate_config.py` enforces README ↔ defaults.yml ↔ rust-toolchain.toml tag agreement. The MSRV job remains observational until one green run, after which it becomes blocking. |
 
 ---
 
