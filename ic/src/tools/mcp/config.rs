@@ -454,6 +454,8 @@ pub(crate) async fn acquire_mcp_config_write_guard() -> Result<McpConfigWriteGua
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
+            // Lock file: contents are irrelevant, only the flock matters.
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)?;

@@ -225,21 +225,23 @@ impl EffectBridgeAdapter {
     fn mission_updates(
         params: &serde_json::Value,
     ) -> Result<lunarwing_engine::MissionUpdate, EngineError> {
-        let mut updates = lunarwing_engine::MissionUpdate::default();
-        updates.name = params
-            .get("name")
-            .or_else(|| params.get("new_name"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        updates.goal = params
-            .get("goal")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        updates.cadence = params
-            .get("cadence")
-            .and_then(serde_json::Value::as_str)
-            .map(parse_cadence)
-            .transpose()?;
+        let mut updates = lunarwing_engine::MissionUpdate {
+            name: params
+                .get("name")
+                .or_else(|| params.get("new_name"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            goal: params
+                .get("goal")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            cadence: params
+                .get("cadence")
+                .and_then(serde_json::Value::as_str)
+                .map(parse_cadence)
+                .transpose()?,
+            ..Default::default()
+        };
         if let Some(channels) = params
             .get("notify_channels")
             .and_then(serde_json::Value::as_array)
