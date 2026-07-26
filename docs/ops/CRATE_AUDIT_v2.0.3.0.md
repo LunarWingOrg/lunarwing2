@@ -112,19 +112,21 @@ Confirmed transitive deadwood shed by the update (removals): `pathdiff`, `wasip3
 
 ## Advisory Status (`deny.toml`)
 
-`cargo-deny` is not currently installed on the dev VM, so a live advisory scan was not run for this audit. The `deny.toml` ignore list was inspected manually:
+> **Update (2026-07-26, item #14):** `cargo-deny` 0.20.2 is now installed on the dev VM. The two "now unblocked" hickory ignores (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`) have been **removed from `deny.toml`**, so a live `cargo deny check advisories` run now surfaces them as failures instead of silently hiding them. The remaining five clusters are still legitimately blocked upstream and stay ignored. Clearing the two surfaced advisories is gated on item #10 (the `tokio-xmpp` 5 → 6 upgrade). Until that lands, `cargo deny check advisories` will fail by design — the vulnerabilities are real and the fix path is known.
+
+A live advisory scan was run (`cargo deny check advisories`, cargo-deny 0.20.2) after removing the two unblocked ignores. Remaining ignored entries:
 
 | Advisory | Ignored reason | Status |
 |----------|----------------|--------|
-| `RUSTSEC-2026-0118` | hickory-proto 0.25.x; blocked on tokio-xmpp supporting hickory-resolver 0.26 | **Now unblocked** — tokio-xmpp 6.0.0 is out. Clearable by Tier 1 update #1. |
-| `RUSTSEC-2026-0119` | same chain as above | **Now unblocked** — same fix. |
+| ~~`RUSTSEC-2026-0118`~~ | ~~hickory-proto 0.25.x; blocked on tokio-xmpp supporting hickory-resolver 0.26~~ | **Removed** — tokio-xmpp 6.0.0 is out; ignore dropped so the advisory is surfaced. Clearable by Tier 1 update #1 (item #10). |
+| ~~`RUSTSEC-2026-0119`~~ | ~~same chain as above~~ | **Removed** — same fix; now surfaced. |
 | `RUSTSEC-2026-0049` | rustls-webpki CRL distributionPoint; pinned by libsql transitive | Still blocked on upstream libsql. |
 | `RUSTSEC-2026-0098` / `-0099` / `-0104` | rustls-webpki 0.102 via rustls 0.22 via libsql 0.6.0 | Still blocked on upstream libsql supporting rustls 0.23. |
 | `RUSTSEC-2026-0187` | lopdf 0.34 via pdf-extract 0.7.12 | Still blocked on upstream pdf-extract. |
 | `RUSTSEC-2023-0071` | rsa Marvin timing attack; no upstream constant-time release | Still open upstream. |
 | `RUSTSEC-2019-0036` / `RUSTSEC-2020-0036` | `failure` crate EOL; vendored libsignal-protocol | No patch; vendored. |
 
-**Actionable:** two of the seven distinct advisory clusters (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`) are now clearable via the `tokio-xmpp` 6 upgrade.
+**Actionable:** the two previously-silenced hickory advisories (`RUSTSEC-2026-0118`, `RUSTSEC-2026-0119`) are now **surfaced as live failures** by `cargo deny check advisories` and will be cleared by the `tokio-xmpp` 6 upgrade (item #10). The ignore removal is intentional: it converts a hidden vulnerability into a visible CI gate so the fix cannot be silently skipped.
 
 ---
 
