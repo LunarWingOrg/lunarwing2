@@ -1,6 +1,6 @@
 ---
 name: study-notes
-version: 2.0.0
+version: 2.1.0
 description: Search shared LunarWing codebase-study notes before broad exploration
 activation:
   keywords:
@@ -46,6 +46,8 @@ source provenance. Current source remains authority.
    freshness materially affects task.
 7. Cite note topic and source path when note materially affects answer or plan.
 8. Continue normal source exploration when notes have no useful result.
+9. If core-agent write tools are available, call them only after verified substantive
+   research and only when user requested recording or maintaining shared notes.
 
 ## Tools
 
@@ -54,9 +56,12 @@ source provenance. Current source remains authority.
 - `study_notes_knowledge_list_topics`: Coverage and version counts.
 - `study_notes_knowledge_list_stale`: Notes needing verification.
 - `study_notes_knowledge_stats`: Database and consolidation counts.
+- `study_notes_knowledge_submit_note`: Optional approved note creation/replacement.
+- `study_notes_knowledge_update_status`: Optional approved lifecycle update.
 
-Integration is read-only. Write tools are intentionally absent. Do not bypass
-this control by editing the shared checkout through filesystem or shell tools.
+Write tools are absent by default and require explicit operator opt-in plus user
+approval. OpenCode workers remain read-only. Never bypass MCP controls by editing
+Study Notes through filesystem or shell tools.
 
 ## Search Patterns
 

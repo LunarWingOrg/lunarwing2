@@ -75,6 +75,7 @@ mod tests {
             .expect("embedded Study Notes skill should parse");
 
         assert_eq!(parsed.manifest.name, "study-notes");
+        assert_eq!(parsed.manifest.version, "2.1.0");
         assert!(
             parsed
                 .manifest

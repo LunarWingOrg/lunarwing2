@@ -4,6 +4,7 @@
 //! Configuration is persisted at ~/.lunarwing/mcp-servers.json.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use fs4::FileExt;
@@ -15,8 +16,18 @@ use crate::tools::tool::ToolError;
 
 /// Operator-provided path to a local lw2studymcp checkout.
 pub const STUDY_NOTES_HOME_ENV: &str = "LW2STUDYMCP_HOME";
+/// Optional state directory containing the mutable Study Notes database and notes.
+pub const STUDY_NOTES_STATE_HOME_ENV: &str = "LW2STUDYMCP_STATE_HOME";
+/// Explicit opt-in for Study Notes write tools.
+pub const STUDY_NOTES_ALLOW_WRITE_ENV: &str = "LW2STUDYMCP_ALLOW_WRITE";
 /// Stable MCP server name used by core agents and OpenCode workers.
 pub const STUDY_NOTES_SERVER_NAME: &str = "study_notes";
+/// Upstream Study Notes tools that mutate shared state.
+pub const STUDY_NOTES_WRITE_TOOLS: [&str; 2] = ["knowledge_submit_note", "knowledge_update_status"];
+
+const STUDY_NOTES_MANAGED_DESCRIPTION_PREFIX: &str = "Managed Study Notes MCP";
+const LEGACY_STUDY_NOTES_DESCRIPTION: &str =
+    "Shared read-only LunarWing codebase study notes (managed by LW2STUDYMCP_HOME)";
 
 /// Transport configuration for an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +75,10 @@ pub struct McpServerConfig {
     /// Optional description for the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Raw MCP tool names that always require explicit approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub always_require_approval: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -81,6 +96,7 @@ impl McpServerConfig {
             oauth: None,
             enabled: true,
             description: None,
+            always_require_approval: Vec::new(),
         }
     }
 
@@ -103,6 +119,7 @@ impl McpServerConfig {
             oauth: None,
             enabled: true,
             description: None,
+            always_require_approval: Vec::new(),
         }
     }
 
@@ -118,6 +135,7 @@ impl McpServerConfig {
             oauth: None,
             enabled: true,
             description: None,
+            always_require_approval: Vec::new(),
         }
     }
 
@@ -136,6 +154,15 @@ impl McpServerConfig {
     /// Set custom headers.
     pub fn with_headers(mut self, headers: HashMap<String, String>) -> Self {
         self.headers = headers;
+        self
+    }
+
+    /// Set raw MCP tool names that must receive per-invocation approval.
+    pub fn with_always_require_approval(
+        mut self,
+        tools: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.always_require_approval = tools.into_iter().map(Into::into).collect();
         self
     }
 
@@ -249,6 +276,17 @@ impl McpServerConfig {
             }
         }
 
+        if self
+            .always_require_approval
+            .iter()
+            .any(|name| name.is_empty() || name.contains('\0'))
+        {
+            return Err(ConfigError::InvalidConfig {
+                reason: "Approval-required MCP tool names cannot be empty or contain NUL bytes"
+                    .to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -300,12 +338,48 @@ impl McpServerConfig {
     }
 }
 
-/// Build the managed read-only Study Notes MCP configuration.
+/// Parse the explicit Study Notes write opt-in.
+pub fn parse_study_notes_allow_write(value: Option<&OsStr>) -> Result<bool, ConfigError> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let value = value.to_str().ok_or_else(|| ConfigError::InvalidConfig {
+        reason: format!("{STUDY_NOTES_ALLOW_WRITE_ENV} is not valid UTF-8"),
+    })?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        _ => Err(ConfigError::InvalidConfig {
+            reason: format!(
+                "{STUDY_NOTES_ALLOW_WRITE_ENV} must be one of 1/true/yes/on or 0/false/no/off"
+            ),
+        }),
+    }
+}
+
+fn canonical_study_notes_entry(path: &Path) -> Result<PathBuf, ConfigError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| ConfigError::InvalidConfig {
+            reason: format!("Study Notes path '{}': {error}", path.display()),
+        })?;
+    if canonical != path {
+        return Err(ConfigError::InvalidConfig {
+            reason: format!("Study Notes path must not be a symlink: {}", path.display()),
+        });
+    }
+    Ok(canonical)
+}
+
+/// Build the managed Study Notes MCP configuration.
 ///
-/// The checkout remains operator-managed. LunarWing only validates the canonical
-/// server/data layout and runs its dependency-free stdio server. Write tools are
-/// intentionally unavailable because `--allow-write` is never supplied.
-pub fn study_notes_server_from_home(home: &Path) -> Result<McpServerConfig, ConfigError> {
+/// Code remains operator-managed and read-only. Write mode requires a separate
+/// state directory and forces per-invocation approval for every mutation tool.
+pub fn study_notes_server_from_home(
+    home: &Path,
+    state_home: Option<&Path>,
+    allow_write: bool,
+) -> Result<McpServerConfig, ConfigError> {
     let home = home
         .canonicalize()
         .map_err(|error| ConfigError::InvalidConfig {
@@ -320,16 +394,60 @@ pub fn study_notes_server_from_home(home: &Path) -> Result<McpServerConfig, Conf
         });
     }
 
-    let server = home.join("study_notes_mcp.py");
-    let database = home.join("agent-notes.sqlite3");
-    let notes = home.join("agent-notes-by-agent");
-    let memorydb = home.join("memorydb.py");
-    for required in [&server, &database, &memorydb] {
+    let server = canonical_study_notes_entry(&home.join("study_notes_mcp.py"))?;
+    let memorydb = canonical_study_notes_entry(&home.join("memorydb.py"))?;
+    let source_database = canonical_study_notes_entry(&home.join("agent-notes.sqlite3"))?;
+    let source_notes = canonical_study_notes_entry(&home.join("agent-notes-by-agent"))?;
+    for required in [&server, &memorydb, &source_database] {
         if !required.is_file() {
             return Err(ConfigError::InvalidConfig {
                 reason: format!("Study Notes file missing: {}", required.display()),
             });
         }
+    }
+    if !source_notes.is_dir() {
+        return Err(ConfigError::InvalidConfig {
+            reason: format!("Study Notes directory missing: {}", source_notes.display()),
+        });
+    }
+
+    if allow_write && state_home.is_none() {
+        return Err(ConfigError::InvalidConfig {
+            reason: format!(
+                "{STUDY_NOTES_STATE_HOME_ENV} is required when {STUDY_NOTES_ALLOW_WRITE_ENV} is enabled"
+            ),
+        });
+    }
+    let data_home = match state_home {
+        Some(state_home) => {
+            state_home
+                .canonicalize()
+                .map_err(|error| ConfigError::InvalidConfig {
+                    reason: format!(
+                        "{STUDY_NOTES_STATE_HOME_ENV} path '{}': {error}",
+                        state_home.display()
+                    ),
+                })?
+        }
+        None => home.clone(),
+    };
+    if state_home.is_some() && (data_home.starts_with(&home) || home.starts_with(&data_home)) {
+        return Err(ConfigError::InvalidConfig {
+            reason: "Study Notes code and state directories must not overlap".to_string(),
+        });
+    }
+    let database = canonical_study_notes_entry(&data_home.join("agent-notes.sqlite3"))?;
+    let notes = canonical_study_notes_entry(&data_home.join("agent-notes-by-agent"))?;
+    if !database.starts_with(&data_home) || !notes.starts_with(&data_home) {
+        return Err(ConfigError::InvalidConfig {
+            reason: "Study Notes database and notes must remain inside their data directory"
+                .to_string(),
+        });
+    }
+    if !database.is_file() {
+        return Err(ConfigError::InvalidConfig {
+            reason: format!("Study Notes file missing: {}", database.display()),
+        });
     }
     if !notes.is_dir() {
         return Err(ConfigError::InvalidConfig {
@@ -344,21 +462,158 @@ pub fn study_notes_server_from_home(home: &Path) -> Result<McpServerConfig, Conf
                 reason: format!("Study Notes path is not valid UTF-8: {}", path.display()),
             })
     };
-    Ok(McpServerConfig::new_stdio(
+    let mut args = vec![
+        path_arg(&server)?,
+        "--db".to_string(),
+        path_arg(&database)?,
+        "--notes".to_string(),
+        path_arg(&notes)?,
+    ];
+    if allow_write {
+        args.push("--allow-write".to_string());
+    }
+    let mode = if allow_write {
+        "read-write"
+    } else {
+        "read-only"
+    };
+    let mut config = McpServerConfig::new_stdio(
         STUDY_NOTES_SERVER_NAME,
         "python3",
-        vec![
-            path_arg(&server)?,
-            "--db".to_string(),
-            path_arg(&database)?,
-            "--notes".to_string(),
-            path_arg(&notes)?,
-        ],
+        args,
         HashMap::new(),
     )
-    .with_description(
-        "Shared read-only LunarWing codebase study notes (managed by LW2STUDYMCP_HOME)",
-    ))
+    .with_description(format!(
+        "{STUDY_NOTES_MANAGED_DESCRIPTION_PREFIX} ({mode}; managed by {STUDY_NOTES_HOME_ENV})"
+    ));
+    if allow_write {
+        config = config.with_always_require_approval(STUDY_NOTES_WRITE_TOOLS);
+    }
+    Ok(config)
+}
+
+fn is_managed_study_notes_server(config: &McpServerConfig) -> bool {
+    config.name == STUDY_NOTES_SERVER_NAME
+        && config.description.as_deref().is_some_and(|description| {
+            description.starts_with(STUDY_NOTES_MANAGED_DESCRIPTION_PREFIX)
+                || description == LEGACY_STUDY_NOTES_DESCRIPTION
+        })
+}
+
+fn managed_study_notes_is_writable(config: &McpServerConfig) -> bool {
+    is_managed_study_notes_server(config)
+        && (!config.always_require_approval.is_empty()
+            || matches!(
+                config.effective_transport(),
+                EffectiveTransport::Stdio { args, .. }
+                    if args.iter().any(|arg| arg == "--allow-write")
+            ))
+}
+
+/// Enforce live environment opt-in whenever a persisted managed writer is activated.
+pub fn validate_managed_study_notes_runtime(config: &McpServerConfig) -> Result<(), ConfigError> {
+    let allow_write =
+        parse_study_notes_allow_write(std::env::var_os(STUDY_NOTES_ALLOW_WRITE_ENV).as_deref())?;
+    let home = std::env::var_os(STUDY_NOTES_HOME_ENV);
+    let state_home = std::env::var_os(STUDY_NOTES_STATE_HOME_ENV);
+    validate_managed_study_notes_runtime_settings(
+        config,
+        allow_write,
+        home.as_deref().map(Path::new),
+        state_home.as_deref().map(Path::new),
+    )
+}
+
+fn validate_managed_study_notes_runtime_settings(
+    config: &McpServerConfig,
+    allow_write: bool,
+    home: Option<&Path>,
+    state_home: Option<&Path>,
+) -> Result<(), ConfigError> {
+    if !managed_study_notes_is_writable(config) {
+        return Ok(());
+    }
+    if !allow_write {
+        return Err(ConfigError::InvalidConfig {
+            reason: format!(
+                "Managed Study Notes write mode requires live {STUDY_NOTES_ALLOW_WRITE_ENV}=1"
+            ),
+        });
+    }
+    let home = home.ok_or_else(|| ConfigError::InvalidConfig {
+        reason: format!("Managed Study Notes write mode requires {STUDY_NOTES_HOME_ENV}"),
+    })?;
+    let state_home = state_home.ok_or_else(|| ConfigError::InvalidConfig {
+        reason: format!("Managed Study Notes write mode requires {STUDY_NOTES_STATE_HOME_ENV}"),
+    })?;
+    let expected = study_notes_server_from_home(home, Some(state_home), true)?;
+    if serde_json::to_value(&config.transport)? != serde_json::to_value(&expected.transport)?
+        || config.always_require_approval != expected.always_require_approval
+    {
+        return Err(ConfigError::InvalidConfig {
+            reason: "Persisted Study Notes writer does not match live code/state configuration"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Remove a managed Study Notes server from this startup snapshot after config failure.
+pub fn suppress_managed_study_notes_server(servers: &mut McpServersFile) -> bool {
+    let managed = servers
+        .get(STUDY_NOTES_SERVER_NAME)
+        .is_some_and(is_managed_study_notes_server);
+    managed && servers.remove(STUDY_NOTES_SERVER_NAME)
+}
+
+/// Suppress persisted managed write mode unless live environment explicitly reconciles it.
+pub fn suppress_unapproved_managed_study_notes_write(servers: &mut McpServersFile) -> bool {
+    let writable = servers
+        .get(STUDY_NOTES_SERVER_NAME)
+        .is_some_and(managed_study_notes_is_writable);
+    writable && servers.remove(STUDY_NOTES_SERVER_NAME)
+}
+
+fn apply_managed_study_notes_config(
+    servers: &mut McpServersFile,
+    mut config: McpServerConfig,
+) -> Option<McpServerConfig> {
+    if let Some(existing) = servers.get(STUDY_NOTES_SERVER_NAME) {
+        if !is_managed_study_notes_server(existing) {
+            return None;
+        }
+        config.enabled = existing.enabled;
+    }
+    servers.upsert(config.clone());
+    Some(config)
+}
+
+/// Create or refresh the managed Study Notes config without replacing a user-owned server.
+pub async fn reconcile_managed_study_notes_server(
+    store: Option<&dyn crate::db::Database>,
+    owner_id: &str,
+    servers: &mut McpServersFile,
+    config: McpServerConfig,
+) -> Result<bool, ConfigError> {
+    let reconciled = if let Some(store) = store {
+        mutate_mcp_servers_db(store, owner_id, |latest| {
+            Ok(apply_managed_study_notes_config(latest, config.clone()))
+        })
+        .await?
+    } else {
+        let _config_guard = acquire_mcp_config_write_guard().await?;
+        let mut latest = load_mcp_servers().await?;
+        let reconciled = apply_managed_study_notes_config(&mut latest, config);
+        if reconciled.is_some() {
+            save_mcp_servers(&latest).await?;
+        }
+        reconciled
+    };
+    let Some(config) = reconciled else {
+        return Ok(false);
+    };
+    servers.upsert(config);
+    Ok(true)
 }
 
 /// OAuth 2.1 configuration for an MCP server.
@@ -1005,14 +1260,12 @@ mod tests {
     #[test]
     fn study_notes_config_is_read_only_stdio() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("study_notes_mcp.py"), "").unwrap();
-        std::fs::write(dir.path().join("memorydb.py"), "").unwrap();
-        std::fs::write(dir.path().join("agent-notes.sqlite3"), "").unwrap();
-        std::fs::create_dir(dir.path().join("agent-notes-by-agent")).unwrap();
+        create_study_notes_fixture(dir.path());
 
-        let config = study_notes_server_from_home(dir.path()).unwrap();
+        let config = study_notes_server_from_home(dir.path(), None, false).unwrap();
         assert_eq!(config.name, STUDY_NOTES_SERVER_NAME);
         assert!(config.enabled);
+        assert!(config.always_require_approval.is_empty());
         match config.effective_transport() {
             EffectiveTransport::Stdio { command, args, env } => {
                 assert_eq!(command, "python3");
@@ -1028,8 +1281,157 @@ mod tests {
     #[test]
     fn study_notes_config_rejects_incomplete_checkout() {
         let dir = tempdir().unwrap();
-        let error = study_notes_server_from_home(dir.path()).unwrap_err();
+        let error = study_notes_server_from_home(dir.path(), None, false).unwrap_err();
         assert!(error.to_string().contains("study_notes_mcp.py"));
+    }
+
+    #[test]
+    fn study_notes_write_config_uses_separate_state_and_forces_approval() {
+        let code = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        create_study_notes_fixture(code.path());
+        std::fs::write(state.path().join("agent-notes.sqlite3"), "").unwrap();
+        std::fs::create_dir(state.path().join("agent-notes-by-agent")).unwrap();
+
+        let config = study_notes_server_from_home(code.path(), Some(state.path()), true).unwrap();
+        assert_eq!(
+            config.always_require_approval,
+            STUDY_NOTES_WRITE_TOOLS.map(str::to_string)
+        );
+        assert!(
+            validate_managed_study_notes_runtime_settings(
+                &config,
+                false,
+                Some(code.path()),
+                Some(state.path())
+            )
+            .is_err()
+        );
+        assert!(
+            validate_managed_study_notes_runtime_settings(&config, true, Some(code.path()), None)
+                .is_err()
+        );
+        validate_managed_study_notes_runtime_settings(
+            &config,
+            true,
+            Some(code.path()),
+            Some(state.path()),
+        )
+        .unwrap();
+        match config.effective_transport() {
+            EffectiveTransport::Stdio { args, .. } => {
+                assert!(args.iter().any(|arg| arg == "--allow-write"));
+                assert!(
+                    args.iter()
+                        .any(|arg| arg.starts_with(state.path().to_str().unwrap()))
+                );
+                assert!(!args.iter().any(|arg| {
+                    arg.starts_with(code.path().to_str().unwrap())
+                        && arg.ends_with("agent-notes.sqlite3")
+                }));
+            }
+            other => panic!("expected stdio config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn study_notes_write_config_requires_separate_state() {
+        let dir = tempdir().unwrap();
+        create_study_notes_fixture(dir.path());
+
+        let missing = study_notes_server_from_home(dir.path(), None, true).unwrap_err();
+        assert!(missing.to_string().contains(STUDY_NOTES_STATE_HOME_ENV));
+        let overlapping =
+            study_notes_server_from_home(dir.path(), Some(dir.path()), true).unwrap_err();
+        assert!(overlapping.to_string().contains("must not overlap"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn study_notes_config_rejects_symlinked_executable() {
+        use std::os::unix::fs::symlink;
+
+        let code = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        create_study_notes_fixture(code.path());
+        std::fs::write(outside.path().join("server.py"), "").unwrap();
+        std::fs::remove_file(code.path().join("study_notes_mcp.py")).unwrap();
+        symlink(
+            outside.path().join("server.py"),
+            code.path().join("study_notes_mcp.py"),
+        )
+        .unwrap();
+
+        let error = study_notes_server_from_home(code.path(), None, false).unwrap_err();
+        assert!(error.to_string().contains("must not be a symlink"));
+    }
+
+    #[test]
+    fn study_notes_write_opt_in_is_strict() {
+        assert!(!parse_study_notes_allow_write(None).unwrap());
+        assert!(parse_study_notes_allow_write(Some(OsStr::new("true"))).unwrap());
+        assert!(!parse_study_notes_allow_write(Some(OsStr::new("off"))).unwrap());
+        assert!(parse_study_notes_allow_write(Some(OsStr::new("sometimes"))).is_err());
+    }
+
+    #[test]
+    fn managed_study_notes_refresh_preserves_disabled_state() {
+        let code = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        create_study_notes_fixture(code.path());
+        std::fs::write(state.path().join("agent-notes.sqlite3"), "").unwrap();
+        std::fs::create_dir(state.path().join("agent-notes-by-agent")).unwrap();
+
+        let mut existing = study_notes_server_from_home(code.path(), None, false).unwrap();
+        existing.description = Some(LEGACY_STUDY_NOTES_DESCRIPTION.to_string());
+        existing.enabled = false;
+        let mut servers = McpServersFile::default();
+        servers.upsert(existing);
+        let generated =
+            study_notes_server_from_home(code.path(), Some(state.path()), true).unwrap();
+
+        let replacement = apply_managed_study_notes_config(&mut servers, generated)
+            .expect("managed config should refresh");
+        assert!(!replacement.enabled);
+        assert!(
+            replacement
+                .always_require_approval
+                .contains(&"knowledge_submit_note".to_string())
+        );
+        let mut persisted_write = McpServersFile::default();
+        persisted_write.upsert(replacement);
+        assert!(suppress_unapproved_managed_study_notes_write(
+            &mut persisted_write
+        ));
+        assert!(suppress_managed_study_notes_server(&mut servers));
+        assert!(servers.get(STUDY_NOTES_SERVER_NAME).is_none());
+    }
+
+    #[test]
+    fn managed_study_notes_refresh_does_not_replace_custom_server() {
+        let mut servers = McpServersFile::default();
+        servers.upsert(
+            McpServerConfig::new_stdio(
+                STUDY_NOTES_SERVER_NAME,
+                "custom-server",
+                Vec::new(),
+                HashMap::new(),
+            )
+            .with_description("Operator-owned Study Notes server"),
+        );
+        let generated = servers.get(STUDY_NOTES_SERVER_NAME).unwrap().clone();
+
+        assert!(apply_managed_study_notes_config(&mut servers, generated).is_none());
+        assert!(!suppress_managed_study_notes_server(&mut servers));
+        assert!(!suppress_unapproved_managed_study_notes_write(&mut servers));
+        assert!(servers.get(STUDY_NOTES_SERVER_NAME).is_some());
+    }
+
+    fn create_study_notes_fixture(path: &Path) {
+        std::fs::write(path.join("study_notes_mcp.py"), "").unwrap();
+        std::fs::write(path.join("memorydb.py"), "").unwrap();
+        std::fs::write(path.join("agent-notes.sqlite3"), "").unwrap();
+        std::fs::create_dir(path.join("agent-notes-by-agent")).unwrap();
     }
 
     #[tokio::test]
@@ -1460,6 +1862,7 @@ mod tests {
         assert_eq!(config.url, "https://mcp.notion.com");
         assert!(config.transport.is_none());
         assert!(config.headers.is_empty());
+        assert!(config.always_require_approval.is_empty());
         assert!(matches!(
             config.effective_transport(),
             EffectiveTransport::Http
