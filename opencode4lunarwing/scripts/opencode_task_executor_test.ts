@@ -10,6 +10,7 @@ interface MockOptions {
   pendingEvents?: boolean
   parts?: Array<{ type: string; text?: string }>
   promptError?: Error
+  assistantErrors?: Array<unknown | undefined>
 }
 
 function makeSdk(options: MockOptions = {}) {
@@ -33,9 +34,10 @@ function makeSdk(options: MockOptions = {}) {
       prompt: async (...args: unknown[]) => {
         promptArgs.push(args)
         if (options.promptError) throw options.promptError
+        const assistantError = options.assistantErrors?.[promptArgs.length - 1]
         return {
           data: {
-            info: {},
+            info: assistantError ? { error: assistantError } : {},
             parts: options.parts ?? [{ type: "text", text: "done" }],
           },
         }
@@ -106,6 +108,70 @@ const rejected = await runTask(makeSdk({ promptError: new Error("provider failed
 assert.equal(rejected.status, "error")
 assert.equal(rejected.error, "provider failed")
 
+const savedRetryDelay = process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
+process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = "0"
+const retrying = makeSdk({
+  events: [
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+  ],
+  assistantErrors: [
+    { message: "Model longcat2_nanogpt timed out due to configured `streaming.total_ms` timeout (550s)" },
+    undefined,
+  ],
+})
+const retryProgress: string[] = []
+const retryResults: Array<{ status: string; error: string | null }> = []
+await executeTask(
+  { task_id: "task-retry", prompt: "continue the work" },
+  (progress) => retryProgress.push(progress.delta),
+  (result) => retryResults.push(result),
+  undefined,
+  retrying.sdk,
+)
+assert.equal(retryResults.length, 1)
+assert.equal(retryResults[0]!.status, "success")
+assert.equal(retrying.promptArgs.length, 2)
+assert.match(retryProgress[0]!, /retrying same OpenCode session \(1\/2\)/)
+assert.deepEqual(retrying.promptArgs[1], [
+  {
+    sessionID: "session-1",
+    parts: [
+      {
+        type: "text",
+        text:
+          "The previous model request timed out. Continue this task from the current session and " +
+          "workspace state. Do not repeat completed work. Inspect existing changes and proceed from " +
+          "the next incomplete step.",
+      },
+    ],
+  },
+  { throwOnError: true },
+])
+
+const sessionRetrying = makeSdk({
+  events: [
+    {
+      type: "session.error",
+      properties: {
+        sessionID: "session-1",
+        error: { message: "upstream provider timed out" },
+      },
+    },
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+  ],
+})
+const sessionRetryResult = await runTask(sessionRetrying.sdk)
+assert.equal(sessionRetryResult.status, "success")
+assert.equal(sessionRetrying.promptArgs.length, 2)
+
+if (savedRetryDelay === undefined) {
+  delete process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
+} else {
+  process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = savedRetryDelay
+}
+
 const permission = makeSdk({
   events: [
     {
@@ -121,17 +187,26 @@ assert.equal(permission.v2ReplyCount(), 1)
 
 const timeout = makeSdk({ pendingEvents: true })
 const timeoutResults: Array<{ status: string; error: string | null }> = []
+const timeoutProgress: string[] = []
+const savedHeartbeat = process.env.OPENCODE_PROGRESS_HEARTBEAT_MS
+process.env.OPENCODE_PROGRESS_HEARTBEAT_MS = "2"
 await executeTask(
   { task_id: "task-timeout", prompt: "test", timeout_ms: 10 },
-  () => {},
+  (progress) => timeoutProgress.push(progress.delta),
   (result) => timeoutResults.push(result),
   undefined,
   timeout.sdk,
 )
+if (savedHeartbeat === undefined) {
+  delete process.env.OPENCODE_PROGRESS_HEARTBEAT_MS
+} else {
+  process.env.OPENCODE_PROGRESS_HEARTBEAT_MS = savedHeartbeat
+}
 assert.equal(timeoutResults.length, 1)
 assert.equal(timeoutResults[0]!.status, "error")
 assert.equal(timeoutResults[0]!.error, "Task timed out after 10ms")
 assert.equal(timeout.abortCount(), 1)
+assert.match(timeoutProgress[0]!, /task remains active/)
 
 const contextPrompt = makeSdk()
 await runTask(contextPrompt.sdk, {

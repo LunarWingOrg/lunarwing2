@@ -41,6 +41,12 @@ of leaving it running in the container.
 Job metadata and progress events are persisted by LunarWing. After a daemon restart,
 running jobs are reported as `interrupted`, while `list_jobs`, `job_status`, and
 `job_events` can still read their saved status and event history from the database.
+Transient provider streaming timeouts are retried twice in the same OpenCode session
+by default, preserving completed workspace work without resetting the overall task
+deadline. Configure this with `OPENCODE_PROVIDER_MAX_RETRIES` (0-5) and
+`OPENCODE_PROVIDER_RETRY_DELAY_MS` (0-60000). While inference is otherwise
+silent, the worker emits a persisted progress heartbeat every 60 seconds;
+configure or disable it with `OPENCODE_PROGRESS_HEARTBEAT_MS` (0-300000).
 
 ## Usage
 

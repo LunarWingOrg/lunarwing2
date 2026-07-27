@@ -20,9 +20,39 @@ const OPENCODE_HOST = process.env.OPENCODE_SERVE_HOST || "127.0.0.1"
 const OPENCODE_PORT = process.env.OPENCODE_SERVE_PORT || "4096"
 const OPENCODE_BASE_URL = `http://${OPENCODE_HOST}:${OPENCODE_PORT}`
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
+const RETRY_PROMPT =
+  "The previous model request timed out. Continue this task from the current session and " +
+  "workspace state. Do not repeat completed work. Inspect existing changes and proceed from " +
+  "the next incomplete step."
 
 function getPassword(): string | undefined {
   return process.env.OPENCODE_SERVER_PASSWORD
+}
+
+function boundedEnvInteger(name: string, fallback: number, min: number, max: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? "", 10)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.min(max, Math.max(min, parsed))
+}
+
+function providerMaxRetries(): number {
+  return boundedEnvInteger("OPENCODE_PROVIDER_MAX_RETRIES", 2, 0, 5)
+}
+
+function providerRetryDelayMs(): number {
+  return boundedEnvInteger("OPENCODE_PROVIDER_RETRY_DELAY_MS", 5_000, 0, 60_000)
+}
+
+function progressHeartbeatMs(): number {
+  return boundedEnvInteger("OPENCODE_PROGRESS_HEARTBEAT_MS", 60_000, 0, 300_000)
+}
+
+function isRetryableProviderError(message: string): boolean {
+  return (
+    /streaming\.total_ms/i.test(message) ||
+    /\bprovider\b.*\btimed?\s*out\b/i.test(message) ||
+    /\bupstream\b.*\btimed?\s*out\b/i.test(message)
+  )
 }
 
 function createSdk(directory?: string): OpencodeClient {
@@ -52,6 +82,9 @@ export async function executeTask(
 ): Promise<void> {
   const startTime = Date.now()
   const timeoutMs = request.timeout_ms ?? DEFAULT_TIMEOUT_MS
+  const maxProviderRetries = providerMaxRetries()
+  const retryDelayMs = providerRetryDelayMs()
+  const heartbeatMs = progressHeartbeatMs()
   const workDir = request.context?.project_dir
     ? resolveWorkDir(request.context.project_dir)
     : WORKSPACE_ROOT
@@ -69,9 +102,19 @@ export async function executeTask(
   const sdk = sdkOverride ?? createSdk(workDir)
   let sessionID: string | undefined
   let output = ""
-  let sawSessionError = false
-  let sessionErrorMsg = ""
   let deniedPermissions = 0
+  let lastProgressAt = Date.now()
+  const emitProgress = (delta: string) => {
+    lastProgressAt = Date.now()
+    onProgress({ task_id: request.task_id, delta, done: false })
+  }
+  const progressHeartbeat =
+    heartbeatMs > 0
+      ? setInterval(() => {
+          if (Date.now() - lastProgressAt < heartbeatMs) return
+          emitProgress("[worker] Still waiting for OpenCode/model response; task remains active.")
+        }, heartbeatMs)
+      : undefined
 
   type StopReason = "timeout" | "cancelled"
   let resolveStop: (reason: StopReason) => void = () => {}
@@ -106,123 +149,147 @@ export async function executeTask(
     }
 
     const events = await sdk.event.subscribe()
-
-    // Attach rejection handling immediately so a provider/API error cannot
-    // become an unhandled rejection while the SSE loop is still draining.
-    const promptPromise = sdk.session
-      .prompt(
-        {
-          sessionID,
-          parts: [{ type: "text", text: buildTaskPrompt(request) }],
-        },
-        { throwOnError: true },
-      )
-      .then(
-        (result) => ({ result }),
-        (error: unknown) => ({ error }),
-      )
-
     const eventIterator = events.stream[Symbol.asyncIterator]()
     let stopReason: StopReason | undefined
+    let finalPromptData: Awaited<ReturnType<typeof sdk.session.prompt>>["data"] | undefined
 
-    while (!stopReason) {
-      const next = await Promise.race([
-        stopPromise.then((reason) => ({ kind: "stop" as const, reason })),
-        eventIterator.next().then((result) => ({ kind: "event" as const, result })),
-      ])
-      if (next.kind === "stop") {
-        stopReason = next.reason
-        break
-      }
-      if (next.result.done) break
-      const event = next.result.value
+    for (let attempt = 0; ; attempt++) {
+      let sessionErrorMsg = ""
+      const promptText = attempt === 0 ? buildTaskPrompt(request) : RETRY_PROMPT
+      // Attach rejection handling immediately so a provider/API error cannot
+      // become an unhandled rejection while the SSE loop is still draining.
+      const promptPromise = sdk.session
+        .prompt(
+          {
+            sessionID,
+            parts: [{ type: "text", text: promptText }],
+          },
+          { throwOnError: true },
+        )
+        .then(
+          (result) => ({ result }),
+          (error: unknown) => ({ error }),
+        )
+      const promptFailure = promptPromise.then((outcome) => {
+        if (!("error" in outcome)) return new Promise<never>(() => {})
+        return { kind: "prompt_error" as const }
+      })
 
-      if (event.type === "message.part.updated") {
-        const part = event.properties.part
-        if (part.sessionID !== sessionID) continue
+      while (!stopReason) {
+        const next = await Promise.race([
+          stopPromise.then((reason) => ({ kind: "stop" as const, reason })),
+          promptFailure,
+          eventIterator.next().then((result) => ({ kind: "event" as const, result })),
+        ])
+        if (next.kind === "stop") {
+          stopReason = next.reason
+          break
+        }
+        if (next.kind === "prompt_error") break
+        if (next.result.done) break
+        const event = next.result.value
 
-        if (part.type === "text" && part.time?.end) {
-          const text = part.text?.trim()
-          if (text) {
-            output += text + "\n"
-            onProgress({
-              task_id: request.task_id,
-              delta: text,
-              done: false,
-            })
+        if (event.type === "message.part.updated") {
+          const part = event.properties.part
+          if (part.sessionID !== sessionID) continue
+
+          if (part.type === "text" && part.time?.end) {
+            const text = part.text?.trim()
+            if (text) {
+              output += text + "\n"
+              emitProgress(text)
+            }
+          }
+
+          if (part.type === "tool" && part.state?.status === "completed") {
+            const toolOutput = part.state.output?.trim()
+            const toolName = part.tool || "unknown"
+            const delta = `[${toolName}] ${toolOutput || "completed"}`
+            output += delta + "\n"
+            emitProgress(delta)
+          }
+
+          if (part.type === "tool" && part.state?.status === "error") {
+            const toolName = part.tool || "unknown"
+            const delta = `[${toolName}] ERROR: ${part.state.error}`
+            output += delta + "\n"
+            emitProgress(delta)
           }
         }
 
-        if (part.type === "tool" && part.state?.status === "completed") {
-          const toolOutput = part.state.output?.trim()
-          const toolName = part.tool || "unknown"
-          const delta = `[${toolName}] ${toolOutput || "completed"}`
-          output += delta + "\n"
-          onProgress({
-            task_id: request.task_id,
-            delta,
-            done: false,
-          })
+        if (event.type === "session.error") {
+          if (event.properties.sessionID !== sessionID) continue
+          if (!sessionErrorMsg) sessionErrorMsg = opencodeErrorMessage(event.properties.error)
         }
 
-        if (part.type === "tool" && part.state?.status === "error") {
-          const toolName = part.tool || "unknown"
-          const delta = `[${toolName}] ERROR: ${part.state.error}`
-          output += delta + "\n"
-          onProgress({
-            task_id: request.task_id,
-            delta,
-            done: false,
-          })
+        if (event.type === "permission.asked") {
+          if (event.properties.sessionID !== sessionID) continue
+          // Reject anything not granted by the session allow-policy above.
+          deniedPermissions++
+          await sdk.permission.reply(
+            {
+              requestID: event.properties.id,
+              reply: "reject",
+            },
+            { throwOnError: true },
+          )
+        }
+
+        if (event.type === "permission.v2.asked") {
+          if (event.properties.sessionID !== sessionID) continue
+          deniedPermissions++
+          await sdk.v2.session.permission.reply(
+            {
+              sessionID,
+              requestID: event.properties.id,
+              reply: "reject",
+            },
+            { throwOnError: true },
+          )
+        }
+
+        if (
+          (event.type === "session.status" &&
+            event.properties.sessionID === sessionID &&
+            event.properties.status?.type === "idle") ||
+          (event.type === "session.idle" && event.properties.sessionID === sessionID)
+        ) {
+          break
         }
       }
 
-      if (event.type === "session.error") {
-        if (event.properties.sessionID !== sessionID) continue
-        const err = event.properties.error
-        const errMsg = opencodeErrorMessage(err)
-        output += `ERROR: ${errMsg}\n`
-        sawSessionError = true
-        if (!sessionErrorMsg) sessionErrorMsg = errMsg
+      if (stopReason) break
+
+      const promptOutcome = await promptPromise
+      const promptData = "result" in promptOutcome ? promptOutcome.result.data : undefined
+      const promptError =
+        ("error" in promptOutcome ? opencodeErrorMessage(promptOutcome.error) : "") ||
+        (promptData?.info.error ? opencodeErrorMessage(promptData.info.error) : "") ||
+        sessionErrorMsg
+
+      if (!promptError) {
+        finalPromptData = promptData
+        break
       }
 
-      if (event.type === "permission.asked") {
-        if (event.properties.sessionID !== sessionID) continue
-        // This rejects every runtime permission prompt — a safety net for
-        // anything NOT already granted by the session.create allow-policy above.
-        // If that policy's shape is wrong (unverified vs the real opencode SDK —
-        // see DEFERRED-2026-07-02-OPENCODE-EXTERNAL-WORKER.md), every action
-        // falls through to here and is denied, so the task does nothing. Count
-        // denials so we fail loudly below instead of reporting a false success.
-        deniedPermissions++
-        await sdk.permission.reply(
-          {
-            requestID: event.properties.id,
-            reply: "reject",
-          },
-          { throwOnError: true },
-        )
+      if (!isRetryableProviderError(promptError) || attempt >= maxProviderRetries) {
+        throw new Error(promptError)
       }
 
-      if (event.type === "permission.v2.asked") {
-        if (event.properties.sessionID !== sessionID) continue
-        deniedPermissions++
-        await sdk.v2.session.permission.reply(
-          {
-            sessionID,
-            requestID: event.properties.id,
-            reply: "reject",
-          },
-          { throwOnError: true },
-        )
-      }
+      const retryNumber = attempt + 1
+      const delta =
+        `[worker] Provider request timed out; retrying same OpenCode session ` +
+        `(${retryNumber}/${maxProviderRetries}).`
+      output += `ERROR: ${promptError}\n${delta}\n`
+      emitProgress(delta)
+      console.warn(`[opencode_task_executor] task ${request.task_id}: ${delta} ${promptError}`)
 
-      if (
-        (event.type === "session.status" &&
-          event.properties.sessionID === sessionID &&
-          event.properties.status?.type === "idle") ||
-        (event.type === "session.idle" && event.properties.sessionID === sessionID)
-      ) {
+      const delayResult = await Promise.race([
+        new Promise<undefined>((resolve) => setTimeout(resolve, retryDelayMs)),
+        stopPromise,
+      ])
+      if (delayResult) {
+        stopReason = delayResult
         break
       }
     }
@@ -247,30 +314,9 @@ export async function executeTask(
       return
     }
 
-    const promptOutcome = await promptPromise
-    if ("error" in promptOutcome) throw promptOutcome.error
-
-    const promptData = promptOutcome.result.data
-    const assistantError = promptData?.info.error
-    if (assistantError) {
-      throw new Error(opencodeErrorMessage(assistantError))
-    }
-
-    const canonicalOutput = extractAssistantText(promptData?.parts)
+    const canonicalOutput = extractAssistantText(finalPromptData?.parts)
     const resultOutput = canonicalOutput || output.trim()
     const durationMs = Date.now() - startTime
-
-    // Honest result: a session error must not be reported as success.
-    if (sawSessionError) {
-      onResult({
-        task_id: request.task_id,
-        status: "error",
-        output: output.trim(),
-        error: sessionErrorMsg || "opencode session reported an error",
-        duration_ms: durationMs,
-      })
-      return
-    }
 
     // If every permission was denied and the task produced no output, it did
     // nothing — report that instead of a silent "success".
@@ -318,6 +364,7 @@ export async function executeTask(
     })
   } finally {
     clearTimeout(timeout)
+    if (progressHeartbeat) clearInterval(progressHeartbeat)
     abortSignal?.removeEventListener("abort", handleAbort)
     for (const key of injectedKeys) {
       if (savedValues[key] === undefined) {
