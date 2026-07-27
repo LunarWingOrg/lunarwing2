@@ -997,14 +997,15 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     }
 
     // Build centralized auth manager for pre-flight credential checks.
-    let has_secrets = agent.tools().secrets_store().is_some();
+    let secrets_store = agent.tools().secrets_store().cloned();
+    let has_secrets = secrets_store.is_some();
     let has_cred_reg = agent.tools().credential_registry().is_some();
     debug!(
         has_secrets_store = has_secrets,
         has_credential_registry = has_cred_reg,
         "engine v2: auth manager init check"
     );
-    let auth_manager = if let Some(ss) = agent.tools().secrets_store().cloned() {
+    let auth_manager = if let Some(ss) = secrets_store.clone() {
         // The local SkillRegistry (crate::skills::SkillRegistry) does not carry
         // credential specs (manifest.credentials), so passing None here is
         // semantically correct — there's nothing to look up.
@@ -1021,8 +1022,14 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         None
     };
 
-    let store = Arc::new(HybridStore::new(agent.workspace().cloned()));
-    store.load_state_from_workspace().await;
+    let store = Arc::new(HybridStore::new_with_secrets_store(
+        agent.workspace().cloned(),
+        secrets_store.clone(),
+    ));
+    store
+        .load_state_from_workspace()
+        .await
+        .map_err(|error| engine_err("load engine state", error))?;
 
     // Clean up completed threads and dead leases from prior runs
     let cleaned = store
@@ -1372,7 +1379,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         pending_gates,
         sse: agent.deps.sse_tx.clone(),
         db: agent.deps.store.clone(),
-        secrets_store: agent.tools().secrets_store().cloned(),
+        secrets_store,
         auth_manager,
         pending_gate_expiry,
     });
