@@ -12,7 +12,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use lunarwing_common::{PromptContextLimits, PromptContextMessage, select_prompt_context};
+use lunarwing_common::{
+    DEFAULT_WORKER_ITERATIONS, MAX_WORKER_ITERATIONS, PromptContextLimits, PromptContextMessage,
+    select_prompt_context,
+};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -114,6 +117,21 @@ fn external_job_wait(params: &serde_json::Value) -> bool {
         .get("wait")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+fn worker_max_iterations(params: &serde_json::Value) -> Result<u32, ToolError> {
+    let Some(value) = params.get("max_iterations") else {
+        return Ok(DEFAULT_WORKER_ITERATIONS);
+    };
+    let value = value.as_u64().ok_or_else(|| {
+        ToolError::InvalidParameters("max_iterations must be an integer".to_string())
+    })?;
+    if !(1..=u64::from(MAX_WORKER_ITERATIONS)).contains(&value) {
+        return Err(ToolError::InvalidParameters(format!(
+            "max_iterations must be between 1 and {MAX_WORKER_ITERATIONS}"
+        )));
+    }
+    Ok(value as u32)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,6 +421,7 @@ impl CreateJobTool {
         &self,
         title: &str,
         description: &str,
+        max_iterations: u32,
         ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
@@ -416,7 +435,12 @@ impl CreateJobTool {
             && let Some(ref scheduler) = *slot.read().await
         {
             return match scheduler
-                .dispatch_job(&ctx.user_id, title, description, None)
+                .dispatch_job(
+                    &ctx.user_id,
+                    title,
+                    description,
+                    Some(serde_json::json!({ "max_iterations": max_iterations })),
+                )
                 .await
             {
                 Ok(job_id) => {
@@ -424,6 +448,7 @@ impl CreateJobTool {
                         "job_id": job_id.to_string(),
                         "title": title,
                         "status": "in_progress",
+                        "max_iterations": max_iterations,
                         "message": format!("Created and scheduled job '{}'", title)
                     });
                     Ok(ToolOutput::success(result, start.elapsed()))
@@ -444,10 +469,17 @@ impl CreateJobTool {
             .await
         {
             Ok(job_id) => {
+                self.context_manager
+                    .update_context(job_id, |job| {
+                        job.metadata = serde_json::json!({ "max_iterations": max_iterations });
+                    })
+                    .await
+                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
                 let result = serde_json::json!({
                     "job_id": job_id.to_string(),
                     "title": title,
                     "status": "pending",
+                    "max_iterations": max_iterations,
                     "message": format!("Created job '{}' (not scheduled — scheduler unavailable)", title)
                 });
                 Ok(ToolOutput::success(result, start.elapsed()))
@@ -467,8 +499,8 @@ impl CreateJobTool {
         task: &str,
         explicit_dir: Option<PathBuf>,
         wait: bool,
-        mode: JobMode,
         credential_grants: Vec<CredentialGrant>,
+        max_iterations: u32,
         ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
@@ -505,6 +537,12 @@ impl CreateJobTool {
             .map_err(|e| {
                 ToolError::ExecutionFailed(format!("failed to register sandbox job: {}", e))
             })?;
+        self.context_manager
+            .update_context(job_id, |job| {
+                job.metadata = serde_json::json!({ "max_iterations": max_iterations });
+            })
+            .await
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
 
         // Persist the job to DB before creating the container.
         self.persist_job(SandboxJobRecord {
@@ -532,7 +570,14 @@ impl CreateJobTool {
 
         // Create the container job with the pre-determined job_id.
         let _token = jm
-            .create_job(job_id, task, Some(project_dir), mode, credential_grants)
+            .create_job(
+                job_id,
+                task,
+                Some(project_dir),
+                JobMode::Worker,
+                credential_grants,
+                max_iterations,
+            )
             .await
             .map_err(|e| {
                 self.update_status(
@@ -577,6 +622,7 @@ impl CreateJobTool {
             let result = serde_json::json!({
                 "job_id": job_id.to_string(),
                 "status": "started",
+                "max_iterations": max_iterations,
                 "message": "Container started. Use job_events to check status or job_prompt to send follow-up instructions.",
                 "project_dir": project_dir_str,
                 "browse_url": format!("/projects/{}", browse_id),
@@ -648,6 +694,7 @@ impl CreateJobTool {
                             let result = serde_json::json!({
                                 "job_id": job_id.to_string(),
                                 "status": "completed",
+                                "max_iterations": max_iterations,
                                 "output": message,
                                 "project_dir": project_dir_str,
                                 "browse_url": format!("/projects/{}", browse_id),
@@ -671,6 +718,7 @@ impl CreateJobTool {
                             let result = serde_json::json!({
                                 "job_id": job_id.to_string(),
                                 "status": "stuck",
+                                "max_iterations": max_iterations,
                                 "output": message,
                                 "project_dir": project_dir_str,
                                 "browse_url": format!("/projects/{}", browse_id),
@@ -1163,7 +1211,8 @@ impl Tool for CreateJobTool {
              skills, routines, or SSH hosts; do not search for or install them. Put the complete task \
              in description. External jobs default to asynchronous dispatch so long tasks outlive \
              the current conversation turn; set wait=true only when a synchronous result is \
-             required. External worker deadlines come from worker \
+             required. Local and Docker workers default to 200 iterations; use max_iterations=300 \
+             or higher for large multi-fix write tasks. External worker deadlines come from worker \
              configuration and are returned as timeout_ms; the 30-second local-job default does \
              not apply."
         } else if self.sandbox_enabled() {
@@ -1171,11 +1220,13 @@ impl Tool for CreateJobTool {
              sub-agent that has shell, file read/write, list_dir, and apply_patch tools. Use this \
              whenever the user asks you to build, create, or work on something. The task \
              description should be detailed enough for the sub-agent to work independently. \
+             Jobs default to 200 iterations; use max_iterations=300 or higher for large multi-fix work. \
              Jobs default to wait=true so the conversation blocks until the container exits. \
              Set wait=false if you want the conversation to stay responsive while they stream progress."
         } else {
             "Create a new job or task for the agent to work on. Use this when the user wants \
-             you to do something substantial that should be tracked as a separate job."
+             you to do something substantial that should be tracked as a separate job. Jobs default \
+             to 200 iterations; use max_iterations=300 or higher for large multi-fix write tasks."
         }
     }
 
@@ -1211,6 +1262,13 @@ impl Tool for CreateJobTool {
                                     secrets store (via 'lunarwing tool auth' or web UI). Example: \
                                     {\"github_token\": \"GITHUB_TOKEN\", \"npm_token\": \"NPM_TOKEN\"}",
                     "additionalProperties": { "type": "string" }
+                });
+                props["max_iterations"] = serde_json::json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_WORKER_ITERATIONS,
+                    "default": DEFAULT_WORKER_ITERATIONS,
+                    "description": "Iteration budget for local or Docker worker jobs. Use 300+ for large multi-fix write tasks. Named external workers do not support this option."
                 });
             }
 
@@ -1269,6 +1327,13 @@ impl Tool for CreateJobTool {
                     "description": {
                         "type": "string",
                         "description": "Full description of what needs to be done"
+                    },
+                    "max_iterations": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_WORKER_ITERATIONS,
+                        "default": DEFAULT_WORKER_ITERATIONS,
+                        "description": "Iteration budget for autonomous job execution. Use 300+ for large multi-fix write tasks."
                     }
                 },
                 "required": ["title", "description"]
@@ -1313,6 +1378,11 @@ impl Tool for CreateJobTool {
             if let Some(ref ewm) = self.external_worker_manager
                 && ewm.get_worker(mode_str).is_some()
             {
+                if params.get("max_iterations").is_some() {
+                    return Err(ToolError::InvalidParameters(format!(
+                        "max_iterations is not supported by named external worker '{mode_str}'"
+                    )));
+                }
                 let wait = external_job_wait(&params);
                 let context_scope = ExternalContextScope::parse(&params)?;
                 let project_dir = params
@@ -1353,7 +1423,7 @@ impl Tool for CreateJobTool {
         }
 
         if self.sandbox_enabled() {
-            let mode = JobMode::Worker;
+            let max_iterations = worker_max_iterations(&params)?;
 
             let wait = params.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
 
@@ -1367,10 +1437,19 @@ impl Tool for CreateJobTool {
 
             // Combine title and description into the task prompt for the sub-agent.
             let task = format!("{}\n\n{}", title, description);
-            self.execute_sandbox(&task, explicit_dir, wait, mode, credential_grants, ctx)
-                .await
+            self.execute_sandbox(
+                &task,
+                explicit_dir,
+                wait,
+                credential_grants,
+                max_iterations,
+                ctx,
+            )
+            .await
         } else {
-            self.execute_local(title, description, ctx).await
+            let max_iterations = worker_max_iterations(&params)?;
+            self.execute_local(title, description, max_iterations, ctx)
+                .await
         }
     }
 
@@ -2010,6 +2089,12 @@ mod tests {
             result.result.get("status").unwrap().as_str().unwrap(), // safety: test
             "pending"
         );
+        assert_eq!(result.result["max_iterations"], DEFAULT_WORKER_ITERATIONS);
+        let job_id = Uuid::parse_str(job_id).unwrap();
+        assert_eq!(
+            manager.get_context(job_id).await.unwrap().metadata["max_iterations"],
+            DEFAULT_WORKER_ITERATIONS
+        );
     }
 
     #[test]
@@ -2022,6 +2107,7 @@ mod tests {
         let props = schema.get("properties").unwrap().as_object().unwrap(); // safety: test
         assert!(props.contains_key("title")); // safety: test
         assert!(props.contains_key("description")); // safety: test
+        assert!(props.contains_key("max_iterations")); // safety: test
         assert!(!props.contains_key("wait")); // safety: test
         assert!(!props.contains_key("mode")); // safety: test
     }
@@ -2069,6 +2155,45 @@ mod tests {
             serde_json::json!(["none", "recent"])
         );
         assert_eq!(schema["properties"]["context_scope"]["default"], "none");
+        assert_eq!(
+            schema["properties"]["max_iterations"]["default"],
+            DEFAULT_WORKER_ITERATIONS
+        );
+        assert_eq!(
+            schema["properties"]["max_iterations"]["maximum"],
+            MAX_WORKER_ITERATIONS
+        );
+    }
+
+    #[tokio::test]
+    async fn named_external_worker_rejects_local_iteration_budget() {
+        use crate::config::{ExternalWorkerConfig, LoadBalanceStrategy};
+
+        let manager = Arc::new(ContextManager::new(5));
+        let workers = Arc::new(ExternalWorkerManager::new(vec![ExternalWorkerConfig {
+            name: "opencode".to_string(),
+            url: "ws://127.0.0.1:9/ws/agent".to_string(),
+            auth_token: None,
+            timeout_ms: 900_000,
+            endpoints: vec![],
+            load_balance: LoadBalanceStrategy::default(),
+            prompt_context: Default::default(),
+        }]));
+        let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "title": "Unsupported option",
+                    "description": "Do work",
+                    "mode": "opencode",
+                    "max_iterations": 300
+                }),
+                &JobContext::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not supported"));
     }
 
     #[test]
@@ -2076,6 +2201,26 @@ mod tests {
         assert!(!external_job_wait(&serde_json::json!({})));
         assert!(!external_job_wait(&serde_json::json!({ "wait": false })));
         assert!(external_job_wait(&serde_json::json!({ "wait": true })));
+    }
+
+    #[test]
+    fn worker_iteration_budget_defaults_and_validates_bounds() {
+        assert_eq!(
+            worker_max_iterations(&serde_json::json!({})).unwrap(),
+            DEFAULT_WORKER_ITERATIONS
+        );
+        assert_eq!(
+            worker_max_iterations(&serde_json::json!({"max_iterations": 300})).unwrap(),
+            300
+        );
+        assert!(worker_max_iterations(&serde_json::json!({"max_iterations": 0})).is_err());
+        assert!(
+            worker_max_iterations(
+                &serde_json::json!({"max_iterations": MAX_WORKER_ITERATIONS + 1})
+            )
+            .is_err()
+        );
+        assert!(worker_max_iterations(&serde_json::json!({"max_iterations": "300"})).is_err());
     }
 
     #[test]
@@ -2151,8 +2296,8 @@ mod tests {
                 "test task",
                 None,
                 false,
-                JobMode::Worker,
                 vec![],
+                DEFAULT_WORKER_ITERATIONS,
                 &JobContext::default(),
             )
             .await;

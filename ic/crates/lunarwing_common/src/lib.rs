@@ -18,3 +18,6 @@ pub use util::truncate_preview;
 /// clamp in `create_job_inner`) and the worker runtime (`worker/job.rs`).
 /// A single source of truth prevents the two from drifting.
 pub const MAX_WORKER_ITERATIONS: u32 = 500;
+
+/// Default iteration budget for autonomous local and Docker worker jobs.
+pub const DEFAULT_WORKER_ITERATIONS: u32 = 200;

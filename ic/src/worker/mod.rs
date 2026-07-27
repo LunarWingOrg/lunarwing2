@@ -103,7 +103,7 @@ pub async fn run_worker(
     let config = container::WorkerConfig {
         job_id,
         orchestrator_url: orchestrator_url.to_string(),
-        max_iterations,
+        max_iterations: max_iterations.clamp(1, lunarwing_common::MAX_WORKER_ITERATIONS),
         timeout: std::time::Duration::from_secs(600),
     };
 
