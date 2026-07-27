@@ -462,7 +462,7 @@ Sandbox containers route all HTTP traffic through the proxy, which enforces a do
 
 **Severity:** Low (for local deployment)
 **Details:** None of the listeners terminate TLS. All communication is plain HTTP.
-**Mitigation:** The web gateway and OAuth callback bind to loopback by default. For production, users are expected to front the gateway with a reverse proxy (nginx, Caddy) or tunnel (Cloudflare, ngrok) that provides TLS.
+**Mitigation:** The web gateway and OAuth callback bind to loopback by default. For production, users are expected to front the gateway with a TLS reverse proxy (such as nginx or Caddy), NetBird Reverse Proxy, a custom managed tunnel, or an externally managed HTTPS tunnel configured through `TUNNEL_URL`.
 **Recommendation:** Document the requirement for a TLS-terminating reverse proxy in deployment guides.
 
 #### F-3. Orchestrator binds to `0.0.0.0` on Linux
