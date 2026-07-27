@@ -55,14 +55,13 @@ class MockIRC:
         asyncio.create_task(self._pump_injections())
 
     async def _pump_injections(self):
-        # Proactively push queued DMs to the adapter's IRC stream (independent of
-        # the adapter sending anything), so /poll tests get reliable delivery.
+        # Proactively push queued IRC frames to the adapter's stream (independent
+        # of the adapter sending anything), so /poll tests get reliable delivery.
         while True:
-            dm = await self._inject_q.get()
+            line = await self._inject_q.get()
             if self._writer is not None:
-                payload = f":sender!u@h PRIVMSG {self.adapter_nick} :{dm}\r\n"
                 try:
-                    self._writer.write(payload.encode())
+                    self._writer.write((line + "\r\n").encode())
                     await self._writer.drain()
                 except (ConnectionError, OSError):
                     pass
@@ -92,7 +91,13 @@ class MockIRC:
             pass
 
     def inject_dm(self, text):
-        self._inject_q.put_nowait(text)
+        self._inject_q.put_nowait(
+            f":sender!u@h PRIVMSG {self.adapter_nick} :{text}"
+        )
+
+    def inject_raw(self, line):
+        """Inject an arbitrary IRC line verbatim (for malformed-input tests)."""
+        self._inject_q.put_nowait(line)
 
     async def stop(self):
         if self._writer:
@@ -282,6 +287,28 @@ class AdapterIntegrationTest(unittest.IsolatedAsyncioTestCase):
         for body in (None, b"{}", b"not-json"):
             status, _ = await self.H("POST", "/ack", token=self.secret, body=body)
             self.assertEqual(status, 400)
+
+    async def test_irc_loop_survives_malformed_and_control_char_lines(self):
+        # Regression: a prefix-only line (parse_line unpack) or a control-char
+        # PING token (pong -> _send control-char guard) raised an uncaught
+        # ValueError that killed the IRC loop, silently stopping ALL inbound and
+        # paced outbound delivery while /health kept reporting the adapter up.
+        # Feed both, then a normal DM, and confirm the DM still reaches /poll —
+        # proving the loop survived the hostile input.
+        self.irc.inject_raw(":foo")                 # prefix, no command
+        self.irc.inject_raw("PING :tok\x01en")      # control char in PING token
+        self.irc.inject_dm("still alive")
+
+        got = False
+        for _ in range(40):
+            await asyncio.sleep(0.2)
+            _, body = await self.H("GET", "/poll", token=self.secret)
+            if any(m["text"] == "still alive" for m in body["messages"]):
+                got = True
+                break
+        self.assertTrue(
+            got, "IRC loop died: DM sent after malformed input never arrived"
+        )
 
     async def test_send_forwards_privmsg(self):
         s, body = await self.H(

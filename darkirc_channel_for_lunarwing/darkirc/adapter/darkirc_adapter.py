@@ -156,7 +156,11 @@ class IRCClient:
         return line
 
     async def pong(self, token: str):
-        await self._send(f"PONG :{token}")
+        # The PONG token echoes the (possibly hostile or corrupt) PING token.
+        # _send rejects any control character in a frame, so strip them here —
+        # otherwise a PING whose token contains a control char would raise and
+        # take down the IRC loop.
+        await self._send(f"PONG :{_CTRL_RE.sub('', token)}")
 
     async def close(self):
         self._connected = False
@@ -171,7 +175,10 @@ class IRCClient:
     def parse_line(self, raw: str):
         prefix = None
         if raw.startswith(":"):
-            prefix, raw = raw[1:].split(" ", 1)
+            # partition never raises: a prefix-only line (":foo", no space)
+            # yields prefix="foo", raw="" instead of an unpack ValueError that
+            # would propagate out and kill the IRC loop.
+            prefix, _, raw = raw[1:].partition(" ")
         if " :" in raw:
             params_part, trailing = raw.split(" :", 1)
         else:
@@ -552,6 +559,12 @@ async def irc_loop():
             log.warning("IRC timeout, reconnecting")
         except (ConnectionError, OSError) as e:
             log.error("IRC error: %s", e)
+        except Exception as e:
+            # Last-resort self-heal: reconnect instead of letting the task die
+            # silently. A dead irc_loop stops all inbound DMs AND paced outbound
+            # delivery (outbox_loop only drains while irc.connected) while the
+            # HTTP server keeps reporting the adapter healthy.
+            log.error("Unexpected IRC loop error, reconnecting: %s", e)
         finally:
             await irc.close()
 
