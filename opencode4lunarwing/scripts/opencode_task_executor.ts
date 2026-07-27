@@ -42,6 +42,30 @@ function createSdk(directory?: string): OpencodeClient {
 export type ProgressCallback = (progress: TaskProgress) => void
 export type ResultCallback = (result: TaskResult) => void
 
+function buildPrompt(request: TaskRequest): string {
+  const parts: string[] = []
+  const ctx = request.context
+
+  if (ctx?.conversation_history && ctx.conversation_history.length > 0) {
+    parts.push("--- Conversation history ---")
+    for (const msg of ctx.conversation_history) {
+      parts.push(`${msg.role}: ${msg.content}`)
+    }
+    parts.push("--- End conversation history ---\n")
+  }
+
+  if (ctx?.metadata && Object.keys(ctx.metadata).length > 0) {
+    parts.push("--- Task metadata ---")
+    for (const [key, value] of Object.entries(ctx.metadata)) {
+      parts.push(`${key}: ${value}`)
+    }
+    parts.push("--- End task metadata ---\n")
+  }
+
+  parts.push(request.prompt)
+  return parts.join("\n")
+}
+
 export async function executeTask(
   request: TaskRequest,
   onProgress: ProgressCallback,
@@ -108,11 +132,12 @@ export async function executeTask(
 
     // Attach rejection handling immediately so a provider/API error cannot
     // become an unhandled rejection while the SSE loop is still draining.
-    const promptPromise = sdk.session
+    const promptText = buildPrompt(request)
+  const promptPromise = sdk.session
       .prompt(
         {
           sessionID,
-          parts: [{ type: "text", text: request.prompt }],
+          parts: [{ type: "text", text: promptText }],
         },
         { throwOnError: true },
       )
