@@ -171,6 +171,40 @@ the next startup. Pass `--offline` to request that behavior explicitly. A custom
 `--url` also requires an explicit `--token`, so a stored gateway credential is
 never forwarded to an overridden origin.
 
+#### LunarWing Study Notes
+
+LunarWing can seed the shared [lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp)
+checkout as a managed read-only stdio server. Clone it at an absolute, stable path,
+verify its database, then set `LW2STUDYMCP_HOME` in the daemon environment:
+
+```bash
+git clone https://git.lunarwing.org/cmc/lw2studymcp.git /srv/lunarwing/lw2studymcp
+python3 /srv/lunarwing/lw2studymcp/memorydb.py stats
+export LW2STUDYMCP_HOME=/srv/lunarwing/lw2studymcp
+```
+
+On first startup, LunarWing validates the canonical script/database/notes layout
+and persists an enabled `study_notes` MCP config for the current owner. An existing
+config with that name wins, including a previously disabled config. The generated
+command never includes `--allow-write`; only search, topic, stale, and stats tools
+are exposed. A bundled trusted skill activates this search-first workflow only when
+`LW2STUDYMCP_HOME` and `python3` are available.
+
+Multi-tenant hosts should configure the same readable checkout through mt-admin:
+
+```bash
+sudo scripts/lunarwing-mt-admin.sh configure-study-mcp TENANT \
+  --home /srv/lunarwing/lw2studymcp
+sudo scripts/lunarwing-mt-admin.sh restart-tenant TENANT
+```
+
+This also bind-mounts the checkout read-only into that tenant's OpenCode worker.
+On SELinux hosts, mt-admin applies the shared `container_file_t` label before the
+rootless worker mount.
+Database updates at the same path are visible without MCP restart because the
+server opens SQLite per request. Restart LunarWing/OpenCode after server or skill
+code changes.
+
 **Decision guide:**
 
 | Scenario | Use |

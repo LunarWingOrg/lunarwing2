@@ -13,6 +13,11 @@ use tokio::fs;
 use crate::bootstrap::lunarwing_base_dir;
 use crate::tools::tool::ToolError;
 
+/// Operator-provided path to a local lw2studymcp checkout.
+pub const STUDY_NOTES_HOME_ENV: &str = "LW2STUDYMCP_HOME";
+/// Stable MCP server name used by core agents and OpenCode workers.
+pub const STUDY_NOTES_SERVER_NAME: &str = "study_notes";
+
 /// Transport configuration for an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "lowercase")]
@@ -293,6 +298,67 @@ impl McpServerConfig {
     pub fn client_id_secret_name(&self) -> String {
         format!("mcp_{}_client_id", self.name)
     }
+}
+
+/// Build the managed read-only Study Notes MCP configuration.
+///
+/// The checkout remains operator-managed. LunarWing only validates the canonical
+/// server/data layout and runs its dependency-free stdio server. Write tools are
+/// intentionally unavailable because `--allow-write` is never supplied.
+pub fn study_notes_server_from_home(home: &Path) -> Result<McpServerConfig, ConfigError> {
+    let home = home
+        .canonicalize()
+        .map_err(|error| ConfigError::InvalidConfig {
+            reason: format!("{STUDY_NOTES_HOME_ENV} path '{}': {error}", home.display()),
+        })?;
+    if !home.is_dir() {
+        return Err(ConfigError::InvalidConfig {
+            reason: format!(
+                "{STUDY_NOTES_HOME_ENV} path '{}' is not a directory",
+                home.display()
+            ),
+        });
+    }
+
+    let server = home.join("study_notes_mcp.py");
+    let database = home.join("agent-notes.sqlite3");
+    let notes = home.join("agent-notes-by-agent");
+    let memorydb = home.join("memorydb.py");
+    for required in [&server, &database, &memorydb] {
+        if !required.is_file() {
+            return Err(ConfigError::InvalidConfig {
+                reason: format!("Study Notes file missing: {}", required.display()),
+            });
+        }
+    }
+    if !notes.is_dir() {
+        return Err(ConfigError::InvalidConfig {
+            reason: format!("Study Notes directory missing: {}", notes.display()),
+        });
+    }
+
+    let path_arg = |path: &Path| {
+        path.to_str()
+            .map(str::to_string)
+            .ok_or_else(|| ConfigError::InvalidConfig {
+                reason: format!("Study Notes path is not valid UTF-8: {}", path.display()),
+            })
+    };
+    Ok(McpServerConfig::new_stdio(
+        STUDY_NOTES_SERVER_NAME,
+        "python3",
+        vec![
+            path_arg(&server)?,
+            "--db".to_string(),
+            path_arg(&database)?,
+            "--notes".to_string(),
+            path_arg(&notes)?,
+        ],
+        HashMap::new(),
+    )
+    .with_description(
+        "Shared read-only LunarWing codebase study notes (managed by LW2STUDYMCP_HOME)",
+    ))
 }
 
 /// OAuth 2.1 configuration for an MCP server.
@@ -934,6 +1000,36 @@ mod tests {
 
         // Remove non-existent server
         assert!(!file.remove("nonexistent"));
+    }
+
+    #[test]
+    fn study_notes_config_is_read_only_stdio() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("study_notes_mcp.py"), "").unwrap();
+        std::fs::write(dir.path().join("memorydb.py"), "").unwrap();
+        std::fs::write(dir.path().join("agent-notes.sqlite3"), "").unwrap();
+        std::fs::create_dir(dir.path().join("agent-notes-by-agent")).unwrap();
+
+        let config = study_notes_server_from_home(dir.path()).unwrap();
+        assert_eq!(config.name, STUDY_NOTES_SERVER_NAME);
+        assert!(config.enabled);
+        match config.effective_transport() {
+            EffectiveTransport::Stdio { command, args, env } => {
+                assert_eq!(command, "python3");
+                assert!(args.iter().any(|arg| arg.ends_with("study_notes_mcp.py")));
+                assert!(args.iter().any(|arg| arg.ends_with("agent-notes.sqlite3")));
+                assert!(!args.iter().any(|arg| arg == "--allow-write"));
+                assert!(env.is_empty());
+            }
+            other => panic!("expected stdio config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn study_notes_config_rejects_incomplete_checkout() {
+        let dir = tempdir().unwrap();
+        let error = study_notes_server_from_home(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("study_notes_mcp.py"));
     }
 
     #[tokio::test]

@@ -64,4 +64,37 @@ mod tests {
                 .any(|keyword| keyword == "cavepony")
         );
     }
+
+    #[test]
+    fn study_notes_is_bundled_and_env_gated() {
+        let (_, content) = load_bundled_skills()
+            .iter()
+            .find(|(name, _)| name == "study-notes")
+            .expect("Study Notes skill should be embedded");
+        let parsed = crate::skills::parser::parse_skill_md(content)
+            .expect("embedded Study Notes skill should parse");
+
+        assert_eq!(parsed.manifest.name, "study-notes");
+        assert!(
+            parsed
+                .manifest
+                .activation
+                .keywords
+                .iter()
+                .any(|keyword| keyword == "lunarwing")
+        );
+        assert!(
+            parsed
+                .manifest
+                .metadata
+                .and_then(|metadata| metadata.openclaw)
+                .is_some_and(|openclaw| {
+                    openclaw
+                        .requires
+                        .env
+                        .iter()
+                        .any(|name| name == "LW2STUDYMCP_HOME")
+                })
+        );
+    }
 }

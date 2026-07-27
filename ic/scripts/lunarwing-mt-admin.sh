@@ -142,6 +142,7 @@ tenant_quadlet_dir() { printf '%s/.config/containers/systemd' "$(tenant_home "$1
 tenant_state_dir() { printf '%s/state' "$(tenant_lw_root "$1")"; }
 tenant_log_dir() { printf '%s/logs' "$(tenant_lw_root "$1")"; }
 tenant_run_dir() { printf '%s/run' "$(tenant_lw_root "$1")"; }
+STUDY_NOTES_CONTAINER_HOME="/opt/lw2studymcp"
 
 # ── Container config-hash tracking ────────────────────────────────────────────
 #
@@ -371,6 +372,10 @@ Commands:
     --model <model>                TensorZero model (OPENCODE_MODEL; any string)
     --base-url <url>               TensorZero baseURL (OPENCODE_BASE_URL; full URL)
                                    (restart the worker after: stop-tenant && start-tenant)
+
+  configure-study-mcp <name>       Enable read-only lw2studymcp for LunarWing and
+    --home <absolute-path>          its opencode worker using a shared host checkout
+                                   (restart the tenant after configuration)
 
    configure-ssh <name>             Provision SSH harness for an existing tenant
      --host <host>                  SSH host (default: 127.0.0.1)
@@ -2236,6 +2241,21 @@ _env_existing() {  # <env_file> <KEY>
   sed -n "s/^$2=//p" "$1" | head -1
 }
 
+validate_study_notes_home() {  # <absolute checkout path>
+  local home="$1"
+  [[ "$home" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    || die "Study Notes home must be an absolute path without whitespace or shell metacharacters"
+  [[ -f "$home/study_notes_mcp.py" ]] || die "Study Notes file missing: $home/study_notes_mcp.py"
+  [[ -f "$home/memorydb.py" ]] || die "Study Notes file missing: $home/memorydb.py"
+  [[ -f "$home/agent-notes.sqlite3" ]] || die "Study Notes file missing: $home/agent-notes.sqlite3"
+  [[ -d "$home/agent-notes-by-agent" ]] || die "Study Notes directory missing: $home/agent-notes-by-agent"
+  [[ -f "$home/skills/study-notes/SKILL.md" ]] || die "Study Notes skill missing: $home/skills/study-notes/SKILL.md"
+}
+
+tenant_study_notes_home() {  # <tenant>
+  _env_existing "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_HOME
+}
+
 # Resolve a tenant's XMPP JID: an explicit <jid> wins; else PRESERVE the one
 # already in lunarwing.env; else fall back to <name>@xmpp.localhost (first-time
 # provision). lunarwing.env is the authoritative source — the bridge binary
@@ -2549,7 +2569,7 @@ write_tenant_lunarwing_env() {
   # tenant's encrypted DB secrets (it is the AES-256-GCM vault key); rotating the
   # tokens would break live clients/workers; minting a fresh XMPP_PASSWORD would
   # break the already-registered XMPP account. Generate fresh ONLY on first write.
-  local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password darkirc_adapter_secret
+  local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password darkirc_adapter_secret study_notes_home
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
   relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
@@ -2567,6 +2587,7 @@ write_tenant_lunarwing_env() {
   [[ -n "$nanocode_base_url" ]] || nanocode_base_url="$(_env_existing "$path" NANOCODE_BASE_URL)"
   [[ -n "$opencode_model" ]]    || opencode_model="$(_env_existing "$path" OPENCODE_MODEL)"
   [[ -n "$opencode_base_url" ]] || opencode_base_url="$(_env_existing "$path" OPENCODE_BASE_URL)"
+  study_notes_home="$(_env_existing "$path" LW2STUDYMCP_HOME)"
   # LLM circuit breaker: fleet defaults (open after 7 fully-retried failures,
   # probe again after 45s). These are tunables, so preserve an operator's
   # per-tenant override across re-provision rather than clobbering it.
@@ -2731,6 +2752,10 @@ ENVEOF
   [[ -n "$nanocode_base_url" ]] && printf 'NANOCODE_BASE_URL=%s\n' "$nanocode_base_url" >> "$path"
   [[ -n "$opencode_model" ]]    && printf '\nOPENCODE_MODEL=%s\n'    "$opencode_model"     >> "$path"
   [[ -n "$opencode_base_url" ]] && printf 'OPENCODE_BASE_URL=%s\n' "$opencode_base_url" >> "$path"
+  if [[ -n "$study_notes_home" ]]; then
+    printf '\n# Shared read-only LunarWing Study Notes MCP\nLW2STUDYMCP_HOME=%s\n' \
+      "$study_notes_home" >> "$path"
+  fi
   chown "$name:$name" "$path"
   say "wrote: $path"
 }
@@ -4067,6 +4092,50 @@ configure_opencode() {
   fi
 }
 
+configure_study_mcp() {
+  local name="$1"
+  local home="$2"
+
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  validate_study_notes_home "$home"
+
+  # Rootless Podman cannot relabel a root-owned shared checkout itself.
+  if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+    require_cmd chcon
+    chcon -R -t container_file_t -- "$home" \
+      || die "failed to label Study Notes checkout for container access: $home"
+  fi
+
+  local required
+  for required in \
+    "$home/study_notes_mcp.py" \
+    "$home/memorydb.py" \
+    "$home/agent-notes.sqlite3" \
+    "$home/skills/study-notes/SKILL.md"; do
+    sudo -u "$name" test -r "$required" \
+      || die "tenant '$name' cannot read Study Notes file: $required"
+  done
+  sudo -u "$name" test -x "$home/agent-notes-by-agent" \
+    || die "tenant '$name' cannot traverse Study Notes directory: $home/agent-notes-by-agent"
+
+  local env_path tmp
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
+  tmp="$(mktemp)"
+  grep -v '^LW2STUDYMCP_HOME=' "$env_path" > "$tmp" || true
+  printf '\n# Shared read-only LunarWing Study Notes MCP\nLW2STUDYMCP_HOME=%s\n' \
+    "$home" >> "$tmp"
+  cat "$tmp" > "$env_path"
+  rm -f "$tmp"
+  chown "$name:$name" "$env_path"
+  chmod 600 "$env_path"
+
+  say "Study Notes MCP configured for tenant '$name' from $home"
+  say "restart tenant to seed core MCP config and recreate opencode worker mount:"
+  say "  sudo $0 restart-tenant $name"
+}
+
 start_tenant_opencode() {
   local name="$1"
   ensure_container_runtime
@@ -4160,6 +4229,17 @@ start_tenant_opencode() {
       env_flags+=(--env-file "$opencode_env_path")
     fi
 
+    local study_notes_home
+    local -a study_notes_mount=()
+    study_notes_home="$(tenant_study_notes_home "$name")"
+    if [[ -n "$study_notes_home" ]]; then
+      validate_study_notes_home "$study_notes_home"
+      study_notes_mount=(
+        -v "${study_notes_home}:${STUDY_NOTES_CONTAINER_HOME}:ro,z"
+        -e "LW2STUDYMCP_HOME=${STUDY_NOTES_CONTAINER_HOME}"
+      )
+    fi
+
     local workspace_dir
     workspace_dir="$(tenant_lw_root "$name")/opencode-workspace"
     mkdir -p "$workspace_dir"
@@ -4185,6 +4265,7 @@ start_tenant_opencode() {
       -e WS_PATH=/ws/agent \
       "${env_flags[@]}" \
       "${ssh_mount[@]}" \
+      "${study_notes_mount[@]}" \
       -p "127.0.0.1:${wss_port}:${wss_port}" \
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
@@ -5062,6 +5143,11 @@ render_worker_quadlet() {
   # not configured for the tenant, the socket simply won't exist and SSH
   # commands from the worker will fail with a clear "no agent" error.
   local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+  local study_notes_home=""
+  if [[ "$worker" == "opencode" ]]; then
+    study_notes_home="$(tenant_study_notes_home "$name")"
+    [[ -z "$study_notes_home" ]] || validate_study_notes_home "$study_notes_home"
+  fi
 
   {
     cat <<EOF
@@ -5083,6 +5169,10 @@ Environment=HEALTH_PORT=${health_port}
 Environment=WS_BIND_HOST=0.0.0.0
 Environment=WS_PATH=/ws/agent
 EOF
+    if [[ -n "$study_notes_home" ]]; then
+      printf 'Volume=%s:%s:ro,z\n' "$study_notes_home" "$STUDY_NOTES_CONTAINER_HOME"
+      printf 'Environment=LW2STUDYMCP_HOME=%s\n' "$STUDY_NOTES_CONTAINER_HOME"
+    fi
     # SSH agent socket mount + env (always included — the daemon creates the
     # socket at startup; if SSH isn't configured, the socket won't exist and
     # SSH commands from the worker will fail with a clear "no agent" error).
@@ -7670,6 +7760,25 @@ main() {
       done
       [[ -n "$name" ]] || die "usage: configure-opencode <name> [--model <model>] [--base-url <url>]"
       configure_opencode "$name" "$oc_model" "$oc_base_url"
+      ;;
+
+    configure-study-mcp)
+      require_root
+      local name="" study_home=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --home) study_home="$2"; shift 2 ;;
+          -*)     die "unknown flag: $1" ;;
+          *)
+            if [[ -z "$name" ]]; then name="$1"; shift
+            else die "unexpected argument: $1"
+            fi
+            ;;
+        esac
+      done
+      [[ -n "$name" && -n "$study_home" ]] \
+        || die "usage: configure-study-mcp <name> --home <absolute-path>"
+      configure_study_mcp "$name" "$study_home"
       ;;
 
     configure-ssh)

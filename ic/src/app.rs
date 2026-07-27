@@ -506,7 +506,10 @@ impl AppBuilder {
         ),
         anyhow::Error,
     > {
-        use crate::tools::mcp::config::load_mcp_servers_from_db_or_migrate;
+        use crate::tools::mcp::config::{
+            STUDY_NOTES_HOME_ENV, STUDY_NOTES_SERVER_NAME, load_mcp_servers_from_db_or_migrate,
+            persist_mcp_server, persist_mcp_server_db, study_notes_server_from_home,
+        };
         use crate::tools::wasm::{WasmToolLoader, load_dev_tools};
 
         let mcp_session_manager = Arc::new(McpSessionManager::new());
@@ -601,7 +604,43 @@ impl AppBuilder {
                     crate::tools::mcp::config::load_mcp_servers().await
                 };
                 match servers_result {
-                    Ok(servers) => {
+                    Ok(mut servers) => {
+                        if servers.get(STUDY_NOTES_SERVER_NAME).is_none()
+                            && let Some(home) = std::env::var_os(STUDY_NOTES_HOME_ENV)
+                        {
+                            match study_notes_server_from_home(std::path::Path::new(&home)) {
+                                Ok(config) => {
+                                    let persisted = if let Some(ref d) = db {
+                                        persist_mcp_server_db(
+                                            d.as_ref(),
+                                            &owner_id,
+                                            config.clone(),
+                                            false,
+                                        )
+                                        .await
+                                    } else {
+                                        persist_mcp_server(config.clone(), false).await
+                                    };
+                                    match persisted {
+                                        Ok(()) => {
+                                            servers.upsert(config);
+                                            tracing::info!(
+                                                home = %std::path::Path::new(&home).display(),
+                                                "Seeded read-only Study Notes MCP server"
+                                            );
+                                        }
+                                        Err(error) => tracing::warn!(
+                                            %error,
+                                            "Failed to persist managed Study Notes MCP server"
+                                        ),
+                                    }
+                                }
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    "Ignoring invalid LW2STUDYMCP_HOME configuration"
+                                ),
+                            }
+                        }
                         let enabled: Vec<_> = servers.enabled_servers().cloned().collect();
                         if !enabled.is_empty() {
                             tracing::debug!(

@@ -76,3 +76,25 @@ Speaks `lunarwing-agent-v1` WebSocket subprotocol (legacy alias `ironclaw-agent-
 ## Environment Variables
 
 See `.env.example` for the full list with descriptions.
+
+## Study Notes MCP
+
+Set `LW2STUDYMCP_HOME` to an absolute lw2studymcp checkout visible inside the
+container. Startup validates the canonical scripts, skill, SQLite schema, FTS5
+table, and database integrity before injecting both:
+
+- `<home>/skills` into OpenCode `skills.paths`
+- a local `study_notes` MCP process running `study_notes_mcp.py`
+
+Only read tools are enabled; startup never passes `--allow-write`. For multi-tenant
+installs, configure the host checkout through mt-admin, which also emits the
+read-only container mount for both Quadlet/systemd and imperative/OpenRC paths:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-study-mcp TENANT \
+  --home /srv/lunarwing/lw2studymcp
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant TENANT
+```
+
+Do not use `opencode_study.py` auto-clone inside the persistent worker. Runtime
+network cloning would make worker content unpinned and startup network-dependent.
