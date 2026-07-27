@@ -286,7 +286,7 @@ pub struct TunnelSettings {
     #[serde(default)]
     pub public_url: Option<String>,
 
-    /// Managed tunnel provider: "netbird", "ngrok", "cloudflare", "tailscale", "custom".
+    /// Managed tunnel provider: "netbird", "custom".
     #[serde(default)]
     pub provider: Option<String>,
 
@@ -297,26 +297,6 @@ pub struct TunnelSettings {
     /// Prefix for NetBird's generated ephemeral service name.
     #[serde(default)]
     pub netbird_name_prefix: Option<String>,
-
-    /// Cloudflare tunnel token.
-    #[serde(default)]
-    pub cf_token: Option<String>,
-
-    /// ngrok auth token.
-    #[serde(default)]
-    pub ngrok_token: Option<String>,
-
-    /// ngrok custom domain (paid plans).
-    #[serde(default)]
-    pub ngrok_domain: Option<String>,
-
-    /// Use Tailscale Funnel (public) instead of Serve (tailnet-only).
-    #[serde(default)]
-    pub ts_funnel: bool,
-
-    /// Tailscale hostname override.
-    #[serde(default)]
-    pub ts_hostname: Option<String>,
 
     /// Shell command for custom tunnel (with `{port}` / `{host}` placeholders).
     #[serde(default)]
