@@ -11,7 +11,7 @@
   [[sandbox.external_workers]]
   name = "nanocode"
   url = "ws://localhost:9090/ws/agent"
-  timeout_ms = 300000
+  timeout_ms = 3600000
 
   Not [sandbox.external_workers] (single brackets = table, not array) and not nested under an existing [sandbox] header with external_workers = [...] inline array format.
 

@@ -34,7 +34,7 @@ Add to `config.toml` under `LUNARWING_BASE_DIR`:
 [[sandbox.external_workers]]
 name = "pebble"
 url = "ws://localhost:9090/ws/agent"
-timeout_ms = 300000
+timeout_ms = 3600000
 ```
 
 The agent logs `External workers configured: pebble` on startup.
@@ -45,7 +45,8 @@ The agent logs `External workers configured: pebble` on startup.
 create_job(title: "Fix the tests", description: "Run cargo test and fix failures", mode: "pebble")
 ```
 
-With `wait=false`, use `job_events <id>` and `job_status <id>` to monitor progress.
+External jobs default to `wait=false`; use `job_events <id>` and `job_status <id>`
+to monitor progress.
 
 ## Environment Variables
 

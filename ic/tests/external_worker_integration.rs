@@ -33,7 +33,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use uuid::Uuid;
 
+use lunarwing::channels::web::types::SseEvent;
 use lunarwing::config::{ExternalWorkerConfig, LoadBalanceStrategy, WorkerEndpoint};
+use lunarwing::context::{ContextManager, JobState};
 use lunarwing::error::OrchestratorError;
 use lunarwing::orchestrator::ExternalWorkerManager;
 use lunarwing::orchestrator::external_worker::{
@@ -510,6 +512,56 @@ async fn task_timeout_when_worker_hangs() {
     assert!(
         matches!(err, OrchestratorError::ExternalWorkerTimeout { .. }),
         "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn async_timeout_finalizes_job_and_emits_result() {
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Hang).await;
+    let context_manager = Arc::new(ContextManager::new(5));
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)])
+        .with_event_deps(event_tx, Arc::clone(&context_manager));
+    let job_id = Uuid::new_v4();
+    context_manager
+        .register_sandbox_job(job_id, "test-user", "task", "task")
+        .await
+        .expect("register job");
+
+    let result = mgr
+        .execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(100),
+            false,
+            TaskContext::default(),
+        )
+        .await
+        .expect("dispatch async task");
+    assert!(result.is_none());
+
+    let status = timeout(TEST_BOUND, async {
+        loop {
+            let (event_job_id, _, event) = event_rx.recv().await.expect("job event");
+            if event_job_id == job_id
+                && let SseEvent::JobResult { status, .. } = event
+            {
+                break status;
+            }
+        }
+    })
+    .await
+    .expect("result event timed out");
+
+    assert_eq!(status, "failed");
+    assert_eq!(
+        context_manager
+            .get_context(job_id)
+            .await
+            .expect("job context")
+            .state,
+        JobState::Failed
     );
 }
 

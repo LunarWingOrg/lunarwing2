@@ -110,6 +110,13 @@ fn sandbox_completion_status(success: bool, message: Option<&str>) -> &'static s
     }
 }
 
+fn external_job_wait(params: &serde_json::Value) -> bool {
+    params
+        .get("wait")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Tool for creating a new job.
 ///
 /// When sandbox deps are injected (via `with_sandbox`), the tool automatically
@@ -761,7 +768,7 @@ impl CreateJobTool {
                 ToolError::ExecutionFailed(format!("failed to register external job: {}", e))
             })?;
 
-        self.persist_job(SandboxJobRecord {
+        let record = SandboxJobRecord {
             id: job_id,
             task: task.to_string(),
             status: "creating".to_string(),
@@ -773,17 +780,25 @@ impl CreateJobTool {
             started_at: None,
             completed_at: None,
             credential_grants_json: grants_json,
-        });
+        };
 
         if let Some(store) = &self.store {
-            let store = store.clone();
-            let mode_val = JobMode::External(worker_name.to_string()).db_value();
-            tokio::spawn(async move {
-                let _ = store.update_sandbox_job_mode(job_id, &mode_val).await;
-            });
-        }
+            if let Err(error) = store.save_sandbox_job(&record).await {
+                tracing::warn!(job_id = %job_id, "Failed to persist external job: {error}");
+            }
 
-        self.update_status(job_id, "running", None, None, Some(Utc::now()), None);
+            let mode_val = JobMode::External(worker_name.to_string()).db_value();
+            if let Err(error) = store.update_sandbox_job_mode(job_id, &mode_val).await {
+                tracing::warn!(job_id = %job_id, "Failed to persist external job mode: {error}");
+            }
+
+            if let Err(error) = store
+                .update_sandbox_job_status(job_id, "running", None, None, Some(Utc::now()), None)
+                .await
+            {
+                tracing::warn!(job_id = %job_id, "Failed to mark external job running: {error}");
+            }
+        }
 
         let pre_subscribed_rx = if !wait {
             self.event_tx.as_ref().map(|etx| etx.subscribe())
@@ -1119,7 +1134,9 @@ impl Tool for CreateJobTool {
              directly and set mode to the exact worker name from the mode schema (for example \
              'opencode'). External workers are job execution backends, not extensions, MCP servers, \
              skills, routines, or SSH hosts; do not search for or install them. Put the complete task \
-             in description. wait defaults to true. External worker deadlines come from worker \
+             in description. External jobs default to asynchronous dispatch so long tasks outlive \
+             the current conversation turn; set wait=true only when a synchronous result is \
+             required. External worker deadlines come from worker \
              configuration and are returned as timeout_ms; the 30-second local-job default does \
              not apply."
         } else if self.sandbox_enabled() {
@@ -1150,7 +1167,7 @@ impl Tool for CreateJobTool {
                     "type": "boolean",
                     "description": "If true, wait for the job to complete and return results. \
                                     If false, start the job and return the job_id immediately. \
-                                    Defaults to true."
+                                    Defaults to false for external workers and true for the Docker sandbox."
                 }
             });
 
@@ -1263,7 +1280,7 @@ impl Tool for CreateJobTool {
             if let Some(ref ewm) = self.external_worker_manager
                 && ewm.get_worker(mode_str).is_some()
             {
-                let wait = params.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
+                let wait = external_job_wait(&params);
                 let project_dir = params
                     .get("project_dir")
                     .and_then(|v| v.as_str())
@@ -1986,6 +2003,10 @@ mod tests {
         );
         assert!(tool.description().contains("not extensions, MCP servers"));
         assert!(tool.description().contains("30-second local-job default"));
+        assert!(
+            tool.description()
+                .contains("default to asynchronous dispatch")
+        );
         assert_eq!(tool.execution_timeout(), Duration::from_secs(960));
         assert_eq!(
             tool.requires_approval(&serde_json::json!({})),
@@ -1998,6 +2019,13 @@ mod tests {
         let description = mode["description"].as_str().expect("mode description");
         assert!(description.contains("create_job directly"));
         assert!(description.contains("opencode"));
+    }
+
+    #[test]
+    fn external_jobs_default_to_async_but_allow_explicit_wait() {
+        assert!(!external_job_wait(&serde_json::json!({})));
+        assert!(!external_job_wait(&serde_json::json!({ "wait": false })));
+        assert!(external_job_wait(&serde_json::json!({ "wait": true })));
     }
 
     #[test]

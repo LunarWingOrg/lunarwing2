@@ -464,7 +464,7 @@ mod tests {
 name = "nanocode"
 url = "ws://127.0.0.1:10007/ws/agent"
 auth_token = "deadbeefcafe1234"
-timeout_ms = 300000
+timeout_ms = 3600000
 "#;
 
         let settings: crate::settings::Settings =
@@ -478,7 +478,7 @@ timeout_ms = 300000
             workers[0].auth_token.as_ref().map(|s| s.expose_secret()),
             Some("deadbeefcafe1234")
         );
-        assert_eq!(workers[0].timeout_ms, 300_000);
+        assert_eq!(workers[0].timeout_ms, 3_600_000);
     }
 
     /// Multiple `[[sandbox.external_workers]]` blocks in one file (e.g. nanocode
@@ -492,13 +492,13 @@ timeout_ms = 300000
 name = "nanocode"
 url = "ws://127.0.0.1:10007/ws/agent"
 auth_token = "tok-nano"
-timeout_ms = 300000
+timeout_ms = 3600000
 
 [[sandbox.external_workers]]
 name = "pebble"
 url = "ws://127.0.0.1:10008/ws/agent"
 auth_token = "tok-pebble"
-timeout_ms = 300000
+timeout_ms = 3600000
 "#;
 
         let settings: crate::settings::Settings =
@@ -518,7 +518,7 @@ timeout_ms = 300000
 name = "nanocode"
 url = "ws://127.0.0.1:10007/ws/agent"
 auth_token = "tok-legacy"
-timeout_ms = 300000
+timeout_ms = 3600000
 
 [[sandbox.external_workers.endpoints]]
 url = "ws://10.0.0.1:9090/ws/agent"
@@ -549,7 +549,7 @@ auth_token = "tok-2"
 name = "pebble"
 url = "ws://127.0.0.1:8443/ws/agent"
 auth_token = "tok-legacy"
-timeout_ms = 300000
+timeout_ms = 3600000
 "#;
 
         let settings: crate::settings::Settings =

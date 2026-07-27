@@ -74,7 +74,7 @@ The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Bu
 
 Agent-facing dispatch uses `create_job(title: "...", description: "...", mode: "opencode")` in both legacy and Engine V2 chat paths. `opencode` is a named job execution backend, not an extension, MCP server, skill, routine, or SSH host; no registry search or installation is involved.
 
-Multi-tenant worker configuration sets the task deadline to `300000ms` (5 minutes). This replaces the 30-second default used by a bare local `create_job`; configured external workers do not use that local default. Synchronous results include both `duration_ms` and effective `timeout_ms`. Engine V2 has a 600-second deadline for the whole orchestration call, so an external action receives somewhat less than 600 seconds and higher worker deadlines cannot complete synchronously.
+Multi-tenant worker configuration sets the task deadline to `3600000ms` (one hour), configurable for new tenant entries with `LUNARWING_MT_EXTERNAL_WORKER_TIMEOUT_MS`. Re-running mt-admin migrates exact legacy `300000ms` entries; set `LUNARWING_MT_MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS=false` to preserve an intentional five-minute value. External jobs default to asynchronous dispatch (`wait=false`) so they outlive the current conversation turn; completion and progress remain available through job events/status. Explicit `wait=true` remains available for short tasks, but synchronous execution is still bounded by the parent conversation deadline.
 
 ## OpenCode Worker (old section)
 
