@@ -7,6 +7,7 @@
 
 import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk/v2"
 import {
+  buildTaskPrompt,
   type TaskRequest,
   type TaskProgress,
   type TaskResult,
@@ -112,7 +113,7 @@ export async function executeTask(
       .prompt(
         {
           sessionID,
-          parts: [{ type: "text", text: request.prompt }],
+          parts: [{ type: "text", text: buildTaskPrompt(request) }],
         },
         { throwOnError: true },
       )

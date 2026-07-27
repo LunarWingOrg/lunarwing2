@@ -444,6 +444,7 @@ pub async fn jobs_restart_handler(
                     Some(project_dir),
                     mode,
                     credential_grants,
+                    lunarwing_common::DEFAULT_WORKER_ITERATIONS,
                 )
                 .await
                 .map_err(|e| {

@@ -248,6 +248,7 @@ impl Store {
                     completed_at: row.get("completed_at"),
                     transitions: Vec::new(), // Not loaded from DB for now
                     metadata: serde_json::Value::Null,
+                    prompt_context: std::sync::Arc::from([]),
                     max_tokens: row.get::<_, Option<i64>>("max_tokens").unwrap_or(0) as u64,
                     total_tokens_used: row.get::<_, Option<i64>>("total_tokens_used").unwrap_or(0)
                         as u64,

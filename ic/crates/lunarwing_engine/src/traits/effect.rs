@@ -4,8 +4,15 @@
 //! trait. The main crate implements it by wrapping `ToolRegistry` and
 //! `SafetyLayer` — the engine itself has no knowledge of specific tools.
 
+use std::sync::Arc;
+
+use lunarwing_common::{
+    HARD_PROMPT_CONTEXT_LIMITS, PromptContextMessage, PromptContextRole, select_prompt_context_by,
+};
+
 use crate::types::capability::{ActionDef, CapabilityLease};
 use crate::types::error::EngineError;
+use crate::types::message::{MessageRole, ThreadMessage};
 use crate::types::project::ProjectId;
 use crate::types::step::{ActionResult, StepId};
 use crate::types::thread::{ThreadId, ThreadType};
@@ -31,6 +38,29 @@ pub struct ThreadExecutionContext {
     /// Timeout in seconds for supervised approval prompts.
     /// Default: 300 (5 minutes).
     pub supervised_timeout_secs: u64,
+    /// Bounded visible conversation snapshot for delegated worker tools.
+    pub prompt_context: Arc<[PromptContextMessage]>,
+}
+
+/// Convert visible thread messages into hard-bounded delegated-worker context.
+pub fn prompt_context_from_thread_messages(
+    messages: &[ThreadMessage],
+) -> Arc<[PromptContextMessage]> {
+    Arc::from(select_prompt_context_by(
+        messages,
+        HARD_PROMPT_CONTEXT_LIMITS,
+        |message| {
+            let role = match message.role {
+                MessageRole::User => PromptContextRole::User,
+                MessageRole::Assistant if message.action_calls.is_none() => {
+                    PromptContextRole::Assistant
+                }
+                MessageRole::Assistant => return None,
+                MessageRole::System | MessageRole::ActionResult => return None,
+            };
+            Some((role, message.content.as_str()))
+        },
+    ))
 }
 
 /// Abstraction over capability action execution.
@@ -64,4 +94,36 @@ pub trait EffectExecutor: Send + Sync {
         &self,
         leases: &[CapabilityLease],
     ) -> Result<Vec<ActionDef>, EngineError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_prompt_context_excludes_system_and_action_results() {
+        let mut action_message = ThreadMessage::assistant("private action reasoning");
+        action_message.action_calls = Some(Vec::new());
+        let messages = [
+            ThreadMessage::system("secret system prompt"),
+            ThreadMessage::user("question"),
+            action_message,
+            ThreadMessage::action_result("call", "tool", "secret tool output"),
+            ThreadMessage::assistant("answer"),
+        ];
+
+        assert_eq!(
+            prompt_context_from_thread_messages(&messages).as_ref(),
+            [
+                PromptContextMessage {
+                    role: PromptContextRole::User,
+                    content: "question".to_string(),
+                },
+                PromptContextMessage {
+                    role: PromptContextRole::Assistant,
+                    content: "answer".to_string(),
+                },
+            ]
+        );
+    }
 }

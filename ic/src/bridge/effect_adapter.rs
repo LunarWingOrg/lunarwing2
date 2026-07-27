@@ -731,7 +731,8 @@ impl EffectBridgeAdapter {
             &context.user_id,
             "engine_v2",
             format!("Thread {}", context.thread_id),
-        );
+        )
+        .with_prompt_context(Arc::clone(&context.prompt_context));
 
         let result = crate::tools::execute::execute_tool_with_safety(
             &self.tools,
@@ -1282,6 +1283,7 @@ mod tests {
             source_channel: None,
             supervised_mode: false,
             supervised_timeout_secs: 300,
+            prompt_context: Arc::from([]),
         };
         let llm: Arc<dyn lunarwing_engine::LlmBackend> = Arc::new(StubEngineLlm);
 
@@ -1396,6 +1398,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
             source_channel: None,
             supervised_mode: false,
             supervised_timeout_secs: 300,
+            prompt_context: Arc::from([]),
         }
     }
 
@@ -2077,6 +2080,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
             source_channel: None,
             supervised_mode: false,
             supervised_timeout_secs: 300,
+            prompt_context: Arc::from([]),
         };
 
         let result = adapter.execute_action("http", params, &lease, &ctx).await;
@@ -2170,6 +2174,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
             source_channel: None,
             supervised_mode: false,
             supervised_timeout_secs: 300,
+            prompt_context: Arc::from([]),
         };
 
         let result = adapter

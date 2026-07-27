@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
+pub use lunarwing_common::PromptContextMessage as ConversationMessage;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
@@ -68,13 +69,6 @@ struct TaskProgressPayload {
     delta: String,
     #[allow(dead_code)]
     done: bool,
-}
-
-/// A single message in conversation history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationMessage {
-    pub role: String,
-    pub content: String,
 }
 
 /// Context passed to external workers with task requests.
@@ -1309,6 +1303,7 @@ async fn record_external_task_error(
 mod tests {
     use super::*;
     use crate::config::LoadBalanceStrategy;
+    use lunarwing_common::PromptContextRole;
 
     #[test]
     fn envelope_serialization() {
@@ -1354,6 +1349,7 @@ mod tests {
                 timeout_ms: 300_000,
                 endpoints: vec![],
                 load_balance: LoadBalanceStrategy::default(),
+                prompt_context: Default::default(),
             },
             ExternalWorkerConfig {
                 name: "pebble".to_string(),
@@ -1362,6 +1358,7 @@ mod tests {
                 timeout_ms: 600_000,
                 endpoints: vec![],
                 load_balance: LoadBalanceStrategy::default(),
+                prompt_context: Default::default(),
             },
         ]);
         assert!(!mgr.is_empty());
@@ -1389,11 +1386,11 @@ mod tests {
             project_dir: Some("/workspace/myproject".to_string()),
             conversation_history: vec![
                 ConversationMessage {
-                    role: "user".to_string(),
+                    role: PromptContextRole::User,
                     content: "fix the bug".to_string(),
                 },
                 ConversationMessage {
-                    role: "assistant".to_string(),
+                    role: PromptContextRole::Assistant,
                     content: "working on it".to_string(),
                 },
             ],
@@ -1414,7 +1411,10 @@ mod tests {
             Some("/workspace/myproject".to_string())
         );
         assert_eq!(deserialized.conversation_history.len(), 2);
-        assert_eq!(deserialized.conversation_history[0].role, "user");
+        assert_eq!(
+            deserialized.conversation_history[0].role,
+            PromptContextRole::User
+        );
         assert_eq!(deserialized.conversation_history[0].content, "fix the bug");
         assert_eq!(
             deserialized.environment.get("API_KEY"),
@@ -1669,7 +1669,7 @@ mod tests {
             .into_iter()
             .collect();
         let history = vec![ConversationMessage {
-            role: "user".to_string(),
+            role: PromptContextRole::User,
             content: "do the thing".to_string(),
         }];
         let meta: HashMap<String, String> = [("priority".to_string(), "high".to_string())]
@@ -1744,6 +1744,7 @@ mod tests {
                 },
             ],
             load_balance: LoadBalanceStrategy::default(),
+            prompt_context: Default::default(),
         }]);
 
         let lb = mgr.load_balancers.get("multi").unwrap();

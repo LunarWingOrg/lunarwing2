@@ -488,6 +488,7 @@ mod tests {
             source_channel: None,
             supervised_mode: false,
             supervised_timeout_secs: 300,
+            prompt_context: crate::prompt_context_from_thread_messages(&thread.messages),
         }
     }
 

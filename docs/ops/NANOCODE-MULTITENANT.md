@@ -101,7 +101,11 @@ name = "nanocode"
 url = "ws://127.0.0.1:<WSS_PORT>/ws/agent"
 auth_token = "<GATEWAY_TOKEN>"
 timeout_ms = 3600000
+prompt_context = { max_messages = 12, max_chars_per_message = 2000, max_total_chars = 12000 }
 ```
+
+`create_job(..., mode: "nanocode", context_scope: "recent")` opts into scoped
+user/assistant history. Default `none` preserves prompt-only behavior.
 
 **Critical TOML ordering:** `[[sandbox.external_workers]]` must appear after all scalar fields under `[sandbox]`. TOML does not allow returning to a table header after an array-of-tables entry.
 

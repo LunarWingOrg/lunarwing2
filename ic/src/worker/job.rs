@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lunarwing_common::{DEFAULT_WORKER_ITERATIONS, MAX_WORKER_ITERATIONS};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -19,7 +20,7 @@ use crate::agent::agentic_loop::{
 use crate::agent::scheduler::WorkerMessage;
 use crate::agent::task::TaskOutput;
 use crate::channels::web::types::SseEvent;
-use crate::context::{ContextManager, JobState};
+use crate::context::{ContextManager, JobContext, JobState};
 use crate::db::Database;
 use crate::error::Error;
 use crate::hooks::HookRegistry;
@@ -33,6 +34,13 @@ use crate::tools::rate_limiter::RateLimitResult;
 use crate::tools::{
     ApprovalContext, ToolRegistry, autonomous_unavailable_error, prepare_tool_params, redact_params,
 };
+
+fn worker_iteration_limit(job_context: Option<&JobContext>) -> usize {
+    job_context
+        .and_then(|ctx| ctx.metadata.get("max_iterations").and_then(|v| v.as_u64()))
+        .unwrap_or(u64::from(DEFAULT_WORKER_ITERATIONS))
+        .clamp(1, u64::from(MAX_WORKER_ITERATIONS)) as usize
+}
 
 /// Shared dependencies for worker execution.
 ///
@@ -300,13 +308,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         reasoning: &Reasoning,
         reason_ctx: &mut ReasoningContext,
     ) -> Result<(), Error> {
-        const MAX_WORKER_ITERATIONS: usize = 500;
         let job_context = self.context_manager().get_context(self.job_id).await.ok();
-        let max_iterations = job_context
-            .as_ref()
-            .and_then(|ctx| ctx.metadata.get("max_iterations").and_then(|v| v.as_u64()))
-            .unwrap_or(50) as usize;
-        let max_iterations = max_iterations.min(MAX_WORKER_ITERATIONS);
+        let max_iterations = worker_iteration_limit(job_context.as_ref());
 
         // Initial tool definitions for planning (will be refreshed in loop)
         reason_ctx.available_tools = if let Some(context) = job_context.as_ref() {
@@ -1464,7 +1467,6 @@ mod tests {
 
     use super::*;
     use crate::config::SafetyConfig;
-    use crate::context::JobContext;
     use crate::llm::{
         CompletionRequest, CompletionResponse, LlmProvider, ToolCompletionRequest,
         ToolCompletionResponse,
@@ -1473,6 +1475,29 @@ mod tests {
     use crate::testing::{BroadcastCapture, RecordingBroadcastChannel};
     use crate::tools::builtin::MessageTool;
     use crate::tools::{Tool, ToolError as ToolExecError, ToolOutput};
+
+    #[test]
+    fn worker_iteration_limit_defaults_and_clamps() {
+        assert_eq!(
+            worker_iteration_limit(None),
+            DEFAULT_WORKER_ITERATIONS as usize
+        );
+
+        let context = JobContext {
+            metadata: serde_json::json!({"max_iterations": 300}),
+            ..Default::default()
+        };
+        assert_eq!(worker_iteration_limit(Some(&context)), 300);
+
+        let context = JobContext {
+            metadata: serde_json::json!({"max_iterations": u64::MAX}),
+            ..Default::default()
+        };
+        assert_eq!(
+            worker_iteration_limit(Some(&context)),
+            MAX_WORKER_ITERATIONS as usize
+        );
+    }
 
     /// A test tool that sleeps for a configurable duration before returning.
     struct SlowTool {
