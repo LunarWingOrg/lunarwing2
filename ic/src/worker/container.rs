@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lunarwing_common::DEFAULT_WORKER_ITERATIONS;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -41,7 +42,7 @@ impl Default for WorkerConfig {
         Self {
             job_id: Uuid::nil(),
             orchestrator_url: String::new(),
-            max_iterations: 50,
+            max_iterations: DEFAULT_WORKER_ITERATIONS,
             timeout: Duration::from_secs(600),
         }
     }

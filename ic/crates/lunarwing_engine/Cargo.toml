@@ -16,6 +16,7 @@ dist = false
 [dependencies]
 async-trait = "0.1"
 futures = "0.3"
+lunarwing_common = { path = "../lunarwing_common", version = "2.0.3" }
 lunarwing_skills = { path = "../lunarwing_skills", version = "2.0.3", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"

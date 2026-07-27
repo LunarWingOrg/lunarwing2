@@ -848,6 +848,9 @@ pub struct ExternalWorkerSettings {
     /// Load balancing strategy (defaults to RoundRobin).
     #[serde(default)]
     pub load_balance: crate::config::LoadBalanceStrategy,
+    /// Bounds applied when `create_job` requests recent conversation context.
+    #[serde(default)]
+    pub prompt_context: lunarwing_common::PromptContextLimits,
 }
 
 fn default_external_worker_timeout() -> u64 {
@@ -1782,10 +1785,23 @@ mod tests {
 name = "nanocode"
 url = "ws://localhost:9090/ws/agent"
 timeout_ms = 3600000
+
+[sandbox.external_workers.prompt_context]
+max_messages = 8
+max_chars_per_message = 1500
+max_total_chars = 9000
 "#;
         let parsed: Settings = toml::from_str(toml_str).unwrap();
         assert_eq!(parsed.sandbox.external_workers.len(), 1);
         assert_eq!(parsed.sandbox.external_workers[0].name, "nanocode");
+        assert_eq!(
+            parsed.sandbox.external_workers[0].prompt_context,
+            lunarwing_common::PromptContextLimits {
+                max_messages: 8,
+                max_chars_per_message: 1500,
+                max_total_chars: 9000,
+            }
+        );
 
         let mut base = Settings::default();
         assert!(base.sandbox.external_workers.is_empty());

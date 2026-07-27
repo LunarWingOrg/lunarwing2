@@ -52,7 +52,7 @@ pub enum MissionStatus {
 ///
 /// The engine owns cron scheduling and manual fire behavior. The bridge/host
 /// connects external webhook and event sources to the matching mission.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum MissionCadence {
     /// Spawn on a cron schedule (e.g., "0 */6 * * *" for every 6 hours).
     Cron {
@@ -67,10 +67,42 @@ pub enum MissionCadence {
     /// The bridge registers the webhook endpoint and routes payloads here.
     Webhook {
         path: String,
+        /// Runtime-only plaintext. Host persistence stores an encrypted secret reference.
+        #[serde(default, skip_serializing)]
         secret: Option<String>,
     },
     /// Only spawn when manually triggered (via mission_fire tool or API).
     Manual,
+}
+
+impl std::fmt::Debug for MissionCadence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cron {
+                expression,
+                timezone,
+            } => f
+                .debug_struct("Cron")
+                .field("expression", expression)
+                .field("timezone", timezone)
+                .finish(),
+            Self::OnEvent { event_pattern } => f
+                .debug_struct("OnEvent")
+                .field("event_pattern", event_pattern)
+                .finish(),
+            Self::OnSystemEvent { source, event_type } => f
+                .debug_struct("OnSystemEvent")
+                .field("source", source)
+                .field("event_type", event_type)
+                .finish(),
+            Self::Webhook { path, secret } => f
+                .debug_struct("Webhook")
+                .field("path", path)
+                .field("secret_configured", &secret.is_some())
+                .finish(),
+            Self::Manual => f.write_str("Manual"),
+        }
+    }
 }
 
 /// A mission — a long-running goal that spawns threads over time.
@@ -207,5 +239,27 @@ mod tests {
 
         let restored: Mission = serde_json::from_value(value).expect("deserialize legacy mission");
         assert_eq!(restored.threads_today_date, None);
+    }
+
+    #[test]
+    fn webhook_secret_deserializes_but_never_serializes_or_debugs() {
+        let cadence: MissionCadence = serde_json::from_value(serde_json::json!({
+            "Webhook": {
+                "path": "build-ready",
+                "secret": "plaintext-webhook-secret"
+            }
+        }))
+        .expect("deserialize legacy webhook cadence");
+
+        assert!(matches!(
+            &cadence,
+            MissionCadence::Webhook { path, secret }
+                if path == "build-ready"
+                    && secret.as_deref() == Some("plaintext-webhook-secret")
+        ));
+        let serialized = serde_json::to_string(&cadence).expect("serialize cadence");
+        assert!(!serialized.contains("plaintext-webhook-secret"));
+        assert!(!serialized.contains("\"secret\""));
+        assert!(!format!("{cadence:?}").contains("plaintext-webhook-secret"));
     }
 }

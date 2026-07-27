@@ -428,6 +428,12 @@ attachment bytes are the deliberate exception: only sanitized attachment text
 is durable, while provider-bound image parts remain transient. The router also
 dual-writes V1-compatible conversation history to the relational database.
 
+Webhook mission documents contain only versioned secret references. Plaintext
+webhook secrets live in the encrypted host `SecretsStore`, are hydrated into
+runtime memory when Engine V2 starts, and are omitted from serialization and
+debug output. Startup migrates legacy plaintext mission documents in place so
+workspace search chunks no longer contain the credential.
+
 "Cleanup" of terminal threads means writing a compact archive and evicting
 in-memory cache entries to bound RAM; workspace files remain. `load_thread()`,
 `load_steps()`, and `load_events()` reload persisted files on a cache miss.

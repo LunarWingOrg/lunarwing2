@@ -9,6 +9,10 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
+use lunarwing_common::{
+    HARD_PROMPT_CONTEXT_LIMITS, PromptContextMessage, PromptContextRole, select_prompt_context_by,
+};
+
 use crate::agent::Agent;
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::channels::{IncomingMessage, StatusUpdate};
@@ -19,7 +23,7 @@ use async_trait::async_trait;
 use crate::agent::agentic_loop::{
     AgenticLoopConfig, LoopDelegate, LoopOutcome, LoopSignal, TextAction,
 };
-use crate::llm::{ChatMessage, Reasoning, ReasoningContext};
+use crate::llm::{ChatMessage, Reasoning, ReasoningContext, Role};
 use crate::tools::redact_params;
 
 /// Result of the agentic loop execution.
@@ -31,6 +35,22 @@ pub(super) enum AgenticLoopResult {
         /// The pending approval request to store.
         pending: Box<PendingApproval>,
     },
+}
+
+fn prompt_context_from_chat_messages(messages: &[ChatMessage]) -> Arc<[PromptContextMessage]> {
+    Arc::from(select_prompt_context_by(
+        messages,
+        HARD_PROMPT_CONTEXT_LIMITS,
+        |message| {
+            let role = match message.role {
+                Role::User => PromptContextRole::User,
+                Role::Assistant if message.tool_calls.is_none() => PromptContextRole::Assistant,
+                Role::Assistant => return None,
+                Role::System | Role::Tool => return None,
+            };
+            Some((role, message.content.as_str()))
+        },
+    ))
 }
 
 impl Agent {
@@ -61,6 +81,7 @@ impl Agent {
             None, // user setting lookup can be added later
             &self.config.default_timezone,
         );
+        let prompt_context = prompt_context_from_chat_messages(&initial_messages);
 
         let system_prompt = if let Some(ws) = self.workspace() {
             match ws
@@ -150,7 +171,8 @@ impl Agent {
             let mut job_ctx =
                 JobContext::with_user(&message.user_id, "reflex", "Reflex fast-path execution")
                     .with_requester_id(&message.sender_id)
-                    .with_vision_service_url(self.deps.vision_service_url.clone());
+                    .with_vision_service_url(self.deps.vision_service_url.clone())
+                    .with_prompt_context(Arc::clone(&prompt_context));
             job_ctx.user_timezone = user_tz.name().to_string();
 
             let params = serde_json::json!({"input": message.content});
@@ -192,7 +214,8 @@ impl Agent {
         let mut job_ctx =
             JobContext::with_user(&message.user_id, "chat", "Interactive chat session")
                 .with_requester_id(&message.sender_id)
-                .with_vision_service_url(self.deps.vision_service_url.clone());
+                .with_vision_service_url(self.deps.vision_service_url.clone())
+                .with_prompt_context(prompt_context);
         job_ctx.http_interceptor = self.deps.http_interceptor.clone();
         job_ctx.user_timezone = user_tz.name().to_string();
         job_ctx.metadata = crate::agent::agent_loop::chat_tool_execution_metadata(message);
@@ -1221,7 +1244,30 @@ mod tests {
     use crate::safety::SafetyLayer;
     use crate::tools::ToolRegistry;
 
-    use super::check_auth_required;
+    use super::{check_auth_required, prompt_context_from_chat_messages};
+
+    #[test]
+    fn delegated_prompt_context_contains_only_visible_chat_roles() {
+        let mut tool_call_message = crate::llm::ChatMessage::assistant("private tool reasoning");
+        tool_call_message.tool_calls = Some(Vec::new());
+        let messages = [
+            crate::llm::ChatMessage::system("secret system prompt"),
+            crate::llm::ChatMessage::user("question"),
+            tool_call_message,
+            crate::llm::ChatMessage::tool_result("call", "tool", "secret tool output"),
+            crate::llm::ChatMessage::assistant("answer"),
+        ];
+
+        let context = prompt_context_from_chat_messages(&messages);
+        assert_eq!(context.len(), 2);
+        assert_eq!(context[0].role, lunarwing_common::PromptContextRole::User);
+        assert_eq!(context[0].content, "question");
+        assert_eq!(
+            context[1].role,
+            lunarwing_common::PromptContextRole::Assistant
+        );
+        assert_eq!(context[1].content, "answer");
+    }
 
     /// Minimal LLM provider for unit tests that always returns a static response.
     struct StaticLlmProvider;
