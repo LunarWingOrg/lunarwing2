@@ -51,6 +51,8 @@ HTTP_PORT = int(os.getenv("ADAPTER_PORT", "6680"))
 
 # Max fresh inbound messages before IRC reads pause and apply TCP backpressure.
 MAX_QUEUE = int(os.getenv("ADAPTER_MAX_QUEUE", "500"))
+# Host accepts at most 100 emits from one WASM callback.
+MAX_POLL_BATCH = 100
 
 # Max UTF-8 payload bytes; per-target clamp keeps full IRC frame within 450 bytes.
 MAX_IRC_MESSAGE_BYTES = int(os.getenv("DARKIRC_MAX_MESSAGE_BYTES", "400"))
@@ -456,7 +458,7 @@ def _poll_messages() -> list:
     """Return current at-least-once batch without evicting unacked entries."""
     global pending_batch_id
     if not pending_ack:
-        while message_queue and len(pending_ack) < MAX_QUEUE:
+        while message_queue and len(pending_ack) < min(MAX_QUEUE, MAX_POLL_BATCH):
             pending_ack.append(message_queue.popleft())
         if pending_ack:
             pending_batch_id = secrets.token_urlsafe(24)

@@ -312,6 +312,24 @@ class PendingAckTest(unittest.TestCase):
         self.assertTrue(_ack_batch(batch_id))
         self.assertFalse(_ack_batch(batch_id))
 
+    def test_poll_batches_never_exceed_host_emit_limit(self):
+        for index in range(mod.MAX_POLL_BATCH + 1):
+            mod.message_queue.append(
+                {"from": "alice", "text": f"message-{index}", "ts": str(index)}
+            )
+
+        first = _poll_messages()
+        first_batch_id = mod.pending_batch_id
+        self.assertEqual(len(first), mod.MAX_POLL_BATCH)
+        self.assertEqual(len(mod.message_queue), 1)
+        self.assertEqual(_poll_messages(), first)
+        self.assertEqual(mod.pending_batch_id, first_batch_id)
+
+        self.assertTrue(_ack_batch(first_batch_id))
+        second = _poll_messages()
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0]["text"], f"message-{mod.MAX_POLL_BATCH}")
+
 
 class FakeIRC:
     """Records PRIVMSG lines; can be told to fail sends."""

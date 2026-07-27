@@ -165,6 +165,11 @@ curl http://127.0.0.1:6680/poll
 | `ADAPTER_OUTBOX_JOURNAL` | (disabled) | Durable outbox path; production template sets a tenant-local file |
 | `ADAPTER_LOG_LEVEL` | `INFO` | Log verbosity |
 
+Inbound `/poll` responses contain at most 100 messages, matching host callback
+capacity. LunarWing acknowledges each batch on a later poll only after every
+message entered the host agent queue; failed dispatch leaves the batch unacked
+for retry.
+
 ## Capabilities JSON Reference
 
 The file at `~/.lunarwing/channels/darkirc.capabilities.json` must match LunarWing's expected schema exactly. Known working version:
