@@ -142,7 +142,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain 1.92.0 \
+        | sh -s -- -y --default-toolchain 1.96.1 \
       && chmod -R a+r /usr/local/rustup /usr/local/cargo; \
     fi
 

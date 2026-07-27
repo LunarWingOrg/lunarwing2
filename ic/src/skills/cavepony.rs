@@ -17,6 +17,7 @@ pub enum CaveponyMode {
     Ultra,
     Pony,
     Canterlot,
+    TonySoprano,
 }
 
 impl CaveponyMode {
@@ -27,6 +28,7 @@ impl CaveponyMode {
             "ultra" => Some(Self::Ultra),
             "pony" => Some(Self::Pony),
             "canterlot" => Some(Self::Canterlot),
+            "tony-soprano" => Some(Self::TonySoprano),
             _ => None,
         }
     }
@@ -42,6 +44,7 @@ impl CaveponyMode {
             Self::Ultra => "ultra",
             Self::Pony => "pony",
             Self::Canterlot => "canterlot",
+            Self::TonySoprano => "tony-soprano",
         }
     }
 }
@@ -218,6 +221,10 @@ mod tests {
             CaveponyMode::from_setting_value(&serde_json::json!("ultra")),
             Some(CaveponyMode::Ultra)
         );
+        assert_eq!(
+            CaveponyMode::from_setting_value(&serde_json::json!("tony-soprano")),
+            Some(CaveponyMode::TonySoprano)
+        );
         assert_eq!(CaveponyMode::parse("tokens"), None);
         assert_eq!(
             CaveponyMode::from_setting_value(&serde_json::json!(true)),
@@ -234,6 +241,10 @@ mod tests {
         assert_eq!(
             CaveponyDirective::parse(" /CAVEPONY ultra "),
             Some(CaveponyDirective::Mode(CaveponyMode::Ultra))
+        );
+        assert_eq!(
+            CaveponyDirective::parse("/cavepony Tony-Soprano"),
+            Some(CaveponyDirective::Mode(CaveponyMode::TonySoprano))
         );
         assert_eq!(
             CaveponyDirective::parse("/normal"),
@@ -336,6 +347,11 @@ mod tests {
             .expect("turn instruction");
         assert!(turn.contains("scope=\"turn\""));
         assert!(turn.contains("mode=\"lite\""));
+
+        let tony = CaveponyActivation::Turn(CaveponyMode::TonySoprano)
+            .prompt_instruction()
+            .expect("Tony Soprano instruction");
+        assert!(tony.contains("mode=\"tony-soprano\""));
 
         let bypass = CaveponyActivation::Bypass
             .prompt_instruction()

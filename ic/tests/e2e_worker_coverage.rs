@@ -91,21 +91,32 @@ mod tests {
 
     #[tokio::test]
     async fn tool_error_feedback() {
-        // Use a tempdir for the recovery file. The fixture's recovery path
-        // is updated to write here via the test_dir variable.
+        // A missing absolute path is writable when CI runs as root because
+        // write_file creates parents. A regular file cannot become a directory,
+        // making the first write fail regardless of process privileges.
         let tmp = tempfile::tempdir().expect("create temp dir");
-        let test_dir = tmp.path().to_str().expect("tempdir path");
+        let invalid_parent = tmp.path().join("not-a-directory");
+        std::fs::write(&invalid_parent, "sentinel").expect("create invalid parent sentinel");
+        let invalid_path = invalid_parent.join("file.txt");
+        let recovery_path = tmp.path().join("recovered.txt");
+        let invalid_path = invalid_path.to_str().expect("invalid path");
+        let recovery_path = recovery_path.to_str().expect("recovery path");
 
-        // Patch the fixture's recovery path to use our tempdir.
+        // Patch both fixture paths to use deterministic tempdir locations.
         let fixture_str = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/llm_traces/worker/tool_error_feedback.json"
         ))
         .expect("read fixture");
-        let fixture_str = fixture_str.replace(
-            "/tmp/lunarwing_error_feedback_test/recovered.txt",
-            &format!("{test_dir}/recovered.txt"),
-        );
+        let fixture_str = fixture_str
+            .replace(
+                "/nonexistent_root_dir_xyz/impossible/file.txt",
+                invalid_path,
+            )
+            .replace(
+                "/tmp/lunarwing_error_feedback_test/recovered.txt",
+                recovery_path,
+            );
         let trace: LlmTrace = serde_json::from_str(&fixture_str).expect("parse patched fixture");
 
         let rig = TestRigBuilder::new()
@@ -120,8 +131,7 @@ mod tests {
         rig.verify_trace_expects(&trace, &responses);
 
         // Verify the recovery file exists in the tempdir.
-        let content = std::fs::read_to_string(format!("{test_dir}/recovered.txt"))
-            .expect("recovered.txt should exist");
+        let content = std::fs::read_to_string(recovery_path).expect("recovered.txt should exist");
         assert!(
             content.contains("recovered"),
             "Expected 'recovered' in file, got: {content:?}"

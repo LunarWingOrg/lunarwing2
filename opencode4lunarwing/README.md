@@ -38,6 +38,9 @@ The agent logs `External workers configured: opencode` on startup.
 LunarWing and this worker.
 On timeout or cancellation, the worker aborts the active OpenCode session instead
 of leaving it running in the container.
+Job metadata and progress events are persisted by LunarWing. After a daemon restart,
+running jobs are reported as `interrupted`, while `list_jobs`, `job_status`, and
+`job_events` can still read their saved status and event history from the database.
 
 ## Usage
 
