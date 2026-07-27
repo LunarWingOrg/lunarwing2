@@ -690,10 +690,21 @@ async fn check_tunnel_provider(settings: &Settings) -> (&'static str, CheckResul
         .or_else(|| settings.tunnel.provider.clone());
 
     match provider.as_deref() {
-        Some("netbird") => ("netbird", check_netbird().await),
-        Some("cloudflare") => ("cloudflared", check_binary("cloudflared", &["--version"])),
-        Some("ngrok") => ("ngrok", check_binary("ngrok", &["version"])),
-        Some("tailscale") => ("tailscale", check_binary("tailscale", &["version"])),
+        Some("netbird") => {
+            let prefix = crate::config::helpers::env_or_override("TUNNEL_NETBIRD_NAME_PREFIX")
+                .or_else(|| settings.tunnel.netbird_name_prefix.clone())
+                .unwrap_or_else(|| "lunarwing".to_string());
+            if let Err(error) = crate::tunnel::validate_netbird_name_prefix(&prefix) {
+                return ("netbird", CheckResult::Fail(error.to_string()));
+            }
+            ("netbird", check_netbird().await)
+        }
+        Some(provider @ ("cloudflare" | "ngrok" | "tailscale")) => (
+            "Tunnel provider",
+            CheckResult::Fail(format!(
+                "managed provider '{provider}' was removed; configure netbird, custom, or an externally managed HTTPS TUNNEL_URL"
+            )),
+        ),
         Some("custom") => {
             let command = crate::config::helpers::env_or_override("TUNNEL_CUSTOM_COMMAND")
                 .or_else(|| settings.tunnel.custom_command.clone());
@@ -715,7 +726,9 @@ async fn check_tunnel_provider(settings: &Settings) -> (&'static str, CheckResul
         ),
         Some(other) => (
             "Tunnel provider",
-            CheckResult::Fail(format!("unknown provider: {other}")),
+            CheckResult::Fail(format!(
+                "unknown provider: {other}; valid providers: none, netbird, custom"
+            )),
         ),
     }
 }
@@ -782,34 +795,6 @@ fn first_command_line(output: &std::process::Output) -> String {
         .to_string()
 }
 
-fn check_binary(name: &str, args: &[&str]) -> CheckResult {
-    match std::process::Command::new(name)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-    {
-        Ok(output) => {
-            let version = String::from_utf8_lossy(&output.stdout);
-            let version = version.trim();
-            // Some tools print version to stderr
-            let version = if version.is_empty() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                stderr.trim().lines().next().unwrap_or("").to_string()
-            } else {
-                version.lines().next().unwrap_or("").to_string()
-            };
-
-            if output.status.success() {
-                CheckResult::Pass(version)
-            } else {
-                CheckResult::Fail(format!("exited with {}", output.status))
-            }
-        }
-        Err(_) => CheckResult::Skip(format!("{name} not found in PATH")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::cli::doctor::*;
@@ -818,7 +803,12 @@ mod tests {
 
     impl TunnelEnvGuard {
         fn clear() -> Self {
-            let keys = ["TUNNEL_URL", "TUNNEL_PROVIDER", "TUNNEL_CUSTOM_COMMAND"];
+            let keys = [
+                "TUNNEL_URL",
+                "TUNNEL_PROVIDER",
+                "TUNNEL_CUSTOM_COMMAND",
+                "TUNNEL_NETBIRD_NAME_PREFIX",
+            ];
             let previous = keys
                 .into_iter()
                 .map(|key| (key, std::env::var(key).ok()))
@@ -858,25 +848,6 @@ mod tests {
     }
 
     #[test]
-    fn check_binary_finds_sh() {
-        match check_binary("sh", &["-c", "echo ok"]) {
-            CheckResult::Pass(_) => {}
-            other => panic!("expected Pass for sh, got: {}", format_result(&other)),
-        }
-    }
-
-    #[test]
-    fn check_binary_skips_nonexistent() {
-        match check_binary("__lunarwing_nonexistent_binary__", &["--version"]) {
-            CheckResult::Skip(_) => {}
-            other => panic!(
-                "expected Skip for nonexistent binary, got: {}",
-                format_result(&other)
-            ),
-        }
-    }
-
-    #[test]
     fn tunnel_provider_skips_when_unconfigured() {
         let settings = Settings::default();
         let (_, result) = check_tunnel_without_env(&settings);
@@ -909,6 +880,27 @@ mod tests {
         settings.tunnel.provider = Some("netbird".to_string());
         let (_, result) = check_tunnel_without_env(&settings);
         assert!(matches!(result, CheckResult::Fail(detail) if detail.contains("HTTPS")));
+    }
+
+    #[test]
+    fn tunnel_provider_reports_removed_managed_providers() {
+        for provider in ["cloudflare", "ngrok", "tailscale"] {
+            let mut settings = Settings::default();
+            settings.tunnel.provider = Some(provider.to_string());
+            let (name, result) = check_tunnel_without_env(&settings);
+            assert_eq!(name, "Tunnel provider");
+            assert!(matches!(result, CheckResult::Fail(detail) if detail.contains("was removed")));
+        }
+    }
+
+    #[test]
+    fn tunnel_provider_rejects_invalid_netbird_prefix_before_binary_probe() {
+        let mut settings = Settings::default();
+        settings.tunnel.provider = Some("netbird".to_string());
+        settings.tunnel.netbird_name_prefix = Some("Invalid Prefix".to_string());
+        let (name, result) = check_tunnel_without_env(&settings);
+        assert_eq!(name, "netbird");
+        assert!(matches!(result, CheckResult::Fail(detail) if detail.contains("name prefix")));
     }
 
     #[tokio::test]

@@ -41,7 +41,7 @@ Start with these deeper docs as needed (keep in mind most of these are outdated 
 - Container orchestrator and external workers: `src/orchestrator/`
 - Secrets management: `src/secrets/`
 - Lifecycle hooks: `src/hooks/`
-- Tunnel abstraction (netbird, cloudflare, ngrok, tailscale): `src/tunnel/`
+- Tunnel abstraction (NetBird, custom commands, static URLs): `src/tunnel/`
 - SKILL.md prompt extensions: `src/skills/`
 - Engine V2 bridge: `src/bridge/`
 - Execution gate and approval pending state: `src/gate/`
@@ -237,5 +237,4 @@ Exceptions: comments/docs forbidding the pattern; code inside `ic/scripts/lunarw
 - Run the most targeted tests/checks that cover the change.
 - Re-check security-sensitive paths when touching auth, secrets, network listeners, sandboxing, or approvals.
 - Keep the final diff scoped to the task.
-
 

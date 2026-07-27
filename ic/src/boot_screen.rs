@@ -28,9 +28,9 @@ pub struct BootInfo {
     pub routines_enabled: bool,
     pub skills_enabled: bool,
     pub channels: Vec<String>,
-    /// Public URL from a managed tunnel (e.g., "https://abc.ngrok.io").
+    /// Public URL from a managed tunnel (e.g., "https://lunarwing.example.com").
     pub tunnel_url: Option<String>,
-    /// Provider name for the managed tunnel (e.g., "ngrok").
+    /// Provider name for the managed tunnel (e.g., "netbird").
     pub tunnel_provider: Option<String>,
     /// Time elapsed during startup. Shown at the bottom when present.
     pub startup_elapsed: Option<std::time::Duration>,
@@ -277,8 +277,8 @@ mod tests {
                 "gateway".to_string(),
                 "xmpp".to_string(),
             ],
-            tunnel_url: Some("https://abc123.ngrok.io".to_string()),
-            tunnel_provider: Some("ngrok".to_string()),
+            tunnel_url: Some("https://lunarwing.example.com".to_string()),
+            tunnel_provider: Some("netbird".to_string()),
             startup_elapsed: None,
         };
         // Should not panic

@@ -214,6 +214,7 @@ impl AppBuilder {
                 self.config = db_config;
                 tracing::debug!("Configuration reloaded from database");
             }
+            Err(error) if fatal_db_reload_error(&error) => return Err(error.into()),
             Err(e) => {
                 tracing::warn!(
                     "Failed to reload config from DB, keeping env-based config: {}",
@@ -1203,6 +1204,14 @@ impl AppBuilder {
     }
 }
 
+fn fatal_db_reload_error(error: &crate::error::ConfigError) -> bool {
+    matches!(
+        error,
+        crate::error::ConfigError::InvalidValue { key, .. }
+            if key.starts_with("TUNNEL_")
+    )
+}
+
 /// One-shot cleanup of ghost-seeded tool permission rows from a previous
 /// version that wrote baseline defaults into the database.
 ///
@@ -1319,7 +1328,7 @@ async fn cleanup_ghost_seeded_tool_permissions(
 mod tests {
     use std::sync::Arc;
 
-    use super::{AppBuilder, TurnBudgetOutcome};
+    use super::{AppBuilder, TurnBudgetOutcome, fatal_db_reload_error};
 
     use async_trait::async_trait;
     use tokio::sync::mpsc;
@@ -1331,6 +1340,36 @@ mod tests {
 
     struct SessionStartHook {
         tx: mpsc::UnboundedSender<(String, String)>,
+    }
+
+    #[test]
+    fn invalid_db_tunnel_provider_is_fatal_to_startup() {
+        let tunnel_error = crate::error::ConfigError::InvalidValue {
+            key: "TUNNEL_PROVIDER".to_string(),
+            message: "managed provider was removed".to_string(),
+        };
+        let unrelated_error = crate::error::ConfigError::InvalidValue {
+            key: "SELECTED_MODEL".to_string(),
+            message: "invalid".to_string(),
+        };
+        let tunnel_url_error = crate::error::ConfigError::InvalidValue {
+            key: "TUNNEL_URL".to_string(),
+            message: "must use HTTPS".to_string(),
+        };
+        let custom_command_error = crate::error::ConfigError::InvalidValue {
+            key: "TUNNEL_CUSTOM_COMMAND".to_string(),
+            message: "required".to_string(),
+        };
+        let netbird_prefix_error = crate::error::ConfigError::InvalidValue {
+            key: "TUNNEL_NETBIRD_NAME_PREFIX".to_string(),
+            message: "invalid".to_string(),
+        };
+
+        assert!(fatal_db_reload_error(&tunnel_error));
+        assert!(fatal_db_reload_error(&tunnel_url_error));
+        assert!(fatal_db_reload_error(&custom_command_error));
+        assert!(fatal_db_reload_error(&netbird_prefix_error));
+        assert!(!fatal_db_reload_error(&unrelated_error));
     }
 
     #[async_trait]

@@ -78,7 +78,7 @@
 24. [x] (S) Refactor mt admin. The existing document plans have SERIOUS issues. Therefore, I'm going with a COMPLETELY different plan for this. Please see the following branch: mtadminrefactor/meta4/v2.0.3.0
 25. [ ] Review recent work on XMPP file transfer — remaining polish (further hardening), see documents about this if unsure. create new doc detailing findings in docs/ops
 26. [ ] Review recent work on Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure. create new doc detailing findings in docs/ops
-27. [ ] Review recent changes for: Gut proprietary tunnel providers and add support for netbird. improve if necessary
+27. [x] Review recent changes for: Gut proprietary tunnel providers and add support for netbird. improve if necessary
 28. [ ] ensure dependency list is updated for gentoo and include archlinux dependency list if not present as well
 29. [ ] review darkirc key exchange implementation (only if item 20 was completed)
 30. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs

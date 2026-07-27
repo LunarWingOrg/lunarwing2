@@ -15,7 +15,7 @@ use crate::settings::Settings;
 /// the gateway starts the tunnel on boot and populates `public_url`.
 #[derive(Debug, Clone, Default)]
 pub struct TunnelConfig {
-    /// Public URL from tunnel provider (e.g., "https://abc123.ngrok.io").
+    /// Public URL from a tunnel provider (e.g., "https://tunnel.example.com").
     /// Set statically via `TUNNEL_URL` or populated at runtime by a managed tunnel.
     pub public_url: Option<String>,
     /// Provider configuration for lifecycle-managed tunnels.
@@ -38,39 +38,30 @@ impl TunnelConfig {
             .or_else(|| settings.tunnel.provider.clone())
             .unwrap_or_default();
 
-        let provider = if provider_name.is_empty() || provider_name == "none" {
-            None
-        } else {
-            Some(crate::tunnel::TunnelProviderConfig {
-                provider: provider_name.clone(),
-                netbird: Some(crate::tunnel::NetBirdTunnelConfig {
-                    custom_domain: optional_env("TUNNEL_NETBIRD_CUSTOM_DOMAIN")?
-                        .or_else(|| settings.tunnel.netbird_custom_domain.clone()),
-                    name_prefix: optional_env("TUNNEL_NETBIRD_NAME_PREFIX")?
-                        .or_else(|| settings.tunnel.netbird_name_prefix.clone())
-                        .unwrap_or_else(|| "lunarwing".to_string()),
-                }),
-                cloudflare: optional_env("TUNNEL_CF_TOKEN")?
-                    .or_else(|| settings.tunnel.cf_token.clone())
-                    .map(|token| crate::tunnel::CloudflareTunnelConfig { token }),
-                tailscale: Some(crate::tunnel::TailscaleTunnelConfig {
-                    funnel: optional_env("TUNNEL_TS_FUNNEL")?
-                        .map(|s| s == "true" || s == "1")
-                        .unwrap_or(settings.tunnel.ts_funnel),
-                    hostname: optional_env("TUNNEL_TS_HOSTNAME")?
-                        .or_else(|| settings.tunnel.ts_hostname.clone()),
-                }),
-                ngrok: {
-                    let ngrok_domain = optional_env("TUNNEL_NGROK_DOMAIN")?
-                        .or_else(|| settings.tunnel.ngrok_domain.clone());
-                    optional_env("TUNNEL_NGROK_TOKEN")?
-                        .or_else(|| settings.tunnel.ngrok_token.clone())
-                        .map(|auth_token| crate::tunnel::NgrokTunnelConfig {
-                            auth_token,
-                            domain: ngrok_domain,
-                        })
-                },
-                custom: {
+        let provider =
+            if public_url.is_some() || provider_name.is_empty() || provider_name == "none" {
+                None
+            } else {
+                crate::tunnel::validate_provider_name(&provider_name).map_err(|message| {
+                    ConfigError::InvalidValue {
+                        key: "TUNNEL_PROVIDER".to_string(),
+                        message,
+                    }
+                })?;
+
+                let netbird_name_prefix = optional_env("TUNNEL_NETBIRD_NAME_PREFIX")?
+                    .or_else(|| settings.tunnel.netbird_name_prefix.clone())
+                    .unwrap_or_else(|| "lunarwing".to_string());
+                if provider_name == "netbird" {
+                    crate::tunnel::validate_netbird_name_prefix(&netbird_name_prefix).map_err(
+                        |error| ConfigError::InvalidValue {
+                            key: "TUNNEL_NETBIRD_NAME_PREFIX".to_string(),
+                            message: error.to_string(),
+                        },
+                    )?;
+                }
+
+                let custom = {
                     let health_url = optional_env("TUNNEL_CUSTOM_HEALTH_URL")?
                         .or_else(|| settings.tunnel.custom_health_url.clone());
                     let url_pattern = optional_env("TUNNEL_CUSTOM_URL_PATTERN")?
@@ -82,9 +73,28 @@ impl TunnelConfig {
                             health_url,
                             url_pattern,
                         })
-                },
-            })
-        };
+                };
+                if provider_name == "custom"
+                    && custom
+                        .as_ref()
+                        .is_none_or(|config| config.start_command.trim().is_empty())
+                {
+                    return Err(ConfigError::InvalidValue {
+                        key: "TUNNEL_CUSTOM_COMMAND".to_string(),
+                        message: "custom tunnel provider requires a non-empty command".to_string(),
+                    });
+                }
+
+                Some(crate::tunnel::TunnelProviderConfig {
+                    provider: provider_name.clone(),
+                    netbird: Some(crate::tunnel::NetBirdTunnelConfig {
+                        custom_domain: optional_env("TUNNEL_NETBIRD_CUSTOM_DOMAIN")?
+                            .or_else(|| settings.tunnel.netbird_custom_domain.clone()),
+                        name_prefix: netbird_name_prefix,
+                    }),
+                    custom,
+                })
+            };
 
         Ok(Self {
             public_url,
@@ -120,10 +130,49 @@ pub(crate) fn validate_public_url(url: &str) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use crate::config::tunnel::TunnelConfig;
-    use crate::tunnel::{
-        CloudflareTunnelConfig, CustomTunnelConfig, NetBirdTunnelConfig, NgrokTunnelConfig,
-        TailscaleTunnelConfig, TunnelProviderConfig,
-    };
+    use crate::settings::Settings;
+    use crate::tunnel::{CustomTunnelConfig, NetBirdTunnelConfig, TunnelProviderConfig};
+
+    struct TunnelEnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl TunnelEnvGuard {
+        fn clear() -> Self {
+            let keys = [
+                "TUNNEL_URL",
+                "TUNNEL_PROVIDER",
+                "TUNNEL_NETBIRD_CUSTOM_DOMAIN",
+                "TUNNEL_NETBIRD_NAME_PREFIX",
+                "TUNNEL_CUSTOM_COMMAND",
+                "TUNNEL_CUSTOM_HEALTH_URL",
+                "TUNNEL_CUSTOM_URL_PATTERN",
+            ];
+            let previous = keys
+                .into_iter()
+                .map(|key| (key, std::env::var(key).ok()))
+                .collect();
+            // SAFETY: Callers hold the shared environment lock.
+            unsafe {
+                for key in keys {
+                    std::env::remove_var(key);
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for TunnelEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: Guard is dropped while caller still holds environment lock.
+            unsafe {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
 
     // ── Default ─────────────────────────────────────────────────────
 
@@ -133,6 +182,56 @@ mod tests {
         assert!(cfg.public_url.is_none());
         assert!(cfg.provider.is_none());
         assert!(!cfg.is_enabled());
+    }
+
+    #[test]
+    fn removed_provider_fails_without_static_url() {
+        let _env_lock = crate::config::helpers::lock_env();
+        let _env = TunnelEnvGuard::clear();
+        let mut settings = Settings::default();
+        settings.tunnel.provider = Some("ngrok".to_string());
+
+        let error = TunnelConfig::resolve(&settings).unwrap_err();
+        assert!(error.to_string().contains("was removed"));
+    }
+
+    #[test]
+    fn static_url_ignores_removed_provider_marker() {
+        let _env_lock = crate::config::helpers::lock_env();
+        let _env = TunnelEnvGuard::clear();
+        let mut settings = Settings::default();
+        settings.tunnel.public_url = Some("https://tunnel.example.com".to_string());
+        settings.tunnel.provider = Some("ngrok".to_string());
+
+        let config = TunnelConfig::resolve(&settings).unwrap();
+        assert_eq!(
+            config.public_url.as_deref(),
+            Some("https://tunnel.example.com")
+        );
+        assert!(config.provider.is_none());
+    }
+
+    #[test]
+    fn custom_provider_requires_command() {
+        let _env_lock = crate::config::helpers::lock_env();
+        let _env = TunnelEnvGuard::clear();
+        let mut settings = Settings::default();
+        settings.tunnel.provider = Some("custom".to_string());
+
+        let error = TunnelConfig::resolve(&settings).unwrap_err();
+        assert!(error.to_string().contains("TUNNEL_CUSTOM_COMMAND"));
+    }
+
+    #[test]
+    fn netbird_provider_rejects_invalid_prefix_during_config_resolution() {
+        let _env_lock = crate::config::helpers::lock_env();
+        let _env = TunnelEnvGuard::clear();
+        let mut settings = Settings::default();
+        settings.tunnel.provider = Some("netbird".to_string());
+        settings.tunnel.netbird_name_prefix = Some("Invalid Prefix".to_string());
+
+        let error = TunnelConfig::resolve(&settings).unwrap_err();
+        assert!(error.to_string().contains("TUNNEL_NETBIRD_NAME_PREFIX"));
     }
 
     // ── is_enabled ──────────────────────────────────────────────────
@@ -151,13 +250,8 @@ mod tests {
         let cfg = TunnelConfig {
             public_url: None,
             provider: Some(TunnelProviderConfig {
-                provider: "cloudflare".to_string(),
-                netbird: None,
-                cloudflare: Some(CloudflareTunnelConfig {
-                    token: "cf-tok".to_string(),
-                }),
-                tailscale: None,
-                ngrok: None,
+                provider: "netbird".to_string(),
+                netbird: Some(NetBirdTunnelConfig::default()),
                 custom: None,
             }),
         };
@@ -169,15 +263,13 @@ mod tests {
         let cfg = TunnelConfig {
             public_url: Some("https://example.com".to_string()),
             provider: Some(TunnelProviderConfig {
-                provider: "ngrok".to_string(),
+                provider: "custom".to_string(),
                 netbird: None,
-                cloudflare: None,
-                tailscale: None,
-                ngrok: Some(NgrokTunnelConfig {
-                    auth_token: "ngrok-tok".to_string(),
-                    domain: None,
+                custom: Some(CustomTunnelConfig {
+                    start_command: "example-tunnel {port}".to_string(),
+                    health_url: None,
+                    url_pattern: None,
                 }),
-                custom: None,
             }),
         };
         assert!(cfg.is_enabled());
@@ -194,62 +286,62 @@ mod tests {
     #[test]
     fn webhook_url_basic() {
         let cfg = TunnelConfig {
-            public_url: Some("https://abc.ngrok.io".to_string()),
+            public_url: Some("https://tunnel.example.com".to_string()),
             provider: None,
         };
         assert_eq!(
             cfg.webhook_url("/webhook/xmpp"),
-            Some("https://abc.ngrok.io/webhook/xmpp".to_string())
+            Some("https://tunnel.example.com/webhook/xmpp".to_string())
         );
     }
 
     #[test]
     fn webhook_url_trims_trailing_slash_on_base() {
         let cfg = TunnelConfig {
-            public_url: Some("https://abc.ngrok.io/".to_string()),
+            public_url: Some("https://tunnel.example.com/".to_string()),
             provider: None,
         };
         assert_eq!(
             cfg.webhook_url("/hook"),
-            Some("https://abc.ngrok.io/hook".to_string())
+            Some("https://tunnel.example.com/hook".to_string())
         );
     }
 
     #[test]
     fn webhook_url_trims_leading_slash_on_path() {
         let cfg = TunnelConfig {
-            public_url: Some("https://abc.ngrok.io".to_string()),
+            public_url: Some("https://tunnel.example.com".to_string()),
             provider: None,
         };
         // Path without leading slash should also work
         assert_eq!(
             cfg.webhook_url("hook"),
-            Some("https://abc.ngrok.io/hook".to_string())
+            Some("https://tunnel.example.com/hook".to_string())
         );
     }
 
     #[test]
     fn webhook_url_double_slash_normalization() {
         let cfg = TunnelConfig {
-            public_url: Some("https://abc.ngrok.io/".to_string()),
+            public_url: Some("https://tunnel.example.com/".to_string()),
             provider: None,
         };
         // Both base trailing and path leading slashes trimmed
         assert_eq!(
             cfg.webhook_url("/api/webhook"),
-            Some("https://abc.ngrok.io/api/webhook".to_string())
+            Some("https://tunnel.example.com/api/webhook".to_string())
         );
     }
 
     #[test]
     fn webhook_url_empty_path() {
         let cfg = TunnelConfig {
-            public_url: Some("https://abc.ngrok.io".to_string()),
+            public_url: Some("https://tunnel.example.com".to_string()),
             provider: None,
         };
         assert_eq!(
             cfg.webhook_url(""),
-            Some("https://abc.ngrok.io/".to_string())
+            Some("https://tunnel.example.com/".to_string())
         );
     }
 
@@ -276,56 +368,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_config_cloudflare() {
-        let p = TunnelProviderConfig {
-            provider: "cloudflare".to_string(),
-            netbird: None,
-            cloudflare: Some(CloudflareTunnelConfig {
-                token: "cf-secret".to_string(),
-            }),
-            tailscale: None,
-            ngrok: None,
-            custom: None,
-        };
-        assert_eq!(p.provider, "cloudflare");
-        assert_eq!(p.cloudflare.as_ref().unwrap().token, "cf-secret");
-    }
-
-    #[test]
-    fn provider_config_tailscale() {
-        let ts = TailscaleTunnelConfig {
-            funnel: true,
-            hostname: Some("my-host".to_string()),
-        };
-        assert!(ts.funnel);
-        assert_eq!(ts.hostname.as_deref(), Some("my-host"));
-    }
-
-    #[test]
-    fn provider_config_tailscale_defaults() {
-        let ts = TailscaleTunnelConfig::default();
-        assert!(!ts.funnel);
-        assert!(ts.hostname.is_none());
-    }
-
-    #[test]
-    fn provider_config_ngrok() {
-        let ng = NgrokTunnelConfig {
-            auth_token: "ng-tok".to_string(),
-            domain: Some("custom.ngrok.dev".to_string()),
-        };
-        assert_eq!(ng.auth_token, "ng-tok");
-        assert_eq!(ng.domain.as_deref(), Some("custom.ngrok.dev"));
-    }
-
-    #[test]
-    fn provider_config_ngrok_defaults() {
-        let ng = NgrokTunnelConfig::default();
-        assert!(ng.auth_token.is_empty());
-        assert!(ng.domain.is_none());
-    }
-
-    #[test]
     fn provider_config_custom() {
         let c = CustomTunnelConfig {
             start_command: "bore local {port}".to_string(),
@@ -343,11 +385,5 @@ mod tests {
         assert!(c.start_command.is_empty());
         assert!(c.health_url.is_none());
         assert!(c.url_pattern.is_none());
-    }
-
-    #[test]
-    fn cloudflare_config_defaults() {
-        let cf = CloudflareTunnelConfig::default();
-        assert!(cf.token.is_empty());
     }
 }
