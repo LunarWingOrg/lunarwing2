@@ -85,7 +85,7 @@
 31. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
 32. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
 33. [ ] write up proper plan document in docs/proposals for integrating docs/proposals/MULTIAGENTTEAMORCHESTRATION into the next release, 2.0.4.0
-34. [ ] write up proper single plan document in docs/proposals for integrating docs/proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED in docs/proposals - see the following branch: rc2/aragents/v2.0.3.0
+34. [x] write up proper single plan document in docs/proposals for integrating docs/proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED in docs/proposals - see the following branch: rc2/aragents/v2.0.3.0
 35. [x] (S) update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
 36. [ ] update docs/README.md
 37. [ ] update README.md at repo root
