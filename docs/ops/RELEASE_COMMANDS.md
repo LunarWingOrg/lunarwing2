@@ -74,7 +74,7 @@ NOTES_FILE=RELEASE-v<version>.md
 # NOTES_FILE=docs/releases/RELEASE-v<version>.md
 
 # Project path, URL-encoded (avoids needing the numeric project ID)
-PROJECT="LunarWing%2FLunarWing_v2"
+PROJECT=35
 TAG=v<version>
 TITLE="v<version> - Codename <codename>"
 
