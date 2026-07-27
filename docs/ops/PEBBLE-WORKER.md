@@ -31,8 +31,12 @@ Add to `config.toml` under `LUNARWING_BASE_DIR`:
 [[sandbox.external_workers]]
 name = "pebble"
 url = "ws://localhost:9090/ws/agent"
-timeout_ms = 300000
+timeout_ms = 3600000
+prompt_context = { max_messages = 12, max_chars_per_message = 2000, max_total_chars = 12000 }
 ```
+
+`create_job(..., mode: "pebble", context_scope: "recent")` opts into scoped
+user/assistant history. Default `none` preserves prompt-only behavior.
 
 ## Multi-Tenant Setup
 

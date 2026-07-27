@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
+pub use lunarwing_common::PromptContextMessage as ConversationMessage;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
@@ -68,13 +69,6 @@ struct TaskProgressPayload {
     delta: String,
     #[allow(dead_code)]
     done: bool,
-}
-
-/// A single message in conversation history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationMessage {
-    pub role: String,
-    pub content: String,
 }
 
 /// Context passed to external workers with task requests.
@@ -240,6 +234,10 @@ impl ExternalWorkerManager {
         self.workers.keys().map(|s| s.as_str()).collect()
     }
 
+    pub fn max_timeout_ms(&self) -> Option<u64> {
+        self.workers.values().map(|worker| worker.timeout_ms).max()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.workers.is_empty()
     }
@@ -373,6 +371,17 @@ impl ExternalWorkerManager {
                     continue;
                 }
 
+                if let Err(error) = &result {
+                    record_external_task_error(
+                        job_id,
+                        error,
+                        event_tx.as_ref(),
+                        context_manager.as_ref(),
+                        store.as_ref(),
+                    )
+                    .await;
+                }
+
                 active_handles.write().await.remove(&job_id);
                 return result.map(Some);
             }
@@ -407,6 +416,17 @@ impl ExternalWorkerManager {
                 .await;
 
                 active_handles.write().await.remove(&job_id);
+
+                if let Err(error) = &result {
+                    record_external_task_error(
+                        job_id,
+                        error,
+                        event_tx.as_ref(),
+                        context_manager.as_ref(),
+                        store.as_ref(),
+                    )
+                    .await;
+                }
 
                 match &result {
                     Ok(r) => {
@@ -1232,7 +1252,56 @@ async fn persist_event(
 ) {
     if let Some(db) = store {
         let value = serde_json::json!({ "content": data });
-        let _ = db.save_job_event(job_id, event_type, &value).await;
+        if let Err(error) = db.save_job_event(job_id, event_type, &value).await {
+            tracing::warn!(
+                %job_id,
+                event_type,
+                "Failed to persist external worker event: {error}"
+            );
+        }
+    }
+}
+
+async fn record_external_task_error(
+    job_id: Uuid,
+    error: &OrchestratorError,
+    event_tx: Option<&broadcast::Sender<(Uuid, String, SseEvent)>>,
+    context_manager: Option<&Arc<ContextManager>>,
+    store: Option<&Arc<dyn Database>>,
+) {
+    let reason = error.to_string();
+
+    if let Some(cm) = context_manager {
+        let _ = cm
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(JobState::Failed, Some(reason.clone()))
+            })
+            .await;
+    }
+
+    persist_event(store, job_id, "result", &format!("Failed: {reason}")).await;
+    emit_event(
+        event_tx,
+        job_id,
+        SseEvent::JobResult {
+            job_id: job_id.to_string(),
+            status: "failed".to_string(),
+            session_id: None,
+            fallback_deliverable: None,
+        },
+    );
+
+    if let Some(db) = store {
+        let _ = db
+            .update_sandbox_job_status(
+                job_id,
+                "failed",
+                Some(false),
+                Some(&reason),
+                None,
+                Some(Utc::now()),
+            )
+            .await;
     }
 }
 
@@ -1240,6 +1309,7 @@ async fn persist_event(
 mod tests {
     use super::*;
     use crate::config::LoadBalanceStrategy;
+    use lunarwing_common::PromptContextRole;
 
     #[test]
     fn envelope_serialization() {
@@ -1285,6 +1355,7 @@ mod tests {
                 timeout_ms: 300_000,
                 endpoints: vec![],
                 load_balance: LoadBalanceStrategy::default(),
+                prompt_context: Default::default(),
             },
             ExternalWorkerConfig {
                 name: "pebble".to_string(),
@@ -1293,6 +1364,7 @@ mod tests {
                 timeout_ms: 600_000,
                 endpoints: vec![],
                 load_balance: LoadBalanceStrategy::default(),
+                prompt_context: Default::default(),
             },
         ]);
         assert!(!mgr.is_empty());
@@ -1320,11 +1392,11 @@ mod tests {
             project_dir: Some("/workspace/myproject".to_string()),
             conversation_history: vec![
                 ConversationMessage {
-                    role: "user".to_string(),
+                    role: PromptContextRole::User,
                     content: "fix the bug".to_string(),
                 },
                 ConversationMessage {
-                    role: "assistant".to_string(),
+                    role: PromptContextRole::Assistant,
                     content: "working on it".to_string(),
                 },
             ],
@@ -1345,7 +1417,10 @@ mod tests {
             Some("/workspace/myproject".to_string())
         );
         assert_eq!(deserialized.conversation_history.len(), 2);
-        assert_eq!(deserialized.conversation_history[0].role, "user");
+        assert_eq!(
+            deserialized.conversation_history[0].role,
+            PromptContextRole::User
+        );
         assert_eq!(deserialized.conversation_history[0].content, "fix the bug");
         assert_eq!(
             deserialized.environment.get("API_KEY"),
@@ -1600,7 +1675,7 @@ mod tests {
             .into_iter()
             .collect();
         let history = vec![ConversationMessage {
-            role: "user".to_string(),
+            role: PromptContextRole::User,
             content: "do the thing".to_string(),
         }];
         let meta: HashMap<String, String> = [("priority".to_string(), "high".to_string())]
@@ -1675,6 +1750,7 @@ mod tests {
                 },
             ],
             load_balance: LoadBalanceStrategy::default(),
+            prompt_context: Default::default(),
         }]);
 
         let lb = mgr.load_balancers.get("multi").unwrap();

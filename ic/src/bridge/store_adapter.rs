@@ -23,12 +23,14 @@
 //!     └── steps/{thread_id}.json
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, warn};
+use uuid::Uuid;
 
 use lunarwing_engine::{
     CapabilityLease, ConversationId, ConversationSurface, DocId, DocType, EngineError, LeaseId,
@@ -36,6 +38,7 @@ use lunarwing_engine::{
     types::mission::{Mission, MissionId, MissionStatus},
 };
 
+use crate::secrets::{CreateSecretParams, SecretsStore};
 use crate::workspace::{Workspace, WorkspaceEntry};
 
 // ── Path constants ──────────────────────────────────────────
@@ -57,6 +60,13 @@ const ORCHESTRATOR_FAILURES_TITLE: &str = "orchestrator:failures";
 const PREAMBLE_OVERLAY_TITLE: &str = "prompt:codeact_preamble";
 const ORCHESTRATOR_CODE_TAG: &str = "orchestrator_code";
 const FIX_PATTERN_TITLE: &str = "fix_pattern_database";
+const MISSION_WEBHOOK_SECRET_PROVIDER: &str = "lunarwing_engine_webhook";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MissionSecretRef {
+    user_id: String,
+    name: String,
+}
 
 /// Workspace-backed engine store.
 pub struct HybridStore {
@@ -67,14 +77,26 @@ pub struct HybridStore {
     conversations: RwLock<HashMap<ConversationId, ConversationSurface>>,
     leases: RwLock<HashMap<LeaseId, CapabilityLease>>,
     missions: RwLock<HashMap<MissionId, Mission>>,
+    /// Tracks every workspace path found for each mission, including legacy duplicates.
+    mission_paths: RwLock<HashMap<MissionId, HashSet<String>>>,
+    mission_secret_refs: RwLock<HashMap<MissionId, MissionSecretRef>>,
     docs: RwLock<HashMap<DocId, MemoryDoc>>,
     /// Tracks current workspace path for each doc so renames can delete the old file.
     doc_paths: RwLock<HashMap<DocId, String>>,
     workspace: Option<Arc<Workspace>>,
+    secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
 }
 
 impl HybridStore {
+    #[cfg(test)]
     pub fn new(workspace: Option<Arc<Workspace>>) -> Self {
+        Self::new_with_secrets_store(workspace, None)
+    }
+
+    pub fn new_with_secrets_store(
+        workspace: Option<Arc<Workspace>>,
+        secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    ) -> Self {
         Self {
             threads: RwLock::new(HashMap::new()),
             steps: RwLock::new(HashMap::new()),
@@ -83,16 +105,19 @@ impl HybridStore {
             conversations: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
             missions: RwLock::new(HashMap::new()),
+            mission_paths: RwLock::new(HashMap::new()),
+            mission_secret_refs: RwLock::new(HashMap::new()),
             docs: RwLock::new(HashMap::new()),
             doc_paths: RwLock::new(HashMap::new()),
             workspace,
+            secrets_store,
         }
     }
 
     /// Load persisted engine state from the workspace on startup.
-    pub async fn load_state_from_workspace(&self) {
+    pub async fn load_state_from_workspace(&self) -> Result<(), EngineError> {
         let Some(ws) = self.workspace.as_ref() else {
-            return;
+            return Ok(());
         };
 
         self.load_knowledge_docs(ws).await;
@@ -132,7 +157,7 @@ impl HybridStore {
         })
         .await;
         // Missions live under each project: engine/projects/{slug}/missions/{slug}/mission.json
-        self.load_missions_from_projects(ws).await;
+        self.load_missions_from_projects(ws).await?;
 
         // Backfill archived threads referenced by missions but missing from the
         // active threads map (threads archived before the fix that preserves
@@ -159,6 +184,7 @@ impl HybridStore {
             docs,
             "loaded engine state from workspace"
         );
+        Ok(())
     }
 
     /// Evict terminal (Done/Failed) threads from in-memory caches.
@@ -415,21 +441,272 @@ impl HybridStore {
         }
     }
 
+    fn mission_secret_prefix(id: MissionId) -> String {
+        format!("engine_v2_mission_webhook_{}_", id.0.simple())
+    }
+
+    fn mission_secret_ref_from_json(value: &serde_json::Value) -> Option<String> {
+        value
+            .pointer("/cadence/Webhook/secret_ref")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    fn validate_mission_secret_ref(id: MissionId, name: &str) -> Result<(), EngineError> {
+        if name.starts_with(&Self::mission_secret_prefix(id)) {
+            return Ok(());
+        }
+        Err(EngineError::Store {
+            reason: format!("invalid webhook secret reference for mission {id}"),
+        })
+    }
+
+    fn mission_webhook_secret(mission: &Mission) -> Option<&str> {
+        match &mission.cadence {
+            lunarwing_engine::MissionCadence::Webhook { secret, .. } => secret.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn mission_json(
+        mission: &Mission,
+        secret_ref: Option<&MissionSecretRef>,
+    ) -> Result<String, EngineError> {
+        let mut value = serde_json::to_value(mission).map_err(|error| EngineError::Store {
+            reason: format!("failed to serialize mission {}: {error}", mission.id),
+        })?;
+        if let Some(secret_ref) = secret_ref {
+            let webhook = value
+                .pointer_mut("/cadence/Webhook")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| EngineError::Store {
+                    reason: format!(
+                        "mission {} secret reference has no webhook cadence",
+                        mission.id
+                    ),
+                })?;
+            webhook.remove("secret");
+            webhook.insert(
+                "secret_ref".to_string(),
+                serde_json::Value::String(secret_ref.name.clone()),
+            );
+        }
+        serde_json::to_string_pretty(&value).map_err(|error| EngineError::Store {
+            reason: format!("failed to serialize mission {}: {error}", mission.id),
+        })
+    }
+
+    async fn create_mission_secret(
+        &self,
+        mission: &Mission,
+        plaintext: &str,
+    ) -> Result<MissionSecretRef, EngineError> {
+        let store = self
+            .secrets_store
+            .as_ref()
+            .ok_or_else(|| EngineError::Store {
+                reason: format!(
+                    "secure secrets storage is required for webhook mission {}",
+                    mission.id
+                ),
+            })?;
+        let name = format!(
+            "{}{}",
+            Self::mission_secret_prefix(mission.id),
+            Uuid::new_v4().simple()
+        );
+        store
+            .create(
+                &mission.user_id,
+                CreateSecretParams::new(&name, plaintext)
+                    .with_provider(MISSION_WEBHOOK_SECRET_PROVIDER),
+            )
+            .await
+            .map_err(|error| EngineError::Store {
+                reason: format!(
+                    "failed to encrypt webhook secret for mission {}: {error}",
+                    mission.id
+                ),
+            })?;
+        Ok(MissionSecretRef {
+            user_id: mission.user_id.clone(),
+            name,
+        })
+    }
+
+    async fn remove_mission_secret(&self, mission_id: MissionId, secret_ref: &MissionSecretRef) {
+        let Some(store) = self.secrets_store.as_ref() else {
+            return;
+        };
+        if let Err(error) = store.delete(&secret_ref.user_id, &secret_ref.name).await {
+            warn!(%mission_id, %error, "failed to remove obsolete encrypted mission secret");
+        }
+    }
+
+    async fn prepare_mission_secret(
+        &self,
+        mission: &Mission,
+        previous: Option<&MissionSecretRef>,
+    ) -> Result<(Option<MissionSecretRef>, Option<MissionSecretRef>), EngineError> {
+        let Some(plaintext) = Self::mission_webhook_secret(mission) else {
+            return Ok((None, None));
+        };
+        if self.workspace.is_none() {
+            return Ok((None, None));
+        }
+        if let Some(previous) = previous
+            && previous.user_id == mission.user_id
+        {
+            Self::validate_mission_secret_ref(mission.id, &previous.name)?;
+            let decrypted = self
+                .secrets_store
+                .as_ref()
+                .ok_or_else(|| EngineError::Store {
+                    reason: format!(
+                        "secure secrets storage is required for webhook mission {}",
+                        mission.id
+                    ),
+                })?
+                .get_decrypted(&previous.user_id, &previous.name)
+                .await
+                .map_err(|error| EngineError::Store {
+                    reason: format!(
+                        "failed to read webhook secret for mission {}: {error}",
+                        mission.id
+                    ),
+                })?;
+            if bool::from(decrypted.expose().as_bytes().ct_eq(plaintext.as_bytes())) {
+                return Ok((Some(previous.clone()), None));
+            }
+        }
+        let created = self.create_mission_secret(mission, plaintext).await?;
+        Ok((Some(created.clone()), Some(created)))
+    }
+
+    async fn persist_mission_json(
+        &self,
+        path: &str,
+        mission: &Mission,
+        secret_ref: Option<&MissionSecretRef>,
+    ) -> Result<(), EngineError> {
+        let Some(ws) = self.workspace.as_ref() else {
+            return Ok(());
+        };
+        let json = Self::mission_json(mission, secret_ref)?;
+        ws.write(path, &json)
+            .await
+            .map_err(|error| EngineError::Store {
+                reason: format!("failed to persist mission {}: {error}", mission.id),
+            })?;
+        Ok(())
+    }
+
+    async fn hydrate_mission_secret(
+        &self,
+        path: &str,
+        raw: &serde_json::Value,
+        mut mission: Mission,
+    ) -> Result<(Mission, Option<MissionSecretRef>), EngineError> {
+        if !matches!(
+            &mission.cadence,
+            lunarwing_engine::MissionCadence::Webhook { .. }
+        ) {
+            return Ok((mission, None));
+        }
+
+        if let Some(name) = Self::mission_secret_ref_from_json(raw) {
+            Self::validate_mission_secret_ref(mission.id, &name)?;
+            let secret_ref = MissionSecretRef {
+                user_id: mission.user_id.clone(),
+                name,
+            };
+            let decrypted = self
+                .secrets_store
+                .as_ref()
+                .ok_or_else(|| EngineError::Store {
+                    reason: format!(
+                        "secure secrets storage is required to load webhook mission {}",
+                        mission.id
+                    ),
+                })?
+                .get_decrypted(&secret_ref.user_id, &secret_ref.name)
+                .await
+                .map_err(|error| EngineError::Store {
+                    reason: format!(
+                        "failed to decrypt webhook secret for mission {}: {error}",
+                        mission.id
+                    ),
+                })?;
+            if let lunarwing_engine::MissionCadence::Webhook { secret, .. } = &mut mission.cadence {
+                *secret = Some(decrypted.expose().to_string());
+            }
+            if raw.pointer("/cadence/Webhook/secret").is_some() {
+                self.persist_mission_json(path, &mission, Some(&secret_ref))
+                    .await?;
+            }
+            return Ok((mission, Some(secret_ref)));
+        }
+
+        let Some(plaintext) = Self::mission_webhook_secret(&mission).map(str::to_string) else {
+            return Ok((mission, None));
+        };
+        let secret_ref = self.create_mission_secret(&mission, &plaintext).await?;
+        if let Err(error) = self
+            .persist_mission_json(path, &mission, Some(&secret_ref))
+            .await
+        {
+            self.remove_mission_secret(mission.id, &secret_ref).await;
+            return Err(error);
+        }
+        Ok((mission, Some(secret_ref)))
+    }
+
+    async fn cleanup_stale_mission(
+        &self,
+        ws: &Workspace,
+        path: &str,
+        mut mission: Mission,
+    ) -> Result<bool, EngineError> {
+        match ws.delete(path).await {
+            Ok(()) => Ok(true),
+            Err(delete_error) => {
+                // If stale deletion is unavailable, fail the duplicate closed and
+                // overwrite it without plaintext or a secret reference.
+                mission.status = MissionStatus::Failed;
+                self.persist_mission_json(path, &mission, None)
+                    .await
+                    .map_err(|scrub_error| EngineError::Store {
+                        reason: format!(
+                            "failed to delete stale mission {path}: {delete_error}; \
+                             failed to scrub stale mission: {scrub_error}"
+                        ),
+                    })?;
+                warn!(
+                    %path,
+                    %delete_error,
+                    "stale mission could not be deleted; scrubbed and disabled instead"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     /// Load missions from within each project directory.
     ///
     /// Scans `engine/projects/*/missions/*/mission.json`.
-    async fn load_missions_from_projects(&self, ws: &Workspace) {
-        let project_dirs = match ws.list(PROJECTS_PREFIX).await {
+    async fn load_missions_from_projects(&self, ws: &Workspace) -> Result<(), EngineError> {
+        let project_dirs = match ws.list_primary(PROJECTS_PREFIX).await {
             Ok(entries) => entries,
-            Err(_) => return,
+            Err(_) => return Ok(()),
         };
 
+        let mut candidates = Vec::new();
         for proj_entry in project_dirs {
             if !proj_entry.is_directory {
                 continue;
             }
             let missions_dir = format!("{}/missions", proj_entry.path);
-            let mission_dirs = match ws.list(&missions_dir).await {
+            let mission_dirs = match ws.list_primary(&missions_dir).await {
                 Ok(entries) => entries,
                 Err(_) => continue,
             };
@@ -438,18 +715,83 @@ impl HybridStore {
                     continue;
                 }
                 let mission_file = format!("{}/mission.json", mission_entry.path);
-                if let Ok(doc) = ws.read(&mission_file).await {
-                    match serde_json::from_str::<Mission>(&doc.content) {
-                        Ok(mission) => {
-                            self.missions.write().await.insert(mission.id, mission);
-                        }
+                if let Ok(doc) = ws.read_primary(&mission_file).await {
+                    match serde_json::from_str::<serde_json::Value>(&doc.content) {
+                        Ok(raw) => match serde_json::from_value::<Mission>(raw.clone()) {
+                            Ok(mission) => {
+                                candidates.push((mission_file, raw, mission));
+                            }
+                            Err(e) => {
+                                debug!(path = %mission_file, "failed to parse mission: {e}")
+                            }
+                        },
                         Err(e) => {
-                            debug!(path = %mission_file, "failed to parse mission: {e}")
+                            debug!(path = %mission_file, "failed to parse mission JSON: {e}")
                         }
                     }
                 }
             }
         }
+
+        // Select the authoritative document before secret hydration. A broken
+        // newest secret must not reactivate an older duplicate mission.
+        candidates.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
+        let mut selected: HashMap<MissionId, (String, serde_json::Value, Mission)> = HashMap::new();
+        let mut discovered_paths: HashMap<MissionId, HashSet<String>> = HashMap::new();
+        let mut stale_candidates = Vec::new();
+        for (path, raw, mission) in candidates {
+            discovered_paths
+                .entry(mission.id)
+                .or_default()
+                .insert(path.clone());
+            let replace = selected
+                .get(&mission.id)
+                .is_none_or(|(_, _, current)| mission.updated_at >= current.updated_at);
+            if replace {
+                if let Some(previous) = selected.insert(mission.id, (path, raw, mission)) {
+                    stale_candidates.push(previous);
+                }
+            } else {
+                stale_candidates.push((path, raw, mission));
+            }
+        }
+
+        for (path, _, mission) in stale_candidates {
+            let mission_id = mission.id;
+            if self.cleanup_stale_mission(ws, &path, mission).await?
+                && let Some(paths) = discovered_paths.get_mut(&mission_id)
+            {
+                paths.remove(&path);
+            }
+        }
+
+        let mut loaded = Vec::new();
+        for (path, raw, mission) in selected.into_values() {
+            match self.hydrate_mission_secret(&path, &raw, mission).await {
+                Ok((mission, secret_ref)) => loaded.push((mission, secret_ref)),
+                Err(error) => warn!(
+                    %path,
+                    %error,
+                    "skipping mission whose webhook secret could not be loaded"
+                ),
+            }
+        }
+
+        let mut missions = self.missions.write().await;
+        let mut paths = self.mission_paths.write().await;
+        let mut secret_refs = self.mission_secret_refs.write().await;
+        for (mission, secret_ref) in loaded {
+            if let Some(mission_paths) = discovered_paths.remove(&mission.id) {
+                paths.insert(mission.id, mission_paths);
+            }
+            if let Some(secret_ref) = secret_ref {
+                secret_refs.insert(mission.id, secret_ref);
+            } else {
+                secret_refs.remove(&mission.id);
+            }
+            missions.insert(mission.id, mission);
+        }
+        Ok(())
     }
 
     /// Backfill threads referenced by missions but not yet in the in-memory map.
@@ -1221,12 +1563,83 @@ impl Store for HybridStore {
 
     async fn save_mission(&self, mission: &Mission) -> Result<(), EngineError> {
         let proj_slug = self.project_slug(mission.project_id).await;
+        let new_path = mission_path(&proj_slug, &mission.name, mission.id);
+        let previous_secret_ref = self
+            .mission_secret_refs
+            .read()
+            .await
+            .get(&mission.id)
+            .cloned();
+        let (next_secret_ref, created_secret_ref) = self
+            .prepare_mission_secret(mission, previous_secret_ref.as_ref())
+            .await?;
+        if let Err(error) = self
+            .persist_mission_json(&new_path, mission, next_secret_ref.as_ref())
+            .await
+        {
+            if let Some(created_secret_ref) = created_secret_ref.as_ref() {
+                self.remove_mission_secret(mission.id, created_secret_ref)
+                    .await;
+            }
+            return Err(error);
+        }
+
+        let stale_paths = {
+            let mut paths = self.mission_paths.write().await;
+            let tracked = paths.entry(mission.id).or_default();
+            tracked.insert(new_path.clone());
+            tracked
+                .iter()
+                .filter(|path| path.as_str() != new_path)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         self.missions
             .write()
             .await
             .insert(mission.id, mission.clone());
-        self.persist_json(mission_path(&proj_slug, &mission.name, mission.id), mission)
-            .await;
+        {
+            let mut secret_refs = self.mission_secret_refs.write().await;
+            if let Some(secret_ref) = next_secret_ref.as_ref() {
+                secret_refs.insert(mission.id, secret_ref.clone());
+            } else {
+                secret_refs.remove(&mission.id);
+            }
+        }
+
+        let mut stale_cleanup_failed = false;
+        if let Some(ws) = self.workspace.as_ref() {
+            for stale_path in stale_paths {
+                let result = match ws.exists(&stale_path).await {
+                    Ok(true) => ws.delete(&stale_path).await,
+                    Ok(false) => Ok(()),
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(()) => {
+                        if let Some(paths) = self.mission_paths.write().await.get_mut(&mission.id) {
+                            paths.remove(&stale_path);
+                        }
+                    }
+                    Err(error) => {
+                        stale_cleanup_failed = true;
+                        warn!(
+                            mission_id = %mission.id,
+                            path = %stale_path,
+                            %error,
+                            "failed to remove stale mission path; retaining it for retry"
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(previous_secret_ref) = previous_secret_ref.as_ref()
+            && Some(previous_secret_ref) != next_secret_ref.as_ref()
+            && !stale_cleanup_failed
+        {
+            self.remove_mission_secret(mission.id, previous_secret_ref)
+                .await;
+        }
         Ok(())
     }
 
@@ -1276,21 +1689,602 @@ impl Store for HybridStore {
         id: MissionId,
         status: MissionStatus,
     ) -> Result<(), EngineError> {
-        let updated = {
-            let mut missions = self.missions.write().await;
-            if let Some(mission) = missions.get_mut(&id) {
-                mission.status = status;
-                mission.updated_at = chrono::Utc::now();
-                Some(mission.clone())
-            } else {
-                None
-            }
-        };
-        if let Some(mission) = updated.as_ref() {
-            let proj_slug = self.project_slug(mission.project_id).await;
-            self.persist_json(mission_path(&proj_slug, &mission.name, id), mission)
-                .await;
+        let updated = self.missions.read().await.get(&id).cloned();
+        if let Some(mut mission) = updated {
+            mission.status = status;
+            mission.updated_at = chrono::Utc::now();
+            self.save_mission(&mission).await?;
         }
         Ok(())
+    }
+
+    async fn delete_mission(&self, id: MissionId) -> Result<(), EngineError> {
+        let Some(mission) = self.missions.read().await.get(&id).cloned() else {
+            return Ok(());
+        };
+        let proj_slug = self.project_slug(mission.project_id).await;
+        let current_path = mission_path(&proj_slug, &mission.name, id);
+        let mut paths = self
+            .mission_paths
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        paths.remove(&current_path);
+        let mut first_error = None;
+        if let Some(ws) = self.workspace.as_ref() {
+            for path in paths {
+                let result = match ws.exists(&path).await {
+                    Ok(true) => ws.delete(&path).await,
+                    Ok(false) => Ok(()),
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(()) => {
+                        if let Some(paths) = self.mission_paths.write().await.get_mut(&id) {
+                            paths.remove(&path);
+                        }
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(EngineError::Store {
+                    reason: format!("failed to delete stale persisted mission {id}: {error}"),
+                });
+            }
+
+            let current_result = match ws.exists(&current_path).await {
+                Ok(true) => ws.delete(&current_path).await,
+                Ok(false) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = current_result {
+                return Err(EngineError::Store {
+                    reason: format!("failed to delete persisted mission {id}: {error}"),
+                });
+            }
+        }
+        let secret_ref = self.mission_secret_refs.write().await.remove(&id);
+        self.missions.write().await.remove(&id);
+        self.mission_paths.write().await.remove(&id);
+        if let Some(secret_ref) = secret_ref.as_ref() {
+            self.remove_mission_secret(id, secret_ref).await;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mission_delete_path_targets_persisted_document() {
+        let id = MissionId::new();
+        let path = mission_path("default--project", "Daily report", id);
+        assert!(path.ends_with("/mission.json"));
+        assert_eq!(
+            path,
+            format!(
+                "{}/mission.json",
+                mission_dir("default--project", "Daily report", id)
+            )
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn renamed_then_deleted_mission_does_not_reload_from_workspace() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("mission-delete.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "mission-delete-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "delete project", "test");
+        let mut mission = Mission::new(
+            project.id,
+            "test-user",
+            "delete me",
+            "test deletion",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+        let stale_mission = mission.clone();
+        let original_path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        assert!(
+            workspace
+                .exists(&mission_path(
+                    &store.project_slug(project.id).await,
+                    &mission.name,
+                    mission.id,
+                ))
+                .await
+                .expect("mission existence")
+        );
+
+        mission.name = "renamed mission".into();
+        mission.updated_at = chrono::Utc::now() + chrono::Duration::seconds(1);
+        store.save_mission(&mission).await.expect("rename mission");
+        assert!(
+            !workspace
+                .exists(&original_path)
+                .await
+                .expect("old path existence")
+        );
+
+        // Simulate legacy duplicate left by an older rename implementation.
+        workspace
+            .write(
+                &original_path,
+                &serde_json::to_string_pretty(&stale_mission).unwrap(),
+            )
+            .await
+            .expect("write stale duplicate");
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded.load_state_from_workspace().await.unwrap();
+        assert_eq!(
+            reloaded
+                .load_mission(mission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "renamed mission"
+        );
+
+        reloaded
+            .delete_mission(mission.id)
+            .await
+            .expect("delete mission");
+
+        let final_reload = HybridStore::new(Some(workspace));
+        final_reload.load_state_from_workspace().await.unwrap();
+        assert!(
+            final_reload
+                .load_mission(mission.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn stale_cleanup_failure_keeps_authoritative_mission_consistent() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = Arc::new(
+            LibSqlBackend::new_local(&temp_dir.path().join("mission-cleanup.db"))
+                .await
+                .expect("libsql backend"),
+        );
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "mission-cleanup-test",
+            Arc::clone(&backend) as Arc<dyn Database>,
+        ));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "cleanup project", "test");
+        let mut mission = Mission::new(
+            project.id,
+            "test-user",
+            "old name",
+            "preserve authoritative state",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+        let project_slug = store.project_slug(project.id).await;
+        let stale_path = mission_path(&project_slug, &mission.name, mission.id);
+        let connection = backend.connect().await.unwrap();
+        let trigger_sql = format!(
+            "CREATE TRIGGER fail_mission_stale_delete \
+             BEFORE DELETE ON memory_documents \
+             WHEN OLD.path = '{}' \
+             BEGIN SELECT RAISE(FAIL, 'injected stale delete failure'); END",
+            stale_path
+        );
+        connection.execute(&trigger_sql, ()).await.unwrap();
+
+        mission.name = "new name".into();
+        mission.updated_at = chrono::Utc::now() + chrono::Duration::seconds(1);
+        store.save_mission(&mission).await.unwrap();
+        let current_path = mission_path(&project_slug, &mission.name, mission.id);
+        assert!(workspace.exists(&stale_path).await.unwrap());
+        assert!(workspace.exists(&current_path).await.unwrap());
+        assert_eq!(
+            store.load_mission(mission.id).await.unwrap().unwrap().name,
+            "new name"
+        );
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded.load_state_from_workspace().await.unwrap();
+        assert_eq!(
+            reloaded
+                .load_mission(mission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "new name"
+        );
+        assert!(reloaded.delete_mission(mission.id).await.is_err());
+        assert!(workspace.exists(&current_path).await.unwrap());
+        assert_eq!(
+            reloaded
+                .load_mission(mission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "new name"
+        );
+
+        connection
+            .execute("DROP TRIGGER fail_mission_stale_delete", ())
+            .await
+            .unwrap();
+        reloaded.delete_mission(mission.id).await.unwrap();
+        let final_reload = HybridStore::new(Some(workspace));
+        final_reload.load_state_from_workspace().await.unwrap();
+        assert!(
+            final_reload
+                .load_mission(mission.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn mission_write_failure_does_not_commit_create_or_secret_rotation() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = Arc::new(
+            LibSqlBackend::new_local(&temp_dir.path().join("mission-write.db"))
+                .await
+                .expect("libsql backend"),
+        );
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "mission-write-test",
+            Arc::clone(&backend) as Arc<dyn Database>,
+        ));
+        let secrets_store: Arc<dyn SecretsStore + Send + Sync> =
+            Arc::new(crate::testing::credentials::test_secrets_store());
+        let store = HybridStore::new_with_secrets_store(
+            Some(Arc::clone(&workspace)),
+            Some(Arc::clone(&secrets_store)),
+        );
+        let project = Project::new("test-user", "write project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "secure hook",
+            "test rotation",
+            lunarwing_engine::MissionCadence::Webhook {
+                path: "secure".into(),
+                secret: Some("old-secret".into()),
+            },
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+        let mission_file = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        let persisted = workspace.read(&mission_file).await.unwrap().content;
+        assert!(!persisted.contains("old-secret"));
+        assert!(!persisted.contains("\"secret\""));
+        assert!(persisted.contains("\"secret_ref\""));
+        assert_eq!(secrets_store.list("test-user").await.unwrap().len(), 1);
+
+        let connection = backend.connect().await.expect("connection");
+        connection
+            .execute(
+                "ALTER TABLE memory_documents RENAME TO unavailable_memory_documents",
+                (),
+            )
+            .await
+            .expect("disable workspace writes");
+
+        let failed_create = Mission::new(
+            project.id,
+            "test-user",
+            "must not appear",
+            "failed create",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        assert!(store.save_mission(&failed_create).await.is_err());
+        assert!(
+            store
+                .load_mission(failed_create.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let mut rotated = mission.clone();
+        rotated.cadence = lunarwing_engine::MissionCadence::Webhook {
+            path: "secure".into(),
+            secret: Some("new-secret".into()),
+        };
+        rotated.updated_at = chrono::Utc::now() + chrono::Duration::seconds(1);
+        assert!(store.save_mission(&rotated).await.is_err());
+        let stored = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(matches!(
+            stored.cadence,
+            lunarwing_engine::MissionCadence::Webhook { path, secret }
+                if path == "secure" && secret.as_deref() == Some("old-secret")
+        ));
+        assert_eq!(secrets_store.list("test-user").await.unwrap().len(), 1);
+
+        connection
+            .execute(
+                "ALTER TABLE unavailable_memory_documents RENAME TO memory_documents",
+                (),
+            )
+            .await
+            .expect("restore workspace writes");
+        let reloaded =
+            HybridStore::new_with_secrets_store(Some(workspace), Some(Arc::clone(&secrets_store)));
+        reloaded.load_state_from_workspace().await.unwrap();
+        let stored = reloaded.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(matches!(
+            stored.cadence,
+            lunarwing_engine::MissionCadence::Webhook { path, secret }
+                if path == "secure" && secret.as_deref() == Some("old-secret")
+        ));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn legacy_plaintext_webhook_secret_is_migrated_and_scrubbed() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("mission-migrate.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "mission-migrate-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let secrets_store: Arc<dyn SecretsStore + Send + Sync> =
+            Arc::new(crate::testing::credentials::test_secrets_store());
+        let seed = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "migration project", "test");
+        seed.save_project(&project).await.unwrap();
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "legacy hook",
+            "migrate secret",
+            lunarwing_engine::MissionCadence::Webhook {
+                path: "legacy".into(),
+                secret: Some("legacyplaintextsecret".into()),
+            },
+        );
+        let path = mission_path(
+            &seed.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        let mut legacy = serde_json::to_value(&mission).unwrap();
+        legacy
+            .pointer_mut("/cadence/Webhook")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .insert(
+                "secret".into(),
+                serde_json::Value::String("legacyplaintextsecret".into()),
+            );
+        workspace
+            .write(&path, &serde_json::to_string_pretty(&legacy).unwrap())
+            .await
+            .unwrap();
+
+        let reloaded = HybridStore::new_with_secrets_store(
+            Some(Arc::clone(&workspace)),
+            Some(Arc::clone(&secrets_store)),
+        );
+        reloaded.load_state_from_workspace().await.unwrap();
+
+        let persisted = workspace.read(&path).await.unwrap().content;
+        assert!(!persisted.contains("legacyplaintextsecret"));
+        assert!(!persisted.contains("\"secret\""));
+        assert!(persisted.contains("\"secret_ref\""));
+        assert_eq!(secrets_store.list("test-user").await.unwrap().len(), 1);
+        let restored = reloaded.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(matches!(
+            restored.cadence,
+            lunarwing_engine::MissionCadence::Webhook { secret, .. }
+                if secret.as_deref() == Some("legacyplaintextsecret")
+        ));
+        assert!(
+            workspace
+                .search("legacyplaintextsecret", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn missing_webhook_secret_skips_only_affected_mission() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("mission-missing-secret.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "mission-missing-secret-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let seed = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "secret recovery project", "test");
+        seed.save_project(&project).await.unwrap();
+
+        let healthy = Mission::new(
+            project.id,
+            "test-user",
+            "healthy mission",
+            "keep running",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        seed.save_mission(&healthy).await.unwrap();
+
+        let broken = Mission::new(
+            project.id,
+            "test-user",
+            "broken webhook",
+            "must fail closed",
+            lunarwing_engine::MissionCadence::Webhook {
+                path: "broken".into(),
+                secret: None,
+            },
+        );
+        let broken_path = mission_path(
+            &seed.project_slug(project.id).await,
+            &broken.name,
+            broken.id,
+        );
+        let mut broken_json = serde_json::to_value(&broken).unwrap();
+        broken_json
+            .pointer_mut("/cadence/Webhook")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .insert(
+                "secret_ref".into(),
+                serde_json::Value::String(format!(
+                    "{}{}",
+                    HybridStore::mission_secret_prefix(broken.id),
+                    Uuid::new_v4().simple()
+                )),
+            );
+        workspace
+            .write(
+                &broken_path,
+                &serde_json::to_string_pretty(&broken_json).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut stale = broken.clone();
+        stale.name = "stale fallback".into();
+        stale.cadence = lunarwing_engine::MissionCadence::Webhook {
+            path: "stale".into(),
+            secret: Some("staleplaintextsecret".into()),
+        };
+        stale.updated_at = broken.updated_at - chrono::Duration::seconds(1);
+        let stale_path = mission_path(&seed.project_slug(project.id).await, &stale.name, stale.id);
+        let mut stale_json = serde_json::to_value(&stale).unwrap();
+        stale_json
+            .pointer_mut("/cadence/Webhook")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .insert(
+                "secret".into(),
+                serde_json::Value::String("staleplaintextsecret".into()),
+            );
+        workspace
+            .write(
+                &stale_path,
+                &serde_json::to_string_pretty(&stale_json).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let reloaded = HybridStore::new_with_secrets_store(
+            Some(Arc::clone(&workspace)),
+            Some(Arc::new(crate::testing::credentials::test_secrets_store())),
+        );
+        reloaded.load_state_from_workspace().await.unwrap();
+
+        assert!(reloaded.load_mission(healthy.id).await.unwrap().is_some());
+        assert!(reloaded.load_mission(broken.id).await.unwrap().is_none());
+        assert!(!workspace.exists(&stale_path).await.unwrap());
+        assert!(
+            workspace
+                .search("staleplaintextsecret", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn mission_loader_ignores_additional_read_scopes() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = Arc::new(
+            LibSqlBackend::new_local(&temp_dir.path().join("mission-scope.db"))
+                .await
+                .expect("libsql backend"),
+        );
+        backend.run_migrations().await.expect("migrations");
+        let database: Arc<dyn Database> = backend;
+
+        let secondary_workspace = Arc::new(Workspace::new_with_db(
+            "secondary-user",
+            Arc::clone(&database),
+        ));
+        let secondary_store = HybridStore::new(Some(secondary_workspace));
+        let project = Project::new("secondary-user", "secondary project", "test");
+        let mission = Mission::new(
+            project.id,
+            "secondary-user",
+            "secondary mission",
+            "must stay isolated",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        secondary_store.save_project(&project).await.unwrap();
+        secondary_store.save_mission(&mission).await.unwrap();
+
+        let primary_workspace = Arc::new(
+            Workspace::new_with_db("primary-user", database)
+                .with_additional_read_scopes(vec!["secondary-user".into()]),
+        );
+        let primary_store = HybridStore::new(Some(primary_workspace));
+        primary_store.load_state_from_workspace().await.unwrap();
+
+        assert!(
+            primary_store
+                .load_mission(mission.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

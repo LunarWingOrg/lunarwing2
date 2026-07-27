@@ -5,15 +5,24 @@
 > `docs/ops/AGENT_GOALS_2.0.3.0.md`. It is **review only**; it does not change
 > CI files.
 >
-> **Scope reviewed on 2026-07-25:** `.gitlab-ci.yml`, `.gitlab/ci/*.yml`,
-> `.gitlab/scripts/*`, `.gitlab/README.md`, and the originating plan
+> **Scope reviewed on 2026-07-25, refreshed 2026-07-26:**
+> `.gitlab-ci.yml`, `.gitlab/ci/*.yml`, `.gitlab/scripts/*`,
+> `.gitlab/README.md`, `ic/rust-toolchain.toml`, and the originating plan
 > `docs/proposals/GITLAB_CI_CD_PLAN.md`. All findings are verified against the
 > current tree at that date.
 >
 > **Overall assessment:** The implemented Phase 1 pipeline is well-structured,
 > secret-free, properly DAG'd, digest-pinned, and faithful to the plan. The
 > items below are targeted hardening, parity fixes, and low-risk gaps — not a
-> rearchitecture.
+> rearchitecture. The 2026-07-26 refresh adds findings on build-thread
+> divergence, `rust-toolchain.toml`, coverage, and checkout depth.
+>
+> **2026-07-26 update (item #16):** The P0, P1, and documentation-parity P2
+> findings below are now addressed on branch `aj/item-16-20260726-1500`.
+> Each finding heading carries a `**Status:**` line recording the fix. The
+> validator (`validate_config.py`) now enforces README↔defaults image digest
+> parity and `rust-toolchain.toml` channel agreement, so the drift classes
+> cannot recur silently.
 
 ## 1. Current pipeline summary (verified)
 
@@ -24,8 +33,9 @@
 - **Required (blocking) jobs:** `ci-config`, `shell-syntax`, `python-syntax`,
   `registry-json`, `version-policy`, `panic-policy`, `rustfmt`,
   `cargo-metadata`, four-shape `cargo check` matrix, `rust-test-lib`,
-  `rust-test-libsql`, `python-unit`, `shell-harnesses`, `cavepony-wasm`,
-  `cargo-deny`, `secret-detection`.
+  `rust-test-libsql`, `python-unit`, `shell-harnesses`, `cavepony-wasm`
+  (cavepony version assert + `wit_compat` test), `cargo-deny`,
+  `secret-detection`, and tag-only `release-version`.
 - **Observational (`allow_failure`) jobs:** `rust-clippy-all`,
   `architecture-boundaries`, `shellcheck`, `secret-history`.
 - **Toolchain pin:** Rust **1.96.1** Bookworm, digest-pinned
@@ -43,6 +53,11 @@ This is a solid Phase 1. The following sections list issues by priority.
 ## 2. Priority findings
 
 ### P0 — Stale README image digest vs. actual image (must fix)
+
+**Status (2026-07-26): FIXED.** `.gitlab/README.md` config.toml example and
+Pinned images list now cite `rust:1.96.1-bookworm@sha256:a339861a…`.
+`validate_config.py` asserts the README digest matches `defaults.yml` and
+rejects stale Rust image tags, so this drift class is now CI-enforced.
 
 `.gitlab/README.md:121` instructs operators to configure the runner
 `config.toml` with:
@@ -71,19 +86,35 @@ guarantee the pipeline relies on.
 
 ### P0 — README claims MSRV 1.92, CI pins 1.96.1, no MSRV verification
 
+**Status (2026-07-26): FIXED.** Workspace declarations were raised to the
+supported `1.96.1` toolchain. New observational `rust-msrv-check` job runs
+`cargo check --locked` on `rust:1.96.1-bookworm`, default-branch and schedule
+only. `rust-toolchain.toml` is moved aside for the job so rustup selects the
+image rustc. Becomes blocking once MSRV is confirmed green. Closes plan §15.5.
+
 `ic/Cargo.toml:15` declares `rust-version = "1.92"` and `AGENTS.md` lists
 MSRV 1.92, but the only Rust job uses 1.96.1. Nothing in CI proves the crate
 still builds on its declared MSRV. The plan explicitly flags this
 (`docs/proposals/GITLAB_CI_CD_PLAN.md` §15.5: "Pin one supported Rust
-toolchain and reconcile 1.92 versus 1.96 docs/builds").
+toolchain and reconcile 1.92 versus 1.96 docs/builds"). A third pin location
+now also exists: `ic/rust-toolchain.toml` hardcodes `channel = "1.96.1"`,
+so the 1.92/1.96 split is now visible in four places: `Cargo.toml`,
+`AGENTS.md`, `rust-toolchain.toml`, and `.gitlab/ci/defaults.yml`.
 
-**Suggested fix:** add one scheduled (non-MR) `rust-msrv-check` job using
+**Original suggested fix:** add one scheduled (non-MR) `rust-msrv-check` job using
 `rust:1.92-bookworm` that runs `cargo check --locked` on the default feature
 set. Keep it observational until green, then make it required on the default
-branch. This is low-cost and directly closes the reconciliation item from the
-plan.
+branch. This is low-cost and directly closes the reconciliation item from
+the plan.
 
 ### P1 — Parallel Cargo jobs can overlap on `0-5` within one runner host
+
+**Status (2026-07-26): DOCUMENTED.** The `limit = 1` constraint is now
+recorded as a hard requirement in the README "Required jobs" section and as
+a verification item in the §6 activation evidence checklist. A
+`resource_group:` was not added because the runner-host `limit = 1` already
+prevents overlap and the project does not rely on GitLab-side concurrency
+control for correctness.
 
 `cargo-ci.sh` pins `taskset -c 0-5`, and the README correctly notes a per-host
 job limit of one Rust job. However that constraint lives only in the README,
@@ -101,6 +132,11 @@ host (e.g. misconfigured `limit = 2`), the two `taskset -c 0-5` processes will
   the README rather than leaving it as prose.
 
 ### P1 — `validate_config.py` does not detect this class of drift
+
+**Status (2026-07-26): FIXED.** `validate_config.py` now extracts the Rust
+image tag+digest from `defaults.yml`, asserts the same digest appears in
+`.gitlab/README.md`, and flags any stale Rust image tag. The P0 image drift
+above would now fail `ci-config`.
 
 `validate_config.py` checks image digest pinning and direct `cargo` usage, but
 does not check that the image digest referenced in `README.md` matches the one
@@ -156,23 +192,94 @@ for reuse. If any later job needs the cavepony wasm it would rebuild.
 document that `cavepony-wasm` is intentionally self-contained. If a future job
 needs it, lift it into the shared artifact producer. No change needed today.
 
+### P2 — All Cargo jobs use `-j2`, diverging from project and plan standard
+
+**Status (2026-07-26): DOCUMENTED.** README "Required jobs" section now
+records that CI uses `-j2` (libSQL `-j1`) to stay within 16 GB during
+four-way parallel check, distinct from the local-dev `-j6` budget in AGENTS.md.
+
+Every Rust job in `.gitlab/ci/rust.yml` and `.gitlab/ci/integration.yml` runs
+`cargo-ci.sh <cmd> -j2` (libsql uses `-j1`). The project standard in
+`AGENTS.md` and the plan (§8.2, §10) is `-j6` bounded by `taskset -c 0-5`.
+The `-j2` choice keeps peak memory well under the 16 GB runner cap, which is
+correct for a memory-constrained shared runner, but the rationale lives only
+in commit `afc423b` ("Limit GitLab Rust jobs to two build workers") — not in
+any README, plan exit criterion, or named variable.
+
+**Why it matters:** without a documented link between `-j2`, the 16 GB cap,
+and the four parallel check jobs, an operator who bumps runner RAM or
+misreads the plan's `-j6` guidance will silently re-introduce OOM risk or
+leave performance on the table. The cache key also does not encode the job
+parallelism, so a flip between `-j2` and `-j6` would not invalidate cached
+metadata.
+
+**Suggested fix:** add one sentence to `.gitlab/README.md` §"Required jobs"
+recording that CI intentionally uses `-j2` (libSQL `-j1`) to stay within
+16 GB during four-way parallel check, and that `-j6` from `AGENTS.md` is the
+local-dev budget, not the CI budget. No YAML change required; this is a
+documentation parity fix so the two standards do not look contradictory.
+
+### P2 — Rust version pins can drift independently
+
+**Status (2026-07-26): FIXED.** `validate_config.py` now asserts 1.96.1 across
+`ic/Cargo.toml` `rust-version`, `ic/rust-toolchain.toml`, and both `.rust-job`
+and `.rust-msrv-job` image tags. It also requires both jobs to use the same
+digest-pinned image. Four-way version drift is caught by `ci-config`; the
+declared MSRV is additionally exercised by `rust-msrv-check`.
+
+`ic/Cargo.toml` and `ic/rust-toolchain.toml` declare 1.96.1. `defaults.yml`
+pins both Rust job templates to the same digest-pinned `1.96.1-bookworm`
+image, while `bootstrap-rust.sh` re-verifies `rustc 1.96.1` at runtime.
+`validate_config.py` parses all four declarations, rejects any version other
+than 1.96.1, and rejects primary/MSRV image identity drift. README digest
+parity and generic image-digest checks remain enforced.
+
+### P3 — `GIT_DEPTH: "0"` clones full history on every job
+
+`.gitlab/ci/defaults.yml:14` sets `GIT_DEPTH: "0"`, forcing a full clone for
+every job, including the four `rust-check-*` jobs that only need the working
+tree plus `Cargo.lock`. This is required for `version-policy` and
+`panic-policy` (diff against base SHA) and for `secret-history`, but it is
+unnecessary for `rustfmt`, `cargo-metadata`, the four `cargo check` jobs,
+`cargo-deny`, `python-unit`, `shell-harnesses`, and `secret-detection`.
+
+**Suggested fix:** leave `GIT_DEPTH: "0"` as the default (correct for the
+policy jobs), but consider setting a shallow `GIT_DEPTH` (e.g. `"50"`) on
+the pure-build jobs via job-level `variables:` once the runner is live and
+clone time is measured. Low priority; measure first per the plan's exit
+criteria (warm-cache p95 ≤ 30 min).
+
+### P3 — Dummy `LUNARWING_CLOUD_*` URLs in test jobs
+
+`rust-test-lib` and `rust-test-libsql` set `LUNARWING_CLOUD_AUTH_URL` and
+`LUNARWING_CLOUD_BASE_URL` to `http://127.0.0.1` (no path, no port). This is
+a safe placeholder that prevents real network egress, but the security
+review in §4 below does not mention it. If a future test starts treating a
+non-200 from `127.0.0.1` as a hard failure, the job will break with a
+confusing connection-refused rather than a clear "cloud mock missing"
+message.
+
+**Suggested fix:** no change needed today; record in §4 that these variables
+are intentional placeholders so the security review is complete. If the
+tests grow a real cloud mock, switch the URL to a named fixture service.
+
 ---
 
 ## 3. Parity gaps vs. the plan (Phase 1 scope)
 
 These are items the plan lists under Phase 1 that are **not yet** implemented.
-They are tracked here for visibility; most are intentionally deferred and
-documented as such in `.gitlab/README.md`. Confirm each is a deliberate defer
-rather than an oversight.
+They are tracked here for visibility. Each row is confirmed as either a deliberate
+defer (with plan/README citation) or an implemented/closed gap.
 
-| Plan item (§) | Status in pipeline | Note |
-|---|---|---|
-| 8.1 `python-static` (Pyright/Ruff) | Not present | Plan marks "Phase 2 blocking". OK to defer. |
-| 8.1 `docs-links` (internal Markdown link check) | Not present | Plan marks "Phase 2 blocking". Consider adding; `docs/` is large and link rot is visible in other review tasks (e.g. goals items #19–#24). |
-| 8.3 PostgreSQL integration job | Not present | Plan defers to Phase 2 with pgvector service. Confirmed deferred in README. |
-| 8.5 Path-triggered standalone crates matrix | Not present | Eight standalone lockfiles exist (see §5 below). Currently the core `ic/Cargo.lock` does not validate them. Plan defers to Phase 2; reasonable, but see suggestion in §5. |
-| 8.6 Strict WASM (`build-wasm-extensions.sh --strict`) | Partial | `wasm-channel-test-artifacts` builds two channels directly; the strict-mode flag described in the plan is not exercised. |
-| 15.5 Toolchain reconciliation (1.92 vs 1.96) | **Unresolved** | See P0 above — this is the one Phase 0 item still visibly open. |
+| Plan item (§) | Status in pipeline | Confirmed defer/implemented | Note |
+|---|---|---|---|
+| 8.1 `python-static` (Pyright/Ruff) | Not present | **Deliberate Phase 2** | Plan §8.1 marks "Phase 2 blocking". README confirms defer. OK. |
+| 8.1 `docs-links` (internal Markdown link check) | Not present | **Deliberate Phase 2** | Plan §8.1 marks "Phase 2 blocking". `docs/` is large; link rot visible in other review tasks. OK to defer. |
+| 8.3 PostgreSQL integration job | Not present | **Deliberate Phase 2** | Plan §8.3 defers to Phase 2 with pgvector service. README confirms defer. OK. |
+| 8.5 Path-triggered standalone crates matrix | Not present | **Deliberate Phase 2** | 17 standalone lockfiles exist (see §5). Plan §8.5 defers to Phase 2; §5 suggests a cheaper `standalone-cargo-metadata` observation first. OK. |
+| 8.6 Strict WASM (`build-wasm-extensions.sh --strict`) | Implemented | **Done 2026-07-26** | `--strict` validates manifest fields and capability files relative to `.source.dir`, fails fast, and combines with `--tools`/`--channels`. Fixture regression covers valid/missing capability paths and both selectors without real builds. Default non-strict preserves current behavior. Not yet wired into CI YAML (Phase 2). |
+| 10.1 Coverage reporting | Not present | **Deliberate Phase 2** | `ic/scripts/coverage.sh` and `ic/codecov.yml` exist. Plan §10.1 defers to Phase 2 with measured baseline. README confirms defer. OK. |
+| 15.5 Toolchain reconciliation (1.92 vs 1.96) | Resolved | **Done 2026-07-26** | Workspace MSRV raised to 1.96.1; `rust-msrv-check` validates that declared minimum; `validate_config.py` enforces workspace manifest ↔ toolchain ↔ primary image ↔ MSRV image agreement plus README/digest parity. The MSRV job remains observational until one green run, after which it becomes blocking. |
 
 ---
 
@@ -202,15 +309,23 @@ Reviewed `.gitlab/scripts/*.sh` and `*.py` for the runtime invariants in
 observational. This is the correct split — current-tree is blocking, history
 is advisory until triaged. No change needed; recorded as correct.
 
+**Second observation (added 2026-07-26):** `rust-test-lib` and
+`rust-test-libsql` set `LUNARWING_CLOUD_AUTH_URL` and
+`LUNARWING_CLOUD_BASE_URL` to `http://127.0.0.1`. These are safe placeholders
+that prevent real cloud egress, not secrets. Recorded here so the security
+review is complete; see P3 above for the related test-clarity note.
+
 No security weaknesses found in the CI logic itself.
 
 ---
 
 ## 5. Standalone crate coverage observation
 
-There are **18** `Cargo.lock` files in the repo (verified), of which only
-`ic/Cargo.lock` is validated by `cargo-metadata` and used as a cache key.
-Standalone deployable crates with their own lockfiles — e.g.
+There are **17** `Cargo.lock` files outside the core workspace (verified
+2026-07-26; `ic/vendor/libsignal-protocol/Cargo.lock` is vendored source, not
+a deployable crate, and is excluded), of which only `ic/Cargo.lock` is
+validated by `cargo-metadata` and used as a cache key. Standalone deployable
+crates with their own lockfiles — e.g.
 `ic/bridges/xmpp-bridge/Cargo.lock`,
 `lunarwing_weechat_wss/weechat_relay/Cargo.lock`,
 `darkirc_channel_for_lunarwing/darkirc/Cargo.lock`,
@@ -227,8 +342,8 @@ path-triggered matrix in plan §8.5 and catches the most common failure.
 
 ## 6. Documentation / metadata suggestions
 
-- `.gitlab/README.md` §"Pinned images" lists Rust 1.92 and cargo-deny 0.20.2;
-  `defaults.yml` uses Rust 1.96.1. Reconcile (P0 above).
+- `.gitlab/README.md` §"Pinned images" and `defaults.yml` now agree on Rust
+  1.96.1; the obsolete Rust 1.92 image pin was removed.
 - The "Required jobs" list in the README does not mention `cavepony-wasm`,
   `python-unit`, or `shell-harnesses` by name in its prose summary, though
   they are required. Consider enumerating them for operator clarity.
@@ -240,21 +355,31 @@ path-triggered matrix in plan §8.5 and catches the most common failure.
 
 ## 7. Recommended next actions (ordered)
 
-1. **(P0)** Reconcile `.gitlab/README.md` Rust image digest with
-   `defaults.yml` (1.96.1, hash `a339861a…`).
-2. **(P0)** Add an observational MSRV check job on Rust 1.92 to close plan
-   §15.5.
-3. **(P1)** Extend `validate_config.py` to assert README image digest ==
-   `defaults.yml` image digest, preventing future drift.
-4. **(P1)** Make the one-Rust-job-per-host constraint explicit (README
-   checklist or `resource_group`).
-5. **(Phase 2)** Add `standalone-cargo-metadata` observational job for the 17
-   non-core lockfiles.
-6. **(Phase 2)** Add a `docs-links` job; several other goals items depend on
-   doc accuracy.
-7. *(Defer)* PostgreSQL integration, package/release, and CD remain correctly
-   gated behind their plan prerequisites; do not advance without the mt-admin
-   artifact-activation work.
+1. **(STATUS: DONE 2026-07-26)** Reconcile `.gitlab/README.md` Rust image
+   digest with `defaults.yml` (1.96.1, hash `a339861a…`). Enforced by
+   validator; obsolete 1.92 digest removed after raising the declared MSRV.
+2. **(STATUS: DONE 2026-07-26)** Add an observational MSRV check job on Rust
+   1.96.1 to close plan §15.5 after raising workspace declarations; also
+   reconcile `ic/rust-toolchain.toml` channel (validator now asserts workspace,
+   toolchain, primary image, and MSRV image all remain at 1.96.1).
+3. **(STATUS: DONE 2026-07-26)** Extend `validate_config.py` to assert
+   README image digest == `defaults.yml` image digest, preventing future
+   drift. Also asserts four-way Rust version agreement and primary/MSRV image
+   identity.
+4. **(STATUS: DONE 2026-07-26)** One-Rust-job-per-host constraint now explicit
+   in README required jobs and activation checklist (`limit = 1` hard req).
+5. **(STATUS: DONE 2026-07-26)** Toolchain.toml now validated automatically;
+   covered in item 3 above.
+6. **(STATUS: DONE 2026-07-26)** CI `-j2`/`-j1` rationale documented in
+   README "Required jobs"; local-dev `-j6` remains in AGENTS.md.
+7. **(Phase 2)** Add `standalone-cargo-metadata` observational job for the 17
+    non-core lockfiles.
+8. **(Phase 2)** Add a `docs-links` job; several other goals items depend on
+    doc accuracy.
+9. **(Phase 2)** Add coverage reporting once a measured baseline is captured.
+10. *(Defer)* PostgreSQL integration, package/release, and CD remain correctly
+     gated behind their plan prerequisites; do not advance without the mt-admin
+     artifact-activation work.
 
 ---
 
@@ -265,9 +390,19 @@ path-triggered matrix in plan §8.5 and catches the most common failure.
 - Every image is digest-pinned; `validate_config.py` enforces it.
 - `cargo-ci.sh` centralizes the `taskset -c 0-5` rule — no direct `cargo`
   calls leak through (and the validator catches any that do).
+- `bootstrap-rust.sh` hard-asserts `rustc 1.96.1` at runtime; a mismatched
+  image exits nonzero before any build runs.
 - Observational jobs each carry an `Owner:` line and a removal condition in
   the YAML, matching the plan's "no permanent `allow_failure`" rule.
 - No secrets, no Docker socket, no tenant access in any MR job — consistent
   with `AGENTS.md` security invariants.
 - Gitleaks uses exact fingerprints in `/.gitleaksignore`; broad rule
   exclusions are forbidden (per README). Good discipline.
+- `release-version` job is correctly tag-gated (`$CI_COMMIT_TAG =~ /^v/`)
+  and validates tag syntax, protection, crate-version mapping, codename, and
+  release-note presence before any tag can be promoted.
+- `cavepony-wasm` asserts `CAVEPONY_EXPECTED_VERSION` at build time and runs
+  the `wit_compat` test, giving the WASM tool path a version + ABI check the
+  channel artifact job lacks.
+- Dummy `LUNARWING_CLOUD_*` URLs in test jobs prevent real cloud egress; safe
+  by construction.

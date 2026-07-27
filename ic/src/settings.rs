@@ -626,6 +626,12 @@ pub struct AgentSettings {
     /// Max seconds for session pruning (default: 30).
     #[serde(default = "default_session_prune_timeout")]
     pub session_prune_timeout_secs: u64,
+
+    /// Expiry in seconds for pending execution gates (approval/auth).
+    /// Gates older than this are swept by the background cleanup task.
+    /// Default: 1800 (30 minutes).
+    #[serde(default = "default_gate_expiry")]
+    pub pending_gate_expiry_secs: u64,
 }
 
 fn default_agent_name() -> String {
@@ -684,6 +690,10 @@ fn default_session_prune_timeout() -> u64 {
     30
 }
 
+fn default_gate_expiry() -> u64 {
+    1800
+}
+
 fn default_true() -> bool {
     true
 }
@@ -708,6 +718,7 @@ impl Default for AgentSettings {
             session_prune_timeout_secs: default_session_prune_timeout(),
             ws_ping_interval_secs: default_ws_ping_interval(),
             ws_idle_timeout_secs: default_ws_idle_timeout(),
+            pending_gate_expiry_secs: default_gate_expiry(),
         }
     }
 }
@@ -837,10 +848,13 @@ pub struct ExternalWorkerSettings {
     /// Load balancing strategy (defaults to RoundRobin).
     #[serde(default)]
     pub load_balance: crate::config::LoadBalanceStrategy,
+    /// Bounds applied when `create_job` requests recent conversation context.
+    #[serde(default)]
+    pub prompt_context: lunarwing_common::PromptContextLimits,
 }
 
 fn default_external_worker_timeout() -> u64 {
-    400_000
+    3_600_000
 }
 
 fn default_sandbox_policy() -> String {
@@ -1770,11 +1784,24 @@ mod tests {
 [[sandbox.external_workers]]
 name = "nanocode"
 url = "ws://localhost:9090/ws/agent"
-timeout_ms = 300000
+timeout_ms = 3600000
+
+[sandbox.external_workers.prompt_context]
+max_messages = 8
+max_chars_per_message = 1500
+max_total_chars = 9000
 "#;
         let parsed: Settings = toml::from_str(toml_str).unwrap();
         assert_eq!(parsed.sandbox.external_workers.len(), 1);
         assert_eq!(parsed.sandbox.external_workers[0].name, "nanocode");
+        assert_eq!(
+            parsed.sandbox.external_workers[0].prompt_context,
+            lunarwing_common::PromptContextLimits {
+                max_messages: 8,
+                max_chars_per_message: 1500,
+                max_total_chars: 9000,
+            }
+        );
 
         let mut base = Settings::default();
         assert!(base.sandbox.external_workers.is_empty());
@@ -1789,6 +1816,20 @@ timeout_ms = 300000
             base.sandbox.external_workers[0].url,
             "ws://localhost:9090/ws/agent"
         );
+    }
+
+    #[test]
+    fn external_worker_timeout_defaults_to_one_hour() {
+        let settings: Settings = toml::from_str(
+            r#"
+[[sandbox.external_workers]]
+name = "opencode"
+url = "ws://localhost:9090/ws/agent"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.sandbox.external_workers[0].timeout_ms, 3_600_000);
     }
 
     /// Regression: /model writes a single key ("selected_model") to the DB via

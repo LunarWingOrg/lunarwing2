@@ -33,6 +33,7 @@ use crate::traits::llm::{LlmBackend, LlmCallConfig};
 use crate::types::error::EngineError;
 use crate::types::event::EventKind;
 use crate::types::message::{MessageRole, ThreadMessage};
+use crate::types::provenance::Provenance;
 use crate::types::step::{ActionResult, LlmResponse, TokenUsage};
 use crate::types::thread::Thread;
 
@@ -884,7 +885,12 @@ async fn preflight_action(
         .and_then(|actions| actions.into_iter().find(|a| a.name == action_name));
 
     if let Some(ref action_def) = action_def {
-        match policy.evaluate(action_def, &lease, capability_policies) {
+        match policy.evaluate_with_provenance(
+            action_def,
+            &lease,
+            capability_policies,
+            &Provenance::LlmGenerated,
+        ) {
             PolicyDecision::Deny { reason } => {
                 events.push(EventKind::ActionFailed {
                     step_id: context.step_id,
@@ -1604,6 +1610,7 @@ mod tests {
             source_channel: None,
             supervised_mode: false,
             supervised_timeout_secs: 300,
+            prompt_context: crate::prompt_context_from_thread_messages(&thread.messages),
         }
     }
 

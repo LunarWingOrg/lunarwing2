@@ -571,19 +571,20 @@ impl RateWindow {
         }
     }
 
-    fn check_and_record(&mut self, now_ms: u64, limit: u32) -> bool {
-        // Reset window if expired
+    fn reset_if_expired(&mut self, now_ms: u64) {
         if now_ms.saturating_sub(self.window_start) > self.window_duration_ms {
             self.count = 0;
             self.window_start = now_ms;
         }
+    }
 
-        if self.count >= limit {
-            return false;
-        }
+    fn can_record(&mut self, now_ms: u64, limit: u32, count: u32) -> bool {
+        self.reset_if_expired(now_ms);
+        self.count.saturating_add(count) <= limit
+    }
 
-        self.count += 1;
-        true
+    fn record(&mut self, count: u32) {
+        self.count += count;
     }
 }
 
@@ -602,20 +603,33 @@ impl ChannelEmitRateLimiter {
     ///
     /// Returns true if the emit is allowed, false if rate limited.
     pub fn check_and_record(&mut self) -> bool {
+        self.check_and_record_many(1)
+    }
+
+    /// Atomically check and record rate budget for an entire emitted batch.
+    pub fn check_and_record_many(&mut self, count: usize) -> bool {
+        let Ok(count) = u32::try_from(count) else {
+            return false;
+        };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        // Check both windows
         let minute_ok = self
             .minute_window
-            .check_and_record(now, self.config.messages_per_minute);
+            .can_record(now, self.config.messages_per_minute, count);
         let hour_ok = self
             .hour_window
-            .check_and_record(now, self.config.messages_per_hour);
+            .can_record(now, self.config.messages_per_hour, count);
 
-        minute_ok && hour_ok
+        if !minute_ok || !hour_ok {
+            return false;
+        }
+
+        self.minute_window.record(count);
+        self.hour_window.record(count);
+        true
     }
 
     /// Get the current emission count for the minute window.
@@ -756,6 +770,21 @@ mod tests {
 
         // 11th should be blocked
         assert!(!limiter.check_and_record());
+    }
+
+    #[test]
+    fn test_rate_limiter_batch_is_atomic() {
+        let config = EmitRateLimitConfig {
+            messages_per_minute: 3,
+            messages_per_hour: 100,
+        };
+        let mut limiter = ChannelEmitRateLimiter::new(config);
+
+        assert!(limiter.check_and_record_many(2));
+        assert!(!limiter.check_and_record_many(2));
+        assert_eq!(limiter.minute_count(), 2);
+        assert_eq!(limiter.hour_count(), 2);
+        assert!(limiter.check_and_record());
     }
 
     #[test]

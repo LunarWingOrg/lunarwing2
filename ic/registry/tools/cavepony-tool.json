@@ -2,9 +2,9 @@
   "name": "cavepony-tool",
   "display_name": "Cavepony",
   "kind": "tool",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "wit_version": "0.3.0",
-  "description": "Compress, expand, and measure prose with Cavepony token, concise, pony, and Canterlot modes",
+  "description": "Compress, expand, measure, and restyle prose with Cavepony token, concise, pony, Canterlot, and Tony Soprano modes",
   "keywords": [
     "cavepony",
     "compression",
@@ -12,7 +12,9 @@
     "concise",
     "tokens",
     "pony",
-    "canterlot"
+    "canterlot",
+    "tony-soprano",
+    "speech"
   ],
   "source": {
     "dir": "tools-src/cavepony",

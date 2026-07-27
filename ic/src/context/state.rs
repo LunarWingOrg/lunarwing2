@@ -5,6 +5,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use lunarwing_common::PromptContextMessage;
 use rust_decimal::Decimal;
 
 // ── Process-wide vision/OCR sidecar URL ──────────────────────────────────────
@@ -198,6 +199,10 @@ pub struct JobContext {
     pub transitions: Vec<StateTransition>,
     /// Metadata.
     pub metadata: serde_json::Value,
+    /// Transient visible conversation snapshot available to delegated workers.
+    /// Never persisted or exposed through generic tool context serialization.
+    #[serde(skip)]
+    pub prompt_context: Arc<[PromptContextMessage]>,
     /// Extra environment variables to inject into spawned child processes.
     ///
     /// Used by the worker runtime to pass fetched credentials to tools
@@ -265,6 +270,7 @@ impl JobContext {
             extra_env: Arc::new(HashMap::new()),
             http_interceptor: None,
             metadata: serde_json::Value::Null,
+            prompt_context: Arc::from([]),
             tool_output_stash: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             user_timezone: "UTC".to_string(),
         }
@@ -287,6 +293,15 @@ impl JobContext {
     /// with host-wins precedence.
     pub fn with_vision_service_url(mut self, url: Option<String>) -> Self {
         self.vision_service_url = url;
+        self
+    }
+
+    /// Attach transient visible conversation context for delegated workers.
+    pub fn with_prompt_context(
+        mut self,
+        prompt_context: impl Into<Arc<[PromptContextMessage]>>,
+    ) -> Self {
+        self.prompt_context = prompt_context.into();
         self
     }
 
@@ -476,6 +491,19 @@ mod tests {
         ctx.transition_to(JobState::Completed, Some("Done".to_string()))
             .unwrap();
         assert_eq!(ctx.state, JobState::Completed);
+    }
+
+    #[test]
+    fn prompt_context_is_transient_and_debug_redacted() {
+        let ctx = JobContext::default().with_prompt_context([PromptContextMessage {
+            role: lunarwing_common::PromptContextRole::User,
+            content: "private conversation text".to_string(),
+        }]);
+
+        let serialized = serde_json::to_string(&ctx).unwrap();
+        let debug = format!("{ctx:?}");
+        assert!(!serialized.contains("private conversation text"));
+        assert!(!debug.contains("private conversation text"));
     }
 
     #[test]

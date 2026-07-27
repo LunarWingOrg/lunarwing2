@@ -1008,16 +1008,9 @@ Example:
             Some(c) => c,
             None => return String::new(),
         };
-        let hints = match channel {
-            "xmpp" => {
-                "\
-- Keep messages concise. Markdown is generally not rendered.\n\
-- Prefer plain text with minimal formatting."
-            }
-            "signal" => "",
-            _ => {
-                return String::new();
-            }
+        let hints = match channel_formatting_hints(channel) {
+            Some(hints) => hints,
+            None => return String::new(),
         };
 
         let message_tool_hint = "\
@@ -1989,6 +1982,27 @@ fn collapse_newlines(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// Channel-specific formatting hints for the system prompt.
+///
+/// Returns `None` for channels with no special guidance (no channel section
+/// is emitted). `Some("")` means "emit the section (proactive-messaging help)
+/// without channel-specific bullet points".
+fn channel_formatting_hints(channel: &str) -> Option<String> {
+    match channel {
+        "xmpp" => Some(
+            "\
+- Keep messages concise. Markdown is generally not rendered.\n\
+- Prefer plain text with minimal formatting."
+                .to_string(),
+        ),
+        "signal" => Some(String::new()),
+        // Rate-metered channels (DarkIRC) get budget-derived guidance so the
+        // agent writes replies the transport can actually deliver.
+        other => crate::channels::budget::budget_for_channel(other)
+            .map(|budget| budget.prompt_guidance()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2012,6 +2026,35 @@ That's my plan."#;
             .with_job("Test job");
         assert_eq!(context.messages.len(), 1);
         assert!(context.job_description.is_some());
+    }
+
+    // ---- Channel formatting hints ----
+
+    #[test]
+    fn darkirc_channel_hints_describe_the_message_budget() {
+        // Regression: darkirc used to fall through to None, so the agent got
+        // zero guidance about the 390-byte / paced-delivery constraints and
+        // wrote multi-KB markdown replies the transport could not deliver.
+        let hints = channel_formatting_hints("darkirc").expect("darkirc must have hints");
+        assert!(hints.contains("darkirc"));
+        assert!(hints.contains("390"));
+        assert!(hints.contains("Plain text only"));
+    }
+
+    #[test]
+    fn xmpp_and_signal_hints_are_preserved() {
+        assert!(
+            channel_formatting_hints("xmpp")
+                .expect("xmpp has hints")
+                .contains("concise")
+        );
+        assert_eq!(channel_formatting_hints("signal").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn unconstrained_channels_have_no_hints() {
+        assert!(channel_formatting_hints("gateway").is_none());
+        assert!(channel_formatting_hints("weechat").is_none());
     }
 
     // ---- Basic thinking tag stripping ----

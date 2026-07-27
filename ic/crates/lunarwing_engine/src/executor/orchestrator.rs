@@ -23,8 +23,8 @@ use std::sync::Arc;
 use std::collections::HashMap;
 
 use monty::{
-    ExtFunctionResult, LimitedTracker, MontyObject, MontyRun, NameLookupResult, PrintWriter,
-    ResourceLimits, RunProgress,
+    ExtFunctionResult, FunctionCall, LimitedTracker, MontyObject, MontyRun, NameLookupResult,
+    PrintWriter, ResourceLimits, RunProgress,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -33,13 +33,16 @@ use crate::capability::lease::LeaseManager;
 use crate::capability::policy::PolicyEngine;
 use crate::memory::RetrievalEngine;
 use crate::runtime::messaging::{SignalReceiver, ThreadOutcome, ThreadSignal};
-use crate::traits::effect::{EffectExecutor, ThreadExecutionContext};
+use crate::traits::effect::{
+    EffectExecutor, ThreadExecutionContext, prompt_context_from_thread_messages,
+};
 use crate::traits::llm::{LlmBackend, LlmCallConfig, LlmOutput};
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
 use crate::types::event::{EventKind, ThreadEvent, summarize_params};
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
+use crate::types::provenance::Provenance;
 use crate::types::shared_owner_id;
 use crate::types::step::{ActionCall, LlmResponse, StepId, TokenUsage};
 use crate::types::thread::{Thread, ThreadState};
@@ -89,7 +92,11 @@ fn normalize_pause_outcome(
     Ok(())
 }
 
-/// Maximum wall-clock duration for one orchestrator VM invocation.
+/// Maximum cumulative active duration for one orchestrator VM invocation.
+///
+/// Time spent waiting for host functions is excluded by resetting this limit
+/// before each resume. This keeps slow tools and LLMs from consuming the
+/// untrusted Python execution budget.
 pub const ORCHESTRATOR_TIMEOUT_SECS: u64 = 600;
 
 /// Resource limits for the orchestrator VM.
@@ -98,6 +105,15 @@ fn orchestrator_limits() -> ResourceLimits {
         .max_duration(std::time::Duration::from_secs(ORCHESTRATOR_TIMEOUT_SECS))
         .max_allocations(5_000_000)
         .max_memory(128 * 1024 * 1024) // 128 MB
+}
+
+fn reset_orchestrator_phase_timeout(
+    call: &mut FunctionCall<LimitedTracker>,
+    active_duration: std::time::Duration,
+) {
+    let remaining =
+        std::time::Duration::from_secs(ORCHESTRATOR_TIMEOUT_SECS).saturating_sub(active_duration);
+    call.tracker_mut().set_max_duration(remaining);
 }
 
 /// Maximum consecutive failures before auto-rollback.
@@ -362,6 +378,7 @@ pub async fn execute_orchestrator(
 
     // Drive the orchestrator dispatch loop
     let mut final_result: Option<serde_json::Value> = None;
+    let mut active_vm_duration = std::time::Duration::ZERO;
 
     loop {
         match progress {
@@ -382,7 +399,9 @@ pub async fn execute_orchestrator(
                 });
             }
 
-            RunProgress::FunctionCall(call) => {
+            RunProgress::FunctionCall(mut call) => {
+                active_vm_duration =
+                    active_vm_duration.saturating_add(call.tracker_mut().elapsed());
                 let action_name = call.function_name.clone();
                 let args = &call.args;
                 let kwargs = &call.kwargs;
@@ -521,7 +540,8 @@ pub async fn execute_orchestrator(
                     other => ExtFunctionResult::NotFound(other.to_string()),
                 };
 
-                // Resume the orchestrator VM
+                // Host I/O may take minutes. Bound active VM execution, not suspended time.
+                reset_orchestrator_phase_timeout(&mut call, active_vm_duration);
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     call.resume(ext_result, PrintWriter::Collect(&mut stdout))
                 })) {
@@ -767,6 +787,7 @@ async fn handle_execute_code_step(
         source_channel: thread_source_channel(thread),
         supervised_mode: thread.config.supervised_mode,
         supervised_timeout_secs: thread.config.supervised_timeout_secs,
+        prompt_context: prompt_context_from_thread_messages(&thread.messages),
     };
 
     // Run user code in a nested Monty VM (same pattern as rlm_query)
@@ -887,6 +908,7 @@ async fn handle_execute_action(
         source_channel: thread_source_channel(thread),
         supervised_mode: thread.config.supervised_mode,
         supervised_timeout_secs: thread.config.supervised_timeout_secs,
+        prompt_context: prompt_context_from_thread_messages(&thread.messages),
     };
 
     // Helper: emit event only. The orchestrator owns transcript recording.
@@ -940,7 +962,7 @@ async fn handle_execute_action(
         .and_then(|actions| actions.into_iter().find(|a| a.name == name));
 
     if let Some(ref ad) = action_def {
-        match policy.evaluate(ad, &lease, &[]) {
+        match policy.evaluate_with_provenance(ad, &lease, &[], &Provenance::LlmGenerated) {
             crate::capability::policy::PolicyDecision::Deny { reason } => {
                 let output = serde_json::json!({"error": format!("Denied: {reason}")});
                 emit_and_record(
@@ -1219,7 +1241,7 @@ async fn handle_execute_actions_parallel(
             .and_then(|actions| actions.into_iter().find(|a| a.name == pc.name));
 
         if let Some(ref ad) = action_def {
-            match policy.evaluate(ad, &lease, &[]) {
+            match policy.evaluate_with_provenance(ad, &lease, &[], &Provenance::LlmGenerated) {
                 crate::capability::policy::PolicyDecision::Deny { reason } => {
                     let output = serde_json::json!({"error": format!("Denied: {reason}")});
                     let result_json = serde_json::json!({
@@ -1335,6 +1357,7 @@ async fn handle_execute_actions_parallel(
         }
     }
 
+    let prompt_context = prompt_context_from_thread_messages(&thread.messages);
     if runnable.len() == 1 {
         // Single call: execute directly
         let (idx, lease) = runnable.into_iter().next().unwrap(); // safety: len()==1 checked above
@@ -1349,6 +1372,7 @@ async fn handle_execute_actions_parallel(
             source_channel: None,
             supervised_mode: thread.config.supervised_mode,
             supervised_timeout_secs: thread.config.supervised_timeout_secs,
+            prompt_context: Arc::clone(&prompt_context),
         };
         let ps = summarize_params(&pc.name, &pc.params);
         let (result_json, event, output) = execute_single_action(
@@ -1388,6 +1412,7 @@ async fn handle_execute_actions_parallel(
                 source_channel: None,
                 supervised_mode: thread.config.supervised_mode,
                 supervised_timeout_secs: thread.config.supervised_timeout_secs,
+                prompt_context: Arc::clone(&prompt_context),
             };
             let ps = summarize_params(&pc_name, &pc_params);
 
@@ -2365,6 +2390,35 @@ mod tests {
     use std::time::Duration;
 
     // ── Python helper unit tests via Monty ──────────────────────
+
+    #[test]
+    fn host_wait_does_not_consume_orchestrator_phase_timeout() {
+        let statements = (0..50)
+            .map(|i| format!("value_{i} = {i}"))
+            .collect::<Vec<_>>();
+        let code = format!("host_call()\n{}", statements.join("\n"));
+        let runner = MontyRun::new(code, "host-wait.py", vec![]).expect("test code should parse");
+        let tracker =
+            LimitedTracker::new(ResourceLimits::new().max_duration(Duration::from_millis(1)));
+        let mut stdout = String::new();
+        let progress = runner
+            .start(vec![], tracker, PrintWriter::Collect(&mut stdout))
+            .expect("test code should reach host call");
+        let RunProgress::FunctionCall(mut call) = progress else {
+            panic!("test code should suspend at host call");
+        };
+
+        let active_duration = call.tracker_mut().elapsed();
+        std::thread::sleep(Duration::from_millis(10));
+        reset_orchestrator_phase_timeout(&mut call, active_duration);
+        let result = call.resume(
+            ExtFunctionResult::Return(MontyObject::None),
+            PrintWriter::Collect(&mut stdout),
+        );
+
+        assert!(matches!(result, Ok(RunProgress::Complete(_))));
+    }
+
     //
     // Extracts the helper functions from the default orchestrator and
     // evaluates `signals_tool_intent(text)` directly, mirroring the V1

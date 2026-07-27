@@ -471,6 +471,8 @@ struct DarkircFixtureState {
     sends: Vec<DarkircRequest>,
     poll_mode: DarkircPollMode,
     poll_batches: VecDeque<serde_json::Value>,
+    pending_batch: Option<(String, serde_json::Value)>,
+    next_batch_id: usize,
 }
 
 fn darkirc_batch(text: &str, timestamp: &str) -> serde_json::Value {
@@ -733,11 +735,31 @@ async fn start_darkirc_fixture() -> (
                         }
                         DarkircPollMode::Normal => {}
                     }
-                    let messages = state
-                        .poll_batches
-                        .pop_front()
-                        .unwrap_or_else(|| serde_json::json!([]));
-                    (StatusCode::OK, Json(serde_json::json!({"messages": messages})))
+                    if state.pending_batch.is_none() {
+                        let messages = state
+                            .poll_batches
+                            .pop_front()
+                            .unwrap_or_else(|| serde_json::json!([]));
+                        if !messages.as_array().is_none_or(Vec::is_empty) {
+                            state.next_batch_id += 1;
+                            let batch_id = format!("fixture-batch-{}", state.next_batch_id);
+                            state.pending_batch = Some((batch_id, messages));
+                        }
+                    }
+                    let (batch_id, messages) = state
+                        .pending_batch
+                        .as_ref()
+                        .map(|(batch_id, messages)| {
+                            (Some(batch_id.clone()), messages.clone())
+                        })
+                        .unwrap_or_else(|| (None, serde_json::json!([])));
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "messages": messages,
+                            "batch_id": batch_id,
+                        })),
+                    )
                         .into_response()
                 },
             ),
@@ -746,14 +768,30 @@ async fn start_darkirc_fixture() -> (
             "/ack",
             post(
                 |State(state): State<Arc<Mutex<DarkircFixtureState>>>,
-                 headers: HeaderMap| async move {
+                 headers: HeaderMap,
+                 body: Bytes| async move {
                     if !authenticated(&headers).await {
                         return StatusCode::UNAUTHORIZED;
                     }
-                    state
+                    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+                        return StatusCode::BAD_REQUEST;
+                    };
+                    let Some(batch_id) = payload.get("batch_id").and_then(|value| value.as_str())
+                    else {
+                        return StatusCode::BAD_REQUEST;
+                    };
+                    let mut state = state
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .ack_count += 1;
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if !state
+                        .pending_batch
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending == batch_id)
+                    {
+                        return StatusCode::CONFLICT;
+                    }
+                    state.pending_batch = None;
+                    state.ack_count += 1;
                     StatusCode::OK
                 },
             ),
@@ -1035,6 +1073,28 @@ async fn real_darkirc_component_routes_engine_v2_and_proactive_delivery() {
         assert!(state.sends.is_empty());
     }
 
+    let undispatched = load_real_channel(
+        "darkirc",
+        &wasm_path,
+        &capabilities_path,
+        config.clone(),
+        Arc::clone(&pairing_store),
+        Some("darkirc:nick:alice".to_string()),
+    )
+    .await;
+    let undispatched = with_darkirc_adapter_secret(undispatched).await;
+    undispatched.call_on_start().await.unwrap();
+    let dispatch_error = undispatched.call_on_poll().await.unwrap_err();
+    assert!(dispatch_error.to_string().contains("no agent queue"));
+    assert_eq!(
+        fixture
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ack_count,
+        0,
+        "failed host dispatch must leave adapter batch unacked"
+    );
+
     let channel = load_real_channel(
         "darkirc",
         &wasm_path,
@@ -1058,6 +1118,14 @@ async fn real_darkirc_component_routes_engine_v2_and_proactive_delivery() {
         .call_on_poll()
         .await
         .expect("DarkIRC poll callback should execute");
+    assert_eq!(
+        fixture
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ack_count,
+        0,
+        "batch ACK must wait until a later poll after host dispatch"
+    );
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let sends = fixture
@@ -1330,6 +1398,10 @@ async fn real_darkirc_component_keeps_approval_and_auth_in_the_originating_dm() 
         .await
         .expect("DarkIRC credential poll should execute");
     wait_for_darkirc_text(&fixture, AUTHENTICATED_RESPONSE).await;
+    channel
+        .call_on_poll()
+        .await
+        .expect("DarkIRC final control batch ACK should execute");
 
     {
         let state = fixture
@@ -1462,6 +1534,10 @@ async fn real_darkirc_component_keeps_interrupt_in_the_originating_dm() {
     .await
     .expect("DarkIRC interrupt should cancel the originating Engine V2 thread");
     tokio::time::sleep(Duration::from_millis(100)).await;
+    channel
+        .call_on_poll()
+        .await
+        .expect("DarkIRC interrupt batch ACK should execute");
 
     {
         let state = fixture

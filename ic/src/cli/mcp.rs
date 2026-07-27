@@ -777,6 +777,7 @@ fn build_update_config(
 }
 
 /// Toggle server enabled/disabled state.
+#[allow(clippy::too_many_arguments)] // CLI flag plumbing mirrors the clap surface
 async fn toggle_server(
     name: String,
     enable: bool,

@@ -53,7 +53,8 @@ pub use self::routines::RoutineConfig;
 pub use self::safety::SafetyConfig;
 use self::safety::resolve_safety_config;
 pub use self::sandbox::{
-    AcpModeConfig, ExternalWorkerConfig, LoadBalanceStrategy, SandboxModeConfig, WorkerEndpoint,
+    AcpModeConfig, ExternalWorkerConfig, LoadBalanceStrategy, PromptContextLimits,
+    SandboxModeConfig, WorkerEndpoint,
 };
 pub use self::search::WorkspaceSearchConfig;
 pub use self::secrets::SecretsConfig;

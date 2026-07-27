@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
+use lunarwing_common::PromptContextRole;
 use secrecy::SecretString;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -33,12 +34,16 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use uuid::Uuid;
 
+use lunarwing::channels::web::types::SseEvent;
 use lunarwing::config::{ExternalWorkerConfig, LoadBalanceStrategy, WorkerEndpoint};
+use lunarwing::context::{ContextManager, JobContext, JobState};
 use lunarwing::error::OrchestratorError;
 use lunarwing::orchestrator::ExternalWorkerManager;
 use lunarwing::orchestrator::external_worker::{
-    ExternalTaskStatus, SUBPROTOCOL, SUBPROTOCOL_LEGACY, TaskContext,
+    ConversationMessage, ExternalTaskStatus, SUBPROTOCOL, SUBPROTOCOL_LEGACY, TaskContext,
 };
+use lunarwing::tools::Tool;
+use lunarwing::tools::builtin::CreateJobTool;
 
 /// How long we wait for any single test assertion before declaring the test
 /// hung. The protocol path under test should resolve in well under this.
@@ -59,6 +64,10 @@ enum MockBehavior {
     /// Return one successful result, then drop the socket without a close
     /// frame. A pooled client must detect this before dispatching another task.
     SuccessThenDisconnect { output: String },
+    /// Capture task-request envelope, then return success.
+    Capture {
+        requests: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    },
     /// Send `ready`, then on `task_request`: a single failed result.
     Failed { error: String },
     /// Send `ready`, read `task_request`, then never reply (drives a timeout).
@@ -339,6 +348,22 @@ async fn handle_connection(
                 let _ = ws.send(Message::Text(r.into())).await;
                 return;
             }
+            MockBehavior::Capture { ref requests } => {
+                let _ = requests.send(req_envelope);
+                let result = envelope(
+                    "task_result",
+                    serde_json::json!({
+                        "task_id": "t",
+                        "status": "success",
+                        "output": "captured",
+                        "error": null,
+                        "duration_ms": 1,
+                    }),
+                );
+                if ws.send(Message::Text(result.into())).await.is_err() {
+                    return;
+                }
+            }
             MockBehavior::Hang => {
                 // Never reply; the client will time out or be cancelled. Hold
                 // the connection open (bounded) so the read side stays pending.
@@ -364,6 +389,7 @@ fn config_for(url: &str) -> ExternalWorkerConfig {
             weight: None,
         }],
         load_balance: LoadBalanceStrategy::RoundRobin,
+        prompt_context: Default::default(),
     }
 }
 
@@ -381,6 +407,7 @@ fn config_for_with_auth(url: &str, token: &str) -> ExternalWorkerConfig {
             weight: None,
         }],
         load_balance: LoadBalanceStrategy::RoundRobin,
+        prompt_context: Default::default(),
     }
 }
 
@@ -424,6 +451,136 @@ async fn happy_path_success_with_progress() {
     // accumulated progress deltas.
     assert_eq!(res.output, "Hello world");
     assert!(res.error.is_none());
+}
+
+#[tokio::test]
+async fn task_request_serializes_typed_conversation_context() {
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
+        requests: request_tx,
+    })
+    .await;
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)]);
+    let context = TaskContext {
+        conversation_history: vec![
+            ConversationMessage {
+                role: PromptContextRole::User,
+                content: "question".to_string(),
+            },
+            ConversationMessage {
+                role: PromptContextRole::Assistant,
+                content: "answer".to_string(),
+            },
+        ],
+        ..Default::default()
+    };
+
+    timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            Uuid::new_v4(),
+            "mock",
+            "authoritative task",
+            Some(5_000),
+            true,
+            context,
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored");
+
+    let request = request_rx.recv().await.expect("captured request");
+    assert_eq!(request["payload"]["prompt"], "authoritative task");
+    assert_eq!(
+        request["payload"]["context"]["conversation_history"],
+        serde_json::json!([
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn create_job_context_scope_is_opt_in_and_metadata_isolated() {
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
+        requests: request_tx,
+    })
+    .await;
+    let worker_manager = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]));
+    let tool = CreateJobTool::new(Arc::new(ContextManager::new(5)))
+        .with_external_workers(worker_manager, None);
+    let mut context = JobContext::with_user("user-1", "chat", "test");
+    context.metadata = serde_json::json!({
+        "conv_secret": "must-not-cross",
+        "notify_user": "routing-id"
+    });
+    context.prompt_context = Arc::from([
+        ConversationMessage {
+            role: PromptContextRole::User,
+            content: "prior question".to_string(),
+        },
+        ConversationMessage {
+            role: PromptContextRole::Assistant,
+            content: "prior answer".to_string(),
+        },
+    ]);
+
+    timeout(
+        TEST_BOUND,
+        tool.execute(
+            serde_json::json!({
+                "title": "Context job",
+                "description": "Do work",
+                "mode": "mock",
+                "context_scope": "recent",
+                "wait": true
+            }),
+            &context,
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("create_job failed");
+    let with_context = request_rx
+        .recv()
+        .await
+        .expect("captured contextual request");
+    assert_eq!(
+        with_context["payload"]["context"]["conversation_history"],
+        serde_json::json!([
+            {"role": "user", "content": "prior question"},
+            {"role": "assistant", "content": "prior answer"}
+        ])
+    );
+    assert_eq!(
+        with_context["payload"]["context"]["metadata"],
+        serde_json::json!({})
+    );
+    assert!(!with_context.to_string().contains("must-not-cross"));
+    assert!(!with_context.to_string().contains("routing-id"));
+
+    timeout(
+        TEST_BOUND,
+        tool.execute(
+            serde_json::json!({
+                "title": "No context job",
+                "description": "Do other work",
+                "mode": "mock",
+                "wait": true
+            }),
+            &context,
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("create_job failed");
+    let without_context = request_rx.recv().await.expect("captured plain request");
+    assert_eq!(
+        without_context["payload"]["context"]["conversation_history"],
+        serde_json::json!([])
+    );
 }
 
 #[tokio::test]
@@ -510,6 +667,56 @@ async fn task_timeout_when_worker_hangs() {
     assert!(
         matches!(err, OrchestratorError::ExternalWorkerTimeout { .. }),
         "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn async_timeout_finalizes_job_and_emits_result() {
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Hang).await;
+    let context_manager = Arc::new(ContextManager::new(5));
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)])
+        .with_event_deps(event_tx, Arc::clone(&context_manager));
+    let job_id = Uuid::new_v4();
+    context_manager
+        .register_sandbox_job(job_id, "test-user", "task", "task")
+        .await
+        .expect("register job");
+
+    let result = mgr
+        .execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(100),
+            false,
+            TaskContext::default(),
+        )
+        .await
+        .expect("dispatch async task");
+    assert!(result.is_none());
+
+    let status = timeout(TEST_BOUND, async {
+        loop {
+            let (event_job_id, _, event) = event_rx.recv().await.expect("job event");
+            if event_job_id == job_id
+                && let SseEvent::JobResult { status, .. } = event
+            {
+                break status;
+            }
+        }
+    })
+    .await
+    .expect("result event timed out");
+
+    assert_eq!(status, "failed");
+    assert_eq!(
+        context_manager
+            .get_context(job_id)
+            .await
+            .expect("job context")
+            .state,
+        JobState::Failed
     );
 }
 

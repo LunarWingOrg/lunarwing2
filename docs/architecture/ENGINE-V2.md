@@ -358,6 +358,14 @@ the agent's outer outbound handler, which applies `BeforeOutbound`, suppresses
 empty responses, persists compatibility history, and calls
 `ChannelManager::respond()` once with the original incoming metadata.
 
+Rate-metered channels (DarkIRC) carry a host-side message budget
+(`ic/src/channels/budget.rs`). The bridge injects the budget's guidance into
+new engine threads via `ThreadConfig::channel_context` (rendered as a
+"Channel Constraints" system-prompt section — the engine crate stays
+channel-neutral), and the bundled `BeforeOutbound` hook
+(`builtin.channel_message_budget`) truncates over-budget terminal responses at
+a UTF-8-safe boundary with an explicit continuation marker before delivery.
+
 Approval, authentication, interrupt, clear, and new-thread controls use the
 same user and engine-conversation scope as ordinary input. This includes
 non-UUID DarkIRC and WeeChat scope keys. Approval and auth prompts are statuses;
@@ -419,6 +427,12 @@ orchestrator artifacts live in human-readable paths under `engine/`. Raw
 attachment bytes are the deliberate exception: only sanitized attachment text
 is durable, while provider-bound image parts remain transient. The router also
 dual-writes V1-compatible conversation history to the relational database.
+
+Webhook mission documents contain only versioned secret references. Plaintext
+webhook secrets live in the encrypted host `SecretsStore`, are hydrated into
+runtime memory when Engine V2 starts, and are omitted from serialization and
+debug output. Startup migrates legacy plaintext mission documents in place so
+workspace search chunks no longer contain the credential.
 
 "Cleanup" of terminal threads means writing a compact archive and evicting
 in-memory cache entries to bound RAM; workspace files remain. `load_thread()`,

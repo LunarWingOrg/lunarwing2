@@ -12,6 +12,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use lunarwing_common::{
+    DEFAULT_WORKER_ITERATIONS, MAX_WORKER_ITERATIONS, PromptContextLimits, PromptContextMessage,
+    select_prompt_context,
+};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -23,12 +27,14 @@ use crate::db::Database;
 use crate::history::SandboxJobRecord;
 use crate::orchestrator::ExternalWorkerManager;
 use crate::orchestrator::auth::CredentialGrant;
-use crate::orchestrator::external_worker::{
-    ConversationMessage, ExternalTaskStatus, build_task_context,
-};
+use crate::orchestrator::external_worker::{ExternalTaskStatus, build_task_context};
 use crate::orchestrator::job_manager::{ContainerJobManager, JobMode};
 use crate::secrets::SecretsStore;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
+
+const LONG_JOB_TOOL_TIMEOUT: Duration = Duration::from_secs(660);
+const EXTERNAL_WORKER_TIMEOUT_GRACE: Duration = Duration::from_secs(60);
+const MAX_LISTED_JOBS: usize = 100;
 
 /// Lazy scheduler reference, filled after Agent::new creates the Scheduler.
 ///
@@ -77,6 +83,55 @@ async fn resolve_job_id(input: &str, context_manager: &ContextManager) -> Result
     }
 }
 
+/// Resolve a queryable job from live context or persisted sandbox records.
+async fn resolve_query_job_id(
+    input: &str,
+    context_manager: &ContextManager,
+    store: Option<&Arc<dyn Database>>,
+    user_id: &str,
+) -> Result<Uuid, ToolError> {
+    if let Ok(id) = Uuid::parse_str(input) {
+        return Ok(id);
+    }
+
+    if input.len() < 4 {
+        return Err(ToolError::InvalidParameters(
+            "job ID prefix must be at least 4 hex characters".to_string(),
+        ));
+    }
+
+    let input_lower = input.to_lowercase();
+    let mut matches = context_manager.all_jobs_for(user_id).await;
+    if let Some(store) = store {
+        match store.list_sandbox_jobs_for_user(user_id).await {
+            Ok(jobs) => matches.extend(jobs.into_iter().map(|job| job.id)),
+            Err(error) if matches.is_empty() => {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "failed to search persisted jobs: {error}"
+                )));
+            }
+            Err(error) => {
+                tracing::warn!("Failed to search persisted jobs: {error}");
+            }
+        }
+    }
+
+    matches.retain(|id| id.simple().to_string().starts_with(&input_lower));
+    matches.sort_unstable();
+    matches.dedup();
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => Err(ToolError::InvalidParameters(format!(
+            "no job found matching prefix '{}'",
+            input
+        ))),
+        n => Err(ToolError::InvalidParameters(format!(
+            "ambiguous prefix '{}' matches {} jobs, provide more characters",
+            input, n
+        ))),
+    }
+}
+
 fn sandbox_job_requires_attention(message: Option<&str>) -> bool {
     let Some(message) = message else {
         return false;
@@ -104,6 +159,67 @@ fn sandbox_completion_status(success: bool, message: Option<&str>) -> &'static s
         JobState::Completed => "completed",
         JobState::Stuck => "stuck",
         _ => "failed",
+    }
+}
+
+fn external_job_wait(params: &serde_json::Value) -> bool {
+    params
+        .get("wait")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn worker_max_iterations(params: &serde_json::Value) -> Result<u32, ToolError> {
+    let Some(value) = params.get("max_iterations") else {
+        return Ok(DEFAULT_WORKER_ITERATIONS);
+    };
+    let value = value.as_u64().ok_or_else(|| {
+        ToolError::InvalidParameters("max_iterations must be an integer".to_string())
+    })?;
+    if !(1..=u64::from(MAX_WORKER_ITERATIONS)).contains(&value) {
+        return Err(ToolError::InvalidParameters(format!(
+            "max_iterations must be between 1 and {MAX_WORKER_ITERATIONS}"
+        )));
+    }
+    Ok(value as u32)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalContextScope {
+    None,
+    Recent,
+}
+
+impl ExternalContextScope {
+    fn parse(params: &serde_json::Value) -> Result<Self, ToolError> {
+        match params.get("context_scope") {
+            None => Ok(Self::None),
+            Some(value) => match value.as_str() {
+                Some("none") => Ok(Self::None),
+                Some("recent") => Ok(Self::Recent),
+                _ => Err(ToolError::InvalidParameters(
+                    "context_scope must be 'none' or 'recent'".to_string(),
+                )),
+            },
+        }
+    }
+}
+
+struct ExternalExecutionOptions {
+    wait: bool,
+    context_scope: ExternalContextScope,
+    project_dir: Option<String>,
+    credential_grants: Vec<CredentialGrant>,
+}
+
+fn external_prompt_context(
+    ctx: &JobContext,
+    scope: ExternalContextScope,
+    limits: PromptContextLimits,
+) -> Vec<PromptContextMessage> {
+    match scope {
+        ExternalContextScope::None => Vec::new(),
+        ExternalContextScope::Recent => select_prompt_context(&ctx.prompt_context, limits),
     }
 }
 
@@ -197,6 +313,10 @@ impl CreateJobTool {
         self.external_worker_manager
             .as_ref()
             .is_some_and(|m| !m.is_empty())
+    }
+
+    fn external_worker_monitor_timeout(&self, worker_timeout_ms: u64) -> Duration {
+        Duration::from_millis(worker_timeout_ms).saturating_add(EXTERNAL_WORKER_TIMEOUT_GRACE)
     }
 
     /// Parse and validate the `credentials` parameter.
@@ -351,6 +471,7 @@ impl CreateJobTool {
         &self,
         title: &str,
         description: &str,
+        max_iterations: u32,
         ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
@@ -364,7 +485,12 @@ impl CreateJobTool {
             && let Some(ref scheduler) = *slot.read().await
         {
             return match scheduler
-                .dispatch_job(&ctx.user_id, title, description, None)
+                .dispatch_job(
+                    &ctx.user_id,
+                    title,
+                    description,
+                    Some(serde_json::json!({ "max_iterations": max_iterations })),
+                )
                 .await
             {
                 Ok(job_id) => {
@@ -372,6 +498,7 @@ impl CreateJobTool {
                         "job_id": job_id.to_string(),
                         "title": title,
                         "status": "in_progress",
+                        "max_iterations": max_iterations,
                         "message": format!("Created and scheduled job '{}'", title)
                     });
                     Ok(ToolOutput::success(result, start.elapsed()))
@@ -392,10 +519,17 @@ impl CreateJobTool {
             .await
         {
             Ok(job_id) => {
+                self.context_manager
+                    .update_context(job_id, |job| {
+                        job.metadata = serde_json::json!({ "max_iterations": max_iterations });
+                    })
+                    .await
+                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
                 let result = serde_json::json!({
                     "job_id": job_id.to_string(),
                     "title": title,
                     "status": "pending",
+                    "max_iterations": max_iterations,
                     "message": format!("Created job '{}' (not scheduled — scheduler unavailable)", title)
                 });
                 Ok(ToolOutput::success(result, start.elapsed()))
@@ -415,8 +549,8 @@ impl CreateJobTool {
         task: &str,
         explicit_dir: Option<PathBuf>,
         wait: bool,
-        mode: JobMode,
         credential_grants: Vec<CredentialGrant>,
+        max_iterations: u32,
         ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
@@ -453,6 +587,12 @@ impl CreateJobTool {
             .map_err(|e| {
                 ToolError::ExecutionFailed(format!("failed to register sandbox job: {}", e))
             })?;
+        self.context_manager
+            .update_context(job_id, |job| {
+                job.metadata = serde_json::json!({ "max_iterations": max_iterations });
+            })
+            .await
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
 
         // Persist the job to DB before creating the container.
         self.persist_job(SandboxJobRecord {
@@ -480,7 +620,14 @@ impl CreateJobTool {
 
         // Create the container job with the pre-determined job_id.
         let _token = jm
-            .create_job(job_id, task, Some(project_dir), mode, credential_grants)
+            .create_job(
+                job_id,
+                task,
+                Some(project_dir),
+                JobMode::Worker,
+                credential_grants,
+                max_iterations,
+            )
             .await
             .map_err(|e| {
                 self.update_status(
@@ -525,6 +672,7 @@ impl CreateJobTool {
             let result = serde_json::json!({
                 "job_id": job_id.to_string(),
                 "status": "started",
+                "max_iterations": max_iterations,
                 "message": "Container started. Use job_events to check status or job_prompt to send follow-up instructions.",
                 "project_dir": project_dir_str,
                 "browse_url": format!("/projects/{}", browse_id),
@@ -596,6 +744,7 @@ impl CreateJobTool {
                             let result = serde_json::json!({
                                 "job_id": job_id.to_string(),
                                 "status": "completed",
+                                "max_iterations": max_iterations,
                                 "output": message,
                                 "project_dir": project_dir_str,
                                 "browse_url": format!("/projects/{}", browse_id),
@@ -619,6 +768,7 @@ impl CreateJobTool {
                             let result = serde_json::json!({
                                 "job_id": job_id.to_string(),
                                 "status": "stuck",
+                                "max_iterations": max_iterations,
                                 "output": message,
                                 "project_dir": project_dir_str,
                                 "browse_url": format!("/projects/{}", browse_id),
@@ -696,15 +846,13 @@ impl CreateJobTool {
         }
     }
 
-    /// Execute via an external worker (nanocode, codex, etc.).
+    /// Execute via an external worker (nanocode, opencode, etc.).
     async fn execute_external(
         &self,
         task: &str,
         worker_name: &str,
-        wait: bool,
         ctx: &JobContext,
-        project_dir: Option<String>,
-        credential_grants: Vec<CredentialGrant>,
+        options: ExternalExecutionOptions,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
         let ewm = self.external_worker_manager.as_ref().ok_or_else(|| {
@@ -712,18 +860,22 @@ impl CreateJobTool {
                 "External worker execution requires a configured worker manager".to_string(),
             )
         })?;
+        let worker_config = ewm.get_worker(worker_name).ok_or_else(|| {
+            ToolError::ExecutionFailed(format!("External worker '{worker_name}' is not configured"))
+        })?;
+        let worker_timeout_ms = worker_config.timeout_ms;
 
         let job_id = Uuid::new_v4();
 
         // Resolve credential grants to actual env var values
         let mut environment = std::collections::HashMap::new();
-        if !credential_grants.is_empty() {
+        if !options.credential_grants.is_empty() {
             let secrets = self.secrets_store.as_ref().ok_or_else(|| {
                 ToolError::ExecutionFailed(
                     "credentials requested but no secrets store is configured".to_string(),
                 )
             })?;
-            for grant in &credential_grants {
+            for grant in &options.credential_grants {
                 let decrypted = secrets
                     .get_decrypted(&ctx.user_id, &grant.secret_name)
                     .await
@@ -737,7 +889,7 @@ impl CreateJobTool {
             }
         }
 
-        let grants_json = serde_json::to_string(&credential_grants).unwrap_or_default();
+        let grants_json = serde_json::to_string(&options.credential_grants).unwrap_or_default();
 
         self.context_manager
             .register_sandbox_job(job_id, &ctx.user_id, task, task)
@@ -746,70 +898,80 @@ impl CreateJobTool {
                 ToolError::ExecutionFailed(format!("failed to register external job: {}", e))
             })?;
 
-        self.persist_job(SandboxJobRecord {
+        let record = SandboxJobRecord {
             id: job_id,
             task: task.to_string(),
             status: "creating".to_string(),
             user_id: ctx.user_id.clone(),
-            project_dir: project_dir.clone().unwrap_or_default(),
+            project_dir: options.project_dir.clone().unwrap_or_default(),
             success: None,
             failure_reason: None,
             created_at: Utc::now(),
             started_at: None,
             completed_at: None,
             credential_grants_json: grants_json,
-        });
+        };
 
         if let Some(store) = &self.store {
-            let store = store.clone();
+            if let Err(error) = store.save_sandbox_job(&record).await {
+                tracing::warn!(job_id = %job_id, "Failed to persist external job: {error}");
+            }
+
             let mode_val = JobMode::External(worker_name.to_string()).db_value();
-            tokio::spawn(async move {
-                let _ = store.update_sandbox_job_mode(job_id, &mode_val).await;
-            });
+            if let Err(error) = store.update_sandbox_job_mode(job_id, &mode_val).await {
+                tracing::warn!(job_id = %job_id, "Failed to persist external job mode: {error}");
+            }
+
+            if let Err(error) = store
+                .update_sandbox_job_status(job_id, "running", None, None, Some(Utc::now()), None)
+                .await
+            {
+                tracing::warn!(job_id = %job_id, "Failed to mark external job running: {error}");
+            }
         }
 
-        self.update_status(job_id, "running", None, None, Some(Utc::now()), None);
-
-        let pre_subscribed_rx = if !wait {
+        let pre_subscribed_rx = if !options.wait {
             self.event_tx.as_ref().map(|etx| etx.subscribe())
         } else {
             None
         };
 
-        let metadata = if ctx.metadata.is_object() {
-            ctx.metadata
-                .as_object()
-                .map(|map| {
-                    map.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            std::collections::HashMap::new()
-        };
-
-        let conversation_history: Vec<ConversationMessage> = metadata
+        let conversation_history =
+            external_prompt_context(ctx, options.context_scope, worker_config.prompt_context);
+        let selected_chars: usize = conversation_history
             .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix("conv_").map(|_| ConversationMessage {
-                    role: "context".to_string(),
-                    content: v.clone(),
-                })
-            })
-            .collect();
+            .map(|message| message.content.chars().count())
+            .sum();
+        let truncated = matches!(options.context_scope, ExternalContextScope::Recent)
+            && conversation_history.as_slice() != ctx.prompt_context.as_ref();
+        tracing::debug!(
+            worker = worker_name,
+            context_scope = ?options.context_scope,
+            source_messages = ctx.prompt_context.len(),
+            selected_messages = conversation_history.len(),
+            selected_chars,
+            truncated,
+            "Prepared external worker prompt context"
+        );
 
         let task_context = build_task_context(
             &ctx.user_id,
-            project_dir.as_deref(),
+            options.project_dir.as_deref(),
             environment,
             conversation_history,
-            metadata,
+            std::collections::HashMap::new(),
         );
 
-        if wait {
+        if options.wait {
             match ewm
-                .execute_task(job_id, worker_name, task, None, true, task_context)
+                .execute_task(
+                    job_id,
+                    worker_name,
+                    task,
+                    Some(worker_timeout_ms),
+                    true,
+                    task_context,
+                )
                 .await
             {
                 Ok(Some(result)) => {
@@ -821,6 +983,7 @@ impl CreateJobTool {
                             "worker": worker_name,
                             "output": result.output,
                             "duration_ms": result.duration_ms,
+                            "timeout_ms": worker_timeout_ms,
                         });
                         Ok(ToolOutput::success(output, start.elapsed()))
                     } else {
@@ -858,7 +1021,14 @@ impl CreateJobTool {
             }
         } else {
             if let Err(e) = ewm
-                .execute_task(job_id, worker_name, task, None, false, task_context)
+                .execute_task(
+                    job_id,
+                    worker_name,
+                    task,
+                    Some(worker_timeout_ms),
+                    false,
+                    task_context,
+                )
                 .await
             {
                 self.update_status(
@@ -876,7 +1046,7 @@ impl CreateJobTool {
                 )));
             }
 
-            let monitor_timeout = std::time::Duration::from_secs(630);
+            let monitor_timeout = self.external_worker_monitor_timeout(worker_timeout_ms);
             if let (Some(rx), Some(itx)) = (pre_subscribed_rx, &self.inject_tx) {
                 if let Some(route) = monitor_route_from_ctx(ctx) {
                     crate::agent::job_monitor::spawn_job_monitor_with_context(
@@ -901,6 +1071,7 @@ impl CreateJobTool {
                 "job_id": job_id.to_string(),
                 "status": "started",
                 "worker": worker_name,
+                "timeout_ms": worker_timeout_ms,
                 "message": format!(
                     "Task dispatched to external worker '{}'. Use job_events to check progress.",
                     worker_name
@@ -1088,17 +1259,24 @@ impl Tool for CreateJobTool {
              directly and set mode to the exact worker name from the mode schema (for example \
              'opencode'). External workers are job execution backends, not extensions, MCP servers, \
              skills, routines, or SSH hosts; do not search for or install them. Put the complete task \
-             in description. wait defaults to true."
+             in description. External jobs default to asynchronous dispatch so long tasks outlive \
+             the current conversation turn; set wait=true only when a synchronous result is \
+             required. Local and Docker workers default to 200 iterations; use max_iterations=300 \
+             or higher for large multi-fix write tasks. External worker deadlines come from worker \
+             configuration and are returned as timeout_ms; the 30-second local-job default does \
+             not apply."
         } else if self.sandbox_enabled() {
             "Create and execute a job. The job runs in a sandboxed Docker container with its own \
              sub-agent that has shell, file read/write, list_dir, and apply_patch tools. Use this \
              whenever the user asks you to build, create, or work on something. The task \
              description should be detailed enough for the sub-agent to work independently. \
+             Jobs default to 200 iterations; use max_iterations=300 or higher for large multi-fix work. \
              Jobs default to wait=true so the conversation blocks until the container exits. \
              Set wait=false if you want the conversation to stay responsive while they stream progress."
         } else {
             "Create a new job or task for the agent to work on. Use this when the user wants \
-             you to do something substantial that should be tracked as a separate job."
+             you to do something substantial that should be tracked as a separate job. Jobs default \
+             to 200 iterations; use max_iterations=300 or higher for large multi-fix write tasks."
         }
     }
 
@@ -1117,7 +1295,7 @@ impl Tool for CreateJobTool {
                     "type": "boolean",
                     "description": "If true, wait for the job to complete and return results. \
                                     If false, start the job and return the job_id immediately. \
-                                    Defaults to true."
+                                    Defaults to false for external workers and true for the Docker sandbox."
                 }
             });
 
@@ -1134,6 +1312,13 @@ impl Tool for CreateJobTool {
                                     secrets store (via 'lunarwing tool auth' or web UI). Example: \
                                     {\"github_token\": \"GITHUB_TOKEN\", \"npm_token\": \"NPM_TOKEN\"}",
                     "additionalProperties": { "type": "string" }
+                });
+                props["max_iterations"] = serde_json::json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_WORKER_ITERATIONS,
+                    "default": DEFAULT_WORKER_ITERATIONS,
+                    "description": "Iteration budget for local or Docker worker jobs. Use 300+ for large multi-fix write tasks. Named external workers do not support this option."
                 });
             }
 
@@ -1168,6 +1353,12 @@ impl Tool for CreateJobTool {
                     "description": mode_desc,
                     "enum": modes
                 });
+                props["context_scope"] = serde_json::json!({
+                    "type": "string",
+                    "description": "External workers only. Use 'recent' to include bounded user/assistant messages from the current scoped conversation as untrusted reference context. Defaults to 'none'.",
+                    "enum": ["none", "recent"],
+                    "default": "none"
+                });
             }
 
             serde_json::json!({
@@ -1186,6 +1377,13 @@ impl Tool for CreateJobTool {
                     "description": {
                         "type": "string",
                         "description": "Full description of what needs to be done"
+                    },
+                    "max_iterations": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_WORKER_ITERATIONS,
+                        "default": DEFAULT_WORKER_ITERATIONS,
+                        "description": "Iteration budget for autonomous job execution. Use 300+ for large multi-fix write tasks."
                     }
                 },
                 "required": ["title", "description"]
@@ -1195,8 +1393,13 @@ impl Tool for CreateJobTool {
 
     fn execution_timeout(&self) -> Duration {
         if self.sandbox_enabled() || self.has_external_workers() {
-            // Sandbox polls for up to 10 min; external workers have per-worker timeouts.
-            Duration::from_secs(660)
+            let external_timeout = self
+                .external_worker_manager
+                .as_ref()
+                .and_then(|manager| manager.max_timeout_ms())
+                .map(|timeout_ms| self.external_worker_monitor_timeout(timeout_ms))
+                .unwrap_or_default();
+            LONG_JOB_TOOL_TIMEOUT.max(external_timeout)
         } else {
             Duration::from_secs(30)
         }
@@ -1225,7 +1428,13 @@ impl Tool for CreateJobTool {
             if let Some(ref ewm) = self.external_worker_manager
                 && ewm.get_worker(mode_str).is_some()
             {
-                let wait = params.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
+                if params.get("max_iterations").is_some() {
+                    return Err(ToolError::InvalidParameters(format!(
+                        "max_iterations is not supported by named external worker '{mode_str}'"
+                    )));
+                }
+                let wait = external_job_wait(&params);
+                let context_scope = ExternalContextScope::parse(&params)?;
                 let project_dir = params
                     .get("project_dir")
                     .and_then(|v| v.as_str())
@@ -1233,7 +1442,17 @@ impl Tool for CreateJobTool {
                 let credential_grants = self.parse_credentials(&params, &ctx.user_id).await?;
                 let task = format!("{}\n\n{}", title, description);
                 return self
-                    .execute_external(&task, mode_str, wait, ctx, project_dir, credential_grants)
+                    .execute_external(
+                        &task,
+                        mode_str,
+                        ctx,
+                        ExternalExecutionOptions {
+                            wait,
+                            context_scope,
+                            project_dir,
+                            credential_grants,
+                        },
+                    )
                     .await;
             }
             return Err(ToolError::InvalidParameters(format!(
@@ -1254,7 +1473,7 @@ impl Tool for CreateJobTool {
         }
 
         if self.sandbox_enabled() {
-            let mode = JobMode::Worker;
+            let max_iterations = worker_max_iterations(&params)?;
 
             let wait = params.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
 
@@ -1268,10 +1487,19 @@ impl Tool for CreateJobTool {
 
             // Combine title and description into the task prompt for the sub-agent.
             let task = format!("{}\n\n{}", title, description);
-            self.execute_sandbox(&task, explicit_dir, wait, mode, credential_grants, ctx)
-                .await
+            self.execute_sandbox(
+                &task,
+                explicit_dir,
+                wait,
+                credential_grants,
+                max_iterations,
+                ctx,
+            )
+            .await
         } else {
-            self.execute_local(title, description, ctx).await
+            let max_iterations = worker_max_iterations(&params)?;
+            self.execute_local(title, description, max_iterations, ctx)
+                .await
         }
     }
 
@@ -1287,11 +1515,20 @@ impl Tool for CreateJobTool {
 /// Tool for listing jobs.
 pub struct ListJobsTool {
     context_manager: Arc<ContextManager>,
+    store: Option<Arc<dyn Database>>,
 }
 
 impl ListJobsTool {
     pub fn new(context_manager: Arc<ContextManager>) -> Self {
-        Self { context_manager }
+        Self {
+            context_manager,
+            store: None,
+        }
+    }
+
+    pub fn with_store(mut self, store: Arc<dyn Database>) -> Self {
+        self.store = Some(store);
+        self
     }
 }
 
@@ -1302,7 +1539,7 @@ impl Tool for ListJobsTool {
     }
 
     fn description(&self) -> &str {
-        "List all jobs or filter by status. Shows job IDs, titles, and current status."
+        "List up to 100 recent jobs or filter by status. Shows job IDs, titles, and current status."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1330,43 +1567,104 @@ impl Tool for ListJobsTool {
             .and_then(|v| v.as_str())
             .unwrap_or("all");
 
-        let job_ids = match filter {
-            "active" => self.context_manager.active_jobs_for(&ctx.user_id).await,
-            _ => self.context_manager.all_jobs_for(&ctx.user_id).await,
-        };
-
-        let mut jobs = Vec::new();
-        for job_id in job_ids {
-            if let Ok(ctx) = self.context_manager.get_context(job_id).await {
-                let include = match filter {
-                    "completed" => ctx.state == JobState::Completed,
-                    "failed" => ctx.state == JobState::Failed,
-                    "active" => ctx.state.is_active(),
-                    _ => true,
-                };
-
-                if include {
-                    jobs.push(serde_json::json!({
-                        "job_id": job_id.to_string(),
-                        "title": ctx.title,
-                        "status": format!("{:?}", ctx.state),
-                        "created_at": ctx.created_at.to_rfc3339()
-                    }));
+        let mut all_jobs = std::collections::HashMap::new();
+        if let Some(store) = &self.store {
+            match store.list_agent_jobs_for_user(&ctx.user_id).await {
+                Ok(records) => {
+                    for record in records {
+                        all_jobs.insert(
+                            record.id,
+                            serde_json::json!({
+                                "job_id": record.id.to_string(),
+                                "title": record.title,
+                                "status": record.status,
+                                "created_at": record.created_at.to_rfc3339(),
+                                "source": "database",
+                            }),
+                        );
+                    }
                 }
+                Err(error) => tracing::warn!("Failed to list persisted agent jobs: {error}"),
+            }
+            match store.list_sandbox_jobs_for_user(&ctx.user_id).await {
+                Ok(records) => {
+                    for record in records {
+                        all_jobs.insert(
+                            record.id,
+                            serde_json::json!({
+                                "job_id": record.id.to_string(),
+                                "title": record.task,
+                                "status": record.status,
+                                "created_at": record.created_at.to_rfc3339(),
+                                "source": "database",
+                            }),
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!("Failed to list persisted sandbox jobs: {error}"),
             }
         }
 
-        let summary = self.context_manager.summary_for(&ctx.user_id).await;
+        for job_id in self.context_manager.all_jobs_for(&ctx.user_id).await {
+            if let Ok(job_ctx) = self.context_manager.get_context(job_id).await {
+                all_jobs.insert(
+                    job_id,
+                    serde_json::json!({
+                        "job_id": job_id.to_string(),
+                        "title": job_ctx.title,
+                        "status": format!("{:?}", job_ctx.state),
+                        "created_at": job_ctx.created_at.to_rfc3339(),
+                        "source": "live",
+                    }),
+                );
+            }
+        }
+
+        let mut summary = serde_json::Map::from_iter([
+            ("total".to_string(), serde_json::json!(all_jobs.len())),
+            ("pending".to_string(), serde_json::json!(0)),
+            ("in_progress".to_string(), serde_json::json!(0)),
+            ("completed".to_string(), serde_json::json!(0)),
+            ("failed".to_string(), serde_json::json!(0)),
+            ("stuck".to_string(), serde_json::json!(0)),
+            ("interrupted".to_string(), serde_json::json!(0)),
+        ]);
+        for job in all_jobs.values() {
+            let status = job["status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .replace('_', "");
+            let key = match status.as_str() {
+                "pending" => Some("pending"),
+                "inprogress" | "running" | "creating" => Some("in_progress"),
+                "completed" | "submitted" | "accepted" => Some("completed"),
+                "failed" | "cancelled" => Some("failed"),
+                "stuck" => Some("stuck"),
+                "interrupted" => Some("interrupted"),
+                _ => None,
+            };
+            if let Some(key) = key {
+                let count = summary[key].as_u64().unwrap_or_default() + 1;
+                summary.insert(key.to_string(), serde_json::json!(count));
+            }
+        }
+
+        let mut jobs: Vec<_> = all_jobs
+            .into_values()
+            .filter(|job| job_matches_filter(filter, job["status"].as_str().unwrap_or_default()))
+            .collect();
+        jobs.sort_by(|left, right| {
+            right["created_at"]
+                .as_str()
+                .cmp(&left["created_at"].as_str())
+        });
+        jobs.truncate(MAX_LISTED_JOBS);
 
         let result = serde_json::json!({
+            "returned": jobs.len(),
             "jobs": jobs,
-            "summary": {
-                "total": summary.total,
-                "pending": summary.pending,
-                "in_progress": summary.in_progress,
-                "completed": summary.completed,
-                "failed": summary.failed
-            }
+            "summary": summary,
         });
 
         Ok(ToolOutput::success(result, start.elapsed()))
@@ -1377,14 +1675,39 @@ impl Tool for ListJobsTool {
     }
 }
 
+fn job_matches_filter(filter: &str, status: &str) -> bool {
+    let status = status.to_ascii_lowercase().replace('_', "");
+    match filter {
+        "active" => matches!(
+            status.as_str(),
+            "pending" | "inprogress" | "running" | "creating"
+        ),
+        "completed" => matches!(status.as_str(), "completed" | "submitted" | "accepted"),
+        "failed" => matches!(
+            status.as_str(),
+            "failed" | "cancelled" | "stuck" | "interrupted"
+        ),
+        _ => true,
+    }
+}
+
 /// Tool for checking job status.
 pub struct JobStatusTool {
     context_manager: Arc<ContextManager>,
+    store: Option<Arc<dyn Database>>,
 }
 
 impl JobStatusTool {
     pub fn new(context_manager: Arc<ContextManager>) -> Self {
-        Self { context_manager }
+        Self {
+            context_manager,
+            store: None,
+        }
+    }
+
+    pub fn with_store(mut self, store: Arc<dyn Database>) -> Self {
+        self.store = Some(store);
+        self
     }
 }
 
@@ -1420,7 +1743,13 @@ impl Tool for JobStatusTool {
         let requester_id = ctx.user_id.clone();
 
         let job_id_str = require_str(&params, "job_id")?;
-        let job_id = resolve_job_id(job_id_str, &self.context_manager).await?;
+        let job_id = resolve_query_job_id(
+            job_id_str,
+            &self.context_manager,
+            self.store.as_ref(),
+            &requester_id,
+        )
+        .await?;
 
         match self.context_manager.get_context(job_id).await {
             Ok(job_ctx) => {
@@ -1443,9 +1772,32 @@ impl Tool for JobStatusTool {
                 });
                 Ok(ToolOutput::success(result, start.elapsed()))
             }
-            Err(e) => {
+            Err(context_error) => {
+                let Some(store) = &self.store else {
+                    let result = serde_json::json!({
+                        "error": format!("Job not found: {}", context_error)
+                    });
+                    return Ok(ToolOutput::success(result, start.elapsed()));
+                };
+                let record = store.get_sandbox_job(job_id).await.map_err(|error| {
+                    ToolError::ExecutionFailed(format!("failed to load persisted job: {error}"))
+                })?;
+                let Some(record) = record.filter(|record| record.user_id == requester_id) else {
+                    let result = serde_json::json!({ "error": "Job not found" });
+                    return Ok(ToolOutput::success(result, start.elapsed()));
+                };
                 let result = serde_json::json!({
-                    "error": format!("Job not found: {}", e)
+                    "job_id": record.id.to_string(),
+                    "title": record.task,
+                    "status": record.status,
+                    "created_at": record.created_at.to_rfc3339(),
+                    "started_at": record.started_at.map(|time| time.to_rfc3339()),
+                    "completed_at": record.completed_at.map(|time| time.to_rfc3339()),
+                    "success": record.success,
+                    "failure_reason": record.failure_reason,
+                    "project_dir": record.project_dir,
+                    "source": "database",
+                    "events_available": true,
                 });
                 Ok(ToolOutput::success(result, start.elapsed()))
             }
@@ -1678,24 +2030,29 @@ impl Tool for JobEventsTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParameters("missing 'job_id' parameter".into()))?;
 
-        let job_id = resolve_job_id(job_id_str, &self.context_manager).await?;
+        let job_id = resolve_query_job_id(
+            job_id_str,
+            &self.context_manager,
+            Some(&self.store),
+            &ctx.user_id,
+        )
+        .await?;
 
-        // Verify the caller owns this job. A missing context is treated as
-        // unauthorized to prevent leaking events after process restarts.
-        let job_ctx = self
+        let live_owner = self
             .context_manager
             .get_context(job_id)
             .await
-            .map_err(|_| {
-                ToolError::ExecutionFailed(format!(
-                    "job {} not found or context unavailable",
-                    job_id
-                ))
+            .is_ok_and(|job_ctx| job_ctx.user_id == ctx.user_id);
+        let persisted_owner = self
+            .store
+            .sandbox_job_belongs_to_user(job_id, &ctx.user_id)
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("failed to verify job ownership: {error}"))
             })?;
-
-        if job_ctx.user_id != ctx.user_id {
+        if !live_owner && !persisted_owner {
             return Err(ToolError::ExecutionFailed(format!(
-                "job {} does not belong to current user",
+                "job {} not found",
                 job_id
             )));
         }
@@ -1911,6 +2268,12 @@ mod tests {
             result.result.get("status").unwrap().as_str().unwrap(), // safety: test
             "pending"
         );
+        assert_eq!(result.result["max_iterations"], DEFAULT_WORKER_ITERATIONS);
+        let job_id = Uuid::parse_str(job_id).unwrap();
+        assert_eq!(
+            manager.get_context(job_id).await.unwrap().metadata["max_iterations"],
+            DEFAULT_WORKER_ITERATIONS
+        );
     }
 
     #[test]
@@ -1923,6 +2286,7 @@ mod tests {
         let props = schema.get("properties").unwrap().as_object().unwrap(); // safety: test
         assert!(props.contains_key("title")); // safety: test
         assert!(props.contains_key("description")); // safety: test
+        assert!(props.contains_key("max_iterations")); // safety: test
         assert!(!props.contains_key("wait")); // safety: test
         assert!(!props.contains_key("mode")); // safety: test
     }
@@ -1936,9 +2300,10 @@ mod tests {
             name: "opencode".to_string(),
             url: "ws://127.0.0.1:20007/ws/agent".to_string(),
             auth_token: None,
-            timeout_ms: 300_000,
+            timeout_ms: 900_000,
             endpoints: vec![],
             load_balance: LoadBalanceStrategy::default(),
+            prompt_context: Default::default(),
         }]));
         let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
 
@@ -1947,6 +2312,12 @@ mod tests {
                 .contains("call this create_job tool directly")
         );
         assert!(tool.description().contains("not extensions, MCP servers"));
+        assert!(tool.description().contains("30-second local-job default"));
+        assert!(
+            tool.description()
+                .contains("default to asynchronous dispatch")
+        );
+        assert_eq!(tool.execution_timeout(), Duration::from_secs(960));
         assert_eq!(
             tool.requires_approval(&serde_json::json!({})),
             ApprovalRequirement::UnlessAutoApproved
@@ -1958,6 +2329,129 @@ mod tests {
         let description = mode["description"].as_str().expect("mode description");
         assert!(description.contains("create_job directly"));
         assert!(description.contains("opencode"));
+        assert_eq!(
+            schema["properties"]["context_scope"]["enum"],
+            serde_json::json!(["none", "recent"])
+        );
+        assert_eq!(schema["properties"]["context_scope"]["default"], "none");
+        assert_eq!(
+            schema["properties"]["max_iterations"]["default"],
+            DEFAULT_WORKER_ITERATIONS
+        );
+        assert_eq!(
+            schema["properties"]["max_iterations"]["maximum"],
+            MAX_WORKER_ITERATIONS
+        );
+    }
+
+    #[tokio::test]
+    async fn named_external_worker_rejects_local_iteration_budget() {
+        use crate::config::{ExternalWorkerConfig, LoadBalanceStrategy};
+
+        let manager = Arc::new(ContextManager::new(5));
+        let workers = Arc::new(ExternalWorkerManager::new(vec![ExternalWorkerConfig {
+            name: "opencode".to_string(),
+            url: "ws://127.0.0.1:9/ws/agent".to_string(),
+            auth_token: None,
+            timeout_ms: 900_000,
+            endpoints: vec![],
+            load_balance: LoadBalanceStrategy::default(),
+            prompt_context: Default::default(),
+        }]));
+        let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "title": "Unsupported option",
+                    "description": "Do work",
+                    "mode": "opencode",
+                    "max_iterations": 300
+                }),
+                &JobContext::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn external_jobs_default_to_async_but_allow_explicit_wait() {
+        assert!(!external_job_wait(&serde_json::json!({})));
+        assert!(!external_job_wait(&serde_json::json!({ "wait": false })));
+        assert!(external_job_wait(&serde_json::json!({ "wait": true })));
+    }
+
+    #[test]
+    fn worker_iteration_budget_defaults_and_validates_bounds() {
+        assert_eq!(
+            worker_max_iterations(&serde_json::json!({})).unwrap(),
+            DEFAULT_WORKER_ITERATIONS
+        );
+        assert_eq!(
+            worker_max_iterations(&serde_json::json!({"max_iterations": 300})).unwrap(),
+            300
+        );
+        assert!(worker_max_iterations(&serde_json::json!({"max_iterations": 0})).is_err());
+        assert!(
+            worker_max_iterations(
+                &serde_json::json!({"max_iterations": MAX_WORKER_ITERATIONS + 1})
+            )
+            .is_err()
+        );
+        assert!(worker_max_iterations(&serde_json::json!({"max_iterations": "300"})).is_err());
+    }
+
+    #[test]
+    fn external_context_scope_defaults_to_none_and_rejects_unknown_values() {
+        assert_eq!(
+            ExternalContextScope::parse(&serde_json::json!({})).unwrap(),
+            ExternalContextScope::None
+        );
+        assert_eq!(
+            ExternalContextScope::parse(&serde_json::json!({"context_scope": "recent"})).unwrap(),
+            ExternalContextScope::Recent
+        );
+        assert!(
+            ExternalContextScope::parse(&serde_json::json!({"context_scope": "full"})).is_err()
+        );
+    }
+
+    #[test]
+    fn external_prompt_context_is_opt_in_bounded_and_metadata_independent() {
+        use lunarwing_common::{PromptContextMessage, PromptContextRole};
+
+        let ctx = JobContext {
+            metadata: serde_json::json!({
+                "conv_secret": "must not become history",
+                "notify_user": "private-routing-id"
+            }),
+            prompt_context: Arc::from([
+                PromptContextMessage {
+                    role: PromptContextRole::User,
+                    content: "old question".to_string(),
+                },
+                PromptContextMessage {
+                    role: PromptContextRole::Assistant,
+                    content: "new answer".to_string(),
+                },
+            ]),
+            ..Default::default()
+        };
+        let limits = PromptContextLimits {
+            max_messages: 1,
+            max_chars_per_message: 3,
+            max_total_chars: 3,
+        };
+
+        assert!(external_prompt_context(&ctx, ExternalContextScope::None, limits).is_empty());
+        assert_eq!(
+            external_prompt_context(&ctx, ExternalContextScope::Recent, limits),
+            vec![PromptContextMessage {
+                role: PromptContextRole::Assistant,
+                content: "new".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -1981,8 +2475,8 @@ mod tests {
                 "test task",
                 None,
                 false,
-                JobMode::Worker,
                 vec![],
+                DEFAULT_WORKER_ITERATIONS,
                 &JobContext::default(),
             )
             .await;
@@ -2030,6 +2524,90 @@ mod tests {
             result.result.get("title").unwrap().as_str().unwrap(), // safety: test
             "Test Job"
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn persisted_external_job_remains_queryable_after_restart() {
+        use crate::testing::TestHarnessBuilder;
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let store = Arc::clone(&harness.db);
+        let manager = Arc::new(ContextManager::new(5));
+        let job_id = Uuid::new_v4();
+        store
+            .save_sandbox_job(&SandboxJobRecord {
+                id: job_id,
+                task: "Persisted OpenCode task".to_string(),
+                status: "interrupted".to_string(),
+                user_id: "default".to_string(),
+                project_dir: "/workspace/lunarwing2".to_string(),
+                success: None,
+                failure_reason: Some("Process restarted".to_string()),
+                created_at: Utc::now(),
+                started_at: Some(Utc::now()),
+                completed_at: Some(Utc::now()),
+                credential_grants_json: "[]".to_string(),
+            })
+            .await
+            .expect("save persisted job");
+        store
+            .save_job_event(
+                job_id,
+                "message",
+                &serde_json::json!({ "content": "reading source files" }),
+            )
+            .await
+            .expect("save persisted event");
+
+        let prefix = &job_id.simple().to_string()[..8];
+        let ctx = JobContext::default();
+        let status = JobStatusTool::new(Arc::clone(&manager))
+            .with_store(Arc::clone(&store))
+            .execute(serde_json::json!({ "job_id": prefix }), &ctx)
+            .await
+            .expect("query persisted status");
+        assert_eq!(status.result["job_id"], job_id.to_string());
+        assert_eq!(status.result["status"], "interrupted");
+        assert_eq!(status.result["failure_reason"], "Process restarted");
+
+        let events = JobEventsTool::new(Arc::clone(&store), Arc::clone(&manager))
+            .execute(serde_json::json!({ "job_id": prefix }), &ctx)
+            .await
+            .expect("query persisted events");
+        assert_eq!(events.result["total_events"], 1);
+        assert_eq!(
+            events.result["events"][0]["data"]["content"],
+            "reading source files"
+        );
+
+        let listed = ListJobsTool::new(manager)
+            .with_store(store)
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .expect("list persisted jobs");
+        assert_eq!(listed.result["jobs"][0]["job_id"], job_id.to_string());
+        assert_eq!(listed.result["summary"]["interrupted"], 1);
+
+        let other_ctx = JobContext::with_user("other-user", "query", "query");
+        let hidden_status = JobStatusTool::new(Arc::new(ContextManager::new(5)))
+            .with_store(Arc::clone(&harness.db))
+            .execute(
+                serde_json::json!({ "job_id": job_id.to_string() }),
+                &other_ctx,
+            )
+            .await
+            .expect("hide persisted status from another user");
+        assert_eq!(hidden_status.result["error"], "Job not found");
+
+        let hidden_events =
+            JobEventsTool::new(Arc::clone(&harness.db), Arc::new(ContextManager::new(5)))
+                .execute(
+                    serde_json::json!({ "job_id": job_id.to_string() }),
+                    &other_ctx,
+                )
+                .await;
+        assert!(hidden_events.is_err());
     }
 
     #[tokio::test]

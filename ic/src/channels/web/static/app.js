@@ -102,7 +102,14 @@ let currentSettingsSubtab = 'inference';
 let caveponyMode = '';
 let caveponyAvailable = false;
 let caveponyPreferenceSaving = false;
-const CAVEPONY_MODES = { lite: true, full: true, ultra: true, pony: true, canterlot: true };
+const CAVEPONY_MODES = {
+  lite: true,
+  full: true,
+  ultra: true,
+  pony: true,
+  canterlot: true,
+  'tony-soprano': true,
+};
 
 // --- Frame-coalesced rendering state ---
 let _streamBuffer = '';

@@ -518,8 +518,14 @@ impl ToolRegistry {
             create_tool = create_tool.with_secrets(secrets);
         }
         self.register_sync(Arc::new(create_tool));
-        self.register_sync(Arc::new(ListJobsTool::new(Arc::clone(&context_manager))));
-        self.register_sync(Arc::new(JobStatusTool::new(Arc::clone(&context_manager))));
+        let mut list_tool = ListJobsTool::new(Arc::clone(&context_manager));
+        let mut status_tool = JobStatusTool::new(Arc::clone(&context_manager));
+        if let Some(store) = &store {
+            list_tool = list_tool.with_store(Arc::clone(store));
+            status_tool = status_tool.with_store(Arc::clone(store));
+        }
+        self.register_sync(Arc::new(list_tool));
+        self.register_sync(Arc::new(status_tool));
         let mut cancel_tool = CancelJobTool::new(Arc::clone(&context_manager));
         if let Some(jm) = jm_for_cancel {
             cancel_tool = cancel_tool.with_sandbox(jm, store_for_cancel);

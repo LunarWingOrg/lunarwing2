@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use lunarwing_common::MAX_WORKER_ITERATIONS;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -211,6 +212,19 @@ fn validate_bind_mount_path(
     Ok(canonical)
 }
 
+fn worker_command(job_id: Uuid, orchestrator_url: &str, max_iterations: u32) -> Vec<String> {
+    let max_iterations = max_iterations.clamp(1, MAX_WORKER_ITERATIONS);
+    vec![
+        "worker".to_string(),
+        "--job-id".to_string(),
+        job_id.to_string(),
+        "--orchestrator-url".to_string(),
+        orchestrator_url.to_string(),
+        "--max-iterations".to_string(),
+        max_iterations.to_string(),
+    ]
+}
+
 /// Manages the lifecycle of Docker containers for sandboxed job execution.
 pub struct ContainerJobManager {
     config: ContainerJobConfig,
@@ -283,6 +297,7 @@ impl ContainerJobManager {
         project_dir: Option<PathBuf>,
         mode: JobMode,
         credential_grants: Vec<CredentialGrant>,
+        max_iterations: u32,
     ) -> Result<String, OrchestratorError> {
         // Generate auth token (stored in TokenStore, never logged)
         let token = self.token_store.create_token(job_id).await;
@@ -310,7 +325,7 @@ impl ContainerJobManager {
         // Run the actual container creation. On any failure, revoke the token
         // and remove the handle so we don't leak resources.
         match self
-            .create_job_inner(job_id, &token, project_dir, mode)
+            .create_job_inner(job_id, &token, project_dir, mode, max_iterations)
             .await
         {
             Ok(()) => Ok(token),
@@ -329,6 +344,7 @@ impl ContainerJobManager {
         token: &str,
         project_dir: Option<PathBuf>,
         _mode: JobMode,
+        max_iterations: u32,
     ) -> Result<(), OrchestratorError> {
         // Connect to Docker (reuses cached connection)
         let docker = self.docker().await?;
@@ -390,13 +406,7 @@ impl ContainerJobManager {
             ..Default::default()
         };
 
-        let cmd = vec![
-            "worker".to_string(),
-            "--job-id".to_string(),
-            job_id.to_string(),
-            "--orchestrator-url".to_string(),
-            orchestrator_url,
-        ];
+        let cmd = worker_command(job_id, &orchestrator_url, max_iterations);
 
         // Add Docker labels for reaper identification and orphan detection
         let mut labels = std::collections::HashMap::new();
@@ -453,6 +463,7 @@ impl ContainerJobManager {
 
         tracing::info!(
             job_id = %job_id,
+            max_iterations = max_iterations.clamp(1, MAX_WORKER_ITERATIONS),
             "Created and started worker container"
         );
 
@@ -732,6 +743,19 @@ mod tests {
     fn test_container_state_display() {
         assert_eq!(ContainerState::Running.to_string(), "running");
         assert_eq!(ContainerState::Stopped.to_string(), "stopped");
+    }
+
+    #[test]
+    fn worker_command_propagates_and_clamps_iteration_limit() {
+        let job_id = Uuid::new_v4();
+        let command = worker_command(job_id, "http://orchestrator", 300);
+        assert_eq!(command.last().map(String::as_str), Some("300"));
+
+        let clamped = worker_command(job_id, "http://orchestrator", u32::MAX);
+        assert_eq!(
+            clamped.last().and_then(|value| value.parse::<u32>().ok()),
+            Some(MAX_WORKER_ITERATIONS)
+        );
     }
 
     #[test]
