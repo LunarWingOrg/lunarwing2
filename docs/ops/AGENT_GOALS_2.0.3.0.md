@@ -79,18 +79,18 @@
 25. [ ] Review recent work on XMPP file transfer — remaining polish (further hardening), see documents about this if unsure. create new doc detailing findings in docs/ops
 26. [ ] Review recent work on Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure. create new doc detailing findings in docs/ops
 27. [ ] Review recent changes for: Gut proprietary tunnel providers and add support for netbird. improve if necessary
-28. [ ] review darkirc key exchange implementation
-29. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
-30. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
-31. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
-32. [ ] write up proper plan document in docs/proposals for integrating docs/proposals/MULTIAGENTTEAMORCHESTRATION into the next release, 2.0.4.0
-33. [ ] write up proper single plan document in docs/proposals for integrating docs/proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED in docs/proposals
-34. [x] (S) update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
-35. [ ] update docs/README.md
-36. [ ] update README.md at repo root
-37. [ ] come up with codename ideas for release. put into doc.
-38. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.3.0 explaining all relevant changes since v2.0.2.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.3.0.md and should be written to the ROOT of the repo. When complete with draft, move on to another task, which is: Improve accuracy of the first draft of release notes (from previous task) - RELEASE-v2.0.3.0.md
-39. [ ] review items in docs/ directory
+28. [ ] ensure dependency list is updated for gentoo and include archlinux dependency list if not present as well
+29. [ ] review darkirc key exchange implementation (only if item 20 was completed)
+30. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
+31. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+32. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
+33. [ ] write up proper plan document in docs/proposals for integrating docs/proposals/MULTIAGENTTEAMORCHESTRATION into the next release, 2.0.4.0
+34. [ ] write up proper single plan document in docs/proposals for integrating docs/proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED in docs/proposals
+35. [x] (S) update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
+36. [ ] update docs/README.md
+37. [ ] update README.md at repo root
+38. [ ] come up with codename ideas for release. put into doc.
+39. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.3.0 explaining all relevant changes since v2.0.2.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.3.0.md and should be written to the ROOT of the repo. When complete with draft, move on to another task, which is: Improve accuracy of the first draft of release notes (from previous task) - RELEASE-v2.0.3.0.md
 40. [ ] review README.md and release notes in root of repo and do a final pass. you may also shorten superfluous information
 
 ---
