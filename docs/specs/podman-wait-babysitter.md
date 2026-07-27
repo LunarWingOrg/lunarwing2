@@ -90,7 +90,7 @@ respawn_max=10       # Max 10 respawns
 respawn_period=120   # Within 120 seconds
 ```
 
-After 10 rapid respawns, OpenRC marks unit `crashed` → self-heal (15-min sweep) becomes backstop.
+After 10 rapid respawns, OpenRC marks unit `crashed` → self-heal (5-min sweep) becomes backstop.
 
 ## Environment Threading
 

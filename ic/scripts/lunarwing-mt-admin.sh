@@ -56,7 +56,9 @@ MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS="${LUNARWING_MT_MIGRATE_LEGACY_EXTERNAL_
 # out per add-tenant with --no-health, or fleet-wide with
 # LUNARWING_MT_HEALTH_ENABLED=false.
 DEFAULT_HEALTH_ENABLED="${LUNARWING_MT_HEALTH_ENABLED:-true}"
-HEALTH_INTERVAL_MIN="${LUNARWING_MT_HEALTH_INTERVAL_MIN:-15}"
+# Resolved after init detection: OpenRC defaults to 5 minutes, systemd to 15.
+# An explicit override applies to either init system.
+HEALTH_INTERVAL_MIN="${LUNARWING_MT_HEALTH_INTERVAL_MIN:-}"
 HEALTH_BASE_DIR="${LUNARWING_MT_HEALTH_BASE_DIR:-/var/lib/lunarwing-health}"
 HEALTH_SRC_DIR="$LUNARWING_ROOT/ic-infrastructure-health-check"
 HEALTH_LIB_DIR="/usr/local/lib/lunarwing-health"
@@ -485,6 +487,13 @@ detect_init_system() {
 INIT_SYSTEM=""
 ensure_init_system() {
   [[ -n "$INIT_SYSTEM" ]] || INIT_SYSTEM="$(detect_init_system)"
+  if [[ -z "$HEALTH_INTERVAL_MIN" ]]; then
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+      HEALTH_INTERVAL_MIN=5
+    else
+      HEALTH_INTERVAL_MIN=15
+    fi
+  fi
 }
 
 # Machine-wide persisted runtime choice (see _save_container_runtime). One

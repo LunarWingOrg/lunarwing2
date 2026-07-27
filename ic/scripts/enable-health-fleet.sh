@@ -12,7 +12,7 @@
 # functions/config). No logic is duplicated, so it can't drift from mt-admin.
 #
 # It also adds the safety the implicit add-tenant path lacks: it refuses to enable
-# the host-wide 15-minute remediation timer while any tenant daemon is DOWN
+# the host-wide remediation schedule while any tenant daemon is DOWN
 # (otherwise self-heal would immediately try to restart a tenant you stopped for
 # maintenance). Run it only after the whole fleet is upgraded and back up.
 #
@@ -122,7 +122,7 @@ fi
 if [[ ${#DOWN[@]} -gt 0 ]]; then
   _say ""
   _say "WARNING: these tenant daemons are NOT active: ${DOWN[*]}"
-  _say "Enabling self-heal now would try to restart them within ~15 min."
+  _say "Enabling self-heal now would try to restart them within ~${HEALTH_INTERVAL_MIN} min."
   if ! $ALLOW_DOWN; then
     _die "refusing to enable while tenants are down. Bring them up, or pass --allow-down if this is intended."
   fi
