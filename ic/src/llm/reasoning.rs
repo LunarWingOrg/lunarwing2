@@ -2033,11 +2033,11 @@ That's my plan."#;
     #[test]
     fn darkirc_channel_hints_describe_the_message_budget() {
         // Regression: darkirc used to fall through to None, so the agent got
-        // zero guidance about the 400-byte / paced-delivery constraints and
+        // zero guidance about the 390-byte / paced-delivery constraints and
         // wrote multi-KB markdown replies the transport could not deliver.
         let hints = channel_formatting_hints("darkirc").expect("darkirc must have hints");
         assert!(hints.contains("darkirc"));
-        assert!(hints.contains("400"));
+        assert!(hints.contains("390"));
         assert!(hints.contains("Plain text only"));
     }
 

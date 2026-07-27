@@ -507,6 +507,7 @@ impl MissionManager {
             return Ok(None);
         }
 
+        let rollback_mission = mission.clone();
         let now = Utc::now();
         let today = now.date_naive();
         let budget_date_changed = match mission.threads_today_date {
@@ -542,7 +543,7 @@ impl MissionManager {
             .unwrap_or_default();
         let meta_prompt = build_meta_prompt(&mission, &project_docs, &trigger_payload);
 
-        // Spawn thread with meta-prompt as initial user message
+        // Build thread configuration before reserving its durable mission record.
         let channel_context = {
             let contexts = self.channel_contexts.read().await;
             mission
@@ -554,24 +555,33 @@ impl MissionManager {
             channel_context,
             ..ThreadConfig::default()
         };
-        let thread_id = self
+        // Reserve history and quota before execution can perform side effects.
+        let thread_id = ThreadId::new();
+        let mut updated = mission.clone();
+        updated.record_thread(thread_id);
+        updated.threads_today += 1;
+        updated.last_trigger_payload = trigger_payload;
+        self.store.save_mission(&updated).await?;
+
+        let spawned = self
             .thread_manager
-            .spawn_thread(
+            .spawn_thread_with_history(
                 &meta_prompt,
                 ThreadType::Mission,
                 mission.project_id,
                 thread_config,
                 None,
                 user_id,
+                Vec::new(),
+                Some(thread_id),
             )
-            .await?;
-
-        // Record the thread + trigger payload in mission history
-        let mut updated = mission;
-        updated.record_thread(thread_id);
-        updated.threads_today += 1;
-        updated.last_trigger_payload = trigger_payload;
-        self.store.save_mission(&updated).await?;
+            .await;
+        if let Err(error) = spawned {
+            if let Err(rollback_error) = self.store.save_mission(&rollback_mission).await {
+                warn!(mission_id = %id, %thread_id, %rollback_error, "failed to roll back mission after thread spawn failure");
+            }
+            return Err(error);
+        }
 
         debug!(mission_id = %id, thread_id = %thread_id, "mission fired");
         self.spawn_mission_outcome_watcher(id, thread_id);
@@ -2038,6 +2048,7 @@ mod tests {
         docs: tokio::sync::RwLock<Vec<MemoryDoc>>,
         mission_load_delay: Duration,
         failing_mission_loads: tokio::sync::RwLock<Vec<MissionId>>,
+        failing_mission_saves: tokio::sync::RwLock<Vec<MissionId>>,
     }
 
     impl TestStore {
@@ -2048,6 +2059,7 @@ mod tests {
                 docs: tokio::sync::RwLock::new(Vec::new()),
                 mission_load_delay: Duration::ZERO,
                 failing_mission_loads: tokio::sync::RwLock::new(Vec::new()),
+                failing_mission_saves: tokio::sync::RwLock::new(Vec::new()),
             }
         }
 
@@ -2149,6 +2161,14 @@ mod tests {
 
         // ── Mission (fully implemented) ──
         async fn save_mission(&self, mission: &Mission) -> Result<(), EngineError> {
+            let mut failing = self.failing_mission_saves.write().await;
+            if let Some(index) = failing.iter().position(|id| *id == mission.id) {
+                failing.swap_remove(index);
+                return Err(EngineError::Store {
+                    reason: format!("injected mission save failure for {}", mission.id),
+                });
+            }
+            drop(failing);
             self.missions
                 .write()
                 .await
@@ -2319,6 +2339,33 @@ mod tests {
         assert_eq!(mission.goal, "do the thing");
         assert_eq!(mission.status, MissionStatus::Active);
         assert_eq!(mission.project_id, project_id);
+    }
+
+    #[tokio::test]
+    async fn fire_mission_save_failure_spawns_no_thread() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "failing fire",
+                "must not leave an orphan",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        store.failing_mission_saves.write().await.push(id);
+
+        let error = mgr.fire_mission(id, "test-user", None).await.unwrap_err();
+        assert!(error.to_string().contains("injected mission save failure"));
+
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert!(mission.thread_history.is_empty());
+        assert_eq!(mission.threads_today, 0);
+
+        assert!(store.threads.read().await.is_empty());
     }
 
     #[tokio::test]
