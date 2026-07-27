@@ -186,6 +186,10 @@ fn allow_from_path(tenant_id: &str) -> String {
     format!("state/{}/allow_from", tenant_id)
 }
 
+fn pending_ack_path(tenant_id: &str) -> String {
+    format!("state/{}/pending_ack_batch_id", tenant_id)
+}
+
 fn tenant_id_path() -> String {
     "state/tenant_id".to_string() // Global, not tenant-specific
 }
@@ -202,6 +206,7 @@ const MAX_IRC_MESSAGE_BYTES: usize = 400;
 // adapter re-splits each part into paced IRC chunks, so this split is a
 // safety valve for pathologically long responses — NOT IRC chunking.
 const ADAPTER_SEND_MAX_BYTES: usize = 30_000;
+const MAX_POLL_BATCH: usize = 100;
 
 // === Channel Implementation ===
 
@@ -305,6 +310,32 @@ impl Guest for DarkircChannel {
 
         let poll_url = format!("{}/poll", adapter_url);
         let headers_json = serde_json::json!({}).to_string();
+        let pending_ack_path = pending_ack_path(&tenant_id);
+
+        // Workspace writes from a poll commit only after host dispatch succeeds.
+        // Therefore any stored token represents a batch accepted by the agent queue.
+        if let Some(batch_id) =
+            channel_host::workspace_read(&pending_ack_path).filter(|batch_id| !batch_id.is_empty())
+        {
+            match adapter_ack(&adapter_url, &batch_id) {
+                Ok(()) => {
+                    if let Err(error) = channel_host::workspace_write(&pending_ack_path, "") {
+                        channel_host::log(
+                            channel_host::LogLevel::Warn,
+                            &format!("Failed to clear committed adapter ACK token: {error}"),
+                        );
+                        return;
+                    }
+                }
+                Err(error) => {
+                    channel_host::log(
+                        channel_host::LogLevel::Warn,
+                        &format!("Adapter /ack failed (will retry next poll): {error}"),
+                    );
+                    return;
+                }
+            }
+        }
 
         let response =
             match channel_host::http_request("GET", &poll_url, &headers_json, None, Some(5_000)) {
@@ -341,6 +372,32 @@ impl Guest for DarkircChannel {
             return;
         }
 
+        let Some(batch_id) = poll_response.batch_id.as_deref() else {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                "Adapter poll response omitted batch_id; batch left unprocessed",
+            );
+            return;
+        };
+        if poll_response.messages.len() > MAX_POLL_BATCH {
+            channel_host::log(
+                channel_host::LogLevel::Error,
+                &format!(
+                    "Adapter returned {} messages; host limit is {}. Batch left unacked",
+                    poll_response.messages.len(),
+                    MAX_POLL_BATCH
+                ),
+            );
+            return;
+        }
+        if let Err(error) = channel_host::workspace_write(&pending_ack_path, batch_id) {
+            channel_host::log(
+                channel_host::LogLevel::Error,
+                &format!("Failed to stage adapter ACK token: {error}"),
+            );
+            return;
+        }
+
         channel_host::log(
             channel_host::LogLevel::Debug,
             &format!(
@@ -351,27 +408,6 @@ impl Guest for DarkircChannel {
 
         for msg in &poll_response.messages {
             handle_inbound_dm(msg);
-        }
-
-        // Ack the batch so the adapter can drop it (M4: at-least-once delivery —
-        // if we crash before this ack, the next /poll re-serves the same batch).
-        // Legacy responses without batch_id fail safe: process messages but do
-        // not send an unscoped ACK that could clear a newer adapter batch.
-        let Some(batch_id) = poll_response.batch_id.as_deref() else {
-            channel_host::log(
-                channel_host::LogLevel::Warn,
-                "Adapter poll response omitted batch_id; batch left unacked",
-            );
-            return;
-        };
-        if let Err(e) = adapter_ack(&adapter_url, batch_id) {
-            channel_host::log(
-                channel_host::LogLevel::Warn,
-                &format!(
-                    "Adapter /ack failed (batch will be re-delivered next poll): {}",
-                    e
-                ),
-            );
         }
     }
 
@@ -663,10 +699,12 @@ fn adapter_ack(adapter_url: &str, batch_id: &str) -> Result<(), String> {
     let headers_json = serde_json::json!({"Content-Type": "application/json"}).to_string();
     let response =
         channel_host::http_request("POST", &url, &headers_json, Some(&payload), Some(5_000))?;
-    if response.status == 200 {
-        Ok(())
-    } else {
-        Err(format!("HTTP {}", response.status))
+    match response.status {
+        200 => Ok(()),
+        // Previous ACK may have reached the adapter while its workspace clear
+        // was withheld after a later dispatch failure. Stale means already done.
+        409 => Ok(()),
+        status => Err(format!("HTTP {status}")),
     }
 }
 

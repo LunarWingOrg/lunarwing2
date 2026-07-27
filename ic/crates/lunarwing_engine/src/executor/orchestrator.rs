@@ -33,7 +33,9 @@ use crate::capability::lease::LeaseManager;
 use crate::capability::policy::PolicyEngine;
 use crate::memory::RetrievalEngine;
 use crate::runtime::messaging::{SignalReceiver, ThreadOutcome, ThreadSignal};
-use crate::traits::effect::{EffectExecutor, ThreadExecutionContext};
+use crate::traits::effect::{
+    EffectExecutor, ThreadExecutionContext, prompt_context_from_thread_messages,
+};
 use crate::traits::llm::{LlmBackend, LlmCallConfig, LlmOutput};
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
@@ -785,6 +787,7 @@ async fn handle_execute_code_step(
         source_channel: thread_source_channel(thread),
         supervised_mode: thread.config.supervised_mode,
         supervised_timeout_secs: thread.config.supervised_timeout_secs,
+        prompt_context: prompt_context_from_thread_messages(&thread.messages),
     };
 
     // Run user code in a nested Monty VM (same pattern as rlm_query)
@@ -905,6 +908,7 @@ async fn handle_execute_action(
         source_channel: thread_source_channel(thread),
         supervised_mode: thread.config.supervised_mode,
         supervised_timeout_secs: thread.config.supervised_timeout_secs,
+        prompt_context: prompt_context_from_thread_messages(&thread.messages),
     };
 
     // Helper: emit event only. The orchestrator owns transcript recording.
@@ -1353,6 +1357,7 @@ async fn handle_execute_actions_parallel(
         }
     }
 
+    let prompt_context = prompt_context_from_thread_messages(&thread.messages);
     if runnable.len() == 1 {
         // Single call: execute directly
         let (idx, lease) = runnable.into_iter().next().unwrap(); // safety: len()==1 checked above
@@ -1367,6 +1372,7 @@ async fn handle_execute_actions_parallel(
             source_channel: None,
             supervised_mode: thread.config.supervised_mode,
             supervised_timeout_secs: thread.config.supervised_timeout_secs,
+            prompt_context: Arc::clone(&prompt_context),
         };
         let ps = summarize_params(&pc.name, &pc.params);
         let (result_json, event, output) = execute_single_action(
@@ -1406,6 +1412,7 @@ async fn handle_execute_actions_parallel(
                 source_channel: None,
                 supervised_mode: thread.config.supervised_mode,
                 supervised_timeout_secs: thread.config.supervised_timeout_secs,
+                prompt_context: Arc::clone(&prompt_context),
             };
             let ps = summarize_params(&pc_name, &pc_params);
 

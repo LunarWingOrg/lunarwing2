@@ -44,6 +44,7 @@ use crate::channels::wasm::capabilities::ChannelCapabilities;
 use crate::channels::wasm::error::WasmChannelError;
 use crate::channels::wasm::host::{
     ChannelEmitRateLimiter, ChannelHostState, ChannelWorkspaceStore, EmittedMessage,
+    PendingWorkspaceWrite,
 };
 use crate::channels::wasm::router::RegisteredEndpoint;
 use crate::channels::wasm::runtime::{PreparedChannelModule, WasmChannelRuntime};
@@ -1442,8 +1443,6 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
-        let workspace_store = self.workspace_store.clone();
-
         // Prepare request data
         let method = method.to_string();
         let path = path.to_string();
@@ -1486,11 +1485,8 @@ impl WasmChannel {
                 let mut host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
 
-                // Commit pending workspace writes to the persistent store
                 let pending_writes = host_state.take_pending_writes();
-                workspace_store.commit_writes(&pending_writes);
-
-                Ok((response, host_state))
+                Ok((response, host_state, pending_writes))
             })
             .await
             .map_err(|e| WasmChannelError::ExecutionPanicked {
@@ -1502,10 +1498,17 @@ impl WasmChannel {
 
         let channel_name = self.name.clone();
         match result {
-            Ok(Ok((response, mut host_state))) => {
+            Ok(Ok((response, mut host_state, pending_writes))) => {
                 // Process emitted messages
                 let emitted = host_state.take_emitted_messages();
+                if host_state.emits_dropped() > 0 {
+                    return Err(WasmChannelError::CallbackFailed {
+                        name: channel_name,
+                        reason: "on_http_request exceeded the per-callback emit limit".to_string(),
+                    });
+                }
                 self.process_emitted_messages(emitted).await?;
+                self.workspace_store.commit_writes(&pending_writes);
 
                 tracing::debug!(
                     channel = %channel_name,
@@ -1548,7 +1551,6 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
-        let workspace_store = self.workspace_store.clone();
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
@@ -1569,12 +1571,8 @@ impl WasmChannel {
                     .call_on_poll(&mut store)
                     .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
 
-                let mut host_state =
+                let host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
-
-                // Commit pending workspace writes to the persistent store
-                let pending_writes = host_state.take_pending_writes();
-                workspace_store.commit_writes(&pending_writes);
 
                 Ok(((), host_state))
             })
@@ -1600,7 +1598,15 @@ impl WasmChannel {
                         emitted.len(),
                     );
                 }
+                let pending_writes = host_state.take_pending_writes();
+                if host_state.emits_dropped() > 0 {
+                    return Err(WasmChannelError::CallbackFailed {
+                        name: channel_name,
+                        reason: "on_poll exceeded the per-callback emit limit".to_string(),
+                    });
+                }
                 self.process_emitted_messages(emitted).await?;
+                self.workspace_store.commit_writes(&pending_writes);
 
                 tracing::debug!(
                     channel = %channel_name,
@@ -2250,117 +2256,23 @@ impl WasmChannel {
         &self,
         messages: Vec<EmittedMessage>,
     ) -> Result<(), WasmChannelError> {
-        tracing::info!(
-            channel = %self.name,
-            message_count = messages.len(),
-            "Processing emitted messages from WASM callback"
-        );
-
         if messages.is_empty() {
             tracing::debug!(channel = %self.name, "No messages emitted");
             return Ok(());
         }
-
-        // Clone sender to avoid holding RwLock read guard across send().await in the loop
-        let tx = {
-            let tx_guard = self.message_tx.read().await;
-            let Some(tx) = tx_guard.as_ref() else {
-                tracing::error!(
-                    channel = %self.name,
-                    count = messages.len(),
-                    "Messages emitted but no sender available - channel may not be started!"
-                );
-                return Ok(());
-            };
-            tx.clone()
-        };
-
-        for emitted in messages {
-            // Check rate limit — acquire and release the write lock before send().await
-            {
-                let mut rate_limiter = self.rate_limiter.write().await;
-                if !rate_limiter.check_and_record() {
-                    tracing::warn!(
-                        channel = %self.name,
-                        "Message emission rate limited"
-                    );
-                    return Err(WasmChannelError::EmitRateLimited {
-                        name: self.name.clone(),
-                    });
-                }
-            }
-
-            let (resolved_user_id, is_owner_sender) = resolve_message_scope(
-                &self.owner_scope_id,
-                self.owner_actor_id.as_deref(),
-                &emitted.user_id,
-            );
-
-            // Convert to IncomingMessage
-            let mut msg = IncomingMessage::new(&self.name, &resolved_user_id, &emitted.content)
-                .with_owner_id(&self.owner_scope_id)
-                .with_sender_id(&emitted.user_id);
-
-            if let Some(name) = emitted.user_name {
-                msg = msg.with_user_name(name);
-            }
-
-            if let Some(thread_id) = emitted.thread_id {
-                msg = msg.with_thread(thread_id);
-            }
-
-            // Convert attachments
-            if !emitted.attachments.is_empty() {
-                let incoming_attachments = emitted
-                    .attachments
-                    .iter()
-                    .map(|a| crate::channels::IncomingAttachment {
-                        id: a.id.clone(),
-                        kind: crate::channels::AttachmentKind::from_mime_type(&a.mime_type),
-                        mime_type: a.mime_type.clone(),
-                        filename: a.filename.clone(),
-                        size_bytes: a.size_bytes,
-                        source_url: a.source_url.clone(),
-                        storage_key: a.storage_key.clone(),
-                        extracted_text: a.extracted_text.clone(),
-                        data: a.data.clone(),
-                        duration_secs: a.duration_secs,
-                    })
-                    .collect();
-                msg = msg.with_attachments(incoming_attachments);
-            }
-
-            // Parse metadata JSON
-            msg = apply_emitted_metadata(msg, &emitted.metadata_json);
-            if is_owner_sender {
-                // Store for owner-target routing (chat_id etc.).
-                self.update_broadcast_metadata(&emitted.metadata_json).await;
-            }
-
-            // Send to stream — no locks held across this await
-            tracing::info!(
-                channel = %self.name,
-                user_id = %emitted.user_id,
-                content_len = emitted.content.len(),
-                attachment_count = msg.attachments.len(),
-                "Sending emitted message to agent"
-            );
-
-            if tx.send(msg).await.is_err() {
-                tracing::error!(
-                    channel = %self.name,
-                    "Failed to send emitted message, channel closed"
-                );
-                break;
-            }
-
-            tracing::info!(
-                channel = %self.name,
-                "Message successfully sent to agent queue"
-            );
-        }
-
-        Ok(())
+        Self::dispatch_emitted_messages(
+            EmitDispatchContext {
+                channel_name: &self.name,
+                owner_scope_id: &self.owner_scope_id,
+                owner_actor_id: self.owner_actor_id.as_deref(),
+                message_tx: &self.message_tx,
+                rate_limiter: &self.rate_limiter,
+                last_broadcast_metadata: &self.last_broadcast_metadata,
+                settings_store: self.settings_store.as_ref(),
+            },
+            messages,
+        )
+        .await
     }
 
     /// Start the supervised polling loop.
@@ -2442,18 +2354,15 @@ impl WasmChannel {
                             .await;
 
                             match result {
-                                Ok(emitted_messages) => {
-                                    lpe.store(
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis()
-                                            as u64,
-                                        std::sync::atomic::Ordering::Release,
-                                    );
-
-                                    if !emitted_messages.is_empty()
-                                        && let Err(e) = Self::dispatch_emitted_messages(
+                                Ok(execution) => {
+                                    let PollExecution {
+                                        emitted_messages,
+                                        pending_writes,
+                                    } = execution;
+                                    let dispatch_result = if emitted_messages.is_empty() {
+                                        Ok(())
+                                    } else {
+                                        Self::dispatch_emitted_messages(
                                             EmitDispatchContext {
                                                 channel_name: &cn,
                                                 owner_scope_id: &osi,
@@ -2466,11 +2375,23 @@ impl WasmChannel {
                                             emitted_messages,
                                         )
                                         .await
-                                    {
-                                        tracing::warn!(
+                                    };
+                                    match dispatch_result {
+                                        Ok(()) => {
+                                            ws.commit_writes(&pending_writes);
+                                            lpe.store(
+                                                std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_millis()
+                                                    as u64,
+                                                std::sync::atomic::Ordering::Release,
+                                            );
+                                        }
+                                        Err(e) => tracing::warn!(
                                             channel = %cn, error = %e,
-                                            "Failed to dispatch emitted messages from poll"
-                                        );
+                                            "Failed to dispatch emitted messages from poll; workspace writes not committed"
+                                        ),
                                     }
                                 }
                                 Err(e) => {
@@ -2543,14 +2464,14 @@ impl WasmChannel {
         pairing_store: Arc<PairingStore>,
         timeout: Duration,
         workspace_store: &Arc<ChannelWorkspaceStore>,
-    ) -> Result<Vec<EmittedMessage>, WasmChannelError> {
+    ) -> Result<PollExecution, WasmChannelError> {
         // Skip if no WASM bytes (testing mode)
         if prepared.component().is_none() {
             tracing::debug!(
                 channel = %channel_name,
                 "WASM channel on_poll called (no WASM module)"
             );
-            return Ok(Vec::new());
+            return Ok(PollExecution::default());
         }
 
         let runtime = Arc::clone(runtime);
@@ -2558,7 +2479,6 @@ impl WasmChannel {
         let capabilities = Self::inject_workspace_reader(capabilities, workspace_store);
         let credentials_snapshot = credentials.read().await.clone();
         let channel_name_owned = channel_name.to_string();
-        let workspace_store = Arc::clone(workspace_store);
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
@@ -2579,12 +2499,8 @@ impl WasmChannel {
                     .call_on_poll(&mut store)
                     .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
 
-                let mut host_state =
+                let host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
-
-                // Commit pending workspace writes to the persistent store
-                let pending_writes = host_state.take_pending_writes();
-                workspace_store.commit_writes(&pending_writes);
 
                 Ok(host_state)
             })
@@ -2619,13 +2535,23 @@ impl WasmChannel {
                     }
                 }
 
+                if host_state.emits_dropped() > 0 {
+                    return Err(WasmChannelError::CallbackFailed {
+                        name: channel_name.to_string(),
+                        reason: "on_poll exceeded the per-callback emit limit".to_string(),
+                    });
+                }
                 let emitted = host_state.take_emitted_messages();
+                let pending_writes = host_state.take_pending_writes();
                 tracing::debug!(
                     channel = %channel_name,
                     emitted_count = emitted.len(),
                     "WASM channel on_poll completed"
                 );
-                Ok(emitted)
+                Ok(PollExecution {
+                    emitted_messages: emitted,
+                    pending_writes,
+                })
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(WasmChannelError::Timeout {
@@ -2658,104 +2584,132 @@ impl WasmChannel {
                     count = messages.len(),
                     "Messages emitted but no sender available - channel may not be started!"
                 );
-                return Ok(());
+                return Err(WasmChannelError::CallbackFailed {
+                    name: dispatch.channel_name.to_string(),
+                    reason: "messages emitted but no agent queue is available".to_string(),
+                });
             };
             tx.clone()
         };
 
-        for emitted in messages {
-            // Check rate limit — acquire and release the write lock before send().await
-            {
-                let mut limiter = dispatch.rate_limiter.write().await;
-                if !limiter.check_and_record() {
-                    tracing::warn!(
-                        channel = %dispatch.channel_name,
-                        "Message emission rate limited"
-                    );
-                    return Err(WasmChannelError::EmitRateLimited {
-                        name: dispatch.channel_name.to_string(),
-                    });
-                }
-            }
-
-            let (resolved_user_id, is_owner_sender) = resolve_message_scope(
-                dispatch.owner_scope_id,
-                dispatch.owner_actor_id,
-                &emitted.user_id,
-            );
-
-            // Convert to IncomingMessage
-            let mut msg =
-                IncomingMessage::new(dispatch.channel_name, &resolved_user_id, &emitted.content)
-                    .with_owner_id(dispatch.owner_scope_id)
-                    .with_sender_id(&emitted.user_id);
-
-            if let Some(name) = emitted.user_name {
-                msg = msg.with_user_name(name);
-            }
-
-            if let Some(thread_id) = emitted.thread_id {
-                msg = msg.with_thread(thread_id);
-            }
-
-            // Convert attachments
-            if !emitted.attachments.is_empty() {
-                let incoming_attachments = emitted
-                    .attachments
-                    .iter()
-                    .map(|a| crate::channels::IncomingAttachment {
-                        id: a.id.clone(),
-                        kind: crate::channels::AttachmentKind::from_mime_type(&a.mime_type),
-                        mime_type: a.mime_type.clone(),
-                        filename: a.filename.clone(),
-                        size_bytes: a.size_bytes,
-                        source_url: a.source_url.clone(),
-                        storage_key: a.storage_key.clone(),
-                        extracted_text: a.extracted_text.clone(),
-                        data: a.data.clone(),
-                        duration_secs: a.duration_secs,
-                    })
-                    .collect();
-                msg = msg.with_attachments(incoming_attachments);
-            }
-
-            msg = apply_emitted_metadata(msg, &emitted.metadata_json);
-            if is_owner_sender {
-                // Store for owner-target routing (chat_id etc.)
-                do_update_broadcast_metadata(
-                    dispatch.channel_name,
-                    dispatch.owner_scope_id,
-                    &emitted.metadata_json,
-                    dispatch.last_broadcast_metadata,
-                    dispatch.settings_store,
-                )
-                .await;
-            }
-
-            // Send to stream — no locks held across this await
-            tracing::info!(
-                channel = %dispatch.channel_name,
-                user_id = %emitted.user_id,
-                content_len = emitted.content.len(),
-                attachment_count = msg.attachments.len(),
-                "Sending polled message to agent"
-            );
-
-            if tx.send(msg).await.is_err() {
-                tracing::error!(
-                    channel = %dispatch.channel_name,
-                    "Failed to send polled message, channel closed"
-                );
-                break;
-            }
-
-            tracing::info!(
-                channel = %dispatch.channel_name,
-                "Message successfully sent to agent queue"
-            );
+        let message_count = messages.len();
+        if message_count > tx.max_capacity() {
+            return Err(WasmChannelError::CallbackFailed {
+                name: dispatch.channel_name.to_string(),
+                reason: format!(
+                    "emitted batch of {message_count} messages exceeds agent queue capacity of {}",
+                    tx.max_capacity()
+                ),
+            });
         }
 
+        let mut queued_messages = Vec::with_capacity(message_count);
+        for emitted in messages {
+            queued_messages.push(Self::prepare_emitted_message(&dispatch, emitted).await);
+        }
+
+        let permits =
+            tx.reserve_many(message_count)
+                .await
+                .map_err(|_| WasmChannelError::CallbackFailed {
+                    name: dispatch.channel_name.to_string(),
+                    reason: "agent message queue closed before dispatch".to_string(),
+                })?;
+
+        {
+            let mut limiter = dispatch.rate_limiter.write().await;
+            if tx.is_closed() {
+                return Err(WasmChannelError::CallbackFailed {
+                    name: dispatch.channel_name.to_string(),
+                    reason: "agent message queue closed before dispatch".to_string(),
+                });
+            }
+            if !limiter.check_and_record_many(message_count) {
+                tracing::warn!(
+                    channel = %dispatch.channel_name,
+                    message_count,
+                    "Message emission batch rate limited"
+                );
+                return Err(WasmChannelError::EmitRateLimited {
+                    name: dispatch.channel_name.to_string(),
+                });
+            }
+        }
+
+        // No await or fallible operation after first send: batch enters queue atomically
+        // with respect to cancellation and dispatch errors.
+        for (permit, msg) in permits.zip(queued_messages) {
+            permit.send(msg);
+        }
+
+        tracing::info!(
+            channel = %dispatch.channel_name,
+            message_count,
+            "Emitted message batch sent to agent queue"
+        );
         Ok(())
+    }
+
+    async fn prepare_emitted_message(
+        dispatch: &EmitDispatchContext<'_>,
+        emitted: EmittedMessage,
+    ) -> IncomingMessage {
+        let (resolved_user_id, is_owner_sender) = resolve_message_scope(
+            dispatch.owner_scope_id,
+            dispatch.owner_actor_id,
+            &emitted.user_id,
+        );
+        let mut msg =
+            IncomingMessage::new(dispatch.channel_name, &resolved_user_id, &emitted.content)
+                .with_owner_id(dispatch.owner_scope_id)
+                .with_sender_id(&emitted.user_id);
+
+        if let Some(name) = emitted.user_name {
+            msg = msg.with_user_name(name);
+        }
+        if let Some(thread_id) = emitted.thread_id {
+            msg = msg.with_thread(thread_id);
+        }
+        if !emitted.attachments.is_empty() {
+            let attachments = emitted
+                .attachments
+                .iter()
+                .map(|attachment| crate::channels::IncomingAttachment {
+                    id: attachment.id.clone(),
+                    kind: crate::channels::AttachmentKind::from_mime_type(&attachment.mime_type),
+                    mime_type: attachment.mime_type.clone(),
+                    filename: attachment.filename.clone(),
+                    size_bytes: attachment.size_bytes,
+                    source_url: attachment.source_url.clone(),
+                    storage_key: attachment.storage_key.clone(),
+                    extracted_text: attachment.extracted_text.clone(),
+                    data: attachment.data.clone(),
+                    duration_secs: attachment.duration_secs,
+                })
+                .collect();
+            msg = msg.with_attachments(attachments);
+        }
+
+        msg = apply_emitted_metadata(msg, &emitted.metadata_json);
+        if is_owner_sender {
+            do_update_broadcast_metadata(
+                dispatch.channel_name,
+                dispatch.owner_scope_id,
+                &emitted.metadata_json,
+                dispatch.last_broadcast_metadata,
+                dispatch.settings_store,
+            )
+            .await;
+        }
+
+        tracing::info!(
+            channel = %dispatch.channel_name,
+            user_id = %emitted.user_id,
+            content_len = emitted.content.len(),
+            attachment_count = msg.attachments.len(),
+            "Prepared polled message for agent queue"
+        );
+        msg
     }
 }
 
@@ -2767,6 +2721,12 @@ struct EmitDispatchContext<'a> {
     rate_limiter: &'a RwLock<ChannelEmitRateLimiter>,
     last_broadcast_metadata: &'a tokio::sync::RwLock<Option<String>>,
     settings_store: Option<&'a Arc<dyn crate::db::SettingsStore>>,
+}
+
+#[derive(Default)]
+struct PollExecution {
+    emitted_messages: Vec<EmittedMessage>,
+    pending_writes: Vec<PendingWorkspaceWrite>,
 }
 
 #[async_trait]
@@ -3585,6 +3545,8 @@ mod tests {
     use crate::channels::Channel;
     use crate::channels::OutgoingResponse;
     use crate::channels::wasm::capabilities::ChannelCapabilities;
+    use crate::channels::wasm::error::WasmChannelError;
+    use crate::channels::wasm::host::EmittedMessage;
     use crate::channels::wasm::runtime::{
         PreparedChannelModule, WasmChannelRuntime, WasmChannelRuntimeConfig,
     };
@@ -4098,8 +4060,9 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok()); // safety: test-only assertion
-        assert!(result.unwrap().is_empty());
+        let result = result.unwrap();
+        assert!(result.emitted_messages.is_empty());
+        assert!(result.pending_writes.is_empty());
     }
 
     #[tokio::test]
@@ -4153,7 +4116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_emitted_messages_no_sender_returns_ok() {
+    async fn test_dispatch_emitted_messages_no_sender_returns_error() {
         use crate::channels::wasm::host::EmittedMessage;
 
         // No sender available (channel not started)
@@ -4166,7 +4129,6 @@ mod tests {
 
         let messages = vec![EmittedMessage::new("user1", "Hello!")];
 
-        // Should return Ok even without a sender (logs warning but doesn't fail)
         let last_broadcast_metadata = Arc::new(tokio::sync::RwLock::new(None));
         let result = WasmChannel::dispatch_emitted_messages(
             EmitDispatchContext {
@@ -4182,7 +4144,78 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok());
+        assert!(matches!(
+            result,
+            Err(WasmChannelError::CallbackFailed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_emitted_messages_closed_sender_returns_error() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let message_tx = Arc::new(tokio::sync::RwLock::new(Some(tx)));
+        let rate_limiter = Arc::new(tokio::sync::RwLock::new(
+            crate::channels::wasm::host::ChannelEmitRateLimiter::new(
+                crate::channels::wasm::capabilities::EmitRateLimitConfig::default(),
+            ),
+        ));
+        let last_broadcast_metadata = Arc::new(tokio::sync::RwLock::new(None));
+
+        let result = WasmChannel::dispatch_emitted_messages(
+            EmitDispatchContext {
+                channel_name: "test-channel",
+                owner_scope_id: "default",
+                owner_actor_id: None,
+                message_tx: &message_tx,
+                rate_limiter: &rate_limiter,
+                last_broadcast_metadata: &last_broadcast_metadata,
+                settings_store: None,
+            },
+            vec![EmittedMessage::new("user1", "Hello!")],
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WasmChannelError::CallbackFailed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_emitted_messages_oversized_batch_sends_nothing() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let message_tx = Arc::new(tokio::sync::RwLock::new(Some(tx)));
+        let rate_limiter = Arc::new(tokio::sync::RwLock::new(
+            crate::channels::wasm::host::ChannelEmitRateLimiter::new(
+                crate::channels::wasm::capabilities::EmitRateLimitConfig::default(),
+            ),
+        ));
+        let last_broadcast_metadata = Arc::new(tokio::sync::RwLock::new(None));
+
+        let result = WasmChannel::dispatch_emitted_messages(
+            EmitDispatchContext {
+                channel_name: "test-channel",
+                owner_scope_id: "default",
+                owner_actor_id: None,
+                message_tx: &message_tx,
+                rate_limiter: &rate_limiter,
+                last_broadcast_metadata: &last_broadcast_metadata,
+                settings_store: None,
+            },
+            vec![
+                EmittedMessage::new("user1", "first"),
+                EmittedMessage::new("user2", "second"),
+            ],
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WasmChannelError::CallbackFailed { .. })
+        ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(rate_limiter.read().await.minute_count(), 0);
     }
 
     #[tokio::test]

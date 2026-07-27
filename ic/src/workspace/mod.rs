@@ -932,6 +932,20 @@ impl Workspace {
         }
     }
 
+    /// List immediate children from the primary scope only.
+    ///
+    /// Use this for mutable runtime/configuration trees whose reads must target
+    /// the same scope as writes and deletes.
+    pub async fn list_primary(
+        &self,
+        directory: &str,
+    ) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
+        let directory = normalize_directory(directory);
+        self.storage
+            .list_directory(&self.user_id, self.agent_id, &directory)
+            .await
+    }
+
     /// List all files recursively (flat list of all paths).
     ///
     /// When multi-scope reads are configured, lists across all read scopes.

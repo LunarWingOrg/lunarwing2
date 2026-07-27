@@ -327,7 +327,7 @@ pub enum Command {
         orchestrator_url: String,
 
         /// Maximum iterations before stopping.
-        #[arg(long, default_value = "50")]
+        #[arg(long, default_value_t = lunarwing_common::DEFAULT_WORKER_ITERATIONS)]
         max_iterations: u32,
     },
 
