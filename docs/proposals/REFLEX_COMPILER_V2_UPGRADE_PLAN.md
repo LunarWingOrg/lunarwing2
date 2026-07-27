@@ -55,7 +55,7 @@ User Input
 | File | Lines | Purpose |
 |------|-------|---------|
 | `ic/src/agent/reflex.rs` | 1,710 | Core router, compiler, evictor, normalization, tests |
-| `ic/src/agent/dispatcher.rs` | ~2,584 | Fast-path check before LLM (lines 145-169) |
+| `ic/src/agent/dispatcher.rs` | ~2,584 | Fast-path check before LLM (lines 166-190) |
 | `ic/src/agent/agent_loop.rs` | ~2,500+ | Background task spawning (lines 792-822) |
 | `ic/src/cli/reflex.rs` | 331 | CLI management (list, show, delete, status, prune) |
 | `ic/src/db/libsql/reflex.rs` | 334 | libSQL ReflexStore implementation |
@@ -79,7 +79,7 @@ These are the "it's broken in production" fixes. All three are small, well-under
 - `semantic_route()`, `pattern_embeddings` cache, `embed_missing_patterns()`, and the DB's `semantic_search_reflex_patterns()` + `update_reflex_pattern_embedding()` are all dead code in production
 - The workspace's `EmbeddingProvider` (used for workspace search) is not shared with the reflex router
 
-**Fix:** In `Agent::new()` or `Agent::run()`, attach the workspace embedding provider:
+**Fix:** In `Agent::new()` (line 347) or `Agent::run()`, attach the workspace embedding provider:
 
 ```rust
 // agent_loop.rs — replace line 347
@@ -99,17 +99,17 @@ reflex_router: Arc::new(router),
 
 ### 1b. Call `bump_reflex_pattern_match()` in Dispatcher Hot Path
 
-**Problem:** `dispatcher.rs:147-168` routes to a compiled tool but **never records the match** back to the database. Consequences:
+**Problem:** `dispatcher.rs:166-190` routes to a compiled tool but **never records the match** back to the database. Consequences:
 - `match_count` and `last_matched_at` in `reflex_patterns` are never updated during routing
 - The eviction sweep's staleness check (`last_matched_at < cutoff`) will evict patterns that are actively being used
 - `match_count` only reflects compilation-time counts from `find_recurring_job_patterns`, not actual routing hits
 
 The `bump_reflex_pattern_match()` method exists in both DB backends and is tested (`reflex.rs:1336-1340`), but is never invoked from the dispatcher.
 
-**Fix:** After successful `execute_chat_tool()` in `dispatcher.rs`:
+**Fix:** After successful `execute_chat_tool()` in `dispatcher.rs` (line ~180):
 
 ```rust
-// dispatcher.rs — after line 158 (Ok(output) match arm)
+// dispatcher.rs — after line 180 (Ok(output) match arm)
 Ok(output) => {
     // Record the match for staleness tracking
     if let Some(store) = self.store() {
@@ -132,7 +132,7 @@ Ok(output) => {
 
 **Problem:** `agent_loop.rs:792-822` spawns the compiler and cache refresh tasks, but **`spawn_reflex_evictor()` is never called**. The `ReflexEvictor` struct and spawn function exist (`reflex.rs:758-864`) and are tested, but production code only spawns compiler + cache refresh. Stale patterns accumulate indefinitely. The only eviction path is manual: `lunarwing reflex prune --stale-days N`.
 
-**Fix:** Add evictor spawn in the `reflex.enabled` block of `Agent::run()`:
+**Fix:** Add evictor spawn in the `reflex.enabled` block of `Agent::run()` (after line 822):
 
 ```rust
 // agent_loop.rs — inside the reflex.enabled block, after cache refresh spawn
@@ -200,7 +200,7 @@ This is a v1-era single-user assumption that diverges from v2's multi-tenant arc
 - `compile_pattern()`: use `self.user_id` instead of `"default"`
 - `find_recurring_job_patterns()`: add `user_id` parameter to trait + both backends
 - `spawn_reflex_compiler()`: accept user_id parameter
-- `agent_loop.rs`: pass user_id when spawning
+- `agent_loop.rs`: pass user_id when spawning (line 801)
 
 ### 2b. Increment `compilation_attempts` on Build Failure
 
@@ -249,6 +249,8 @@ Implement in both `db/postgres.rs` and `db/libsql/reflex.rs`.
 
 **Alternative (simpler):** Reuse `upsert_reflex_pattern` with a status check — if `compilation_attempts >= 3`, set `status = 'disabled'` in the upsert. This avoids a new trait method but is less explicit.
 
+**Note:** After Phase 2a (multi-tenant), replace `"default"` with `self.user_id`.
+
 ---
 
 ## Phase 3 — Configuration & Cleanup
@@ -293,7 +295,7 @@ Or refactor constants into the struct and use `FuzzyConfig::default()` in `Refle
 
 **Problem:** `postgres.rs:1390` SELECT after eviction omits `embedding` and `embedding_model` columns. The `row_to_reflex_pattern()` function uses `try_get` so it won't crash, but returned records will have `embedding: None` even though data exists in DB.
 
-**Fix:** Add `embedding, embedding_model` to the SELECT list at `postgres.rs:1390`.
+**Fix:** Add `embedding, embedding_model` to the SELECT list at `postgres.rs:1390` (the re-query after UPDATE).
 
 ---
 
@@ -422,7 +424,7 @@ impl ReflexBridgeAdapter {
 
 ### 5c. Reflex Path Safety Integration
 
-**Problem:** The reflex fast-path (`dispatcher.rs:145-169`) executes compiled tools via `execute_chat_tool()` directly, bypassing:
+**Problem:** The reflex fast-path (`dispatcher.rs:166-190`) executes compiled tools via `execute_chat_tool()` directly, bypassing:
 - The v2 agentic loop's 3-phase tool execution (preflight → parallel exec → post-flight)
 - Hook pre/post-execution callbacks
 - Approval flow (`ApprovalContext`)
