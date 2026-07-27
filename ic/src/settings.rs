@@ -851,7 +851,7 @@ pub struct ExternalWorkerSettings {
 }
 
 fn default_external_worker_timeout() -> u64 {
-    400_000
+    3_600_000
 }
 
 fn default_sandbox_policy() -> String {
@@ -1781,7 +1781,7 @@ mod tests {
 [[sandbox.external_workers]]
 name = "nanocode"
 url = "ws://localhost:9090/ws/agent"
-timeout_ms = 300000
+timeout_ms = 3600000
 "#;
         let parsed: Settings = toml::from_str(toml_str).unwrap();
         assert_eq!(parsed.sandbox.external_workers.len(), 1);
@@ -1800,6 +1800,20 @@ timeout_ms = 300000
             base.sandbox.external_workers[0].url,
             "ws://localhost:9090/ws/agent"
         );
+    }
+
+    #[test]
+    fn external_worker_timeout_defaults_to_one_hour() {
+        let settings: Settings = toml::from_str(
+            r#"
+[[sandbox.external_workers]]
+name = "opencode"
+url = "ws://localhost:9090/ws/agent"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.sandbox.external_workers[0].timeout_ms, 3_600_000);
     }
 
     /// Regression: /model writes a single key ("selected_model") to the DB via

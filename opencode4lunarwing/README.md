@@ -29,11 +29,12 @@ Add to `config.toml` under `LUNARWING_BASE_DIR`:
 [[sandbox.external_workers]]
 name = "opencode"
 url = "ws://localhost:9090/ws/agent"
-timeout_ms = 300000
+timeout_ms = 3600000
 ```
 
 The agent logs `External workers configured: opencode` on startup.
-`timeout_ms` is the hard task deadline enforced by both LunarWing and this worker.
+`timeout_ms` defaults to one hour and is the hard task deadline enforced by both
+LunarWing and this worker.
 On timeout or cancellation, the worker aborts the active OpenCode session instead
 of leaving it running in the container.
 
@@ -43,8 +44,9 @@ of leaving it running in the container.
 create_job(title: "Fix the tests", description: "Run cargo test and fix failures", mode: "opencode")
 ```
 
-For long tasks, set `wait: false`. LunarWing returns the job ID immediately and
-keeps monitoring worker events without blocking the current conversation turn.
+External jobs default to `wait: false`. LunarWing returns the job ID immediately
+and keeps monitoring worker events without blocking the current conversation
+turn. Set `wait: true` only for short tasks that must return synchronously.
 
 ## Health Endpoints
 
