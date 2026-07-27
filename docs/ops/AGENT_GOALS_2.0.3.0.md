@@ -72,7 +72,7 @@
     **Defer for now:** worker-local MCP, automatic npm/pip install, secret injection through process env, general runtime-adapter refactor, gateway integration, automatic crash restart — each materially increases the security/lifecycle surface.
     </details>
 20. [ ] dark irc key exchange. automate the process secruely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on this branches already DONE: feat/darkirc-key-exchange-v1 - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the branch: rarity/item-20-20260722-1501
-21. [ ] continue to work on external workers, in particular for opencode
+21. [x] continue to work on external workers, in particular for opencode
 22. [ ] review kawarimi adapter. make improvements (only if necessary)
 23. [x] go over release notes for 2.0.2.0 and see what else still needs to be added to next release, see documents about this if unsure of each item. create new doc under docs/proposals for items that should be included in 2.0.3.0 (you must focus on enginev2 related fixes/polishing)
 24. [ ] Refactor mt admin. The existing document plans have SERIOUS issues. Therefore, I'm going with a COMPLETELY different plan for this. Please see the following branch: mtadminrefactor/meta4/v2.0.3.0
