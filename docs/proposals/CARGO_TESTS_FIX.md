@@ -43,6 +43,11 @@ Root cause: trace fixture `tests/fixtures/llm_traces/worker/tool_error_feedback.
 
 Fix: replaced `ironclaw` with `lunarwing` in the fixture JSON.
 
+Follow-up (2026-07-27): the fixture's nominally invalid absolute path was
+writable by the root user in the Docker CI runner because `write_file` creates
+parent directories. The test now patches that path beneath a regular file in
+its tempdir, making directory creation fail independent of process privileges.
+
 ### Ignored for CI (6 tests, previously DEFERRED)
 
 > Previously these tests hard-failed. As of 2026-07-21 they are marked
