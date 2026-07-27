@@ -140,7 +140,7 @@ assert.deepEqual(retrying.promptArgs[1], [
       {
         type: "text",
         text:
-          "The previous model request timed out. Continue this task from the current session and " +
+          "The previous model request failed transiently. Continue this task from the current session and " +
           "workspace state. Do not repeat completed work. Inspect existing changes and proceed from " +
           "the next incomplete step.",
       },
@@ -165,6 +165,17 @@ const sessionRetrying = makeSdk({
 const sessionRetryResult = await runTask(sessionRetrying.sdk)
 assert.equal(sessionRetryResult.status, "success")
 assert.equal(sessionRetrying.promptArgs.length, 2)
+
+const unavailableRetrying = makeSdk({
+  events: [
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+  ],
+  assistantErrors: [{ message: "No provider available" }, undefined],
+})
+const unavailableRetryResult = await runTask(unavailableRetrying.sdk)
+assert.equal(unavailableRetryResult.status, "success")
+assert.equal(unavailableRetrying.promptArgs.length, 2)
 
 if (savedRetryDelay === undefined) {
   delete process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS

@@ -21,7 +21,7 @@ const OPENCODE_PORT = process.env.OPENCODE_SERVE_PORT || "4096"
 const OPENCODE_BASE_URL = `http://${OPENCODE_HOST}:${OPENCODE_PORT}`
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
 const RETRY_PROMPT =
-  "The previous model request timed out. Continue this task from the current session and " +
+  "The previous model request failed transiently. Continue this task from the current session and " +
   "workspace state. Do not repeat completed work. Inspect existing changes and proceed from " +
   "the next incomplete step."
 
@@ -51,7 +51,8 @@ function isRetryableProviderError(message: string): boolean {
   return (
     /streaming\.total_ms/i.test(message) ||
     /\bprovider\b.*\btimed?\s*out\b/i.test(message) ||
-    /\bupstream\b.*\btimed?\s*out\b/i.test(message)
+    /\bupstream\b.*\btimed?\s*out\b/i.test(message) ||
+    /\bno provider available\b/i.test(message)
   )
 }
 
@@ -278,7 +279,7 @@ export async function executeTask(
 
       const retryNumber = attempt + 1
       const delta =
-        `[worker] Provider request timed out; retrying same OpenCode session ` +
+        `[worker] Transient provider failure; retrying same OpenCode session ` +
         `(${retryNumber}/${maxProviderRetries}).`
       output += `ERROR: ${promptError}\n${delta}\n`
       emitProgress(delta)
