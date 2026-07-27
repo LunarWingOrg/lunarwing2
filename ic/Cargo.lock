@@ -4513,6 +4513,7 @@ dependencies = [
  "chrono-tz",
  "cron",
  "futures",
+ "lunarwing_common",
  "lunarwing_skills",
  "monty",
  "pretty_assertions",

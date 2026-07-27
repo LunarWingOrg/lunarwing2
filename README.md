@@ -54,6 +54,10 @@ DarkIRC is opt-in. It is neither rendered nor built for a new tenant unless the 
 
 LunarWing can attach persistent NanoCode, Pebble, or OpenCode worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant.
 
+External `create_job` calls default to no conversation history. Set
+`context_scope: "recent"` to send bounded user/assistant messages from current
+thread as untrusted reference context; task description remains authoritative.
+
 ### Model providers
 
 | Provider path | Intended use |

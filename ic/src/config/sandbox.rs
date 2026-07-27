@@ -1,5 +1,6 @@
 use crate::config::helpers::{optional_env, parse_bool_env, parse_optional_env, parse_string_env};
 use crate::error::ConfigError;
+pub use lunarwing_common::PromptContextLimits;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use tracing;
@@ -177,6 +178,8 @@ pub struct ExternalWorkerConfig {
     pub endpoints: Vec<WorkerEndpoint>,
     /// Load balancing strategy (defaults to RoundRobin).
     pub load_balance: LoadBalanceStrategy,
+    /// Bounds applied when recent conversation context is requested.
+    pub prompt_context: PromptContextLimits,
 }
 
 impl ExternalWorkerConfig {
@@ -185,13 +188,26 @@ impl ExternalWorkerConfig {
             .sandbox
             .external_workers
             .iter()
-            .map(|ew| Self {
-                name: ew.name.clone(),
-                url: ew.url.clone(),
-                auth_token: ew.auth_token.clone(),
-                timeout_ms: ew.timeout_ms,
-                endpoints: ew.endpoints.clone(),
-                load_balance: ew.load_balance.clone(),
+            .map(|ew| {
+                let prompt_context = ew.prompt_context.bounded();
+                if prompt_context != ew.prompt_context {
+                    tracing::warn!(
+                        worker = %ew.name,
+                        requested_max_messages = ew.prompt_context.max_messages,
+                        requested_max_chars_per_message = ew.prompt_context.max_chars_per_message,
+                        requested_max_total_chars = ew.prompt_context.max_total_chars,
+                        "External worker prompt-context limits exceeded hard ceilings; clamped"
+                    );
+                }
+                Self {
+                    name: ew.name.clone(),
+                    url: ew.url.clone(),
+                    auth_token: ew.auth_token.clone(),
+                    timeout_ms: ew.timeout_ms,
+                    endpoints: ew.endpoints.clone(),
+                    load_balance: ew.load_balance.clone(),
+                    prompt_context,
+                }
             })
             .collect()
     }
@@ -479,6 +495,28 @@ timeout_ms = 3600000
             Some("deadbeefcafe1234")
         );
         assert_eq!(workers[0].timeout_ms, 3_600_000);
+        assert_eq!(workers[0].prompt_context, PromptContextLimits::default());
+    }
+
+    #[test]
+    fn external_worker_prompt_context_limits_are_clamped() {
+        let generated = r#"
+[[sandbox.external_workers]]
+name = "opencode"
+url = "ws://127.0.0.1:10007/ws/agent"
+
+[sandbox.external_workers.prompt_context]
+max_messages = 500
+max_chars_per_message = 100000
+max_total_chars = 500000
+"#;
+        let settings: crate::settings::Settings = toml::from_str(generated).expect("config parses");
+        let workers = ExternalWorkerConfig::resolve_from_settings(&settings);
+
+        assert_eq!(
+            workers[0].prompt_context,
+            lunarwing_common::HARD_PROMPT_CONTEXT_LIMITS
+        );
     }
 
     /// Multiple `[[sandbox.external_workers]]` blocks in one file (e.g. nanocode

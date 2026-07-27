@@ -595,6 +595,7 @@ async fn execute_pending_gate_action(
         source_channel: Some(pending.source_channel.clone()),
         supervised_mode: thread.config.supervised_mode,
         supervised_timeout_secs: thread.config.supervised_timeout_secs,
+        prompt_context: lunarwing_engine::prompt_context_from_thread_messages(&thread.messages),
     };
 
     state.effect_adapter.reset_call_count();

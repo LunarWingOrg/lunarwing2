@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use lunarwing_common::{PromptContextLimits, PromptContextMessage, select_prompt_context};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -23,9 +24,7 @@ use crate::db::Database;
 use crate::history::SandboxJobRecord;
 use crate::orchestrator::ExternalWorkerManager;
 use crate::orchestrator::auth::CredentialGrant;
-use crate::orchestrator::external_worker::{
-    ConversationMessage, ExternalTaskStatus, build_task_context,
-};
+use crate::orchestrator::external_worker::{ExternalTaskStatus, build_task_context};
 use crate::orchestrator::job_manager::{ContainerJobManager, JobMode};
 use crate::secrets::SecretsStore;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
@@ -115,6 +114,45 @@ fn external_job_wait(params: &serde_json::Value) -> bool {
         .get("wait")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalContextScope {
+    None,
+    Recent,
+}
+
+impl ExternalContextScope {
+    fn parse(params: &serde_json::Value) -> Result<Self, ToolError> {
+        match params.get("context_scope") {
+            None => Ok(Self::None),
+            Some(value) => match value.as_str() {
+                Some("none") => Ok(Self::None),
+                Some("recent") => Ok(Self::Recent),
+                _ => Err(ToolError::InvalidParameters(
+                    "context_scope must be 'none' or 'recent'".to_string(),
+                )),
+            },
+        }
+    }
+}
+
+struct ExternalExecutionOptions {
+    wait: bool,
+    context_scope: ExternalContextScope,
+    project_dir: Option<String>,
+    credential_grants: Vec<CredentialGrant>,
+}
+
+fn external_prompt_context(
+    ctx: &JobContext,
+    scope: ExternalContextScope,
+    limits: PromptContextLimits,
+) -> Vec<PromptContextMessage> {
+    match scope {
+        ExternalContextScope::None => Vec::new(),
+        ExternalContextScope::Recent => select_prompt_context(&ctx.prompt_context, limits),
+    }
 }
 
 /// Tool for creating a new job.
@@ -715,10 +753,8 @@ impl CreateJobTool {
         &self,
         task: &str,
         worker_name: &str,
-        wait: bool,
         ctx: &JobContext,
-        project_dir: Option<String>,
-        credential_grants: Vec<CredentialGrant>,
+        options: ExternalExecutionOptions,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
         let ewm = self.external_worker_manager.as_ref().ok_or_else(|| {
@@ -726,26 +762,22 @@ impl CreateJobTool {
                 "External worker execution requires a configured worker manager".to_string(),
             )
         })?;
-        let worker_timeout_ms = ewm
-            .get_worker(worker_name)
-            .map(|config| config.timeout_ms)
-            .ok_or_else(|| {
-                ToolError::ExecutionFailed(format!(
-                    "External worker '{worker_name}' is not configured"
-                ))
-            })?;
+        let worker_config = ewm.get_worker(worker_name).ok_or_else(|| {
+            ToolError::ExecutionFailed(format!("External worker '{worker_name}' is not configured"))
+        })?;
+        let worker_timeout_ms = worker_config.timeout_ms;
 
         let job_id = Uuid::new_v4();
 
         // Resolve credential grants to actual env var values
         let mut environment = std::collections::HashMap::new();
-        if !credential_grants.is_empty() {
+        if !options.credential_grants.is_empty() {
             let secrets = self.secrets_store.as_ref().ok_or_else(|| {
                 ToolError::ExecutionFailed(
                     "credentials requested but no secrets store is configured".to_string(),
                 )
             })?;
-            for grant in &credential_grants {
+            for grant in &options.credential_grants {
                 let decrypted = secrets
                     .get_decrypted(&ctx.user_id, &grant.secret_name)
                     .await
@@ -759,7 +791,7 @@ impl CreateJobTool {
             }
         }
 
-        let grants_json = serde_json::to_string(&credential_grants).unwrap_or_default();
+        let grants_json = serde_json::to_string(&options.credential_grants).unwrap_or_default();
 
         self.context_manager
             .register_sandbox_job(job_id, &ctx.user_id, task, task)
@@ -773,7 +805,7 @@ impl CreateJobTool {
             task: task.to_string(),
             status: "creating".to_string(),
             user_id: ctx.user_id.clone(),
-            project_dir: project_dir.clone().unwrap_or_default(),
+            project_dir: options.project_dir.clone().unwrap_or_default(),
             success: None,
             failure_reason: None,
             created_at: Utc::now(),
@@ -800,44 +832,39 @@ impl CreateJobTool {
             }
         }
 
-        let pre_subscribed_rx = if !wait {
+        let pre_subscribed_rx = if !options.wait {
             self.event_tx.as_ref().map(|etx| etx.subscribe())
         } else {
             None
         };
 
-        let metadata = if ctx.metadata.is_object() {
-            ctx.metadata
-                .as_object()
-                .map(|map| {
-                    map.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            std::collections::HashMap::new()
-        };
-
-        let conversation_history: Vec<ConversationMessage> = metadata
+        let conversation_history =
+            external_prompt_context(ctx, options.context_scope, worker_config.prompt_context);
+        let selected_chars: usize = conversation_history
             .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix("conv_").map(|_| ConversationMessage {
-                    role: "context".to_string(),
-                    content: v.clone(),
-                })
-            })
-            .collect();
+            .map(|message| message.content.chars().count())
+            .sum();
+        let truncated = matches!(options.context_scope, ExternalContextScope::Recent)
+            && conversation_history.as_slice() != ctx.prompt_context.as_ref();
+        tracing::debug!(
+            worker = worker_name,
+            context_scope = ?options.context_scope,
+            source_messages = ctx.prompt_context.len(),
+            selected_messages = conversation_history.len(),
+            selected_chars,
+            truncated,
+            "Prepared external worker prompt context"
+        );
 
         let task_context = build_task_context(
             &ctx.user_id,
-            project_dir.as_deref(),
+            options.project_dir.as_deref(),
             environment,
             conversation_history,
-            metadata,
+            std::collections::HashMap::new(),
         );
 
-        if wait {
+        if options.wait {
             match ewm
                 .execute_task(
                     job_id,
@@ -1218,6 +1245,12 @@ impl Tool for CreateJobTool {
                     "description": mode_desc,
                     "enum": modes
                 });
+                props["context_scope"] = serde_json::json!({
+                    "type": "string",
+                    "description": "External workers only. Use 'recent' to include bounded user/assistant messages from the current scoped conversation as untrusted reference context. Defaults to 'none'.",
+                    "enum": ["none", "recent"],
+                    "default": "none"
+                });
             }
 
             serde_json::json!({
@@ -1281,6 +1314,7 @@ impl Tool for CreateJobTool {
                 && ewm.get_worker(mode_str).is_some()
             {
                 let wait = external_job_wait(&params);
+                let context_scope = ExternalContextScope::parse(&params)?;
                 let project_dir = params
                     .get("project_dir")
                     .and_then(|v| v.as_str())
@@ -1288,7 +1322,17 @@ impl Tool for CreateJobTool {
                 let credential_grants = self.parse_credentials(&params, &ctx.user_id).await?;
                 let task = format!("{}\n\n{}", title, description);
                 return self
-                    .execute_external(&task, mode_str, wait, ctx, project_dir, credential_grants)
+                    .execute_external(
+                        &task,
+                        mode_str,
+                        ctx,
+                        ExternalExecutionOptions {
+                            wait,
+                            context_scope,
+                            project_dir,
+                            credential_grants,
+                        },
+                    )
                     .await;
             }
             return Err(ToolError::InvalidParameters(format!(
@@ -1994,6 +2038,7 @@ mod tests {
             timeout_ms: 900_000,
             endpoints: vec![],
             load_balance: LoadBalanceStrategy::default(),
+            prompt_context: Default::default(),
         }]));
         let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
 
@@ -2019,6 +2064,11 @@ mod tests {
         let description = mode["description"].as_str().expect("mode description");
         assert!(description.contains("create_job directly"));
         assert!(description.contains("opencode"));
+        assert_eq!(
+            schema["properties"]["context_scope"]["enum"],
+            serde_json::json!(["none", "recent"])
+        );
+        assert_eq!(schema["properties"]["context_scope"]["default"], "none");
     }
 
     #[test]
@@ -2026,6 +2076,58 @@ mod tests {
         assert!(!external_job_wait(&serde_json::json!({})));
         assert!(!external_job_wait(&serde_json::json!({ "wait": false })));
         assert!(external_job_wait(&serde_json::json!({ "wait": true })));
+    }
+
+    #[test]
+    fn external_context_scope_defaults_to_none_and_rejects_unknown_values() {
+        assert_eq!(
+            ExternalContextScope::parse(&serde_json::json!({})).unwrap(),
+            ExternalContextScope::None
+        );
+        assert_eq!(
+            ExternalContextScope::parse(&serde_json::json!({"context_scope": "recent"})).unwrap(),
+            ExternalContextScope::Recent
+        );
+        assert!(
+            ExternalContextScope::parse(&serde_json::json!({"context_scope": "full"})).is_err()
+        );
+    }
+
+    #[test]
+    fn external_prompt_context_is_opt_in_bounded_and_metadata_independent() {
+        use lunarwing_common::{PromptContextMessage, PromptContextRole};
+
+        let ctx = JobContext {
+            metadata: serde_json::json!({
+                "conv_secret": "must not become history",
+                "notify_user": "private-routing-id"
+            }),
+            prompt_context: Arc::from([
+                PromptContextMessage {
+                    role: PromptContextRole::User,
+                    content: "old question".to_string(),
+                },
+                PromptContextMessage {
+                    role: PromptContextRole::Assistant,
+                    content: "new answer".to_string(),
+                },
+            ]),
+            ..Default::default()
+        };
+        let limits = PromptContextLimits {
+            max_messages: 1,
+            max_chars_per_message: 3,
+            max_total_chars: 3,
+        };
+
+        assert!(external_prompt_context(&ctx, ExternalContextScope::None, limits).is_empty());
+        assert_eq!(
+            external_prompt_context(&ctx, ExternalContextScope::Recent, limits),
+            vec![PromptContextMessage {
+                role: PromptContextRole::Assistant,
+                content: "new".to_string(),
+            }]
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@
 
 import { createOpencodeClient, type OpencodeClient } from "@nanogpt/sdk/v2"
 import {
+  buildTaskPrompt,
   type TaskRequest,
   type TaskProgress,
   type TaskResult,
@@ -99,7 +100,7 @@ export async function executeTask(
     // Send the prompt
     const promptPromise = sdk.session.prompt({
       sessionID,
-      parts: [{ type: "text", text: request.prompt }],
+      parts: [{ type: "text", text: buildTaskPrompt(request) }],
     })
 
     // Process events
