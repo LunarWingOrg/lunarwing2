@@ -100,7 +100,7 @@ acp_enabled = false
 name = "nanocode"
 url = "ws://127.0.0.1:<WSS_PORT>/ws/agent"
 auth_token = "<GATEWAY_TOKEN>"
-timeout_ms = 400000
+timeout_ms = 3600000
 ```
 
 **Critical TOML ordering:** `[[sandbox.external_workers]]` must appear after all scalar fields under `[sandbox]`. TOML does not allow returning to a table header after an array-of-tables entry.

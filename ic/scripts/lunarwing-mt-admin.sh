@@ -45,6 +45,9 @@ DEFAULT_VL_URL="${LUNARWING_MT_VL_URL:-http://host.containers.internal:8080/v1/c
 DEFAULT_LLM_BASE_URL="${LUNARWING_MT_LLM_BASE_URL:-}"
 DEFAULT_GOTIFY_URL="${LUNARWING_MT_GOTIFY_URL:-}"
 DEFAULT_GOTIFY_TITLE="${LUNARWING_MT_GOTIFY_TITLE:-}"
+DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS="${LUNARWING_MT_EXTERNAL_WORKER_TIMEOUT_MS:-3600000}"
+LEGACY_EXTERNAL_WORKER_TIMEOUT_MS=300000
+MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS="${LUNARWING_MT_MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS:-true}"
 
 # ── Health-check / self-heal pipeline (host-global) ──────────────────────────
 # The infra health-check + self-heal pipeline auto-discovers every tenant from
@@ -2920,9 +2923,71 @@ generate_darkirc_config() {
 # start_tenant_nanocode), so the daemon side must present that same token as the
 # WebSocket bearer — hence auth_token mirrors GATEWAY_AUTH_TOKEN here.
 #
-# Idempotent: a tenant entry is written once and skipped on re-runs. The block
-# survives the daemon's own config.toml writers (e.g. `/model`), which
-# load-modify-save the whole settings struct.
+# Idempotent: a tenant entry is written once and skipped on re-runs. Exact legacy
+# 5-minute deadlines migrate to the current default. Set
+# LUNARWING_MT_MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS=false to preserve an
+# intentional 5-minute value. Other explicit values remain untouched.
+upgrade_external_worker_timeout() {
+  local name="$1" worker="$2" config_path="$3"
+  local awk_status temp_path
+
+  if [[ "$MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS" != "true" ]] ||
+     [[ "$DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS" == "$LEGACY_EXTERNAL_WORKER_TIMEOUT_MS" ]]; then
+    return 1
+  fi
+
+  if ! temp_path="$(mktemp "${config_path}.tmp.XXXXXX")"; then
+    return 2
+  fi
+
+  if awk \
+    -v worker="$worker" \
+    -v old_timeout="$LEGACY_EXTERNAL_WORKER_TIMEOUT_MS" \
+    -v new_timeout="$DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS" '
+      BEGIN {
+        in_external_worker = 0
+        target_worker = 0
+        changed = 0
+      }
+      /^\[\[sandbox\.external_workers\]\][[:space:]]*$/ {
+        in_external_worker = 1
+        target_worker = 0
+        print
+        next
+      }
+      /^\[/ {
+        in_external_worker = 0
+        target_worker = 0
+      }
+      in_external_worker && $0 == "name = \"" worker "\"" {
+        target_worker = 1
+      }
+      in_external_worker && target_worker && $0 == "timeout_ms = " old_timeout {
+        print "timeout_ms = " new_timeout
+        changed = 1
+        next
+      }
+      { print }
+      END { if (!changed) exit 42 }
+    ' "$config_path" >"$temp_path"; then
+    if ! chown "$name:$name" "$temp_path" ||
+       ! chmod 600 "$temp_path" ||
+       ! mv -f -- "$temp_path" "$config_path"; then
+      rm -f -- "$temp_path"
+      return 2
+    fi
+    say "upgraded external worker '$worker' timeout to ${DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS}ms"
+    return 0
+  else
+    awk_status=$?
+    rm -f -- "$temp_path"
+    if [[ "$awk_status" -eq 42 ]]; then
+      return 1
+    fi
+    return 2
+  fi
+}
+
 ensure_external_worker_config() {
   local name="$1"      # tenant name
   local worker="$2"    # logical worker name, matches create_job mode (e.g. "nanocode")
@@ -2939,11 +3004,22 @@ ensure_external_worker_config() {
     return 0
   fi
 
-  # Already configured? Skip so re-runs / patch-env are idempotent. The daemon's
+  if [[ ! "$DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]]; then
+    die "LUNARWING_MT_EXTERNAL_WORKER_TIMEOUT_MS must be a positive integer"
+  fi
+
+  # Already configured? Upgrade only the exact legacy timeout, then skip so
+  # re-runs / patch-env are idempotent. The daemon's
   # TOML writer emits `name = "<worker>"` identically, so this also matches a
   # file that has been load-modify-saved by `/model`.
   if [[ -f "$config_path" ]] && grep -q "name = \"$worker\"" "$config_path" 2>/dev/null; then
-    say "external worker '$worker' already configured in $config_path (skipping)"
+    local upgrade_status=0
+    upgrade_external_worker_timeout "$name" "$worker" "$config_path" || upgrade_status=$?
+    case "$upgrade_status" in
+      0) ;;
+      1) say "external worker '$worker' already configured in $config_path (skipping)" ;;
+      *) die "failed to upgrade external worker '$worker' timeout in $config_path" ;;
+    esac
     return 0
   fi
 
@@ -2975,7 +3051,7 @@ HDR
     if [[ -n "$auth_token" ]]; then
       printf 'auth_token = "%s"\n' "$auth_token"
     fi
-    printf 'timeout_ms = 300000\n'
+    printf 'timeout_ms = %s\n' "$DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS"
   } >>"$config_path"
 
   if [[ -z "$auth_token" ]]; then

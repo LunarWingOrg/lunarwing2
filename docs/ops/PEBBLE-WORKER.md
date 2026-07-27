@@ -31,7 +31,7 @@ Add to `config.toml` under `LUNARWING_BASE_DIR`:
 [[sandbox.external_workers]]
 name = "pebble"
 url = "ws://localhost:9090/ws/agent"
-timeout_ms = 300000
+timeout_ms = 3600000
 ```
 
 ## Multi-Tenant Setup

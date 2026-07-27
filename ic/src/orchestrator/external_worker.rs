@@ -377,6 +377,17 @@ impl ExternalWorkerManager {
                     continue;
                 }
 
+                if let Err(error) = &result {
+                    record_external_task_error(
+                        job_id,
+                        error,
+                        event_tx.as_ref(),
+                        context_manager.as_ref(),
+                        store.as_ref(),
+                    )
+                    .await;
+                }
+
                 active_handles.write().await.remove(&job_id);
                 return result.map(Some);
             }
@@ -411,6 +422,17 @@ impl ExternalWorkerManager {
                 .await;
 
                 active_handles.write().await.remove(&job_id);
+
+                if let Err(error) = &result {
+                    record_external_task_error(
+                        job_id,
+                        error,
+                        event_tx.as_ref(),
+                        context_manager.as_ref(),
+                        store.as_ref(),
+                    )
+                    .await;
+                }
 
                 match &result {
                     Ok(r) => {
@@ -1237,6 +1259,49 @@ async fn persist_event(
     if let Some(db) = store {
         let value = serde_json::json!({ "content": data });
         let _ = db.save_job_event(job_id, event_type, &value).await;
+    }
+}
+
+async fn record_external_task_error(
+    job_id: Uuid,
+    error: &OrchestratorError,
+    event_tx: Option<&broadcast::Sender<(Uuid, String, SseEvent)>>,
+    context_manager: Option<&Arc<ContextManager>>,
+    store: Option<&Arc<dyn Database>>,
+) {
+    let reason = error.to_string();
+
+    if let Some(cm) = context_manager {
+        let _ = cm
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(JobState::Failed, Some(reason.clone()))
+            })
+            .await;
+    }
+
+    persist_event(store, job_id, "result", &format!("Failed: {reason}")).await;
+    emit_event(
+        event_tx,
+        job_id,
+        SseEvent::JobResult {
+            job_id: job_id.to_string(),
+            status: "failed".to_string(),
+            session_id: None,
+            fallback_deliverable: None,
+        },
+    );
+
+    if let Some(db) = store {
+        let _ = db
+            .update_sandbox_job_status(
+                job_id,
+                "failed",
+                Some(false),
+                Some(&reason),
+                None,
+                Some(Utc::now()),
+            )
+            .await;
     }
 }
 
