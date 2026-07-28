@@ -4374,7 +4374,9 @@ start_tenant_opencode() {
   case "$image_user" in
     "$OPENCODE_CONTAINER_UID"|"$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID") ;;
     *)
-      die "opencode worker image has user '${image_user:-unset}', expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; rebuild it"
+      say "WARNING: opencode worker image has user '${image_user:-unset}', expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; skipping incompatible worker" >&2
+      say "         Recovery: sudo $0 build-opencode-worker && sudo $0 start-worker $name opencode" >&2
+      return 0
       ;;
   esac
 
