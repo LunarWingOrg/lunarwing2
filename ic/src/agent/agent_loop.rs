@@ -835,10 +835,17 @@ impl Agent {
             };
 
             let evictor_handle = if let Some(store) = self.store() {
-                tracing::info!("Spawning reflex evictor (stale_after_days: 30)");
+                tracing::info!(
+                    "Spawning reflex evictor (stale_after_days: {}, check_interval: {}s)",
+                    self.config.reflex.eviction_stale_days,
+                    self.config.reflex.eviction_check_interval.as_secs()
+                );
                 Some(crate::agent::reflex::spawn_reflex_evictor(
                     Arc::clone(store),
-                    crate::agent::reflex::EvictionConfig::default(),
+                    crate::agent::reflex::EvictionConfig::new(
+                        self.config.reflex.eviction_check_interval,
+                        self.config.reflex.eviction_stale_days,
+                    ),
                 ))
             } else {
                 None

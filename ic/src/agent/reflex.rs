@@ -759,6 +759,16 @@ impl Default for EvictionConfig {
     }
 }
 
+impl EvictionConfig {
+    /// Create an `EvictionConfig` from reflex config values.
+    pub fn new(check_interval: Duration, stale_after_days: i32) -> Self {
+        Self {
+            check_interval,
+            stale_after_days,
+        }
+    }
+}
+
 // ── ReflexEvictor ───────────────────
 
 /// Background task that periodically evicts stale reflex patterns.
