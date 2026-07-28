@@ -66,8 +66,7 @@ external workers manage their own iteration policy and reject this option.
 
 | Provider path | Intended use |
 | --- | --- |
-| `lunarwing_cloud` | Hosted LunarWing inference (default) |
-| `openai_compatible` | OpenAI-compatible endpoints, including compatible routing gateways |
+| `openai_compatible` | OpenAI-compatible endpoints, including compatible routing gateways such as Tensorzero|
 | `ollama` | Local Ollama deployments |
 
 ## Get started with the onboarding GUI
