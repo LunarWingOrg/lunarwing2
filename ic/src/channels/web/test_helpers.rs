@@ -75,6 +75,7 @@ impl TestGatewayBuilder {
             tool_registry: None,
             store: None,
             job_manager: None,
+            external_worker_manager: None,
             prompt_queue: None,
             owner_id: self.user_id.clone(),
             default_sender_id: self.user_id,

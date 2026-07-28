@@ -116,7 +116,7 @@ export interface TaskProgress {
 
 export interface TaskResult {
   task_id: string
-  status: "success" | "error" | "cancelled"
+  status: "success" | "error" | "cancelled" | "timed_out"
   output: string
   error: string | null
   duration_ms: number

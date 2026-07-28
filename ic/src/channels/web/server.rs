@@ -346,6 +346,8 @@ pub struct GatewayState {
     pub store: Option<Arc<dyn Database>>,
     /// Container job manager for sandbox operations.
     pub job_manager: Option<Arc<ContainerJobManager>>,
+    /// External worker manager for cancelling persistent worker jobs.
+    pub external_worker_manager: Option<Arc<crate::orchestrator::ExternalWorkerManager>>,
     /// Prompt queue for Claude Code follow-up prompts.
     pub prompt_queue: Option<PromptQueue>,
     /// Durable owner scope for persistence and unauthenticated callback flows.
@@ -3170,6 +3172,7 @@ mod tests {
             tool_registry: None,
             store: None,
             job_manager: None,
+            external_worker_manager: None,
             prompt_queue: None,
             owner_id: "test".to_string(),
             default_sender_id: "test".to_string(),

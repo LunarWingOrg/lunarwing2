@@ -100,6 +100,7 @@ impl GatewayChannel {
             tool_registry: None,
             store: None,
             job_manager: None,
+            external_worker_manager: None,
             prompt_queue: None,
             scheduler: None,
             owner_id: owner_id.clone(),
@@ -146,6 +147,7 @@ impl GatewayChannel {
             tool_registry: self.state.tool_registry.clone(),
             store: self.state.store.clone(),
             job_manager: self.state.job_manager.clone(),
+            external_worker_manager: self.state.external_worker_manager.clone(),
             prompt_queue: self.state.prompt_queue.clone(),
             scheduler: self.state.scheduler.clone(),
             owner_id: self.state.owner_id.clone(),
@@ -229,6 +231,15 @@ impl GatewayChannel {
     /// Inject the container job manager for sandbox operations.
     pub fn with_job_manager(mut self, jm: Arc<ContainerJobManager>) -> Self {
         self.rebuild_state(|s| s.job_manager = Some(jm));
+        self
+    }
+
+    /// Inject the external worker manager for job cancellation.
+    pub fn with_external_worker_manager(
+        mut self,
+        manager: Arc<crate::orchestrator::ExternalWorkerManager>,
+    ) -> Self {
+        self.rebuild_state(|state| state.external_worker_manager = Some(manager));
         self
     }
 

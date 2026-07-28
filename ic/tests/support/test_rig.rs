@@ -883,6 +883,8 @@ impl TestRigBuilder {
             owner_id: components.config.owner_id.clone(),
             vision_service_url: components.config.vision_service_url.clone(),
             store: components.db,
+            container_job_manager: None,
+            external_worker_manager: None,
             llm: components.llm,
             cheap_llm: components.cheap_llm,
             safety: components.safety,

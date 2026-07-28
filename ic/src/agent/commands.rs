@@ -204,16 +204,64 @@ impl Agent {
         if ctx.user_id != user_id {
             return Err(crate::error::JobError::NotFound { id: uuid }.into());
         }
+        if !ctx.state.is_active() {
+            return Ok(format!(
+                "Job {job_id} is {} and cannot be cancelled.",
+                ctx.state
+            ));
+        }
 
-        self.scheduler.stop(uuid).await?;
+        let mut stopped = self.scheduler.stop(uuid).await?;
+        if let Some(ref manager) = self.deps.external_worker_manager {
+            stopped |= manager.cancel_task(uuid).await;
+        }
+        if let Some(ref manager) = self.deps.container_job_manager {
+            match manager.stop_job(uuid).await {
+                Ok(()) => stopped = true,
+                Err(crate::error::OrchestratorError::ContainerNotFound { .. }) => {}
+                Err(error) => {
+                    tracing::warn!(job_id = %uuid, "Failed to stop job container: {error}");
+                }
+            }
+        }
+        if !stopped {
+            return Ok(format!(
+                "Job {job_id} has no active runtime; cancellation was not reported as successful."
+            ));
+        }
+
+        let _ = self
+            .context_manager
+            .update_context(uuid, |ctx| {
+                if ctx.state == JobState::Cancelled {
+                    Ok(())
+                } else {
+                    ctx.transition_to(JobState::Cancelled, Some("Cancelled by user".to_string()))
+                }
+            })
+            .await;
 
         // Also update DB so the Jobs tab reflects cancellation immediately.
-        if let Some(store) = self.store()
-            && let Err(e) = store
+        if let Some(store) = self.store() {
+            if let Err(error) = store
                 .update_job_status(uuid, JobState::Cancelled, Some("Cancelled by user"))
                 .await
-        {
-            tracing::warn!(job_id = %uuid, "Failed to persist cancellation to DB: {}", e);
+            {
+                tracing::warn!(job_id = %uuid, "Failed to persist agent cancellation: {error}");
+            }
+            if let Err(error) = store
+                .update_sandbox_job_status(
+                    uuid,
+                    "cancelled",
+                    Some(false),
+                    Some("Cancelled by user"),
+                    None,
+                    Some(chrono::Utc::now()),
+                )
+                .await
+            {
+                tracing::warn!(job_id = %uuid, "Failed to persist sandbox cancellation: {error}");
+            }
         }
 
         Ok(format!("Job {} has been cancelled.", job_id))

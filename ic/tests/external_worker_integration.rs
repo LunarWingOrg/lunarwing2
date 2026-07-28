@@ -72,6 +72,10 @@ enum MockBehavior {
     Failed { error: String },
     /// Send `ready`, read `task_request`, then never reply (drives a timeout).
     Hang,
+    /// Wait for and capture the daemon's cancel envelope.
+    WaitForCancel {
+        messages: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    },
     /// Complete the WebSocket upgrade but close without sending `ready`
     /// (drives a protocol error).
     CloseBeforeReady,
@@ -370,6 +374,21 @@ async fn handle_connection(
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 return;
             }
+            MockBehavior::WaitForCancel { ref messages } => {
+                while let Some(Ok(message)) = ws.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let Ok(envelope) = serde_json::from_str::<serde_json::Value>(text) else {
+                        continue;
+                    };
+                    let _ = messages.send(envelope.clone());
+                    if envelope.get("type").and_then(|value| value.as_str()) == Some("cancel") {
+                        return;
+                    }
+                }
+                return;
+            }
             MockBehavior::CloseBeforeReady => unreachable!("handled above"),
         }
     }
@@ -644,15 +663,20 @@ async fn failed_result_status() {
 
 #[tokio::test]
 async fn task_timeout_when_worker_hangs() {
-    let (url, _count) = spawn_mock_worker_async(MockBehavior::Hang).await;
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::WaitForCancel {
+        messages: message_tx,
+    })
+    .await;
     let mgr = ExternalWorkerManager::new(vec![config_for(&url)]);
+    let job_id = Uuid::new_v4();
 
     // Short task timeout (covers only the response-read phase, which starts
     // after connect+handshake+send, all local and fast).
     let err = timeout(
         TEST_BOUND,
         mgr.execute_task(
-            Uuid::new_v4(),
+            job_id,
             "mock",
             "task",
             Some(300),
@@ -668,6 +692,12 @@ async fn task_timeout_when_worker_hangs() {
         matches!(err, OrchestratorError::ExternalWorkerTimeout { .. }),
         "got {err:?}"
     );
+    let cancel = timeout(TEST_BOUND, message_rx.recv())
+        .await
+        .expect("cancel envelope timed out")
+        .expect("cancel envelope channel closed");
+    assert_eq!(cancel["type"], "cancel");
+    assert_eq!(cancel["payload"]["task_id"], job_id.to_string());
 }
 
 #[tokio::test]
@@ -709,7 +739,7 @@ async fn async_timeout_finalizes_job_and_emits_result() {
     .await
     .expect("result event timed out");
 
-    assert_eq!(status, "failed");
+    assert_eq!(status, "timed_out");
     assert_eq!(
         context_manager
             .get_context(job_id)
@@ -722,7 +752,11 @@ async fn async_timeout_finalizes_job_and_emits_result() {
 
 #[tokio::test]
 async fn cancel_in_flight_task() {
-    let (url, _count) = spawn_mock_worker_async(MockBehavior::Hang).await;
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::WaitForCancel {
+        messages: message_tx,
+    })
+    .await;
     let mgr = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]));
     let job_id = Uuid::new_v4();
 
@@ -750,6 +784,48 @@ async fn cancel_in_flight_task() {
     .expect("expected result");
 
     assert_eq!(res.status, ExternalTaskStatus::Cancelled);
+    let cancel = timeout(TEST_BOUND, message_rx.recv())
+        .await
+        .expect("cancel envelope timed out")
+        .expect("cancel envelope channel closed");
+    assert_eq!(cancel["type"], "cancel");
+    assert_eq!(cancel["payload"]["task_id"], job_id.to_string());
+}
+
+#[tokio::test]
+async fn cancellation_before_dispatch_is_preserved() {
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, count) = spawn_mock_worker_async(MockBehavior::WaitForCancel {
+        messages: message_tx,
+    })
+    .await;
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)]);
+    let job_id = Uuid::new_v4();
+
+    mgr.reserve_task(job_id, "mock")
+        .await
+        .expect("reserve task");
+    assert!(mgr.cancel_task(job_id).await);
+
+    let result = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+
+    assert_eq!(result.status, ExternalTaskStatus::Cancelled);
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert!(message_rx.try_recv().is_err());
 }
 
 #[tokio::test]
