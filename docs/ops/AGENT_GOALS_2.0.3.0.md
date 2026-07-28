@@ -88,7 +88,7 @@
 34. [x] (S) Work on reflex compiler. see docs/proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED in docs/proposals - ALSO, see the following branches: rc2/aragents/v2.0.3.0 and anattemptatreflexcompilerv2 for work as inspiration
 35. [x] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
 36. [ ] update docs/README.md
-37. [ ] update README.md at repo root
+37. [x] update README.md at repo root
 38. [ ] come up with codename ideas for release. put into new doc.
 39. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.3.0 explaining all relevant changes since v2.0.2.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.3.0.md and should be written to the ROOT of the repo. When complete with draft, move on to another task, which is: Improve accuracy of the first draft of release notes (from previous task) - RELEASE-v2.0.3.0.md
 40. [ ] review README.md and release notes from item #39 in root of repo and do a final pass. you may also shorten superfluous information
