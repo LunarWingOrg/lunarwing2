@@ -21,9 +21,17 @@ const OPENCODE_PORT = process.env.OPENCODE_SERVE_PORT || "4096"
 const OPENCODE_BASE_URL = `http://${OPENCODE_HOST}:${OPENCODE_PORT}`
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
 const RETRY_PROMPT =
-  "The previous model request timed out. Continue this task from the current session and " +
+  "The previous model request failed transiently. Continue this task from the current session and " +
   "workspace state. Do not repeat completed work. Inspect existing changes and proceed from " +
   "the next incomplete step."
+
+type StopReason = "timeout" | "cancelled"
+
+class TaskStoppedError extends Error {
+  constructor(readonly reason: StopReason) {
+    super(`Task ${reason}`)
+  }
+}
 
 function getPassword(): string | undefined {
   return process.env.OPENCODE_SERVER_PASSWORD
@@ -47,11 +55,16 @@ function progressHeartbeatMs(): number {
   return boundedEnvInteger("OPENCODE_PROGRESS_HEARTBEAT_MS", 60_000, 0, 300_000)
 }
 
+function sessionAbortTimeoutMs(): number {
+  return boundedEnvInteger("OPENCODE_SESSION_ABORT_TIMEOUT_MS", 5_000, 100, 30_000)
+}
+
 function isRetryableProviderError(message: string): boolean {
   return (
     /streaming\.total_ms/i.test(message) ||
     /\bprovider\b.*\btimed?\s*out\b/i.test(message) ||
-    /\bupstream\b.*\btimed?\s*out\b/i.test(message)
+    /\bupstream\b.*\btimed?\s*out\b/i.test(message) ||
+    /\bno provider available\b/i.test(message)
   )
 }
 
@@ -85,6 +98,7 @@ export async function executeTask(
   const maxProviderRetries = providerMaxRetries()
   const retryDelayMs = providerRetryDelayMs()
   const heartbeatMs = progressHeartbeatMs()
+  const abortTimeoutMs = sessionAbortTimeoutMs()
   const workDir = request.context?.project_dir
     ? resolveWorkDir(request.context.project_dir)
     : WORKSPACE_ROOT
@@ -101,6 +115,7 @@ export async function executeTask(
 
   const sdk = sdkOverride ?? createSdk(workDir)
   let sessionID: string | undefined
+  let closeEvents: (() => void) | undefined
   let output = ""
   let deniedPermissions = 0
   let lastProgressAt = Date.now()
@@ -116,31 +131,84 @@ export async function executeTask(
         }, heartbeatMs)
       : undefined
 
-  type StopReason = "timeout" | "cancelled"
+  let stopReason: StopReason | undefined
   let resolveStop: (reason: StopReason) => void = () => {}
   const stopPromise = new Promise<StopReason>((resolve) => {
     resolveStop = resolve
   })
-  const timeout = setTimeout(() => resolveStop("timeout"), timeoutMs)
-  const handleAbort = () => resolveStop("cancelled")
+  const taskController = new AbortController()
+  const requestStop = (reason: StopReason) => {
+    if (stopReason) return
+    stopReason = reason
+    resolveStop(reason)
+    taskController.abort(reason)
+  }
+  const timeout = setTimeout(() => requestStop("timeout"), timeoutMs)
+  const handleAbort = () => requestStop("cancelled")
   abortSignal?.addEventListener("abort", handleAbort, { once: true })
   if (abortSignal?.aborted) handleAbort()
 
+  const waitForStop = async <T>(operation: Promise<T>): Promise<T> => {
+    const outcome = await Promise.race([
+      operation.then(
+        (value) => ({ kind: "value" as const, value }),
+        (error: unknown) => ({ kind: "error" as const, error }),
+      ),
+      stopPromise.then((reason) => ({ kind: "stop" as const, reason })),
+    ])
+    if (outcome.kind === "stop") throw new TaskStoppedError(outcome.reason)
+    if (outcome.kind === "error") throw outcome.error
+    return outcome.value
+  }
+
+  const abortSession = async () => {
+    if (!sessionID) return
+    const controller = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const outcome = await Promise.race([
+      sdk.session
+        .abort(
+          { sessionID },
+          { throwOnError: true, signal: controller.signal },
+        )
+        .then(
+          () => ({ kind: "done" as const }),
+          (error: unknown) => ({ kind: "error" as const, error }),
+        ),
+      new Promise<{ kind: "timeout" }>((resolve) => {
+        timer = setTimeout(() => {
+          controller.abort("session abort timed out")
+          resolve({ kind: "timeout" })
+        }, abortTimeoutMs)
+      }),
+    ])
+    if (timer) clearTimeout(timer)
+    if (outcome.kind === "error") {
+      console.error("[opencode_task_executor] failed to abort stopped session:", outcome.error)
+    } else if (outcome.kind === "timeout") {
+      console.error(
+        `[opencode_task_executor] session abort exceeded ${abortTimeoutMs}ms for task ${request.task_id}`,
+      )
+    }
+  }
+
   try {
-    const sessionResult = await sdk.session.create(
-      {
-        title: `lunarwing-opencode-${request.task_id}`,
-        permission: [
-          { permission: "edit", action: "allow", pattern: "*" },
-          { permission: "bash", action: "allow", pattern: "*" },
-          { permission: "read", action: "allow", pattern: "*" },
-          { permission: "write", action: "allow", pattern: "*" },
-          { permission: "question", action: "deny", pattern: "*" },
-          { permission: "plan_enter", action: "deny", pattern: "*" },
-          { permission: "plan_exit", action: "deny", pattern: "*" },
-        ],
-      },
-      { throwOnError: true },
+    const sessionResult = await waitForStop(
+      sdk.session.create(
+        {
+          title: `lunarwing-opencode-${request.task_id}`,
+          permission: [
+            { permission: "edit", action: "allow", pattern: "*" },
+            { permission: "bash", action: "allow", pattern: "*" },
+            { permission: "read", action: "allow", pattern: "*" },
+            { permission: "write", action: "allow", pattern: "*" },
+            { permission: "question", action: "deny", pattern: "*" },
+            { permission: "plan_enter", action: "deny", pattern: "*" },
+            { permission: "plan_exit", action: "deny", pattern: "*" },
+          ],
+        },
+        { throwOnError: true, signal: taskController.signal },
+      ),
     )
 
     sessionID = sessionResult.data?.id
@@ -148,9 +216,11 @@ export async function executeTask(
       throw new Error("Failed to create opencode session")
     }
 
-    const events = await sdk.event.subscribe()
+    const events = await waitForStop(
+      sdk.event.subscribe(undefined, { signal: taskController.signal }),
+    )
     const eventIterator = events.stream[Symbol.asyncIterator]()
-    let stopReason: StopReason | undefined
+    closeEvents = () => void eventIterator.return?.()
     let finalPromptData: Awaited<ReturnType<typeof sdk.session.prompt>>["data"] | undefined
 
     for (let attempt = 0; ; attempt++) {
@@ -164,7 +234,7 @@ export async function executeTask(
             sessionID,
             parts: [{ type: "text", text: promptText }],
           },
-          { throwOnError: true },
+          { throwOnError: true, signal: taskController.signal },
         )
         .then(
           (result) => ({ result }),
@@ -226,25 +296,29 @@ export async function executeTask(
           if (event.properties.sessionID !== sessionID) continue
           // Reject anything not granted by the session allow-policy above.
           deniedPermissions++
-          await sdk.permission.reply(
-            {
-              requestID: event.properties.id,
-              reply: "reject",
-            },
-            { throwOnError: true },
+          await waitForStop(
+            sdk.permission.reply(
+              {
+                requestID: event.properties.id,
+                reply: "reject",
+              },
+              { throwOnError: true, signal: taskController.signal },
+            ),
           )
         }
 
         if (event.type === "permission.v2.asked") {
           if (event.properties.sessionID !== sessionID) continue
           deniedPermissions++
-          await sdk.v2.session.permission.reply(
-            {
-              sessionID,
-              requestID: event.properties.id,
-              reply: "reject",
-            },
-            { throwOnError: true },
+          await waitForStop(
+            sdk.v2.session.permission.reply(
+              {
+                sessionID,
+                requestID: event.properties.id,
+                reply: "reject",
+              },
+              { throwOnError: true, signal: taskController.signal },
+            ),
           )
         }
 
@@ -258,9 +332,9 @@ export async function executeTask(
         }
       }
 
-      if (stopReason) break
+      if (stopReason) throw new TaskStoppedError(stopReason)
 
-      const promptOutcome = await promptPromise
+      const promptOutcome = await waitForStop(promptPromise)
       const promptData = "result" in promptOutcome ? promptOutcome.result.data : undefined
       const promptError =
         ("error" in promptOutcome ? opencodeErrorMessage(promptOutcome.error) : "") ||
@@ -278,7 +352,7 @@ export async function executeTask(
 
       const retryNumber = attempt + 1
       const delta =
-        `[worker] Provider request timed out; retrying same OpenCode session ` +
+        `[worker] Transient provider failure; retrying same OpenCode session ` +
         `(${retryNumber}/${maxProviderRetries}).`
       output += `ERROR: ${promptError}\n${delta}\n`
       emitProgress(delta)
@@ -289,29 +363,8 @@ export async function executeTask(
         stopPromise,
       ])
       if (delayResult) {
-        stopReason = delayResult
-        break
+        throw new TaskStoppedError(delayResult)
       }
-    }
-
-    if (stopReason) {
-      try {
-        await sdk.session.abort({ sessionID }, { throwOnError: true })
-      } catch (error) {
-        console.error("[opencode_task_executor] failed to abort stopped session:", error)
-      }
-      // Do not await return(): a silent SSE iterator may still be blocked in next().
-      void eventIterator.return?.()
-
-      const durationMs = Date.now() - startTime
-      onResult({
-        task_id: request.task_id,
-        status: stopReason === "timeout" ? "error" : "cancelled",
-        output: output.trim(),
-        error: stopReason === "timeout" ? `Task timed out after ${timeoutMs}ms` : null,
-        duration_ms: durationMs,
-      })
-      return
     }
 
     const canonicalOutput = extractAssistantText(finalPromptData?.parts)
@@ -354,6 +407,19 @@ export async function executeTask(
     })
   } catch (err) {
     const durationMs = Date.now() - startTime
+    const stopped = stopReason ?? (err instanceof TaskStoppedError ? err.reason : undefined)
+    if (stopped) {
+      closeEvents?.()
+      await abortSession()
+      onResult({
+        task_id: request.task_id,
+        status: stopped === "timeout" ? "timed_out" : "cancelled",
+        output: output.trim(),
+        error: stopped === "timeout" ? `Task timed out after ${timeoutMs}ms` : null,
+        duration_ms: Date.now() - startTime,
+      })
+      return
+    }
     const errorMsg = opencodeErrorMessage(err)
     onResult({
       task_id: request.task_id,
@@ -366,6 +432,7 @@ export async function executeTask(
     clearTimeout(timeout)
     if (progressHeartbeat) clearInterval(progressHeartbeat)
     abortSignal?.removeEventListener("abort", handleAbort)
+    closeEvents?.()
     for (const key of injectedKeys) {
       if (savedValues[key] === undefined) {
         delete process.env[key]

@@ -8,6 +8,8 @@
  *   client — connects outbound to a hub
  */
 
+import { resolve } from "node:path"
+
 import {
   createEnvelope,
   parseEnvelope,
@@ -27,6 +29,7 @@ process.on("unhandledRejection", (reason) => {
   console.error("[bridge] unhandledRejection (surviving):", reason)
 })
 import { executeTask } from "./opencode_task_executor"
+import { expandWorkspacePath } from "./workspace_path"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -38,14 +41,31 @@ const WS_URL = process.env.WS_URL || ""
 const AGENT_AUTH_TOKEN = process.env.AGENT_AUTH_TOKEN || ""
 const RECONNECT_MS = parseInt(process.env.RECONNECT_MS || "3000", 10)
 const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || "20000", 10)
+const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
 
 // ── Active Tasks ──────────────────────────────────────────────────────────────
 
-const activeTasks = new Map<string, AbortController>()
+type BridgeSocket = { send(data: string): void }
+type ActiveTask = { controller: AbortController; socket: BridgeSocket; workspace: string }
+
+const activeTasks = new Map<string, ActiveTask>()
+const activeWorkspaces = new Map<string, string>()
+
+function taskWorkspace(request: TaskRequest): string {
+  return resolve(expandWorkspacePath(request.context?.project_dir || WORKSPACE_ROOT, WORKSPACE_ROOT))
+}
+
+function abortSocketTasks(socket: BridgeSocket): void {
+  for (const [taskID, task] of activeTasks) {
+    if (task.socket !== socket) continue
+    console.warn(`[bridge] task ${taskID}: connection closed; cancelling`)
+    task.controller.abort()
+  }
+}
 
 // ── Message Handling ──────────────────────────────────────────────────────────
 
-function sendReady(ws: { send(data: string): void }): void {
+function sendReady(ws: BridgeSocket): void {
   const msg = createEnvelope("ready", {
     worker_id: WORKER_ID,
     version: WORKER_VERSION,
@@ -54,7 +74,7 @@ function sendReady(ws: { send(data: string): void }): void {
   ws.send(JSON.stringify(msg))
 }
 
-async function handleMessage(data: string, ws: { send(data: string): void }): Promise<void> {
+async function handleMessage(data: string, ws: BridgeSocket): Promise<void> {
   const envelope = parseEnvelope(data)
   if (!envelope) {
     console.error("[bridge] failed to parse message:", data.slice(0, 200))
@@ -66,7 +86,9 @@ async function handleMessage(data: string, ws: { send(data: string): void }): Pr
   try {
     switch (envelope.type) {
       case "task_request":
-        await handleTaskRequest(envelope.payload as unknown as TaskRequest, ws)
+        void handleTaskRequest(envelope.payload as unknown as TaskRequest, ws).catch((error) => {
+          console.error("[bridge] asynchronous task handler failed:", error)
+        })
         break
 
       case "cancel":
@@ -87,7 +109,7 @@ async function handleMessage(data: string, ws: { send(data: string): void }): Pr
 
 async function handleTaskRequest(
   request: TaskRequest,
-  ws: { send(data: string): void },
+  ws: BridgeSocket,
 ): Promise<void> {
   if (!request.task_id || !request.prompt) {
     const errMsg = createEnvelope("task_result", {
@@ -113,8 +135,28 @@ async function handleTaskRequest(
     return
   }
 
+  const workspace = taskWorkspace(request)
+  const workspaceTask = activeWorkspaces.get(workspace)
+  if (workspaceTask) {
+    const result = createEnvelope("task_result", {
+      task_id: request.task_id,
+      status: "error",
+      output: "",
+      error:
+        `Workspace ${workspace} is already being modified by task ${workspaceTask}. ` +
+        "Cancel or finish that task before dispatching another task to this workspace.",
+      duration_ms: 0,
+    })
+    ws.send(JSON.stringify(result))
+    console.warn(
+      `[bridge] task ${request.task_id}: rejected because workspace is owned by ${workspaceTask}`,
+    )
+    return
+  }
+
   const controller = new AbortController()
-  activeTasks.set(request.task_id, controller)
+  activeTasks.set(request.task_id, { controller, socket: ws, workspace })
+  activeWorkspaces.set(workspace, request.task_id)
 
   try {
     await executeTask(
@@ -132,14 +174,15 @@ async function handleTaskRequest(
     )
   } finally {
     activeTasks.delete(request.task_id)
+    if (activeWorkspaces.get(workspace) === request.task_id) activeWorkspaces.delete(workspace)
   }
 }
 
 function handleCancel(payload: { task_id: string }): void {
-  const controller = activeTasks.get(payload.task_id)
-  if (controller) {
+  const task = activeTasks.get(payload.task_id)
+  if (task) {
     console.log(`[bridge] task ${payload.task_id}: cancelled`)
-    controller.abort()
+    task.controller.abort()
   } else {
     console.warn(`[bridge] cancel: task ${payload.task_id} not found`)
   }
@@ -217,6 +260,7 @@ function startServer(): void {
         await handleMessage(data, ws)
       },
       close(ws, code, reason) {
+        abortSocketTasks(ws)
         connectionCount--
         updateState(connectionCount > 0)
         console.log(`[bridge] agent disconnected: ${code} ${reason} (${connectionCount} active)`)
@@ -259,19 +303,21 @@ async function startClient(): Promise<void> {
       const ws = new WebSocket(uri, {
         headers,
       })
+      const bridgeSocket: BridgeSocket = { send: (data) => ws.send(data) }
 
       ws.addEventListener("open", () => {
         console.log(`[bridge] connected to hub`)
         updateState(true)
-        sendReady({ send: (data: string) => ws.send(data) })
+        sendReady(bridgeSocket)
       })
 
       ws.addEventListener("message", async (event) => {
         const data = typeof event.data === "string" ? event.data : ""
-        await handleMessage(data, { send: (d: string) => ws.send(d) })
+        await handleMessage(data, bridgeSocket)
       })
 
       ws.addEventListener("close", (event) => {
+        abortSocketTasks(bridgeSocket)
         console.log(`[bridge] disconnected from hub: ${event.code} ${event.reason}`)
         updateState(false)
         scheduleReconnect()

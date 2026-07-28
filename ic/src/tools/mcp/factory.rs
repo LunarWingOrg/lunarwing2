@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use crate::secrets::SecretsStore;
 use crate::tools::ToolError;
-use crate::tools::mcp::config::{EffectiveTransport, McpServerConfig};
+use crate::tools::mcp::config::{
+    EffectiveTransport, McpServerConfig, validate_managed_study_notes_runtime,
+};
 use crate::tools::mcp::{McpClient, McpProcessManager, McpSessionManager, McpTransport};
 
 /// Error returned when MCP client creation fails.
@@ -33,6 +35,12 @@ pub async fn create_client_from_config(
     user_id: &str,
 ) -> Result<McpClient, McpFactoryError> {
     let server_name = server.name.clone();
+    validate_managed_study_notes_runtime(&server).map_err(|error| {
+        McpFactoryError::InvalidConfig {
+            name: server_name.clone(),
+            reason: error.to_string(),
+        }
+    })?;
 
     match server.effective_transport() {
         EffectiveTransport::Stdio { command, args, env } => {

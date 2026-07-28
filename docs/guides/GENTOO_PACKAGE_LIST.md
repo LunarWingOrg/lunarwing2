@@ -62,7 +62,7 @@ sudo emerge sys-process/fcron      # or sys-process/cronie, or sys-process/dcron
 ```
 
 `mt-admin` adds the cron daemon to the `default` runlevel automatically when it installs the
-schedule (`*/15` by default). `fcron` is preferred (supports catch-up of missed runs).
+schedule (`*/5` by default). `fcron` is preferred (supports catch-up of missed runs).
 
 ## 4. Rust build toolchain (per-tenant builds)
 

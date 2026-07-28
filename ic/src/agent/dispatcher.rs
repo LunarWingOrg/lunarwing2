@@ -1318,6 +1318,8 @@ mod tests {
             owner_id: "default".to_string(),
             vision_service_url: None,
             store: None,
+            container_job_manager: None,
+            external_worker_manager: None,
             llm: Arc::new(StaticLlmProvider),
             cheap_llm: None,
             safety: Arc::new(SafetyLayer::new(&SafetyConfig {
@@ -2205,6 +2207,8 @@ mod tests {
             owner_id: "default".to_string(),
             vision_service_url: None,
             store: None,
+            container_job_manager: None,
+            external_worker_manager: None,
             llm,
             cheap_llm: None,
             safety: Arc::new(SafetyLayer::new(&SafetyConfig {
@@ -2328,6 +2332,8 @@ mod tests {
                 owner_id: "default".to_string(),
                 vision_service_url: None,
                 store: None,
+                container_job_manager: None,
+                external_worker_manager: None,
                 llm,
                 cheap_llm: None,
                 safety: Arc::new(SafetyLayer::new(&SafetyConfig {

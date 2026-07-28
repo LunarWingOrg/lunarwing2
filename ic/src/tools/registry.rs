@@ -498,6 +498,7 @@ impl ToolRegistry {
         secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
     ) {
         let mut create_tool = CreateJobTool::new(Arc::clone(&context_manager));
+        let scheduler_for_cancel = scheduler_slot.clone();
         if let Some(slot) = scheduler_slot {
             create_tool = create_tool.with_scheduler_slot(slot);
         }
@@ -527,11 +528,17 @@ impl ToolRegistry {
         self.register_sync(Arc::new(list_tool));
         self.register_sync(Arc::new(status_tool));
         let mut cancel_tool = CancelJobTool::new(Arc::clone(&context_manager));
+        if let Some(slot) = scheduler_for_cancel {
+            cancel_tool = cancel_tool.with_scheduler(slot);
+        }
         if let Some(jm) = jm_for_cancel {
             cancel_tool = cancel_tool.with_sandbox(jm, store_for_cancel);
         }
         if let Some(ewm) = ewm_for_cancel {
             cancel_tool = cancel_tool.with_external_workers(ewm);
+        }
+        if let Some(cancel_store) = store.clone() {
+            cancel_tool = cancel_tool.with_store(cancel_store);
         }
         self.register_sync(Arc::new(cancel_tool));
 
@@ -539,7 +546,7 @@ impl ToolRegistry {
         let mut job_tool_count = 4;
 
         // Register event reader if store is available
-        if let Some(store) = store {
+        if let Some(store) = store.clone() {
             self.register_sync(Arc::new(JobEventsTool::new(
                 store,
                 Arc::clone(&context_manager),
@@ -549,10 +556,11 @@ impl ToolRegistry {
 
         // Register prompt tool if queue is available
         if let Some(pq) = prompt_queue {
-            self.register_sync(Arc::new(JobPromptTool::new(
-                pq,
-                Arc::clone(&context_manager),
-            )));
+            let mut prompt_tool = JobPromptTool::new(pq, Arc::clone(&context_manager));
+            if let Some(prompt_store) = store {
+                prompt_tool = prompt_tool.with_store(prompt_store);
+            }
+            self.register_sync(Arc::new(prompt_tool));
             job_tool_count += 1;
         }
 

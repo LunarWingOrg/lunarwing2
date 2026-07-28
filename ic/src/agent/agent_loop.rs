@@ -220,6 +220,10 @@ pub struct AgentDeps {
     /// tool receives it via Request.context with host-wins precedence.
     pub vision_service_url: Option<String>,
     pub store: Option<Arc<dyn Database>>,
+    /// Container runtime used by `/cancel` for sandbox jobs.
+    pub container_job_manager: Option<Arc<crate::orchestrator::ContainerJobManager>>,
+    /// External worker runtime used by `/cancel` for persistent worker jobs.
+    pub external_worker_manager: Option<Arc<crate::orchestrator::ExternalWorkerManager>>,
     pub llm: Arc<dyn LlmProvider>,
     /// Cheap/fast LLM for lightweight tasks (heartbeat, routing, evaluation).
     /// Falls back to the main `llm` if None.

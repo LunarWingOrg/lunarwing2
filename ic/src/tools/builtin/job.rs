@@ -891,12 +891,19 @@ impl CreateJobTool {
 
         let grants_json = serde_json::to_string(&options.credential_grants).unwrap_or_default();
 
-        self.context_manager
+        ewm.reserve_task(job_id, worker_name).await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("failed to reserve external job: {e}"))
+        })?;
+        if let Err(error) = self
+            .context_manager
             .register_sandbox_job(job_id, &ctx.user_id, task, task)
             .await
-            .map_err(|e| {
-                ToolError::ExecutionFailed(format!("failed to register external job: {}", e))
-            })?;
+        {
+            ewm.release_task_reservation(job_id).await;
+            return Err(ToolError::ExecutionFailed(format!(
+                "failed to register external job: {error}"
+            )));
+        }
 
         let record = SandboxJobRecord {
             id: job_id,
@@ -974,9 +981,8 @@ impl CreateJobTool {
                 )
                 .await
             {
-                Ok(Some(result)) => {
-                    let success = matches!(result.status, ExternalTaskStatus::Success);
-                    if success {
+                Ok(Some(result)) => match result.status {
+                    ExternalTaskStatus::Success => {
                         let output = serde_json::json!({
                             "job_id": job_id.to_string(),
                             "status": "completed",
@@ -986,14 +992,23 @@ impl CreateJobTool {
                             "timeout_ms": worker_timeout_ms,
                         });
                         Ok(ToolOutput::success(output, start.elapsed()))
-                    } else {
-                        Err(ToolError::ExecutionFailed(format!(
-                            "external worker '{}' failed: {}",
-                            worker_name,
-                            result.error.as_deref().unwrap_or(&result.output)
-                        )))
                     }
-                }
+                    ExternalTaskStatus::Cancelled => {
+                        let output = serde_json::json!({
+                            "job_id": job_id.to_string(),
+                            "status": "cancelled",
+                            "worker": worker_name,
+                            "output": result.output,
+                            "duration_ms": result.duration_ms,
+                        });
+                        Ok(ToolOutput::success(output, start.elapsed()))
+                    }
+                    _ => Err(ToolError::ExecutionFailed(format!(
+                        "external worker '{}' failed: {}",
+                        worker_name,
+                        result.error.as_deref().unwrap_or(&result.output)
+                    ))),
+                },
                 Ok(None) => {
                     let output = serde_json::json!({
                         "job_id": job_id.to_string(),
@@ -1639,7 +1654,7 @@ impl Tool for ListJobsTool {
                 "pending" => Some("pending"),
                 "inprogress" | "running" | "creating" => Some("in_progress"),
                 "completed" | "submitted" | "accepted" => Some("completed"),
-                "failed" | "cancelled" => Some("failed"),
+                "failed" | "cancelled" | "timedout" => Some("failed"),
                 "stuck" => Some("stuck"),
                 "interrupted" => Some("interrupted"),
                 _ => None,
@@ -1685,7 +1700,7 @@ fn job_matches_filter(filter: &str, status: &str) -> bool {
         "completed" => matches!(status.as_str(), "completed" | "submitted" | "accepted"),
         "failed" => matches!(
             status.as_str(),
-            "failed" | "cancelled" | "stuck" | "interrupted"
+            "failed" | "cancelled" | "timedout" | "stuck" | "interrupted"
         ),
         _ => true,
     }
@@ -1816,6 +1831,7 @@ impl Tool for JobStatusTool {
 /// of the web cancellation handler in `channels/web/handlers/jobs.rs`.
 pub struct CancelJobTool {
     context_manager: Arc<ContextManager>,
+    scheduler: Option<SchedulerSlot>,
     job_manager: Option<Arc<ContainerJobManager>>,
     external_worker_manager: Option<Arc<ExternalWorkerManager>>,
     store: Option<Arc<dyn Database>>,
@@ -1825,10 +1841,16 @@ impl CancelJobTool {
     pub fn new(context_manager: Arc<ContextManager>) -> Self {
         Self {
             context_manager,
+            scheduler: None,
             job_manager: None,
             external_worker_manager: None,
             store: None,
         }
+    }
+
+    pub fn with_scheduler(mut self, scheduler: SchedulerSlot) -> Self {
+        self.scheduler = Some(scheduler);
+        self
     }
 
     /// Inject sandbox dependencies so cancellation also stops containers.
@@ -1847,6 +1869,11 @@ impl CancelJobTool {
         self.external_worker_manager = Some(mgr);
         self
     }
+
+    pub fn with_store(mut self, store: Arc<dyn Database>) -> Self {
+        self.store = Some(store);
+        self
+    }
 }
 
 #[async_trait]
@@ -1856,7 +1883,9 @@ impl Tool for CancelJobTool {
     }
 
     fn description(&self) -> &str {
-        "Cancel a running or pending job. The job will be marked as cancelled and stopped."
+        "Immediately cancel a running or pending job and stop its active scheduler, sandbox, or \
+         external-worker execution. Use this instead of job_prompt(done=true), which only ends \
+         follow-up prompting and does not cancel work."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1883,78 +1912,84 @@ impl Tool for CancelJobTool {
         let job_id_str = require_str(&params, "job_id")?;
         let job_id = resolve_job_id(job_id_str, &self.context_manager).await?;
 
-        // Transition to cancelled state
-        match self
+        let job = self
             .context_manager
-            .update_context(job_id, |ctx| {
-                if ctx.user_id != requester_id {
-                    return Err("Job not found".to_string());
-                }
-                ctx.transition_to(JobState::Cancelled, Some("Cancelled by user".to_string()))
-            })
+            .get_context(job_id)
             .await
+            .map_err(|_| ToolError::ExecutionFailed(format!("job {job_id} not found")))?;
+        if job.user_id != requester_id {
+            return Err(ToolError::ExecutionFailed("Job not found".to_string()));
+        }
+        if !job.state.is_active() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "job {job_id} is {} and cannot be cancelled",
+                job.state
+            )));
+        }
+
+        let mut stopped = false;
+        if let Some(ref ewm) = self.external_worker_manager {
+            stopped |= ewm.cancel_task(job_id).await;
+        }
+        if let Some(ref slot) = self.scheduler
+            && let Some(ref scheduler) = *slot.read().await
         {
-            Ok(Ok(())) => {
-                // Stop the sandbox container if one exists for this job.
-                if let Some(ref jm) = self.job_manager
-                    && let Err(e) = jm.stop_job(job_id).await
-                {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        "Failed to stop container during cancellation: {}", e
-                    );
+            stopped |= scheduler.stop(job_id).await.map_err(|e| {
+                ToolError::ExecutionFailed(format!("failed to stop scheduled job: {e}"))
+            })?;
+        }
+        if let Some(ref jm) = self.job_manager {
+            match jm.stop_job(job_id).await {
+                Ok(()) => stopped = true,
+                Err(crate::error::OrchestratorError::ContainerNotFound { .. }) => {}
+                Err(error) => {
+                    tracing::warn!(%job_id, "Failed to stop container during cancellation: {error}");
                 }
-
-                // Cancel via external worker manager if applicable.
-                if let Some(ref ewm) = self.external_worker_manager {
-                    let _ = ewm.cancel_task(job_id).await;
-                }
-
-                // Update DB status for sandbox jobs. Uses "failed" (not
-                // "cancelled") to match the web cancel handler convention —
-                // the sandbox DB schema treats cancellation as a failure variant.
-                if let Some(ref store) = self.store {
-                    let store = store.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = store
-                            .update_sandbox_job_status(
-                                job_id,
-                                "failed",
-                                Some(false),
-                                Some("Cancelled by user"),
-                                None,
-                                Some(Utc::now()),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                job_id = %job_id,
-                                "Failed to update sandbox job status on cancel: {}", e
-                            );
-                        }
-                    });
-                }
-
-                let result = serde_json::json!({
-                    "job_id": job_id.to_string(),
-                    "status": "cancelled",
-                    "message": "Job cancelled successfully"
-                });
-                Ok(ToolOutput::success(result, start.elapsed()))
-            }
-            Ok(Err(reason)) => {
-                let result = serde_json::json!({
-                    "error": format!("Cannot cancel job: {}", reason)
-                });
-                Ok(ToolOutput::success(result, start.elapsed()))
-            }
-            Err(e) => {
-                let result = serde_json::json!({
-                    "error": format!("Job not found: {}", e)
-                });
-                Ok(ToolOutput::success(result, start.elapsed()))
             }
         }
+
+        let runtime_backends_configured = self.scheduler.is_some()
+            || self.job_manager.is_some()
+            || self.external_worker_manager.is_some();
+        if !stopped && runtime_backends_configured {
+            return Err(ToolError::ExecutionFailed(format!(
+                "job {job_id} has no active runtime to cancel"
+            )));
+        }
+
+        self.context_manager
+            .update_context(job_id, |ctx| {
+                if ctx.state == JobState::Cancelled {
+                    Ok(())
+                } else {
+                    ctx.transition_to(JobState::Cancelled, Some("Cancelled by user".to_string()))
+                }
+            })
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("failed to update job: {e}")))?
+            .map_err(|e| ToolError::ExecutionFailed(format!("cannot cancel job: {e}")))?;
+
+        if let Some(ref store) = self.store
+            && let Err(error) = store
+                .update_sandbox_job_status(
+                    job_id,
+                    "cancelled",
+                    Some(false),
+                    Some("Cancelled by user"),
+                    None,
+                    Some(Utc::now()),
+                )
+                .await
+        {
+            tracing::warn!(%job_id, "Failed to persist job cancellation: {error}");
+        }
+
+        let result = serde_json::json!({
+            "job_id": job_id.to_string(),
+            "status": "cancelled",
+            "message": "Job cancellation requested"
+        });
+        Ok(ToolOutput::success(result, start.elapsed()))
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
@@ -2106,6 +2141,7 @@ impl Tool for JobEventsTool {
 pub struct JobPromptTool {
     prompt_queue: PromptQueue,
     context_manager: Arc<ContextManager>,
+    store: Option<Arc<dyn Database>>,
 }
 
 /// Type alias matching `crate::channels::web::server::PromptQueue`.
@@ -2123,7 +2159,13 @@ impl JobPromptTool {
         Self {
             prompt_queue,
             context_manager,
+            store: None,
         }
+    }
+
+    pub fn with_store(mut self, store: Arc<dyn Database>) -> Self {
+        self.store = Some(store);
+        self
     }
 }
 
@@ -2136,7 +2178,9 @@ impl Tool for JobPromptTool {
     fn description(&self) -> &str {
         "Send a follow-up prompt to a running Claude Code sandbox job. The prompt is \
          queued and delivered on the next poll cycle. Use this to give the sub-agent \
-         additional instructions, answer its questions, or tell it to wrap up."
+         additional instructions, answer its questions, or tell it to wrap up. This does \
+         not cancel work; use cancel_job for cancellation. External workers do not support \
+         follow-up prompts."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -2199,6 +2243,16 @@ impl Tool for JobPromptTool {
             return Err(ToolError::ExecutionFailed(format!(
                 "job {} is {} and cannot receive follow-up prompts",
                 job_id, job_ctx.state
+            )));
+        }
+
+        if let Some(ref store) = self.store
+            && let Ok(Some(mode)) = store.get_sandbox_job_mode(job_id).await
+            && mode.starts_with("external:")
+        {
+            return Err(ToolError::ExecutionFailed(format!(
+                "job {job_id} uses external worker '{}'; external jobs cannot receive job_prompt. Use cancel_job to stop it",
+                mode.trim_start_matches("external:")
             )));
         }
 

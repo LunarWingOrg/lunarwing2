@@ -15,7 +15,7 @@ use futures::{SinkExt, StreamExt};
 pub use lunarwing_common::PromptContextMessage as ConversationMessage;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use uuid::Uuid;
 
 use crate::channels::web::types::SseEvent;
@@ -142,14 +142,13 @@ struct TaskResultPayload {
 pub struct ExternalJobHandle {
     pub job_id: Uuid,
     pub worker_name: String,
-    cancel_tx: Option<oneshot::Sender<()>>,
+    cancel_tx: watch::Sender<bool>,
+    started: bool,
 }
 
 impl ExternalJobHandle {
-    pub fn cancel(mut self) {
-        if let Some(tx) = self.cancel_tx.take() {
-            let _ = tx.send(());
-        }
+    pub fn cancel(&self) {
+        self.cancel_tx.send_replace(true);
     }
 }
 
@@ -163,7 +162,7 @@ pub struct ExternalWorkerManager {
     job_event_tx: Option<broadcast::Sender<(Uuid, String, SseEvent)>>,
     context_manager: Option<Arc<ContextManager>>,
     store: Option<Arc<dyn Database>>,
-    active_handles: Arc<RwLock<HashMap<Uuid, Arc<Mutex<ExternalJobHandle>>>>>,
+    active_handles: Arc<RwLock<HashMap<Uuid, ExternalJobHandle>>>,
 }
 
 impl ExternalWorkerManager {
@@ -242,6 +241,46 @@ impl ExternalWorkerManager {
         self.workers.is_empty()
     }
 
+    /// Reserve a job ID before exposing its context or DB record to cancellation callers.
+    pub async fn reserve_task(
+        &self,
+        job_id: Uuid,
+        worker_name: &str,
+    ) -> Result<(), OrchestratorError> {
+        if !self.workers.contains_key(worker_name) {
+            return Err(OrchestratorError::ExternalWorkerNotFound {
+                worker_name: worker_name.to_string(),
+            });
+        }
+
+        let mut handles = self.active_handles.write().await;
+        if handles.contains_key(&job_id) {
+            return Err(OrchestratorError::ExternalWorkerTaskAlreadyActive {
+                worker_name: worker_name.to_string(),
+                job_id,
+            });
+        }
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        handles.insert(
+            job_id,
+            ExternalJobHandle {
+                job_id,
+                worker_name: worker_name.to_string(),
+                cancel_tx,
+                started: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Release a reservation when setup fails before task execution starts.
+    pub async fn release_task_reservation(&self, job_id: Uuid) {
+        let mut handles = self.active_handles.write().await;
+        if handles.get(&job_id).is_some_and(|handle| !handle.started) {
+            handles.remove(&job_id);
+        }
+    }
+
     /// Execute a task on a named external worker.
     ///
     /// Connects via WebSocket, sends the task, streams progress as job events,
@@ -289,18 +328,51 @@ impl ExternalWorkerManager {
         let active_handles = Arc::clone(&self.active_handles);
         let pool = Arc::clone(&self.pool);
 
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let handle = Arc::new(Mutex::new(ExternalJobHandle {
-            job_id,
-            worker_name: worker_name_owned.clone(),
-            cancel_tx: Some(cancel_tx),
-        }));
-        active_handles
-            .write()
-            .await
-            .insert(job_id, Arc::clone(&handle));
+        let cancel_rx = {
+            let mut handles = active_handles.write().await;
+            if let Some(handle) = handles.get_mut(&job_id) {
+                if handle.started {
+                    return Err(OrchestratorError::ExternalWorkerTaskAlreadyActive {
+                        worker_name: worker_name_owned,
+                        job_id,
+                    });
+                }
+                handle.started = true;
+                handle.cancel_tx.subscribe()
+            } else {
+                let (cancel_tx, cancel_rx) = watch::channel(false);
+                handles.insert(
+                    job_id,
+                    ExternalJobHandle {
+                        job_id,
+                        worker_name: worker_name_owned.clone(),
+                        cancel_tx,
+                        started: true,
+                    },
+                );
+                cancel_rx
+            }
+        };
 
-        let mut maybe_cancel_rx = Some(cancel_rx);
+        if *cancel_rx.borrow() {
+            let result = ExternalTaskResult {
+                status: ExternalTaskStatus::Cancelled,
+                output: String::new(),
+                error: Some("Cancelled before external worker dispatch".to_string()),
+                duration_ms: 0,
+            };
+            record_external_task_cancelled(
+                job_id,
+                &context.user_id,
+                event_tx.as_ref(),
+                context_manager.as_ref(),
+                store.as_ref(),
+                result.error.as_deref().unwrap_or("Cancelled by user"),
+            )
+            .await;
+            active_handles.write().await.remove(&job_id);
+            return Ok(wait.then_some(result));
+        }
 
         if wait {
             let lb = self.load_balancers.get(worker_name);
@@ -330,11 +402,6 @@ impl ExternalWorkerManager {
                     .unwrap_or_else(|| config.auth_token.clone());
                 let attempt_pool_key = format!("{worker_name_owned}:{attempt_url}");
 
-                let attempt_cancel_rx = maybe_cancel_rx.take().unwrap_or_else(|| {
-                    let (_, rx) = oneshot::channel();
-                    rx
-                });
-
                 let result = run_external_task(
                     job_id,
                     &attempt_url,
@@ -345,7 +412,7 @@ impl ExternalWorkerManager {
                     event_tx.as_ref(),
                     context_manager.as_ref(),
                     store.as_ref(),
-                    attempt_cancel_rx,
+                    cancel_rx.clone(),
                     context.clone(),
                     &pool,
                     &attempt_pool_key,
@@ -389,10 +456,6 @@ impl ExternalWorkerManager {
             active_handles.write().await.remove(&job_id);
             unreachable!("loop always returns when max_attempts > 0");
         } else {
-            let spawn_cancel_rx = maybe_cancel_rx.take().unwrap_or_else(|| {
-                let (_, rx) = oneshot::channel();
-                rx
-            });
             tokio::spawn(async move {
                 // Hold the endpoint lease for the task's lifetime so the active
                 // count (LeastConnections accounting) stays accurate until the
@@ -408,7 +471,7 @@ impl ExternalWorkerManager {
                     event_tx.as_ref(),
                     context_manager.as_ref(),
                     store.as_ref(),
-                    spawn_cancel_rx,
+                    cancel_rx,
                     context,
                     &pool,
                     &pool_key,
@@ -454,12 +517,9 @@ impl ExternalWorkerManager {
 
     /// Cancel an active external worker task.
     pub async fn cancel_task(&self, job_id: Uuid) -> bool {
-        if let Some(handle) = self.active_handles.write().await.remove(&job_id) {
-            let mut h = handle.lock().await;
-            if let Some(tx) = h.cancel_tx.take() {
-                let _ = tx.send(());
-                return true;
-            }
+        if let Some(handle) = self.active_handles.read().await.get(&job_id) {
+            handle.cancel();
+            return true;
         }
         false
     }
@@ -681,6 +741,9 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WsWrite = futures::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>;
+
+const CANCEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct PooledConnection {
     pub stream: WsStream,
@@ -947,12 +1010,14 @@ async fn run_external_task(
     event_tx: Option<&broadcast::Sender<(Uuid, String, SseEvent)>>,
     context_manager: Option<&Arc<ContextManager>>,
     store: Option<&Arc<dyn Database>>,
-    cancel_rx: oneshot::Receiver<()>,
+    cancel_rx: watch::Receiver<bool>,
     context: TaskContext,
     pool: &WorkerConnectionPool,
     pool_key: &str,
 ) -> Result<ExternalTaskResult, OrchestratorError> {
     use tokio_tungstenite::tungstenite;
+
+    let event_user_id = context.user_id.clone();
 
     // Probe pooled connections before dispatch so a worker restart cannot leave
     // the next task attempting to use a dead WebSocket.
@@ -984,6 +1049,7 @@ async fn run_external_task(
     emit_event(
         event_tx,
         job_id,
+        &event_user_id,
         SseEvent::JobStatus {
             job_id: job_id.to_string(),
             message: format!("Connected to external worker '{worker_name}'"),
@@ -1073,6 +1139,7 @@ async fn run_external_task(
                                 emit_event(
                                     event_tx,
                                     job_id,
+                                    &event_user_id,
                                     SseEvent::JobMessage {
                                         job_id: job_id.to_string(),
                                         content: progress.delta.clone(),
@@ -1102,6 +1169,7 @@ async fn run_external_task(
                             let status = match result.status.as_str() {
                                 "success" => ExternalTaskStatus::Success,
                                 "cancelled" => ExternalTaskStatus::Cancelled,
+                                "timed_out" => ExternalTaskStatus::TimedOut,
                                 _ => ExternalTaskStatus::Failed,
                             };
 
@@ -1118,19 +1186,12 @@ async fn run_external_task(
                         }
                     }
                 }
-                _ = &mut cancel_rx => {
-                    // Send cancel envelope
-                    let cancel_env = Envelope::new(
-                        "cancel",
-                        serde_json::json!({ "task_id": job_id.to_string() }),
-                    );
-                    if let Ok(json) = serde_json::to_string(&cancel_env) {
-                        let _ = write.send(tungstenite::Message::Text(json.into())).await;
-                    }
+                _ = wait_for_cancellation(&mut cancel_rx) => {
+                    send_cancel_envelope(&mut write, job_id).await;
                     return Ok(ExternalTaskResult {
                         status: ExternalTaskStatus::Cancelled,
                         output: accumulated_output.clone(),
-                        error: None,
+                        error: Some("Cancelled by user".to_string()),
                         duration_ms: 0,
                     });
                 }
@@ -1142,6 +1203,10 @@ async fn run_external_task(
     let task_result = match result {
         Ok(r) => r?,
         Err(_) => {
+            // Tell the worker to abort its underlying provider/session work before
+            // dropping the socket. Its own deadline is defense in depth, not the
+            // daemon's only cancellation mechanism.
+            send_cancel_envelope(&mut write, job_id).await;
             return Err(OrchestratorError::ExternalWorkerTimeout {
                 worker_name: worker_name.to_string(),
                 job_id,
@@ -1149,38 +1214,58 @@ async fn run_external_task(
         }
     };
 
-    // Update context manager state
-    let success = matches!(task_result.status, ExternalTaskStatus::Success);
-    let final_state = if success {
-        JobState::Completed
-    } else {
-        JobState::Failed
+    let (success, final_state, status_str, final_msg) = match &task_result.status {
+        ExternalTaskStatus::Success => (
+            true,
+            JobState::Completed,
+            "completed",
+            format!("Completed: {}", task_result.output),
+        ),
+        ExternalTaskStatus::Cancelled => (
+            false,
+            JobState::Cancelled,
+            "cancelled",
+            "Cancelled by user".to_string(),
+        ),
+        ExternalTaskStatus::TimedOut => (
+            false,
+            JobState::Failed,
+            "timed_out",
+            task_result
+                .error
+                .clone()
+                .unwrap_or_else(|| "External worker timed out".to_string()),
+        ),
+        ExternalTaskStatus::Failed | ExternalTaskStatus::Partial(_) => (
+            false,
+            JobState::Failed,
+            "failed",
+            format!(
+                "Failed: {}",
+                task_result.error.as_deref().unwrap_or("unknown error")
+            ),
+        ),
     };
 
     if let Some(cm) = context_manager {
         let _ = cm
             .update_context(job_id, |ctx| {
+                if ctx.state == final_state {
+                    return Ok(());
+                }
                 ctx.transition_to(final_state, task_result.error.clone())
             })
             .await;
     }
 
     // Persist final event
-    let final_msg = if success {
-        format!("Completed: {}", task_result.output)
-    } else {
-        format!(
-            "Failed: {}",
-            task_result.error.as_deref().unwrap_or("unknown error")
-        )
-    };
     persist_event(store, job_id, "result", &final_msg).await;
 
     // Emit final SSE event
-    let status_str = if success { "completed" } else { "failed" };
     emit_event(
         event_tx,
         job_id,
+        &event_user_id,
         SseEvent::JobResult {
             job_id: job_id.to_string(),
             status: status_str.to_string(),
@@ -1191,11 +1276,10 @@ async fn run_external_task(
 
     // Update DB job record
     if let Some(db) = store {
-        let status = if success { "completed" } else { "failed" };
         let _ = db
             .update_sandbox_job_status(
                 job_id,
-                status,
+                status_str,
                 Some(success),
                 task_result.error.as_deref(),
                 None,
@@ -1234,13 +1318,44 @@ async fn run_external_task(
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+async fn wait_for_cancellation(cancel_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancel_rx.borrow() {
+            return;
+        }
+        if cancel_rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+async fn send_cancel_envelope(write: &mut WsWrite, job_id: Uuid) {
+    let cancel_env = Envelope::new(
+        "cancel",
+        serde_json::json!({ "task_id": job_id.to_string() }),
+    );
+    let Ok(json) = serde_json::to_string(&cancel_env) else {
+        return;
+    };
+    if tokio::time::timeout(
+        CANCEL_SEND_TIMEOUT,
+        write.send(tokio_tungstenite::tungstenite::Message::Text(json.into())),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(%job_id, "Timed out sending external worker cancellation");
+    }
+}
+
 fn emit_event(
     tx: Option<&broadcast::Sender<(Uuid, String, SseEvent)>>,
     job_id: Uuid,
+    user_id: &str,
     event: SseEvent,
 ) {
     if let Some(tx) = tx {
-        let _ = tx.send((job_id, "external".to_string(), event));
+        let _ = tx.send((job_id, user_id.to_string(), event));
     }
 }
 
@@ -1270,8 +1385,17 @@ async fn record_external_task_error(
     store: Option<&Arc<dyn Database>>,
 ) {
     let reason = error.to_string();
+    let status = if matches!(error, OrchestratorError::ExternalWorkerTimeout { .. }) {
+        "timed_out"
+    } else {
+        "failed"
+    };
+    let mut user_id = String::new();
 
     if let Some(cm) = context_manager {
+        if let Ok(context) = cm.get_context(job_id).await {
+            user_id = context.user_id;
+        }
         let _ = cm
             .update_context(job_id, |ctx| {
                 ctx.transition_to(JobState::Failed, Some(reason.clone()))
@@ -1279,13 +1403,14 @@ async fn record_external_task_error(
             .await;
     }
 
-    persist_event(store, job_id, "result", &format!("Failed: {reason}")).await;
+    persist_event(store, job_id, "result", &format!("{status}: {reason}")).await;
     emit_event(
         event_tx,
         job_id,
+        &user_id,
         SseEvent::JobResult {
             job_id: job_id.to_string(),
-            status: "failed".to_string(),
+            status: status.to_string(),
             session_id: None,
             fallback_deliverable: None,
         },
@@ -1295,9 +1420,54 @@ async fn record_external_task_error(
         let _ = db
             .update_sandbox_job_status(
                 job_id,
-                "failed",
+                status,
                 Some(false),
                 Some(&reason),
+                None,
+                Some(Utc::now()),
+            )
+            .await;
+    }
+}
+
+async fn record_external_task_cancelled(
+    job_id: Uuid,
+    user_id: &str,
+    event_tx: Option<&broadcast::Sender<(Uuid, String, SseEvent)>>,
+    context_manager: Option<&Arc<ContextManager>>,
+    store: Option<&Arc<dyn Database>>,
+    reason: &str,
+) {
+    if let Some(context_manager) = context_manager {
+        let _ = context_manager
+            .update_context(job_id, |context| {
+                if context.state == JobState::Cancelled {
+                    Ok(())
+                } else {
+                    context.transition_to(JobState::Cancelled, Some(reason.to_string()))
+                }
+            })
+            .await;
+    }
+    persist_event(store, job_id, "result", reason).await;
+    emit_event(
+        event_tx,
+        job_id,
+        user_id,
+        SseEvent::JobResult {
+            job_id: job_id.to_string(),
+            status: "cancelled".to_string(),
+            session_id: None,
+            fallback_deliverable: None,
+        },
+    );
+    if let Some(store) = store {
+        let _ = store
+            .update_sandbox_job_status(
+                job_id,
+                "cancelled",
+                Some(false),
+                Some(reason),
                 None,
                 Some(Utc::now()),
             )

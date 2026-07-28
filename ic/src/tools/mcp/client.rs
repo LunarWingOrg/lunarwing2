@@ -667,7 +667,14 @@ impl Tool for McpToolWrapper {
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        if self.tool.requires_approval() {
+        if self.client.server_config.as_ref().is_some_and(|config| {
+            config
+                .always_require_approval
+                .iter()
+                .any(|name| name == &self.tool.name)
+        }) {
+            ApprovalRequirement::Always
+        } else if self.tool.requires_approval() {
             ApprovalRequirement::UnlessAutoApproved
         } else {
             ApprovalRequirement::Never
@@ -1365,6 +1372,25 @@ mod tests {
         };
         let approval = wrapper.requires_approval(&serde_json::json!({}));
         assert_eq!(approval, ApprovalRequirement::Never);
+    }
+
+    #[test]
+    fn test_mcp_tool_wrapper_always_approval_from_server_config() {
+        let mut client = McpClient::new("http://localhost:8080");
+        client.server_config = Some(
+            McpServerConfig::new("configured", "http://localhost:8080")
+                .with_always_require_approval(["do_thing"]),
+        );
+        let wrapper = McpToolWrapper {
+            tool: make_test_mcp_tool(false),
+            prefixed_name: "configured_do_thing".to_string(),
+            client: Arc::new(client),
+        };
+
+        assert_eq!(
+            wrapper.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::Always
+        );
     }
 
     #[tokio::test]

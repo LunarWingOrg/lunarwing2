@@ -171,6 +171,73 @@ the next startup. Pass `--offline` to request that behavior explicitly. A custom
 `--url` also requires an explicit `--token`, so a stored gateway credential is
 never forwarded to an overridden origin.
 
+#### LunarWing Study Notes
+
+LunarWing can seed the shared [lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp)
+checkout as a managed stdio server. Read-only mode is default. Clone it at an
+absolute, stable path, verify its database, then set `LW2STUDYMCP_HOME`:
+
+```bash
+git clone https://git.lunarwing.org/cmc/lw2studymcp.git /srv/lunarwing/lw2studymcp
+python3 /srv/lunarwing/lw2studymcp/memorydb.py stats
+export LW2STUDYMCP_HOME=/srv/lunarwing/lw2studymcp
+```
+
+Startup validates the canonical layout and creates or refreshes its managed
+`study_notes` config. Refresh preserves a disabled managed config. A user-owned
+config with the same name wins. A bundled trusted skill activates only when
+`LW2STUDYMCP_HOME` and `python3` are available.
+
+Write mode requires mutable state separate from executable code and skill content:
+
+```bash
+install -d /srv/lunarwing/study-notes-state
+cp -p /srv/lunarwing/lw2studymcp/agent-notes.sqlite3 \
+  /srv/lunarwing/study-notes-state/
+cp -a /srv/lunarwing/lw2studymcp/agent-notes-by-agent \
+  /srv/lunarwing/study-notes-state/
+export LW2STUDYMCP_STATE_HOME=/srv/lunarwing/study-notes-state
+export LW2STUDYMCP_ALLOW_WRITE=1
+```
+
+This adds `knowledge_submit_note` and `knowledge_update_status`. LunarWing marks
+both as `Always` approval tools. Code remains outside mutable state, preventing a
+note-writing agent from replacing MCP code or trusted skill instructions.
+
+Multi-tenant hosts should configure the same readable checkout through mt-admin:
+
+```bash
+sudo scripts/lunarwing-mt-admin.sh configure-study-mcp TENANT \
+  --home /srv/lunarwing/lw2studymcp
+sudo scripts/lunarwing-mt-admin.sh restart-tenant TENANT
+```
+
+Add `--allow-write` to create and seed isolated state at
+`<tenant-state-dir>/study-notes`. Use `--state-home <absolute-path>`
+for operator-managed state. Existing shared state must already grant tenant read
+and write access. Sharing one state path across tenants makes every participant a
+trusted writer whose notes become prompt input for all other participants.
+
+```bash
+sudo scripts/lunarwing-mt-admin.sh configure-study-mcp TENANT \
+  --home /srv/lunarwing/lw2studymcp --allow-write
+sudo scripts/lunarwing-mt-admin.sh restart-tenant TENANT
+```
+
+Write tools are exposed only to core LunarWing agents, where every mutation gets
+per-call approval. Podman workers always receive code and current state read-only
+at `/opt/lw2studymcp` and `/var/lib/lw2studymcp`. This prevents OpenCode's broad
+shell/edit permissions from bypassing MCP validation. Workers see core writes on
+later reads. On SELinux hosts, mt-admin applies `container_file_t` to both mounts.
+
+Rerun `configure-study-mcp` without `--allow-write` to disable mutation tools while
+retaining latest state for reads. Back up both state database and notes directory
+while tenant is stopped, or use one filesystem snapshot. State is not automatically
+committed back to the code checkout. Default per-tenant state is included in tenant
+state exports; custom external state must be backed up separately. Database updates
+become visible per request; restart LunarWing/OpenCode only after server or skill
+code changes.
+
 **Decision guide:**
 
 | Scenario | Use |
