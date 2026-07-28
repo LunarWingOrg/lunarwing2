@@ -1920,7 +1920,7 @@ impl Tool for CancelJobTool {
         if job.user_id != requester_id {
             return Err(ToolError::ExecutionFailed("Job not found".to_string()));
         }
-        if !job.state.is_active() {
+        if !job.state.is_parallel_blocking() {
             return Err(ToolError::ExecutionFailed(format!(
                 "job {job_id} is {} and cannot be cancelled",
                 job.state
@@ -2840,14 +2840,16 @@ mod tests {
 
         let tool = CancelJobTool::new(Arc::clone(&manager));
         let ctx = JobContext::default();
-        let result = tool
+        let error = tool
             .execute(serde_json::json!({ "job_id": job_id.to_string() }), &ctx)
             .await
-            .unwrap(); // safety: test
+            .unwrap_err(); // safety: test
 
-        let error = result.result.get("error").and_then(|v| v.as_str()).unwrap(); // safety: test
-        assert!(error.contains("Cannot cancel job")); // safety: test
-        assert!(error.contains("completed")); // safety: test
+        let message = error.to_string();
+        assert!(message.contains("cannot be cancelled"));
+        assert!(message.contains("completed"));
+        let unchanged = manager.get_context(job_id).await.unwrap(); // safety: test
+        assert_eq!(unchanged.state, JobState::Completed);
     }
 
     #[tokio::test]
