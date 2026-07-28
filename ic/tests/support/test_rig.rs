@@ -390,6 +390,7 @@ pub struct TestRigBuilder {
     auto_approve_tools: Option<bool>,
     enable_skills: bool,
     enable_routines: bool,
+    wire_job_scheduler: bool,
     http_exchanges: Vec<HttpExchange>,
     extra_tools: Vec<Arc<dyn Tool>>,
     extra_hooks: Vec<Arc<dyn Hook>>,
@@ -414,6 +415,7 @@ impl TestRigBuilder {
             auto_approve_tools: Some(true),
             enable_skills: false,
             enable_routines: false,
+            wire_job_scheduler: true,
             http_exchanges: Vec::new(),
             extra_tools: Vec::new(),
             extra_hooks: Vec::new(),
@@ -548,6 +550,12 @@ impl TestRigBuilder {
         self
     }
 
+    /// Keep job tools on their pending-job fallback path.
+    pub fn without_job_scheduler(mut self) -> Self {
+        self.wire_job_scheduler = false;
+        self
+    }
+
     /// Keep `bootstrap_pending` so the proactive greeting fires on startup.
     pub fn with_bootstrap(mut self) -> Self {
         self.keep_bootstrap = true;
@@ -596,6 +604,7 @@ impl TestRigBuilder {
             auto_approve_tools,
             enable_skills,
             enable_routines,
+            wire_job_scheduler,
             http_exchanges: explicit_http_exchanges,
             extra_tools,
             extra_hooks,
@@ -756,7 +765,7 @@ impl TestRigBuilder {
 
             components.tools.register_job_tools(
                 Arc::clone(&components.context_manager),
-                Some(scheduler_slot.clone()),
+                wire_job_scheduler.then_some(scheduler_slot.clone()),
                 None,
                 None,
                 components.db.clone(),
