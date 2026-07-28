@@ -249,4 +249,32 @@ if grep -Fq -- ' run -d ' "$ctr_calls"; then
   exit 1
 fi
 
+# Uncached Podman builds minimize peak storage without pruning tenant containers.
+build_calls="$fixture/build-calls"
+podman() { printf '%s\n' "$*" >>"$build_calls"; }
+LUNARWING_ROOT="$fixture"
+mkdir -p "$LUNARWING_ROOT/opencode4lunarwing"
+build_opencode_worker true true
+grep -Fqx 'image prune -f' "$build_calls"
+grep -Fq 'build --no-cache --layers=false --build-arg WITH_TOOLCHAINS=true' "$build_calls"
+
+: >"$build_calls"
+build_opencode_worker false false
+if grep -Eq -- 'image prune|--no-cache|--layers=false' "$build_calls"; then
+  printf 'Cached OpenCode build used uncached-build storage cleanup\n' >&2
+  exit 1
+fi
+
+docker() { printf '%s\n' "$*" >>"$build_calls"; }
+CONTAINER_RT="docker"
+: >"$build_calls"
+build_opencode_worker true true
+grep -Fq 'build --no-cache --build-arg WITH_TOOLCHAINS=true' "$build_calls"
+if grep -Eq -- 'image prune|--layers=false' "$build_calls"; then
+  printf 'Podman-only OpenCode storage flags leaked into Docker build\n' >&2
+  exit 1
+fi
+
+grep -Fq 'bun pm cache rm' "$dockerfile"
+
 printf 'Study MCP worker mount tests passed\n'
