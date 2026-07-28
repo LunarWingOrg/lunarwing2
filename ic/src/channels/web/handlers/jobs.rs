@@ -279,24 +279,53 @@ pub async fn jobs_cancel_handler(
                 if job.user_id != user.user_id {
                     return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
                 }
-                if job.status == "running" || job.status == "creating" {
-                    if let Some(ref jm) = state.job_manager
-                        && let Err(e) = jm.stop_job(job_id).await
-                    {
-                        tracing::warn!(job_id = %job_id, error = %e, "Failed to stop container during cancellation");
-                    }
-                    store
-                        .update_sandbox_job_status(
-                            job_id,
-                            "failed",
-                            Some(false),
-                            Some("Cancelled by user"),
-                            None,
-                            Some(chrono::Utc::now()),
-                        )
-                        .await
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                if job.status != "running" && job.status != "creating" {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!("Job is '{}' and cannot be cancelled", job.status),
+                    ));
                 }
+
+                let mode = store
+                    .get_sandbox_job_mode(job_id)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                let delivered = if mode.as_deref().is_some_and(|m| m.starts_with("external:")) {
+                    let manager = state.external_worker_manager.as_ref().ok_or((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "External worker manager not available".to_string(),
+                    ))?;
+                    manager.cancel_task(job_id).await
+                } else if let Some(ref manager) = state.job_manager {
+                    manager.stop_job(job_id).await.map_err(|error| {
+                        (
+                            StatusCode::CONFLICT,
+                            format!("Job runtime is not active: {error}"),
+                        )
+                    })?;
+                    true
+                } else {
+                    false
+                };
+
+                if !delivered {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "Job has no active runtime; cancellation was not delivered".to_string(),
+                    ));
+                }
+
+                store
+                    .update_sandbox_job_status(
+                        job_id,
+                        "cancelled",
+                        Some(false),
+                        Some("Cancelled by user"),
+                        None,
+                        Some(chrono::Utc::now()),
+                    )
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                 return Ok(Json(serde_json::json!({
                     "status": "cancelled",
                     "job_id": job_id,
@@ -325,10 +354,21 @@ pub async fn jobs_cancel_handler(
                     // Try to stop via scheduler (aborts the worker task + updates
                     // in-memory ContextManager). This is best-effort — the job may
                     // not be in the scheduler map if it already finished.
-                    if let Some(ref slot) = state.scheduler
+                    let stopped = if let Some(ref slot) = state.scheduler
                         && let Some(ref scheduler) = *slot.read().await
                     {
-                        let _ = scheduler.stop(job_id).await;
+                        scheduler.stop(job_id).await.map_err(|error| {
+                            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                        })?
+                    } else {
+                        false
+                    };
+                    if !stopped {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            "Job has no active scheduler runtime; cancellation was not delivered"
+                                .to_string(),
+                        ));
                     }
 
                     // Always persist cancellation to the DB so the state is

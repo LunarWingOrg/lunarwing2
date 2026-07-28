@@ -346,6 +346,11 @@ Commands:
   start-tenant <name>             Start all services for a tenant
   stop-tenant <name>              Stop all services for a tenant
   restart-tenant <name>           Stop then start
+  start-worker <name> <worker>    Start one enabled external worker
+  stop-worker <name> <worker>     Gracefully stop one external worker
+  restart-worker <name> <worker>  Restart one external worker
+  kill-worker <name> <worker>     Emergency zero-grace stop; leaves worker stopped
+                                   Workers: nanocode, pebble, opencode
   render-units <name>             Re-render a tenant's service units from the current
                                   generator (no restart; applies init-script changes)
   upgrade-tenant <name> --target <ref>
@@ -7104,6 +7109,98 @@ restart_tenant() {
   start_tenant "$name"
 }
 
+require_worker_name() {
+  case "${1:-}" in
+    nanocode|pebble|opencode) ;;
+    *) die "unknown worker '${1:-}'; expected nanocode, pebble, or opencode" ;;
+  esac
+}
+
+prepare_worker_lifecycle() {
+  local name worker
+  name="$(sanitize_name "$1")"
+  worker="$2"
+  require_worker_name "$worker"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  printf '%s %s\n' "$name" "$worker"
+}
+
+start_worker() {
+  local prepared name worker
+  prepared="$(prepare_worker_lifecycle "$1" "$2")" || return
+  read -r name worker <<<"$prepared"
+  tenant_worker_enabled "$name" "$worker" \
+    || die "worker '$worker' is not enabled for tenant '$name'"
+  "start_tenant_${worker}" "$name"
+}
+
+stop_worker() {
+  local prepared name worker container service
+  prepared="$(prepare_worker_lifecycle "$1" "$2")" || return
+  read -r name worker <<<"$prepared"
+  container="lunarwing-${worker}-${name}"
+  service="${container}.service"
+  ensure_container_runtime
+  ensure_init_system
+
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    _systemctl_user "$name" stop "$service" >/dev/null 2>&1 \
+      || _ctr "$name" stop "$container" >/dev/null 2>&1 \
+      || die "failed to stop $service"
+  elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    rc-service "${container}-sup" stop >/dev/null 2>&1 || true
+    if [[ -f "/etc/init.d/${container}" ]]; then
+      rc-service "$container" stop >/dev/null 2>&1 \
+        || die "failed to stop OpenRC service $container"
+    elif _ctr "$name" inspect "$container" &>/dev/null; then
+      _ctr "$name" stop "$container" >/dev/null 2>&1 \
+        || die "failed to stop container $container"
+    fi
+  elif _ctr "$name" inspect "$container" &>/dev/null; then
+    _ctr "$name" stop "$container" >/dev/null 2>&1 \
+      || die "failed to stop container $container"
+  fi
+  say "$worker worker stopped for $name"
+}
+
+kill_worker() {
+  local prepared name worker container service
+  prepared="$(prepare_worker_lifecycle "$1" "$2")" || return
+  read -r name worker <<<"$prepared"
+  container="lunarwing-${worker}-${name}"
+  service="${container}.service"
+  ensure_container_runtime
+  ensure_init_system
+
+  # Stop supervision before the zero-grace container stop. Otherwise
+  # Restart=on-failure/supervise-daemon can resurrect the worker immediately.
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    _systemctl_user "$name" stop --no-block "$service" >/dev/null 2>&1 || true
+  elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    rc-service "${container}-sup" stop >/dev/null 2>&1 || true
+  fi
+
+  if _ctr "$name" inspect "$container" &>/dev/null; then
+    _ctr "$name" stop --time 0 "$container" >/dev/null 2>&1 \
+      || die "failed to kill container $container"
+  fi
+
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    _systemctl_user "$name" stop "$service" >/dev/null 2>&1 || true
+  elif [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container}" ]]; then
+    rc-service "$container" stop >/dev/null 2>&1 || true
+  fi
+  say "$worker worker killed and left stopped for $name"
+}
+
+restart_worker() {
+  stop_worker "$1" "$2"
+  start_worker "$1" "$2"
+}
+
 # Cargo builds can refresh tracked lockfiles in nested standalone crates. Restore
 # them only when they are the sole tracked changes; otherwise preserve everything
 # and fail. Untracked tenant runtime directories do not block checkout.
@@ -7824,6 +7921,17 @@ main() {
       require_root
       [[ -n "${1:-}" ]] || die "usage: restart-tenant <name>"
       restart_tenant "$1"
+      ;;
+
+    start-worker|stop-worker|restart-worker|kill-worker)
+      require_root
+      [[ $# -eq 2 ]] || die "usage: $command_name <name> <nanocode|pebble|opencode>"
+      case "$command_name" in
+        start-worker) start_worker "$1" "$2" ;;
+        stop-worker) stop_worker "$1" "$2" ;;
+        restart-worker) restart_worker "$1" "$2" ;;
+        kill-worker) kill_worker "$1" "$2" ;;
+      esac
       ;;
 
     render-units)

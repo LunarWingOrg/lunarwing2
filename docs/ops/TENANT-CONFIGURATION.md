@@ -308,6 +308,24 @@ sudo lunarwing-mt-admin.sh restart-tenant <tenant>
 
 For granular restarts, use the per-init commands below.
 
+External workers have init-agnostic lifecycle commands. Prefer these over raw
+`podman`: tenant containers use tenant-owned rootless stores, and their init
+supervisors must be stopped before the container or they will respawn it.
+
+```bash
+sudo lunarwing-mt-admin.sh stop-worker <tenant> opencode
+sudo lunarwing-mt-admin.sh start-worker <tenant> opencode
+sudo lunarwing-mt-admin.sh restart-worker <tenant> opencode
+
+# Emergency immediate stop. Disables supervision first, then uses a zero-grace
+# tenant-scoped container stop and leaves the worker stopped.
+sudo lunarwing-mt-admin.sh kill-worker <tenant> opencode
+```
+
+The same commands accept `nanocode` and `pebble`. Running `podman stop` as root
+targets root's unrelated store and runtime directory (`/run/user/0/libpod`), not
+the tenant container. Do not use raw root Podman for tenant workers.
+
 ### Systemd
 
 Per-tenant units are **user** units owned by the tenant's OS user, so they are
@@ -348,6 +366,7 @@ sudo rc-service lunarwing-pg-<tenant> restart               # Postgres container
 sudo rc-service lunarwing-weechat-<tenant> restart          # weechat backend
 sudo rc-service lunarwing-weechat-adapter-<tenant> restart  # weechat WS adapter
 # workers (if provisioned): lunarwing-nanocode-<tenant>, lunarwing-pebble-<tenant>, lunarwing-opencode-<tenant>
+# each worker also has a <unit>-sup babysitter; stop it before stopping a container manually
 ```
 
 ### Verifying

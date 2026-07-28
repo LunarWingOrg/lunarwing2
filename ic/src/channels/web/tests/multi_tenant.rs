@@ -65,6 +65,7 @@ fn build_state(
         tool_registry: None,
         store,
         job_manager: None,
+        external_worker_manager: None,
         prompt_queue,
         owner_id: "test".to_string(),
         default_sender_id: "test".to_string(),

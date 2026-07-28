@@ -34,10 +34,11 @@ prompt_context = { max_messages = 12, max_chars_per_message = 2000, max_total_ch
 ```
 
 The agent logs `External workers configured: opencode` on startup.
-`timeout_ms` defaults to one hour and is the hard task deadline enforced by both
-LunarWing and this worker.
-On timeout or cancellation, the worker aborts the active OpenCode session instead
-of leaving it running in the container.
+`timeout_ms` defaults to one hour and is shared by all provider retries. Every
+OpenCode SDK request receives the task abort signal. On timeout or cancellation,
+the worker stops waiting immediately and gives session cleanup a bounded five-second
+grace (`OPENCODE_SESSION_ABORT_TIMEOUT_MS`) instead of leaving work orphaned.
+LunarWing also sends a protocol cancel envelope when its own deadline expires.
 Job metadata and progress events are persisted by LunarWing. After a daemon restart,
 running jobs are reported as `interrupted`, while `list_jobs`, `job_status`, and
 `job_events` can still read their saved status and event history from the database.
@@ -48,6 +49,9 @@ this with `OPENCODE_PROVIDER_MAX_RETRIES` (0-5) and
 `OPENCODE_PROVIDER_RETRY_DELAY_MS` (0-60000). While inference is otherwise
 silent, the worker emits a persisted progress heartbeat every 60 seconds;
 configure or disable it with `OPENCODE_PROGRESS_HEARTBEAT_MS` (0-300000).
+Only one active task may modify a resolved workspace path. A second task targeting
+the same workspace fails immediately with the full UUID of the active task; cancel
+or finish that task before dispatching another.
 
 ## Usage
 

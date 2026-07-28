@@ -358,6 +358,9 @@ pub enum OrchestratorError {
 
     #[error("External worker '{worker_name}' task timed out (job {job_id})")]
     ExternalWorkerTimeout { worker_name: String, job_id: Uuid },
+
+    #[error("External worker '{worker_name}' task is already active (job {job_id})")]
+    ExternalWorkerTaskAlreadyActive { worker_name: String, job_id: Uuid },
 }
 
 /// Worker errors (container-side execution).

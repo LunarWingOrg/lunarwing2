@@ -562,6 +562,8 @@ impl TestHarnessBuilder {
             owner_id: "default".to_string(),
             vision_service_url: None,
             store: Some(Arc::clone(&db)),
+            container_job_manager: None,
+            external_worker_manager: None,
             llm,
             cheap_llm: None,
             safety,
