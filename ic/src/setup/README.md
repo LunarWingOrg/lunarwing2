@@ -422,11 +422,12 @@ key first, then falls back to the standard env var.
 3. Registry channels (`registry/channels/*.json`, download-first with source fallback)
 
 **Tunnel setup** (`setup_tunnel`):
-- Options: NetBird Reverse Proxy, ngrok, Cloudflare Tunnel, Tailscale, custom command, static URL
+- Options: NetBird Reverse Proxy, custom command, static HTTPS URL
 - Validates HTTPS requirement
 - Managed provider config is stored in `self.settings.tunnel`; runtime URL is populated after launch
 - NetBird assumes an operator-enrolled peer and never stores setup keys or runs `netbird up/down`
 - Self-hosted NetBird requirements are documented in `docs/guides/NETBIRD_TUNNEL.md`
+- Managed Cloudflare, ngrok, and Tailscale providers were removed; migration and credential cleanup are documented in `docs/guides/TUNNEL_PROVIDER_MIGRATION.md`
 
 **WASM channel setup** (`setup_wasm_channel`):
 - Reads `capabilities.json` for `setup.required_secrets`

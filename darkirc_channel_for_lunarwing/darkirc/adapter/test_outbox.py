@@ -441,5 +441,51 @@ class OutboxLoopTest(unittest.IsolatedAsyncioTestCase):
                 pass
 
 
+class RecordingWriter:
+    """Minimal asyncio.StreamWriter stand-in that records written bytes."""
+
+    def __init__(self):
+        self.data = b""
+
+    def write(self, b):
+        self.data += b
+
+    async def drain(self):
+        pass
+
+
+class IrcLineRobustnessTest(unittest.IsolatedAsyncioTestCase):
+    """A single malformed or hostile inbound line must never kill the IRC loop.
+
+    Regression for the crash cluster: parse_line used to unpack-raise on a
+    prefix-only line (":foo"), and pong echoed the PING token unsanitized so a
+    control char in it raised inside _send. Either ValueError escaped irc_loop
+    (which only caught Timeout/Connection/OSError), silently ending inbound AND
+    paced outbound delivery while HTTP stayed up.
+    """
+
+    def test_parse_line_prefix_without_command_does_not_raise(self):
+        client = mod.IRCClient()
+        for line in (":foo", ":nick!user@host", ":"):
+            parsed = client.parse_line(line)  # must not raise
+            self.assertEqual(parsed["command"], "")
+
+    def test_parse_line_well_formed_privmsg_still_parses(self):
+        client = mod.IRCClient()
+        parsed = client.parse_line(":n!u@h PRIVMSG me :hello there")
+        self.assertEqual(parsed["command"], "PRIVMSG")
+        self.assertEqual(parsed["params"], ["me"])
+        self.assertEqual(parsed["trailing"], "hello there")
+        self.assertEqual(parsed["prefix"], "n!u@h")
+
+    async def test_pong_sanitizes_control_chars_in_token(self):
+        client = mod.IRCClient()
+        client._writer = RecordingWriter()
+        await client.pong("tok\r\nen\x01")  # must not raise
+        sent = client._writer.data.decode()
+        self.assertEqual(sent, "PONG :token\r\n")
+        self.assertFalse(mod._CTRL_RE.search(sent.rstrip("\r\n")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -2783,6 +2783,11 @@ async fn settings_set_handler(
     Path(key): Path<String>,
     Json(body): Json<SettingWriteRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    crate::settings::validate_setting_write(&key, &body.value).map_err(|error| {
+        tracing::warn!(setting = %key, %error, "Rejected settings API write");
+        StatusCode::BAD_REQUEST
+    })?;
+
     let store = state
         .store
         .as_ref()
@@ -2839,6 +2844,11 @@ async fn settings_import_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     Json(body): Json<SettingsImportRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    crate::settings::validate_settings_write(&body.settings).map_err(|error| {
+        tracing::warn!(%error, "Rejected settings API import");
+        StatusCode::BAD_REQUEST
+    })?;
+
     let store = state
         .store
         .as_ref()
@@ -3183,6 +3193,103 @@ mod tests {
             ws_ping_interval_secs: 30,
             ws_idle_timeout_secs: 120,
         })
+    }
+
+    async fn settings_request(
+        method: axum::http::Method,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> StatusCode {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let state = test_gateway_state(None);
+        let app = Router::new()
+            .route("/api/settings/import", post(settings_import_handler))
+            .route(
+                "/api/settings/{key}",
+                axum::routing::put(settings_set_handler),
+            )
+            .with_state(state);
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request");
+        request.extensions_mut().insert(UserIdentity {
+            user_id: "test".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        ServiceExt::<axum::http::Request<Body>>::oneshot(app, request)
+            .await
+            .expect("response")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn settings_api_rejects_removed_tunnel_values_before_database_write() {
+        let provider_status = settings_request(
+            axum::http::Method::PUT,
+            "/api/settings/tunnel.provider",
+            serde_json::json!({"value": "cloudflare"}),
+        )
+        .await;
+        assert_eq!(provider_status, StatusCode::BAD_REQUEST);
+
+        let key_status = settings_request(
+            axum::http::Method::PUT,
+            "/api/settings/tunnel.ngrok_token",
+            serde_json::json!({"value": "sensitive-value"}),
+        )
+        .await;
+        assert_eq!(key_status, StatusCode::BAD_REQUEST);
+
+        let object_status = settings_request(
+            axum::http::Method::PUT,
+            "/api/settings/tunnel",
+            serde_json::json!({
+                "value": {"provider": "netbird", "cf_token": "sensitive-value"}
+            }),
+        )
+        .await;
+        assert_eq!(object_status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn settings_api_rejects_mixed_legacy_import_before_database_write() {
+        let status = settings_request(
+            axum::http::Method::POST,
+            "/api/settings/import",
+            serde_json::json!({
+                "settings": {
+                    "agent.name": "updated",
+                    "tunnel.ts_hostname": "old-host"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn networking_ui_lists_only_supported_managed_tunnel_providers() {
+        let app_js = include_str!("static/app.js");
+        assert!(app_js.contains("options: ['none', 'netbird', 'custom']"));
+        assert!(
+            !app_js.contains("options: ['none', 'cloudflare', 'ngrok', 'tailscale', 'custom']")
+        );
+        for key in [
+            "tunnel.netbird_custom_domain",
+            "tunnel.netbird_name_prefix",
+            "tunnel.custom_command",
+            "tunnel.custom_health_url",
+            "tunnel.custom_url_pattern",
+            "tunnel.public_url",
+        ] {
+            assert!(app_js.contains(key), "missing networking setting: {key}");
+        }
     }
 
     /// Build a test router with just the OAuth callback route.

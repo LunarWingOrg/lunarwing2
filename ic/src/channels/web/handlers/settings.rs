@@ -68,6 +68,11 @@ pub async fn settings_set_handler(
     Path(key): Path<String>,
     Json(body): Json<SettingWriteRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    crate::settings::validate_setting_write(&key, &body.value).map_err(|error| {
+        tracing::warn!(setting = %key, %error, "Rejected settings API write");
+        StatusCode::BAD_REQUEST
+    })?;
+
     let store = state
         .store
         .as_ref()
@@ -124,6 +129,11 @@ pub async fn settings_import_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     Json(body): Json<SettingsImportRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    crate::settings::validate_settings_write(&body.settings).map_err(|error| {
+        tracing::warn!(%error, "Rejected settings API import");
+        StatusCode::BAD_REQUEST
+    })?;
+
     let store = state
         .store
         .as_ref()

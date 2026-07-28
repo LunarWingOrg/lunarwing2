@@ -85,8 +85,8 @@ open items are:
 
 ## G6. Tunnel provider cutover verification (NetBird)
 
-**Verdict: PREMISE INVALID — providers were NOT gutted.** NetBird was ADDED
-alongside existing providers; no cutover occurred.
+**Initial verdict: PREMISE INVALID.** NetBird was added alongside existing
+providers; no cutover had occurred when this review ran.
 
 ### Findings
 
@@ -96,27 +96,22 @@ NetBird." This is incorrect:
 - Commit `cbc0040` ("add self-hosted NetBird tunnel provider") **adds**
   `netbird.rs` and wires it into the existing tunnel factory. It does **not**
   remove cloudflare, ngrok, or tailscale.
-- All four legacy providers remain fully implemented:
-  - `ic/src/tunnel/cloudflare.rs` — CloudflareTunnel (cloudflared)
-  - `ic/src/tunnel/ngrok.rs` — NgrokTunnel (ngrok)
-  - `ic/src/tunnel/tailscale.rs` — TailscaleTunnel (tailscale serve/funnel)
-  - `ic/src/tunnel/netbird.rs` — NetBirdTunnel (netbird expose)
-- `ic/src/tunnel/mod.rs:1-13` documents all six providers as supported.
-- The tunnel factory (`mod.rs:230-272`) dispatches to all of them.
+- Cloudflare, ngrok, Tailscale, and NetBird were all implemented at review
+  time.
+- Tunnel factory, settings, setup, doctor, and web UI still exposed legacy
+  managed providers.
 
-### Stale AGENTS.md reference
+### Item #27 Follow-up
 
-Both `AGENTS.md` (root) and `ic/AGENTS.md` line 40/44 say:
+- Removed Cloudflare, ngrok, and Tailscale runtime implementations and setup
+  paths.
+- Retained NetBird, custom commands, and vendor-neutral static HTTPS URLs.
+- Added V24 cleanup for PostgreSQL and libSQL legacy detail/credential rows.
+- Added fail-fast migration guidance for legacy provider values while
+  preserving static URL precedence.
+- Updated setup, doctor, web settings, security guidance, and operator docs.
 
-> Tunnel abstraction (cloudflare, ngrok, tailscale): `src/tunnel/`
-
-This omits NetBird. Updated to include NetBird.
-
-### Action required
-
-- Updated `AGENTS.md` and `ic/AGENTS.md` "Where to Work" to include NetBird.
-- No stale config, secret keys, or dangling references found — nothing was
-  removed, so there is no cleanup needed.
+See `docs/guides/TUNNEL_PROVIDER_MIGRATION.md` for operator action.
 
 ---
 
@@ -205,14 +200,17 @@ triaged separately for v2.0.4.0 fit.
 |----|----------|---------|---------------------|
 | G4 | P1 | No regression | None — libSQL compiles, full trait coverage |
 | G5 | P1 | 3 fixed, 3 partial, 1 open | Auth-token persistence is highest-value remaining fix |
-| G6 | P1 | Premise invalid | Updated AGENTS.md to include NetBird |
+| G6 | P1 | Cutover completed by item #27 | Follow operator migration guide |
 | G7 | P1 | Polling fixed, OMEMO unverified | OMEMO needs live bridge repro; deferrable |
 | G8 | P1 | 2 fixed, 1 open (UX only) | Bare-repo HEAD is low-priority; deferrable |
 
-### Files changed in this task
+### Files changed in initial review
 
 - `docs/ops/P1_GAP_FINDINGS_v2.0.3.0.md` — this document (new)
 - `ic/src/db/CLAUDE.md` — recorded libSQL feature surface (new)
 - `AGENTS.md` — updated tunnel provider list to include NetBird
 - `ic/AGENTS.md` — updated tunnel provider list to include NetBird
 - `docs/ops/AGENT_GOALS_2.0.3.0.md` — checked off item #17
+
+Item #27 subsequently changed tunnel runtime, setup, settings, migrations,
+doctor, web UI, and migration documentation as summarized in G6 above.

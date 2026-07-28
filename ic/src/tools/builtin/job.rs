@@ -34,6 +34,7 @@ use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, requi
 
 const LONG_JOB_TOOL_TIMEOUT: Duration = Duration::from_secs(660);
 const EXTERNAL_WORKER_TIMEOUT_GRACE: Duration = Duration::from_secs(60);
+const MAX_LISTED_JOBS: usize = 100;
 
 /// Lazy scheduler reference, filled after Agent::new creates the Scheduler.
 ///
@@ -69,6 +70,55 @@ async fn resolve_job_id(input: &str, context_manager: &ContextManager) -> Result
         })
         .collect();
 
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => Err(ToolError::InvalidParameters(format!(
+            "no job found matching prefix '{}'",
+            input
+        ))),
+        n => Err(ToolError::InvalidParameters(format!(
+            "ambiguous prefix '{}' matches {} jobs, provide more characters",
+            input, n
+        ))),
+    }
+}
+
+/// Resolve a queryable job from live context or persisted sandbox records.
+async fn resolve_query_job_id(
+    input: &str,
+    context_manager: &ContextManager,
+    store: Option<&Arc<dyn Database>>,
+    user_id: &str,
+) -> Result<Uuid, ToolError> {
+    if let Ok(id) = Uuid::parse_str(input) {
+        return Ok(id);
+    }
+
+    if input.len() < 4 {
+        return Err(ToolError::InvalidParameters(
+            "job ID prefix must be at least 4 hex characters".to_string(),
+        ));
+    }
+
+    let input_lower = input.to_lowercase();
+    let mut matches = context_manager.all_jobs_for(user_id).await;
+    if let Some(store) = store {
+        match store.list_sandbox_jobs_for_user(user_id).await {
+            Ok(jobs) => matches.extend(jobs.into_iter().map(|job| job.id)),
+            Err(error) if matches.is_empty() => {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "failed to search persisted jobs: {error}"
+                )));
+            }
+            Err(error) => {
+                tracing::warn!("Failed to search persisted jobs: {error}");
+            }
+        }
+    }
+
+    matches.retain(|id| id.simple().to_string().starts_with(&input_lower));
+    matches.sort_unstable();
+    matches.dedup();
     match matches.len() {
         1 => Ok(matches[0]),
         0 => Err(ToolError::InvalidParameters(format!(
@@ -1465,11 +1515,20 @@ impl Tool for CreateJobTool {
 /// Tool for listing jobs.
 pub struct ListJobsTool {
     context_manager: Arc<ContextManager>,
+    store: Option<Arc<dyn Database>>,
 }
 
 impl ListJobsTool {
     pub fn new(context_manager: Arc<ContextManager>) -> Self {
-        Self { context_manager }
+        Self {
+            context_manager,
+            store: None,
+        }
+    }
+
+    pub fn with_store(mut self, store: Arc<dyn Database>) -> Self {
+        self.store = Some(store);
+        self
     }
 }
 
@@ -1480,7 +1539,7 @@ impl Tool for ListJobsTool {
     }
 
     fn description(&self) -> &str {
-        "List all jobs or filter by status. Shows job IDs, titles, and current status."
+        "List up to 100 recent jobs or filter by status. Shows job IDs, titles, and current status."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1508,43 +1567,104 @@ impl Tool for ListJobsTool {
             .and_then(|v| v.as_str())
             .unwrap_or("all");
 
-        let job_ids = match filter {
-            "active" => self.context_manager.active_jobs_for(&ctx.user_id).await,
-            _ => self.context_manager.all_jobs_for(&ctx.user_id).await,
-        };
-
-        let mut jobs = Vec::new();
-        for job_id in job_ids {
-            if let Ok(ctx) = self.context_manager.get_context(job_id).await {
-                let include = match filter {
-                    "completed" => ctx.state == JobState::Completed,
-                    "failed" => ctx.state == JobState::Failed,
-                    "active" => ctx.state.is_active(),
-                    _ => true,
-                };
-
-                if include {
-                    jobs.push(serde_json::json!({
-                        "job_id": job_id.to_string(),
-                        "title": ctx.title,
-                        "status": format!("{:?}", ctx.state),
-                        "created_at": ctx.created_at.to_rfc3339()
-                    }));
+        let mut all_jobs = std::collections::HashMap::new();
+        if let Some(store) = &self.store {
+            match store.list_agent_jobs_for_user(&ctx.user_id).await {
+                Ok(records) => {
+                    for record in records {
+                        all_jobs.insert(
+                            record.id,
+                            serde_json::json!({
+                                "job_id": record.id.to_string(),
+                                "title": record.title,
+                                "status": record.status,
+                                "created_at": record.created_at.to_rfc3339(),
+                                "source": "database",
+                            }),
+                        );
+                    }
                 }
+                Err(error) => tracing::warn!("Failed to list persisted agent jobs: {error}"),
+            }
+            match store.list_sandbox_jobs_for_user(&ctx.user_id).await {
+                Ok(records) => {
+                    for record in records {
+                        all_jobs.insert(
+                            record.id,
+                            serde_json::json!({
+                                "job_id": record.id.to_string(),
+                                "title": record.task,
+                                "status": record.status,
+                                "created_at": record.created_at.to_rfc3339(),
+                                "source": "database",
+                            }),
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!("Failed to list persisted sandbox jobs: {error}"),
             }
         }
 
-        let summary = self.context_manager.summary_for(&ctx.user_id).await;
+        for job_id in self.context_manager.all_jobs_for(&ctx.user_id).await {
+            if let Ok(job_ctx) = self.context_manager.get_context(job_id).await {
+                all_jobs.insert(
+                    job_id,
+                    serde_json::json!({
+                        "job_id": job_id.to_string(),
+                        "title": job_ctx.title,
+                        "status": format!("{:?}", job_ctx.state),
+                        "created_at": job_ctx.created_at.to_rfc3339(),
+                        "source": "live",
+                    }),
+                );
+            }
+        }
+
+        let mut summary = serde_json::Map::from_iter([
+            ("total".to_string(), serde_json::json!(all_jobs.len())),
+            ("pending".to_string(), serde_json::json!(0)),
+            ("in_progress".to_string(), serde_json::json!(0)),
+            ("completed".to_string(), serde_json::json!(0)),
+            ("failed".to_string(), serde_json::json!(0)),
+            ("stuck".to_string(), serde_json::json!(0)),
+            ("interrupted".to_string(), serde_json::json!(0)),
+        ]);
+        for job in all_jobs.values() {
+            let status = job["status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .replace('_', "");
+            let key = match status.as_str() {
+                "pending" => Some("pending"),
+                "inprogress" | "running" | "creating" => Some("in_progress"),
+                "completed" | "submitted" | "accepted" => Some("completed"),
+                "failed" | "cancelled" => Some("failed"),
+                "stuck" => Some("stuck"),
+                "interrupted" => Some("interrupted"),
+                _ => None,
+            };
+            if let Some(key) = key {
+                let count = summary[key].as_u64().unwrap_or_default() + 1;
+                summary.insert(key.to_string(), serde_json::json!(count));
+            }
+        }
+
+        let mut jobs: Vec<_> = all_jobs
+            .into_values()
+            .filter(|job| job_matches_filter(filter, job["status"].as_str().unwrap_or_default()))
+            .collect();
+        jobs.sort_by(|left, right| {
+            right["created_at"]
+                .as_str()
+                .cmp(&left["created_at"].as_str())
+        });
+        jobs.truncate(MAX_LISTED_JOBS);
 
         let result = serde_json::json!({
+            "returned": jobs.len(),
             "jobs": jobs,
-            "summary": {
-                "total": summary.total,
-                "pending": summary.pending,
-                "in_progress": summary.in_progress,
-                "completed": summary.completed,
-                "failed": summary.failed
-            }
+            "summary": summary,
         });
 
         Ok(ToolOutput::success(result, start.elapsed()))
@@ -1555,14 +1675,39 @@ impl Tool for ListJobsTool {
     }
 }
 
+fn job_matches_filter(filter: &str, status: &str) -> bool {
+    let status = status.to_ascii_lowercase().replace('_', "");
+    match filter {
+        "active" => matches!(
+            status.as_str(),
+            "pending" | "inprogress" | "running" | "creating"
+        ),
+        "completed" => matches!(status.as_str(), "completed" | "submitted" | "accepted"),
+        "failed" => matches!(
+            status.as_str(),
+            "failed" | "cancelled" | "stuck" | "interrupted"
+        ),
+        _ => true,
+    }
+}
+
 /// Tool for checking job status.
 pub struct JobStatusTool {
     context_manager: Arc<ContextManager>,
+    store: Option<Arc<dyn Database>>,
 }
 
 impl JobStatusTool {
     pub fn new(context_manager: Arc<ContextManager>) -> Self {
-        Self { context_manager }
+        Self {
+            context_manager,
+            store: None,
+        }
+    }
+
+    pub fn with_store(mut self, store: Arc<dyn Database>) -> Self {
+        self.store = Some(store);
+        self
     }
 }
 
@@ -1598,7 +1743,13 @@ impl Tool for JobStatusTool {
         let requester_id = ctx.user_id.clone();
 
         let job_id_str = require_str(&params, "job_id")?;
-        let job_id = resolve_job_id(job_id_str, &self.context_manager).await?;
+        let job_id = resolve_query_job_id(
+            job_id_str,
+            &self.context_manager,
+            self.store.as_ref(),
+            &requester_id,
+        )
+        .await?;
 
         match self.context_manager.get_context(job_id).await {
             Ok(job_ctx) => {
@@ -1621,9 +1772,32 @@ impl Tool for JobStatusTool {
                 });
                 Ok(ToolOutput::success(result, start.elapsed()))
             }
-            Err(e) => {
+            Err(context_error) => {
+                let Some(store) = &self.store else {
+                    let result = serde_json::json!({
+                        "error": format!("Job not found: {}", context_error)
+                    });
+                    return Ok(ToolOutput::success(result, start.elapsed()));
+                };
+                let record = store.get_sandbox_job(job_id).await.map_err(|error| {
+                    ToolError::ExecutionFailed(format!("failed to load persisted job: {error}"))
+                })?;
+                let Some(record) = record.filter(|record| record.user_id == requester_id) else {
+                    let result = serde_json::json!({ "error": "Job not found" });
+                    return Ok(ToolOutput::success(result, start.elapsed()));
+                };
                 let result = serde_json::json!({
-                    "error": format!("Job not found: {}", e)
+                    "job_id": record.id.to_string(),
+                    "title": record.task,
+                    "status": record.status,
+                    "created_at": record.created_at.to_rfc3339(),
+                    "started_at": record.started_at.map(|time| time.to_rfc3339()),
+                    "completed_at": record.completed_at.map(|time| time.to_rfc3339()),
+                    "success": record.success,
+                    "failure_reason": record.failure_reason,
+                    "project_dir": record.project_dir,
+                    "source": "database",
+                    "events_available": true,
                 });
                 Ok(ToolOutput::success(result, start.elapsed()))
             }
@@ -1856,24 +2030,29 @@ impl Tool for JobEventsTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParameters("missing 'job_id' parameter".into()))?;
 
-        let job_id = resolve_job_id(job_id_str, &self.context_manager).await?;
+        let job_id = resolve_query_job_id(
+            job_id_str,
+            &self.context_manager,
+            Some(&self.store),
+            &ctx.user_id,
+        )
+        .await?;
 
-        // Verify the caller owns this job. A missing context is treated as
-        // unauthorized to prevent leaking events after process restarts.
-        let job_ctx = self
+        let live_owner = self
             .context_manager
             .get_context(job_id)
             .await
-            .map_err(|_| {
-                ToolError::ExecutionFailed(format!(
-                    "job {} not found or context unavailable",
-                    job_id
-                ))
+            .is_ok_and(|job_ctx| job_ctx.user_id == ctx.user_id);
+        let persisted_owner = self
+            .store
+            .sandbox_job_belongs_to_user(job_id, &ctx.user_id)
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("failed to verify job ownership: {error}"))
             })?;
-
-        if job_ctx.user_id != ctx.user_id {
+        if !live_owner && !persisted_owner {
             return Err(ToolError::ExecutionFailed(format!(
-                "job {} does not belong to current user",
+                "job {} not found",
                 job_id
             )));
         }
@@ -2345,6 +2524,90 @@ mod tests {
             result.result.get("title").unwrap().as_str().unwrap(), // safety: test
             "Test Job"
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn persisted_external_job_remains_queryable_after_restart() {
+        use crate::testing::TestHarnessBuilder;
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let store = Arc::clone(&harness.db);
+        let manager = Arc::new(ContextManager::new(5));
+        let job_id = Uuid::new_v4();
+        store
+            .save_sandbox_job(&SandboxJobRecord {
+                id: job_id,
+                task: "Persisted OpenCode task".to_string(),
+                status: "interrupted".to_string(),
+                user_id: "default".to_string(),
+                project_dir: "/workspace/lunarwing2".to_string(),
+                success: None,
+                failure_reason: Some("Process restarted".to_string()),
+                created_at: Utc::now(),
+                started_at: Some(Utc::now()),
+                completed_at: Some(Utc::now()),
+                credential_grants_json: "[]".to_string(),
+            })
+            .await
+            .expect("save persisted job");
+        store
+            .save_job_event(
+                job_id,
+                "message",
+                &serde_json::json!({ "content": "reading source files" }),
+            )
+            .await
+            .expect("save persisted event");
+
+        let prefix = &job_id.simple().to_string()[..8];
+        let ctx = JobContext::default();
+        let status = JobStatusTool::new(Arc::clone(&manager))
+            .with_store(Arc::clone(&store))
+            .execute(serde_json::json!({ "job_id": prefix }), &ctx)
+            .await
+            .expect("query persisted status");
+        assert_eq!(status.result["job_id"], job_id.to_string());
+        assert_eq!(status.result["status"], "interrupted");
+        assert_eq!(status.result["failure_reason"], "Process restarted");
+
+        let events = JobEventsTool::new(Arc::clone(&store), Arc::clone(&manager))
+            .execute(serde_json::json!({ "job_id": prefix }), &ctx)
+            .await
+            .expect("query persisted events");
+        assert_eq!(events.result["total_events"], 1);
+        assert_eq!(
+            events.result["events"][0]["data"]["content"],
+            "reading source files"
+        );
+
+        let listed = ListJobsTool::new(manager)
+            .with_store(store)
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .expect("list persisted jobs");
+        assert_eq!(listed.result["jobs"][0]["job_id"], job_id.to_string());
+        assert_eq!(listed.result["summary"]["interrupted"], 1);
+
+        let other_ctx = JobContext::with_user("other-user", "query", "query");
+        let hidden_status = JobStatusTool::new(Arc::new(ContextManager::new(5)))
+            .with_store(Arc::clone(&harness.db))
+            .execute(
+                serde_json::json!({ "job_id": job_id.to_string() }),
+                &other_ctx,
+            )
+            .await
+            .expect("hide persisted status from another user");
+        assert_eq!(hidden_status.result["error"], "Job not found");
+
+        let hidden_events =
+            JobEventsTool::new(Arc::clone(&harness.db), Arc::new(ContextManager::new(5)))
+                .execute(
+                    serde_json::json!({ "job_id": job_id.to_string() }),
+                    &other_ctx,
+                )
+                .await;
+        assert!(hidden_events.is_err());
     }
 
     #[tokio::test]

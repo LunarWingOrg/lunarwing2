@@ -71,8 +71,11 @@ of tenant provisioning (unless `--no-health` is passed). This function:
 4. Writes a launcher script that sources the env file and execs `cron-wrapper.sh`.
 5. Schedules the launcher:
    - **systemd**: installs + enables `lunarwing-mt-health.{service,timer}`
-     (default: every 15 min, configurable via `LUNARWING_MT_HEALTH_INTERVAL_MIN`).
-   - **OpenRC**: installs a managed `fcron`/`crontab` entry (managed block).
+     (default: every 15 min).
+   - **OpenRC**: installs a managed `fcron`/`crontab` entry every 5 min
+     (managed block).
+
+   Set `LUNARWING_MT_HEALTH_INTERVAL_MIN` to override either default.
 
 Because the pipeline is host-global and auto-discovers tenants, the scheduling
 is idempotent — subsequent `add-tenant` calls re-run `ensure_health_pipeline()`

@@ -102,7 +102,14 @@ let currentSettingsSubtab = 'inference';
 let caveponyMode = '';
 let caveponyAvailable = false;
 let caveponyPreferenceSaving = false;
-const CAVEPONY_MODES = { lite: true, full: true, ultra: true, pony: true, canterlot: true };
+const CAVEPONY_MODES = {
+  lite: true,
+  full: true,
+  ultra: true,
+  pony: true,
+  canterlot: true,
+  'tony-soprano': true,
+};
 
 // --- Frame-coalesced rendering state ---
 let _streamBuffer = '';
@@ -5864,7 +5871,9 @@ function renderStructuredSettingsRow(def, value, activeValue) {
 
 var RESTART_REQUIRED_KEYS = ['llm_backend', 'selected_model', 'ollama_base_url', 'openai_compatible_base_url',
   'bedrock_region', 'bedrock_cross_region', 'bedrock_profile', 'embeddings.enabled', 'embeddings.provider', 'embeddings.base_url', 'embeddings.model',
-  'agent.auto_approve_tools', 'tunnel.provider', 'tunnel.public_url', 'gateway.rate_limit', 'gateway.max_connections'];
+  'agent.auto_approve_tools', 'tunnel.provider', 'tunnel.netbird_custom_domain', 'tunnel.netbird_name_prefix',
+  'tunnel.custom_command', 'tunnel.custom_health_url', 'tunnel.custom_url_pattern', 'tunnel.public_url',
+  'gateway.rate_limit', 'gateway.max_connections'];
 
 var _settingsSavedTimers = {};
 
@@ -6110,7 +6119,12 @@ var NETWORKING_SETTINGS = [
     group: 'cfg.group.tunnel',
     settings: [
       { key: 'tunnel.provider', label: 'cfg.tunnel_provider.label', description: 'cfg.tunnel_provider.desc',
-        type: 'select', options: ['none', 'cloudflare', 'ngrok', 'tailscale', 'custom'] },
+        type: 'select', options: ['none', 'netbird', 'custom'] },
+      { key: 'tunnel.netbird_custom_domain', label: 'cfg.tunnel_netbird_domain.label', description: 'cfg.tunnel_netbird_domain.desc', type: 'text' },
+      { key: 'tunnel.netbird_name_prefix', label: 'cfg.tunnel_netbird_prefix.label', description: 'cfg.tunnel_netbird_prefix.desc', type: 'text' },
+      { key: 'tunnel.custom_command', label: 'cfg.tunnel_custom_command.label', description: 'cfg.tunnel_custom_command.desc', type: 'text' },
+      { key: 'tunnel.custom_health_url', label: 'cfg.tunnel_custom_health.label', description: 'cfg.tunnel_custom_health.desc', type: 'text' },
+      { key: 'tunnel.custom_url_pattern', label: 'cfg.tunnel_custom_pattern.label', description: 'cfg.tunnel_custom_pattern.desc', type: 'text' },
       { key: 'tunnel.public_url', label: 'cfg.tunnel_public_url.label', description: 'cfg.tunnel_public_url.desc', type: 'text' },
     ]
   },
@@ -6125,7 +6139,7 @@ var NETWORKING_SETTINGS = [
 
 function loadNetworkingSettings() {
   var container = document.getElementById('settings-networking-content');
-  container.innerHTML = renderSettingsSkeleton(4);
+  container.innerHTML = renderSettingsSkeleton(9);
 
   apiFetch('/api/settings/export').then(function(data) {
     var settings = data.settings || {};

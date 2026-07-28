@@ -1252,7 +1252,13 @@ async fn persist_event(
 ) {
     if let Some(db) = store {
         let value = serde_json::json!({ "content": data });
-        let _ = db.save_job_event(job_id, event_type, &value).await;
+        if let Err(error) = db.save_job_event(job_id, event_type, &value).await {
+            tracing::warn!(
+                %job_id,
+                event_type,
+                "Failed to persist external worker event: {error}"
+            );
+        }
     }
 }
 

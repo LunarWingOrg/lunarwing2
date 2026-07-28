@@ -214,6 +214,7 @@ impl AppBuilder {
                 self.config = db_config;
                 tracing::debug!("Configuration reloaded from database");
             }
+            Err(error) if fatal_db_reload_error(&error) => return Err(error.into()),
             Err(e) => {
                 tracing::warn!(
                     "Failed to reload config from DB, keeping env-based config: {}",
@@ -506,7 +507,12 @@ impl AppBuilder {
         ),
         anyhow::Error,
     > {
-        use crate::tools::mcp::config::load_mcp_servers_from_db_or_migrate;
+        use crate::tools::mcp::config::{
+            STUDY_NOTES_ALLOW_WRITE_ENV, STUDY_NOTES_HOME_ENV, STUDY_NOTES_STATE_HOME_ENV,
+            load_mcp_servers_from_db_or_migrate, parse_study_notes_allow_write,
+            reconcile_managed_study_notes_server, study_notes_server_from_home,
+            suppress_managed_study_notes_server, suppress_unapproved_managed_study_notes_write,
+        };
         use crate::tools::wasm::{WasmToolLoader, load_dev_tools};
 
         let mcp_session_manager = Arc::new(McpSessionManager::new());
@@ -601,7 +607,64 @@ impl AppBuilder {
                     crate::tools::mcp::config::load_mcp_servers().await
                 };
                 match servers_result {
-                    Ok(servers) => {
+                    Ok(mut servers) => {
+                        if let Some(home) = std::env::var_os(STUDY_NOTES_HOME_ENV) {
+                            let state_home = std::env::var_os(STUDY_NOTES_STATE_HOME_ENV);
+                            let allow_write = parse_study_notes_allow_write(
+                                std::env::var_os(STUDY_NOTES_ALLOW_WRITE_ENV).as_deref(),
+                            );
+                            let config = allow_write.and_then(|allow_write| {
+                                study_notes_server_from_home(
+                                    std::path::Path::new(&home),
+                                    state_home.as_deref().map(std::path::Path::new),
+                                    allow_write,
+                                )
+                            });
+                            match config {
+                                Ok(config) => {
+                                    let allow_write = !config.always_require_approval.is_empty();
+                                    match reconcile_managed_study_notes_server(
+                                        db.as_deref(),
+                                        &owner_id,
+                                        &mut servers,
+                                        config,
+                                    )
+                                    .await
+                                    {
+                                        Ok(true) => {
+                                            tracing::info!(
+                                                home = %std::path::Path::new(&home).display(),
+                                                allow_write,
+                                                "Reconciled managed Study Notes MCP server"
+                                            );
+                                        }
+                                        Ok(false) => {}
+                                        Err(error) => {
+                                            let suppressed =
+                                                suppress_managed_study_notes_server(&mut servers);
+                                            tracing::warn!(
+                                                %error,
+                                                suppressed,
+                                                "Failed to reconcile managed Study Notes MCP server"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let suppressed =
+                                        suppress_managed_study_notes_server(&mut servers);
+                                    tracing::warn!(
+                                        %error,
+                                        suppressed,
+                                        "Ignoring invalid Study Notes MCP configuration"
+                                    );
+                                }
+                            }
+                        } else if suppress_unapproved_managed_study_notes_write(&mut servers) {
+                            tracing::warn!(
+                                "Suppressed managed Study Notes write mode without live opt-in"
+                            );
+                        }
                         let enabled: Vec<_> = servers.enabled_servers().cloned().collect();
                         if !enabled.is_empty() {
                             tracing::debug!(
@@ -1203,6 +1266,14 @@ impl AppBuilder {
     }
 }
 
+fn fatal_db_reload_error(error: &crate::error::ConfigError) -> bool {
+    matches!(
+        error,
+        crate::error::ConfigError::InvalidValue { key, .. }
+            if key.starts_with("TUNNEL_")
+    )
+}
+
 /// One-shot cleanup of ghost-seeded tool permission rows from a previous
 /// version that wrote baseline defaults into the database.
 ///
@@ -1319,7 +1390,7 @@ async fn cleanup_ghost_seeded_tool_permissions(
 mod tests {
     use std::sync::Arc;
 
-    use super::{AppBuilder, TurnBudgetOutcome};
+    use super::{AppBuilder, TurnBudgetOutcome, fatal_db_reload_error};
 
     use async_trait::async_trait;
     use tokio::sync::mpsc;
@@ -1331,6 +1402,36 @@ mod tests {
 
     struct SessionStartHook {
         tx: mpsc::UnboundedSender<(String, String)>,
+    }
+
+    #[test]
+    fn invalid_db_tunnel_provider_is_fatal_to_startup() {
+        let tunnel_error = crate::error::ConfigError::InvalidValue {
+            key: "TUNNEL_PROVIDER".to_string(),
+            message: "managed provider was removed".to_string(),
+        };
+        let unrelated_error = crate::error::ConfigError::InvalidValue {
+            key: "SELECTED_MODEL".to_string(),
+            message: "invalid".to_string(),
+        };
+        let tunnel_url_error = crate::error::ConfigError::InvalidValue {
+            key: "TUNNEL_URL".to_string(),
+            message: "must use HTTPS".to_string(),
+        };
+        let custom_command_error = crate::error::ConfigError::InvalidValue {
+            key: "TUNNEL_CUSTOM_COMMAND".to_string(),
+            message: "required".to_string(),
+        };
+        let netbird_prefix_error = crate::error::ConfigError::InvalidValue {
+            key: "TUNNEL_NETBIRD_NAME_PREFIX".to_string(),
+            message: "invalid".to_string(),
+        };
+
+        assert!(fatal_db_reload_error(&tunnel_error));
+        assert!(fatal_db_reload_error(&tunnel_url_error));
+        assert!(fatal_db_reload_error(&custom_command_error));
+        assert!(fatal_db_reload_error(&netbird_prefix_error));
+        assert!(!fatal_db_reload_error(&unrelated_error));
     }
 
     #[async_trait]
