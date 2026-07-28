@@ -77,7 +77,7 @@
 23. [x] go over release notes for 2.0.2.0 and see what else still needs to be added to next release, see documents about this if unsure of each item. create new doc under docs/proposals for items that should be included in 2.0.3.0 (you must focus on enginev2 related fixes/polishing)
 24. [x] (S) Refactor mt admin. The existing document plans have SERIOUS issues. Therefore, I'm going with a COMPLETELY different plan for this. Please see the following branch: mtadminrefactor/meta4/v2.0.3.0
 25. [ ] Review recent work on XMPP file transfer — remaining polish (further hardening), see documents about this if unsure. create new doc detailing findings in docs/ops called XMPP_FT_REVIEW_R.md (yes, it is intentional to have this goal defined twice)
-26. [ ] Review recent work on Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure. create new doc detailing findings in docs/ops called XMPP_FT_REVIEW_A.md (yes, it is intentional to have this goal defined twice)
+26. [x] Review recent work on Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure. create new doc detailing findings in docs/ops called XMPP_FT_REVIEW_A.md (yes, it is intentional to have this goal defined twice)
 27. [x] Review recent changes for: Gut proprietary tunnel providers and add support for netbird. improve if necessary
 28. [ ] ensure dependency list is updated for gentoo and include archlinux dependency list if not present as well. be sure to include python packages not listed in these dep lists currently
 29. [x] review darkirc key exchange implementation (only if item 20 was completed). if #20 is not done, check this off — #20 not completed, checked off per instruction

@@ -258,6 +258,9 @@ focused middleware suite passed with the required six-CPU limit:
 ```text
 taskset -c 0-5 cargo test -j6 vision_enrichment --lib -- --nocapture
 test result: ok. 8 passed; 0 failed; 0 ignored; 4193 filtered out
+
+taskset -c 0-5 cargo test -j6 channels::xmpp --lib -- --nocapture
+test result: ok. 62 passed; 0 failed; 0 ignored; 4139 filtered out
 ```
 
 This verifies the existing middleware behavior, not the unresolved bridge,
