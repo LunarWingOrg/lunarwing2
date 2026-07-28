@@ -481,7 +481,11 @@ function updateRestartButtonVisibility() {
 
 function connectSSE() {
   if (eventSource) eventSource.close();
-  resetStreamingState();
+  // Preserve an active stream across transient SSE reconnects; only reset
+  // when there is no in-flight message for the current thread.
+  if (!(_streamingThreadId && _streamingThreadId === currentThreadId)) {
+    resetStreamingState();
+  }
 
   eventSource = new EventSource('/api/chat/events?token=' + encodeURIComponent(token));
 
@@ -521,7 +525,11 @@ function connectSSE() {
 
     if (sseHasConnectedBefore && currentThreadId) {
       finalizeActivityGroup();
-      loadHistory();
+      // Don't reload history mid-stream — loadHistory() would wipe the
+      // in-progress message that only lives in the DOM.
+      if (!(_streamingThreadId && _streamingThreadId === currentThreadId)) {
+        loadHistory();
+      }
     }
     sseHasConnectedBefore = true;
   };
@@ -1904,10 +1912,20 @@ function loadHistory(before) {
 
   // Show skeleton while loading (only for fresh loads)
   if (!isPaginating) {
+    // Capture any in-flight stream content before we wipe the DOM.
+    // The server history does not yet contain the partial response.
+    const streamingThreadId = _streamingThreadId;
+    const streamingContent = (_streamingMessage && _streamingMessage.getAttribute('data-raw')) || '';
+    const wasStreaming = !!(streamingThreadId && streamingThreadId === currentThreadId && _streamingMessage);
+
     resetStreamingState();
     const chatContainer = document.getElementById('chat-messages');
     chatContainer.innerHTML = '';
     chatContainer.appendChild(renderSkeleton('message', 3));
+
+    // Stash the captured text on the container so the async handler can
+    // restore it after history loads.
+    chatContainer._savedStream = wasStreaming ? { threadId: streamingThreadId, content: streamingContent } : null;
   }
 
   apiFetch(historyUrl).then((data) => {
@@ -1944,6 +1962,30 @@ function loadHistory(before) {
       if (data.pending_approval) {
         showApproval(data.pending_approval);
       }
+
+      // If we were streaming when loadHistory started, and the last turn is
+      // still in-flight on the server, recreate the streaming message so the
+      // user doesn't lose the text that had already arrived.
+      const saved = container._savedStream;
+      if (saved && saved.threadId === currentThreadId) {
+        var lastTurn = data.turns.length > 0 ? data.turns[data.turns.length - 1] : null;
+        if (lastTurn && !lastTurn.response && lastTurn.state === 'Processing') {
+          _streamingThreadId = saved.threadId;
+          _streamingMessage = createMessageElement('assistant', '', { plainText: true });
+          _streamingMessage.setAttribute('data-streaming', 'true');
+          if (saved.content) {
+            _streamingMessage.setAttribute('data-raw', saved.content);
+            _streamingMessage.setAttribute('data-copy-text', saved.content);
+            const contentEl = _streamingMessage.querySelector('.message-content');
+            if (contentEl) {
+              contentEl.appendChild(document.createTextNode(saved.content));
+            }
+          }
+          container.appendChild(_streamingMessage);
+        }
+        container._savedStream = null;
+      }
+
       scheduleChatScrollToBottom();
     } else {
       // Pagination: prepend older messages
