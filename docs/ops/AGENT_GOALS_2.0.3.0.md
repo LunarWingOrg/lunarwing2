@@ -8,6 +8,8 @@
 ### Rares = odd (1, 3, 5, 7, ...)
 ### AJ = even (2, 4, 6, 8, ...)
 
+#### Please check off item before the final commit/push. You may add a note to the item to say if it was completed 100%, failed, or other kind of status
+
 ---
 1. [x] Bump crate versions. they are at 2.0.2. we need bump to 2.0.3
 2. [x] check cicd logic and suggest improvements in doc in docs/ops - this doc is outdated: docs/ops/CICD_LOGIC_REVIEW.md - so worth updating....
