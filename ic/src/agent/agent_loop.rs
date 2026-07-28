@@ -798,7 +798,7 @@ impl Agent {
         };
 
         // Spawn reflex compiler and cache refresh if enabled
-        let (_reflex_compiler_handle, _reflex_cache_handle) = if self.config.reflex.enabled {
+        let (_reflex_compiler_handle, _reflex_cache_handle, _reflex_evictor_handle) = if self.config.reflex.enabled {
             let compiler_handle =
                 if let (Some(store), Some(builder)) = (self.store(), self.deps.builder.clone()) {
                     tracing::info!(
@@ -834,9 +834,19 @@ impl Agent {
                 None
             };
 
-            (compiler_handle, cache_handle)
+            let evictor_handle = if let Some(store) = self.store() {
+                tracing::info!("Spawning reflex evictor (stale_after_days: 30)");
+                Some(crate::agent::reflex::spawn_reflex_evictor(
+                    Arc::clone(store),
+                    crate::agent::reflex::EvictionConfig::default(),
+                ))
+            } else {
+                None
+            };
+
+            (compiler_handle, cache_handle, evictor_handle)
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         // Spawn routine engine if enabled
