@@ -4497,7 +4497,8 @@ start_tenant_opencode() {
     local workspace_dir
     workspace_dir="$(tenant_lw_root "$name")/opencode-workspace"
     mkdir -p "$workspace_dir"
-    chown "$name:$name" "$workspace_dir"
+    # Migrate files created under an older rootless UID mapping before keep-id.
+    chown -R "$name:$name" "$workspace_dir"
     chmod 777 "$workspace_dir"
 
     local -a restart_arg=()
@@ -5377,7 +5378,14 @@ render_worker_quadlet() {
   tenant_env_path="$env_dir/lunarwing.env"
   worker_env_path="$env_dir/${worker}.env"
   workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
-  mkdir -p "$workspace_dir"; chown "$name:$name" "$workspace_dir"; chmod 777 "$workspace_dir"
+  mkdir -p "$workspace_dir"
+  if [[ "$worker" == "opencode" ]]; then
+    # Migrate files created under OpenCode's older rootless UID mapping.
+    chown -R "$name:$name" "$workspace_dir"
+  else
+    chown "$name:$name" "$workspace_dir"
+  fi
+  chmod 777 "$workspace_dir"
   mkdir -p "$qdir"
 
   local agent_token tz_key

@@ -31,7 +31,8 @@ ports_get() {
     *) return 1 ;;
   esac
 }
-chown() { :; }
+chown_calls="$fixture/chown-calls"
+chown() { printf '%s\n' "$*" >>"$chown_calls"; }
 say() { :; }
 selinuxenabled() { [[ "$selinux_active" == "true" ]]; }
 chcon() { printf '%s\n' "$*" >> "$selinux_calls"; }
@@ -153,6 +154,7 @@ ctr_calls="$fixture/container-calls"
 CONTAINER_RT="podman"
 MT_ROOTLESS="true"
 start_tenant_opencode test
+grep -Fqx -- "-R test:test $(tenant_lw_root test)/opencode-workspace" "$chown_calls"
 grep -Fq -- "-v $study_home:/opt/lw2studymcp:ro,z" "$ctr_calls"
 grep -Fq -- "-e LW2STUDYMCP_HOME=/opt/lw2studymcp" "$ctr_calls"
 grep -Fq -- "-v $study_state:/var/lib/lw2studymcp:ro,z" "$ctr_calls"
@@ -165,6 +167,7 @@ fi
 
 render_worker_quadlet test opencode 8443
 opencode_unit="$(tenant_quadlet_dir test)/lunarwing-opencode-test.container"
+grep -Fqx -- "-R test:test $(tenant_lw_root test)/opencode-workspace" "$chown_calls"
 grep -Fq "Volume=$study_home:/opt/lw2studymcp:ro,z" "$opencode_unit"
 grep -Fq "Environment=LW2STUDYMCP_HOME=/opt/lw2studymcp" "$opencode_unit"
 grep -Fq "Volume=$study_state:/var/lib/lw2studymcp:ro,z" "$opencode_unit"
