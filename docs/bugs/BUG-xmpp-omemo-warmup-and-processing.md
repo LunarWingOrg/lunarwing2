@@ -1,6 +1,6 @@
 # XMPP OMEMO fallback spam and processing stall
 
-> **Status: UNVERIFIED (checked against current source on 2026-07-25).** The
+> **Status: UNVERIFIED (checked against current source on 2026-07-28).** The
 > historical fallback-spam symptom has not been reproduced against the current
 > bridge and no current source path proves that it is resolved. The separate
 > stuck `Processing`-thread failure has a current static fix and is recorded
@@ -62,7 +62,7 @@ turn` followed by no reply. The documented root cause was cancellation of
 (`docs/internal/history/architecture/HANDLE_MESSAGE_FIX.md:5-20`). The current
 agent loop runs `handle_message` in a spawned task, keeps it alive through the
 soft timeout, and uses a hard-kill recovery that calls `fail_turn` while
-preserving queued messages (`ic/src/agent/agent_loop.rs:972-1034,1204-1284`). The
+preserving queued messages (`ic/src/agent/agent_loop.rs:1030-1090,1262-1324`). The
 regression tests cover resetting a stuck thread and draining its queued
 messages (`ic/src/agent/session.rs:1641-1705`).
 

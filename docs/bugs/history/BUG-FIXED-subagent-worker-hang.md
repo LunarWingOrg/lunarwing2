@@ -1,6 +1,6 @@
 # Fire-and-forget sandbox completion race
 
-> **Status: FIXED (current source at `51ae5a8` verified 2026-07-20).** This is the archived
+> **Status: FIXED (current source verified 2026-07-28).** This is the archived
 > completion-state portion of the former `BUG-subagent-worker-hang.md`. The
 > stronger claim that a single worker exit made every channel unresponsive was
 > never isolated and is now cross-referenced from

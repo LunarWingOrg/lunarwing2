@@ -1,7 +1,7 @@
 # Kawarimi import worker-flag parity
 
-> **Status: FIXED for the named issue (verified against `51ae5a8` on
-> 2026-07-20).** The former
+> **Status: FIXED for the named issue (verified against current source on
+> 2026-07-28).** The former
 > `BUG-kawarimi-import-no-opencode.md` is archived here. The separate
 > `--with-wasm` parser mismatch is tracked in
 > [`../BUG-kawarimi-import-flag-parity.md`](../BUG-kawarimi-import-flag-parity.md).

@@ -1,7 +1,7 @@
 # BUG: WASM tools can't resolve secrets when triggered over WeeChat (IRC)
 
-> **STATUS: FIXED (current source at `51ae5a8` verified 2026-07-20)** — channel-originated messages now execute under the
-> owner credential scope (`resolve_message_scope`, `ic/src/channels/wasm/wrapper.rs:769-780`), so
+> **STATUS: FIXED (current source verified 2026-07-28)** — channel-originated messages now execute under the
+> owner credential scope (`resolve_message_scope`, `ic/src/channels/wasm/wrapper.rs:770-782`), so
 > tools like `web_search` resolve secrets over WeeChat. Analysis retained for history.
 
 **Severity:** Medium — secret-backed WASM tools (e.g. `web_search` → `brave_api_key`) failed
@@ -62,7 +62,7 @@ weakened the per-user isolation the test enforces.)
 ## Current verification
 
 `resolve_message_scope` returns `owner_scope_id` when no owner actor is configured
-(`ic/src/channels/wasm/wrapper.rs:769-780`), and emitted messages carry that
+(`ic/src/channels/wasm/wrapper.rs:770-782`), and emitted messages carry that
 resolved value as `IncomingMessage.user_id` while retaining the raw sender ID
 separately (`wrapper.rs:2293-2302`). The old single-line `:768` reference is
 historical. No Cargo or live WeeChat run was performed.
