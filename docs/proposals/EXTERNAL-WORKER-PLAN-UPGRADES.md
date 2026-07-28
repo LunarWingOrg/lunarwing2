@@ -4,6 +4,12 @@
 > tasks landed for the surviving workers. The unchecked acceptance boxes below
 > are preserved as the original execution plan, not current incomplete work;
 > Codex was removed in v1.1.9.
+> 
+> **Note (2026-07-28):** Line number references throughout this document were
+> verified at the time of writing (2026-06-22) and may have shifted as the
+> codebase evolved. Substantive claims (struct names, features, behavior) remain
+> correct; for current line numbers see the progress checklist in
+> `docs/proposals/EXTERNAL-WORKER-UPGRADES-PROGRESS.md`.
 
 ## TL;DR
 

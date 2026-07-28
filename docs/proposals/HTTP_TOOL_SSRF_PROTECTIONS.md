@@ -1,9 +1,10 @@
 # Agent HTTP Tool SSRF Protections Investigation
 
-> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED INVESTIGATION RECORD.**
-> HTTPS-only validation, private-address blocking, redirect
-> revalidation, approval gating, and DNS pinning remain active. The proposed
-> built-in-tool `ALLOW_PRIVATE_IPS` bypass was intentionally not added.
+> **Current status (2026-07-28, verified against current source): IMPLEMENTED
+> INVESTIGATION RECORD.** HTTPS-only validation, private-address blocking,
+> redirect revalidation, approval gating, and DNS pinning remain active. The
+> proposed built-in-tool `ALLOW_PRIVATE_IPS` bypass was intentionally not
+> added. Line numbers updated to match current source.
 
 ## Status
 
@@ -19,7 +20,7 @@ The agent's built-in `http` tool refuses certain URLs, preventing the agent from
 
 All in `ic/src/tools/builtin/http.rs`:
 
-### 1. HTTPS-only scheme allowlist (lines 117-121)
+### 1. HTTPS-only scheme allowlist (line 119)
 ```rust
 if parsed.scheme() != "https" {
     return Err(ToolError::NotAuthorized("only https URLs are allowed".to_string()));
@@ -27,19 +28,19 @@ if parsed.scheme() != "https" {
 ```
 - Blocks `aesgcm://`, `http://`, `ftp://`, etc.
 - Prevents MITM injection of malicious content into agent context
-- Re-checked on every redirect hop (line 677)
+- Re-checked on every redirect hop (line 636)
 
-### 2. SSRF private-IP blocklist (lines 210-239)
+### 2. SSRF private-IP blocklist (lines 211-236)
 - Blocks: private (10.x, 172.16-31.x, 192.168.x), loopback, link-local (169.254.x including cloud metadata 169.254.169.254), multicast, unspecified, carrier-grade NAT (100.64-127.x)
 - Also catches IPv4-mapped IPv6 (`::ffff:10.0.0.1`)
 - Prevents agent from hitting cloud metadata endpoints, localhost admin APIs, or internal services
 
-### 3. Redirect re-validation (lines 600-714)
+### 3. Redirect re-validation (lines 550-657)
 - reqwest built with `Policy::none()` (no auto-redirect)
 - Simple GETs (no body, no headers): follow up to 3 redirects, each re-validated against #1 and #2
 - Non-simple requests (POST, custom headers): redirects hard-blocked with "blocked to prevent SSRF"
 
-### 4. Approval gating (lines 846-864)
+### 4. Approval gating (lines 862-879)
 - Plain GET with no headers: `ApprovalRequirement::Never` (no approval needed)
 - GET with auth headers or credential-registry match: `UnlessAutoApproved`
 - Blocks requests with credentials unless auto-approved
@@ -74,4 +75,4 @@ But is **missing** from `ic/src/tools/builtin/http.rs`. Adding it there, gated b
 
 ## Note on aesgcm:// URLs
 
-The `aesgcm://` scheme should never reach the agent's HTTP tool. The XMPP channel handles `aesgcm://` download + decryption before the attachment reaches the agent (see `download_aesgcm_file()` in `ic/src/channels/xmpp/mod.rs:3060`). The OMEMO URL leak fix (commit `1fdcf362`) ensures the raw URL is stripped from the message body. If `aesgcm://` URLs are still reaching the agent after that fix, the WASM attachment trap (see `XMPP_WASM_ATTACHMENT_TRAP.md`) is the likely upstream cause.
+The `aesgcm://` scheme should never reach the agent's HTTP tool. The XMPP channel handles `aesgcm://` download + decryption before the attachment reaches the agent (see `download_aesgcm_file()` in `ic/src/channels/xmpp/mod.rs:3083`). The OMEMO URL leak fix (commit `1fdcf362`) ensures the raw URL is stripped from the message body. If `aesgcm://` URLs are still reaching the agent after that fix, the WASM attachment trap (see `XMPP_WASM_ATTACHMENT_TRAP.md`) is the likely upstream cause.
