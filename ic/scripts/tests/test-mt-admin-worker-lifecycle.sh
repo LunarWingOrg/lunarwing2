@@ -39,7 +39,7 @@ assert_before() {
 sanitize_name() { printf '%s' "$1"; }
 tenant_exists_in_registry() { return 0; }
 tenant_worker_enabled() { return 0; }
-ensure_container_runtime() { CONTAINER_RT="podman"; MT_ROOTLESS="true"; }
+ensure_container_runtime() { CONTAINER_RT="podman"; MT_ROOTLESS="${MT_ROOTLESS:-true}"; }
 ensure_init_system() { :; }
 podman_supports_quadlet() { return 0; }
 say() { :; }
@@ -60,9 +60,13 @@ CALLS=()
 kill_worker alice opencode
 assert_call "systemctl:alice stop --no-block lunarwing-opencode-alice.service"
 assert_call "ctr:alice stop --time 0 lunarwing-opencode-alice"
+assert_call "systemctl:alice stop lunarwing-opencode-alice.service"
 assert_before \
   "systemctl:alice stop --no-block lunarwing-opencode-alice.service" \
   "ctr:alice stop --time 0 lunarwing-opencode-alice"
+assert_before \
+  "ctr:alice stop --time 0 lunarwing-opencode-alice" \
+  "systemctl:alice stop lunarwing-opencode-alice.service"
 
 INIT_SYSTEM="openrc"
 CALLS=()
@@ -72,8 +76,22 @@ assert_call "ctr:alice stop lunarwing-opencode-alice"
 assert_before "rc:lunarwing-opencode-alice-sup stop" "ctr:alice stop lunarwing-opencode-alice"
 
 CALLS=()
+kill_worker alice opencode
+assert_call "rc:lunarwing-opencode-alice-sup stop"
+assert_call "ctr:alice stop --time 0 lunarwing-opencode-alice"
+assert_before \
+  "rc:lunarwing-opencode-alice-sup stop" \
+  "ctr:alice stop --time 0 lunarwing-opencode-alice"
+
+CALLS=()
 start_worker alice opencode
 assert_call "start-opencode:alice"
+
+INIT_SYSTEM="systemd"
+MT_ROOTLESS="false"
+CALLS=()
+stop_worker alice opencode
+assert_call "ctr:alice stop lunarwing-opencode-alice"
 
 if (stop_worker alice arbitrary >/dev/null 2>&1); then
   fail "unknown worker accepted"

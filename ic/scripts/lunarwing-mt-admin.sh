@@ -7149,7 +7149,12 @@ stop_worker() {
       || _ctr "$name" stop "$container" >/dev/null 2>&1 \
       || die "failed to stop $service"
   elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-    rc-service "${container}-sup" stop >/dev/null 2>&1 || true
+    if [[ -f "/etc/init.d/${container}-sup" ]]; then
+      rc-service "${container}-sup" stop >/dev/null 2>&1 \
+        || die "failed to stop OpenRC supervisor ${container}-sup"
+    else
+      rc-service "${container}-sup" stop >/dev/null 2>&1 || true
+    fi
     if [[ -f "/etc/init.d/${container}" ]]; then
       rc-service "$container" stop >/dev/null 2>&1 \
         || die "failed to stop OpenRC service $container"

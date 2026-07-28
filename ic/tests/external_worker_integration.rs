@@ -739,7 +739,7 @@ async fn async_timeout_finalizes_job_and_emits_result() {
     .await
     .expect("result event timed out");
 
-    assert_eq!(status, "failed");
+    assert_eq!(status, "timed_out");
     assert_eq!(
         context_manager
             .get_context(job_id)
@@ -795,7 +795,7 @@ async fn cancel_in_flight_task() {
 #[tokio::test]
 async fn cancellation_before_dispatch_is_preserved() {
     let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (url, _count) = spawn_mock_worker_async(MockBehavior::WaitForCancel {
+    let (url, count) = spawn_mock_worker_async(MockBehavior::WaitForCancel {
         messages: message_tx,
     })
     .await;
@@ -824,11 +824,8 @@ async fn cancellation_before_dispatch_is_preserved() {
     .expect("expected result");
 
     assert_eq!(result.status, ExternalTaskStatus::Cancelled);
-    let cancel = timeout(TEST_BOUND, message_rx.recv())
-        .await
-        .expect("cancel envelope timed out")
-        .expect("cancel envelope channel closed");
-    assert_eq!(cancel["type"], "cancel");
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert!(message_rx.try_recv().is_err());
 }
 
 #[tokio::test]

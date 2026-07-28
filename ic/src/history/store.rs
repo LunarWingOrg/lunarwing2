@@ -713,7 +713,7 @@ impl Store {
                 "creating" => summary.creating += c,
                 "running" => summary.running += c,
                 "completed" => summary.completed += c,
-                "failed" | "cancelled" => summary.failed += c,
+                "failed" | "cancelled" | "timed_out" => summary.failed += c,
                 "stuck" => summary.stuck += c,
                 "interrupted" => summary.interrupted += c,
                 _ => {}
@@ -808,7 +808,7 @@ impl Store {
                 "creating" => summary.creating += c,
                 "running" => summary.running += c,
                 "completed" => summary.completed += c,
-                "failed" | "cancelled" => summary.failed += c,
+                "failed" | "cancelled" | "timed_out" => summary.failed += c,
                 "stuck" => summary.stuck += c,
                 "interrupted" => summary.interrupted += c,
                 _ => {}

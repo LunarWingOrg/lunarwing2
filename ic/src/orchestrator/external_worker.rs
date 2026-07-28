@@ -354,6 +354,26 @@ impl ExternalWorkerManager {
             }
         };
 
+        if *cancel_rx.borrow() {
+            let result = ExternalTaskResult {
+                status: ExternalTaskStatus::Cancelled,
+                output: String::new(),
+                error: Some("Cancelled before external worker dispatch".to_string()),
+                duration_ms: 0,
+            };
+            record_external_task_cancelled(
+                job_id,
+                &context.user_id,
+                event_tx.as_ref(),
+                context_manager.as_ref(),
+                store.as_ref(),
+                result.error.as_deref().unwrap_or("Cancelled by user"),
+            )
+            .await;
+            active_handles.write().await.remove(&job_id);
+            return Ok(wait.then_some(result));
+        }
+
         if wait {
             let lb = self.load_balancers.get(worker_name);
             let max_attempts = if lb.is_some_and(|l| l.endpoint_count() > 1) {
@@ -1365,6 +1385,11 @@ async fn record_external_task_error(
     store: Option<&Arc<dyn Database>>,
 ) {
     let reason = error.to_string();
+    let status = if matches!(error, OrchestratorError::ExternalWorkerTimeout { .. }) {
+        "timed_out"
+    } else {
+        "failed"
+    };
     let mut user_id = String::new();
 
     if let Some(cm) = context_manager {
@@ -1378,14 +1403,14 @@ async fn record_external_task_error(
             .await;
     }
 
-    persist_event(store, job_id, "result", &format!("Failed: {reason}")).await;
+    persist_event(store, job_id, "result", &format!("{status}: {reason}")).await;
     emit_event(
         event_tx,
         job_id,
         &user_id,
         SseEvent::JobResult {
             job_id: job_id.to_string(),
-            status: "failed".to_string(),
+            status: status.to_string(),
             session_id: None,
             fallback_deliverable: None,
         },
@@ -1395,9 +1420,54 @@ async fn record_external_task_error(
         let _ = db
             .update_sandbox_job_status(
                 job_id,
-                "failed",
+                status,
                 Some(false),
                 Some(&reason),
+                None,
+                Some(Utc::now()),
+            )
+            .await;
+    }
+}
+
+async fn record_external_task_cancelled(
+    job_id: Uuid,
+    user_id: &str,
+    event_tx: Option<&broadcast::Sender<(Uuid, String, SseEvent)>>,
+    context_manager: Option<&Arc<ContextManager>>,
+    store: Option<&Arc<dyn Database>>,
+    reason: &str,
+) {
+    if let Some(context_manager) = context_manager {
+        let _ = context_manager
+            .update_context(job_id, |context| {
+                if context.state == JobState::Cancelled {
+                    Ok(())
+                } else {
+                    context.transition_to(JobState::Cancelled, Some(reason.to_string()))
+                }
+            })
+            .await;
+    }
+    persist_event(store, job_id, "result", reason).await;
+    emit_event(
+        event_tx,
+        job_id,
+        user_id,
+        SseEvent::JobResult {
+            job_id: job_id.to_string(),
+            status: "cancelled".to_string(),
+            session_id: None,
+            fallback_deliverable: None,
+        },
+    );
+    if let Some(store) = store {
+        let _ = store
+            .update_sandbox_job_status(
+                job_id,
+                "cancelled",
+                Some(false),
+                Some(reason),
                 None,
                 Some(Utc::now()),
             )

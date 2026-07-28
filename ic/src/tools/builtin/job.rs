@@ -981,9 +981,8 @@ impl CreateJobTool {
                 )
                 .await
             {
-                Ok(Some(result)) => {
-                    let success = matches!(result.status, ExternalTaskStatus::Success);
-                    if success {
+                Ok(Some(result)) => match result.status {
+                    ExternalTaskStatus::Success => {
                         let output = serde_json::json!({
                             "job_id": job_id.to_string(),
                             "status": "completed",
@@ -993,14 +992,23 @@ impl CreateJobTool {
                             "timeout_ms": worker_timeout_ms,
                         });
                         Ok(ToolOutput::success(output, start.elapsed()))
-                    } else {
-                        Err(ToolError::ExecutionFailed(format!(
-                            "external worker '{}' failed: {}",
-                            worker_name,
-                            result.error.as_deref().unwrap_or(&result.output)
-                        )))
                     }
-                }
+                    ExternalTaskStatus::Cancelled => {
+                        let output = serde_json::json!({
+                            "job_id": job_id.to_string(),
+                            "status": "cancelled",
+                            "worker": worker_name,
+                            "output": result.output,
+                            "duration_ms": result.duration_ms,
+                        });
+                        Ok(ToolOutput::success(output, start.elapsed()))
+                    }
+                    _ => Err(ToolError::ExecutionFailed(format!(
+                        "external worker '{}' failed: {}",
+                        worker_name,
+                        result.error.as_deref().unwrap_or(&result.output)
+                    ))),
+                },
                 Ok(None) => {
                     let output = serde_json::json!({
                         "job_id": job_id.to_string(),
@@ -1646,7 +1654,7 @@ impl Tool for ListJobsTool {
                 "pending" => Some("pending"),
                 "inprogress" | "running" | "creating" => Some("in_progress"),
                 "completed" | "submitted" | "accepted" => Some("completed"),
-                "failed" | "cancelled" => Some("failed"),
+                "failed" | "cancelled" | "timedout" => Some("failed"),
                 "stuck" => Some("stuck"),
                 "interrupted" => Some("interrupted"),
                 _ => None,
@@ -1692,7 +1700,7 @@ fn job_matches_filter(filter: &str, status: &str) -> bool {
         "completed" => matches!(status.as_str(), "completed" | "submitted" | "accepted"),
         "failed" => matches!(
             status.as_str(),
-            "failed" | "cancelled" | "stuck" | "interrupted"
+            "failed" | "cancelled" | "timedout" | "stuck" | "interrupted"
         ),
         _ => true,
     }
@@ -1979,7 +1987,7 @@ impl Tool for CancelJobTool {
         let result = serde_json::json!({
             "job_id": job_id.to_string(),
             "status": "cancelled",
-            "message": "Job cancellation delivered"
+            "message": "Job cancellation requested"
         });
         Ok(ToolOutput::success(result, start.elapsed()))
     }

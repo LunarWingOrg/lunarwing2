@@ -202,7 +202,7 @@ impl SandboxStore for LibSqlBackend {
                 "creating" => summary.creating += count,
                 "running" => summary.running += count,
                 "completed" => summary.completed += count,
-                "failed" | "cancelled" => summary.failed += count,
+                "failed" | "cancelled" | "timed_out" => summary.failed += count,
                 "stuck" => summary.stuck += count,
                 "interrupted" => summary.interrupted += count,
                 _ => {}
@@ -278,7 +278,7 @@ impl SandboxStore for LibSqlBackend {
                 "creating" => summary.creating += count,
                 "running" => summary.running += count,
                 "completed" => summary.completed += count,
-                "failed" | "cancelled" => summary.failed += count,
+                "failed" | "cancelled" | "timed_out" => summary.failed += count,
                 "stuck" => summary.stuck += count,
                 "interrupted" => summary.interrupted += count,
                 _ => {}
