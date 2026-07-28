@@ -722,6 +722,13 @@ impl ReflexCompiler {
                         description,
                         result.error
                     );
+                    if let Err(e) = self
+                        .store
+                        .increment_reflex_compilation_attempts(&self.user_id, &normalized, 3)
+                        .await
+                    {
+                        tracing::debug!("Failed to increment compilation attempts: {}", e);
+                    }
                 }
             }
             Err(e) => {

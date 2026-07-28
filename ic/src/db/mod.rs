@@ -774,6 +774,17 @@ pub trait ReflexStore: Send + Sync {
         normalized_pattern: &str,
     ) -> Result<(), DatabaseError>;
 
+    /// Increment `compilation_attempts` for a reflex pattern.
+    ///
+    /// If the count reaches `max_attempts`, the pattern is disabled
+    /// (status set to `'disabled'`) so the compiler stops retrying it.
+    async fn increment_reflex_compilation_attempts(
+        &self,
+        user_id: &str,
+        normalized_pattern: &str,
+        max_attempts: i32,
+    ) -> Result<(), DatabaseError>;
+
     /// Prune (auto-disable) reflex patterns that haven't been matched
     /// in the last `stale_after_days` days.
     ///

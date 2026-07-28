@@ -219,6 +219,32 @@ impl ReflexStore for LibSqlBackend {
         Ok(())
     }
 
+    async fn increment_reflex_compilation_attempts(
+        &self,
+        user_id: &str,
+        normalized_pattern: &str,
+        max_attempts: i32,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let now = fmt_ts(&Utc::now());
+        conn.execute(
+            r#"
+                UPDATE reflex_patterns
+                SET compilation_attempts = compilation_attempts + 1,
+                    updated_at = ?3,
+                    status = CASE
+                        WHEN compilation_attempts + 1 >= ?4 THEN 'disabled'
+                        ELSE status
+                    END
+                WHERE user_id = ?1 AND normalized_pattern = ?2
+                "#,
+            params![user_id, normalized_pattern, now, max_attempts as i64],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(())
+    }
+
     async fn prune_stale_reflex_patterns(
         &self,
         stale_after_days: i32,

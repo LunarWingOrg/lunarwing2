@@ -1352,6 +1352,28 @@ impl ReflexStore for PgBackend {
         Ok(())
     }
 
+    async fn increment_reflex_compilation_attempts(
+        &self,
+        user_id: &str,
+        normalized_pattern: &str,
+        max_attempts: i32,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.pool().get().await?;
+        conn.execute(
+            "UPDATE reflex_patterns
+             SET compilation_attempts = compilation_attempts + 1,
+                 updated_at = NOW(),
+                 status = CASE
+                     WHEN compilation_attempts + 1 >= $3 THEN 'disabled'
+                     ELSE status
+                 END
+             WHERE user_id = $1 AND normalized_pattern = $2",
+            &[&user_id, &normalized_pattern, &max_attempts],
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn prune_stale_reflex_patterns(
         &self,
         stale_after_days: i32,
