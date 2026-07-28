@@ -235,8 +235,17 @@ grep -Fq "useradd --uid $OPENCODE_CONTAINER_UID --gid $OPENCODE_CONTAINER_GID" "
 grep -Fq "USER $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID" "$dockerfile"
 
 container_image_user="999:999"
-if (start_tenant_opencode test >/dev/null 2>&1); then
+: > "$ctr_calls"
+if stale_output="$(start_tenant_opencode test 2>&1)"; then
   printf 'OpenCode worker accepted stale image user contract\n' >&2
+  exit 1
+fi
+if [[ "$stale_output" != *"expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; rebuild it"* ]]; then
+  printf 'OpenCode stale image error omitted rebuild instruction\n' >&2
+  exit 1
+fi
+if grep -Fq -- ' run -d ' "$ctr_calls"; then
+  printf 'OpenCode worker started with stale image user contract\n' >&2
   exit 1
 fi
 
