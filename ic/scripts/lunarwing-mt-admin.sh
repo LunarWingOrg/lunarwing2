@@ -373,7 +373,8 @@ Commands:
   upgrade-tenant <name> --target <ref>
                                   In-place upgrade: backup, fetch, clean-tree gate,
                                   stop, checkout <ref> (as tenant user), rebuild
-                                  with WASM, re-render units, patch env, start.
+                                  with WASM and selected OpenCode worker, re-render
+                                  units, patch env, start.
                                   Long-running — run inside tmux.
     --source-repo <path>           Point the tenant's git origin at this repo first
     --no-backup                    Skip the pre-upgrade Postgres backup
@@ -4374,9 +4375,7 @@ start_tenant_opencode() {
   case "$image_user" in
     "$OPENCODE_CONTAINER_UID"|"$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID") ;;
     *)
-      say "WARNING: opencode worker image has user '${image_user:-unset}', expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; skipping incompatible worker" >&2
-      say "         Recovery: sudo $0 build-opencode-worker && sudo $0 start-worker $name opencode" >&2
-      return 0
+      die "opencode worker image has user '${image_user:-unset}', expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; rebuild it"
       ;;
   esac
 
@@ -7425,7 +7424,11 @@ upgrade_tenant_locked() {
   flock -u "$build_lock_fd" || die "failed to release build lock after checkout"
   exec {build_lock_fd}>&-
 
-  build_tenant "$name" "true" "false" "false" "false" "false" "true"
+  local with_opencode="false"
+  if tenant_worker_enabled "$name" opencode; then
+    with_opencode="true"
+  fi
+  build_tenant "$name" "true" "false" "false" "$with_opencode" "false" "true"
 
   if [[ "$do_render" == "true" ]]; then
     render_tenant_units "$name"

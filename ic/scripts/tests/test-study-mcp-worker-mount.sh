@@ -236,14 +236,12 @@ grep -Fq "USER $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID" "$dockerfile"
 
 container_image_user="999:999"
 : > "$ctr_calls"
-say() { printf '%s\n' "$*"; }
-stale_output="$(start_tenant_opencode test 2>&1)"
-if [[ "$stale_output" != *"skipping incompatible worker"* ]]; then
-  printf 'OpenCode worker did not report stale image user contract\n' >&2
+if stale_output="$(start_tenant_opencode test 2>&1)"; then
+  printf 'OpenCode worker accepted stale image user contract\n' >&2
   exit 1
 fi
-if [[ "$stale_output" != *"build-opencode-worker && sudo"*"start-worker test opencode"* ]]; then
-  printf 'OpenCode stale image warning omitted recovery command\n' >&2
+if [[ "$stale_output" != *"expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; rebuild it"* ]]; then
+  printf 'OpenCode stale image error omitted rebuild instruction\n' >&2
   exit 1
 fi
 if grep -Fq -- ' run -d ' "$ctr_calls"; then
