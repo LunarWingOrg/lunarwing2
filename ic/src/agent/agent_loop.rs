@@ -344,7 +344,15 @@ impl Agent {
             routine_config,
             routine_engine_slot: Arc::new(tokio::sync::RwLock::new(None)),
             mission_manager_slot: Arc::new(tokio::sync::RwLock::new(None)),
-            reflex_router: Arc::new(crate::agent::reflex::ReflexRouter::new()),
+            reflex_router: {
+                let mut router = crate::agent::reflex::ReflexRouter::new();
+                if let Some(ws) = &deps.workspace {
+                    if let Some(provider) = ws.embedding_provider() {
+                        router = router.with_embedding_provider(provider);
+                    }
+                }
+                Arc::new(router)
+            },
         }
     }
 
