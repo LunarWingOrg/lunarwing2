@@ -507,7 +507,12 @@ impl AppBuilder {
         ),
         anyhow::Error,
     > {
-        use crate::tools::mcp::config::load_mcp_servers_from_db_or_migrate;
+        use crate::tools::mcp::config::{
+            STUDY_NOTES_ALLOW_WRITE_ENV, STUDY_NOTES_HOME_ENV, STUDY_NOTES_STATE_HOME_ENV,
+            load_mcp_servers_from_db_or_migrate, parse_study_notes_allow_write,
+            reconcile_managed_study_notes_server, study_notes_server_from_home,
+            suppress_managed_study_notes_server, suppress_unapproved_managed_study_notes_write,
+        };
         use crate::tools::wasm::{WasmToolLoader, load_dev_tools};
 
         let mcp_session_manager = Arc::new(McpSessionManager::new());
@@ -602,7 +607,64 @@ impl AppBuilder {
                     crate::tools::mcp::config::load_mcp_servers().await
                 };
                 match servers_result {
-                    Ok(servers) => {
+                    Ok(mut servers) => {
+                        if let Some(home) = std::env::var_os(STUDY_NOTES_HOME_ENV) {
+                            let state_home = std::env::var_os(STUDY_NOTES_STATE_HOME_ENV);
+                            let allow_write = parse_study_notes_allow_write(
+                                std::env::var_os(STUDY_NOTES_ALLOW_WRITE_ENV).as_deref(),
+                            );
+                            let config = allow_write.and_then(|allow_write| {
+                                study_notes_server_from_home(
+                                    std::path::Path::new(&home),
+                                    state_home.as_deref().map(std::path::Path::new),
+                                    allow_write,
+                                )
+                            });
+                            match config {
+                                Ok(config) => {
+                                    let allow_write = !config.always_require_approval.is_empty();
+                                    match reconcile_managed_study_notes_server(
+                                        db.as_deref(),
+                                        &owner_id,
+                                        &mut servers,
+                                        config,
+                                    )
+                                    .await
+                                    {
+                                        Ok(true) => {
+                                            tracing::info!(
+                                                home = %std::path::Path::new(&home).display(),
+                                                allow_write,
+                                                "Reconciled managed Study Notes MCP server"
+                                            );
+                                        }
+                                        Ok(false) => {}
+                                        Err(error) => {
+                                            let suppressed =
+                                                suppress_managed_study_notes_server(&mut servers);
+                                            tracing::warn!(
+                                                %error,
+                                                suppressed,
+                                                "Failed to reconcile managed Study Notes MCP server"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let suppressed =
+                                        suppress_managed_study_notes_server(&mut servers);
+                                    tracing::warn!(
+                                        %error,
+                                        suppressed,
+                                        "Ignoring invalid Study Notes MCP configuration"
+                                    );
+                                }
+                            }
+                        } else if suppress_unapproved_managed_study_notes_write(&mut servers) {
+                            tracing::warn!(
+                                "Suppressed managed Study Notes write mode without live opt-in"
+                            );
+                        }
                         let enabled: Vec<_> = servers.enabled_servers().cloned().collect();
                         if !enabled.is_empty() {
                             tracing::debug!(
