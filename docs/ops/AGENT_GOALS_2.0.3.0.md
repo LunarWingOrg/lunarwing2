@@ -82,9 +82,9 @@
 28. [ ] ensure dependency list is updated for gentoo and include archlinux dependency list if not present as well. be sure to include python packages not listed in these dep lists currently
 29. [x] review darkirc key exchange implementation (only if item 20 was completed). if #20 is not done, check this off — #20 not completed, checked off per instruction
 30. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
-31. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+31. [x] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
 32. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
-33. [ ] write up proper plan document in docs/proposals for integrating docs/proposals/MULTIAGENTTEAMORCHESTRATION into the next release, 2.0.4.0
+33. [x] write up proper plan document in docs/proposals for integrating docs/proposals/MULTIAGENTTEAMORCHESTRATION into the next release, 2.0.4.0
 34. [ ] Work on reflex compiler. see docs/proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED in docs/proposals - ALSO, see the following branches: rc2/aragents/v2.0.3.0 and anattemptatreflexcompilerv2 for work as inspiration
 35. [ ] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
 36. [ ] update docs/README.md

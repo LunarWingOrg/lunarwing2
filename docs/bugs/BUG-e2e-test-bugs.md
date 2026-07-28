@@ -1,7 +1,7 @@
 # E2E test bugs and retired fixtures
 
 > **Overall status: PARTIALLY-FIXED / one item UNVERIFIED (verified against
-> current source on 2026-07-25).** The tool-execution failure is resolved in
+> current source on 2026-07-28).** The tool-execution failure is resolved in
 > the current test/code paths. The old Gmail OAuth fixture was retired. The
 > bootstrap greeting production path is fixed, but both E2E assertions are
 > currently `#[ignore]`'d due to a harness timing race. The clipboard test
@@ -34,13 +34,13 @@ race; the current explicit gateway broadcast resolves that divergence.
 ### Current path and evidence
 
 - `Agent::run` takes `Arc<Self>` and persists the greeting before channel start
-  (`ic/src/agent/agent_loop.rs:462-490`).
+  (`ic/src/agent/agent_loop.rs:520-548`).
 - After startup it registers the gateway thread, constructs an
   `OutgoingResponse`, sets `thread_id`, and broadcasts to the gateway
-  (`ic/src/agent/agent_loop.rs:910-932`).
+  (`ic/src/agent/agent_loop.rs:968-990`).
 - `TestRigBuilder::with_bootstrap()` preserves the pending flag and installs a
   gateway-named test channel
-  (`ic/tests/support/test_rig.rs:540-543,705-709,895-905`).
+  (`ic/tests/support/test_rig.rs:552-553,717-720,910-912`).
 - The two tests remain at `ic/tests/e2e_advanced_traces.rs:760-786` and
   `:804-870`, but both carry `#[ignore = "known-deferred: bootstrap greeting
   broadcast races with test channel readiness; see
@@ -162,5 +162,5 @@ current chat/MCP/extension/tool scenarios. The current Python environment has
 neither importable `pytest` nor `playwright`, so collection did not begin and no
 test body, browser, daemon, build, or Cargo command ran. The clipboard status
 remains unverified because this environment does not provide the E2E runtime.
-Re-verified on 2026-07-25; the bootstrap tests' `#[ignore]` markers were
+Re-verified on 2026-07-28; the bootstrap tests' `#[ignore]` markers were
 confirmed against `ic/tests/e2e_advanced_traces.rs`.

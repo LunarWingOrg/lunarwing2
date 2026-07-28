@@ -1,6 +1,6 @@
 # Engine tests and Rust integration harness failures
 
-> **Status: FIXED (static verification against `51ae5a8` on 2026-07-20;
+> **Status: FIXED (static verification against current source on 2026-07-28;
 > historical test-run counts were not re-run).** This consolidates the former
 > `BUG-engine-crate-test-failures.md` and
 > `BUG-rust-integration-test-harness-failures.md`.

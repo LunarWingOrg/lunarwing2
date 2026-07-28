@@ -1,6 +1,6 @@
 # WeeChat relay `rand_check` stub
 
-> **Status: PARTIALLY-FIXED (verified against `51ae5a8` on 2026-07-20).** The
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-07-28).** The
 > stale `HttpEndpointConfig` import warning is gone; `rand_check` still ignores
 > its probability argument and always returns `false`.
 

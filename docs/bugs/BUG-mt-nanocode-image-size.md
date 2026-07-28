@@ -1,6 +1,6 @@
 # Multi-tenant Nanocode image distribution is too large
 
-> **Status: STILL-OPEN (verified against current source on 2026-07-25).** The worker
+> **Status: STILL-OPEN (verified against current source on 2026-07-28).** The worker
 > image build and healthcheck issues from the 1.1.4 systemd pass are fixed, but
 > the Nanocode image remains large and is copied into each rootless tenant store.
 
@@ -37,4 +37,4 @@ historical context, not duplicate open bugs.
 
 Status is based on current script/Dockerfile inspection and the retained
 systemd validation record. No image build, container run, or Cargo command was
-performed in this pass. Re-verified on 2026-07-25 with updated line references.
+performed in this pass. Re-verified on 2026-07-28 with updated line references.

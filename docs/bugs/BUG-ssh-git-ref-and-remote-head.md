@@ -1,7 +1,7 @@
 # SSH Git ref handling and bare-remote HEAD diagnostics
 
-> **Overall status: PARTIALLY-FIXED (verified against `51ae5a8` on
-> 2026-07-20).** Null-like `ref` values are normalized. A bare repository whose
+> **Overall status: PARTIALLY-FIXED (verified against current source on
+> 2026-07-28).** Null-like `ref` values are normalized. A bare repository whose
 > remote HEAD points at a missing branch still produces an empty/unborn checkout
 > that `ssh_git` marks successful, with only Git's raw stderr warning.
 
