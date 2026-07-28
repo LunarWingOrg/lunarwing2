@@ -78,6 +78,10 @@ PY
 cat >"$(tenant_env_dir test)/lunarwing.env" <<EOF
 GATEWAY_AUTH_TOKEN=test-token
 LLM_API_KEY=test-key
+OPENCODE_MODEL=stale-model
+OPENCODE_MODEL=final-model
+OPENCODE_BASE_URL=http://stale.example
+OPENCODE_BASE_URL=http://final.example
 EOF
 
 # Failed seeding must leave no partial final or staging directory.
@@ -160,6 +164,12 @@ grep -Fq -- "-e LW2STUDYMCP_HOME=/opt/lw2studymcp" "$ctr_calls"
 grep -Fq -- "-v $study_state:/var/lib/lw2studymcp:ro,z" "$ctr_calls"
 grep -Fq -- "-e LW2STUDYMCP_STATE_HOME=/var/lib/lw2studymcp" "$ctr_calls"
 grep -Fq -- "--userns $OPENCODE_USERNS" "$ctr_calls"
+grep -Fq -- "-e OPENCODE_MODEL=final-model" "$ctr_calls"
+grep -Fq -- "-e OPENCODE_BASE_URL=http://final.example" "$ctr_calls"
+if grep -Eq -- 'stale-model|stale\.example' "$ctr_calls"; then
+  printf 'OpenCode imperative launch retained stale duplicate env values\n' >&2
+  exit 1
+fi
 if grep -q -- 'LW2STUDYMCP_ALLOW_WRITE' "$ctr_calls"; then
   printf 'Core Study Notes write settings leaked into OpenCode Podman command\n' >&2
   exit 1
@@ -173,6 +183,12 @@ grep -Fq "Environment=LW2STUDYMCP_HOME=/opt/lw2studymcp" "$opencode_unit"
 grep -Fq "Volume=$study_state:/var/lib/lw2studymcp:ro,z" "$opencode_unit"
 grep -Fq "Environment=LW2STUDYMCP_STATE_HOME=/var/lib/lw2studymcp" "$opencode_unit"
 grep -Fq "UserNS=$OPENCODE_USERNS" "$opencode_unit"
+grep -Fq "Environment=OPENCODE_MODEL=final-model" "$opencode_unit"
+grep -Fq "Environment=OPENCODE_BASE_URL=http://final.example" "$opencode_unit"
+if grep -Eq 'stale-model|stale\.example' "$opencode_unit"; then
+  printf 'OpenCode quadlet retained stale duplicate env values\n' >&2
+  exit 1
+fi
 if grep -q 'LW2STUDYMCP_ALLOW_WRITE' "$opencode_unit"; then
   printf 'Core Study Notes write settings leaked into OpenCode quadlet\n' >&2
   exit 1
