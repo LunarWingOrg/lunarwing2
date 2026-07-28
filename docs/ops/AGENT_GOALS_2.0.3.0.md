@@ -86,7 +86,7 @@
 32. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
 33. [x] write up proper plan document in docs/proposals for integrating docs/proposals/MULTIAGENTTEAMORCHESTRATION into the next release, 2.0.4.0
 34. [ ] Work on reflex compiler. see docs/proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED in docs/proposals - ALSO, see the following branches: rc2/aragents/v2.0.3.0 and anattemptatreflexcompilerv2 for work as inspiration
-35. [ ] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
+35. [x] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
 36. [ ] update docs/README.md
 37. [ ] update README.md at repo root
 38. [ ] come up with codename ideas for release. put into new doc.
