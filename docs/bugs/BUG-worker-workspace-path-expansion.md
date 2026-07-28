@@ -1,6 +1,6 @@
 # Worker workspace path expansion
 
-> **Status: PARTIALLY-FIXED (verified against `51ae5a8` on 2026-07-20).**
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-07-28).**
 > Structured worker project directories now normalize `~`; prompt text and the
 > Pebble executor still pass user-supplied paths without that normalization.
 
