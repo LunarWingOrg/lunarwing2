@@ -252,7 +252,13 @@ are exactly where several of these gaps surface.
 
 ## Verification Status
 
-Static review was performed against the files and revisions named above. A
-focused `vision_enrichment` library test was started with the required six-CPU
-limit; the initial cold compile exceeded the foreground command timeout and was
-restarted in tmux. Its final result must be recorded before this goal is closed.
+Static review was performed against the files and revisions named above. The
+focused middleware suite passed with the required six-CPU limit:
+
+```text
+taskset -c 0-5 cargo test -j6 vision_enrichment --lib -- --nocapture
+test result: ok. 8 passed; 0 failed; 0 ignored; 4193 filtered out
+```
+
+This verifies the existing middleware behavior, not the unresolved bridge,
+download-security, sidecar-admission, or live-client gaps listed above.
