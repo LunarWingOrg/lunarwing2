@@ -1,6 +1,6 @@
 # Multi-tenant external-worker configuration
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-07-25).**
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-07-28).**
 > Tenant provisioning now generates Nanocode, Pebble, and OpenCode endpoint
 > blocks. In-memory settings merges preserve their bearer tokens, but a later
 > full TOML rewrite (for example `/model`) still omits `auth_token` and can make
@@ -21,7 +21,7 @@ URL, timeout, and gateway token:
 - `ensure_external_worker_config` (`ic/scripts/lunarwing-mt-admin.sh:2896-2959`)
 - `add-tenant` calls it for Nanocode, Pebble, and OpenCode (`:6356-6358`)
 - retrofit calls are present in `patch-env` (`:3372-3374`)
-- TOML shape is covered by `ic/src/config/sandbox.rs:454-512`
+- TOML shape is covered by `ic/src/config/sandbox.rs:155-156,169-179`
 
 The generated shape remains:
 
@@ -47,20 +47,20 @@ selection and the start path gates workers on that selection
 **Status: STILL-OPEN (unverified runtime, source-confirmed risk).**
 
 `ExternalWorkerSettings.auth_token` is `Option<SecretString>` with
-`#[serde(default, skip_serializing)]` (`ic/src/settings.rs:811-821`). The
-settings writer serializes the whole struct (`settings.rs:1237-1260`), and the
+`#[serde(default, skip_serializing)]` (`ic/src/settings.rs:874-875`). The
+settings writer serializes the whole struct (`settings.rs:1332-1355`), and the
 `/model` command loads, changes, and saves that struct
-(`ic/src/agent/commands.rs:888-903`). Other full-TOML writers include profile
-persistence (`ic/src/tools/builtin/memory.rs:420-425`), CLI model changes
-(`ic/src/cli/models.rs:121-147,288-313,346-384`), and `config init`
-(`ic/src/cli/config.rs:204-231`). A save round-trip therefore omits the worker
+(`ic/src/agent/commands.rs:885-942`). Other full-TOML writers include profile
+persistence (`ic/src/tools/builtin/memory.rs:604-610`), CLI model changes
+(`ic/src/cli/models.rs:121-143`), and `config init`
+(`ic/src/cli/config.rs:204-223`). A save round-trip therefore omits the worker
 token. `ExternalWorkerConfig::resolve_from_settings` then receives the missing
-token (`ic/src/config/sandbox.rs:182-197`), so the daemon can connect to the
+token (`ic/src/config/sandbox.rs:186-197`), so the daemon can connect to the
 worker without the bearer expected by `AGENT_AUTH_TOKEN`.
 
 `Settings::merge_from` now restores skipped worker and endpoint tokens directly
 from the TOML-parsed overlay after its JSON merge
-(`ic/src/settings.rs:1268-1313`). That fixes token loss during an in-memory
+(`ic/src/settings.rs:1383-1407`). That fixes token loss during an in-memory
 configuration merge; it cannot recover a token that an earlier `save_toml`
 rewrite already removed from disk.
 
@@ -78,5 +78,5 @@ closed until a round-trip test and runtime auth check exist.
 The provisioning status was verified by current shell call sites and in-tree
 config tests. The persistence status was derived from the current serde
 attributes, post-merge fixup, and save/load call path; no Cargo command, daemon
-restart, or worker connection was run. Re-verified on 2026-07-25 with updated
-`lunarwing-mt-admin.sh` line references.
+restart, or worker connection was run. Re-verified on 2026-07-28 with updated
+source line references.
