@@ -330,6 +330,22 @@ impl Agent {
         }
         let scheduler = Arc::new(scheduler);
 
+        // Extract the embedding provider before moving `deps` into the struct.
+        let embedding_provider = deps.workspace.as_ref().and_then(|ws| ws.embedding_provider());
+
+        let reflex_router = {
+            let mut router = crate::agent::reflex::ReflexRouter::new()
+                .with_fuzzy_config(crate::agent::reflex::FuzzyConfig {
+                    threshold: config.reflex.fuzzy_threshold,
+                    ..Default::default()
+                })
+                .with_semantic_threshold(config.reflex.semantic_threshold);
+            if let Some(provider) = embedding_provider {
+                router = router.with_embedding_provider(provider);
+            }
+            Arc::new(router)
+        };
+
         Self {
             config,
             deps,
@@ -344,15 +360,7 @@ impl Agent {
             routine_config,
             routine_engine_slot: Arc::new(tokio::sync::RwLock::new(None)),
             mission_manager_slot: Arc::new(tokio::sync::RwLock::new(None)),
-            reflex_router: {
-                let mut router = crate::agent::reflex::ReflexRouter::new();
-                if let Some(ws) = &deps.workspace {
-                    if let Some(provider) = ws.embedding_provider() {
-                        router = router.with_embedding_provider(provider);
-                    }
-                }
-                Arc::new(router)
-            },
+            reflex_router,
         }
     }
 
