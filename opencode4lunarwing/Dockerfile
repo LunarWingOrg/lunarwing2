@@ -157,7 +157,11 @@ ENV GOROOT=/usr/local/go \
     PATH=/usr/local/go/bin:/home/opencode/go/bin:$PATH
 
 # ── non-root user ──────────────────────
-RUN groupadd -r opencode && useradd -r -g opencode -m -d /home/opencode opencode
+# Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh. Rootless Podman
+# maps the tenant's host identity onto these IDs so private read-only mounts
+# remain accessible without making Study Notes state world-readable.
+RUN groupadd --gid 10001 opencode \
+    && useradd --uid 10001 --gid 10001 -m -d /home/opencode opencode
 
 # ── app layout ─────────────────
 WORKDIR /app
@@ -199,7 +203,7 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -sf http://127.0.0.1:8443/health || exit 1
 
-USER opencode
+USER 10001:10001
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["--mode", "websocket"]

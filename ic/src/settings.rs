@@ -1240,7 +1240,23 @@ impl Settings {
                 serde_json::Value::String(s) => s.clone(),
                 serde_json::Value::Bool(b) => b.to_string(),
                 serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Null => continue, // null means default, skip
+                serde_json::Value::Null => {
+                    match key.as_str() {
+                        "tunnel.public_url" => settings.tunnel.public_url = None,
+                        "tunnel.provider" => settings.tunnel.provider = None,
+                        "tunnel.netbird_custom_domain" => {
+                            settings.tunnel.netbird_custom_domain = None;
+                        }
+                        "tunnel.netbird_name_prefix" => {
+                            settings.tunnel.netbird_name_prefix = None;
+                        }
+                        "tunnel.custom_command" => settings.tunnel.custom_command = None,
+                        "tunnel.custom_health_url" => settings.tunnel.custom_health_url = None,
+                        "tunnel.custom_url_pattern" => settings.tunnel.custom_url_pattern = None,
+                        _ => {}
+                    }
+                    continue;
+                }
                 other => other.to_string(),
             };
 
@@ -2288,6 +2304,73 @@ url = "ws://localhost:9090/ws/agent"
             Some("https://tunnel.example.com")
         );
         assert!(settings.get("tunnel.ts_hostname").is_none());
+    }
+
+    #[test]
+    fn flattened_null_tunnel_settings_clear_nested_legacy_values() {
+        let mut map = std::collections::HashMap::from([(
+            "tunnel".to_string(),
+            serde_json::json!({
+                "public_url": "https://old.example.com",
+                "provider": "tailscale",
+                "netbird_custom_domain": "old.example.com",
+                "netbird_name_prefix": "old-prefix",
+                "custom_command": "old-command",
+                "custom_health_url": "https://old.example.com/health",
+                "custom_url_pattern": "https://.*"
+            }),
+        )]);
+        for key in [
+            "tunnel.public_url",
+            "tunnel.provider",
+            "tunnel.netbird_custom_domain",
+            "tunnel.netbird_name_prefix",
+            "tunnel.custom_command",
+            "tunnel.custom_health_url",
+            "tunnel.custom_url_pattern",
+        ] {
+            map.insert(key.to_string(), serde_json::Value::Null);
+        }
+
+        let settings = Settings::from_db_map(&map);
+
+        assert!(settings.tunnel.public_url.is_none());
+        assert!(settings.tunnel.provider.is_none());
+        assert!(settings.tunnel.netbird_custom_domain.is_none());
+        assert!(settings.tunnel.netbird_name_prefix.is_none());
+        assert!(settings.tunnel.custom_command.is_none());
+        assert!(settings.tunnel.custom_health_url.is_none());
+        assert!(settings.tunnel.custom_url_pattern.is_none());
+    }
+
+    #[test]
+    fn flattened_tunnel_values_override_legacy_object_selectively() {
+        let map = std::collections::HashMap::from([
+            (
+                "tunnel".to_string(),
+                serde_json::json!({
+                    "public_url": "https://old.example.com",
+                    "provider": "tailscale",
+                    "custom_command": "old-command"
+                }),
+            ),
+            ("tunnel.provider".to_string(), serde_json::json!("ngrok")),
+            ("tunnel.public_url".to_string(), serde_json::Value::Null),
+            ("tunnel.app_metadata".to_string(), serde_json::Value::Null),
+            (
+                "lunarwing_cloud.session_token".to_string(),
+                serde_json::Value::Null,
+            ),
+        ]);
+
+        let settings = Settings::from_db_map(&map);
+
+        assert_eq!(settings.tunnel.provider.as_deref(), Some("ngrok"));
+        assert!(settings.tunnel.public_url.is_none());
+        assert_eq!(
+            settings.tunnel.custom_command.as_deref(),
+            Some("old-command")
+        );
     }
 
     /// Simulates the wizard recovery scenario:

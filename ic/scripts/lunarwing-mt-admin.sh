@@ -146,6 +146,10 @@ tenant_log_dir() { printf '%s/logs' "$(tenant_lw_root "$1")"; }
 tenant_run_dir() { printf '%s/run' "$(tenant_lw_root "$1")"; }
 STUDY_NOTES_CONTAINER_HOME="/opt/lw2studymcp"
 STUDY_NOTES_CONTAINER_STATE_HOME="/var/lib/lw2studymcp"
+OPENCODE_CONTAINER_UID="10001"
+OPENCODE_CONTAINER_GID="10001"
+OPENCODE_USERNS="keep-id:uid=${OPENCODE_CONTAINER_UID},gid=${OPENCODE_CONTAINER_GID}"
+OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS}"
 
 # ── Container config-hash tracking ────────────────────────────────────────────
 #
@@ -164,25 +168,38 @@ STUDY_NOTES_CONTAINER_STATE_HOME="/var/lib/lw2studymcp"
 # Directory for config-hash sidecars (created on first use).
 _hash_dir() { printf '%s/.config/lunarwing/container-hashes' "$(tenant_home "$1")"; }
 
+# Hash a config file with an optional launch contract for arguments that are not
+# represented in that file. Empty contracts retain the historical file hash.
+_container_config_hash() {  # <config-file> [launch-contract]
+  local config_file="$1" contract="${2:-}" file_hash
+  file_hash="$(sha256sum "$config_file" 2>/dev/null | cut -d' ' -f1 || true)"
+  [[ -n "$file_hash" ]] || return 1
+  if [[ -z "$contract" ]]; then
+    printf '%s\n' "$file_hash"
+  else
+    printf '%s\n%s\n' "$file_hash" "$contract" | sha256sum | cut -d' ' -f1
+  fi
+}
+
 # Compute and store the hash of a config file (e.g. a .container quadlet).
-# Usage: _store_container_hash <tenant> <container-name> <config-file>
+# Usage: _store_container_hash <tenant> <container-name> <config-file> [launch-contract]
 _store_container_hash() {
-  local name="$1" container="$2" config_file="$3" hdir hash
+  local name="$1" container="$2" config_file="$3" contract="${4:-}" hdir hash
   hdir="$(_hash_dir "$name")"
   mkdir -p "$hdir" 2>/dev/null || true
-  hash="$(sha256sum "$config_file" 2>/dev/null | cut -d' ' -f1 || true)"
+  hash="$(_container_config_hash "$config_file" "$contract" || true)"
   [[ -n "$hash" ]] && printf '%s\n' "$hash" >"$hdir/${container}.hash"
 }
 
 # Check whether the config file's hash matches the stored hash.
-# Returns 0 (match / first-run) or 1 (mismatch / needs recreate).
-# Usage: _container_config_changed <tenant> <container-name> <config-file>
+# Returns 0 when missing/mismatched and recreation is needed, 1 when unchanged.
+# Usage: _container_config_changed <tenant> <container-name> <config-file> [launch-contract]
 _container_config_changed() {
-  local name="$1" container="$2" config_file="$3" hdir stored current
+  local name="$1" container="$2" config_file="$3" contract="${4:-}" hdir stored current
   hdir="$(_hash_dir "$name")"
-  [[ -f "$config_file" ]] || return 0  # no config file = no opinion
-  current="$(sha256sum "$config_file" 2>/dev/null | cut -d' ' -f1 || true)"
-  [[ -n "$current" ]] || return 0      # can't hash = don't force recreate
+  [[ -f "$config_file" ]] || return 1  # no config file = no opinion
+  current="$(_container_config_hash "$config_file" "$contract" || true)"
+  [[ -n "$current" ]] || return 1      # can't hash = don't force recreate
   stored=""
   [[ -f "$hdir/${container}.hash" ]] && stored="$(cat "$hdir/${container}.hash" 2>/dev/null || true)"
   [[ -z "$stored" || "$stored" != "$current" ]]
@@ -4166,6 +4183,28 @@ configure_opencode() {
   fi
 }
 
+snapshot_sqlite_database() {  # <source> <destination>
+  require_cmd python3
+  python3 - "$1" "$2" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1]).resolve(strict=True)
+destination_path = Path(sys.argv[2])
+source = sqlite3.connect(f"{source_path.as_uri()}?mode=ro", uri=True)
+destination = sqlite3.connect(destination_path)
+try:
+    source.backup(destination)
+    result = destination.execute("PRAGMA quick_check").fetchall()
+    if result != [("ok",)]:
+        raise RuntimeError(f"SQLite quick_check failed: {result}")
+finally:
+    destination.close()
+    source.close()
+PY
+}
+
 initialize_study_notes_state() {  # <tenant> <code home> <state home>
   local name="$1" home="$2" state_home="$3"
   validate_study_notes_path "$state_home" "Study Notes state home"
@@ -4192,7 +4231,9 @@ initialize_study_notes_state() {  # <tenant> <code home> <state home>
   state_parent="$(dirname -- "$state_home")"
   mkdir -p "$state_parent"
   staged="$(mktemp -d "$state_parent/.study-notes-state.XXXXXX")"
-  if ! cp -p "$home/agent-notes.sqlite3" "$staged/agent-notes.sqlite3" \
+  if ! snapshot_sqlite_database \
+      "$home/agent-notes.sqlite3" "$staged/agent-notes.sqlite3" \
+      || ! chmod u+rw,go-rwx "$staged/agent-notes.sqlite3" \
       || ! cp -a "$home/agent-notes-by-agent" "$staged/agent-notes-by-agent" \
       || ! chown -R "$name:$name" "$staged" \
       || ! chmod u+rwx "$staged" \
@@ -4303,6 +4344,13 @@ start_tenant_opencode() {
   local name="$1"
   ensure_container_runtime
 
+  local opencode_launch_contract=""
+  local -a opencode_userns_args=()
+  if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
+    opencode_launch_contract="$OPENCODE_ROOTLESS_LAUNCH_CONTRACT"
+    opencode_userns_args=(--userns "$OPENCODE_USERNS")
+  fi
+
   local wss_port container_name opencode_dir
   # `|| true`: ports_get returns nonzero for a genuinely unallocated key; under
   # `set -euo pipefail` a bare assignment would abort the whole start-tenant run
@@ -4320,6 +4368,15 @@ start_tenant_opencode() {
     say "opencode worker image not available; run 'build-opencode-worker' first (skipping)"
     return 0
   fi
+  local image_user
+  image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
+    lunarwing-worker-opencode:latest 2>/dev/null || true)"
+  case "$image_user" in
+    "$OPENCODE_CONTAINER_UID"|"$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID") ;;
+    *)
+      die "opencode worker image has user '${image_user:-unset}', expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; rebuild it"
+      ;;
+  esac
 
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
@@ -4343,19 +4400,22 @@ start_tenant_opencode() {
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
-    if _container_config_changed "$name" "$container_name" "$env_file_for_hash"; then
+    if _container_config_changed \
+        "$name" "$container_name" "$env_file_for_hash" "$opencode_launch_contract"; then
       say "config changed for $container_name; force-recreating"
       _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
       _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
     elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
       say "opencode worker already running ($container_name, WSS port $wss_port)"
-      _store_container_hash "$name" "$container_name" "$env_file_for_hash"
+      _store_container_hash \
+        "$name" "$container_name" "$env_file_for_hash" "$opencode_launch_contract"
       _register_worker_unit "$name" opencode
       return 0
     else
       say "starting existing opencode worker container $container_name"
       _ctr "$name" start "$container_name" >/dev/null
-      _store_container_hash "$name" "$container_name" "$env_file_for_hash"
+      _store_container_hash \
+        "$name" "$container_name" "$env_file_for_hash" "$opencode_launch_contract"
       _register_worker_unit "$name" opencode
       say "opencode worker ready ($container_name, WSS port $wss_port)"
       return 0
@@ -4432,6 +4492,7 @@ start_tenant_opencode() {
     local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
+      "${opencode_userns_args[@]}" \
       -e LUNARWING_WORKER_ID="worker-opencode-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -4448,7 +4509,9 @@ start_tenant_opencode() {
       "${restart_arg[@]}" \
       lunarwing-worker-opencode:latest \
       --mode websocket >/dev/null
-    _store_container_hash "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env"
+    _store_container_hash \
+      "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" \
+      "$opencode_launch_contract"
   fi
 
   _register_worker_unit "$name" opencode
@@ -5363,6 +5426,9 @@ EOF
           "$study_notes_state_home" "$STUDY_NOTES_CONTAINER_STATE_HOME"
         printf 'Environment=LW2STUDYMCP_STATE_HOME=%s\n' "$STUDY_NOTES_CONTAINER_STATE_HOME"
       fi
+    fi
+    if [[ "$worker" == "opencode" ]]; then
+      printf 'UserNS=%s\n' "$OPENCODE_USERNS"
     fi
     # SSH agent socket mount + env (always included — the daemon creates the
     # socket at startup; if SSH isn't configured, the socket won't exist and
