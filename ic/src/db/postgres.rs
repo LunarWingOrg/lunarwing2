@@ -1410,7 +1410,8 @@ impl ReflexStore for PgBackend {
             let rows = conn
                 .query(
                     "SELECT id, user_id, normalized_pattern, original_pattern, tool_name, \
-                     match_count, last_matched_at, created_at, updated_at, status, compilation_attempts \
+                     match_count, last_matched_at, created_at, updated_at, status, compilation_attempts, \
+                     embedding, embedding_model \
                      FROM reflex_patterns \
                      WHERE id = ANY($1) \
                      ORDER BY COALESCE(last_matched_at, created_at) ASC",
