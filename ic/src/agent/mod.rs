@@ -39,7 +39,7 @@ pub(crate) use agent_loop::{HARD_KILL_GRACE_SECS, truncate_for_preview};
 pub use compaction::{CompactionResult, ContextCompactor};
 pub use context_monitor::{CompactionStrategy, ContextBreakdown, ContextMonitor};
 pub use heartbeat::{HeartbeatConfig, HeartbeatResult, HeartbeatRunner, spawn_heartbeat};
-pub use reflex::{ReflexCompiler, ReflexRouter, normalize_pattern, spawn_reflex_compiler, spawn_reflex_evictor, EvictionConfig};
+pub use reflex::{ReflexCompiler, ReflexRouter, FuzzyConfig, normalize_pattern, spawn_reflex_compiler, spawn_reflex_evictor, EvictionConfig};
 pub use router::{MessageIntent, Router};
 pub use routine::{Routine, RoutineAction, RoutineRun, Trigger};
 pub use routine_engine::{RoutineEngine, SandboxReadiness};

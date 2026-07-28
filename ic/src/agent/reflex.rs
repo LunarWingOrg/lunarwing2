@@ -130,6 +130,10 @@ pub struct ReflexRouter {
     fuzzy_hits: Arc<RwLock<HashMap<String, u32>>>,
     /// Similarity threshold for fuzzy matching.
     fuzzy_threshold: f64,
+    /// How many fuzzy matches before a pattern is promoted to exact cache.
+    promotion_threshold: u32,
+    /// Maximum fuzzy candidates to evaluate per route call.
+    max_candidates: usize,
     /// Embedding provider for semantic matching (None = tier disabled).
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     /// Cosine similarity threshold for semantic matching.
@@ -141,10 +145,13 @@ pub struct ReflexRouter {
 impl ReflexRouter {
     /// Create a new empty reflex router with the default threshold.
     pub fn new() -> Self {
+        let fuzzy = FuzzyConfig::default();
         Self {
             patterns: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_hits: Arc::new(RwLock::new(HashMap::new())),
-            fuzzy_threshold: DEFAULT_FUZZY_THRESHOLD,
+            fuzzy_threshold: fuzzy.threshold,
+            promotion_threshold: fuzzy.promotion_threshold,
+            max_candidates: fuzzy.max_candidates,
             embedding_provider: None,
             semantic_threshold: DEFAULT_SEMANTIC_THRESHOLD,
             pattern_embeddings: Arc::new(RwLock::new(HashMap::new())),
@@ -157,6 +164,8 @@ impl ReflexRouter {
             patterns: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_hits: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_threshold: threshold.clamp(0.0, 1.0),
+            promotion_threshold: PROMOTION_THRESHOLD,
+            max_candidates: MAX_FUZZY_CANDIDATES,
             embedding_provider: None,
             semantic_threshold: DEFAULT_SEMANTIC_THRESHOLD,
             pattern_embeddings: Arc::new(RwLock::new(HashMap::new())),
@@ -172,6 +181,14 @@ impl ReflexRouter {
     /// Override the default semantic similarity threshold.
     pub fn with_semantic_threshold(mut self, threshold: f64) -> Self {
         self.semantic_threshold = threshold.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Configure fuzzy matching parameters.
+    pub fn with_fuzzy_config(mut self, config: FuzzyConfig) -> Self {
+        self.fuzzy_threshold = config.threshold.clamp(0.0, 1.0);
+        self.promotion_threshold = config.promotion_threshold;
+        self.max_candidates = config.max_candidates;
         self
     }
 
@@ -259,7 +276,7 @@ impl ReflexRouter {
             }
 
             // Cap the scan to avoid pathological cases
-            if candidates.len() >= MAX_FUZZY_CANDIDATES {
+            if candidates.len() >= self.max_candidates {
                 break;
             }
         }
@@ -343,7 +360,7 @@ impl ReflexRouter {
         let count = hits.entry(normalized_input.to_string()).or_insert(0);
         *count += 1;
 
-        if *count >= PROMOTION_THRESHOLD {
+        if *count >= self.promotion_threshold {
             // Promote: insert this specific input variant into the exact-match cache
             // so subsequent calls are O(1) instead of fuzzy.
             let mut patterns = self.patterns.write().await;
@@ -396,7 +413,7 @@ impl ReflexRouter {
                     score,
                 });
             }
-            if candidates.len() >= MAX_FUZZY_CANDIDATES {
+            if candidates.len() >= self.max_candidates {
                 break;
             }
         }
