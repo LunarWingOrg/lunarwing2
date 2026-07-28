@@ -157,7 +157,11 @@ ENV GOROOT=/usr/local/go \
     PATH=/usr/local/go/bin:/home/opencode/go/bin:$PATH
 
 # ── non-root user ──────────────────────
-RUN groupadd -r opencode && useradd -r -g opencode -m -d /home/opencode opencode
+# Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh. Rootless Podman
+# maps the tenant's host identity onto these IDs so private read-only mounts
+# remain accessible without making Study Notes state world-readable.
+RUN groupadd --gid 10001 opencode \
+    && useradd --uid 10001 --gid 10001 -m -d /home/opencode opencode
 
 # ── app layout ─────────────────
 WORKDIR /app
@@ -178,7 +182,10 @@ RUN ln -s /app/opencode/node_modules /app/node_modules
 # `docker build` and only surfaces as a module-resolution error when the bridge
 # starts inside the running container.
 RUN cd /app && bun -e 'import("@opencode-ai/sdk/v2").then(m => { if (typeof m.createOpencodeClient !== "function") { console.error("FATAL: @opencode-ai/sdk/v2 resolved but is missing createOpencodeClient"); process.exit(1) } }).catch(e => { console.error("FATAL: cannot import @opencode-ai/sdk/v2 —", e.message); process.exit(1) })'
-RUN cd /app && bun scripts/opencode_result_test.ts && bun scripts/opencode_task_executor_test.ts
+RUN cd /app \
+    && bun scripts/opencode_result_test.ts \
+    && bun scripts/opencode_task_executor_test.ts \
+    && python3 scripts/study_notes_config_test.py
 
 # ── XDG directories for opencode state ────────────────────────
 RUN mkdir -p /home/opencode/.local/share/opencode \
@@ -196,7 +203,7 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -sf http://127.0.0.1:8443/health || exit 1
 
-USER opencode
+USER 10001:10001
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["--mode", "websocket"]

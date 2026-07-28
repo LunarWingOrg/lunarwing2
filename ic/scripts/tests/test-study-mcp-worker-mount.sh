@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lunarwing-mt-admin.sh
+source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
+
+fixture="$(mktemp -d)"
+wal_pid=""
+wal_release=""
+cleanup() {
+  if [[ -n "$wal_pid" ]]; then
+    [[ -z "$wal_release" ]] || touch "$wal_release"
+    wait "$wal_pid" 2>/dev/null || true
+  fi
+  rm -rf "$fixture"
+}
+trap cleanup EXIT
+
+tenant_home() { printf '%s/home/%s' "$fixture" "$1"; }
+tenant_lw_root() { printf '%s/home/%s/lunarwing' "$fixture" "$1"; }
+tenant_env_dir() { printf '%s/env' "$(tenant_lw_root "$1")"; }
+tenant_quadlet_dir() { printf '%s/.config/containers/systemd' "$(tenant_home "$1")"; }
+tenant_run_dir() { printf '%s/run' "$(tenant_lw_root "$1")"; }
+ports_get() {
+  case "$2" in
+    opencode_wss) echo 19090 ;;
+    opencode_health) echo 18443 ;;
+    nanocode_wss) echo 29090 ;;
+    nanocode_health) echo 28443 ;;
+    *) return 1 ;;
+  esac
+}
+chown() { :; }
+say() { :; }
+selinuxenabled() { [[ "$selinux_active" == "true" ]]; }
+chcon() { printf '%s\n' "$*" >> "$selinux_calls"; }
+tenant_exists_in_registry() { return 0; }
+sudo() {
+  [[ "$1" == "-u" ]] || return 1
+  shift 2
+  "$@"
+}
+ensure_container_runtime() { :; }
+_ensure_tenant_image() { return 0; }
+ensure_init_system() { INIT_SYSTEM="openrc"; }
+_register_worker_unit() { :; }
+container_image_user="$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID"
+_ctr() {
+  printf '%s\n' "$*" >> "$ctr_calls"
+  if [[ "$2" == "image" && "$3" == "inspect" ]]; then
+    printf '%s\n' "$container_image_user"
+    return 0
+  fi
+  [[ "$2" != "inspect" ]]
+}
+
+study_home="$fixture/study-notes"
+study_state="$(tenant_state_dir test)/study-notes"
+mkdir -p \
+  "$study_home/agent-notes-by-agent" \
+  "$study_home/skills/study-notes" \
+  "$(tenant_env_dir test)"
+touch \
+  "$study_home/study_notes_mcp.py" \
+  "$study_home/memorydb.py" \
+  "$study_home/skills/study-notes/SKILL.md"
+python3 - "$study_home/agent-notes.sqlite3" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("CREATE TABLE notes (body TEXT NOT NULL)")
+connection.commit()
+connection.close()
+PY
+cat >"$(tenant_env_dir test)/lunarwing.env" <<EOF
+GATEWAY_AUTH_TOKEN=test-token
+LLM_API_KEY=test-key
+EOF
+
+# Failed seeding must leave no partial final or staging directory.
+failed_state="$(tenant_state_dir test)/failed-study-notes"
+cp() {
+  return 1
+}
+if (initialize_study_notes_state test "$study_home" "$failed_state" >/dev/null 2>&1); then
+  printf 'Study Notes partial-seed fixture unexpectedly succeeded\n' >&2
+  exit 1
+fi
+unset -f cp
+test ! -e "$failed_state"
+if find "$(dirname "$failed_state")" -maxdepth 1 -name '.study-notes-state.*' -print -quit \
+    | grep -q .; then
+  printf 'Study Notes failed seed left staging directory\n' >&2
+  exit 1
+fi
+
+# Keep a committed row only in the live WAL while state is seeded. A raw copy
+# of agent-notes.sqlite3 would lose this row; SQLite's backup API must retain it.
+wal_ready="$fixture/wal-ready"
+wal_release="$fixture/wal-release"
+python3 - "$study_home/agent-notes.sqlite3" "$wal_ready" "$wal_release" <<'PY' &
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+database, ready, release = map(Path, sys.argv[1:])
+connection = sqlite3.connect(database)
+connection.execute("PRAGMA journal_mode=WAL")
+connection.execute("PRAGMA wal_autocheckpoint=0")
+connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+connection.execute("INSERT INTO notes VALUES ('committed-in-wal')")
+connection.commit()
+ready.touch()
+while not release.exists():
+    time.sleep(0.05)
+connection.close()
+PY
+wal_pid="$!"
+for _ in {1..100}; do
+  [[ -f "$wal_ready" ]] && break
+  sleep 0.05
+done
+test -f "$wal_ready"
+test -s "$study_home/agent-notes.sqlite3-wal"
+
+selinux_active=true
+selinux_calls="$fixture/selinux-calls"
+configure_study_mcp test "$study_home" true
+grep -Fqx "LW2STUDYMCP_HOME=$study_home" "$(tenant_env_dir test)/lunarwing.env"
+grep -Fqx "LW2STUDYMCP_STATE_HOME=$study_state" "$(tenant_env_dir test)/lunarwing.env"
+grep -Fqx "LW2STUDYMCP_ALLOW_WRITE=1" "$(tenant_env_dir test)/lunarwing.env"
+test -f "$study_state/agent-notes.sqlite3"
+test -d "$study_state/agent-notes-by-agent"
+python3 - "$study_state/agent-notes.sqlite3" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+assert connection.execute("SELECT body FROM notes").fetchall() == [("committed-in-wal",)]
+assert connection.execute("PRAGMA quick_check").fetchall() == [("ok",)]
+connection.close()
+PY
+touch "$wal_release"
+wait "$wal_pid"
+wal_pid=""
+grep -Fq -- "-R -t container_file_t -- $study_home" "$selinux_calls"
+grep -Fq -- "-R -t container_file_t -- $study_state" "$selinux_calls"
+
+ctr_calls="$fixture/container-calls"
+CONTAINER_RT="podman"
+MT_ROOTLESS="true"
+start_tenant_opencode test
+grep -Fq -- "-v $study_home:/opt/lw2studymcp:ro,z" "$ctr_calls"
+grep -Fq -- "-e LW2STUDYMCP_HOME=/opt/lw2studymcp" "$ctr_calls"
+grep -Fq -- "-v $study_state:/var/lib/lw2studymcp:ro,z" "$ctr_calls"
+grep -Fq -- "-e LW2STUDYMCP_STATE_HOME=/var/lib/lw2studymcp" "$ctr_calls"
+grep -Fq -- "--userns $OPENCODE_USERNS" "$ctr_calls"
+if grep -q -- 'LW2STUDYMCP_ALLOW_WRITE' "$ctr_calls"; then
+  printf 'Core Study Notes write settings leaked into OpenCode Podman command\n' >&2
+  exit 1
+fi
+
+render_worker_quadlet test opencode 8443
+opencode_unit="$(tenant_quadlet_dir test)/lunarwing-opencode-test.container"
+grep -Fq "Volume=$study_home:/opt/lw2studymcp:ro,z" "$opencode_unit"
+grep -Fq "Environment=LW2STUDYMCP_HOME=/opt/lw2studymcp" "$opencode_unit"
+grep -Fq "Volume=$study_state:/var/lib/lw2studymcp:ro,z" "$opencode_unit"
+grep -Fq "Environment=LW2STUDYMCP_STATE_HOME=/var/lib/lw2studymcp" "$opencode_unit"
+grep -Fq "UserNS=$OPENCODE_USERNS" "$opencode_unit"
+if grep -q 'LW2STUDYMCP_ALLOW_WRITE' "$opencode_unit"; then
+  printf 'Core Study Notes write settings leaked into OpenCode quadlet\n' >&2
+  exit 1
+fi
+
+render_worker_quadlet test nanocode 8443
+nanocode_unit="$(tenant_quadlet_dir test)/lunarwing-nanocode-test.container"
+if grep -q 'LW2STUDYMCP\|/opt/lw2studymcp\|/var/lib/lw2studymcp\|UserNS=keep-id' "$nanocode_unit"; then
+  printf 'Study Notes mount leaked into nanocode quadlet\n' >&2
+  exit 1
+fi
+
+# Disabling core writes retains latest state for worker reads.
+configure_study_mcp test "$study_home" false
+grep -Fqx "LW2STUDYMCP_STATE_HOME=$study_state" "$(tenant_env_dir test)/lunarwing.env"
+if grep -q '^LW2STUDYMCP_ALLOW_WRITE=' "$(tenant_env_dir test)/lunarwing.env"; then
+  printf 'Study Notes write flag survived read-only reconfiguration\n' >&2
+  exit 1
+fi
+
+: > "$ctr_calls"
+start_tenant_opencode test
+grep -Fq -- "-v $study_state:/var/lib/lw2studymcp:ro,z" "$ctr_calls"
+grep -Fq -- "--userns $OPENCODE_USERNS" "$ctr_calls"
+if grep -q -- 'LW2STUDYMCP_ALLOW_WRITE' "$ctr_calls"; then
+  printf 'Study Notes write settings leaked into read-only Podman command\n' >&2
+  exit 1
+fi
+
+render_worker_quadlet test opencode 8443
+grep -Fq "Volume=$study_state:/var/lib/lw2studymcp:ro,z" "$opencode_unit"
+grep -Fq "UserNS=$OPENCODE_USERNS" "$opencode_unit"
+if grep -q 'LW2STUDYMCP_ALLOW_WRITE' "$opencode_unit"; then
+  printf 'Study Notes write settings leaked into read-only quadlet\n' >&2
+  exit 1
+fi
+
+# Rootful runtimes do not use Podman's rootless keep-id mapping.
+: > "$ctr_calls"
+MT_ROOTLESS="false"
+start_tenant_opencode test
+if grep -q -- '--userns' "$ctr_calls"; then
+  printf 'Rootless OpenCode user namespace leaked into rootful command\n' >&2
+  exit 1
+fi
+
+# Static run arguments participate in imperative container recreation checks.
+hash_source="$(tenant_env_dir test)/lunarwing.env"
+_store_container_hash test contract-fixture "$hash_source" "$OPENCODE_ROOTLESS_LAUNCH_CONTRACT"
+if _container_config_changed \
+    test contract-fixture "$hash_source" "$OPENCODE_ROOTLESS_LAUNCH_CONTRACT"; then
+  printf 'Matching OpenCode launch contract reported changed\n' >&2
+  exit 1
+fi
+if ! _container_config_changed test contract-fixture "$hash_source" "userns=changed"; then
+  printf 'Changed OpenCode launch contract did not trigger recreation\n' >&2
+  exit 1
+fi
+
+dockerfile="$SCRIPT_DIR/../../opencode4lunarwing/Dockerfile"
+grep -Fq "groupadd --gid $OPENCODE_CONTAINER_GID opencode" "$dockerfile"
+grep -Fq "useradd --uid $OPENCODE_CONTAINER_UID --gid $OPENCODE_CONTAINER_GID" "$dockerfile"
+grep -Fq "USER $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID" "$dockerfile"
+
+container_image_user="999:999"
+: > "$ctr_calls"
+if stale_output="$(start_tenant_opencode test 2>&1)"; then
+  printf 'OpenCode worker accepted stale image user contract\n' >&2
+  exit 1
+fi
+if [[ "$stale_output" != *"expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; rebuild it"* ]]; then
+  printf 'OpenCode stale image error omitted rebuild instruction\n' >&2
+  exit 1
+fi
+if grep -Fq -- ' run -d ' "$ctr_calls"; then
+  printf 'OpenCode worker started with stale image user contract\n' >&2
+  exit 1
+fi
+
+printf 'Study MCP worker mount tests passed\n'

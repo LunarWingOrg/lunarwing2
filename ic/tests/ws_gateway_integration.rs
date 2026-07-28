@@ -49,6 +49,7 @@ async fn start_test_server() -> (
         tool_registry: None,
         store: None,
         job_manager: None,
+        external_worker_manager: None,
         prompt_queue: None,
         scheduler: None,
         owner_id: "test-user".to_string(),

@@ -120,11 +120,13 @@ git -C "$repo" restore --staged --worktree -- "$lockfile"
 printf 'operator edit\n' >"$tracked_file"
 stopped_marker="$fixture/stopped"
 restarted_marker="$fixture/restarted"
+build_args_file="$fixture/build-args"
 fixture_repo="$repo"
 export BUILD_LOCK="$fixture/build.lock"
 move_ref_on_stop=false
 tenant_lw_root() { printf '%s\n' "$fixture_repo"; }
 tenant_repo() { printf '%s/ic\n' "$fixture_repo"; }
+tenant_worker_enabled() { [[ "$1" == "fixture" && "$2" == "opencode" ]]; }
 stop_tenant() {
   : >"$stopped_marker"
   if [[ "$move_ref_on_stop" == "true" ]]; then
@@ -132,7 +134,7 @@ stop_tenant() {
   fi
 }
 start_tenant() { : >"$restarted_marker"; }
-build_tenant() { :; }
+build_tenant() { printf '%s\n' "$*" >"$build_args_file"; }
 patch_tenant_env() { :; }
 target="$(git -C "$repo" rev-parse HEAD)"
 if output="$(upgrade_tenant fixture "$target" '' false false 2>&1)"; then
@@ -187,6 +189,12 @@ if output="$(upgrade_tenant fixture moving '' false false 2>&1)" \
   pass 'upgrade pins fetched target commit across stop and checkout'
 else
   fail "upgrade did not pin moving target commit: $output"
+fi
+if [[ -f "$build_args_file" ]] \
+  && [[ "$(<"$build_args_file")" == "fixture true false false true false true" ]]; then
+  pass 'upgrade rebuilds selected OpenCode worker with strict WASM build'
+else
+  fail "upgrade forwarded wrong build flags: $(cat "$build_args_file" 2>/dev/null || true)"
 fi
 
 if [[ "$failures" -ne 0 ]]; then

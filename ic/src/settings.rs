@@ -281,12 +281,12 @@ impl Default for EmbeddingsSettings {
 ///   tunnel process automatically at boot/shutdown.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TunnelSettings {
-    /// Public URL from tunnel provider (e.g., "https://abc123.ngrok.io").
+    /// Public URL from a tunnel provider (e.g., "https://tunnel.example.com").
     /// When set without a provider, treated as a static (externally managed) URL.
     #[serde(default)]
     pub public_url: Option<String>,
 
-    /// Managed tunnel provider: "netbird", "ngrok", "cloudflare", "tailscale", "custom".
+    /// Managed tunnel provider: "netbird" or "custom".
     #[serde(default)]
     pub provider: Option<String>,
 
@@ -297,26 +297,6 @@ pub struct TunnelSettings {
     /// Prefix for NetBird's generated ephemeral service name.
     #[serde(default)]
     pub netbird_name_prefix: Option<String>,
-
-    /// Cloudflare tunnel token.
-    #[serde(default)]
-    pub cf_token: Option<String>,
-
-    /// ngrok auth token.
-    #[serde(default)]
-    pub ngrok_token: Option<String>,
-
-    /// ngrok custom domain (paid plans).
-    #[serde(default)]
-    pub ngrok_domain: Option<String>,
-
-    /// Use Tailscale Funnel (public) instead of Serve (tailnet-only).
-    #[serde(default)]
-    pub ts_funnel: bool,
-
-    /// Tailscale hostname override.
-    #[serde(default)]
-    pub ts_hostname: Option<String>,
 
     /// Shell command for custom tunnel (with `{port}` / `{host}` placeholders).
     #[serde(default)]
@@ -329,6 +309,61 @@ pub struct TunnelSettings {
     /// Substring pattern to extract URL from custom tunnel stdout.
     #[serde(default)]
     pub custom_url_pattern: Option<String>,
+}
+
+const REMOVED_TUNNEL_SETTING_KEYS: [&str; 5] = [
+    "tunnel.cf_token",
+    "tunnel.ngrok_token",
+    "tunnel.ngrok_domain",
+    "tunnel.ts_funnel",
+    "tunnel.ts_hostname",
+];
+
+fn is_removed_tunnel_setting(key: &str) -> bool {
+    REMOVED_TUNNEL_SETTING_KEYS.contains(&key)
+}
+
+pub(crate) fn validate_setting_write(key: &str, value: &serde_json::Value) -> Result<(), String> {
+    if is_removed_tunnel_setting(key) {
+        return Err(format!(
+            "setting '{key}' was removed with the legacy managed tunnel providers"
+        ));
+    }
+
+    if key != "tunnel.provider" {
+        if key == "tunnel" {
+            let tunnel = value
+                .as_object()
+                .ok_or_else(|| "tunnel setting must be an object".to_string())?;
+            for removed_key in REMOVED_TUNNEL_SETTING_KEYS {
+                let field = removed_key.strip_prefix("tunnel.").unwrap_or(removed_key);
+                if tunnel.contains_key(field) {
+                    return Err(format!(
+                        "setting '{removed_key}' was removed with the legacy managed tunnel providers"
+                    ));
+                }
+            }
+            if let Some(provider) = tunnel.get("provider") {
+                validate_setting_write("tunnel.provider", provider)?;
+            }
+        }
+        return Ok(());
+    }
+
+    match value {
+        serde_json::Value::Null => Ok(()),
+        serde_json::Value::String(provider) => crate::tunnel::validate_provider_name(provider),
+        _ => Err("tunnel.provider must be a string or null".to_string()),
+    }
+}
+
+pub(crate) fn validate_settings_write(
+    settings: &std::collections::HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    for (key, value) in settings {
+        validate_setting_write(key, value)?;
+    }
+    Ok(())
 }
 
 /// Channel-specific settings.
@@ -1168,8 +1203,35 @@ impl Settings {
         // a known Settings path.
         let mut settings = Self::default();
 
+        // Apply an old whole-object row first. Flattened child rows below then
+        // override it deterministically regardless of HashMap iteration order.
+        if let Some(value) = map.get("tunnel")
+            && !value.is_null()
+        {
+            match serde_json::from_value::<TunnelSettings>(value.clone()) {
+                Ok(tunnel) => settings.tunnel = tunnel,
+                Err(error) => tracing::warn!(%error, "Ignoring invalid nested tunnel setting"),
+            }
+        }
+
         for (key, value) in map {
-            if key == "owner_id" {
+            if key == "owner_id" || key == "tunnel" {
+                continue;
+            }
+
+            // Preserve unsupported provider names so config resolution can stop
+            // startup with migration guidance instead of silently disabling URLs.
+            if key == "tunnel.provider"
+                && let serde_json::Value::String(provider) = value
+            {
+                settings.tunnel.provider = Some(provider.clone());
+                continue;
+            }
+
+            // V24 removes these rows. Skip them safely if settings are loaded
+            // before migration or from an old export; values may contain secrets.
+            if is_removed_tunnel_setting(key) {
+                tracing::warn!(setting = %key, "Ignoring removed tunnel setting");
                 continue;
             }
 
@@ -1178,7 +1240,23 @@ impl Settings {
                 serde_json::Value::String(s) => s.clone(),
                 serde_json::Value::Bool(b) => b.to_string(),
                 serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Null => continue, // null means default, skip
+                serde_json::Value::Null => {
+                    match key.as_str() {
+                        "tunnel.public_url" => settings.tunnel.public_url = None,
+                        "tunnel.provider" => settings.tunnel.provider = None,
+                        "tunnel.netbird_custom_domain" => {
+                            settings.tunnel.netbird_custom_domain = None;
+                        }
+                        "tunnel.netbird_name_prefix" => {
+                            settings.tunnel.netbird_name_prefix = None;
+                        }
+                        "tunnel.custom_command" => settings.tunnel.custom_command = None,
+                        "tunnel.custom_health_url" => settings.tunnel.custom_health_url = None,
+                        "tunnel.custom_url_pattern" => settings.tunnel.custom_url_pattern = None,
+                        _ => {}
+                    }
+                    continue;
+                }
                 other => other.to_string(),
             };
 
@@ -1188,12 +1266,7 @@ impl Settings {
                 // data (e.g. lunarwing_cloud.session_token). Silently skip unknown paths.
                 Err(e) if e.starts_with("Path not found") => {}
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to apply DB setting '{}' = '{}': {}",
-                        key,
-                        value_str,
-                        e
-                    );
+                    tracing::warn!("Failed to apply DB setting '{}': {}", key, e);
                 }
             }
         }
@@ -1419,6 +1492,8 @@ impl Settings {
             // Key doesn't exist, try to parse as JSON or use string
             serde_json::from_str(value).unwrap_or(serde_json::Value::String(value.to_string()))
         };
+
+        validate_setting_write(path, &new_value)?;
 
         obj.insert((*final_key).to_string(), new_value);
 
@@ -2125,6 +2200,177 @@ url = "ws://localhost:9090/ws/agent"
             Some("lw.example.com".to_string())
         );
         assert_eq!(s.tunnel.netbird_name_prefix, Some("lunarwing".to_string()));
+    }
+
+    #[test]
+    fn tunnel_setting_writes_accept_only_supported_providers() {
+        let mut settings = Settings::default();
+
+        for provider in ["none", "netbird", "custom", ""] {
+            settings.set("tunnel.provider", provider).unwrap();
+            assert_eq!(settings.tunnel.provider.as_deref(), Some(provider));
+        }
+
+        settings.set("tunnel.provider", "netbird").unwrap();
+        for provider in ["cloudflare", "ngrok", "tailscale", "wireguard"] {
+            let error = settings.set("tunnel.provider", provider).unwrap_err();
+            assert!(error.contains("provider"));
+            assert_eq!(settings.tunnel.provider.as_deref(), Some("netbird"));
+        }
+    }
+
+    #[test]
+    fn removed_tunnel_settings_cannot_be_reintroduced() {
+        let mut settings = Settings::default();
+
+        for key in REMOVED_TUNNEL_SETTING_KEYS {
+            let error = settings.set(key, "sensitive-value").unwrap_err();
+            assert!(error.contains("was removed"));
+            assert!(!error.contains("sensitive-value"));
+        }
+    }
+
+    #[test]
+    fn db_map_preserves_legacy_provider_but_ignores_removed_credentials() {
+        let map = std::collections::HashMap::from([
+            ("tunnel.provider".to_string(), serde_json::json!("ngrok")),
+            (
+                "tunnel.ngrok_token".to_string(),
+                serde_json::json!("sensitive-value"),
+            ),
+        ]);
+
+        let settings = Settings::from_db_map(&map);
+        assert_eq!(settings.tunnel.provider.as_deref(), Some("ngrok"));
+        assert!(settings.get("tunnel.ngrok_token").is_none());
+    }
+
+    #[test]
+    fn settings_import_validation_rejects_entire_legacy_map() {
+        let map = std::collections::HashMap::from([
+            ("agent.name".to_string(), serde_json::json!("updated")),
+            (
+                "tunnel.cf_token".to_string(),
+                serde_json::json!("sensitive-value"),
+            ),
+        ]);
+
+        let error = validate_settings_write(&map).unwrap_err();
+        assert!(error.contains("tunnel.cf_token"));
+        assert!(!error.contains("sensitive-value"));
+    }
+
+    #[test]
+    fn whole_tunnel_object_cannot_bypass_legacy_validation() {
+        for value in [
+            serde_json::json!({"provider": "ngrok"}),
+            serde_json::json!({"provider": "netbird", "ngrok_token": "sensitive-value"}),
+        ] {
+            let error = validate_setting_write("tunnel", &value).unwrap_err();
+            assert!(error.contains("removed"));
+            assert!(!error.contains("sensitive-value"));
+        }
+
+        validate_setting_write(
+            "tunnel",
+            &serde_json::json!({
+                "provider": "netbird",
+                "netbird_name_prefix": "lunarwing"
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn db_map_preserves_nested_legacy_provider_for_startup_validation() {
+        let map = std::collections::HashMap::from([
+            (
+                "tunnel".to_string(),
+                serde_json::json!({
+                    "provider": "tailscale",
+                    "ts_hostname": "old-host"
+                }),
+            ),
+            (
+                "tunnel.public_url".to_string(),
+                serde_json::json!("https://tunnel.example.com"),
+            ),
+        ]);
+
+        let settings = Settings::from_db_map(&map);
+        assert_eq!(settings.tunnel.provider.as_deref(), Some("tailscale"));
+        assert_eq!(
+            settings.tunnel.public_url.as_deref(),
+            Some("https://tunnel.example.com")
+        );
+        assert!(settings.get("tunnel.ts_hostname").is_none());
+    }
+
+    #[test]
+    fn flattened_null_tunnel_settings_clear_nested_legacy_values() {
+        let mut map = std::collections::HashMap::from([(
+            "tunnel".to_string(),
+            serde_json::json!({
+                "public_url": "https://old.example.com",
+                "provider": "tailscale",
+                "netbird_custom_domain": "old.example.com",
+                "netbird_name_prefix": "old-prefix",
+                "custom_command": "old-command",
+                "custom_health_url": "https://old.example.com/health",
+                "custom_url_pattern": "https://.*"
+            }),
+        )]);
+        for key in [
+            "tunnel.public_url",
+            "tunnel.provider",
+            "tunnel.netbird_custom_domain",
+            "tunnel.netbird_name_prefix",
+            "tunnel.custom_command",
+            "tunnel.custom_health_url",
+            "tunnel.custom_url_pattern",
+        ] {
+            map.insert(key.to_string(), serde_json::Value::Null);
+        }
+
+        let settings = Settings::from_db_map(&map);
+
+        assert!(settings.tunnel.public_url.is_none());
+        assert!(settings.tunnel.provider.is_none());
+        assert!(settings.tunnel.netbird_custom_domain.is_none());
+        assert!(settings.tunnel.netbird_name_prefix.is_none());
+        assert!(settings.tunnel.custom_command.is_none());
+        assert!(settings.tunnel.custom_health_url.is_none());
+        assert!(settings.tunnel.custom_url_pattern.is_none());
+    }
+
+    #[test]
+    fn flattened_tunnel_values_override_legacy_object_selectively() {
+        let map = std::collections::HashMap::from([
+            (
+                "tunnel".to_string(),
+                serde_json::json!({
+                    "public_url": "https://old.example.com",
+                    "provider": "tailscale",
+                    "custom_command": "old-command"
+                }),
+            ),
+            ("tunnel.provider".to_string(), serde_json::json!("ngrok")),
+            ("tunnel.public_url".to_string(), serde_json::Value::Null),
+            ("tunnel.app_metadata".to_string(), serde_json::Value::Null),
+            (
+                "lunarwing_cloud.session_token".to_string(),
+                serde_json::Value::Null,
+            ),
+        ]);
+
+        let settings = Settings::from_db_map(&map);
+
+        assert_eq!(settings.tunnel.provider.as_deref(), Some("ngrok"));
+        assert!(settings.tunnel.public_url.is_none());
+        assert_eq!(
+            settings.tunnel.custom_command.as_deref(),
+            Some("old-command")
+        );
     }
 
     /// Simulates the wizard recovery scenario:

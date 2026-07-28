@@ -148,23 +148,21 @@ verification pass.
 
 ### G6. Tunnel provider cutover verification (NetBird)
 
-Item #17 gutted proprietary providers and added NetBird. The commit
-(`ff5e491`/`cbc0040`) landed, but there is no goal item verifying that the
-removed providers (cloudflare/ngrok/tailscale) leave no dangling config,
-secret keys, or docs references, and that NetBird works on both systemd and
-OpenRC tenants.
+Item #17 added NetBird in `ff5e491`/`cbc0040`, but did not remove existing
+managed Cloudflare, ngrok, or Tailscale providers. Item #27 completed the
+cutover and verification pass.
 
-- **Evidence:** `ic/src/tunnel/{cloudflare,ngrok,tailscale,netbird}.rs`;
-  `docs/proposals/` has no NetBird plan doc; `AGENTS.md` "Tunnel abstraction"
-  still lists all three legacy providers.
-- **Why it matters:** `AGENTS.md` "Where to Work" still advertises the deleted
-  providers, so docs and code are already drifting; also a secrets surface
-  (removed provider credentials lingering in config).
-- **Not a goal:** item #17 is the implementation; no verification/cleanup item
-  exists.
-- **Proposed item:** "Post-NetBird cutover sweep: grep for stale
-  cloudflare/ngrok/tailscale references in `ic/src/`, `docs/`, service units,
-  and `AGENTS.md`; confirm NetBird path on systemd + OpenRC; update docs."
+- **Result:** runtime implementations, setup choices, doctor probes, settings
+  fields, and web options now retain only NetBird, custom commands, and static
+  HTTPS URLs.
+- **Persistence:** PostgreSQL and libSQL migration V24 scrub legacy
+  provider-specific rows while retaining the provider marker for explicit
+  operator migration.
+- **Compatibility:** static `TUNNEL_URL` remains vendor-neutral and takes
+  precedence. Legacy managed values fail with migration guidance when no
+  static URL exists.
+- **Operations:** NetBird enrollment and daemon lifecycle remain external to
+  LunarWing, preserving systemd/OpenRC neutrality.
 
 ### G7. OMEMO + XMPP backpressure bugs
 
@@ -313,7 +311,7 @@ These were considered and rejected so a future reviewer doesn't re-raise them:
 | G3 | P0 | Reconcile MSRV 1.92 vs CI 1.96.1 | `CICD_LOGIC_REVIEW.md` P0 |
 | G4 | P1 | libSQL backend parity audit | `ic/src/db/`, `AGENTS.md` |
 | G5 | P1 | Worker/orchestrator bug sweep | `BUG-*worker*`, `BUG-unbounded-mpsc*` |
-| G6 | P1 | NetBird tunnel cutover verification | `ic/src/tunnel/`, commit `ff5e491` |
+| G6 | P1 | NetBird tunnel cutover verification (completed by item #27) | `ic/src/tunnel/`, migration V24 |
 | G7 | P1 | XMPP OMEMO + backpressure bugs | `BUG-xmpp-*` |
 | G8 | P1 | SSH-git ref/head bug cluster | `BUG-ssh-git-*`, `SSH_HARNESS_*` |
 | G9 | P2 | Docs link checker CI job | `CICD_LOGIC_REVIEW.md` §3 |
@@ -332,6 +330,6 @@ These were considered and rejected so a future reviewer doesn't re-raise them:
    them; they directly determine the "known issues" section.
 2. **G5, G7, G8** — bug-cluster sweeps; cheapest to do while the relevant
    subsystems are warm from this cycle's feature work.
-3. **G4, G6** — parity verification of features that already landed (libSQL,
-   NetBird); high value, low design cost.
+3. **G4** — parity verification of libSQL feature work; high value, low design
+   cost. G6 was completed by item #27.
 4. **G9–G15** — batch as a v2.0.4.0 prep list or squeeze in opportunistically.

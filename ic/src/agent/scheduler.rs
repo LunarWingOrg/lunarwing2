@@ -584,7 +584,7 @@ impl Scheduler {
     }
 
     /// Stop a running job.
-    pub async fn stop(&self, job_id: Uuid) -> Result<(), JobError> {
+    pub async fn stop(&self, job_id: Uuid) -> Result<bool, JobError> {
         let mut jobs = self.jobs.write().await;
 
         if let Some(scheduled) = jobs.remove(&job_id) {
@@ -633,9 +633,10 @@ impl Scheduler {
             }
 
             tracing::info!("Stopped job {}", job_id);
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Send a follow-up user message to a running job.

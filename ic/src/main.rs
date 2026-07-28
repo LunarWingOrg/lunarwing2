@@ -733,6 +733,9 @@ async fn async_main() -> anyhow::Result<()> {
         if let Some(ref jm) = container_job_manager {
             gw = gw.with_job_manager(Arc::clone(jm));
         }
+        if let Some(ref manager) = external_worker_manager {
+            gw = gw.with_external_worker_manager(Arc::clone(manager));
+        }
         gw = gw.with_scheduler(scheduler_slot.clone());
         gw = gw.with_routine_engine_slot(Arc::clone(&shared_routine_engine_slot));
         if let Some(ref sr) = components.skill_registry {
@@ -757,20 +760,20 @@ async fn async_main() -> anyhow::Result<()> {
         }
         if config.sandbox.enabled {
             gw = gw.with_prompt_queue(Arc::clone(&prompt_queue));
+        }
 
-            if let Some(ref tx) = job_event_tx {
-                let mut rx = tx.subscribe();
-                let gw_state = Arc::clone(gw.state());
-                tokio::spawn(async move {
-                    while let Ok((_job_id, user_id, event)) = rx.recv().await {
-                        if user_id.is_empty() {
-                            gw_state.sse.broadcast(event);
-                        } else {
-                            gw_state.sse.broadcast_for_user(&user_id, event);
-                        }
+        if let Some(ref tx) = job_event_tx {
+            let mut rx = tx.subscribe();
+            let gw_state = Arc::clone(gw.state());
+            tokio::spawn(async move {
+                while let Ok((_job_id, user_id, event)) = rx.recv().await {
+                    if user_id.is_empty() {
+                        gw_state.sse.broadcast(event);
+                    } else {
+                        gw_state.sse.broadcast_for_user(&user_id, event);
                     }
-                });
-            }
+                }
+            });
         }
 
         // Persist auto-generated auth token so it survives restarts.
@@ -970,6 +973,8 @@ async fn async_main() -> anyhow::Result<()> {
         owner_id: config.owner_id.clone(),
         vision_service_url: config.vision_service_url.clone(),
         store: components.db,
+        container_job_manager: container_job_manager.clone(),
+        external_worker_manager: external_worker_manager.clone(),
         llm: components.llm,
         cheap_llm: components.cheap_llm,
         safety: components.safety,

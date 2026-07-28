@@ -56,7 +56,9 @@ MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS="${LUNARWING_MT_MIGRATE_LEGACY_EXTERNAL_
 # out per add-tenant with --no-health, or fleet-wide with
 # LUNARWING_MT_HEALTH_ENABLED=false.
 DEFAULT_HEALTH_ENABLED="${LUNARWING_MT_HEALTH_ENABLED:-true}"
-HEALTH_INTERVAL_MIN="${LUNARWING_MT_HEALTH_INTERVAL_MIN:-15}"
+# Resolved after init detection: OpenRC defaults to 5 minutes, systemd to 15.
+# An explicit override applies to either init system.
+HEALTH_INTERVAL_MIN="${LUNARWING_MT_HEALTH_INTERVAL_MIN:-}"
 HEALTH_BASE_DIR="${LUNARWING_MT_HEALTH_BASE_DIR:-/var/lib/lunarwing-health}"
 HEALTH_SRC_DIR="$LUNARWING_ROOT/ic-infrastructure-health-check"
 HEALTH_LIB_DIR="/usr/local/lib/lunarwing-health"
@@ -142,6 +144,12 @@ tenant_quadlet_dir() { printf '%s/.config/containers/systemd' "$(tenant_home "$1
 tenant_state_dir() { printf '%s/state' "$(tenant_lw_root "$1")"; }
 tenant_log_dir() { printf '%s/logs' "$(tenant_lw_root "$1")"; }
 tenant_run_dir() { printf '%s/run' "$(tenant_lw_root "$1")"; }
+STUDY_NOTES_CONTAINER_HOME="/opt/lw2studymcp"
+STUDY_NOTES_CONTAINER_STATE_HOME="/var/lib/lw2studymcp"
+OPENCODE_CONTAINER_UID="10001"
+OPENCODE_CONTAINER_GID="10001"
+OPENCODE_USERNS="keep-id:uid=${OPENCODE_CONTAINER_UID},gid=${OPENCODE_CONTAINER_GID}"
+OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS}"
 
 # ── Container config-hash tracking ────────────────────────────────────────────
 #
@@ -160,25 +168,38 @@ tenant_run_dir() { printf '%s/run' "$(tenant_lw_root "$1")"; }
 # Directory for config-hash sidecars (created on first use).
 _hash_dir() { printf '%s/.config/lunarwing/container-hashes' "$(tenant_home "$1")"; }
 
+# Hash a config file with an optional launch contract for arguments that are not
+# represented in that file. Empty contracts retain the historical file hash.
+_container_config_hash() {  # <config-file> [launch-contract]
+  local config_file="$1" contract="${2:-}" file_hash
+  file_hash="$(sha256sum "$config_file" 2>/dev/null | cut -d' ' -f1 || true)"
+  [[ -n "$file_hash" ]] || return 1
+  if [[ -z "$contract" ]]; then
+    printf '%s\n' "$file_hash"
+  else
+    printf '%s\n%s\n' "$file_hash" "$contract" | sha256sum | cut -d' ' -f1
+  fi
+}
+
 # Compute and store the hash of a config file (e.g. a .container quadlet).
-# Usage: _store_container_hash <tenant> <container-name> <config-file>
+# Usage: _store_container_hash <tenant> <container-name> <config-file> [launch-contract]
 _store_container_hash() {
-  local name="$1" container="$2" config_file="$3" hdir hash
+  local name="$1" container="$2" config_file="$3" contract="${4:-}" hdir hash
   hdir="$(_hash_dir "$name")"
   mkdir -p "$hdir" 2>/dev/null || true
-  hash="$(sha256sum "$config_file" 2>/dev/null | cut -d' ' -f1 || true)"
+  hash="$(_container_config_hash "$config_file" "$contract" || true)"
   [[ -n "$hash" ]] && printf '%s\n' "$hash" >"$hdir/${container}.hash"
 }
 
 # Check whether the config file's hash matches the stored hash.
-# Returns 0 (match / first-run) or 1 (mismatch / needs recreate).
-# Usage: _container_config_changed <tenant> <container-name> <config-file>
+# Returns 0 when missing/mismatched and recreation is needed, 1 when unchanged.
+# Usage: _container_config_changed <tenant> <container-name> <config-file> [launch-contract]
 _container_config_changed() {
-  local name="$1" container="$2" config_file="$3" hdir stored current
+  local name="$1" container="$2" config_file="$3" contract="${4:-}" hdir stored current
   hdir="$(_hash_dir "$name")"
-  [[ -f "$config_file" ]] || return 0  # no config file = no opinion
-  current="$(sha256sum "$config_file" 2>/dev/null | cut -d' ' -f1 || true)"
-  [[ -n "$current" ]] || return 0      # can't hash = don't force recreate
+  [[ -f "$config_file" ]] || return 1  # no config file = no opinion
+  current="$(_container_config_hash "$config_file" "$contract" || true)"
+  [[ -n "$current" ]] || return 1      # can't hash = don't force recreate
   stored=""
   [[ -f "$hdir/${container}.hash" ]] && stored="$(cat "$hdir/${container}.hash" 2>/dev/null || true)"
   [[ -z "$stored" || "$stored" != "$current" ]]
@@ -342,12 +363,18 @@ Commands:
   start-tenant <name>             Start all services for a tenant
   stop-tenant <name>              Stop all services for a tenant
   restart-tenant <name>           Stop then start
+  start-worker <name> <worker>    Start one enabled external worker
+  stop-worker <name> <worker>     Gracefully stop one external worker
+  restart-worker <name> <worker>  Restart one external worker
+  kill-worker <name> <worker>     Emergency zero-grace stop; leaves worker stopped
+                                   Workers: nanocode, pebble, opencode
   render-units <name>             Re-render a tenant's service units from the current
                                   generator (no restart; applies init-script changes)
   upgrade-tenant <name> --target <ref>
                                   In-place upgrade: backup, fetch, clean-tree gate,
                                   stop, checkout <ref> (as tenant user), rebuild
-                                  with WASM, re-render units, patch env, start.
+                                  with WASM and selected OpenCode worker, re-render
+                                  units, patch env, start.
                                   Long-running — run inside tmux.
     --source-repo <path>           Point the tenant's git origin at this repo first
     --no-backup                    Skip the pre-upgrade Postgres backup
@@ -371,6 +398,12 @@ Commands:
     --model <model>                TensorZero model (OPENCODE_MODEL; any string)
     --base-url <url>               TensorZero baseURL (OPENCODE_BASE_URL; full URL)
                                    (restart the worker after: stop-tenant && start-tenant)
+
+  configure-study-mcp <name>       Configure lw2studymcp for LunarWing and
+    --home <absolute-path>          its opencode worker using a shared host checkout
+    [--allow-write]                 Enable approved core-agent writes using separate state
+    [--state-home <absolute-path>]  State path (default: tenant lunarwing/study-notes-state)
+                                   (restart the tenant after configuration)
 
    configure-ssh <name>             Provision SSH harness for an existing tenant
      --host <host>                  SSH host (default: 127.0.0.1)
@@ -485,6 +518,13 @@ detect_init_system() {
 INIT_SYSTEM=""
 ensure_init_system() {
   [[ -n "$INIT_SYSTEM" ]] || INIT_SYSTEM="$(detect_init_system)"
+  if [[ -z "$HEALTH_INTERVAL_MIN" ]]; then
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+      HEALTH_INTERVAL_MIN=5
+    else
+      HEALTH_INTERVAL_MIN=15
+    fi
+  fi
 }
 
 # Machine-wide persisted runtime choice (see _save_container_runtime). One
@@ -2236,6 +2276,71 @@ _env_existing() {  # <env_file> <KEY>
   sed -n "s/^$2=//p" "$1" | head -1
 }
 
+validate_study_notes_path() {  # <absolute path> <label>
+  [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    || die "$2 must be an absolute path without whitespace or shell metacharacters"
+}
+
+validate_study_notes_home() {  # <absolute checkout path>
+  local home="$1"
+  validate_study_notes_path "$home" "Study Notes home"
+  [[ -d "$home" ]] || die "Study Notes home directory missing: $home"
+  [[ -f "$home/study_notes_mcp.py" ]] || die "Study Notes file missing: $home/study_notes_mcp.py"
+  [[ -f "$home/memorydb.py" ]] || die "Study Notes file missing: $home/memorydb.py"
+  [[ -f "$home/agent-notes.sqlite3" ]] || die "Study Notes file missing: $home/agent-notes.sqlite3"
+  [[ -d "$home/agent-notes-by-agent" ]] || die "Study Notes directory missing: $home/agent-notes-by-agent"
+  [[ -f "$home/skills/study-notes/SKILL.md" ]] || die "Study Notes skill missing: $home/skills/study-notes/SKILL.md"
+  local home_real relative
+  home_real="$(readlink -f -- "$home")"
+  for relative in \
+    study_notes_mcp.py \
+    memorydb.py \
+    agent-notes.sqlite3 \
+    agent-notes-by-agent \
+    skills/study-notes/SKILL.md; do
+    [[ "$(readlink -f -- "$home/$relative")" == "$home_real/$relative" ]] \
+      || die "Study Notes code path must not be a symlink: $home/$relative"
+  done
+}
+
+validate_study_notes_state_home() {  # <absolute state path>
+  local state_home="$1"
+  validate_study_notes_path "$state_home" "Study Notes state home"
+  [[ -d "$state_home" ]] || die "Study Notes state directory missing: $state_home"
+  [[ -f "$state_home/agent-notes.sqlite3" ]] \
+    || die "Study Notes state database missing: $state_home/agent-notes.sqlite3"
+  [[ -d "$state_home/agent-notes-by-agent" ]] \
+    || die "Study Notes state notes directory missing: $state_home/agent-notes-by-agent"
+  local state_real database_real notes_real
+  state_real="$(readlink -f -- "$state_home")"
+  database_real="$(readlink -f -- "$state_home/agent-notes.sqlite3")"
+  notes_real="$(readlink -f -- "$state_home/agent-notes-by-agent")"
+  [[ "$database_real" == "$state_real/agent-notes.sqlite3" ]] \
+    || die "Study Notes state database must not be a symlink"
+  [[ "$notes_real" == "$state_real/agent-notes-by-agent" ]] \
+    || die "Study Notes notes directory must not be a symlink"
+}
+
+tenant_study_notes_home() {  # <tenant>
+  _env_existing "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_HOME
+}
+
+tenant_study_notes_state_home() {  # <tenant>
+  _env_existing "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_STATE_HOME
+}
+
+tenant_study_notes_allow_write() {  # <tenant>
+  _env_existing "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_ALLOW_WRITE
+}
+
+study_notes_write_enabled() {  # <raw boolean>
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    ""|0|false|FALSE|no|NO|off|OFF) return 1 ;;
+    *) die "LW2STUDYMCP_ALLOW_WRITE must be a boolean" ;;
+  esac
+}
+
 # Resolve a tenant's XMPP JID: an explicit <jid> wins; else PRESERVE the one
 # already in lunarwing.env; else fall back to <name>@xmpp.localhost (first-time
 # provision). lunarwing.env is the authoritative source — the bridge binary
@@ -2550,6 +2655,7 @@ write_tenant_lunarwing_env() {
   # tokens would break live clients/workers; minting a fresh XMPP_PASSWORD would
   # break the already-registered XMPP account. Generate fresh ONLY on first write.
   local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password darkirc_adapter_secret
+  local study_notes_home study_notes_state_home study_notes_allow_write
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
   relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
@@ -2567,6 +2673,9 @@ write_tenant_lunarwing_env() {
   [[ -n "$nanocode_base_url" ]] || nanocode_base_url="$(_env_existing "$path" NANOCODE_BASE_URL)"
   [[ -n "$opencode_model" ]]    || opencode_model="$(_env_existing "$path" OPENCODE_MODEL)"
   [[ -n "$opencode_base_url" ]] || opencode_base_url="$(_env_existing "$path" OPENCODE_BASE_URL)"
+  study_notes_home="$(_env_existing "$path" LW2STUDYMCP_HOME)"
+  study_notes_state_home="$(_env_existing "$path" LW2STUDYMCP_STATE_HOME)"
+  study_notes_allow_write="$(_env_existing "$path" LW2STUDYMCP_ALLOW_WRITE)"
   # LLM circuit breaker: fleet defaults (open after 7 fully-retried failures,
   # probe again after 45s). These are tunables, so preserve an operator's
   # per-tenant override across re-provision rather than clobbering it.
@@ -2731,6 +2840,14 @@ ENVEOF
   [[ -n "$nanocode_base_url" ]] && printf 'NANOCODE_BASE_URL=%s\n' "$nanocode_base_url" >> "$path"
   [[ -n "$opencode_model" ]]    && printf '\nOPENCODE_MODEL=%s\n'    "$opencode_model"     >> "$path"
   [[ -n "$opencode_base_url" ]] && printf 'OPENCODE_BASE_URL=%s\n' "$opencode_base_url" >> "$path"
+  if [[ -n "$study_notes_home" ]]; then
+    printf '\n# Shared LunarWing Study Notes MCP\nLW2STUDYMCP_HOME=%s\n' \
+      "$study_notes_home" >> "$path"
+    [[ -z "$study_notes_state_home" ]] \
+      || printf 'LW2STUDYMCP_STATE_HOME=%s\n' "$study_notes_state_home" >> "$path"
+    [[ -z "$study_notes_allow_write" ]] \
+      || printf 'LW2STUDYMCP_ALLOW_WRITE=%s\n' "$study_notes_allow_write" >> "$path"
+  fi
   chown "$name:$name" "$path"
   say "wrote: $path"
 }
@@ -4067,9 +4184,173 @@ configure_opencode() {
   fi
 }
 
+snapshot_sqlite_database() {  # <source> <destination>
+  require_cmd python3
+  python3 - "$1" "$2" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1]).resolve(strict=True)
+destination_path = Path(sys.argv[2])
+source = sqlite3.connect(f"{source_path.as_uri()}?mode=ro", uri=True)
+destination = sqlite3.connect(destination_path)
+try:
+    source.backup(destination)
+    result = destination.execute("PRAGMA quick_check").fetchall()
+    if result != [("ok",)]:
+        raise RuntimeError(f"SQLite quick_check failed: {result}")
+finally:
+    destination.close()
+    source.close()
+PY
+}
+
+initialize_study_notes_state() {  # <tenant> <code home> <state home>
+  local name="$1" home="$2" state_home="$3"
+  validate_study_notes_path "$state_home" "Study Notes state home"
+
+  local home_real state_real
+  home_real="$(readlink -f -- "$home")"
+  state_real="$(readlink -m -- "$state_home")"
+  [[ "$state_real" != "$home_real" && "$state_real" != "$home_real/"* \
+      && "$home_real" != "$state_real/"* ]] \
+    || die "Study Notes code and state directories must not overlap"
+
+  if [[ -e "$state_home" ]]; then
+    [[ -d "$state_home" ]] || die "Study Notes state home is not a directory: $state_home"
+    if [[ -e "$state_home/agent-notes.sqlite3" \
+        || -e "$state_home/agent-notes-by-agent" ]]; then
+      validate_study_notes_state_home "$state_home"
+      return 0
+    fi
+    [[ -z "$(find "$state_home" -mindepth 1 -maxdepth 1 -print -quit)" ]] \
+      || die "Study Notes state home is non-empty but uninitialized: $state_home"
+  fi
+
+  local state_parent staged
+  state_parent="$(dirname -- "$state_home")"
+  mkdir -p "$state_parent"
+  staged="$(mktemp -d "$state_parent/.study-notes-state.XXXXXX")"
+  if ! snapshot_sqlite_database \
+      "$home/agent-notes.sqlite3" "$staged/agent-notes.sqlite3" \
+      || ! chmod u+rw,go-rwx "$staged/agent-notes.sqlite3" \
+      || ! cp -a "$home/agent-notes-by-agent" "$staged/agent-notes-by-agent" \
+      || ! chown -R "$name:$name" "$staged" \
+      || ! chmod u+rwx "$staged" \
+      || ! find "$staged/agent-notes-by-agent" -type d -exec chmod u+rwx {} +; then
+    rm -rf -- "$staged"
+    die "failed to seed Study Notes state: $state_home"
+  fi
+  validate_study_notes_state_home "$staged"
+  if [[ -d "$state_home" ]] && ! rmdir -- "$state_home"; then
+    rm -rf -- "$staged"
+    die "Study Notes state home changed while seeding: $state_home"
+  fi
+  if ! mv -T -- "$staged" "$state_home"; then
+    rm -rf -- "$staged"
+    die "failed to install seeded Study Notes state: $state_home"
+  fi
+}
+
+validate_study_notes_tenant_access() {  # <tenant> <code home> [state home] <write bool>
+  local name="$1" home="$2" state_home="$3" allow_write="$4"
+  local required
+  for required in \
+    "$home/study_notes_mcp.py" \
+    "$home/memorydb.py" \
+    "$home/agent-notes.sqlite3" \
+    "$home/skills/study-notes/SKILL.md"; do
+    sudo -u "$name" test -r "$required" \
+      || die "tenant '$name' cannot read Study Notes file: $required"
+  done
+  sudo -u "$name" test -x "$home/agent-notes-by-agent" \
+    || die "tenant '$name' cannot traverse Study Notes directory: $home/agent-notes-by-agent"
+
+  [[ -n "$state_home" ]] || return 0
+  sudo -u "$name" test -r "$state_home/agent-notes.sqlite3" \
+    || die "tenant '$name' cannot read Study Notes state database"
+  sudo -u "$name" test -x "$state_home/agent-notes-by-agent" \
+    || die "tenant '$name' cannot traverse Study Notes state notes"
+  [[ "$allow_write" == "true" ]] || return 0
+  sudo -u "$name" test -w "$state_home" \
+    || die "tenant '$name' cannot write Study Notes state home: $state_home"
+  local unwritable
+  unwritable="$(sudo -u "$name" find "$state_home/agent-notes-by-agent" \
+    -type d ! -writable -print -quit)"
+  [[ -z "$unwritable" ]] \
+    || die "tenant '$name' cannot write Study Notes state directory: $unwritable"
+  if [[ -e "$state_home/agent-notes-by-agent/.study-notes.lock" ]]; then
+    sudo -u "$name" test -w "$state_home/agent-notes-by-agent/.study-notes.lock" \
+      || die "tenant '$name' cannot write Study Notes lock file"
+  fi
+}
+
+configure_study_mcp() {  # <tenant> <code home> <allow-write bool> [state home]
+  local name="$1" home="$2" allow_write_raw="$3" state_home="${4:-}"
+
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  validate_study_notes_home "$home"
+
+  local allow_write=false
+  if study_notes_write_enabled "$allow_write_raw"; then
+    allow_write=true
+  fi
+  if [[ -z "$state_home" ]]; then
+    state_home="$(tenant_study_notes_state_home "$name")"
+  fi
+  if [[ "$allow_write" == "true" && -z "$state_home" ]]; then
+    state_home="$(tenant_state_dir "$name")/study-notes"
+  fi
+  if [[ -n "$state_home" ]]; then
+    initialize_study_notes_state "$name" "$home" "$state_home"
+  fi
+  validate_study_notes_tenant_access "$name" "$home" "$state_home" "$allow_write"
+
+  # Rootless Podman cannot relabel a root-owned shared checkout itself.
+  if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+    require_cmd chcon
+    chcon -R -t container_file_t -- "$home" \
+      || die "failed to label Study Notes checkout for container access: $home"
+    if [[ -n "$state_home" ]]; then
+      chcon -R -t container_file_t -- "$state_home" \
+        || die "failed to label Study Notes state for container access: $state_home"
+    fi
+  fi
+
+  local env_path tmp
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
+  tmp="$(mktemp)"
+  grep -vE '^(# Shared .*Study Notes MCP|LW2STUDYMCP_(HOME|STATE_HOME|ALLOW_WRITE)=)' \
+    "$env_path" > "$tmp" || true
+  printf '\n# Shared LunarWing Study Notes MCP\nLW2STUDYMCP_HOME=%s\n' \
+    "$home" >> "$tmp"
+  [[ -z "$state_home" ]] \
+    || printf 'LW2STUDYMCP_STATE_HOME=%s\n' "$state_home" >> "$tmp"
+  [[ "$allow_write" != "true" ]] \
+    || printf 'LW2STUDYMCP_ALLOW_WRITE=1\n' >> "$tmp"
+  cat "$tmp" > "$env_path"
+  rm -f "$tmp"
+  chown "$name:$name" "$env_path"
+  chmod 600 "$env_path"
+
+  say "Study Notes MCP configured for tenant '$name' from $home (write=$allow_write)"
+  say "restart tenant to seed core MCP config and recreate opencode worker mount:"
+  say "  sudo $0 restart-tenant $name"
+}
+
 start_tenant_opencode() {
   local name="$1"
   ensure_container_runtime
+
+  local opencode_launch_contract=""
+  local -a opencode_userns_args=()
+  if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
+    opencode_launch_contract="$OPENCODE_ROOTLESS_LAUNCH_CONTRACT"
+    opencode_userns_args=(--userns "$OPENCODE_USERNS")
+  fi
 
   local wss_port container_name opencode_dir
   # `|| true`: ports_get returns nonzero for a genuinely unallocated key; under
@@ -4088,6 +4369,15 @@ start_tenant_opencode() {
     say "opencode worker image not available; run 'build-opencode-worker' first (skipping)"
     return 0
   fi
+  local image_user
+  image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
+    lunarwing-worker-opencode:latest 2>/dev/null || true)"
+  case "$image_user" in
+    "$OPENCODE_CONTAINER_UID"|"$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID") ;;
+    *)
+      die "opencode worker image has user '${image_user:-unset}', expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; rebuild it"
+      ;;
+  esac
 
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
@@ -4111,19 +4401,22 @@ start_tenant_opencode() {
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
-    if _container_config_changed "$name" "$container_name" "$env_file_for_hash"; then
+    if _container_config_changed \
+        "$name" "$container_name" "$env_file_for_hash" "$opencode_launch_contract"; then
       say "config changed for $container_name; force-recreating"
       _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
       _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
     elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
       say "opencode worker already running ($container_name, WSS port $wss_port)"
-      _store_container_hash "$name" "$container_name" "$env_file_for_hash"
+      _store_container_hash \
+        "$name" "$container_name" "$env_file_for_hash" "$opencode_launch_contract"
       _register_worker_unit "$name" opencode
       return 0
     else
       say "starting existing opencode worker container $container_name"
       _ctr "$name" start "$container_name" >/dev/null
-      _store_container_hash "$name" "$container_name" "$env_file_for_hash"
+      _store_container_hash \
+        "$name" "$container_name" "$env_file_for_hash" "$opencode_launch_contract"
       _register_worker_unit "$name" opencode
       say "opencode worker ready ($container_name, WSS port $wss_port)"
       return 0
@@ -4160,6 +4453,30 @@ start_tenant_opencode() {
       env_flags+=(--env-file "$opencode_env_path")
     fi
 
+    local study_notes_home study_notes_state_home study_notes_allow_write
+    local -a study_notes_mount=()
+    study_notes_home="$(tenant_study_notes_home "$name")"
+    if [[ -n "$study_notes_home" ]]; then
+      validate_study_notes_home "$study_notes_home"
+      study_notes_mount=(
+        -v "${study_notes_home}:${STUDY_NOTES_CONTAINER_HOME}:ro,z"
+        -e "LW2STUDYMCP_HOME=${STUDY_NOTES_CONTAINER_HOME}"
+      )
+      study_notes_state_home="$(tenant_study_notes_state_home "$name")"
+      study_notes_allow_write="$(tenant_study_notes_allow_write "$name")"
+      if study_notes_write_enabled "$study_notes_allow_write"; then
+        [[ -n "$study_notes_state_home" ]] \
+          || die "Study Notes write mode requires LW2STUDYMCP_STATE_HOME"
+      fi
+      if [[ -n "$study_notes_state_home" ]]; then
+        validate_study_notes_state_home "$study_notes_state_home"
+        study_notes_mount+=(
+          -v "${study_notes_state_home}:${STUDY_NOTES_CONTAINER_STATE_HOME}:ro,z"
+          -e "LW2STUDYMCP_STATE_HOME=${STUDY_NOTES_CONTAINER_STATE_HOME}"
+        )
+      fi
+    fi
+
     local workspace_dir
     workspace_dir="$(tenant_lw_root "$name")/opencode-workspace"
     mkdir -p "$workspace_dir"
@@ -4176,6 +4493,7 @@ start_tenant_opencode() {
     local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
+      "${opencode_userns_args[@]}" \
       -e LUNARWING_WORKER_ID="worker-opencode-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -4185,13 +4503,16 @@ start_tenant_opencode() {
       -e WS_PATH=/ws/agent \
       "${env_flags[@]}" \
       "${ssh_mount[@]}" \
+      "${study_notes_mount[@]}" \
       -p "127.0.0.1:${wss_port}:${wss_port}" \
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
       lunarwing-worker-opencode:latest \
       --mode websocket >/dev/null
-    _store_container_hash "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env"
+    _store_container_hash \
+      "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" \
+      "$opencode_launch_contract"
   fi
 
   _register_worker_unit "$name" opencode
@@ -5062,6 +5383,21 @@ render_worker_quadlet() {
   # not configured for the tenant, the socket simply won't exist and SSH
   # commands from the worker will fail with a clear "no agent" error.
   local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+  local study_notes_home="" study_notes_state_home="" study_notes_allow_write=""
+  if [[ "$worker" == "opencode" ]]; then
+    study_notes_home="$(tenant_study_notes_home "$name")"
+    [[ -z "$study_notes_home" ]] || validate_study_notes_home "$study_notes_home"
+    if [[ -n "$study_notes_home" ]]; then
+      study_notes_state_home="$(tenant_study_notes_state_home "$name")"
+      study_notes_allow_write="$(tenant_study_notes_allow_write "$name")"
+      if study_notes_write_enabled "$study_notes_allow_write"; then
+        [[ -n "$study_notes_state_home" ]] \
+          || die "Study Notes write mode requires LW2STUDYMCP_STATE_HOME"
+      fi
+      [[ -z "$study_notes_state_home" ]] \
+        || validate_study_notes_state_home "$study_notes_state_home"
+    fi
+  fi
 
   {
     cat <<EOF
@@ -5083,6 +5419,18 @@ Environment=HEALTH_PORT=${health_port}
 Environment=WS_BIND_HOST=0.0.0.0
 Environment=WS_PATH=/ws/agent
 EOF
+    if [[ -n "$study_notes_home" ]]; then
+      printf 'Volume=%s:%s:ro,z\n' "$study_notes_home" "$STUDY_NOTES_CONTAINER_HOME"
+      printf 'Environment=LW2STUDYMCP_HOME=%s\n' "$STUDY_NOTES_CONTAINER_HOME"
+      if [[ -n "$study_notes_state_home" ]]; then
+        printf 'Volume=%s:%s:ro,z\n' \
+          "$study_notes_state_home" "$STUDY_NOTES_CONTAINER_STATE_HOME"
+        printf 'Environment=LW2STUDYMCP_STATE_HOME=%s\n' "$STUDY_NOTES_CONTAINER_STATE_HOME"
+      fi
+    fi
+    if [[ "$worker" == "opencode" ]]; then
+      printf 'UserNS=%s\n' "$OPENCODE_USERNS"
+    fi
     # SSH agent socket mount + env (always included — the daemon creates the
     # socket at startup; if SSH isn't configured, the socket won't exist and
     # SSH commands from the worker will fail with a clear "no agent" error).
@@ -6828,6 +7176,103 @@ restart_tenant() {
   start_tenant "$name"
 }
 
+require_worker_name() {
+  case "${1:-}" in
+    nanocode|pebble|opencode) ;;
+    *) die "unknown worker '${1:-}'; expected nanocode, pebble, or opencode" ;;
+  esac
+}
+
+prepare_worker_lifecycle() {
+  local name worker
+  name="$(sanitize_name "$1")"
+  worker="$2"
+  require_worker_name "$worker"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  printf '%s %s\n' "$name" "$worker"
+}
+
+start_worker() {
+  local prepared name worker
+  prepared="$(prepare_worker_lifecycle "$1" "$2")" || return
+  read -r name worker <<<"$prepared"
+  tenant_worker_enabled "$name" "$worker" \
+    || die "worker '$worker' is not enabled for tenant '$name'"
+  "start_tenant_${worker}" "$name"
+}
+
+stop_worker() {
+  local prepared name worker container service
+  prepared="$(prepare_worker_lifecycle "$1" "$2")" || return
+  read -r name worker <<<"$prepared"
+  container="lunarwing-${worker}-${name}"
+  service="${container}.service"
+  ensure_container_runtime
+  ensure_init_system
+
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    _systemctl_user "$name" stop "$service" >/dev/null 2>&1 \
+      || _ctr "$name" stop "$container" >/dev/null 2>&1 \
+      || die "failed to stop $service"
+  elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    if [[ -f "/etc/init.d/${container}-sup" ]]; then
+      rc-service "${container}-sup" stop >/dev/null 2>&1 \
+        || die "failed to stop OpenRC supervisor ${container}-sup"
+    else
+      rc-service "${container}-sup" stop >/dev/null 2>&1 || true
+    fi
+    if [[ -f "/etc/init.d/${container}" ]]; then
+      rc-service "$container" stop >/dev/null 2>&1 \
+        || die "failed to stop OpenRC service $container"
+    elif _ctr "$name" inspect "$container" &>/dev/null; then
+      _ctr "$name" stop "$container" >/dev/null 2>&1 \
+        || die "failed to stop container $container"
+    fi
+  elif _ctr "$name" inspect "$container" &>/dev/null; then
+    _ctr "$name" stop "$container" >/dev/null 2>&1 \
+      || die "failed to stop container $container"
+  fi
+  say "$worker worker stopped for $name"
+}
+
+kill_worker() {
+  local prepared name worker container service
+  prepared="$(prepare_worker_lifecycle "$1" "$2")" || return
+  read -r name worker <<<"$prepared"
+  container="lunarwing-${worker}-${name}"
+  service="${container}.service"
+  ensure_container_runtime
+  ensure_init_system
+
+  # Stop supervision before the zero-grace container stop. Otherwise
+  # Restart=on-failure/supervise-daemon can resurrect the worker immediately.
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    _systemctl_user "$name" stop --no-block "$service" >/dev/null 2>&1 || true
+  elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    rc-service "${container}-sup" stop >/dev/null 2>&1 || true
+  fi
+
+  if _ctr "$name" inspect "$container" &>/dev/null; then
+    _ctr "$name" stop --time 0 "$container" >/dev/null 2>&1 \
+      || die "failed to kill container $container"
+  fi
+
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    _systemctl_user "$name" stop "$service" >/dev/null 2>&1 || true
+  elif [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container}" ]]; then
+    rc-service "$container" stop >/dev/null 2>&1 || true
+  fi
+  say "$worker worker killed and left stopped for $name"
+}
+
+restart_worker() {
+  stop_worker "$1" "$2"
+  start_worker "$1" "$2"
+}
+
 # Cargo builds can refresh tracked lockfiles in nested standalone crates. Restore
 # them only when they are the sole tracked changes; otherwise preserve everything
 # and fail. Untracked tenant runtime directories do not block checkout.
@@ -6979,7 +7424,11 @@ upgrade_tenant_locked() {
   flock -u "$build_lock_fd" || die "failed to release build lock after checkout"
   exec {build_lock_fd}>&-
 
-  build_tenant "$name" "true" "false" "false" "false" "false" "true"
+  local with_opencode="false"
+  if tenant_worker_enabled "$name" opencode; then
+    with_opencode="true"
+  fi
+  build_tenant "$name" "true" "false" "false" "$with_opencode" "false" "true"
 
   if [[ "$do_render" == "true" ]]; then
     render_tenant_units "$name"
@@ -7550,6 +7999,17 @@ main() {
       restart_tenant "$1"
       ;;
 
+    start-worker|stop-worker|restart-worker|kill-worker)
+      require_root
+      [[ $# -eq 2 ]] || die "usage: $command_name <name> <nanocode|pebble|opencode>"
+      case "$command_name" in
+        start-worker) start_worker "$1" "$2" ;;
+        stop-worker) stop_worker "$1" "$2" ;;
+        restart-worker) restart_worker "$1" "$2" ;;
+        kill-worker) kill_worker "$1" "$2" ;;
+      esac
+      ;;
+
     render-units)
       require_root
       [[ -n "${1:-}" ]] || die "usage: render-units <name>"
@@ -7670,6 +8130,27 @@ main() {
       done
       [[ -n "$name" ]] || die "usage: configure-opencode <name> [--model <model>] [--base-url <url>]"
       configure_opencode "$name" "$oc_model" "$oc_base_url"
+      ;;
+
+    configure-study-mcp)
+      require_root
+      local name="" study_home="" study_state_home="" study_allow_write="false"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --home) study_home="$2"; shift 2 ;;
+          --state-home) study_state_home="$2"; shift 2 ;;
+          --allow-write) study_allow_write="true"; shift ;;
+          -*)     die "unknown flag: $1" ;;
+          *)
+            if [[ -z "$name" ]]; then name="$1"; shift
+            else die "unexpected argument: $1"
+            fi
+            ;;
+        esac
+      done
+      [[ -n "$name" && -n "$study_home" ]] \
+        || die "usage: configure-study-mcp <name> --home <path> [--allow-write] [--state-home <path>]"
+      configure_study_mcp "$name" "$study_home" "$study_allow_write" "$study_state_home"
       ;;
 
     configure-ssh)

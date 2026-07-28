@@ -1,31 +1,21 @@
 //! Tunnel abstraction for exposing the agent to the internet.
 //!
-//! Wraps external tunnel binaries (NetBird, cloudflared, ngrok, etc.) behind
-//! a common trait. The gateway starts a tunnel after binding its local port
-//! and stops it on shutdown.
+//! Wraps external tunnel binaries behind a common trait. The gateway starts a
+//! tunnel after binding its local port and stops it on shutdown.
 //!
 //! Supported providers:
 //! - **netbird** - self-hosted-capable Reverse Proxy via `netbird expose`
-//! - **cloudflare** - Zero Trust tunnels via `cloudflared`
-//! - **tailscale** - `tailscale serve` (tailnet) or `tailscale funnel` (public)
-//! - **ngrok** - instant public URLs via `ngrok`
 //! - **custom** - any command with `{host}`/`{port}` placeholders
 //! - **none** - local-only, no external exposure
 
-mod cloudflare;
 mod custom;
 mod netbird;
-mod ngrok;
 mod none;
-mod tailscale;
 
-pub use cloudflare::CloudflareTunnel;
 pub use custom::CustomTunnel;
 pub use netbird::NetBirdTunnel;
 pub(crate) use netbird::validate_name_prefix as validate_netbird_name_prefix;
-pub use ngrok::NgrokTunnel;
 pub use none::NoneTunnel;
-pub use tailscale::TailscaleTunnel;
 
 use std::sync::Arc;
 
@@ -48,7 +38,7 @@ pub(crate) fn new_shared_url() -> SharedUrl {
 /// `start()` after binding its local port and `stop()` on shutdown.
 #[async_trait::async_trait]
 pub trait Tunnel: Send + Sync {
-    /// Human-readable provider name (e.g. "cloudflare", "tailscale").
+    /// Human-readable provider name (e.g. "netbird", "custom").
     fn name(&self) -> &str;
 
     /// Start the tunnel exposing `local_host:local_port` externally.
@@ -154,31 +144,6 @@ fn request_termination(child: &mut tokio::process::Child) -> Result<()> {
 
 // ── Configuration types ──────────────────────────────────────────
 
-/// Provider-specific config for Cloudflare tunnels.
-#[derive(Debug, Clone, Default)]
-pub struct CloudflareTunnelConfig {
-    /// Token from the Cloudflare Zero Trust dashboard.
-    pub token: String,
-}
-
-/// Provider-specific config for Tailscale tunnels.
-#[derive(Debug, Clone, Default)]
-pub struct TailscaleTunnelConfig {
-    /// Use `tailscale funnel` (public) instead of `tailscale serve` (tailnet).
-    pub funnel: bool,
-    /// Override the hostname (default: auto-detect from `tailscale status`).
-    pub hostname: Option<String>,
-}
-
-/// Provider-specific config for ngrok tunnels.
-#[derive(Debug, Clone, Default)]
-pub struct NgrokTunnelConfig {
-    /// ngrok auth token (required).
-    pub auth_token: String,
-    /// Custom domain (requires ngrok paid plan).
-    pub domain: Option<String>,
-}
-
 /// Provider-specific config for NetBird Reverse Proxy tunnels.
 #[derive(Debug, Clone)]
 pub struct NetBirdTunnelConfig {
@@ -211,19 +176,30 @@ pub struct CustomTunnelConfig {
 /// Full tunnel configuration.
 #[derive(Debug, Clone, Default)]
 pub struct TunnelProviderConfig {
-    /// Provider name: "none", "netbird", "cloudflare", "tailscale", "ngrok", "custom".
+    /// Provider name: "none", "netbird", or "custom".
     pub provider: String,
     pub netbird: Option<NetBirdTunnelConfig>,
-    pub cloudflare: Option<CloudflareTunnelConfig>,
-    pub tailscale: Option<TailscaleTunnelConfig>,
-    pub ngrok: Option<NgrokTunnelConfig>,
     pub custom: Option<CustomTunnelConfig>,
 }
 
 // ── Factory ──────────────────────────────────────────────────────
 
+pub(crate) fn validate_provider_name(provider: &str) -> Result<(), String> {
+    match provider {
+        "" | "none" | "netbird" | "custom" => Ok(()),
+        "cloudflare" | "ngrok" | "tailscale" => Err(format!(
+            "managed tunnel provider '{provider}' was removed; use netbird, custom, or an externally managed HTTPS tunnel with TUNNEL_URL"
+        )),
+        other => Err(format!(
+            "unknown tunnel provider '{other}'; valid providers: none, netbird, custom"
+        )),
+    }
+}
+
 /// Create a tunnel from config. Returns `None` for provider "none" or empty.
 pub fn create_tunnel(config: &TunnelProviderConfig) -> Result<Option<Box<dyn Tunnel>>> {
+    validate_provider_name(&config.provider).map_err(anyhow::Error::msg)?;
+
     match config.provider.as_str() {
         "none" | "" => Ok(None),
 
@@ -233,28 +209,6 @@ pub fn create_tunnel(config: &TunnelProviderConfig) -> Result<Option<Box<dyn Tun
                 netbird.custom_domain,
                 netbird.name_prefix,
             )?)))
-        }
-
-        "cloudflare" => {
-            let cf = config.cloudflare.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("TUNNEL_PROVIDER=cloudflare but no TUNNEL_CF_TOKEN configured")
-            })?;
-            Ok(Some(Box::new(CloudflareTunnel::new(cf.token.clone()))))
-        }
-
-        "tailscale" => {
-            let ts = config.tailscale.as_ref().cloned().unwrap_or_default();
-            Ok(Some(Box::new(TailscaleTunnel::new(ts.funnel, ts.hostname))))
-        }
-
-        "ngrok" => {
-            let ng = config.ngrok.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("TUNNEL_PROVIDER=ngrok but no TUNNEL_NGROK_TOKEN configured")
-            })?;
-            Ok(Some(Box::new(NgrokTunnel::new(
-                ng.auth_token.clone(),
-                ng.domain.clone(),
-            ))))
         }
 
         "custom" => {
@@ -268,9 +222,7 @@ pub fn create_tunnel(config: &TunnelProviderConfig) -> Result<Option<Box<dyn Tun
             ))))
         }
 
-        other => bail!(
-            "Unknown tunnel provider: \"{other}\". Valid: none, netbird, cloudflare, tailscale, ngrok, custom"
-        ),
+        other => bail!("unknown tunnel provider '{other}'"),
     }
 }
 
@@ -379,7 +331,7 @@ mod tests {
             provider: "wireguard".into(),
             ..Default::default()
         };
-        assert_tunnel_err(&cfg, "Unknown tunnel provider");
+        assert_tunnel_err(&cfg, "unknown tunnel provider");
     }
 
     #[test]
@@ -406,59 +358,14 @@ mod tests {
     }
 
     #[test]
-    fn factory_cloudflare_missing_config_errors() {
-        let cfg = TunnelProviderConfig {
-            provider: "cloudflare".into(),
-            ..Default::default()
-        };
-        assert_tunnel_err(&cfg, "TUNNEL_CF_TOKEN");
-    }
-
-    #[test]
-    fn factory_cloudflare_with_config_ok() {
-        use crate::testing::credentials::TEST_BEARER_TOKEN;
-        let cfg = TunnelProviderConfig {
-            provider: "cloudflare".into(),
-            cloudflare: Some(CloudflareTunnelConfig {
-                token: TEST_BEARER_TOKEN.into(),
-            }),
-            ..Default::default()
-        };
-        let t = create_tunnel(&cfg).unwrap().unwrap();
-        assert_eq!(t.name(), "cloudflare");
-    }
-
-    #[test]
-    fn factory_tailscale_defaults_ok() {
-        let cfg = TunnelProviderConfig {
-            provider: "tailscale".into(),
-            ..Default::default()
-        };
-        let t = create_tunnel(&cfg).unwrap().unwrap();
-        assert_eq!(t.name(), "tailscale");
-    }
-
-    #[test]
-    fn factory_ngrok_missing_config_errors() {
-        let cfg = TunnelProviderConfig {
-            provider: "ngrok".into(),
-            ..Default::default()
-        };
-        assert_tunnel_err(&cfg, "TUNNEL_NGROK_TOKEN");
-    }
-
-    #[test]
-    fn factory_ngrok_with_config_ok() {
-        let cfg = TunnelProviderConfig {
-            provider: "ngrok".into(),
-            ngrok: Some(NgrokTunnelConfig {
-                auth_token: "tok".into(),
-                domain: None,
-            }),
-            ..Default::default()
-        };
-        let t = create_tunnel(&cfg).unwrap().unwrap();
-        assert_eq!(t.name(), "ngrok");
+    fn factory_removed_providers_error_with_migration_guidance() {
+        for provider in ["cloudflare", "ngrok", "tailscale"] {
+            let cfg = TunnelProviderConfig {
+                provider: provider.into(),
+                ..Default::default()
+            };
+            assert_tunnel_err(&cfg, "was removed");
+        }
     }
 
     #[test]

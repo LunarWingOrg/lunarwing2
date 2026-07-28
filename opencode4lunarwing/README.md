@@ -34,19 +34,24 @@ prompt_context = { max_messages = 12, max_chars_per_message = 2000, max_total_ch
 ```
 
 The agent logs `External workers configured: opencode` on startup.
-`timeout_ms` defaults to one hour and is the hard task deadline enforced by both
-LunarWing and this worker.
-On timeout or cancellation, the worker aborts the active OpenCode session instead
-of leaving it running in the container.
+`timeout_ms` defaults to one hour and is shared by all provider retries. Every
+OpenCode SDK request receives the task abort signal. On timeout or cancellation,
+the worker stops waiting immediately and gives session cleanup a bounded five-second
+grace (`OPENCODE_SESSION_ABORT_TIMEOUT_MS`) instead of leaving work orphaned.
+LunarWing also sends a protocol cancel envelope when its own deadline expires.
 Job metadata and progress events are persisted by LunarWing. After a daemon restart,
 running jobs are reported as `interrupted`, while `list_jobs`, `job_status`, and
 `job_events` can still read their saved status and event history from the database.
-Transient provider streaming timeouts are retried twice in the same OpenCode session
-by default, preserving completed workspace work without resetting the overall task
-deadline. Configure this with `OPENCODE_PROVIDER_MAX_RETRIES` (0-5) and
+Transient provider streaming timeouts and temporary routing exhaustion (`No provider
+available`) are retried twice in the same OpenCode session by default, preserving
+completed workspace work without resetting the overall task deadline. Configure
+this with `OPENCODE_PROVIDER_MAX_RETRIES` (0-5) and
 `OPENCODE_PROVIDER_RETRY_DELAY_MS` (0-60000). While inference is otherwise
 silent, the worker emits a persisted progress heartbeat every 60 seconds;
 configure or disable it with `OPENCODE_PROGRESS_HEARTBEAT_MS` (0-300000).
+Only one active task may modify a resolved workspace path. A second task targeting
+the same workspace fails immediately with the full UUID of the active task; cancel
+or finish that task before dispatching another.
 
 ## Usage
 
@@ -76,3 +81,39 @@ Speaks `lunarwing-agent-v1` WebSocket subprotocol (legacy alias `ironclaw-agent-
 ## Environment Variables
 
 See `.env.example` for the full list with descriptions.
+
+## Study Notes MCP
+
+Set `LW2STUDYMCP_HOME` to an absolute lw2studymcp checkout visible inside the
+container. Startup validates the canonical scripts, skill, SQLite schema, FTS5
+table, and database integrity before injecting both:
+
+- `<home>/skills` into OpenCode `skills.paths`
+- a local `study_notes` MCP process running `study_notes_mcp.py`
+
+Read-only remains default. For multi-tenant installs, configure the host checkout
+through mt-admin, which emits Podman mounts for both Quadlet/systemd and
+imperative/OpenRC paths:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-study-mcp TENANT \
+  --home /srv/lunarwing/lw2studymcp
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant TENANT
+```
+
+Enable mutation tools for core LunarWing agents with separate state:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-study-mcp TENANT \
+  --home /srv/lunarwing/lw2studymcp --allow-write
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant TENANT
+```
+
+OpenCode always mounts code and current state read-only at `/opt/lw2studymcp` and
+`/var/lib/lw2studymcp`. Write tools remain core-only because OpenCode workers have
+broad shell/edit permissions that could bypass MCP-only controls on an RW mount.
+Workers see core writes on later reads. Rerun configuration without `--allow-write`
+to disable core mutation tools while retaining state for reads.
+
+Do not use `opencode_study.py` auto-clone inside the persistent worker. Runtime
+network cloning would make worker content unpinned and startup network-dependent.

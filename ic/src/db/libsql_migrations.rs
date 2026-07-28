@@ -940,6 +940,34 @@ WHERE document_id IN (
 );
 "#,
     ),
+    (
+        24,
+        "remove_legacy_tunnel_settings",
+        // Keep tunnel.provider so startup requires explicit operator migration
+        // rather than silently disabling webhook exposure.
+        r#"
+UPDATE settings
+SET value = json_remove(
+    value,
+    '$.cf_token',
+    '$.ngrok_token',
+    '$.ngrok_domain',
+    '$.ts_funnel',
+    '$.ts_hostname'
+)
+WHERE key = 'tunnel'
+  AND json_valid(value);
+
+DELETE FROM settings
+WHERE key IN (
+    'tunnel.cf_token',
+    'tunnel.ngrok_token',
+    'tunnel.ngrok_domain',
+    'tunnel.ts_funnel',
+    'tunnel.ts_hostname'
+);
+"#,
+    ),
 ];
 
 /// Migrations whose ADD COLUMN should be skipped when the column already
@@ -1218,5 +1246,98 @@ mod tests {
         assert_eq!(row.get::<i64>(3).expect("migration count"), 1);
         assert_eq!(fts_count(&conn, "legacyruntime").await, 0);
         assert_eq!(fts_count(&conn, "ordinarymemory").await, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_tunnel_cleanup_scrubs_details_and_preserves_provider_marker() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("tunnel_cleanup.db");
+        let backend = LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("LibSqlBackend");
+        backend.run_migrations().await.expect("migrations");
+        let conn = backend.connect().await.expect("connect");
+
+        for (user, key, value) in [
+            ("alice", "tunnel.provider", r#""ngrok""#),
+            ("alice", "tunnel.ngrok_token", r#""secret""#),
+            ("alice", "tunnel.ngrok_domain", r#""old.example.com""#),
+            ("bob", "tunnel.cf_token", r#""secret""#),
+            ("bob", "tunnel.ts_funnel", "true"),
+            ("bob", "tunnel.ts_hostname", r#""old-host""#),
+            (
+                "bob",
+                "tunnel.public_url",
+                r#""https://tunnel.example.com""#,
+            ),
+            ("bob", "tunnel.ngrok_token.backup", r#""keep""#),
+            (
+                "charlie",
+                "tunnel",
+                r#"{"provider":"tailscale","ts_hostname":"old-host","netbird_name_prefix":"keep"}"#,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO settings (user_id, key, value) VALUES (?1, ?2, ?3)",
+                libsql::params![user, key, value],
+            )
+            .await
+            .expect("insert setting");
+        }
+
+        conn.execute("DELETE FROM _migrations WHERE version = 24", ())
+            .await
+            .expect("reset migration");
+        run_incremental(&conn).await.expect("rerun migration");
+        run_incremental(&conn).await.expect("idempotent rerun");
+
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM settings WHERE key IN (
+                        'tunnel.cf_token',
+                        'tunnel.ngrok_token',
+                        'tunnel.ngrok_domain',
+                        'tunnel.ts_funnel',
+                        'tunnel.ts_hostname'
+                    )),
+                    (SELECT COUNT(*) FROM settings WHERE key = 'tunnel.provider'),
+                    (SELECT COUNT(*) FROM settings WHERE key = 'tunnel.public_url'),
+                    (SELECT COUNT(*) FROM settings WHERE key = 'tunnel.ngrok_token.backup'),
+                    (SELECT COUNT(*) FROM _migrations WHERE version = 24)
+                "#,
+                (),
+            )
+            .await
+            .expect("query cleanup state");
+        let row = rows
+            .next()
+            .await
+            .expect("fetch cleanup state")
+            .expect("cleanup state row");
+        assert_eq!(row.get::<i64>(0).expect("legacy detail count"), 0);
+        assert_eq!(row.get::<i64>(1).expect("provider marker count"), 1);
+        assert_eq!(row.get::<i64>(2).expect("public URL count"), 1);
+        assert_eq!(row.get::<i64>(3).expect("similar key count"), 1);
+        assert_eq!(row.get::<i64>(4).expect("migration count"), 1);
+
+        let nested: String = conn
+            .query(
+                "SELECT value FROM settings WHERE user_id = 'charlie' AND key = 'tunnel'",
+                (),
+            )
+            .await
+            .expect("query nested tunnel")
+            .next()
+            .await
+            .expect("fetch nested tunnel")
+            .expect("nested tunnel row")
+            .get(0)
+            .expect("nested tunnel value");
+        let nested: serde_json::Value = serde_json::from_str(&nested).expect("nested JSON");
+        assert_eq!(nested["provider"], "tailscale");
+        assert_eq!(nested["netbird_name_prefix"], "keep");
+        assert!(nested.get("ts_hostname").is_none());
     }
 }

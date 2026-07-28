@@ -71,8 +71,29 @@ while [ $# -gt 0 ]; do
 done
 
 # ── config setup ──────────────────────────────────────────────────────────────
+if { [ -n "${LW2STUDYMCP_STATE_HOME:-}" ] || [ -n "${LW2STUDYMCP_ALLOW_WRITE:-}" ]; } \
+    && [ -z "${LW2STUDYMCP_HOME:-}" ]; then
+  die "LW2STUDYMCP_HOME is required when Study Notes state or write mode is configured"
+fi
+case "${LW2STUDYMCP_ALLOW_WRITE:-0}" in
+  1|true|TRUE|yes|YES|on|ON) die "Study Notes writes are not exposed inside OpenCode workers" ;;
+  0|false|FALSE|no|NO|off|OFF|"") ;;
+  *) die "LW2STUDYMCP_ALLOW_WRITE must be a boolean" ;;
+esac
+
 if [ -f /app/config/opencode.json ]; then
   mkdir -p "$WORKSPACE_ROOT/.opencode"
+  if [ -n "${OPENCODE_MODEL:-}" ] || [ -n "${OPENCODE_BASE_URL:-}" ] \
+      || [ -n "${PASEO_URL:-}" ] || [ -n "${PASEO_TOKEN:-}" ] \
+      || [ -n "${LW2STUDYMCP_HOME:-}" ] \
+      || [ -n "${LW2STUDYMCP_STATE_HOME:-}" ]; then
+    rm -f "$WORKSPACE_ROOT/.opencode/opencode.json"
+    cp /app/config/opencode.json "$WORKSPACE_ROOT/.opencode/opencode.json"
+    config_materialized=true
+  else
+    ln -sfn /app/config/opencode.json "$WORKSPACE_ROOT/.opencode/opencode.json"
+    config_materialized=false
+  fi
   if [ -n "${OPENCODE_MODEL:-}" ] || [ -n "${OPENCODE_BASE_URL:-}" ]; then
     python3 - "$WORKSPACE_ROOT/.opencode/opencode.json" <<'PY'
 import json, os, sys
@@ -106,9 +127,10 @@ with open(sys.argv[1], "w") as f:
     json.dump(cfg, f, indent=2)
 PY
     log "Config generated with overrides (model=${OPENCODE_MODEL:-<default>}, baseURL=${OPENCODE_BASE_URL:-<default>})"
+  elif [ "$config_materialized" = true ]; then
+    log "Config copied: /app/config/opencode.json -> $WORKSPACE_ROOT/.opencode/opencode.json"
   else
-    ln -sfn /app/config/opencode.json "$WORKSPACE_ROOT/.opencode/opencode.json"
-    log "Config linked: /app/config/opencode.json → $WORKSPACE_ROOT/.opencode/opencode.json"
+    log "Config linked: /app/config/opencode.json -> $WORKSPACE_ROOT/.opencode/opencode.json"
   fi
 fi
 
@@ -131,6 +153,19 @@ with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
 PY
   log "Paseo MCP entry injected into opencode config"
+fi
+
+# ── optional LunarWing Study Notes MCP integration ────────────────────────────
+if [ -n "${LW2STUDYMCP_HOME:-}" ] && [ -f "$WORKSPACE_ROOT/.opencode/opencode.json" ]; then
+  study_args=(
+    --config "$WORKSPACE_ROOT/.opencode/opencode.json"
+    --home "$LW2STUDYMCP_HOME"
+  )
+  if [ -n "${LW2STUDYMCP_STATE_HOME:-}" ]; then
+    study_args+=(--state-home "$LW2STUDYMCP_STATE_HOME")
+  fi
+  python3 /app/scripts/study_notes_config.py "${study_args[@]}"
+  log "Study Notes MCP and skill path injected into opencode config"
 fi
 
 # ── always start the health server in the background ──────────────────────────

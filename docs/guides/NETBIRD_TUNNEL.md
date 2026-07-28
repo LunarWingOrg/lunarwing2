@@ -76,6 +76,14 @@ netbird status --check startup
 Enable Peer Expose in NetBird dashboard under **Settings > Clients**. Restrict
 permission to a dedicated peer group instead of granting it network-wide.
 
+## Migrating from Removed Managed Providers
+
+LunarWing no longer manages Cloudflare Tunnel, ngrok, or Tailscale tunnel
+processes. Choose NetBird, a custom command, or an externally managed static
+`TUNNEL_URL`. Database migration V24 scrubs old provider-specific settings and
+credentials. Follow [TUNNEL_PROVIDER_MIGRATION.md](TUNNEL_PROVIDER_MIGRATION.md)
+before upgrading production webhook deployments.
+
 ## Configure LunarWing
 
 Minimum configuration:

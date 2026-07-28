@@ -128,6 +128,11 @@ rm -f "$MT_FIXTURE/env/lunarwing.env"
 write_tenant_lunarwing_env fixture-tenant \
   "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" "" "" \
   "glm-5-air" "0.0.0.0" "admin@xmpp.org"
+cat >>"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
+LW2STUDYMCP_HOME=/srv/lunarwing/lw2studymcp
+LW2STUDYMCP_STATE_HOME=/srv/lunarwing/study-state
+LW2STUDYMCP_ALLOW_WRITE=1
+EOF
 # Now re-run WITHOUT the new flags (pass empty for slots 9-11) — file exists.
 write_tenant_lunarwing_env fixture-tenant \
   "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" "" "" \
@@ -135,6 +140,12 @@ write_tenant_lunarwing_env fixture-tenant \
 assert_eq "rerun preserves LLM_MODEL" "$(envval LLM_MODEL)" "glm-5-air"
 assert_eq "rerun preserves GATEWAY_HOST" "$(envval GATEWAY_HOST)" "0.0.0.0"
 assert_eq "rerun preserves XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmpp.localhost,admin@xmpp.org"
+assert_eq "rerun preserves LW2STUDYMCP_HOME" \
+  "$(envval LW2STUDYMCP_HOME)" "/srv/lunarwing/lw2studymcp"
+assert_eq "rerun preserves LW2STUDYMCP_STATE_HOME" \
+  "$(envval LW2STUDYMCP_STATE_HOME)" "/srv/lunarwing/study-state"
+assert_eq "rerun preserves LW2STUDYMCP_ALLOW_WRITE" \
+  "$(envval LW2STUDYMCP_ALLOW_WRITE)" "1"
 
 # Case 4: a DarkIRC-enabled re-render must preserve the existing adapter secret.
 DARKIRC_FIXTURE_ENABLED=true

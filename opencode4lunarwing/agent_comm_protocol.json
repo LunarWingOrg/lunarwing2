@@ -60,7 +60,7 @@
         "description": "Worker → Agent: final result after completion",
         "payload": {
           "task_id":     "string",
-          "status":      "string — success | error | cancelled",
+          "status":      "string — success | error | cancelled | timed_out",
           "output":      "string — full generated output",
           "error":       "string | null — error message if status=error",
           "duration_ms": "integer"
