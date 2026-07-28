@@ -135,10 +135,16 @@ else
   fail 'strict WASM mode returned the wrong validation error'
 fi
 # shellcheck disable=SC2016
-if grep -Fq 'build_tenant "$name" "true" "false" "false" "false" "false" "true"' "$ADMIN_SCRIPT"; then
+if grep -Fq 'build_tenant "$name" "true" "false" "false" "$with_opencode" "false" "true"' "$ADMIN_SCRIPT"; then
   pass 'upgrade-tenant requires successful WASM build'
 else
   fail 'upgrade-tenant does not enable strict WASM build mode'
+fi
+# shellcheck disable=SC2016
+if grep -Fq 'tenant_worker_enabled "$name" opencode' "$ADMIN_SCRIPT"; then
+  pass 'upgrade-tenant rebuilds selected OpenCode worker'
+else
+  fail 'upgrade-tenant ignores persisted OpenCode worker selection'
 fi
 # shellcheck disable=SC2016
 if grep -Fq -- '--require-wasm)' "$ADMIN_SCRIPT" \
