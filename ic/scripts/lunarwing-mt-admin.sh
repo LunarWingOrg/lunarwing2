@@ -4083,18 +4083,18 @@ start_tenant_nanocode() {
     # Core env vars from tenant lunarwing.env
     if [[ -f "$tenant_env_path" ]]; then
       local gateway_token
-      gateway_token="$(grep '^GATEWAY_AUTH_TOKEN=' "$tenant_env_path" | cut -d= -f2- || true)"
+      gateway_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
       [[ -n "$gateway_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$gateway_token")
 
       local llm_api_key
-      llm_api_key="$(grep '^LLM_API_KEY=' "$tenant_env_path" | cut -d= -f2- || true)"
+      llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
       [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORZERO_API_KEY=$llm_api_key")
 
       # Nanocode LLM overrides (model / TensorZero baseURL), if set on the tenant.
       local nanocode_model nanocode_base_url
-      nanocode_model="$(grep '^NANOCODE_MODEL=' "$tenant_env_path" | cut -d= -f2- || true)"
+      nanocode_model="$(_read_env_value "$tenant_env_path" NANOCODE_MODEL)"
       [[ -n "$nanocode_model" ]] && env_flags+=(-e "NANOCODE_MODEL=$nanocode_model")
-      nanocode_base_url="$(grep '^NANOCODE_BASE_URL=' "$tenant_env_path" | cut -d= -f2- || true)"
+      nanocode_base_url="$(_read_env_value "$tenant_env_path" NANOCODE_BASE_URL)"
       [[ -n "$nanocode_base_url" ]] && env_flags+=(-e "NANOCODE_BASE_URL=$nanocode_base_url")
     fi
 
@@ -4452,17 +4452,17 @@ start_tenant_opencode() {
     local env_flags=()
     if [[ -f "$tenant_env_path" ]]; then
       local gateway_token
-      gateway_token="$(grep '^GATEWAY_AUTH_TOKEN=' "$tenant_env_path" | cut -d= -f2- || true)"
+      gateway_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
       [[ -n "$gateway_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$gateway_token")
 
       local llm_api_key
-      llm_api_key="$(grep '^LLM_API_KEY=' "$tenant_env_path" | cut -d= -f2- || true)"
+      llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
       [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORZERO_API_KEY=$llm_api_key")
 
       local opencode_model opencode_base_url
-      opencode_model="$(grep '^OPENCODE_MODEL=' "$tenant_env_path" | cut -d= -f2- || true)"
+      opencode_model="$(_read_env_value "$tenant_env_path" OPENCODE_MODEL)"
       [[ -n "$opencode_model" ]] && env_flags+=(-e "OPENCODE_MODEL=$opencode_model")
-      opencode_base_url="$(grep '^OPENCODE_BASE_URL=' "$tenant_env_path" | cut -d= -f2- || true)"
+      opencode_base_url="$(_read_env_value "$tenant_env_path" OPENCODE_BASE_URL)"
       [[ -n "$opencode_base_url" ]] && env_flags+=(-e "OPENCODE_BASE_URL=$opencode_base_url")
     fi
 
@@ -4628,7 +4628,7 @@ start_tenant_pebble() {
     local env_flags=()
     if [[ -f "$tenant_env_path" ]]; then
       local gateway_token
-      gateway_token="$(grep '^GATEWAY_AUTH_TOKEN=' "$tenant_env_path" | cut -d= -f2- || true)"
+      gateway_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
       [[ -n "$gateway_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$gateway_token")
     fi
 
@@ -5389,11 +5389,11 @@ render_worker_quadlet() {
   mkdir -p "$qdir"
 
   local agent_token tz_key
-  agent_token="$(grep '^GATEWAY_AUTH_TOKEN=' "$tenant_env_path" 2>/dev/null | cut -d= -f2- || true)"
-  tz_key="$(grep '^LLM_API_KEY=' "$tenant_env_path" 2>/dev/null | cut -d= -f2- || true)"
+  agent_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
+  tz_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
   local nanocode_model nanocode_base_url
-  nanocode_model="$(grep '^NANOCODE_MODEL=' "$tenant_env_path" 2>/dev/null | cut -d= -f2- || true)"
-  nanocode_base_url="$(grep '^NANOCODE_BASE_URL=' "$tenant_env_path" 2>/dev/null | cut -d= -f2- || true)"
+  nanocode_model="$(_read_env_value "$tenant_env_path" NANOCODE_MODEL)"
+  nanocode_base_url="$(_read_env_value "$tenant_env_path" NANOCODE_BASE_URL)"
   # systemd treats % as a unit specifier; escape so a token containing % survives.
   agent_token="${agent_token//%/%%}"
   tz_key="${tz_key//%/%%}"
@@ -5482,8 +5482,8 @@ EOF
     [[ "$worker" == "nanocode" && -n "$nanocode_base_url" ]] && printf 'Environment=NANOCODE_BASE_URL=%s\n' "$nanocode_base_url"
     [[ "$worker" == "opencode" && -n "$tz_key" ]] && printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key"
     local oc_model oc_base_url
-    oc_model="$(grep '^OPENCODE_MODEL=' "$tenant_env_path" 2>/dev/null | cut -d= -f2- || true)"
-    oc_base_url="$(grep '^OPENCODE_BASE_URL=' "$tenant_env_path" 2>/dev/null | cut -d= -f2- || true)"
+    oc_model="$(_read_env_value "$tenant_env_path" OPENCODE_MODEL)"
+    oc_base_url="$(_read_env_value "$tenant_env_path" OPENCODE_BASE_URL)"
     [[ "$worker" == "opencode" && -n "$oc_model" ]] && printf 'Environment=OPENCODE_MODEL=%s\n' "$oc_model"
     [[ "$worker" == "opencode" && -n "$oc_base_url" ]] && printf 'Environment=OPENCODE_BASE_URL=%s\n' "$oc_base_url"
     # Operator override file (optional). EnvironmentFile= has existed since the
