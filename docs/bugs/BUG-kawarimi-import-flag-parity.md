@@ -1,15 +1,15 @@
 # Kawarimi import `--with-wasm` flag parity
 
-> **Status: STILL-OPEN (source-verified against `51ae5a8` on 2026-07-20).**
+> **Status: STILL-OPEN (source-verified against current source on 2026-07-28).**
 > `import-tenant.sh` always adds `--with-wasm` internally but rejects an
 > operator-supplied `--with-wasm`, unlike `build-tenant`.
 
 ## Current behavior
 
 - The import parser rejects unknown flags at
-  `ic/scripts/import-tenant.sh:56-73`; `--with-wasm` is not a case arm.
+  `ic/scripts/import-tenant.sh:56-74`; `--with-wasm` is not a case arm.
 - The build argument array unconditionally includes `--with-wasm`
-  (`import-tenant.sh:499`).
+  (`import-tenant.sh:500`).
 - The related `--with-opencode` omission is fixed and documented in
   [`history/BUG-FIXED-kawarimi-import-opencode.md`](history/BUG-FIXED-kawarimi-import-opencode.md).
 
@@ -35,4 +35,4 @@ Verified by current parser/build-argument inspection. A fresh run of the
 Kawarimi flag harness (`ic/scripts/tests/test-kawarimi-import-flags.sh`) passed
 all cases, including the related worker-flag forwarding paths, but it does not
 exercise an explicit `--with-wasm` argument. No tenant import or Cargo command
-was run. Re-verified on 2026-07-25 with updated line references.
+was run. Re-verified on 2026-07-28 with updated line references.
