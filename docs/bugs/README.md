@@ -1,6 +1,6 @@
 # Bug tracker
 
-Reconciled against current source on **2026-07-25** (prior pass against revision
+Reconciled against current source on **2026-07-28** (prior pass against revision
 `51ae5a8` on 2026-07-20). All 38 Markdown documents in this tracker (36
 report/pointer files plus two README files) were checked against current source,
 scripts, tests, and reachable Git history. Closely related reports remain
