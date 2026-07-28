@@ -4395,18 +4395,22 @@ start_tenant_opencode() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
+    local opencode_service="lunarwing-opencode-${name}.service"
     local quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-opencode-${name}.container"
     render_worker_quadlet "$name" opencode 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if _container_config_changed "$name" "lunarwing-opencode-${name}" "$quadlet_file"; then
-      _recreate_quadlet_container "$name" "lunarwing-opencode-${name}.service" "lunarwing-opencode-${name}"
+      _recreate_quadlet_container "$name" "$opencode_service" "lunarwing-opencode-${name}"
     fi
-    if _systemctl_user "$name" start "lunarwing-opencode-${name}.service" >/dev/null 2>&1; then
+    # A bad pre-upgrade image can exhaust StartLimitBurst. Loading a fixed image
+    # does not clear that systemd lockout, so reset it before the explicit retry.
+    _systemctl_user "$name" reset-failed "$opencode_service" >/dev/null 2>&1 || true
+    if _systemctl_user "$name" start "$opencode_service" >/dev/null 2>&1; then
       _store_container_hash "$name" "lunarwing-opencode-${name}" "$quadlet_file"
-      say "opencode worker ready via quadlet (lunarwing-opencode-${name}.service, WSS port $wss_port)"
+      say "opencode worker ready via quadlet ($opencode_service, WSS port $wss_port)"
     else
-      say "WARNING: lunarwing-opencode-${name}.service failed to start" >&2
-      _systemctl_user "$name" status "lunarwing-opencode-${name}.service" --no-pager >&2 || true
+      say "WARNING: $opencode_service failed to start" >&2
+      _systemctl_user "$name" status "$opencode_service" --no-pager --full >&2 || true
     fi
     return 0
   fi

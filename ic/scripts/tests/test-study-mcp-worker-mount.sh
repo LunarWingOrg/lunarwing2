@@ -249,6 +249,35 @@ if grep -Fq -- ' run -d ' "$ctr_calls"; then
   exit 1
 fi
 
+# A rebuilt image must escape any StartLimitBurst lockout left by old failures.
+container_image_user="$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID"
+CONTAINER_RT="podman"
+MT_ROOTLESS="true"
+ensure_init_system() { INIT_SYSTEM="systemd"; }
+podman_supports_quadlet() { return 0; }
+_wait_user_manager() { :; }
+systemctl_calls=()
+_systemctl_user() {
+  systemctl_calls+=("$*")
+  [[ "${2:-}" != "start" ]]
+}
+start_tenant_opencode test >/dev/null 2>&1
+reset_seen=false
+status_full_seen=false
+for call in "${systemctl_calls[@]}"; do
+  [[ "$call" == "test reset-failed lunarwing-opencode-test.service" ]] && reset_seen=true
+  if [[ "$call" == "test start lunarwing-opencode-test.service" && "$reset_seen" != "true" ]]; then
+    printf 'OpenCode Quadlet start ran before reset-failed\n' >&2
+    exit 1
+  fi
+  [[ "$call" == "test status lunarwing-opencode-test.service --no-pager --full" ]] \
+    && status_full_seen=true
+done
+if [[ "$reset_seen" != "true" || "$status_full_seen" != "true" ]]; then
+  printf 'OpenCode Quadlet failure recovery omitted reset or full status\n' >&2
+  exit 1
+fi
+
 # Uncached Podman builds minimize peak storage without pruning tenant containers.
 build_calls="$fixture/build-calls"
 podman() { printf '%s\n' "$*" >>"$build_calls"; }
