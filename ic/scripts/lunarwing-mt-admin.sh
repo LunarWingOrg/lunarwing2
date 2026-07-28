@@ -350,6 +350,8 @@ Commands:
 
   build-opencode-worker            Build the opencode worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
+                                   (Podman also prunes dangling images and avoids
+                                   caching intermediate build layers)
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
 
   build-vision-sidecar             Build the LunarVision OCR sidecar Docker image
@@ -2106,17 +2108,28 @@ build_opencode_worker() {
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
   say "building opencode worker Docker image [$toolchain_desc] ..."
 
-  local cache_flag=""
-  [[ "$no_cache" == "true" ]] && cache_flag="--no-cache"
+  local -a cache_args=()
+  [[ "$no_cache" == "true" ]] && cache_args=(--no-cache)
 
-  local toolchain_arg=""
-  [[ "$with_toolchains" == "true" ]] && toolchain_arg="--build-arg WITH_TOOLCHAINS=true"
+  local -a toolchain_args=()
+  [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
 
   if [[ "$CONTAINER_RT" == "podman" ]]; then
-    podman build $cache_flag $toolchain_arg --network=host --format docker -t lunarwing-worker-opencode:latest "$opencode_dir" \
+    local -a layer_args=()
+    if [[ "$no_cache" == "true" ]]; then
+      # --no-cache avoids reading old layers but still creates new intermediate
+      # layers by default. Drop safe dangling images first, then keep this large
+      # Bun build in one layer per stage to reduce peak storage and inode use.
+      say "pruning dangling Podman images before uncached OpenCode build ..."
+      if ! podman image prune -f >/dev/null; then
+        say "WARNING: failed to prune dangling Podman images; continuing build" >&2
+      fi
+      layer_args=(--layers=false)
+    fi
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" --network=host --format docker -t lunarwing-worker-opencode:latest "$opencode_dir" \
       || die "opencode worker image build failed"
   else
-    docker build $cache_flag $toolchain_arg -t lunarwing-worker-opencode:latest "$opencode_dir" \
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" -t lunarwing-worker-opencode:latest "$opencode_dir" \
       || die "opencode worker image build failed"
   fi
 
