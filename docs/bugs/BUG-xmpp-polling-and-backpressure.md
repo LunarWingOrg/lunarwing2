@@ -1,6 +1,6 @@
 # XMPP/WASM polling can stop delivering messages
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-07-25).**
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-07-28).**
 > Poll-loop crashes and stalls now have supervision and health reporting. A
 > bounded queue can still leave a poll task awaiting delivery if downstream
 > consumption stalls or sustained ingress exceeds its drain rate; that
@@ -52,13 +52,13 @@ a failure criterion.
 
 - `WasmChannel::start_polling` creates an outer supervisor and respawns the inner
   poll loop with exponential backoff after an error or panic
-  (`ic/src/channels/wasm/wrapper.rs:2366-2527`).
+  (`ic/src/channels/wasm/wrapper.rs:2284-2448`).
 - Poll callbacks are bounded by the configured callback timeout
-  (`ic/src/channels/wasm/wrapper.rs:2536-2564`).
+  (`ic/src/channels/wasm/wrapper.rs:2530-2562`).
 - `health_check()` detects a dead supervisor and a stale
-  `last_poll_epoch_ms` (`ic/src/channels/wasm/wrapper.rs:2946-2987`).
+  `last_poll_epoch_ms` (`ic/src/channels/wasm/wrapper.rs:2906-2929`).
 - Dedicated tests cover dead and stalled poll tasks
-  (`ic/src/channels/wasm/wrapper.rs:5609-5655`).
+  (`ic/src/channels/wasm/wrapper.rs:5641-5655`).
 - Channel health is aggregated by `ChannelManager`
   (`ic/src/channels/manager.rs:210-220`) and exposed by the gateway
   (`ic/src/channels/web/server.rs:2887-2961`).
@@ -67,22 +67,23 @@ a failure criterion.
   `ic/scripts/lunarwing-watchdog-openrc.sh:60-88`).
 
 These changes resolve the original silent-exit failure mode. Older references
-to the polling block near line 2285 no longer match the current wrapper layout.
+to the polling block near line 2285 no longer match the current wrapper layout
+(`start_polling` is now at line 2284).
 
 ## Residual backpressure path
 
 The channel's message queue is bounded. `dispatch_emitted_messages` awaits its
-`tx.send` (`ic/src/channels/wasm/wrapper.rs:2642-2750`; the channel is created
-with capacity 256 at `:2783`). If downstream consumption stalls, or sustained
-ingress exceeds the consumer's drain rate, this queue can fill. The poll task is
-then pending in `send`, not exited, so the outer supervisor does not respawn it;
-health timestamps can remain fresh initially because the poll cycle updates
-`last_poll_epoch_ms` before dispatch (`wrapper.rs:2446-2468`).
+`tx.reserve_many` and sends via permits (`ic/src/channels/wasm/wrapper.rs:2568-2650`;
+the queue is created with capacity 256 at `:969,2743`). If downstream consumption
+stalls, or sustained ingress exceeds the consumer's drain rate, this queue can
+fill; the dispatch path returns an error rather than blocking indefinitely. The
+poll task updates `last_poll_epoch_ms` before dispatch (within the poll loop at
+`wrapper.rs:2320-2330`).
 
 The earlier direct coupling to a synchronous worker turn is no longer current:
 the active-turn loop continues polling the merged channel stream, defers
 ordinary messages in a bounded FIFO, and rejects overflow explicitly
-(`ic/src/agent/agent_loop.rs:941-1016`, `ic/src/agent/dispatch.rs:6-51`). That
+(`ic/src/agent/agent_loop.rs:999-1074`, `ic/src/agent/dispatch.rs:6-51`). That
 prevents `wait=true` by itself from halting downstream reads. The residual is
 the unbounded queue-send await under an independently stalled or overloaded
 consumer, not evidence that crash supervision is absent.
