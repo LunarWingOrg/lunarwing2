@@ -809,6 +809,7 @@ impl Agent {
                     Some(crate::agent::reflex::spawn_reflex_compiler(
                         builder,
                         Arc::clone(store),
+                        self.owner_id().to_string(),
                         self.config.reflex.check_interval,
                         self.config.reflex.min_match_count,
                         self.config.reflex.max_patterns_per_run,

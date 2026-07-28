@@ -606,6 +606,7 @@ impl Default for FuzzyConfig {
 pub struct ReflexCompiler {
     builder: Arc<dyn SoftwareBuilder>,
     store: Arc<dyn Database>,
+    user_id: String,
     check_interval: Duration,
     min_match_count: u32,
     max_patterns_per_run: usize,
@@ -616,6 +617,7 @@ impl ReflexCompiler {
     pub fn new(
         builder: Arc<dyn SoftwareBuilder>,
         store: Arc<dyn Database>,
+        user_id: String,
         check_interval: Duration,
         min_match_count: u32,
         max_patterns_per_run: usize,
@@ -623,6 +625,7 @@ impl ReflexCompiler {
         Self {
             builder,
             store,
+            user_id,
             check_interval,
             min_match_count,
             max_patterns_per_run,
@@ -649,6 +652,7 @@ impl ReflexCompiler {
         match self
             .store
             .find_recurring_job_patterns(
+                &self.user_id,
                 self.min_match_count as i32,
                 self.max_patterns_per_run as i32,
             )
@@ -670,7 +674,7 @@ impl ReflexCompiler {
         let normalized = normalize_pattern(description);
 
         // Check if already compiled
-        match self.store.get_reflex_pattern("default", &normalized).await {
+        match self.store.get_reflex_pattern(&self.user_id, &normalized).await {
             Ok(Some((_, status))) if status == "active" => {
                 tracing::debug!("Reflex pattern already compiled: {}", normalized);
                 return;
@@ -702,7 +706,7 @@ impl ReflexCompiler {
                     );
                     if let Err(e) = self
                         .store
-                        .upsert_reflex_pattern("default", &normalized, description, &safe_name)
+                        .upsert_reflex_pattern(&self.user_id, &normalized, description, &safe_name)
                         .await
                     {
                         tracing::warn!(
@@ -817,6 +821,7 @@ impl ReflexEvictor {
 pub fn spawn_reflex_compiler(
     builder: Arc<dyn SoftwareBuilder>,
     store: Arc<dyn Database>,
+    user_id: String,
     check_interval: Duration,
     min_match_count: u32,
     max_patterns_per_run: usize,
@@ -825,6 +830,7 @@ pub fn spawn_reflex_compiler(
         let compiler = ReflexCompiler::new(
             builder,
             store,
+            user_id,
             check_interval,
             min_match_count,
             max_patterns_per_run,

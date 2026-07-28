@@ -193,6 +193,7 @@ fn make_compiler(
     ReflexCompiler::new(
         builder,
         store,
+        "default".to_string(),
         Duration::from_secs(3600),
         min_match,
         max_per_run,

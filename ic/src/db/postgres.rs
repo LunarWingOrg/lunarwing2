@@ -1242,6 +1242,7 @@ impl IdentityStore for PgBackend {
 impl ReflexStore for PgBackend {
     async fn find_recurring_job_patterns(
         &self,
+        user_id: &str,
         min_count: i32,
         limit: i32,
     ) -> Result<Vec<String>, DatabaseError> {
@@ -1249,12 +1250,12 @@ impl ReflexStore for PgBackend {
         let rows = conn
             .query(
                 "SELECT description FROM agent_jobs \
-                 WHERE status = 'completed' AND success = true \
+                 WHERE status = 'completed' AND success = true AND user_id = $1 \
                  GROUP BY description \
-                 HAVING COUNT(*) >= $1 \
+                 HAVING COUNT(*) >= $2 \
                  ORDER BY COUNT(*) DESC \
-                 LIMIT $2",
-                &[&min_count, &limit],
+                 LIMIT $3",
+                &[&user_id, &min_count, &limit],
             )
             .await?;
         Ok(rows

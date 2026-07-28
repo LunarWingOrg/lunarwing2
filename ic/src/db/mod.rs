@@ -733,10 +733,11 @@ pub trait SettingsStore: Send + Sync {
 
 #[async_trait]
 pub trait ReflexStore: Send + Sync {
-    /// Find job descriptions that appear at least `min_count` times.
+    /// Find job descriptions that appear at least `min_count` times for a given user.
     /// Returns up to `limit` recurring patterns.
     async fn find_recurring_job_patterns(
         &self,
+        user_id: &str,
         min_count: i32,
         limit: i32,
     ) -> Result<Vec<String>, DatabaseError>;

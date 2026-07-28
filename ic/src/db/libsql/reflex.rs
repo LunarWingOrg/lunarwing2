@@ -74,6 +74,7 @@ const SELECT_COLS: &str = "id, user_id, normalized_pattern, original_pattern, to
 impl ReflexStore for LibSqlBackend {
     async fn find_recurring_job_patterns(
         &self,
+        user_id: &str,
         min_count: i32,
         limit: i32,
     ) -> Result<Vec<String>, DatabaseError> {
@@ -82,13 +83,13 @@ impl ReflexStore for LibSqlBackend {
             .query(
                 r#"
                 SELECT description FROM agent_jobs
-                WHERE status = 'completed' AND success = 1
+                WHERE status = 'completed' AND success = 1 AND user_id = ?1
                 GROUP BY description
-                HAVING COUNT(*) >= ?1
+                HAVING COUNT(*) >= ?2
                 ORDER BY COUNT(*) DESC
-                LIMIT ?2
+                LIMIT ?3
                 "#,
-                params![min_count as i64, limit as i64],
+                params![user_id, min_count as i64, limit as i64],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
