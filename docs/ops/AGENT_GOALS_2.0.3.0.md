@@ -27,7 +27,7 @@
 16. [x] address 2. Priority findings in docs/ops/CICD_LOGIC_REVIEW.md
 17. [x] address p1 issues in docs/ops/GOAL_GAP_SUGGESTIONS.md
 18. [x] address 3. Parity gaps vs. the plan (Phase 1 scope) in docs/ops/CICD_LOGIC_REVIEW.md
-19. [x] **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. In-place configuration updates were completed on 2026-07-24. Reference the branch here for prior/failed/unverified attempt: rarity/item-8-20260723-0855
+19. [x] (S) **MCP additions — host-local MCP lifecycle.** The foundation (first-class host-local stdio MCP install) and the registry-validation and diagnostics Recommended-List items were completed and verified on 2026-07-21. Runtime deactivate/re-enable and focused integration coverage were completed on 2026-07-22. In-place configuration updates were completed on 2026-07-24. Reference the branch here for prior/failed/unverified attempt: rarity/item-8-20260723-0855
     <details>
     <summary><b>✅ DONE (verified 2026-07-21) — Foundational: first-class host-local stdio MCP installation</b></summary>
     Confirmed present in code with references:
@@ -71,9 +71,9 @@
 
     **Defer for now:** worker-local MCP, automatic npm/pip install, secret injection through process env, general runtime-adapter refactor, gateway integration, automatic crash restart — each materially increases the security/lifecycle surface.
     </details>
-20. [x] (S) dark irc key exchange. automate the process securely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on some branches already done - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the following branches: rarity/item-20-20260722-1501 and darkirckeyex/aragents/v2.0.3.0 and feat/darkirc-key-exchange-v1
-21. [x] continue to work on external workers, in particular for opencode
-22. [x] review kawarimi adapter. make improvements (only if necessary)
+20. [ ] dark irc key exchange. automate the process securely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on some branches already done - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the following branches: rarity/item-20-20260722-1501 and darkirckeyex/aragents/v2.0.3.0 and feat/darkirc-key-exchange-v1
+21. [x] (S) continue to work on external workers, in particular for opencode
+22. [ ] review kawarimi adapter. make improvements (only if necessary)
 23. [x] go over release notes for 2.0.2.0 and see what else still needs to be added to next release, see documents about this if unsure of each item. create new doc under docs/proposals for items that should be included in 2.0.3.0 (you must focus on enginev2 related fixes/polishing)
 24. [x] (S) Refactor mt admin. The existing document plans have SERIOUS issues. Therefore, I'm going with a COMPLETELY different plan for this. Please see the following branch: mtadminrefactor/meta4/v2.0.3.0
 25. [ ] Review recent work on XMPP file transfer — remaining polish (further hardening), see documents about this if unsure. create new doc detailing findings in docs/ops
@@ -85,12 +85,12 @@
 31. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
 32. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
 33. [ ] write up proper plan document in docs/proposals for integrating docs/proposals/MULTIAGENTTEAMORCHESTRATION into the next release, 2.0.4.0
-34. [x] write up proper single plan document in docs/proposals for integrating docs/proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED in docs/proposals - see the following branch: rc2/aragents/v2.0.3.0
-35. [x] (S) update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
+34. [ ] Work on reflex compiler. see docs/proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED in docs/proposals - ALSO, see the following branches: rc2/aragents/v2.0.3.0 and anattemptatreflexcompilerv2 for work as inspiration
+35. [ ] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
 36. [ ] update docs/README.md
 37. [ ] update README.md at repo root
 38. [ ] come up with codename ideas for release. put into new doc.
 39. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.3.0 explaining all relevant changes since v2.0.2.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.3.0.md and should be written to the ROOT of the repo. When complete with draft, move on to another task, which is: Improve accuracy of the first draft of release notes (from previous task) - RELEASE-v2.0.3.0.md
-40. [ ] review README.md and release notes in root of repo and do a final pass. you may also shorten superfluous information
+40. [ ] review README.md and release notes from item #39 in root of repo and do a final pass. you may also shorten superfluous information
 
 ---
