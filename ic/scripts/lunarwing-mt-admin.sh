@@ -350,6 +350,8 @@ Commands:
 
   build-opencode-worker            Build the opencode worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
+                                   (Podman also prunes dangling images and avoids
+                                   caching intermediate build layers)
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
 
   build-vision-sidecar             Build the LunarVision OCR sidecar Docker image
@@ -2106,17 +2108,28 @@ build_opencode_worker() {
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
   say "building opencode worker Docker image [$toolchain_desc] ..."
 
-  local cache_flag=""
-  [[ "$no_cache" == "true" ]] && cache_flag="--no-cache"
+  local -a cache_args=()
+  [[ "$no_cache" == "true" ]] && cache_args=(--no-cache)
 
-  local toolchain_arg=""
-  [[ "$with_toolchains" == "true" ]] && toolchain_arg="--build-arg WITH_TOOLCHAINS=true"
+  local -a toolchain_args=()
+  [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
 
   if [[ "$CONTAINER_RT" == "podman" ]]; then
-    podman build $cache_flag $toolchain_arg --network=host --format docker -t lunarwing-worker-opencode:latest "$opencode_dir" \
+    local -a layer_args=()
+    if [[ "$no_cache" == "true" ]]; then
+      # --no-cache avoids reading old layers but still creates new intermediate
+      # layers by default. Drop safe dangling images first, then keep this large
+      # Bun build in one layer per stage to reduce peak storage and inode use.
+      say "pruning dangling Podman images before uncached OpenCode build ..."
+      if ! podman image prune -f >/dev/null; then
+        say "WARNING: failed to prune dangling Podman images; continuing build" >&2
+      fi
+      layer_args=(--layers=false)
+    fi
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" --network=host --format docker -t lunarwing-worker-opencode:latest "$opencode_dir" \
       || die "opencode worker image build failed"
   else
-    docker build $cache_flag $toolchain_arg -t lunarwing-worker-opencode:latest "$opencode_dir" \
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" -t lunarwing-worker-opencode:latest "$opencode_dir" \
       || die "opencode worker image build failed"
   fi
 
@@ -4382,18 +4395,22 @@ start_tenant_opencode() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
+    local opencode_service="lunarwing-opencode-${name}.service"
     local quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-opencode-${name}.container"
     render_worker_quadlet "$name" opencode 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if _container_config_changed "$name" "lunarwing-opencode-${name}" "$quadlet_file"; then
-      _recreate_quadlet_container "$name" "lunarwing-opencode-${name}.service" "lunarwing-opencode-${name}"
+      _recreate_quadlet_container "$name" "$opencode_service" "lunarwing-opencode-${name}"
     fi
-    if _systemctl_user "$name" start "lunarwing-opencode-${name}.service" >/dev/null 2>&1; then
+    # A bad pre-upgrade image can exhaust StartLimitBurst. Loading a fixed image
+    # does not clear that systemd lockout, so reset it before the explicit retry.
+    _systemctl_user "$name" reset-failed "$opencode_service" >/dev/null 2>&1 || true
+    if _systemctl_user "$name" start "$opencode_service" >/dev/null 2>&1; then
       _store_container_hash "$name" "lunarwing-opencode-${name}" "$quadlet_file"
-      say "opencode worker ready via quadlet (lunarwing-opencode-${name}.service, WSS port $wss_port)"
+      say "opencode worker ready via quadlet ($opencode_service, WSS port $wss_port)"
     else
-      say "WARNING: lunarwing-opencode-${name}.service failed to start" >&2
-      _systemctl_user "$name" status "lunarwing-opencode-${name}.service" --no-pager >&2 || true
+      say "WARNING: $opencode_service failed to start" >&2
+      _systemctl_user "$name" status "$opencode_service" --no-pager --full >&2 || true
     fi
     return 0
   fi
@@ -4480,7 +4497,8 @@ start_tenant_opencode() {
     local workspace_dir
     workspace_dir="$(tenant_lw_root "$name")/opencode-workspace"
     mkdir -p "$workspace_dir"
-    chown "$name:$name" "$workspace_dir"
+    # Migrate files created under an older rootless UID mapping before keep-id.
+    chown -R "$name:$name" "$workspace_dir"
     chmod 777 "$workspace_dir"
 
     local -a restart_arg=()
@@ -5360,7 +5378,14 @@ render_worker_quadlet() {
   tenant_env_path="$env_dir/lunarwing.env"
   worker_env_path="$env_dir/${worker}.env"
   workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
-  mkdir -p "$workspace_dir"; chown "$name:$name" "$workspace_dir"; chmod 777 "$workspace_dir"
+  mkdir -p "$workspace_dir"
+  if [[ "$worker" == "opencode" ]]; then
+    # Migrate files created under OpenCode's older rootless UID mapping.
+    chown -R "$name:$name" "$workspace_dir"
+  else
+    chown "$name:$name" "$workspace_dir"
+  fi
+  chmod 777 "$workspace_dir"
   mkdir -p "$qdir"
 
   local agent_token tz_key

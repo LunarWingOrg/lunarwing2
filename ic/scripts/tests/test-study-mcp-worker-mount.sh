@@ -31,7 +31,8 @@ ports_get() {
     *) return 1 ;;
   esac
 }
-chown() { :; }
+chown_calls="$fixture/chown-calls"
+chown() { printf '%s\n' "$*" >>"$chown_calls"; }
 say() { :; }
 selinuxenabled() { [[ "$selinux_active" == "true" ]]; }
 chcon() { printf '%s\n' "$*" >> "$selinux_calls"; }
@@ -153,6 +154,7 @@ ctr_calls="$fixture/container-calls"
 CONTAINER_RT="podman"
 MT_ROOTLESS="true"
 start_tenant_opencode test
+grep -Fqx -- "-R test:test $(tenant_lw_root test)/opencode-workspace" "$chown_calls"
 grep -Fq -- "-v $study_home:/opt/lw2studymcp:ro,z" "$ctr_calls"
 grep -Fq -- "-e LW2STUDYMCP_HOME=/opt/lw2studymcp" "$ctr_calls"
 grep -Fq -- "-v $study_state:/var/lib/lw2studymcp:ro,z" "$ctr_calls"
@@ -165,6 +167,7 @@ fi
 
 render_worker_quadlet test opencode 8443
 opencode_unit="$(tenant_quadlet_dir test)/lunarwing-opencode-test.container"
+grep -Fqx -- "-R test:test $(tenant_lw_root test)/opencode-workspace" "$chown_calls"
 grep -Fq "Volume=$study_home:/opt/lw2studymcp:ro,z" "$opencode_unit"
 grep -Fq "Environment=LW2STUDYMCP_HOME=/opt/lw2studymcp" "$opencode_unit"
 grep -Fq "Volume=$study_state:/var/lib/lw2studymcp:ro,z" "$opencode_unit"
@@ -248,5 +251,62 @@ if grep -Fq -- ' run -d ' "$ctr_calls"; then
   printf 'OpenCode worker started with stale image user contract\n' >&2
   exit 1
 fi
+
+# A rebuilt image must escape any StartLimitBurst lockout left by old failures.
+container_image_user="$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID"
+CONTAINER_RT="podman"
+MT_ROOTLESS="true"
+ensure_init_system() { INIT_SYSTEM="systemd"; }
+podman_supports_quadlet() { return 0; }
+_wait_user_manager() { :; }
+systemctl_calls=()
+_systemctl_user() {
+  systemctl_calls+=("$*")
+  [[ "${2:-}" != "start" ]]
+}
+start_tenant_opencode test >/dev/null 2>&1
+reset_seen=false
+status_full_seen=false
+for call in "${systemctl_calls[@]}"; do
+  [[ "$call" == "test reset-failed lunarwing-opencode-test.service" ]] && reset_seen=true
+  if [[ "$call" == "test start lunarwing-opencode-test.service" && "$reset_seen" != "true" ]]; then
+    printf 'OpenCode Quadlet start ran before reset-failed\n' >&2
+    exit 1
+  fi
+  [[ "$call" == "test status lunarwing-opencode-test.service --no-pager --full" ]] \
+    && status_full_seen=true
+done
+if [[ "$reset_seen" != "true" || "$status_full_seen" != "true" ]]; then
+  printf 'OpenCode Quadlet failure recovery omitted reset or full status\n' >&2
+  exit 1
+fi
+
+# Uncached Podman builds minimize peak storage without pruning tenant containers.
+build_calls="$fixture/build-calls"
+podman() { printf '%s\n' "$*" >>"$build_calls"; }
+LUNARWING_ROOT="$fixture"
+mkdir -p "$LUNARWING_ROOT/opencode4lunarwing"
+build_opencode_worker true true
+grep -Fqx 'image prune -f' "$build_calls"
+grep -Fq 'build --no-cache --layers=false --build-arg WITH_TOOLCHAINS=true' "$build_calls"
+
+: >"$build_calls"
+build_opencode_worker false false
+if grep -Eq -- 'image prune|--no-cache|--layers=false' "$build_calls"; then
+  printf 'Cached OpenCode build used uncached-build storage cleanup\n' >&2
+  exit 1
+fi
+
+docker() { printf '%s\n' "$*" >>"$build_calls"; }
+CONTAINER_RT="docker"
+: >"$build_calls"
+build_opencode_worker true true
+grep -Fq 'build --no-cache --build-arg WITH_TOOLCHAINS=true' "$build_calls"
+if grep -Eq -- 'image prune|--layers=false' "$build_calls"; then
+  printf 'Podman-only OpenCode storage flags leaked into Docker build\n' >&2
+  exit 1
+fi
+
+grep -Fq 'bun pm cache rm' "$dockerfile"
 
 printf 'Study MCP worker mount tests passed\n'
