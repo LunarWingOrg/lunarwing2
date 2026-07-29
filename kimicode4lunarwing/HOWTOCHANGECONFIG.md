@@ -49,7 +49,7 @@ This sets `KIMI_API_KEY` in the tenant's `lunarwing.env`, which `entrypoint.sh` 
 1. **Baked defaults** (in `config/config.toml`, applied to *every* tenant at boot unless overridden).
 2. **Per-tenant overrides** (via `KIMI_MODEL` / `KIMI_BASE_URL` / `KIMI_API_KEY` env vars, set by `configure-kimi`).
 
-**Priority**: if `KIMI_MODEL` or `KIMI_BASE_URL` is set:
+**Priority**: if `KIMI_MODEL`, `KIMI_BASE_URL`, or `KIMI_API_KEY` is set:
 → read baked config, apply overrides, write to `$KIMI_CODE_HOME/config.toml`
 
 else:

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { expandWorkspacePath } from "./workspace_path.ts"
+import { expandWorkspacePath } from "./workspace_path.js"
 
 const workspaceRoot = "/workspace"
 
