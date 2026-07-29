@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 
-import type { OpencodeClient } from "@opencode-ai/sdk/v2"
+import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 
 import { executeTask } from "./opencode_task_executor.ts"
 import type { TaskRequest } from "./lunarwing_runtime.ts"

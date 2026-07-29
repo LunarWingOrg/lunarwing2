@@ -95,15 +95,16 @@ So the only binary that is ever loaded is the one matching the build host's
 
 ## Proposed Change
 
-Pass `--single` (and optionally `--skip-install`) to the relevant
-`bun run build` invocations in `opencode4lunarwing/Dockerfile`:
+Pass `--single` to the OpenCode build and copy only fixed runtime artifacts:
 
 ```dockerfile
-WORKDIR /build/opencode/packages/app
-RUN bun run build 2>/dev/null || true
-
 WORKDIR /build/opencode/packages/opencode
-RUN bun run build -- --single 2>/dev/null || true
+RUN bun run build -- --single
+
+RUN set -e; \
+    set -- dist/opencode-*/bin/opencode; \
+    [ "$#" -eq 1 ] && [ -x "$1" ]; \
+    install -D -m 0755 "$1" /out/bin/opencode
 ```
 
 Notes:
@@ -114,9 +115,12 @@ Notes:
   optimization (avoids the multi-arch native-dependency install) and is safe
   to add because the native install already happened in the top-level
   `bun install --frozen-lockfile` at line 20.
-- Leave the `packages/app` and `packages/sdk/js` builds unchanged; they
-  produce the embedded web UI and the JS SDK respectively (no Rust, no
-  cross-compile), so they are not the source of the slowdown.
+- The OpenCode build embeds the web UI itself, so a separate `packages/app`
+  build is redundant. Keep the `packages/sdk/js` build to generate the bridge
+  client.
+- Copy the standalone binary and generated SDK client into the runtime stage,
+  not the full upstream monorepo. This bounds Kaniko snapshot memory and final
+  image size.
 
 ### Expected impact
 
@@ -140,16 +144,13 @@ Notes:
    current deployment model (per `_ensure_tenant_image`, images are
    same-host only), but the constraint should be noted in
    `opencode4lunarwing/README.md` when this lands.
-3. **The `2>/dev/null || true` soft-fail is preserved.** The build-time SDK
-   assertion at Dockerfile line 132 (`import("@opencode-ai/sdk/v2")` →
-   `createOpencodeClient`) is the real gate; it already fails the image if
-   the build is broken. Soft-failing the `--single` build does not weaken
-   that guarantee.
+3. **The native build is strict.** A missing binary fails before the runtime
+   stage. The separate SDK assertion imports `@opencode-ai/sdk/v2/client` and
+   verifies `createOpencodeClient`.
 4. **Upstream flag stability.** `--single` is parsed by the pinned opencode
    release (`OPENCODE_REF=v1.17.13`). If a future opencode bump renames or
-   removes the flag, the build step will continue to soft-fail (because of
-   `|| true`) and the SDK assertion will catch the resulting broken build.
-   Worth verifying on each opencode version bump.
+   removes the flag, the strict build fails immediately. Verify on each
+   OpenCode version bump.
 
 ## Verification Plan
 
@@ -158,7 +159,7 @@ After the change:
 1. `build-opencode-worker --no-cache` and confirm the build log shows
    **only** the native target (e.g. `building opencode-linux-x64`) and no
    `darwin-*` / `win32-*` / `*-musl` lines.
-2. Confirm the SDK assertion (Dockerfile:132) still passes.
+2. Confirm the client-only SDK import assertion still passes.
 3. Spin up a tenant worker, run the smoke profile, and confirm the worker
    boots and accepts a task (the live round-trip exercised on `octest`).
 4. Confirm image size dropped (`podman images` before/after).

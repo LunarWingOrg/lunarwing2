@@ -5,7 +5,7 @@
  * send prompts, and stream events back to the caller.
  */
 
-import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk/v2"
+import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import {
   buildTaskPrompt,
   type TaskRequest,
