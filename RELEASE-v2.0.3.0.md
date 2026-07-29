@@ -21,9 +21,8 @@ the background.
 The release also replaces the proprietary Cloudflare/ngrok/tailscale tunnel
 providers with a self-hosted NetBird provider, hardens DarkIRC outbound delivery
 with a paced adapter outbox, completes the WeeChat buffer-restore handoff that
-v2.0.2.0 left broken, adds bounded context and retry logic to external workers
-and a new Kimi Code external worker harness, makes the web gateway UI keep
-streaming answers across thread switches and
+v2.0.2.0 left broken, adds bounded context and retry logic to external workers,
+makes the web gateway UI keep streaming answers across thread switches and
 reconnects while rendering faster, introduces Study Notes as a read/write skill
 with an MCP integration, repairs the self-improving skills pipeline so learning
 missions actually fire and persist extracted skills, and refreshes architecture
@@ -70,10 +69,6 @@ for historical notes.
   `--chuid`.
 - Added bounded context, retry logic, and extended runtime to external workers;
   hardened worker cancellation, terminal state, and timeout handling.
-- Added Kimi Code as a fourth persistent external worker: a Node.js/TypeScript
-  WebSocket bridge harness (`kimicode4lunarwing/`), full mt-admin lifecycle
-  (`--with-kimi` and related flags), and a v12 port-registry migration with a
-  dedicated Kimi port range.
 - Added Study Notes as a read/write skill with an approved write path and a
   read-only MCP integration.
 - Repaired the self-improving skills pipeline: terminal thread events now
@@ -100,7 +95,6 @@ for historical notes.
 | Pinned workspace/container/CI toolchain | Rust `1.96.1` |
 | New SQL migration | `V24__remove_legacy_tunnel_settings.sql`; automatic on startup |
 | Database parity for V24 | PostgreSQL and libSQL |
-| Port registry migration | v12 adds a dedicated Kimi worker range (30000–39999, block size 2); applied automatically by mt-admin |
 | Engine V2 defaults | Unchanged from v2.0.2.0 |
 | MCP transports | HTTP, host-local stdio, and Unix socket; registry manifests support HTTP/stdio |
 | MCP persisted state | Owner-scoped DB setting is authoritative when DB is enabled; disk remains available for migration or `--no-db` |
@@ -215,33 +209,6 @@ and the new start helper are installed.
 - Updated the OpenCode worker Rust toolchain.
 - Persist external job diagnostics across restarts.
 
-### Kimi Code External Worker
-
-MoonshotAI's Kimi Code CLI is now integrated as a persistent LunarWing
-external worker, parallel to NanoCode, Pebble, and OpenCode. The core daemon
-required no Rust changes — the external-worker manager is already generic, so
-the `kimi` worker name appears automatically in the `create_job` mode schema.
-
-- Added the `kimicode4lunarwing/` harness: a Node.js/TypeScript WebSocket
-  bridge that spawns a `kimi -p` subprocess per task and translates its
-  streamed JSONL events to the `lunarwing-agent-v1` protocol, with task
-  timeout and cancellation handling, bounded SIGTERM-then-SIGKILL shutdown,
-  and a progress heartbeat.
-- Added the worker container (Node 22, `@moonshot-ai/kimi-code` 0.30.0,
-  dedicated UID), entrypoint, health server, default `config.toml`, and
-  docker-compose, smoke, and unit test coverage.
-- Extended mt-admin with the Kimi worker lifecycle: `build-kimi-worker`,
-  `configure-kimi`, per-tenant start/stop, and status, doctor, and list
-  support, plus `--with-kimi`, `--kimi-model`, `--kimi-base-url`, and
-  `--kimi-api-key` flags across `add-tenant`, `build-tenant`, `build-all`, and
-  `upgrade-tenant`, with Quadlet and OpenRC rendering.
-- Migrated the tenant port registry to v12 with a dedicated Kimi port range
-  (30000–39999, block size 2) so Kimi worker WebSocket and health ports do not
-  collide with the existing extended block.
-- Wired Kimi through onboarding (CLI and web wizard), tenant import/export,
-  infrastructure health checks, CI container builds, and the external worker
-  harness tests.
-
 ### Study Notes Skill and MCP Integration
 
 - Added `ic/skills/study-notes/SKILL.md` as a read/write skill for managing
@@ -343,9 +310,6 @@ it does not enable it.
 - Added `docs/ops/CODENAME_IDEAS_v2.0.3.0.md`.
 - Added `docs/ops/SIS_FIX_PROPOSAL.md` documenting the self-improving skills
   root causes, fixes, verification coverage, and residual limits.
-- Added `kimicode4lunarwing/` harness documentation (README, AGENTS.md,
-  HOWTOCHANGECONFIG) and updated `docs/ops/WORKER-CONTAINERS.md` and the
-  external worker harness test docs for the Kimi worker.
 
 ### Versioning, Toolchain, and Dependencies
 
@@ -525,9 +489,6 @@ Committed tests cover:
   `--chuid` rendering;
 - external worker bounded context, retry, cancellation, terminal state, and
   timeout handling;
-- Kimi worker bridge task executor, stream-json result parsing, task prompt,
-  and workspace path handling, plus onboarding/import/web coverage for the
-  `--with-kimi` flow;
 - Study Notes read/write skill and MCP integration;
 - self-improving skills: trigger-payload seeding, persist-before-broadcast
   terminal events, gate-pause payload retention, lease revoke/rollback/startup
