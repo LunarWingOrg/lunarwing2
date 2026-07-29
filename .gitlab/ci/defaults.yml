@@ -24,6 +24,13 @@ variables:
   PYTHONDONTWRITEBYTECODE: "1"
   CI_LINT_RUNNER_TAG: lint
   CI_RUST_RUNNER_TAG: rust-x86_64
+  # sccache: shared compile-artifact cache across the Rust jobs (installed by
+  # bootstrap-sccache.sh; nothing required on the runner host). The 80G value
+  # is only the eviction cap — actual usage tracks what the workspace needs.
+  # Note: GitLab zips SCCACHE_DIR into the job cache, so real size matters.
+  RUSTC_WRAPPER: "$CI_PROJECT_DIR/.ci-cache/bin/sccache"
+  SCCACHE_DIR: "$CI_PROJECT_DIR/.ci-cache/sccache"
+  SCCACHE_CACHE_SIZE: "80G"
 
 .lint-job:
   image:
@@ -57,16 +64,26 @@ variables:
     - "$CI_RUST_RUNNER_TAG"
   before_script:
     - bash .gitlab/scripts/bootstrap-rust.sh
+    - bash .gitlab/scripts/bootstrap-sccache.sh
   cache:
-    key:
-      prefix: "rust-1.96.1-dependencies"
-      files:
-        - ic/Cargo.lock
-    paths:
-      - .ci-cache/cargo/registry/index/
-      - .ci-cache/cargo/registry/cache/
-      - .ci-cache/cargo/git/db/
-    policy: pull-push
+    # Downloaded crates: keyed on Cargo.lock (new deps re-fetch on change).
+    - key:
+        prefix: "rust-1.96.1-dependencies"
+        files:
+          - ic/Cargo.lock
+      paths:
+        - .ci-cache/cargo/registry/index/
+        - .ci-cache/cargo/registry/cache/
+        - .ci-cache/cargo/git/db/
+      policy: pull-push
+    # sccache + its binary: static key — one self-overwriting archive, so
+    # lockfile changes neither reset the artifact cache nor pile up stale
+    # zips on the runner host. 80G live cap enforced by sccache itself.
+    - key: "rust-1.96.1-sccache"
+      paths:
+        - .ci-cache/bin/
+        - .ci-cache/sccache/
+      policy: pull-push
 
 # MSRV check uses a separate cache namespace so future primary-toolchain bumps
 # do not contaminate artifacts built with the declared minimum toolchain.
@@ -78,17 +95,23 @@ variables:
     - "$CI_RUST_RUNNER_TAG"
   before_script:
     - bash .gitlab/scripts/bootstrap-msrv.sh
+    - bash .gitlab/scripts/bootstrap-sccache.sh
     - mv ic/rust-toolchain.toml ic/rust-toolchain.toml.disabled
   cache:
-    key:
-      prefix: "rust-1.96.1-msrv"
-      files:
-        - ic/Cargo.lock
-    paths:
-      - .ci-cache/cargo/registry/index/
-      - .ci-cache/cargo/registry/cache/
-      - .ci-cache/cargo/git/db/
-    policy: pull-push
+    - key:
+        prefix: "rust-1.96.1-msrv"
+        files:
+          - ic/Cargo.lock
+      paths:
+        - .ci-cache/cargo/registry/index/
+        - .ci-cache/cargo/registry/cache/
+        - .ci-cache/cargo/git/db/
+      policy: pull-push
+    - key: "rust-1.96.1-msrv-sccache"
+      paths:
+        - .ci-cache/bin/
+        - .ci-cache/sccache/
+      policy: pull-push
 
 .gitleaks-job:
   image:

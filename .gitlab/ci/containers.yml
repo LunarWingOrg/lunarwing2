@@ -5,8 +5,8 @@
 #
 # Images are built with Kaniko (unprivileged, works on any docker-executor
 # runner; produces docker-format images so the Dockerfiles' HEALTHCHECKs
-# survive). Jobs run automatically on the default branch when a worker
-# directory changes, and are available manually on any pipeline.
+# survive). ALL image jobs are manual-only on every pipeline — multi-GB builds
+# never start automatically.
 #
 # If gcr.io is unreachable from the runners, mirror the executor image into
 # our own registry first (bootstrap notes in docs/ops/GITLAB_CONTAINER_REGISTRY.md).
@@ -41,9 +41,6 @@ worker-nanocode-image:
       --destination "$CI_REGISTRY_IMAGE/worker-nanocode:$CI_COMMIT_SHORT_SHA"
       --destination "$CI_REGISTRY_IMAGE/worker-nanocode:latest"
   rules:
-    - if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
-      changes:
-        - lunarcode4lunarwing/**/*
     - when: manual
 
 worker-pebble-image:
@@ -55,10 +52,6 @@ worker-pebble-image:
       --destination "$CI_REGISTRY_IMAGE/worker-pebble:$CI_COMMIT_SHORT_SHA"
       --destination "$CI_REGISTRY_IMAGE/worker-pebble:latest"
   rules:
-    - if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
-      changes:
-        - pebble4lunarwing/**/*
-        - pebble/**/*
     - when: manual
 
 worker-opencode-image:
@@ -75,9 +68,6 @@ worker-opencode-image:
       --destination "$CI_REGISTRY_IMAGE/worker-opencode:$CI_COMMIT_SHORT_SHA"
       --destination "$CI_REGISTRY_IMAGE/worker-opencode:latest"
   rules:
-    - if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
-      changes:
-        - opencode4lunarwing/**/*
     - when: manual
 
 worker-kimi-image:
@@ -92,7 +82,4 @@ worker-kimi-image:
       --destination "$CI_REGISTRY_IMAGE/worker-kimi:$CI_COMMIT_SHORT_SHA"
       --destination "$CI_REGISTRY_IMAGE/worker-kimi:latest"
   rules:
-    - if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
-      changes:
-        - kimicode4lunarwing/**/*
     - when: manual

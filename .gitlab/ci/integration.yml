@@ -24,6 +24,11 @@ cavepony-wasm:
   needs:
     - rust-check-default
   timeout: 30m
+  rules:
+    # Full suite only on the default branch (and MRs into it) — see slim set.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
+    - when: never
   script:
     - rustup target add --toolchain 1.96.1 wasm32-wasip2
     - bash .gitlab/scripts/cargo-ci.sh build -j2 --release --target wasm32-wasip2 --manifest-path tools-src/cavepony/Cargo.toml

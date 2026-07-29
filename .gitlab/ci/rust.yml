@@ -11,6 +11,11 @@ rust-check-postgres:
   stage: check
   needs:
     - cargo-metadata
+  rules:
+    # Full suite only on the default branch (and MRs into it) — see slim set.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
+    - when: never
   script:
     - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --no-default-features --features postgres
 
@@ -19,6 +24,10 @@ rust-check-libsql:
   stage: check
   needs:
     - cargo-metadata
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
+    - when: never
   script:
     - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --no-default-features --features libsql
 
@@ -27,6 +36,10 @@ rust-check-all-features:
   stage: check
   needs:
     - cargo-metadata
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
+    - when: never
   script:
     - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --all-features
 
@@ -99,6 +112,11 @@ rust-test-libsql:
     - job: wasm-channel-test-artifacts
       artifacts: true
   timeout: 60m
+  rules:
+    # Full suite only on the default branch (and MRs into it) — see slim set.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
+    - when: never
   variables:
     LUNARWING_CLOUD_AUTH_URL: "http://127.0.0.1"
     LUNARWING_CLOUD_BASE_URL: "http://127.0.0.1"
