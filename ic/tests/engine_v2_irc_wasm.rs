@@ -783,10 +783,10 @@ async fn start_darkirc_fixture() -> (
                     let mut state = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if !state
+                    if state
                         .pending_batch
                         .as_ref()
-                        .is_some_and(|(pending, _)| pending == batch_id)
+                        .is_none_or(|(pending, _)| pending != batch_id)
                     {
                         return StatusCode::CONFLICT;
                     }
