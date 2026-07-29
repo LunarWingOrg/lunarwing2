@@ -105,7 +105,30 @@ docker login registry.git.lunarwing.org   # GitLab username + PAT with read_regi
 In the GitLab UI: project → Deploy → Container Registry should now list an
 (empty) registry for `lunarwing/lunarwing2`.
 
-### 1e. Large-image notes for Traefik
+(Verified working 2026-07-29: LE cert issued for `registry.git.lunarwing.org`,
+`/v2/` returns 401 + `docker-distribution-api-version: registry/2.0`, token
+realm `https://git.lunarwing.org/jwt/auth`.)
+
+### 1e. Troubleshooting (from the actual bring-up)
+
+- **`curl: (60) self-signed certificate` / `CN=TRAEFIK DEFAULT CERT`:**
+  Traefik has no router for the host and is serving its fallback cert. Check
+  `docker logs traefik | grep -iE 'error|acme'` — a YAML error in
+  `traefik-dynamic.yaml` makes Traefik reject the **entire file** (all routes,
+  not just the new one → every site 404s). Fix indentation: routers under
+  `http.routers`, services under `http.services`.
+- **502 "Waiting for GitLab to boot" page:** that's GitLab's own boot page,
+  not a proxy problem — Rails is still starting after the recreate. Wait a
+  few minutes.
+- **502 Bad Gateway from Traefik (no GitLab page):** the router matched but
+  the backend is down — check `docker exec gitlab ss -ltnp | grep 5050` and
+  `docker exec gitlab grep '^registry' /etc/gitlab/gitlab.rb`. If the
+  registry lines are missing, the `GITLAB_OMNIBUS_CONFIG` env didn't render —
+  it must be a block scalar (`|`) in compose, not list syntax.
+- **Wrong token realm / scheme mismatch on `docker login`:** the
+  `registry_nginx['proxy_set_headers']` block is missing.
+
+### 1f. Large-image notes for Traefik
 
 Worker images can be multi-GB (especially opencode with toolchains). Traefik
 streams request bodies by default, which is fine; if very large layer pushes
