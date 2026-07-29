@@ -456,7 +456,7 @@ pub async fn execute_orchestrator(
                     // __execute_code_step__(code, state)
                     "__execute_code_step__" => {
                         handle_execute_code_step(
-                            args, kwargs, thread, llm, effects, leases, policy, event_tx,
+                            args, kwargs, thread, llm, effects, leases, policy, event_tx, store,
                         )
                         .await
                     }
@@ -761,6 +761,7 @@ async fn handle_execute_code_step(
     leases: &Arc<LeaseManager>,
     policy: &Arc<PolicyEngine>,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
+    store: Option<&Arc<dyn Store>>,
 ) -> ExtFunctionResult {
     let code = match args.first() {
         Some(obj) => monty_to_string(obj),
@@ -801,6 +802,7 @@ async fn handle_execute_code_step(
         &exec_ctx,
         &[],
         &state,
+        store,
     ))
     .await
     {

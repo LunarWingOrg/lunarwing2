@@ -63,3 +63,30 @@ Action Items
     Fix trigger_payload propagation in engine (event → mission thread state)
     Investigate 582 active leases leak (0 active threads but leases not cleaned)
     Confirm whether profile-builder was replaced by conversation-insights
+
+---
+
+## Resolution — 2026-07-29 (branch `k-sis-m-2/2.0.3.0`)
+
+All three action items are addressed by `docs/ops/SIS_FIX_PROPOSAL.md` (item 41),
+implemented on the same branch:
+
+1. **Trigger payload / blind missions — fixed, two root causes:**
+   - Terminal `StateChanged` events were never broadcast on the event bus, so
+     the mission event listener never fired in production. The thread finisher
+     now broadcasts `Done` (and the loop engine broadcasts `Failed`).
+   - `state["trigger_payload"]` was never injected despite all mission prompts
+     referencing it. Mission fires now seed it into the thread's initial
+     orchestrator state via runtime-checkpoint metadata.
+2. **Lease leak — fixed:** leases are revoked on terminal transition in the
+   finisher, and the startup sweep now evicts orphaned leases (terminal/missing
+   thread) and deletes their files so they don't reload on restart.
+3. **profile-builder — never existed in code** (zero matches in tree and git
+   history). `conversation-insights` is the profile-analog mission. Any
+   `profile-builder` mission in the field was created out-of-band via
+   `mission_create` and can be deleted.
+4. **Bonus fix — extraction write path:** mission prompts instructed saves via
+   a `memory_write(title=…, doc_type=…, metadata=…)` signature the v1 tool
+   doesn't have, which is why no `source: "extracted"` skills existed. Missions
+   now have a `__save_memory_doc__(title, content, doc_type, tags, metadata,
+   shared=False)` host function (mission-threads only), and the prompts use it.

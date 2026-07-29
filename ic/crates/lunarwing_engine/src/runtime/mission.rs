@@ -560,8 +560,14 @@ impl MissionManager {
         let mut updated = mission.clone();
         updated.record_thread(thread_id);
         updated.threads_today += 1;
-        updated.last_trigger_payload = trigger_payload;
+        updated.last_trigger_payload = trigger_payload.clone();
         self.store.save_mission(&updated).await?;
+
+        // Seed the payload into the mission thread's initial orchestrator state
+        // so prompts can rely on `state["trigger_payload"]` (see mission_*.md).
+        let initial_state = trigger_payload
+            .as_ref()
+            .map(|payload| serde_json::json!({ "trigger_payload": payload }));
 
         let spawned = self
             .thread_manager
@@ -574,6 +580,7 @@ impl MissionManager {
                 user_id,
                 Vec::new(),
                 Some(thread_id),
+                initial_state,
             )
             .await;
         if let Err(error) = spawned {
@@ -1669,7 +1676,7 @@ fn build_meta_prompt(
     // Trigger payload
     if let Some(payload) = trigger_payload {
         let payload_str = serde_json::to_string_pretty(payload).unwrap_or_default();
-        let preview: String = payload_str.chars().take(1000).collect();
+        let preview: String = payload_str.chars().take(4000).collect();
         parts.push(format!("\n## Trigger Payload\n```json\n{preview}\n```"));
     }
 

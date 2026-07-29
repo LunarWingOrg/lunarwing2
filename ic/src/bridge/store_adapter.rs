@@ -195,8 +195,9 @@ impl HybridStore {
     /// `load_thread()` will lazy-reload from disk on the next access.
     ///
     /// Also writes a compact archive summary for human-browsable indexing
-    /// and cleans up expired/revoked leases (from memory only — lease files
-    /// stay on disk).
+    /// and cleans up expired/revoked leases plus orphaned leases whose thread
+    /// is terminal or no longer known (their files are unlinked so stale
+    /// leases are not reloaded on restart).
     pub async fn cleanup_terminal_state(&self, min_age: chrono::Duration) -> usize {
         let mut cleaned = 0;
         let now = chrono::Utc::now();
@@ -233,17 +234,42 @@ impl HybridStore {
             cleaned += 1;
         }
 
-        // 2. Clean up revoked/expired leases from memory
+        // 2. Clean up revoked/expired leases, plus orphaned leases whose thread
+        //    is terminal or no longer known. Leases are granted without TTL and
+        //    historically were never revoked, so without the orphan sweep they
+        //    accumulate forever (the "active leases" leak).
+        let live_threads: std::collections::HashSet<ThreadId> = self
+            .threads
+            .read()
+            .await
+            .values()
+            .filter(|t| {
+                !matches!(
+                    t.state,
+                    ThreadState::Done | ThreadState::Failed | ThreadState::Completed
+                )
+            })
+            .map(|t| t.id)
+            .collect();
         let dead_leases: Vec<LeaseId> = self
             .leases
             .read()
             .await
             .iter()
-            .filter(|(_, l)| l.revoked || !l.is_valid())
+            .filter(|(_, l)| {
+                l.revoked || !l.is_valid() || !live_threads.contains(&l.thread_id)
+            })
             .map(|(id, _)| *id)
             .collect();
         for lid in &dead_leases {
             self.leases.write().await.remove(lid);
+            // Unlink the lease file so the stale lease is not reloaded on the
+            // next startup.
+            if let Some(ws) = self.workspace.as_ref()
+                && let Err(e) = ws.delete(&lease_path(*lid)).await
+            {
+                debug!(path = %lease_path(*lid), "failed to delete stale lease file: {e}");
+            }
             cleaned += 1;
         }
 
@@ -1772,6 +1798,105 @@ mod tests {
                 "{}/mission.json",
                 mission_dir("default--project", "Daily report", id)
             )
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn cleanup_terminal_state_evicts_orphaned_leases_and_deletes_files() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::types::capability::GrantedActions;
+        use lunarwing_engine::types::thread::{ThreadConfig, ThreadType};
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("lease-sweep.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "lease-sweep-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+
+        let make_lease = |thread_id: ThreadId| CapabilityLease {
+            id: LeaseId::new(),
+            thread_id,
+            capability_name: "test".into(),
+            granted_actions: GrantedActions::All,
+            granted_at: chrono::Utc::now(),
+            expires_at: None,
+            max_uses: None,
+            uses_remaining: None,
+            revoked: false,
+            revoked_reason: None,
+        };
+
+        // A live (running) thread, a terminal (done) thread, and a lease whose
+        // thread no longer exists at all.
+        let mut live_thread = Thread::new(
+            "live",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        live_thread.state = ThreadState::Running;
+        let mut dead_thread = Thread::new(
+            "dead",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        dead_thread.state = ThreadState::Done;
+        store.save_thread(&live_thread).await.expect("save live");
+        store.save_thread(&dead_thread).await.expect("save dead");
+
+        let live_lease = make_lease(live_thread.id);
+        let dead_lease = make_lease(dead_thread.id);
+        let missing_lease = make_lease(ThreadId::new());
+        for lease in [&live_lease, &dead_lease, &missing_lease] {
+            store.save_lease(lease).await.expect("save lease");
+        }
+        assert!(
+            workspace.exists(&lease_path(dead_lease.id)).await.unwrap(),
+            "lease file persisted before sweep"
+        );
+
+        let cleaned = store.cleanup_terminal_state(chrono::Duration::zero()).await;
+
+        // Orphaned leases (terminal or missing thread) are evicted from memory
+        // and their files unlinked; the live thread's lease survives.
+        assert!(cleaned >= 3, "expected terminal thread + 2 orphaned leases");
+        assert_eq!(
+            store.load_active_leases(live_thread.id).await.unwrap().len(),
+            1,
+            "live thread keeps its lease"
+        );
+        assert!(
+            store
+                .load_active_leases(dead_thread.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "terminal thread's lease evicted"
+        );
+        assert!(
+            !workspace.exists(&lease_path(dead_lease.id)).await.unwrap(),
+            "orphaned lease file deleted"
+        );
+        assert!(
+            !workspace
+                .exists(&lease_path(missing_lease.id))
+                .await
+                .unwrap(),
+            "missing-thread lease file deleted"
+        );
+        assert!(
+            workspace.exists(&lease_path(live_lease.id)).await.unwrap(),
+            "live lease file preserved"
         );
     }
 

@@ -155,6 +155,23 @@ impl ExecutionLoop {
         self.thread.updated_at = chrono::Utc::now();
     }
 
+    /// Transition thread state and broadcast the `StateChanged` event so
+    /// subscribers (e.g. the mission event listener) observe it. Unlike
+    /// `emit_event`, this validates the transition via `Thread::transition_to`.
+    fn transition_to_broadcast(
+        &mut self,
+        new_state: crate::types::thread::ThreadState,
+        reason: Option<String>,
+    ) -> Result<(), EngineError> {
+        self.thread.transition_to(new_state, reason)?;
+        if let Some(ref tx) = self.event_tx
+            && let Some(event) = self.thread.events.last()
+        {
+            let _ = tx.send(event.clone());
+        }
+        Ok(())
+    }
+
     fn load_runtime_checkpoint(&self) -> RuntimeCheckpoint {
         let persisted_state = self
             .thread
@@ -387,7 +404,7 @@ impl ExecutionLoop {
                     && self.thread.state != ThreadState::Failed
                     && self.thread.state != ThreadState::Done
                 {
-                    let _ = self.thread.transition_to(
+                    let _ = self.transition_to_broadcast(
                         ThreadState::Failed,
                         Some(format!("orchestrator error: {e}")),
                     );
