@@ -1,5 +1,19 @@
 # Reflex Compiler & Software Builder — v2 Upgrade Plan
 
+> **Current status (2026-07-29): OPEN / PLANNED in the release tree.**
+> The substrate exists (`ReflexEvictor`, `FuzzyConfig`,
+> `embedding_provider` field + attach method in `ic/src/agent/reflex.rs`,
+> merged via `rc2/aragents/v2.0.3.0`), but the Phase 1–2 wiring fixes are
+> **not** in the merged tree: `agent_loop.rs:351` still constructs
+> `ReflexRouter::new()` with no embedding provider (1a),
+> `bump_reflex_pattern_match` has no dispatcher call site (1b),
+> `spawn_reflex_evictor` is never called (1c), and the hardcoded `"default"`
+> user ID remains at `reflex.rs:673,705` (2a). Phases 3–4 are likewise open.
+> **Unmerged fix work exists:** commits `a91a7c5`..`c4adf0f` (`reflex-fix-1`
+> through `reflex-fix-8`) on branches `anattemptatreflexcompilerv2` and
+> `ocpt1/in/v2.0.3.0` cover Phases 1–3; salvage those rather than starting
+> greenfield.
+
 **Date:** 2026-07-27
 **Author:** Volta 🦊⚡
 **Target Release:** v2.0.3.0 (Phases 1–4), v2.0.4.0 (Phase 5)

@@ -1,9 +1,13 @@
 # B-1: Skills as Self-Improving Procedural Memory
 
-> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** The complete
+> **Current status (2026-07-29): IMPLEMENTED + REPAIRED.** The complete
 > propose, review, approve/reject, version-history, metric-reset, API, and web UI
-> flow is in tree. B-2 demotion/pruning and B-3 cross-agent sharing remain
-> separate deferred work.
+> flow is in tree. Goals item #41 (2026-07-29, see `docs/ops/SIS_FIX_PROPOSAL.md`)
+> repaired four runtime breaks in this machinery: terminal `StateChanged` was
+> never broadcast, `trigger_payload` was never seeded into mission state, a
+> permanent-lease leak, and the missing mission write path for skill docs (why
+> zero `source: "extracted"` skills existed). B-2 demotion/pruning and B-3
+> cross-agent sharing remain separate deferred work.
 
 Implement the Hermes-style "skill patching" loop: when a thread fails and the
 failure traces back to an active skill, diagnose it, patch the skill's
