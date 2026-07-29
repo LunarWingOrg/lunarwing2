@@ -24,8 +24,9 @@ with a paced adapter outbox, completes the WeeChat buffer-restore handoff that
 v2.0.2.0 left broken, adds bounded context and retry logic to external workers,
 makes the web gateway UI keep streaming answers across thread switches and
 reconnects while rendering faster, introduces Study Notes as a read/write skill
-with an MCP integration, and refreshes architecture docs, bug docs, and the
-docs README index against current source.
+with an MCP integration, repairs the self-improving skills pipeline so learning
+missions actually fire and persist extracted skills, and refreshes architecture
+docs, bug docs, and the docs README index against current source.
 
 The release, tag, and this document use `2.0.3.0`.
 
@@ -70,6 +71,10 @@ for historical notes.
   hardened worker cancellation, terminal state, and timeout handling.
 - Added Study Notes as a read/write skill with an approved write path and a
   read-only MCP integration.
+- Repaired the self-improving skills pipeline: terminal thread events now
+  broadcast (persist-first), missions receive their `trigger_payload`,
+  capability leases are revoked and rolled back instead of leaking, and
+  missions can persist extracted Skill documents through a real write path.
 - Added Cavepony Tony Soprano speech mode.
 - Refreshed architecture docs, bug docs, and the docs README index against
   current source; added Arch Linux and Gentoo Python package lists.
@@ -214,6 +219,41 @@ and the new start helper are installed.
   read notes without write access.
 - Fixed Study Notes state handling and tunnel resets.
 
+### Self-Improving Skills Repair
+
+The self-improvement machinery was architecturally sound but inert in
+production: four concrete breaks kept learning missions from ever producing a
+persisted skill. v2.0.3.0 fixes all four. `SKILL_SELF_IMPROVEMENT` defaults and
+behavior are unchanged — this work makes the machinery functional when enabled;
+it does not enable it.
+
+- Broadcast the terminal `StateChanged` thread event, but only after the thread
+  is persisted as `Done`, so event-driven learning missions now fire on their
+  triggers instead of only on manual/API calls. Infrastructure failures after
+  execution now transition the thread to `Failed` and emit a terminal event
+  rather than disappearing silently.
+- Seed `state["trigger_payload"]` into mission thread state across the spawn
+  chain. Mission prompts always told the agent to read it; it did not exist.
+  Gate-paused missions retain the payload for resume.
+- Fixed the capability-lease leak: the finisher revokes a terminal thread's
+  leases, spawn/resume persistence failures roll back newly granted leases,
+  concurrent resume attempts start one execution, and a startup sweep revokes
+  still-valid historical leases owned by terminal, missing, or unreferencing
+  threads while retaining the files as audit history.
+- Added the mission-gated `__save_memory_doc__` host function so missions can
+  persist Skill, fix-pattern, and orchestrator documents into the workspace
+  memory-doc store — previously `memory_write` silently dropped the extra
+  arguments and extracted skills survived only as prose. Arguments resolve by
+  keyword then position, and `shared=True` writes to the shared space.
+- Scoped the conversation-insights cadence per user (`project_id:user_id`) so
+  one user's completed threads no longer consume another user's cadence in a
+  shared project.
+- Raised the mission meta-prompt truncation budget from 1000 to 4000 bytes.
+- Note: the `profile-builder` mission referenced in earlier field notes never
+  existed in code; `conversation-insights` is the profile-analog mission.
+- Full root-cause analysis and graft provenance:
+  `docs/ops/SIS_FIX_PROPOSAL.md`.
+
 ### Cavepony
 
 - Added Tony Soprano speech mode to the Cavepony skill.
@@ -268,6 +308,8 @@ and the new start helper are installed.
 - Added `docs/proposals/REFLEX_COMPILER_V2_UPGRADE_PLAN.md`.
 - Added `docs/proposals/MULTIAGENTTEAMORCHESTRATION_INTEGRATION_PLAN_v2.0.4.0.md`.
 - Added `docs/ops/CODENAME_IDEAS_v2.0.3.0.md`.
+- Added `docs/ops/SIS_FIX_PROPOSAL.md` documenting the self-improving skills
+  root causes, fixes, verification coverage, and residual limits.
 
 ### Versioning, Toolchain, and Dependencies
 
@@ -448,6 +490,10 @@ Committed tests cover:
 - external worker bounded context, retry, cancellation, terminal state, and
   timeout handling;
 - Study Notes read/write skill and MCP integration;
+- self-improving skills: trigger-payload seeding, persist-before-broadcast
+  terminal events, gate-pause payload retention, lease revoke/rollback/startup
+  sweep, per-user insights cadence, and the mission-gated
+  `__save_memory_doc__` write path;
 - web gateway stream preservation across thread switches and SSE reconnects,
   DOM-attribute-free streaming flushes, deferred log rendering, single history
   reconciliation on reconnect, and gzip static-asset compression;
@@ -519,6 +565,11 @@ Committed tests cover:
 
 - `event:` and webhook cadences now dispatch, but their runtime behavior is
   newly enabled and has not been rehearsed on a production workload.
+- Self-improvement triggers depend on the Engine V2 `ThreadManager` broadcast;
+  work performed by the v1 harness, main assistant sessions, or external
+  workers emits no such events and produces no learning triggers. End-to-end
+  live validation of the extraction loop (thread completion → `skill-extraction`
+  firing → a `source: "extracted"` Skill doc) is still owed on a real tenant.
 - Cron is wall-clock, one-minute resolution, and no-catch-up. `23h` maps to an
   hour-field cron step rather than a true elapsed 23-hour interval.
 - Mission notifications and history are best-effort rather than durable outbox
