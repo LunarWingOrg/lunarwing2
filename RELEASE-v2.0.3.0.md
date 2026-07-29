@@ -22,9 +22,10 @@ The release also replaces the proprietary Cloudflare/ngrok/tailscale tunnel
 providers with a self-hosted NetBird provider, hardens DarkIRC outbound delivery
 with a paced adapter outbox, completes the WeeChat buffer-restore handoff that
 v2.0.2.0 left broken, adds bounded context and retry logic to external workers,
-introduces Study Notes as a read/write skill with an MCP integration, and
-refreshes architecture docs, bug docs, and the docs README index against current
-source.
+makes the web gateway UI keep streaming answers across thread switches and
+reconnects while rendering faster, introduces Study Notes as a read/write skill
+with an MCP integration, and refreshes architecture docs, bug docs, and the
+docs README index against current source.
 
 The release, tag, and this document use `2.0.3.0`.
 
@@ -74,6 +75,10 @@ for historical notes.
   current source; added Arch Linux and Gentoo Python package lists.
 - Added `lunarwing doctor` MCP diagnostics, in-place MCP config updates, and
   `--strict` mode to the WASM build script.
+- Improved the web gateway UI: in-progress streaming answers now survive
+  thread switches and SSE reconnects, chat rendering and initial page load are
+  faster, and the networking settings panel matches the NetBird tunnel
+  replacement.
 
 ## Compatibility
 
@@ -223,6 +228,25 @@ and the new start helper are installed.
 - Added `lunarwing doctor` MCP diagnostics: validates configuration, reports
   transport and enabled state, and resolves stdio commands through PATH.
 
+### Web Gateway UI
+
+- Preserved in-progress streaming responses across thread switches and SSE
+  reconnects. Per-thread stream snapshots are stashed when leaving a thread
+  and restored on return, so a live answer is no longer lost by switching
+  threads or by a dropped event stream.
+- Reduced chat rendering overhead: streamed chunks no longer churn DOM
+  attributes on every flush, activity-log entries are deferred and capped
+  during bursts, and auto-scroll only engages near the bottom so reading
+  history during an active stream keeps its position.
+- Served static gateway assets with gzip compression and deferred script
+  loading, reducing initial page-load time.
+- Updated the networking settings panel for the tunnel provider replacement:
+  the provider selector now offers `none`, `netbird`, and `custom`, with new
+  fields for the NetBird custom domain and name prefix and for the custom
+  command, health URL, and URL pattern (English and Chinese labels).
+- Added the Tony Soprano option to the Cavepony mode selector in the chat
+  composer (English and Chinese labels).
+
 ### WASM Build
 
 - Added `--strict` mode to `ic/scripts/build-wasm-extensions.sh` for
@@ -294,6 +318,8 @@ and the new start helper are installed.
 - Fixed CI parity checks and standalone locks.
 - Fixed stale CI test assertions.
 - Fixed DarkIRC adapter to survive malformed and control-char IRC lines.
+- Fixed web gateway streams disappearing when switching threads or when the
+  SSE connection dropped mid-response.
 - Made worker error tests root-safe.
 - Fixed release branch CI validation.
 
@@ -422,6 +448,9 @@ Committed tests cover:
 - external worker bounded context, retry, cancellation, terminal state, and
   timeout handling;
 - Study Notes read/write skill and MCP integration;
+- web gateway stream preservation across thread switches and SSE reconnects,
+  DOM-attribute-free streaming flushes, deferred log rendering, single history
+  reconciliation on reconnect, and gzip static-asset compression;
 - stdio and authenticated HTTP MCP deactivate/reactivate, exact tool cleanup,
   owner isolation, concurrent activation, transport shutdown, and browser
   controls;
@@ -573,4 +602,4 @@ Committed tests cover:
 ### Release Limitations
 
 1. The dependency lock remains behind available compatible updates; broad dependency modernization is deferred.
-2. DarkIRC secure contact-key exchange remains manual
+2. DarkIRC secure contact-key exchange remains manual. Automatic key exchange feature still in development.
