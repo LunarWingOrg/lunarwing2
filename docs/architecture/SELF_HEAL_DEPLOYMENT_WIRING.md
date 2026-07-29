@@ -15,13 +15,14 @@ It can be opted out with `--no-health`.
 
 The watchdog installer (`install-lunarwing-watchdog.sh`) is a separate,
 manually-run host-level step focused on the **service-level watchdog** (restarts
-`lunarwing.service` if down). It also copies the self-heal scripts into
+`lunarwing.service` if down). On systemd and OpenRC, it also copies the self-heal scripts into
 `/usr/local/sbin` but does **not** schedule them — that scheduling is now handled
 by the `add-tenant` `ensure_health_pipeline()` flow.
 
 > **Scheduling ownership:** the self-heal pipeline is scheduled exclusively by
 > `add-tenant` / `ensure_health_pipeline()`. The `install-lunarwing-watchdog.sh`
-> installer copies the self-heal scripts to `/usr/local/sbin` but will never
+> installer copies the self-heal scripts to `/usr/local/sbin` on systemd and
+> OpenRC but will never
 > schedule them. On a host where the watchdog installer ran but `add-tenant`
 > hasn't, the scripts are on disk but unscheduled.
 
@@ -109,11 +110,14 @@ the final step of tenant provisioning (unless `--no-health` is passed). The full
 1. Allocate a port block (registry)
 2. Create the tenant OS user
 3. Clone the tenant repo
-4. Write env files (lunarwing / bridge / proxy / gotify)
-5. Start the per-tenant PostgreSQL container
-6. Render the per-tenant init units (`lunarwing-<name>`, `xmpp-bridge-<name>`,
+4. Write env/config files (vision / LunarWing / bridge / optional proxy and
+   DarkIRC / Gotify / external workers)
+5. Bootstrap the WeeChat relay, provision the SSH harness, and build the vision
+   sidecar image if it is missing
+6. Start the per-tenant PostgreSQL container
+7. Render the per-tenant init units (`lunarwing-<name>`, `xmpp-bridge-<name>`,
    `lunarwing-proxy-<name>`, weechat adapter, …)
-7. **Call `ensure_health_pipeline()`** — installs + schedules the host-global
+8. **Call `ensure_health_pipeline()`** — installs + schedules the host-global
    health-check → self-heal pipeline (covers all tenants automatically).
 
 `ic/scripts/setup-instance.sh` (the deprecated single-instance helper) does not
@@ -144,7 +148,7 @@ tenants requires no self-heal changes.
 
 The watchdog installer (`install-lunarwing-watchdog.sh`) remains a separate,
 manually-run step for the **service-level watchdog** (restarts `lunarwing.service`
-if down). It also copies the self-heal scripts but does not schedule them —
+if down). On systemd and OpenRC, it also copies the self-heal scripts but does not schedule them —
 that is handled by `add-tenant`. On hosts that have not run `add-tenant` (e.g.
 single-instance setups), the operator must schedule the pipeline manually per
 `ic-infrastructure-health-check/README.md`.
@@ -154,7 +158,8 @@ single-instance setups), the operator must schedule the pipeline manually per
 The following gaps were documented before `ensure_health_pipeline()` was added
 to `add-tenant`:
 
-- **G1 — self-heal installed but not scheduled.** `install-lunarwing-watchdog.sh`
+- **G1 — self-heal installed but not scheduled.** On systemd and OpenRC,
+  `install-lunarwing-watchdog.sh`
   copies `lunarwing-self-heal` and `lunarwing-health-cron` to `/usr/local/sbin`
   but enables no timer for them. **Resolved:** `add-tenant` now calls
   `ensure_health_pipeline()` which schedules the pipeline via systemd timer

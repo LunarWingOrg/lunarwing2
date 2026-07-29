@@ -88,7 +88,7 @@ termimad = "0.34"
 # Channel integrations
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "set-header", "catch-panic"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "set-header", "catch-panic", "compression-gzip"] }
 
 # ACP (Agent Client Protocol) bridge
 agent-client-protocol = "0.10"

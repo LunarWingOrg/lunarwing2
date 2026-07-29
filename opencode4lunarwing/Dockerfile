@@ -26,7 +26,8 @@ RUN set -e; \
 RUN git clone --depth 1 --branch "${OPENCODE_REF}" https://github.com/sst/opencode.git /build/opencode
 
 WORKDIR /build/opencode
-RUN bun install --frozen-lockfile || bun install
+RUN (bun install --frozen-lockfile || bun install) \
+    && bun pm cache rm
 
 WORKDIR /build/opencode/packages/sdk/js
 # The bridge imports @opencode-ai/sdk/v2 from THIS build's output. Do not hide

@@ -10,7 +10,7 @@ LunarWing is a self-hosted, privacy-focused AI agent runtime and operations plat
 
 ## LunarWing v2
 
-The v2 line introduces the new execution engine, a browser-based multi-tenant onboarding console, richer gateway interactions, and a refreshed foundation for skills, memory, workers, and tools.
+The v2 line introduces a new execution engine (Engine V2), a browser-based multi-tenant onboarding console, richer gateway interactions, a refreshed foundation for skills, memory, workers, and tools, and secure tenant migration (Kawarimi). The current release is v2.0.3.0.
 
 ## Quick links
 
@@ -46,7 +46,10 @@ Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 
 - Browser gateway, CLI, and HTTP interfaces
 - WASM channels for XMPP, WeeChat, DarkIRC, and Multica
-- Optional Gotify notifications and SSH tooling
+- XMPP file attachments via XEP-0363 HTTP File Upload
+- WeeChat buffer restoration across service restarts and clean reboots
+- Host-local stdio MCP servers with install, activate, and deactivate lifecycle controls
+- Optional Gotify notifications, SSH tooling, NetBird tunnels, and LunarVision OCR integration
 
 DarkIRC is opt-in. It is neither rendered nor built for a new tenant unless the operator enables it during tenant creation and builds its supporting service.
 
@@ -66,7 +69,7 @@ external workers manage their own iteration policy and reject this option.
 
 | Provider path | Intended use |
 | --- | --- |
-| `openai_compatible` | OpenAI-compatible endpoints, including compatible routing gateways |
+| `openai_compatible` | OpenAI-compatible endpoints, including compatible routing gateways such as Tensorzero|
 | `ollama` | Local Ollama deployments |
 
 ## Get started with the onboarding GUI
@@ -86,6 +89,8 @@ Demo mode does not create tenants or modify host services. The launcher still cr
 ### 2. Prepare the production host
 
 The supported production path assumes Python 3.10 or newer with `venv` and pip, a Linux host using systemd or OpenRC, root or sudo access, Docker or Podman, `jq`, `git`, download access on first launch, and adequate time and disk space for builds.
+
+For distro-specific prerequisites, use the [Gentoo/OpenRC package list](docs/guides/GENTOO_PACKAGE_LIST.md) or the [Arch Linux/systemd package list](docs/guides/ARCHLINUX_PACKAGE_LIST.md).
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh doctor
@@ -116,9 +121,8 @@ Full GUI reference: [Browser onboarding console](lunarwing_mt_onboard_web/README
 ### Review these defaults before provisioning
 
 - The gateway binds to `127.0.0.1` by default.
-- New tenants enable Engine V2, SSH support, health checks, build, and start.
-- DarkIRC, Gotify, external workers, and optional toolchains remain disabled until selected.
-- Leaving the XMPP fields blank does not disable XMPP: the administration script assigns `<tenant>@xmpp.localhost` and provisions the bridge.
+- New tenants enable Engine V2, SSH support, health checks, build, and start; DarkIRC, Gotify, external workers, and optional toolchains remain disabled until selected.
+- Leaving the XMPP fields blank assigns `<tenant>@xmpp.localhost` and provisions the bridge automatically.
 - Container-runtime group membership is enabled by default. Membership in the rootful Docker group is effectively root-equivalent; rootless Podman normally uses per-user storage, and a `podman` group may not exist.
 
 ### Treat the GUI as a privileged local console
@@ -175,12 +179,13 @@ Kawarimi supports PostgreSQL tenants; libSQL bundles are refused. A real export 
 
 ## Development and testing
 
-The Rust workspace lives under `ic/` and uses Rust 1.92.0.
+The Rust workspace lives under `ic/` and uses Rust 1.96.1 (edition 2024, rust-version 1.96.1).
 
 ```bash
 cd ic
 cargo fmt --all -- --check
-cargo test --locked --features "libsql integration"
+cargo check -j6
+cargo test -j6 -- --test-threads=6
 ```
 
 Additional test surfaces:
@@ -199,6 +204,8 @@ Additional test surfaces:
 | Operator guides | [docs/guides/](docs/guides/) |
 | Production operations | [docs/ops/](docs/ops/) |
 | Known bugs and status | [docs/bugs/README.md](docs/bugs/README.md) |
+| Project blog | [https://blog.lunarwing.org/](https://blog.lunarwing.org/) |
+| Canonical source (Gitlab) | [https://git.lunarwing.org/lunarwing/lunarwing2](https://git.lunarwing.org/lunarwing/lunarwing2) |
 
 ## Project and community
 

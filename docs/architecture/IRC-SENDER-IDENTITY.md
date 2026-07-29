@@ -49,10 +49,11 @@ nick:<network>:<case-folded-nick>
 ```
 
 Thus the same nick on `libera` and `oftc` cannot share a DM principal. The DM
-conversation key is `weechat:dm:v2:<principal>`. Group scope remains tied to
-the full `irc.<network>.<channel>` buffer rather than to an individual sender.
-The original nick and hostmask remain routing and audit metadata; the hostmask
-is not treated as an authenticated account.
+conversation key is `weechat:dm:v2:<principal>`. Group scope is
+`weechat:group:<network>:<target>` rather than an individual sender; the full
+`irc.<network>.<target>` buffer remains in routing metadata. The original nick
+also remains in metadata. The hostmask is used for sender allow-list checks but
+is not stored in emitted metadata or treated as an authenticated account.
 
 The adapter may supply `casemapping_ascii`, `casemapping_rfc1459`, or
 `casemapping_strict-rfc1459` in line tags. LunarWing uses that mapping when

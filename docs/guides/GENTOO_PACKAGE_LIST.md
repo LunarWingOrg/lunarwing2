@@ -92,6 +92,56 @@ sudo emerge net-irc/weechat app-misc/tmux dev-python/aiohttp
 > If WeeChat deps are missing, `start-tenant` skips those services non-fatally (the core daemon
 > does not depend on them).
 
+## 6. Python packages (ops tooling)
+
+The host-side Python tooling (multi-tenant onboard CLIs/web UI, Hermes importer, `ic_sm` secret
+scripts) needs these third-party modules. Gentoo's system Python is PEP-668 managed, so either
+emerge the `dev-python/*` atoms **or** install the pinned requirements into a venv
+(`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`) — each tool ships one.
+
+| Package | Consumers |
+|---------|-----------|
+| `dev-python/cryptography` | `ic_sm/scripts_4_db/*.py`, `lunarwing_mt_onboard/secrets_ops.py`, `hermes_kawarimi` (secrets crypto) |
+| `dev-python/psycopg` | Live tenant DB writes from the same secret tooling (imports `psycopg2`; use a slot/venv providing psycopg 2.x, or `pip install psycopg2-binary` in a venv) |
+| `dev-python/rich` | `lunarwing_mt_onboard` CLI, `hermes_kawarimi` |
+| `dev-python/questionary` | `lunarwing_mt_onboard` interactive CLI, `hermes_kawarimi` |
+| `dev-python/pyyaml` | `hermes_kawarimi` (`config.yaml` parsing), `.gitlab/scripts/validate_config.py` |
+| `dev-python/fastapi` | `lunarwing_mt_onboard_web` (MT onboarding web UI) |
+| `dev-python/uvicorn` | Serves `lunarwing_mt_onboard_web` |
+| `dev-python/websockets` | `lunarwing_mt_onboard_web` (WS endpoints), `tests/mock_orchestrator` |
+| `dev-python/pydantic` | `lunarwing_mt_onboard_web` models |
+| `dev-python/httpx` | `lunarwing_mt_onboard_web` TestClient, `ic/tests/e2e` |
+| `dev-python/aiohttp` | WeeChat WS adapter (see §5), `ic/tests/e2e` mock LLM |
+
+```bash
+sudo emerge \
+  dev-python/cryptography dev-python/psycopg \
+  dev-python/rich dev-python/questionary dev-python/pyyaml \
+  dev-python/fastapi dev-python/uvicorn dev-python/websockets \
+  dev-python/pydantic dev-python/httpx dev-python/aiohttp
+```
+
+Notes:
+
+- `lunarwing_mt_onboard.secrets_ops.install_dependencies()` can `pip install cryptography
+  psycopg2-binary` on demand when they are missing — venv installs are fine for these.
+- The TensorZero proxy scripts (`tensorzero-proxy-configurations/*.py`) and the WeeChat relay's
+  core path are stdlib-only beyond `aiohttp`; no extra modules needed.
+
+### Test/CI-only Python packages
+
+Only needed to run the repo's Python test harnesses, not for a live deployment — a venv with the
+shipped requirements files is the recommended route:
+
+| Package | Consumers |
+|---------|-----------|
+| `dev-python/pytest` (+ `pytest-asyncio`, `pytest-timeout` plugins) | `tests/runner.py`, `ic/tests/e2e` |
+| `dev-python/requests` | `tests/runner.py` |
+| `dev-python/websocket-client` | `tests/runner.py` (imports `websocket`) |
+| `dev-python/tenacity` | `tests/runner.py` |
+| `pytest-playwright` + `playwright` (pip only) | `ic/tests/e2e` browser scenarios |
+| `anthropic` (pip only, optional) | `ic/tests/e2e` vision scenarios |
+
 ---
 
 ## One-shot install (Podman + fcron + WeeChat)
@@ -103,7 +153,11 @@ sudo emerge \
   app-containers/podman \
   sys-process/fcron \
   sys-devel/clang \
-  net-irc/weechat app-misc/tmux dev-python/aiohttp
+  net-irc/weechat app-misc/tmux \
+  dev-python/aiohttp dev-python/cryptography dev-python/psycopg \
+  dev-python/rich dev-python/questionary dev-python/pyyaml \
+  dev-python/fastapi dev-python/uvicorn dev-python/websockets \
+  dev-python/pydantic dev-python/httpx
 echo 'unqualified-search-registries = ["docker.io"]' \
   | sudo tee /etc/containers/registries.conf.d/zz-lunarwing-docker-io.conf
 ```
@@ -138,6 +192,7 @@ and a running network. These are assumed present and not listed above.
 
 ## Cross-reference
 
+- Arch Linux equivalent: [`ARCHLINUX_PACKAGE_LIST.md`](ARCHLINUX_PACKAGE_LIST.md)
 - Setup walkthrough: [`../ops/MT-GENTOO-SETUP-AND-CHANGES-MADE.md`](../ops/MT-GENTOO-SETUP-AND-CHANGES-MADE.md)
 - Admin quickstart: [`MT-ADMIN-QUICKSTART.md`](MT-ADMIN-QUICKSTART.md)
 - Production reference: [`../ops/MULTITENANCY-PRODUCTION.md`](../ops/MULTITENANCY-PRODUCTION.md)

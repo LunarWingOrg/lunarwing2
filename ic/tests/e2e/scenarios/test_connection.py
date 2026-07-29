@@ -1,5 +1,6 @@
 """Scenario 1: Connection, auth, and tab navigation."""
 
+import httpx
 import pytest
 from helpers import AUTH_TOKEN, SEL, TABS
 
@@ -31,6 +32,17 @@ async def test_tab_navigation(page):
     await page.locator(SEL["tab_button"].format(tab="chat")).click()
     chat_input = page.locator(SEL["chat_input"])
     await chat_input.wait_for(state="visible", timeout=5000)
+
+
+async def test_static_assets_support_gzip(lunarwing_server):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{lunarwing_server}/app.js",
+            headers={"Accept-Encoding": "gzip"},
+        )
+
+    response.raise_for_status()
+    assert response.headers.get("content-encoding") == "gzip"
 
 
 async def test_auth_rejection(page, lunarwing_server):

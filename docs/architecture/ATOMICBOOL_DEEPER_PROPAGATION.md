@@ -26,9 +26,14 @@ The `Arc<AtomicBool>` suppression flag is threaded from `agent_loop.rs::run()` d
 - Tool execution layer
 - SSE event emission from tools
 
+The soft-timeout path also starts a hard-kill task. After
+`HARD_KILL_GRACE_SECS` (30 seconds), it aborts the still-running user-input task
+and resets the thread's processing state. Deeper suppression is therefore still
+not implemented, but ghost output is bounded to that grace window.
+
 ## The Problem
 
-When a soft timeout fires, the user is notified and the suppression flag is set. The background task continues to run, including:
+When a soft timeout fires, the user is notified and the suppression flag is set. During the 30-second hard-kill grace window, the background task can continue to run, including:
 
 1. The full agentic loop (LLM calls, tool dispatch)
 2. Individual tool executions
@@ -124,7 +129,7 @@ channels.send_status_tagged(turn_token, status); // silently drops if invalidate
 
 The current implementation suppresses the user-visible response and status updates from `handle_message`/`process_user_input` paths. The remaining unsuppressed paths emit lower-priority events (tool progress, intermediate thinking) that are diagnostic rather than conversational.
 
-When you start seeing real user feedback like "I got 'timed out' but then 5 minutes later I saw 'Running search tool...'" — that's the signal to revisit.
+When you start seeing real user feedback like "I got 'timed out' but then saw 'Running search tool...' during the grace window" — that's the signal to revisit.
 
 If/when you do revisit, **Option C (Channel-Layer Token)** is probably the cleanest path forward:
 
@@ -135,7 +140,7 @@ If/when you do revisit, **Option C (Channel-Layer Token)** is probably the clean
 
 ## Open Questions
 
-1. **Ghost task side effects beyond channels:** What about DB writes, workspace file changes, sub-agent spawns? Do we want to abort those, or let them complete?
+1. **Ghost task side effects beyond channels:** What about DB writes, workspace file changes, sub-agent spawns? The task is hard-aborted after 30 seconds; should cancellation propagate earlier so in-flight effects can stop cooperatively?
 
    *Christopher's note (2026-05-19): Not enough info to answer yet.*
 
@@ -155,6 +160,7 @@ If/when you do revisit, **Option C (Channel-Layer Token)** is probably the clean
 
 - **2026-05-18:** Initial AtomicBool implementation, boundary at `process_user_input`
 - **2026-05-19:** Decision to defer deeper propagation, document for future revisit
+- **By 2026-07-28:** A 30-second hard-abort fallback bounds the ghost-task window; deeper propagation remains deferred
 - **TBD:** When user feedback or telemetry indicates ghost notifications are a real problem
 
 ---
