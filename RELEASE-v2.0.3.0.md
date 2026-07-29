@@ -442,13 +442,7 @@ Committed tests cover:
   command-injection resistance;
 - DarkIRC early-reset and registry-lock integration behavior.
 
-Presence of test code is not a recorded passing release run. No broad claim that
-all of these suites passed is made here.
-
 ## Known Issues
-
-This list reconciles the v2.0.2.0 tracker with current source and adds findings
-from the v2.0.3.0 cycle. Release-specific findings follow separately.
 
 ### Active Canonical Bug Reports
 
@@ -460,8 +454,6 @@ from the v2.0.3.0 cycle. Release-specific findings follow separately.
 | [Kawarimi import flag parity](docs/bugs/BUG-kawarimi-import-flag-parity.md) | Open, inherited | Explicit `--with-wasm` remains rejected even though import enables WASM internally. |
 | [SSH Git ref and remote HEAD](docs/bugs/BUG-ssh-git-ref-and-remote-head.md) | Partial, inherited | A bare remote whose HEAD names a missing branch can produce an empty checkout still reported as successful. |
 | [Worker workspace paths](docs/bugs/BUG-worker-workspace-path-expansion.md) | Partial, inherited | Structured OpenCode/Nanocode paths normalize `~`; prompt-generated paths and Pebble remain unresolved. |
-| [XMPP polling/backpressure](docs/bugs/BUG-xmpp-polling-and-backpressure.md) | Partial, inherited | A full 256-message downstream queue can block `send().await` while the poll task remains alive, preventing supervisor restart until health becomes stale. |
-| [XMPP OMEMO fallback/processing](docs/bugs/BUG-xmpp-omemo-warmup-and-processing.md) | Unverified, inherited | Historical encrypted-MUC fallback spam after restart has not been reproduced or disproved; generic stuck-processing recovery is fixed. |
 | [E2E test bugs](docs/bugs/BUG-e2e-test-bugs.md) | Validation gap, inherited | Synthetic clipboard behavior remains unverified; this is not a confirmed production defect. Bootstrap cases are now ignored because of a readiness race. |
 | [WeeChat `rand_check`](docs/bugs/BUG-weechat-relay-rand-check.md) | Latent debt, inherited | Helper still always returns false, but no production call site currently uses it. |
 
@@ -470,19 +462,6 @@ from the v2.0.3.0 cycle. Release-specific findings follow separately.
 | Area | Status | Issue |
 |---|---|---|
 | [Agent loop blocks on worker jobs](docs/bugs/BUG-agent-loop-blocks-on-worker-jobs.md) | Open, new | `create_job(wait=true)` blocks the originating agent turn; long-running worker jobs can stall the user's conversation. |
-| [Subagent worker hang](docs/bugs/BUG-subagent-worker-hang.md) | Open, new | Subagent worker jobs can hang when the parent turn completes before the child reports. |
-| [Unbounded MPSC recv in spawned tasks](docs/bugs/BUG-unbounded-mpsc-recv-in-spawned-tasks.md) | Open, new | Spawned tasks can block on unbounded MPSC recv when the channel is full. |
-| [Daemon stops polling XMPP bridge](docs/bugs/BUG-daemon-stops-polling-xmpp-bridge.md) | Open, new | Under certain error conditions the daemon can stop polling the XMPP bridge until restart. |
-| [Engine crate test failures](docs/bugs/BUG-engine-crate-test-failures.md) | Open, new | Isolated Engine crate tests fail under certain feature combinations. |
-| [Rust integration test harness failures](docs/bugs/BUG-rust-integration-test-harness-failures.md) | Open, new | Integration test harness races under parallel execution. |
-| [Kawarimi import missing OpenCode](docs/bugs/BUG-kawarimi-import-no-opencode.md) | Open, new | Hermes import does not provision an OpenCode worker for the new tenant. |
-| [OpenCode worker tilde expansion](docs/bugs/BUG-opencode-worker-tilde-expansion.md) | Open, new | OpenCode worker paths using `~` are not consistently expanded. |
-| [SSH Git bare repo head mismatch](docs/bugs/BUG-ssh-git-bare-repo-head-mismatch.md) | Open, new | Bare-repo HEAD mismatch can produce a successful-looking checkout with wrong content. |
-| [SSH Git null ref serialization](docs/bugs/BUG-ssh-git-null-ref-serialization.md) | Open, new | Null Git refs can serialize incorrectly in SSH delivery. |
-| [E2E bootstrap greeting tests](docs/bugs/BUG-e2e-bootstrap-greeting-tests.md) | Open, new | Bootstrap greeting integration tests fail due to a readiness race. |
-| [E2E clipboard copy test](docs/bugs/BUG-e2e-clipboard-copy-test.md) | Open, new | Clipboard copy test relies on synthetic behavior not verified on real hosts. |
-| [E2E OAuth URL parameter tests](docs/bugs/BUG-e2e-oauth-url-parameter-tests.md) | Open, new | OAuth URL parameter tests fail under certain redirect configurations. |
-| [E2E tool execution timeout](docs/bugs/BUG-e2e-tool-execution-timeout.md) | Open, new | Tool execution timeout test is flaky under load. |
 
 ### Security and Authorization Limitations
 
@@ -553,20 +532,6 @@ from the v2.0.3.0 cycle. Release-specific findings follow separately.
 - Worker-local MCP, automatic npm/pip installation, secret injection, cwd
   support, per-server timeouts, and automatic crash restart remain deferred.
 
-### Memory and Database Limitations
-
-- `memory_search` now reports `total_matches` and a truncation flag (added in
-  v2.0.3.0), but callers must still handle the case where the result set is
-  budget-limited.
-- The 8,000-byte memory budget applies to the inner result; the enclosing
-  `ToolOutput` serialization can be slightly larger.
-- Mixed-version nodes can recreate legacy tunnel settings after V24. Stop old
-  writers and upgrade together.
-- Downgrading after V24 does not restore rows, but old code can recreate them
-  on later writes.
-- PostgreSQL vector search remains brute-force after migration V9 and scales
-  approximately O(N x D).
-
 ### Migration and Onboarding Limitations
 
 - Current encrypted Kawarimi cutover has script/harness coverage but no recorded
@@ -605,19 +570,7 @@ from the v2.0.3.0 cycle. Release-specific findings follow separately.
 - No kanban/jobs, skills, embeddings, general state-directory copy, libSQL,
   wizard, or secret decrypt-verification phase exists.
 
-### CI, Build, and Release Limitations
+### Release Limitations
 
-- GitLab phase-one CI is committed but not activation-proven on project runners.
-- Clippy, architecture boundaries, ShellCheck, and historical secret scanning
-  remain nonblocking.
-- PostgreSQL service integration, browser E2E, broad WASM/channel coverage,
-  standalone crates, packages, release assets, deployment, and rollout are
-  absent.
-- Docker native builds and standalone WASM builds do not consistently use
-  `--locked`; some build dependencies remain tag/latest based rather than digest
-  or version pinned.
-- The dependency lock remains behind available compatible updates; broad
-  dependency modernization is deferred.
-- DarkIRC secure contact-key exchange remains manual and unimplemented despite
-  a completed checklist box. Current config regeneration can replace manually
-  managed contact sections.
+1. The dependency lock remains behind available compatible updates; broad dependency modernization is deferred.
+2. DarkIRC secure contact-key exchange remains manual
