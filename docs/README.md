@@ -123,7 +123,7 @@ Deployment, operations, multitenancy, and production guides.
 | [`questions.md`](ops/questions.md) | Notes on migrating the development loop from GitHub to Codeberg |
 | [`REVIEW_2.0.2.0_CHANGES.md`](ops/REVIEW_2.0.2.0_CHANGES.md) | Review of source changes and findings between v2.0.1.0 and v2.0.2.0 |
 | [`SIS.md`](ops/SIS.md) | Field notes from the 2026-07-28/29 self-improving-skills mission test runs |
-| [`SIS_FIX_PROPOSAL.md`](ops/SIS_FIX_PROPOSAL.md) | Self-improving-skills fix proposal (item 41): root causes and implemented fixes for event propagation, trigger payload, lease leak, and mission write path |
+| [`SIS_FIX_PROPOSAL.md`](ops/SIS_FIX_PROPOSAL.md) | Self-improving-skills fix proposal (item 41): four source-verified root causes and implemented fixes for terminal event propagation, trigger-payload seeding, capability-lease leak, and the missing mission write path for skill docs |
 | [`SUBMODULEGIT.md`](ops/SUBMODULEGIT.md) | Pebble submodule reference stub |
 | [`TEST-SCRIPTS-STATUS.md`](ops/TEST-SCRIPTS-STATUS.md) | Automated test-script inventory, fixes, coverage gaps, and follow-up recommendations |
 | [`v2GOALS.md`](ops/v2GOALS.md) | LunarWing v2 roadmap snapshot with feature targets through v2.0.8 |

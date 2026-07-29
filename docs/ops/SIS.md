@@ -1,3 +1,7 @@
+> **Resolved 2026-07-29:** See [`SIS_FIX_PROPOSAL.md`](SIS_FIX_PROPOSAL.md) for
+> source findings, implementation, tests, and remaining limits. A summary is at
+> the end of this file.
+
 [02:31:03] [02:30:00] ## Skill Extraction Mission — Thread #2
 
 Status: No trigger payload propagated to state. last_trigger_payload in mission.json is null. This is thread #2 of 3 allowed today (2026-07-29).
@@ -66,27 +70,37 @@ Action Items
 
 ---
 
-## Resolution — 2026-07-29 (branch `k-sis-m-2/2.0.3.0`)
+## Resolution — 2026-07-29
 
-All three action items are addressed by `docs/ops/SIS_FIX_PROPOSAL.md` (item 41),
-implemented on the same branch:
+All action items are addressed by `docs/ops/SIS_FIX_PROPOSAL.md` (item 41),
+grafted from branches `k-sis-m-2/2.0.3.0` and `g-sis-m-2/2.0.3.0`:
 
 1. **Trigger payload / blind missions — fixed, two root causes:**
    - Terminal `StateChanged` events were never broadcast on the event bus, so
      the mission event listener never fired in production. The thread finisher
-     now broadcasts `Done` (and the loop engine broadcasts `Failed`).
+     now broadcasts the terminal event, but only *after* the final thread state
+     is persisted — otherwise the listener reloads a pre-`Done` thread and
+     silently skips extraction.
    - `state["trigger_payload"]` was never injected despite all mission prompts
      referencing it. Mission fires now seed it into the thread's initial
-     orchestrator state via runtime-checkpoint metadata.
+     orchestrator state, kept in a durable `initial_persisted_state` key so it
+     survives a gate-pause resume and process restart.
 2. **Lease leak — fixed:** leases are revoked on terminal transition in the
-   finisher, and the startup sweep now evicts orphaned leases (terminal/missing
-   thread) and deletes their files so they don't reload on restart.
+   finisher and rolled back if a spawn or resume fails partway. The startup
+   sweep durably revokes leases owned by terminal or missing threads and evicts
+   them from memory; files stay on disk as audit history and reload as revoked.
 3. **profile-builder — never existed in code** (zero matches in tree and git
    history). `conversation-insights` is the profile-analog mission. Any
    `profile-builder` mission in the field was created out-of-band via
    `mission_create` and can be deleted.
-4. **Bonus fix — extraction write path:** mission prompts instructed saves via
-   a `memory_write(title=…, doc_type=…, metadata=…)` signature the v1 tool
-   doesn't have, which is why no `source: "extracted"` skills existed. Missions
-   now have a `__save_memory_doc__(title, content, doc_type, tags, metadata,
-   shared=False)` host function (mission-threads only), and the prompts use it.
+4. **The gating fix — extraction write path:** mission prompts instructed saves
+   via a `memory_write(title=…, doc_type=…, metadata=…)` signature the v1 tool
+   does not have; those arguments were silently dropped, which is why run #1
+   reported an extracted skill while the audit found zero `source: "extracted"`
+   docs — it was written as prose. Missions now have a
+   `__save_memory_doc__(title, content, doc_type, tags, metadata, shared=False)`
+   host function (mission threads only), and the prompts use it.
+
+Also fixed in passing: the conversation-insights counter was keyed by project
+only, so one user's completed threads consumed another's five-thread cadence in
+a shared project. It is now keyed `project:user`.

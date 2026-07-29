@@ -868,7 +868,7 @@ impl MissionManager {
     /// threads complete.
     ///
     /// Subscribes to the ThreadManager's event broadcast channel and watches
-    /// for `StateChanged { to: Done }`. For each completed non-Mission thread:
+    /// for terminal `StateChanged` events. For each non-Mission thread:
     ///
     /// 1. **Error diagnosis** — if trace has issues, fires `thread_completed_with_issues`
     /// 2. **Skill extraction** — if thread succeeded with many steps/actions,
@@ -894,17 +894,15 @@ impl MissionManager {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
-                        // Only react to threads transitioning to Done
-                        let is_done = matches!(
-                            event.kind,
+                        let terminal_state = match event.kind {
                             crate::types::event::EventKind::StateChanged {
-                                to: crate::types::thread::ThreadState::Done,
+                                to:
+                                    state @ (crate::types::thread::ThreadState::Done
+                                    | crate::types::thread::ThreadState::Failed),
                                 ..
-                            }
-                        );
-                        if !is_done {
-                            continue;
-                        }
+                            } => state,
+                            _ => continue,
+                        };
 
                         // Load the completed thread
                         let thread = match mgr.store.load_thread(event.thread_id).await {
@@ -994,6 +992,12 @@ impl MissionManager {
                             }
                         }
 
+                        // Failed threads feed diagnosis only. Extraction and
+                        // conversation insights require successful completion.
+                        if terminal_state != crate::types::thread::ThreadState::Done {
+                            continue;
+                        }
+
                         // ── Trigger 2: Skill extraction ──────────────────
                         let action_count = thread
                             .events
@@ -1054,7 +1058,7 @@ impl MissionManager {
 
                         // ── Trigger 3: Conversation insights ────────────
                         // Use the thread's project_id as a proxy for conversation scope.
-                        let conv_key = thread.project_id.0.to_string();
+                        let conv_key = format!("{}:{}", thread.project_id.0, thread.user_id);
                         let count = conv_thread_counts.entry(conv_key.clone()).or_insert(0);
                         *count += 1;
 
@@ -3413,7 +3417,7 @@ mod tests {
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager_with_response(
             Arc::clone(&store) as Arc<dyn Store>,
-            "Processed the webhook event.\n\nNext focus: none\nGoal achieved: no",
+            "```repl\nFINAL(\"payload:\" + state[\"trigger_payload\"][\"action\"])\n```",
         );
         let project_id = ProjectId::new();
 
@@ -3444,13 +3448,18 @@ mod tests {
             .fire_mission(id, "test-user", Some(payload.clone()))
             .await
             .unwrap();
-        assert!(thread_id.is_some());
+        let thread_id = thread_id.expect("mission should spawn a thread");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let mission = mgr.get_mission(id).await.unwrap().unwrap();
         assert_eq!(mission.last_trigger_payload, Some(payload));
         assert_eq!(mission.threads_today, 1);
+        let thread = store.load_thread(thread_id).await.unwrap().unwrap();
+        assert!(thread.messages.iter().any(|message| {
+            message.role == crate::types::message::MessageRole::Assistant
+                && message.content == "payload:opened"
+        }));
     }
 
     #[tokio::test]
@@ -4182,6 +4191,100 @@ mod tests {
             !alice_m.thread_history.is_empty(),
             "alice's mission should have recorded the spawned thread"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_events_fire_learning_missions() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager_with_response(
+            Arc::clone(&store) as Arc<dyn Store>,
+            "done",
+        ));
+        let project_id = ProjectId::new();
+        let mission_id = mgr
+            .create_mission(
+                project_id,
+                "test-user",
+                "conversation-insights-test",
+                "extract conversation insights",
+                MissionCadence::OnSystemEvent {
+                    source: "engine".into(),
+                    event_type: "conversation_insights_due".into(),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        mgr.start_event_listener("test-user".into());
+
+        for index in 0..4 {
+            let thread_id = mgr
+                .thread_manager
+                .spawn_thread(
+                    format!("source thread {index}"),
+                    ThreadType::Foreground,
+                    project_id,
+                    ThreadConfig::default(),
+                    None,
+                    "test-user",
+                )
+                .await
+                .unwrap();
+            mgr.thread_manager.join_thread(thread_id).await.unwrap();
+        }
+
+        let other_user_thread = mgr
+            .thread_manager
+            .spawn_thread(
+                "other user's source thread",
+                ThreadType::Foreground,
+                project_id,
+                ThreadConfig::default(),
+                None,
+                "other-user",
+            )
+            .await
+            .unwrap();
+        mgr.thread_manager
+            .join_thread(other_user_thread)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            mgr.get_mission(mission_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .thread_history
+                .is_empty(),
+            "another user's completion must not advance this user's cadence"
+        );
+
+        let fifth_thread = mgr
+            .thread_manager
+            .spawn_thread(
+                "source thread 4",
+                ThreadType::Foreground,
+                project_id,
+                ThreadConfig::default(),
+                None,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        mgr.thread_manager.join_thread(fifth_thread).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mission = mgr.get_mission(mission_id).await.unwrap().unwrap();
+                if mission.thread_history.len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("terminal events should fire the matching learning mission");
     }
 
     #[tokio::test]

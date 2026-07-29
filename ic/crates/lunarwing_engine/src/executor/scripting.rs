@@ -460,7 +460,7 @@ pub async fn execute_code_with_skills(
                     ),
                     // Mission-only memory-doc writer (skill extraction output).
                     "__save_memory_doc__" => {
-                        Some(handle_save_memory_doc(&call.args, thread, store).await)
+                        Some(handle_save_memory_doc(&call.args, &call.kwargs, thread, store).await)
                     }
                     "globals" | "locals" => {
                         let entries: Vec<(MontyObject, MontyObject)> = known_actions
@@ -1431,6 +1431,7 @@ async fn resolve_llm_future(
 /// (the default) so they remain attributable to the mission's user.
 async fn handle_save_memory_doc(
     args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
     thread: &Thread,
     store: Option<&Arc<dyn crate::traits::store::Store>>,
 ) -> ExtFunctionResult {
@@ -1443,9 +1444,14 @@ async fn handle_save_memory_doc(
         return ExtFunctionResult::Return(MontyObject::Bool(false));
     };
 
-    let title = args.first().map(monty_to_string).unwrap_or_default();
-    let content = args.get(1).map(monty_to_string).unwrap_or_default();
-    let doc_type_str = args.get(2).map(monty_to_string).unwrap_or_default();
+    // Every parameter accepts a keyword form: the mission prompts call this with
+    // `shared=True`, which lands in `kwargs` and is invisible to positional
+    // lookup. Silently dropping it would write prompt-overlay, orchestrator, and
+    // fix-pattern docs user-scoped, where the engine (which reads them via
+    // `list_shared_memory_docs`) can never see them.
+    let title = extract_string_arg(args, kwargs, "title", 0).unwrap_or_default();
+    let content = extract_string_arg(args, kwargs, "content", 1).unwrap_or_default();
+    let doc_type_str = extract_string_arg(args, kwargs, "doc_type", 2).unwrap_or_default();
     if title.is_empty() || content.is_empty() {
         debug!("__save_memory_doc__: title and content are required");
         return ExtFunctionResult::Return(MontyObject::Bool(false));
@@ -1466,32 +1472,26 @@ async fn handle_save_memory_doc(
         }
     };
 
-    let tags: Vec<String> = args
-        .get(3)
+    let tags: Vec<String> = extract_arg(args, kwargs, "tags", 3)
         .map(monty_to_json)
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
-    let metadata = args
-        .get(4)
+    let metadata = extract_arg(args, kwargs, "metadata", 4)
         .map(monty_to_json)
-        .filter(|v| v.is_object())
+        .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
-    let shared = args.get(5).is_some_and(|o| matches!(o, MontyObject::Bool(true)));
+    let shared = extract_arg(args, kwargs, "shared", 5)
+        .is_some_and(|o| matches!(o, MontyObject::Bool(true)));
 
     let owner = if shared {
         crate::types::shared_owner_id()
     } else {
         thread.user_id.as_str()
     };
-    let mut doc = crate::types::memory::MemoryDoc::new(
-        thread.project_id,
-        owner,
-        doc_type,
-        title,
-        content,
-    )
-    .with_source_thread(thread.id)
-    .with_tags(tags);
+    let mut doc =
+        crate::types::memory::MemoryDoc::new(thread.project_id, owner, doc_type, title, content)
+            .with_source_thread(thread.id)
+            .with_tags(tags);
     doc.metadata = metadata;
 
     let doc_id = doc.id.0.to_string();
@@ -1503,20 +1503,30 @@ async fn handle_save_memory_doc(
     ExtFunctionResult::Return(MontyObject::String(doc_id))
 }
 
+/// Resolve one argument by keyword first, then by position.
+fn extract_arg<'a>(
+    args: &'a [MontyObject],
+    kwargs: &'a [(MontyObject, MontyObject)],
+    name: &str,
+    position: usize,
+) -> Option<&'a MontyObject> {
+    for (k, v) in kwargs {
+        if let MontyObject::String(key) = k
+            && key == name
+        {
+            return Some(v);
+        }
+    }
+    args.get(position)
+}
+
 fn extract_string_arg(
     args: &[MontyObject],
     kwargs: &[(MontyObject, MontyObject)],
     name: &str,
     position: usize,
 ) -> Option<String> {
-    for (k, v) in kwargs {
-        if let MontyObject::String(key) = k
-            && key == name
-        {
-            return Some(monty_to_string(v));
-        }
-    }
-    args.get(position).map(monty_to_string)
+    extract_arg(args, kwargs, name, position).map(monty_to_string)
 }
 
 pub(crate) fn monty_to_string(obj: &MontyObject) -> String {
@@ -1886,6 +1896,73 @@ FINAL(doc_id)
             .unwrap();
         assert_eq!(shared.len(), 1, "overlay doc written as shared");
         assert_eq!(shared[0].title, "prompt:codeact_preamble");
+        assert!(
+            store
+                .list_memory_docs(thread.project_id, "test-user")
+                .await
+                .unwrap()
+                .is_empty(),
+            "shared doc must not be user-scoped"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_memory_doc_accepts_keyword_arguments() {
+        // Regression: the mission prompts call this with `shared=True` and other
+        // keywords. A positional-only handler silently dropped them, writing
+        // overlay/orchestrator/fix-pattern docs user-scoped where the engine's
+        // shared-space loaders can never see them.
+        let store = Arc::new(crate::tests::InMemoryStore::new());
+        let thread = Thread::new(
+            "patch overlay",
+            ThreadType::Mission,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let ctx = make_exec_context(&thread);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let leases = LeaseManager::new();
+        let policy = PolicyEngine::new();
+
+        let code = r#"
+doc_id = __save_memory_doc__(
+    "orchestrator:main",
+    "def orchestrate():\n    pass",
+    doc_type="note",
+    tags=["orchestrator_code"],
+    metadata={"version": 1},
+    shared=True,
+)
+FINAL(doc_id)
+"#;
+        execute_code(
+            code,
+            &thread,
+            &(Arc::new(StubLlm) as Arc<dyn crate::traits::llm::LlmBackend>),
+            &effects,
+            &leases,
+            &policy,
+            &ctx,
+            &[],
+            &serde_json::json!({}),
+            Some(&(Arc::clone(&store) as Arc<dyn crate::traits::store::Store>)),
+        )
+        .await
+        .unwrap();
+
+        let shared = store
+            .list_shared_memory_docs(thread.project_id)
+            .await
+            .unwrap();
+        assert_eq!(shared.len(), 1, "shared=True keyword must be honored");
+        assert_eq!(shared[0].title, "orchestrator:main");
+        assert_eq!(shared[0].tags, vec!["orchestrator_code".to_string()]);
+        assert_eq!(
+            shared[0].metadata.get("version"),
+            Some(&serde_json::json!(1)),
+            "metadata keyword must be honored"
+        );
         assert!(
             store
                 .list_memory_docs(thread.project_id, "test-user")
