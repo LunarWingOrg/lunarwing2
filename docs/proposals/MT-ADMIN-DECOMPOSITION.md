@@ -1,15 +1,23 @@
 # Decomposing `lunarwing-mt-admin.sh` — Proposal
 
-> **Current status (2026-07-22, rev `HEAD`): PROPOSAL — reviewed, ready for implementation.**
-> This is a design document. No code changes are made in this proposal; it
-> describes how the monolithic multi-tenant admin script could be broken into
-> at least four separately-sourced bash libraries, and what the migration
-> path looks like.
+> **Current status (2026-07-29): SUPERSEDED — do not implement as written.**
+> Goals item #24 (v2.0.3.0) reviewed the existing decomposition plans and found
+> **serious issues**; the maintainer chose a **completely different plan**. The
+> replacement split lives on branch `mtadminrefactor/meta4/v2.0.3.0` (commit
+> `b17102e`): `lunarwing-mt-admin.sh` 7748 → 910 lines plus twelve sourced
+> libraries under `ic/scripts/mt-admin-lib/` (`containers`, `detect`,
+> `env-generation`, `health-pipeline`, `owner-scope`, `ports-registry`,
+> `postgres`, `tenant-build`, `tenant-lifecycle`, `units-openrc`,
+> `units-systemd`, `worker-config`). That split is **not yet merged** into the
+> release branch — the current tree still has the monolithic ~8300-line script.
+> This document is retained as the design record of the rejected approach.
 >
-> **Review history:** Reviewed in `docs/ops/KUMOGAKURE_RECENT_REV_T.md`
-> (2026-07-21). Verdict: "solid proposal, ready for sun to greenlight
-> implementation." This revision incorporates the review feedback (see
-> §5.1 Test Surface, §10.1 Updated Recommendations, and the 3a/3b note in §4).
+> **Original status (2026-07-22): PROPOSAL — reviewed, ready for implementation**
+> (superseded as above). Reviewed in `docs/ops/KUMOGAKURE_RECENT_REV_T.md`
+> (2026-07-21). Verdict at the time: "solid proposal, ready for sun to
+> greenlight implementation." This revision incorporates the review feedback
+> (see §5.1 Test Surface, §10.1 Updated Recommendations, and the 3a/3b note
+> in §4).
 
 **Date:** 2026-07-21
 **Origin:** Item #14 of `docs/ops/AGENT_GOALS_2.0.2.0.md` — "refactor mt admin idea. write up a doc on how we can break mt admin setup monolithic megascript (8000 lines of bash rn) into AT LEAST FOUR SEPERATE PARTS. put it in docs/proposals".
