@@ -1,5 +1,15 @@
 # The Roadmap Document
 
+things to add
+
+Add
+
+### Container Registry
+
+### update opencode to new version
+
+### add kimicode harness!
+
 | Feature | Target |
 |---------|--------|
 | Lorebook support / Agent Profile enhancements / Workspace Seeding improvements / Agent Profile switching / User Profile switching (further planning required) | v2.0.4 |
