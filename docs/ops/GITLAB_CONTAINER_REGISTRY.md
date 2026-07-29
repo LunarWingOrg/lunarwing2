@@ -76,11 +76,19 @@ or compose `environment:`):
 registry_external_url 'https://registry.git.lunarwing.org'
 registry_nginx['listen_port'] = 5050
 registry_nginx['listen_https'] = false   # Traefik terminates TLS
+registry_nginx['proxy_set_headers'] = {  # same headers as the main nginx vhost
+  "X-Forwarded-Proto" => "https",
+  "X-Forwarded-Ssl" => "on"
+}
 ```
 
 Setting `registry_external_url` auto-enables the registry in gitlab-rails.
-The two `registry_nginx` lines keep the in-container registry listener on
-plain HTTP :5050, matching the Traefik service above.
+The `registry_nginx` lines keep the in-container registry listener on plain
+HTTP :5050, matching the Traefik service above. The `proxy_set_headers` block
+mirrors the main `nginx['proxy_set_headers']` — without it the registry can
+emit `http://` token/redirect URLs and `docker login`/push fails on the
+scheme mismatch. (`Host` needs nothing: Traefik's `passHostHeader` defaults
+to true.)
 
 Recreate/restart the container (`docker compose up -d`); omnibus reconfigures
 from the env config on boot.
