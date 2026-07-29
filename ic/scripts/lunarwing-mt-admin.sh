@@ -151,6 +151,11 @@ OPENCODE_CONTAINER_GID="10001"
 OPENCODE_USERNS="keep-id:uid=${OPENCODE_CONTAINER_UID},gid=${OPENCODE_CONTAINER_GID}"
 OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS}"
 
+KIMI_CONTAINER_UID="10002"
+KIMI_CONTAINER_GID="10002"
+KIMI_USERNS="keep-id:uid=${KIMI_CONTAINER_UID},gid=${KIMI_CONTAINER_GID}"
+KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS}"
+
 # ── Container config-hash tracking ────────────────────────────────────────────
 #
 # Quadlet and imperative `podman run` both create a container with config
@@ -305,6 +310,7 @@ Commands:
                                    also build the image). Off by default.
     --with-pebble                  Select the pebble worker for this tenant (as above)
     --with-opencode                Select the opencode worker for this tenant (as above)
+    --with-kimi                    Select the kimi worker for this tenant (as above)
     --nanocode-model <model>       Override the nanocode worker's LLM model
                                    (written to lunarwing.env as NANOCODE_MODEL)
     --nanocode-base-url <url>      Override the nanocode worker's TensorZero baseURL
@@ -313,6 +319,12 @@ Commands:
                                    (written to lunarwing.env as OPENCODE_MODEL)
     --opencode-base-url <url>      Override the opencode worker's TensorZero baseURL
                                    (written to lunarwing.env as OPENCODE_BASE_URL)
+    --kimi-model <model>           Override the kimi worker's LLM model
+                                   (written to lunarwing.env as KIMI_MODEL)
+    --kimi-base-url <url>          Override the kimi worker's API base URL
+                                   (written to lunarwing.env as KIMI_BASE_URL)
+    --kimi-api-key <key>           API key for the kimi worker
+                                   (written to lunarwing.env as KIMI_API_KEY)
     --llm-model <model>            Override LLM_MODEL (default:
                                    tensorzero::function_name::lunarwing)
     --gateway-host <host>          Override GATEWAY_HOST bind address (default:
@@ -323,7 +335,8 @@ Commands:
 
    add-tenants <names> [options]    Comma-separated list (e.g. "Ruffles,Miyuki")
      (same options as add-tenant apply to all, including --enable-darkirc,
-      --nanocode-model/--nanocode-base-url, --opencode-model/--opencode-base-url,
+       --nanocode-model/--nanocode-base-url, --opencode-model/--opencode-base-url,
+       --kimi-model/--kimi-base-url/--kimi-api-key,
       --llm-model, --gateway-host, --xmpp-allow-from, and --no-weechat-bootstrap)
 
   remove-tenant <name>             Stop services, deallocate ports
@@ -335,12 +348,14 @@ Commands:
     --with-nanocode                Also build the nanocode worker Docker image
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
+    --with-kimi                    Also build the kimi worker Docker image
 
   build-all                        Build each tenant sequentially
     --with-wasm                    Also build WASM extensions
     --with-nanocode                Also build the nanocode worker Docker image
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
+    --with-kimi                    Also build the kimi worker Docker image
 
   build-nanocode-worker            Build the nanocode worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
@@ -353,6 +368,11 @@ Commands:
                                    (Podman also prunes dangling images and avoids
                                    caching intermediate build layers)
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
+
+  build-kimi-worker                Build the kimi worker Docker image
+    --no-cache                     Force a full rebuild without container cache
+    --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
+    --kimi-code-version <version>  Override kimi-code package version
 
   build-vision-sidecar             Build the LunarVision OCR sidecar Docker image
 
@@ -369,13 +389,13 @@ Commands:
   stop-worker <name> <worker>     Gracefully stop one external worker
   restart-worker <name> <worker>  Restart one external worker
   kill-worker <name> <worker>     Emergency zero-grace stop; leaves worker stopped
-                                   Workers: nanocode, pebble, opencode
+                                   Workers: nanocode, pebble, opencode, kimi
   render-units <name>             Re-render a tenant's service units from the current
                                   generator (no restart; applies init-script changes)
   upgrade-tenant <name> --target <ref>
                                   In-place upgrade: backup, fetch, clean-tree gate,
                                   stop, checkout <ref> (as tenant user), rebuild
-                                  with WASM and selected OpenCode worker, re-render
+                                   with WASM and selected OpenCode/Kimi workers, re-render
                                   units, patch env, start.
                                   Long-running — run inside tmux.
     --source-repo <path>           Point the tenant's git origin at this repo first
@@ -399,6 +419,12 @@ Commands:
   configure-opencode <name>        Set opencode worker LLM overrides for a tenant
     --model <model>                TensorZero model (OPENCODE_MODEL; any string)
     --base-url <url>               TensorZero baseURL (OPENCODE_BASE_URL; full URL)
+                                   (restart the worker after: stop-tenant && start-tenant)
+
+  configure-kimi <name>            Set kimi worker LLM overrides for a tenant
+    --model <model>                Kimi model (KIMI_MODEL; any string)
+    --base-url <url>               Kimi API base URL (KIMI_BASE_URL; full URL)
+    --api-key <key>                Kimi API key (KIMI_API_KEY)
                                    (restart the worker after: stop-tenant && start-tenant)
 
   configure-study-mcp <name>       Configure lw2studymcp for LunarWing and
@@ -957,7 +983,7 @@ ports_registry_init() {
       registry_needs_repair="true"
     fi
   fi
-  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "11" || "$registry_needs_repair" == "true" ]]; then
+  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "12" || "$registry_needs_repair" == "true" ]]; then
     acquire_ports_lock
   fi
 
@@ -983,6 +1009,7 @@ ENDJSON
   fi
 
   ports_migrate
+  # ports_migrate may have bumped to v12; verify and release.
   release_ports_lock
 }
 
@@ -1187,6 +1214,7 @@ ports_migrate() {
   if [[ "$current_version" -lt 9 ]]; then ports_migrate_v9; fi
   if [[ "$current_version" -lt 10 ]]; then ports_migrate_v10; fi
   if [[ "$current_version" -lt 11 ]]; then ports_migrate_v11; fi
+  if [[ "$current_version" -lt 12 ]]; then ports_migrate_v12; fi
 }
 
 # v8 -> v9: rename extended_ports.reserved_5 -> vision_service.
@@ -1295,6 +1323,52 @@ ports_migrate_v11() {
   mv "$tmp" "$PORTS_REGISTRY"
 }
 
+# v11 -> v12: add a dedicated kimi port range (30000-39999, block_size 2)
+# with per-tenant kimi_ports {kimi_wss, kimi_health}. The existing extended
+# block (20000-29999, block_size 10) has only one free slot (reserved_9), which
+# is insufficient for two ports. Using a separate range avoids re-spacing
+# existing tenants' extended blocks (which would require re-render + restart
+# of every running tenant) and is fully non-disruptive.
+ports_migrate_v12() {
+  if ! jq -e '.tenants | to_entries[] | select(.value.kimi_ports | has("kimi_wss") | not)' "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    # No tenants need kimi_ports; just bump the version.
+    local tmp
+    tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+    jq '.version = 12
+      | .kimi_range = ((.kimi_range) // {"start": 30000, "end": 39999})
+      | .kimi_block_size = ((.kimi_block_size) // 2)' "$PORTS_REGISTRY" >"$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$PORTS_REGISTRY"
+    return 0
+  fi
+
+  say "migrating port registry -> v12 (add kimi_wss + kimi_health from dedicated range) ..."
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  jq '
+    .version = 12
+    | .kimi_range = ((.kimi_range) // {"start": 30000, "end": 39999})
+    | .kimi_block_size = ((.kimi_block_size) // 2)
+    | ( .range.start // 10000 ) as $rstart
+    | ( .kimi_range.start ) as $kstart
+    | .tenants |= with_entries(
+        .value |= (
+          if .base_port then
+            ( .base_port - $rstart + $kstart ) as $kbase
+            | .kimi_base = $kbase
+            | .kimi_ports = {
+                kimi_wss: ($kbase + 0),
+                kimi_health: ($kbase + 1)
+              }
+          else . end
+        )
+      )
+  ' "$PORTS_REGISTRY" >"$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "port registry migrated to v12 (kimi_wss + kimi_health dedicated in kimi_range 30000-39999)"
+}
+
 ports_allocate() {
   local name="$1"
   local enable_darkirc="${2:-false}"
@@ -1331,7 +1405,7 @@ ports_allocate() {
     # as darkirc/proxy: re-running `add-tenant <existing> --with-<worker>` turns a
     # worker on; omitting the flag never turns one off (disabling is manual).
     local _w
-    for _w in nanocode pebble opencode; do
+    for _w in nanocode pebble opencode kimi; do
       if [[ "$(jq -r --arg w "$_w" '.[$w] // false' <<<"$workers_json" 2>/dev/null)" == "true" ]]; then
         ports_enable_worker "$name" "$_w"
       fi
@@ -1358,19 +1432,22 @@ ports_allocate() {
   [[ "$enable_darkirc" == "true" ]] && darkirc_json="true"
   local proxy_json="false"
   [[ "$enable_proxy" == "true" ]] && proxy_json="true"
-  # Normalize the workers spec to a full {nanocode,pebble,opencode} bool map so
+  # Normalize the workers spec to a full {nanocode,pebble,opencode,kimi} bool map so
   # every tenant object has a stable, explicit shape (missing/garbage -> all off).
   local workers_norm
   workers_norm="$(jq -c '{
       nanocode: (.nanocode // false),
       pebble:   (.pebble   // false),
-      opencode: (.opencode // false)
-    }' <<<"$workers_json" 2>/dev/null || echo '{"nanocode":false,"pebble":false,"opencode":false}')"
+      opencode: (.opencode // false),
+      kimi:     (.kimi     // false)
+    }' <<<"$workers_json" 2>/dev/null || echo '{"nanocode":false,"pebble":false,"opencode":false,"kimi":false}')"
   jq --arg name "$name" --argjson base "$base" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson darkirc "$darkirc_json" --argjson proxy "$proxy_json" --argjson workers "$workers_norm" '
     ( .range.start // 10000 ) as $rstart
     | ( .extended_range.start // 20000 ) as $estart
     | ( .extended_block_size // 10 ) as $ebs
+    | ( .kimi_range.start // 30000 ) as $kstart
     | ( $base - $rstart + $estart ) as $ebase
+    | ( $base - $rstart + $kstart ) as $kbase
     | .tenants[$name] = {
         base_port: $base,
         user: $name,
@@ -1404,7 +1481,12 @@ ports_allocate() {
             opencode_health: ($ebase + 8)
           }
           + (reduce range(9; $ebs) as $i ({}; . + { ("reserved_\($i)"): ($ebase + $i) }))
-        )
+        ),
+        kimi_base: $kbase,
+        kimi_ports: {
+          kimi_wss: ($kbase + 0),
+          kimi_health: ($kbase + 1)
+        }
       }
   ' "$PORTS_REGISTRY" >"$tmp"
   chmod 0644 "$tmp"
@@ -1467,8 +1549,8 @@ ports_enable_proxy() {
 ports_enable_worker() {
   local name="$1" worker="$2"
   require_cmd jq
-  case "$worker" in
-    nanocode|pebble|opencode) ;;
+    case "$worker" in
+    nanocode|pebble|opencode|kimi) ;;
     *) die "ports_enable_worker: unknown worker '$worker'" ;;
   esac
   local current
@@ -1519,6 +1601,11 @@ ports_get() {
     return 0
   fi
   port="$(jq -r ".tenants[\"$name\"].extended_ports.$port_name // empty" "$PORTS_REGISTRY")"
+  if [[ -n "$port" ]]; then
+    printf '%s' "$port"
+    return 0
+  fi
+  port="$(jq -r ".tenants[\"$name\"].kimi_ports.$port_name // empty" "$PORTS_REGISTRY")"
   if [[ -n "$port" ]]; then
     printf '%s' "$port"
     return 0
@@ -1841,8 +1928,9 @@ build_tenant() {
   local with_nanocode="${3:-false}"
   local with_pebble="${4:-false}"
   local with_opencode="${5:-false}"
-  local with_toolchains="${6:-false}"
-  local require_wasm="${7:-false}"
+  local with_kimi="${6:-false}"
+  local with_toolchains="${7:-false}"
+  local require_wasm="${8:-false}"
   local repo
   repo="$(tenant_repo "$name")"
 
@@ -1914,6 +2002,12 @@ build_tenant() {
     say ""
     say "=== Building opencode worker image ==="
     build_opencode_worker "false" "$with_toolchains"
+  fi
+
+  if [[ "$with_kimi" == "true" ]]; then
+    say ""
+    say "=== Building kimi worker image ==="
+    build_kimi_worker "false" "$with_toolchains"
   fi
 
   # After a rebuild, the tenant will be restarted with the new binary. If the
@@ -1998,7 +2092,8 @@ build_all() {
   local with_nanocode="${2:-false}"
   local with_pebble="${3:-false}"
   local with_opencode="${4:-false}"
-  local with_toolchains="${5:-false}"
+  local with_kimi="${5:-false}"
+  local with_toolchains="${6:-false}"
   local names
   names="$(all_tenant_names)"
 
@@ -2025,10 +2120,16 @@ build_all() {
     build_opencode_worker "false" "$with_toolchains"
   fi
 
+  if [[ "$with_kimi" == "true" ]]; then
+    say ""
+    say "=== Building kimi worker image ==="
+    build_kimi_worker "false" "$with_toolchains"
+  fi
+
   while IFS= read -r name; do
     say ""
     say "=== Building tenant: $name ==="
-    build_tenant "$name" "$with_wasm" "false" "false"
+    build_tenant "$name" "$with_wasm" "false" "false" "false" "false" "$with_toolchains" "false"
   done <<< "$names"
 }
 
@@ -2134,6 +2235,47 @@ build_opencode_worker() {
   fi
 
   say "opencode worker image built: lunarwing-worker-opencode:latest [$toolchain_desc]"
+}
+
+build_kimi_worker() {
+  local no_cache="${1:-false}"
+  local with_toolchains="${2:-false}"
+  local kimi_code_version="${3:-0.30.0}"
+  local kimi_dir="${LUNARWING_ROOT}/kimicode4lunarwing"
+
+  [[ -d "$kimi_dir" ]] || die "kimi worker dir not found at $kimi_dir"
+
+  ensure_container_runtime
+
+  local toolchain_desc="slim (no toolchains)"
+  [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
+  say "building kimi worker Docker image [$toolchain_desc] (kimi-code version: ${kimi_code_version}) ..."
+
+  local -a cache_args=()
+  [[ "$no_cache" == "true" ]] && cache_args=(--no-cache)
+
+  local -a toolchain_args=()
+  [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
+
+  local -a version_args=(--build-arg KIMI_CODE_VERSION="${kimi_code_version}")
+
+  if [[ "$CONTAINER_RT" == "podman" ]]; then
+    local -a layer_args=()
+    if [[ "$no_cache" == "true" ]]; then
+      say "pruning dangling Podman images before uncached Kimi build ..."
+      if ! podman image prune -f >/dev/null; then
+        say "WARNING: failed to prune dangling Podman images; continuing build" >&2
+      fi
+      layer_args=(--layers=false)
+    fi
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" --network=host --format docker -t lunarwing-worker-kimi:latest "$kimi_dir" \
+      || die "kimi worker image build failed"
+  else
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" -t lunarwing-worker-kimi:latest "$kimi_dir" \
+      || die "kimi worker image build failed"
+  fi
+
+  say "kimi worker image built: lunarwing-worker-kimi:latest [$toolchain_desc]"
 }
 
 # ── WASM install ─────────────────────────────────────────────────────────────
@@ -2643,8 +2785,11 @@ write_tenant_lunarwing_env() {
   local xmpp_allow_from="${11:-}"
   local opencode_model="${12:-}"
   local opencode_base_url="${13:-}"
+  local kimi_model="${14:-}"
+  local kimi_base_url="${15:-}"
+  local kimi_api_key="${16:-}"
 
-  local path gateway_port http_port bridge_port pg_port proxy_port weechat_port weechat_adapter_port orchestrator_port nanocode_wss_port pebble_wss_port opencode_wss_port
+  local path gateway_port http_port bridge_port pg_port proxy_port weechat_port weechat_adapter_port orchestrator_port nanocode_wss_port pebble_wss_port opencode_wss_port kimi_wss_port
   path="$(tenant_env_dir "$name")/lunarwing.env"
   gateway_port="$(ports_get "$name" gateway)"
   http_port="$(ports_get "$name" http)"
@@ -2657,6 +2802,7 @@ write_tenant_lunarwing_env() {
   nanocode_wss_port="$(ports_get "$name" nanocode_wss)"
   pebble_wss_port="$(ports_get "$name" pebble_wss)"
   opencode_wss_port="$(ports_get "$name" opencode_wss)"
+  kimi_wss_port="$(ports_get "$name" kimi_wss)"
 
   local state_dir run_dir
   state_dir="$(tenant_state_dir "$name")"
@@ -2686,6 +2832,9 @@ write_tenant_lunarwing_env() {
   [[ -n "$nanocode_base_url" ]] || nanocode_base_url="$(_env_existing "$path" NANOCODE_BASE_URL)"
   [[ -n "$opencode_model" ]]    || opencode_model="$(_env_existing "$path" OPENCODE_MODEL)"
   [[ -n "$opencode_base_url" ]] || opencode_base_url="$(_env_existing "$path" OPENCODE_BASE_URL)"
+  [[ -n "$kimi_model" ]]        || kimi_model="$(_env_existing "$path" KIMI_MODEL)"
+  [[ -n "$kimi_base_url" ]]     || kimi_base_url="$(_env_existing "$path" KIMI_BASE_URL)"
+  [[ -n "$kimi_api_key" ]]      || kimi_api_key="$(_env_existing "$path" KIMI_API_KEY)"
   study_notes_home="$(_env_existing "$path" LW2STUDYMCP_HOME)"
   study_notes_state_home="$(_env_existing "$path" LW2STUDYMCP_STATE_HOME)"
   study_notes_allow_write="$(_env_existing "$path" LW2STUDYMCP_ALLOW_WRITE)"
@@ -2806,6 +2955,9 @@ NANOCODE_WSS_PORT=$nanocode_wss_port
 # Opencode worker (WebSocket port for agent communication)
 OPENCODE_WSS_PORT=$opencode_wss_port
 
+# Kimi worker (WebSocket port for agent communication)
+KIMI_WSS_PORT=$kimi_wss_port
+
 # Pebble worker (WebSocket port for agent communication)
 PEBBLE_WSS_PORT=$pebble_wss_port
 
@@ -2853,6 +3005,9 @@ ENVEOF
   [[ -n "$nanocode_base_url" ]] && printf 'NANOCODE_BASE_URL=%s\n' "$nanocode_base_url" >> "$path"
   [[ -n "$opencode_model" ]]    && printf '\nOPENCODE_MODEL=%s\n'    "$opencode_model"     >> "$path"
   [[ -n "$opencode_base_url" ]] && printf 'OPENCODE_BASE_URL=%s\n' "$opencode_base_url" >> "$path"
+  [[ -n "$kimi_model" ]]        && printf '\nKIMI_MODEL=%s\n'        "$kimi_model"        >> "$path"
+  [[ -n "$kimi_base_url" ]]     && printf 'KIMI_BASE_URL=%s\n'     "$kimi_base_url"     >> "$path"
+  [[ -n "$kimi_api_key" ]]      && printf 'KIMI_API_KEY=%s\n'      "$kimi_api_key"      >> "$path"
   if [[ -n "$study_notes_home" ]]; then
     printf '\n# Shared LunarWing Study Notes MCP\nLW2STUDYMCP_HOME=%s\n' \
       "$study_notes_home" >> "$path"
@@ -3546,6 +3701,17 @@ patch_tenant_env() {
     fi
   fi
 
+  local kimi_wss_port
+  kimi_wss_port="$(ports_get "$name" kimi_wss)" || true
+  if [[ -n "$kimi_wss_port" ]]; then
+    if grep -q '^KIMI_WSS_PORT=' "$env_path"; then
+      say "KIMI_WSS_PORT already set in $env_path (skipping)"
+    else
+      printf '\n# Kimi worker (WebSocket port for agent communication)\nKIMI_WSS_PORT=%s\n' "$kimi_wss_port" >>"$env_path"
+      say "added KIMI_WSS_PORT=$kimi_wss_port to $env_path"
+    fi
+  fi
+
   local weechat_adapter_port
   weechat_adapter_port="$(ports_get "$name" weechat_adapter)"
   if [[ -n "$weechat_adapter_port" ]]; then
@@ -3608,6 +3774,7 @@ patch_tenant_env() {
   ensure_external_worker_config "$name" "nanocode" "nanocode_wss"
   ensure_external_worker_config "$name" "pebble" "pebble_wss"
   ensure_external_worker_config "$name" "opencode" "opencode_wss"
+  ensure_external_worker_config "$name" "kimi" "kimi_wss"
 }
 
 # ── Owner-scope DB migration ──────────────────────────────────────────────────
@@ -4553,6 +4720,208 @@ stop_tenant_opencode() {
   fi
 }
 
+# ── Kimi Code worker container ────────────────────────────────────────────────
+
+configure_kimi() {
+  local name="$1"
+  local model="${2:-}"
+  local base_url="${3:-}"
+  local api_key="${4:-}"
+
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  [[ -n "$model" || -n "$base_url" || -n "$api_key" ]] \
+    || die "configure-kimi: pass --model <model> and/or --base-url <url> and/or --api-key <key>"
+
+  local env_path
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
+
+  local tmp
+  tmp="$(mktemp)"
+  grep -v -e '^KIMI_MODEL=' -e '^KIMI_BASE_URL=' -e '^KIMI_API_KEY=' "$env_path" >"$tmp" || true
+  [[ -n "$model" ]]    && printf 'KIMI_MODEL=%s\n'    "$model"    >>"$tmp"
+  [[ -n "$base_url" ]] && printf 'KIMI_BASE_URL=%s\n' "$base_url" >>"$tmp"
+  [[ -n "$api_key" ]]  && printf 'KIMI_API_KEY=%s\n'  "$api_key"  >>"$tmp"
+  cat "$tmp" >"$env_path"
+  rm -f "$tmp"
+  chown "$name:$name" "$env_path"
+  chmod 600 "$env_path"
+  say "kimi LLM overrides written to $env_path for tenant '$name'"
+
+  local container_name="lunarwing-kimi-$name"
+  if _ctr "$name" inspect "$container_name" &>/dev/null 2>&1; then
+    say "note: restart the kimi worker to pick up the new config:"
+    say "  sudo $0 stop-tenant $name && sudo $0 start-tenant $name"
+  fi
+}
+
+start_tenant_kimi() {
+  local name="$1"
+  ensure_container_runtime
+
+  local kimi_launch_contract=""
+  local -a kimi_userns_args=()
+  if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
+    kimi_launch_contract="$KIMI_ROOTLESS_LAUNCH_CONTRACT"
+    kimi_userns_args=(--userns "$KIMI_USERNS")
+  fi
+
+  local wss_port container_name kimi_dir
+  wss_port="$(ports_get "$name" kimi_wss)" || true
+  container_name="lunarwing-kimi-$name"
+  kimi_dir="${LUNARWING_ROOT}/kimicode4lunarwing"
+
+  if [[ -z "$wss_port" ]]; then
+    say "no kimi_wss port allocated for $name (skipping kimi worker)"
+    return 0
+  fi
+
+  if ! _ensure_tenant_image "$name" lunarwing-worker-kimi:latest; then
+    say "kimi worker image not available; run 'build-kimi-worker' first (skipping)"
+    return 0
+  fi
+  local image_user
+  image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
+    lunarwing-worker-kimi:latest 2>/dev/null || true)"
+  case "$image_user" in
+    "$KIMI_CONTAINER_UID"|"$KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID") ;;
+    *)
+      die "kimi worker image has user '${image_user:-unset}', expected $KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID; rebuild it"
+      ;;
+  esac
+
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
+    _wait_user_manager "$name"
+    local kimi_service="lunarwing-kimi-${name}.service"
+    local quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-kimi-${name}.container"
+    render_worker_quadlet "$name" kimi 8443
+    _systemctl_user "$name" daemon-reload 2>/dev/null || true
+    if _container_config_changed "$name" "lunarwing-kimi-${name}" "$quadlet_file"; then
+      _recreate_quadlet_container "$name" "$kimi_service" "lunarwing-kimi-${name}"
+    fi
+    _systemctl_user "$name" reset-failed "$kimi_service" >/dev/null 2>&1 || true
+    if _systemctl_user "$name" start "$kimi_service" >/dev/null 2>&1; then
+      _store_container_hash "$name" "lunarwing-kimi-${name}" "$quadlet_file"
+      say "kimi worker ready via quadlet ($kimi_service, WSS port $wss_port)"
+    else
+      say "WARNING: $kimi_service failed to start" >&2
+      _systemctl_user "$name" status "$kimi_service" --no-pager --full >&2 || true
+    fi
+    return 0
+  fi
+
+  if _ctr "$name" inspect "$container_name" &>/dev/null; then
+    local env_file_for_hash
+    env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
+    if _container_config_changed \
+        "$name" "$container_name" "$env_file_for_hash" "$kimi_launch_contract"; then
+      say "config changed for $container_name; force-recreating"
+      _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
+      _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
+    elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
+      say "kimi worker already running ($container_name, WSS port $wss_port)"
+      _store_container_hash \
+        "$name" "$container_name" "$env_file_for_hash" "$kimi_launch_contract"
+      _register_worker_unit "$name" kimi
+      return 0
+    else
+      say "starting existing kimi worker container $container_name"
+      _ctr "$name" start "$container_name" >/dev/null
+      _store_container_hash \
+        "$name" "$container_name" "$env_file_for_hash" "$kimi_launch_contract"
+      _register_worker_unit "$name" kimi
+      say "kimi worker ready ($container_name, WSS port $wss_port)"
+      return 0
+    fi
+  fi
+
+  if ! _ctr "$name" inspect "$container_name" &>/dev/null; then
+    say "creating kimi worker container $container_name on WSS port $wss_port"
+
+    local tenant_env_path
+    tenant_env_path="$(tenant_env_dir "$name")/lunarwing.env"
+
+    local kimi_env_path
+    kimi_env_path="$(tenant_env_dir "$name")/kimi.env"
+
+    local env_flags=()
+    if [[ -f "$tenant_env_path" ]]; then
+      local gateway_token
+      gateway_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
+      [[ -n "$gateway_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$gateway_token")
+
+      local kimi_model kimi_base_url kimi_api_key
+      kimi_model="$(_read_env_value "$tenant_env_path" KIMI_MODEL)"
+      [[ -n "$kimi_model" ]] && env_flags+=(-e "KIMI_MODEL=$kimi_model")
+      kimi_base_url="$(_read_env_value "$tenant_env_path" KIMI_BASE_URL)"
+      [[ -n "$kimi_base_url" ]] && env_flags+=(-e "KIMI_BASE_URL=$kimi_base_url")
+      kimi_api_key="$(_read_env_value "$tenant_env_path" KIMI_API_KEY)"
+      [[ -n "$kimi_api_key" ]] && env_flags+=(-e "KIMI_API_KEY=$kimi_api_key")
+    fi
+
+    if [[ -f "$kimi_env_path" ]]; then
+      env_flags+=(--env-file "$kimi_env_path")
+    fi
+
+    local workspace_dir
+    workspace_dir="$(tenant_lw_root "$name")/kimi-workspace"
+    mkdir -p "$workspace_dir"
+    chown -R "$name:$name" "$workspace_dir"
+    chmod 777 "$workspace_dir"
+
+    local -a restart_arg=()
+    [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
+    local -a health_publish=()
+    local host_health_port
+    host_health_port="$(ports_get "$name" kimi_health)" || true
+    [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
+    local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+    local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
+    _ctr "$name" run -d \
+      --name "$container_name" \
+      "${kimi_userns_args[@]}" \
+      -e LUNARWING_WORKER_ID="worker-kimi-${name}" \
+      -e WS_PORT="$wss_port" \
+      -e HEALTH_PORT="8443" \
+      -e KIMI_MODE=websocket \
+      -e WS_ROLE=server \
+      -e WS_BIND_HOST=0.0.0.0 \
+      -e WS_PATH=/ws/agent \
+      "${env_flags[@]}" \
+      "${ssh_mount[@]}" \
+      -p "127.0.0.1:${wss_port}:${wss_port}" \
+      "${health_publish[@]}" \
+      -v "$workspace_dir:/workspace:z" \
+      "${restart_arg[@]}" \
+      lunarwing-worker-kimi:latest \
+      --mode websocket >/dev/null
+    _store_container_hash \
+      "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" \
+      "$kimi_launch_contract"
+  fi
+
+  _register_worker_unit "$name" kimi
+  say "kimi worker ready ($container_name, WSS port $wss_port)"
+}
+
+stop_tenant_kimi() {
+  local name="$1"
+  ensure_container_runtime
+
+  local container_name="lunarwing-kimi-$name"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
+    _deregister_babysitter "$container_name"
+    rc-service "$container_name" stop >/dev/null 2>&1 || true
+    say "kimi worker stopped ($container_name)"
+  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
+    _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
+    say "kimi worker stopped ($container_name)"
+  fi
+}
+
 # ── Pebble worker container ──────────────────────────────────────────────────
 
 start_tenant_pebble() {
@@ -5379,8 +5748,8 @@ render_worker_quadlet() {
   worker_env_path="$env_dir/${worker}.env"
   workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
   mkdir -p "$workspace_dir"
-  if [[ "$worker" == "opencode" ]]; then
-    # Migrate files created under OpenCode's older rootless UID mapping.
+  if [[ "$worker" == "opencode" || "$worker" == "kimi" ]]; then
+    # Migrate files created under older rootless UID mappings.
     chown -R "$name:$name" "$workspace_dir"
   else
     chown "$name:$name" "$workspace_dir"
@@ -5455,6 +5824,8 @@ EOF
     fi
     if [[ "$worker" == "opencode" ]]; then
       printf 'UserNS=%s\n' "$OPENCODE_USERNS"
+    elif [[ "$worker" == "kimi" ]]; then
+      printf 'UserNS=%s\n' "$KIMI_USERNS"
     fi
     # SSH agent socket mount + env (always included — the daemon creates the
     # socket at startup; if SSH isn't configured, the socket won't exist and
@@ -5475,6 +5846,9 @@ EOF
     elif [[ "$worker" == "opencode" ]]; then
       printf 'Environment=OPENCODE_MODE=websocket\n'
       printf 'Environment=WS_ROLE=server\n'
+    elif [[ "$worker" == "kimi" ]]; then
+      printf 'Environment=KIMI_MODE=websocket\n'
+      printf 'Environment=WS_ROLE=server\n'
     fi
     [[ -n "$agent_token" ]] && printf 'Environment=AGENT_AUTH_TOKEN=%s\n' "$agent_token"
     [[ "$worker" == "nanocode" && -n "$tz_key" ]] && printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key"
@@ -5486,10 +5860,17 @@ EOF
     oc_base_url="$(_read_env_value "$tenant_env_path" OPENCODE_BASE_URL)"
     [[ "$worker" == "opencode" && -n "$oc_model" ]] && printf 'Environment=OPENCODE_MODEL=%s\n' "$oc_model"
     [[ "$worker" == "opencode" && -n "$oc_base_url" ]] && printf 'Environment=OPENCODE_BASE_URL=%s\n' "$oc_base_url"
+    local kimi_model kimi_base_url kimi_api_key
+    kimi_model="$(_read_env_value "$tenant_env_path" KIMI_MODEL)"
+    kimi_base_url="$(_read_env_value "$tenant_env_path" KIMI_BASE_URL)"
+    kimi_api_key="$(_read_env_value "$tenant_env_path" KIMI_API_KEY)"
+    [[ "$worker" == "kimi" && -n "$kimi_model" ]] && printf 'Environment=KIMI_MODEL=%s\n' "$kimi_model"
+    [[ "$worker" == "kimi" && -n "$kimi_base_url" ]] && printf 'Environment=KIMI_BASE_URL=%s\n' "$kimi_base_url"
+    [[ "$worker" == "kimi" && -n "$kimi_api_key" ]] && printf 'Environment=KIMI_API_KEY=%s\n' "$kimi_api_key"
     # Operator override file (optional). EnvironmentFile= has existed since the
     # Quadlet 4.4 debut, so it is safe at our >= 4.6 floor.
     [[ -f "$worker_env_path" ]] && printf 'EnvironmentFile=%s\n' "$worker_env_path"
-    [[ "$worker" == "nanocode" || "$worker" == "opencode" ]] && printf 'Exec=--mode websocket\n'
+    [[ "$worker" == "nanocode" || "$worker" == "opencode" || "$worker" == "kimi" ]] && printf 'Exec=--mode websocket\n'
     cat <<EOF
 HealthCmd=curl -sf http://127.0.0.1:${health_port}/health || exit 1
 HealthInterval=15s
@@ -5796,7 +6177,7 @@ stop_tenant_systemd() {
   local uid
   uid="$(id -u "$name" 2>/dev/null)" || return 0
 
-  for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service" "lunarwing-pebble-${name}.service" "lunarwing-opencode-${name}.service" "lunarwing-vision-${name}.service" "lunarwing-pg-${name}.service"; do
+  for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service" "lunarwing-pebble-${name}.service" "lunarwing-opencode-${name}.service" "lunarwing-kimi-${name}.service" "lunarwing-vision-${name}.service" "lunarwing-pg-${name}.service"; do
     if _systemctl_user "$name" is-active --quiet "$svc" 2>/dev/null; then
       _systemctl_user "$name" stop "$svc"
       say "stopped $svc"
@@ -5822,9 +6203,10 @@ uninstall_tenant_systemd() {
         "$qdir/lunarwing-nanocode-${name}.container" \
         "$qdir/lunarwing-pebble-${name}.container" \
         "$qdir/lunarwing-opencode-${name}.container" \
+        "$qdir/lunarwing-kimi-${name}.container" \
         "$qdir/lunarwing-vision-${name}.container"
   if id -u "$name" >/dev/null 2>&1; then
-    for w in nanocode pebble opencode; do
+    for w in nanocode pebble opencode kimi; do
       _ctr "$name" rm -f "lunarwing-${w}-${name}" >/dev/null 2>&1 || true
     done
     _ctr "$name" rm -f "lunarwing-vision-${name}" >/dev/null 2>&1 || true
@@ -6492,7 +6874,7 @@ start_tenant_openrc() {
   rc-service "xmpp-bridge-${name}" start
   rc-service "lunarwing-${name}" start
   # Start worker babysitters (if workers are configured)
-  for worker in nanocode pebble opencode; do
+  for worker in nanocode pebble opencode kimi; do
     rc-service "lunarwing-${worker}-${name}-sup" start 2>/dev/null || true
   done
   say "OpenRC services started for $name"
@@ -6512,7 +6894,7 @@ start_tenant_openrc() {
     fi
   done
   # Auto-enable worker babysitters
-  for worker in nanocode pebble opencode; do
+  for worker in nanocode pebble opencode kimi; do
     if rc-service "lunarwing-${worker}-${name}-sup" status >/dev/null 2>&1; then
       rc-update add "lunarwing-${worker}-${name}-sup" default >/dev/null 2>&1 || true
     fi
@@ -6535,7 +6917,7 @@ stop_tenant_openrc() {
   rc-service "lunarwing-darkirc-adapter-${name}" stop 2>/dev/null || true
   rc-service "lunarwing-darkirc-${name}" stop 2>/dev/null || true
   # Worker babysitters: stop the supervisors so they don't respawn the stopped containers.
-  for worker in nanocode pebble opencode; do
+  for worker in nanocode pebble opencode kimi; do
     rc-service "lunarwing-${worker}-${name}-sup" stop 2>/dev/null || true
   done
   rc-service "lunarwing-vision-${name}" stop 2>/dev/null || true
@@ -6547,7 +6929,7 @@ stop_tenant_openrc() {
 
 uninstall_tenant_openrc() {
   local name="$1"
-  for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-vision-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup"; do
+  for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-kimi-${name}-sup"; do
     rc-update del "$svc" default 2>/dev/null || true
     rm -f "/etc/init.d/$svc" "/etc/conf.d/$svc"
   done
@@ -6803,6 +7185,10 @@ add_tenant() {
   local with_nanocode="${19:-false}"
   local with_pebble="${20:-false}"
   local with_opencode="${21:-false}"
+  local with_kimi="${22:-false}"
+  local kimi_model="${23:-}"
+  local kimi_base_url="${24:-}"
+  local kimi_api_key="${25:-}"
 
   name="$(sanitize_name "$name")"
   [[ -n "$name" ]] || die "invalid tenant name"
@@ -6814,8 +7200,8 @@ add_tenant() {
   # unit and could mask a real outage as `skipped`), so forbid such names at the
   # source. (weechat-* also covers weechat-adapter-*.)
   case "$name" in
-    pg-*|proxy-*|nanocode-*|pebble-*|opencode-*|weechat-*)
-      die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/weechat-/weechat-adapter-); choose another name" ;;
+    pg-*|proxy-*|nanocode-*|pebble-*|opencode-*|kimi-*|weechat-*)
+      die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/kimi-/weechat-/weechat-adapter-); choose another name" ;;
   esac
 
   # Resolve after sanitize_name so a preserved/default JID keys off the real name.
@@ -6833,8 +7219,8 @@ add_tenant() {
 
   ports_registry_init
   local base_port workers_json
-  workers_json="$(printf '{"nanocode":%s,"pebble":%s,"opencode":%s}' \
-    "$with_nanocode" "$with_pebble" "$with_opencode")"
+  workers_json="$(printf '{"nanocode":%s,"pebble":%s,"opencode":%s,"kimi":%s}' \
+    "$with_nanocode" "$with_pebble" "$with_opencode" "$with_kimi")"
   base_port="$(ports_allocate "$name" "$enable_darkirc" "$enable_proxy" "$workers_json")"
   say ""
 
@@ -6848,7 +7234,7 @@ add_tenant() {
 
   say "--- Generating environment files ---"
   write_tenant_vision_env "$name" >/dev/null
-  write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensorzero_url" "$llm_api_key" "$llm_base_url" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url"
+  write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensorzero_url" "$llm_api_key" "$llm_base_url" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
   write_tenant_bridge_env "$name" "$xmpp_jid" "$xmpp_password" "$xmpp_allow_from"
   if [[ "$enable_proxy" == "true" ]]; then
     write_tenant_proxy_env "$name" "$tensorzero_url"
@@ -6861,6 +7247,7 @@ add_tenant() {
   ensure_external_worker_config "$name" "nanocode" "nanocode_wss"
   ensure_external_worker_config "$name" "pebble" "pebble_wss"
   ensure_external_worker_config "$name" "opencode" "opencode_wss"
+  ensure_external_worker_config "$name" "kimi" "kimi_wss"
 
   # WeeChat relay auto-bootstrap: write a dedicated minimal weechat.env, then
   # attempt a one-shot relay configuration. Non-fatal: a degraded WeeChat setup
@@ -6934,10 +7321,11 @@ add_tenant() {
   say "  nanocode_wss:     $(ports_get "$name" nanocode_wss)"
   say "  pebble_wss:       $(ports_get "$name" pebble_wss)"
   say "  opencode_wss:     $(ports_get "$name" opencode_wss)"
+  say "  kimi_wss:         $(ports_get "$name" kimi_wss)"
   say "  weechat_adapter:  $(ports_get "$name" weechat_adapter)"
   say "  darkirc:          $( [[ "$enable_darkirc" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-darkirc to enable)" )"
   say "  proxy:            $( [[ "$enable_proxy" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-proxy to enable)" )"
-  say "  workers:          $( _selected="$( [[ "$with_nanocode" == "true" ]] && printf 'nanocode '; [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-nanocode/--with-pebble/--with-opencode to select)" )"
+  say "  workers:          $( _selected="$( [[ "$with_nanocode" == "true" ]] && printf 'nanocode '; [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode '; [[ "$with_kimi" == "true" ]] && printf 'kimi ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-nanocode/--with-pebble/--with-opencode/--with-kimi to select)" )"
   say "  ssh:              $( [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]] && echo "enabled (key upload + activation handled by start-tenant)" || echo "disabled (pass --no-ssh)" )"
   say "  weechat relay:    $weechat_bootstrap_ok"
   say ""
@@ -7164,7 +7552,7 @@ start_tenant() {
   # its only guards are "port allocated" (always true) and "image present"
   # (host-wide). See tenant_worker_enabled / PER_TENANT_WORKER_GATING.md.
   local _w
-  for _w in nanocode pebble opencode; do
+  for _w in nanocode pebble opencode kimi; do
     if tenant_worker_enabled "$name" "$_w"; then
       "start_tenant_${_w}" "$name"
     else
@@ -7192,6 +7580,7 @@ stop_tenant() {
   stop_tenant_pebble "$name"
   stop_tenant_nanocode "$name"
   stop_tenant_opencode "$name"
+  stop_tenant_kimi "$name"
   stop_tenant_postgres "$name"
 }
 
@@ -7203,8 +7592,8 @@ restart_tenant() {
 
 require_worker_name() {
   case "${1:-}" in
-    nanocode|pebble|opencode) ;;
-    *) die "unknown worker '${1:-}'; expected nanocode, pebble, or opencode" ;;
+    nanocode|pebble|opencode|kimi) ;;
+    *) die "unknown worker '${1:-}'; expected nanocode, pebble, opencode, or kimi" ;;
   esac
 }
 
@@ -7453,7 +7842,11 @@ upgrade_tenant_locked() {
   if tenant_worker_enabled "$name" opencode; then
     with_opencode="true"
   fi
-  build_tenant "$name" "true" "false" "false" "$with_opencode" "false" "true"
+  local with_kimi="false"
+  if tenant_worker_enabled "$name" kimi; then
+    with_kimi="true"
+  fi
+  build_tenant "$name" "true" "false" "false" "$with_opencode" "$with_kimi" "false" "true"
 
   if [[ "$do_render" == "true" ]]; then
     render_tenant_units "$name"
@@ -7502,6 +7895,7 @@ status_tenant() {
   say "  nanocode_wss:     $(ports_get "$name" nanocode_wss)"
   say "  pebble_wss:       $(ports_get "$name" pebble_wss)"
   say "  opencode_wss:     $(ports_get "$name" opencode_wss)"
+  say "  kimi_wss:         $(ports_get "$name" kimi_wss)"
   say "  weechat_adapter:  $(ports_get "$name" weechat_adapter)"
   say ""
 
@@ -7540,6 +7934,15 @@ status_tenant() {
     say "OpenCode worker: not created"
   fi
 
+  local kimi_container="lunarwing-kimi-$name"
+  if _ctr "$name" inspect -f '{{.State.Running}}' "$kimi_container" 2>/dev/null | grep -q true; then
+    say "Kimi worker: running ($kimi_container, WSS port $(ports_get "$name" kimi_wss))"
+  elif _ctr "$name" inspect "$kimi_container" &>/dev/null; then
+    say "Kimi worker: stopped ($kimi_container)"
+  else
+    say "Kimi worker: not created"
+  fi
+
   ensure_init_system
   say ""
   say "Services ($INIT_SYSTEM):"
@@ -7552,7 +7955,7 @@ status_tenant() {
     # pg + workers are Quadlet units only on rootless podman; on rootful docker
     # they run as plain containers (shown above), not systemd units.
     if [[ "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
-      svcs+=("lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}")
+      svcs+=("lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}")
     fi
     local svc state
     for svc in "${svcs[@]}"; do
@@ -7567,7 +7970,8 @@ status_tenant() {
     fi
     rc_svcs+=("lunarwing-nanocode-${name}" "lunarwing-nanocode-${name}-sup" \
               "lunarwing-pebble-${name}" "lunarwing-pebble-${name}-sup" \
-              "lunarwing-opencode-${name}" "lunarwing-opencode-${name}-sup")
+              "lunarwing-opencode-${name}" "lunarwing-opencode-${name}-sup" \
+              "lunarwing-kimi-${name}" "lunarwing-kimi-${name}-sup")
     local svc state
     for svc in "${rc_svcs[@]}"; do
       state="$(rc-service "$svc" status 2>/dev/null | grep -oE 'started|stopped|crashed' || echo "unknown")"
@@ -7588,13 +7992,13 @@ list_tenants() {
     return 0
   fi
 
-  printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
-    "TENANT" "GATEWAY" "HTTP" "BRIDGE" "PG" "PROXY" "WEECHAT" "WS_ADPT" "ORCH" "NANOCODE" "PEBBLE" "OPENCODE"
-  printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
-    "------" "-------" "----" "------" "--" "-----" "-------" "-------" "----" "--------" "------" "--------"
+  printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
+    "TENANT" "GATEWAY" "HTTP" "BRIDGE" "PG" "PROXY" "WEECHAT" "WS_ADPT" "ORCH" "NANOCODE" "PEBBLE" "OPENCODE" "KIMI"
+  printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
+    "------" "-------" "----" "------" "--" "-----" "-------" "-------" "----" "--------" "------" "--------" "----"
 
   while IFS= read -r name; do
-    printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
+    printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
       "$name" \
       "$(ports_get "$name" gateway)" \
       "$(ports_get "$name" http)" \
@@ -7606,7 +8010,8 @@ list_tenants() {
       "$(ports_get "$name" orchestrator)" \
       "$(ports_get "$name" nanocode_wss)" \
       "$(ports_get "$name" pebble_wss)" \
-      "$(ports_get "$name" opencode_wss)"
+      "$(ports_get "$name" opencode_wss)" \
+      "$(ports_get "$name" kimi_wss)"
   done <<< "$names"
 }
 
@@ -7742,17 +8147,21 @@ doctor() {
   _check "pebble worker Dockerfile exists" test -f "$LUNARWING_ROOT/pebble4lunarwing/Dockerfile"
   _check "opencode worker dir exists" test -d "$LUNARWING_ROOT/opencode4lunarwing"
   _check "opencode worker Dockerfile exists" test -f "$LUNARWING_ROOT/opencode4lunarwing/Dockerfile"
+  _check "kimi worker dir exists" test -d "$LUNARWING_ROOT/kimicode4lunarwing"
+  _check "kimi worker Dockerfile exists" test -f "$LUNARWING_ROOT/kimicode4lunarwing/Dockerfile"
 
   # Check if worker images are built
   if command -v docker >/dev/null 2>&1; then
     _check "nanocode worker image exists" docker image inspect lunarwing-worker-nanocode:latest
     _check "pebble worker image exists" docker image inspect lunarwing-worker-pebble:latest
     _check "opencode worker image exists" docker image inspect lunarwing-worker-opencode:latest
+    _check "kimi worker image exists" docker image inspect lunarwing-worker-kimi:latest
     _check "vision sidecar image exists" docker image inspect "$VISION_SIDECAR_IMAGE"
   elif command -v podman >/dev/null 2>&1; then
     _check "nanocode worker image exists" podman image inspect lunarwing-worker-nanocode:latest
     _check "pebble worker image exists" podman image inspect lunarwing-worker-pebble:latest
     _check "opencode worker image exists" podman image inspect lunarwing-worker-opencode:latest
+    _check "kimi worker image exists" podman image inspect lunarwing-worker-kimi:latest
     _check "vision sidecar image exists" podman image inspect "$VISION_SIDECAR_IMAGE"
   fi
 
@@ -7781,7 +8190,7 @@ main() {
   case "$command_name" in
     add-tenant)
       require_root
-      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" with_nanocode="false" with_pebble="false" with_opencode="false"
+      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_nanocode="false" with_pebble="false" with_opencode="false" with_kimi="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -7794,6 +8203,7 @@ main() {
           --with-nanocode)   with_nanocode="true"; shift ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
+          --with-kimi)       with_kimi="true"; shift ;;
           --xmpp-password)   xmpp_password="$2"; shift 2 ;;
           --llm-api-key)     llm_api_key="$2"; shift 2 ;;
           --llm-base-url)    llm_base_url="$2"; shift 2 ;;
@@ -7804,6 +8214,9 @@ main() {
           --nanocode-base-url) nanocode_base_url="$2"; shift 2 ;;
           --opencode-model)    opencode_model="$2"; shift 2 ;;
           --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
+          --kimi-model)        kimi_model="$2"; shift 2 ;;
+          --kimi-base-url)     kimi_base_url="$2"; shift 2 ;;
+          --kimi-api-key)      kimi_api_key="$2"; shift 2 ;;
           --llm-model)         llm_model="$2"; shift 2 ;;
           --gateway-host)      gateway_host="$2"; shift 2 ;;
           --xmpp-allow-from)   xmpp_allow_from="$2"; shift 2 ;;
@@ -7818,12 +8231,12 @@ main() {
       [[ -n "$name" ]] || die "usage: add-tenant <name> [--docker-group] [--xmpp-jid <jid>]"
       # Leave empty when --xmpp-jid is absent: add_tenant preserves the tenant's
       # existing JID and only defaults to <name>@xmpp.localhost on a first write.
-      add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode"
+      add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
       ;;
 
     add-tenants)
       require_root
-      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" with_nanocode="false" with_pebble="false" with_opencode="false"
+      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_nanocode="false" with_pebble="false" with_opencode="false" with_kimi="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -7836,6 +8249,7 @@ main() {
           --with-nanocode)   with_nanocode="true"; shift ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
+          --with-kimi)       with_kimi="true"; shift ;;
           --llm-api-key)     llm_api_key="$2"; shift 2 ;;
           --llm-base-url)    llm_base_url="$2"; shift 2 ;;
           --tensorzero-url)  tz_url="$2"; shift 2 ;;
@@ -7845,6 +8259,9 @@ main() {
           --nanocode-base-url) nanocode_base_url="$2"; shift 2 ;;
           --opencode-model)    opencode_model="$2"; shift 2 ;;
           --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
+          --kimi-model)        kimi_model="$2"; shift 2 ;;
+          --kimi-base-url)     kimi_base_url="$2"; shift 2 ;;
+          --kimi-api-key)      kimi_api_key="$2"; shift 2 ;;
           --llm-model)         llm_model="$2"; shift 2 ;;
           --gateway-host)      gateway_host="$2"; shift 2 ;;
           --xmpp-allow-from)   xmpp_allow_from="$2"; shift 2 ;;
@@ -7869,7 +8286,7 @@ main() {
         # Empty --xmpp-domain -> empty JID, so add_tenant preserves an existing one.
         local sjid=""
         if [[ -n "$xmpp_domain" ]]; then sjid="${sname}@${xmpp_domain}"; fi
-        add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode"
+        add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
       done
       ;;
 
@@ -7893,7 +8310,7 @@ main() {
 
     build-tenant)
       require_root
-      local name="" with_wasm="false" require_wasm="false" with_nanocode="false" with_pebble="false" with_opencode="false" with_toolchains="false"
+      local name="" with_wasm="false" require_wasm="false" with_nanocode="false" with_pebble="false" with_opencode="false" with_kimi="false" with_toolchains="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --with-wasm)       with_wasm="true"; shift ;;
@@ -7901,6 +8318,7 @@ main() {
           --with-nanocode)   with_nanocode="true"; shift ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
+          --with-kimi)       with_kimi="true"; shift ;;
           --with-toolchains) with_toolchains="true"; shift ;;
           -*)                die "unknown flag: $1" ;;
           *)
@@ -7910,26 +8328,27 @@ main() {
             ;;
         esac
       done
-      [[ -n "$name" ]] || die "usage: build-tenant <name> [--with-wasm] [--require-wasm] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-toolchains]"
+      [[ -n "$name" ]] || die "usage: build-tenant <name> [--with-wasm] [--require-wasm] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]"
       [[ "$require_wasm" != "true" || "$with_wasm" == "true" ]] || die "--require-wasm requires --with-wasm"
-      build_tenant "$(sanitize_name "$name")" "$with_wasm" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_toolchains" "$require_wasm"
+      build_tenant "$(sanitize_name "$name")" "$with_wasm" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains" "$require_wasm"
       ;;
 
     build-all)
       require_root
-      local with_wasm="false" with_nanocode="false" with_pebble="false" with_opencode="false" with_toolchains="false"
+      local with_wasm="false" with_nanocode="false" with_pebble="false" with_opencode="false" with_kimi="false" with_toolchains="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --with-wasm)       with_wasm="true"; shift ;;
           --with-nanocode)   with_nanocode="true"; shift ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
+          --with-kimi)       with_kimi="true"; shift ;;
           --with-toolchains) with_toolchains="true"; shift ;;
           -*)                die "unknown flag: $1" ;;
           *)                 die "unexpected argument: $1" ;;
         esac
       done
-      build_all "$with_wasm" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_toolchains"
+      build_all "$with_wasm" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains"
       ;;
 
     build-darkirc)
@@ -7990,6 +8409,23 @@ main() {
       build_opencode_worker "$no_cache" "$with_toolchains"
       ;;
 
+    build-kimi-worker)
+      require_root
+      local no_cache="false"
+      local with_toolchains="false"
+      local kimi_code_version="0.30.0"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --no-cache)          no_cache="true"; shift ;;
+          --with-toolchains)   with_toolchains="true"; shift ;;
+          --kimi-code-version) kimi_code_version="$2"; shift 2 ;;
+          -*)                  die "unknown flag: $1" ;;
+          *)                   die "unexpected argument: $1" ;;
+        esac
+      done
+      build_kimi_worker "$no_cache" "$with_toolchains" "$kimi_code_version"
+      ;;
+
     build-vision-sidecar)
       require_root
       build_vision_sidecar_image
@@ -8026,7 +8462,7 @@ main() {
 
     start-worker|stop-worker|restart-worker|kill-worker)
       require_root
-      [[ $# -eq 2 ]] || die "usage: $command_name <name> <nanocode|pebble|opencode>"
+      [[ $# -eq 2 ]] || die "usage: $command_name <name> <nanocode|pebble|opencode|kimi>"
       case "$command_name" in
         start-worker) start_worker "$1" "$2" ;;
         stop-worker) stop_worker "$1" "$2" ;;
@@ -8155,6 +8591,26 @@ main() {
       done
       [[ -n "$name" ]] || die "usage: configure-opencode <name> [--model <model>] [--base-url <url>]"
       configure_opencode "$name" "$oc_model" "$oc_base_url"
+      ;;
+
+    configure-kimi)
+      require_root
+      local name="" kimi_model="" kimi_base_url="" kimi_api_key=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --model)    kimi_model="$2"; shift 2 ;;
+          --base-url) kimi_base_url="$2"; shift 2 ;;
+          --api-key)  kimi_api_key="$2"; shift 2 ;;
+          -*)         die "unknown flag: $1" ;;
+          *)
+            if [[ -z "$name" ]]; then name="$1"; shift
+            else die "unexpected argument: $1"
+            fi
+            ;;
+        esac
+      done
+      [[ -n "$name" ]] || die "usage: configure-kimi <name> [--model <model>] [--base-url <url>] [--api-key <key>]"
+      configure_kimi "$name" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
       ;;
 
     configure-study-mcp)

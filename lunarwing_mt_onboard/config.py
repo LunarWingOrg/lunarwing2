@@ -17,7 +17,15 @@ from typing import Any
 
 TENANT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
-RESERVED_PREFIXES = ("pg-", "proxy-", "nanocode-", "pebble-", "opencode-", "weechat-")
+RESERVED_PREFIXES = (
+    "pg-",
+    "proxy-",
+    "nanocode-",
+    "pebble-",
+    "opencode-",
+    "kimi-",
+    "weechat-",
+)
 
 
 class WorkerType(str, Enum):
@@ -26,6 +34,7 @@ class WorkerType(str, Enum):
     NANOCODE = "nanocode"
     PEBBLE = "pebble"
     OPENCODE = "opencode"
+    KIMI = "kimi"
 
 
 @dataclass
@@ -52,6 +61,9 @@ class TenantConfig:
     nanocode_base_url: str = ""
     opencode_model: str = ""
     opencode_base_url: str = ""
+    kimi_model: str = ""
+    kimi_base_url: str = ""
+    kimi_api_key: str = ""
     llm_api_key: str = ""
     secrets_master_key: str = ""
     no_ssh: bool = False
@@ -121,6 +133,9 @@ class TenantConfig:
             nanocode_base_url=data.get("nanocode_base_url", ""),
             opencode_model=data.get("opencode_model", ""),
             opencode_base_url=data.get("opencode_base_url", ""),
+            kimi_model=data.get("kimi_model", ""),
+            kimi_base_url=data.get("kimi_base_url", ""),
+            kimi_api_key=data.get("kimi_api_key", ""),
             llm_api_key=data.get("llm_api_key", ""),
             secrets_master_key=data.get("secrets_master_key", ""),
             no_ssh=data.get("no_ssh", False),

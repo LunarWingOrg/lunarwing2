@@ -33,6 +33,7 @@ class ImportPlan:
     with_nanocode: bool = False
     with_pebble: bool = False
     with_opencode: bool = False
+    with_kimi: bool = False
     with_toolchains: bool = False
     with_vision: bool = False
     tensorzero_url: str = ""
@@ -62,6 +63,7 @@ class ImportPlan:
             "with_nanocode": self.with_nanocode,
             "with_pebble": self.with_pebble,
             "with_opencode": self.with_opencode,
+            "with_kimi": self.with_kimi,
             "with_toolchains": self.with_toolchains,
             "with_vision": self.with_vision,
             "tensorzero_url": self.tensorzero_url,
@@ -87,6 +89,7 @@ class ImportPlan:
             with_nanocode=_bool(data.get("with_nanocode", False)),
             with_pebble=_bool(data.get("with_pebble", False)),
             with_opencode=_bool(data.get("with_opencode", False)),
+            with_kimi=_bool(data.get("with_kimi", False)),
             with_toolchains=_bool(data.get("with_toolchains", False)),
             with_vision=_bool(data.get("with_vision", False)),
             tensorzero_url=_str(data.get("tensorzero_url", "")),

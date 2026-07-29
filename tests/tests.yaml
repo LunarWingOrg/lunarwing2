@@ -51,6 +51,30 @@ workers:
           first_message: ready
           payload_has: [worker_id, version, mode]
 
+  kimi:
+    deploy: kimi_worker
+    health_port: 8447
+    ws_port: 9093
+    auth_token: test-token
+    scenarios:
+      - name: health
+        type: http
+        method: GET
+        path: /health
+        expect:
+          status_code: 200
+      - name: ready
+        type: http
+        method: GET
+        path: /ready
+        expect:
+          status_code: 200
+      - name: ws_handshake
+        type: ws_handshake
+        expect:
+          first_message: ready
+          payload_has: [worker_id, version, mode]
+
   pebble:
     deploy: pebble_worker
     health_port: 8446

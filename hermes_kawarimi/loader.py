@@ -206,6 +206,8 @@ def _worker_flags(plan: ImportPlan) -> list[str]:
         flags.append("--with-pebble")
     if plan.with_opencode:
         flags.append("--with-opencode")
+    if plan.with_kimi:
+        flags.append("--with-kimi")
     return flags
 
 

@@ -27,7 +27,7 @@
 #
 # Usage (run as root on the new host):
 #   sudo ic/scripts/import-tenant.sh <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped]
-#        [--with-nanocode] [--with-pebble] [--with-opencode] [--with-toolchains]
+#        [--with-nanocode] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]
 #        [--with-vision] [--docker-group]
 #        [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]
 # Encrypted bundles read their passphrase from KAWARIMI_PASS_FD, KAWARIMI_PASS,
@@ -43,6 +43,7 @@ WITH_DOCKER_GROUP=false
 WITH_NANOCODE=false
 WITH_PEBBLE=false
 WITH_OPENCODE=false
+WITH_KIMI=false
 WITH_TOOLCHAINS=false
 WITH_VISION=false
 OWNER_SCOPE=""
@@ -62,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --with-nanocode) WITH_NANOCODE=true; shift ;;
     --with-pebble)   WITH_PEBBLE=true; shift ;;
     --with-opencode)   WITH_OPENCODE=true; shift ;;
+    --with-kimi)       WITH_KIMI=true; shift ;;
     --with-toolchains) WITH_TOOLCHAINS=true; shift ;;
     --with-vision)     WITH_VISION=true; shift ;;
     --owner-scope)      OWNER_SCOPE="$2"; shift 2 ;;
@@ -175,7 +177,7 @@ validate_manifest() {
     [[ -z "${seen[$key]+x}" ]] || die "$kind manifest contains duplicate key '$key'"
     seen["$key"]=1
     case "$kind:$key" in
-      lunarwing:SECRETS_MASTER_KEY|lunarwing:XMPP_JID|lunarwing:XMPP_PASSWORD|lunarwing:XMPP_DM_POLICY|lunarwing:XMPP_ALLOW_FROM|lunarwing:XMPP_ALLOW_ROOMS|lunarwing:XMPP_ENCRYPTED_ROOMS|lunarwing:XMPP_ALLOW_PLAINTEXT_FALLBACK|lunarwing:XMPP_OMEMO_DEVICE_ID|lunarwing:LLM_API_KEY|lunarwing:LLM_MODEL|lunarwing:LLM_BASE_URL|lunarwing:NANOCODE_MODEL|lunarwing:NANOCODE_BASE_URL|lunarwing:OPENCODE_MODEL|lunarwing:OPENCODE_BASE_URL|lunarwing:GOTIFY_URL|lunarwing:GATEWAY_HOST|lunarwing:HTTP_HOST) ;;
+      lunarwing:SECRETS_MASTER_KEY|lunarwing:XMPP_JID|lunarwing:XMPP_PASSWORD|lunarwing:XMPP_DM_POLICY|lunarwing:XMPP_ALLOW_FROM|lunarwing:XMPP_ALLOW_ROOMS|lunarwing:XMPP_ENCRYPTED_ROOMS|lunarwing:XMPP_ALLOW_PLAINTEXT_FALLBACK|lunarwing:XMPP_OMEMO_DEVICE_ID|lunarwing:LLM_API_KEY|lunarwing:LLM_MODEL|lunarwing:LLM_BASE_URL|lunarwing:NANOCODE_MODEL|lunarwing:NANOCODE_BASE_URL|lunarwing:OPENCODE_MODEL|lunarwing:OPENCODE_BASE_URL|lunarwing:KIMI_MODEL|lunarwing:KIMI_BASE_URL|lunarwing:KIMI_API_KEY|lunarwing:GOTIFY_URL|lunarwing:GATEWAY_HOST|lunarwing:HTTP_HOST) ;;
       bridge:XMPP_JID|bridge:XMPP_PASSWORD|bridge:XMPP_DM_POLICY|bridge:XMPP_ALLOW_FROM_JSON|bridge:XMPP_ALLOW_ROOMS_JSON|bridge:XMPP_ENCRYPTED_ROOMS_JSON|bridge:XMPP_DEVICE_ID|bridge:XMPP_ALLOW_PLAINTEXT_FALLBACK) ;;
       vision:VL_URL|vision:VL_MODEL|vision:LUNARWING_AUTH_TOKEN) ;;
       *) die "$kind manifest contains unsupported key '$key'" ;;
@@ -356,7 +358,7 @@ reconcile_owner_scope() {
   note "owner-scope continuity verified for '$TENANT'"
 }
 
-[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-toolchains] [--with-vision] [--docker-group] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
+[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] [--with-vision] [--docker-group] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
 [[ -f "$BUNDLE" ]] || die "bundle not found: $BUNDLE"
 [[ "$MAX_BUNDLE_BYTES" =~ ^[1-9][0-9]*$ && "$MAX_STATE_BYTES" =~ ^[1-9][0-9]*$ && "$MAX_STATE_ENTRIES" =~ ^[1-9][0-9]*$ ]] \
   || die "Kawarimi archive limits must be positive integers"
@@ -461,6 +463,9 @@ NANOCODE_MODEL="$(manifest_value NANOCODE_MODEL)"
 NANOCODE_BASE_URL="$(manifest_value NANOCODE_BASE_URL)"
 OPENCODE_MODEL="$(manifest_value OPENCODE_MODEL)"
 OPENCODE_BASE_URL="$(manifest_value OPENCODE_BASE_URL)"
+KIMI_MODEL="$(manifest_value KIMI_MODEL)"
+KIMI_BASE_URL="$(manifest_value KIMI_BASE_URL)"
+KIMI_API_KEY="$(manifest_value KIMI_API_KEY)"
 GOTIFY_URL="$(manifest_value GOTIFY_URL)"
 
 confirm "Stage tenant '$TENANT' on THIS host from the bundle?" || die "aborted by user"
@@ -478,6 +483,9 @@ $WITH_DOCKER_GROUP && add_args+=(--docker-group)
 [[ -n "$NANOCODE_BASE_URL" ]] && add_args+=(--nanocode-base-url "$NANOCODE_BASE_URL")
 [[ -n "$OPENCODE_MODEL" ]] && add_args+=(--opencode-model "$OPENCODE_MODEL")
 [[ -n "$OPENCODE_BASE_URL" ]] && add_args+=(--opencode-base-url "$OPENCODE_BASE_URL")
+[[ -n "$KIMI_MODEL" ]] && add_args+=(--kimi-model "$KIMI_MODEL")
+[[ -n "$KIMI_BASE_URL" ]] && add_args+=(--kimi-base-url "$KIMI_BASE_URL")
+[[ -n "$KIMI_API_KEY" ]] && add_args+=(--kimi-api-key "$KIMI_API_KEY")
 [[ -n "$GOTIFY_URL" ]] && add_args+=(--gotify-url "$GOTIFY_URL")
 # Persist the operator's worker selection at add-tenant (not just build-tenant):
 # start-tenant now gates on the per-tenant registry flag, so an imported tenant
@@ -487,6 +495,7 @@ $WITH_DOCKER_GROUP && add_args+=(--docker-group)
 $WITH_NANOCODE && add_args+=(--with-nanocode)
 $WITH_PEBBLE  && add_args+=(--with-pebble)
 $WITH_OPENCODE && add_args+=(--with-opencode)
+$WITH_KIMI && add_args+=(--with-kimi)
 run "$MT" "${add_args[@]}"
 
 HOME_T="$(getent passwd "$TENANT" | cut -d: -f6 2>/dev/null || echo "/home/$TENANT")"
@@ -501,6 +510,7 @@ build_args=(build-tenant "$TENANT" --with-wasm)
 $WITH_NANOCODE && build_args+=(--with-nanocode)
 $WITH_PEBBLE  && build_args+=(--with-pebble)
 $WITH_OPENCODE && build_args+=(--with-opencode)
+$WITH_KIMI && build_args+=(--with-kimi)
 $WITH_TOOLCHAINS && build_args+=(--with-toolchains)
 run "$MT" "${build_args[@]}"
 $WITH_VISION && run "$MT" build-vision-sidecar

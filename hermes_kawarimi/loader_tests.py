@@ -29,6 +29,10 @@ class WorkerFlagsTest(unittest.TestCase):
         plan = ImportPlan(with_opencode=True)
         self.assertIn("--with-opencode", _worker_flags(plan))
 
+    def test_kimi_flag(self) -> None:
+        plan = ImportPlan(with_kimi=True)
+        self.assertIn("--with-kimi", _worker_flags(plan))
+
 
 class BuildFlagsTest(unittest.TestCase):
     def test_empty_plan_yields_no_flags(self) -> None:

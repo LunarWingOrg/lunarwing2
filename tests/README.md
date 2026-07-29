@@ -8,6 +8,7 @@ Matrix test suite for LunarWing worker types:
 |--------|--------|----------------|-------------|
 | **Nanocode** | `lunarcode4lunarwing/` | `nanocode_worker` | NanoGPT community Nanocode worker container |
 | **Opencode** | `opencode4lunarwing/` | `opencode_worker` | Opencode (sst/opencode) coding-agent worker |
+| **Kimi Code** | `kimicode4lunarwing/` | `kimi_worker` | MoonshotAI Kimi Code coding-agent worker |
 | **Pebble** | `pebble4lunarwing/` | `pebble_worker` | Pebble Rust-based coding-agent worker container |
 | **Built-in** | `ic/src/worker/` | `builtin_worker` | Native worker inside the LunarWing daemon |
 | **Sandbox** | `ic/src/sandbox/` | `sandbox_worker` | Docker-isolated execution sandbox |
@@ -132,6 +133,7 @@ Scenarios with `chaos: true` only run in `--mode full`. These test error paths l
 | `ws_hub` | `python:3.12-slim` | 9000 | default | Mock WebSocket hub |
 | `nanocode_worker` | Built from `lunarcode4lunarwing/` | 8444, 9090 | default | Nanocode worker under test |
 | `opencode_worker` | Built from `opencode4lunarwing/` | 8445, 9091 | default | Opencode worker under test |
+| `kimi_worker` | Built from `kimicode4lunarwing/` | 8447, 9093 | default | Kimi Code worker under test |
 | `pebble_worker` | Built from `pebble4lunarwing/` | 8446, 9092 | default | Pebble worker under test |
 | `builtin_worker` | `lunarwing:latest` | -- | `full` | Built-in worker (requires binary) |
 | `sandbox_worker` | `lunarwing:latest` | -- | `full` | Sandbox worker (requires binary + Docker socket) |
