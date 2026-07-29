@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { buildTaskPrompt, type TaskRequest } from "./lunarwing_runtime.ts"
+import { buildTaskPrompt, type TaskRequest } from "./lunarwing_runtime.js"
 
 test("buildTaskPrompt: no history returns bare prompt", () => {
   const request: TaskRequest = { task_id: "t1", prompt: "do the thing" }

@@ -112,7 +112,7 @@ sudo() {
   return 0
 }
 
-if output="$(build_tenant fixture true false false false false true 2>&1)"; then
+if output="$(build_tenant fixture true false false false false false true 2>&1)"; then
   fail 'strict tenant build should fail after WASM build error'
 else
   pass 'strict tenant build fails after WASM build error'
@@ -127,7 +127,7 @@ if build_tenant fixture true >/dev/null 2>&1 && [[ ! -e "$fixture/installed" ]];
 else
   fail 'non-strict tenant build installed stale WASM after build error'
 fi
-if output="$(build_tenant fixture false false false false false true 2>&1)"; then
+if output="$(build_tenant fixture false false false false false false true 2>&1)"; then
   fail 'strict WASM mode should require --with-wasm'
 elif [[ "$output" == *'--require-wasm requires --with-wasm'* ]]; then
   pass 'strict WASM mode rejects missing --with-wasm'
@@ -135,7 +135,7 @@ else
   fail 'strict WASM mode returned the wrong validation error'
 fi
 # shellcheck disable=SC2016
-if grep -Fq 'build_tenant "$name" "true" "false" "false" "$with_opencode" "false" "true"' "$ADMIN_SCRIPT"; then
+if grep -Fq 'build_tenant "$name" "true" "false" "false" "$with_opencode" "$with_kimi" "false" "true"' "$ADMIN_SCRIPT"; then
   pass 'upgrade-tenant requires successful WASM build'
 else
   fail 'upgrade-tenant does not enable strict WASM build mode'

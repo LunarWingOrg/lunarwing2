@@ -6,8 +6,8 @@
   "description": "LunarWing WebSocket bridge for Kimi Code CLI",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "node --test kimi_result_test.mjs kimi_task_executor_test.mjs task_prompt_test.mjs path_expand_test.mjs",
-    "smoke": "node smoke_test.mjs"
+    "test": "node --test kimi_result_test.js kimi_task_executor_test.js task_prompt_test.js path_expand_test.js",
+    "smoke": "node smoke_test.js"
   },
   "dependencies": {
     "ws": "8.18.3"

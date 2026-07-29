@@ -17,7 +17,7 @@ RUN set -e; \
     (apt-get update 2>/dev/null || { \
       echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
       sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-      apt-get update 2>/dev/null || apt-get update -o Acquire::AllowInsecureRepositories=true; \
+      apt-get update; \
     }) && \
     apt-get install -y --no-install-recommends \
       git python3 make g++ ca-certificates && \
@@ -71,7 +71,7 @@ RUN set -e; \
     (apt-get update 2>/dev/null || { \
       echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
       sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-      apt-get update 2>/dev/null || apt-get update -o Acquire::AllowInsecureRepositories=true; \
+      apt-get update; \
     }) && \
     apt-get install -y --no-install-recommends \
       tini \
@@ -94,7 +94,7 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       (apt-get update 2>/dev/null || { \
         echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
         sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-        apt-get update 2>/dev/null || apt-get update -o Acquire::AllowInsecureRepositories=true; \
+        apt-get update; \
       }) && \
       apt-get install -y --no-install-recommends \
         python3-dev \

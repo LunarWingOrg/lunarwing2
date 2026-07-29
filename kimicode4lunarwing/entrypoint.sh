@@ -68,12 +68,12 @@ done
 
 # ── config setup ──────────────────────────────────────────────────────────────
 # Materialize the Kimi Code config (config.toml) from the baked default unless
-# a per-tenant KIMI_MODEL/KIMI_BASE_URL override is present. Kimi Code CLI reads
-# its config from $KIMI_CODE_HOME/config.toml.
+# a per-tenant KIMI_MODEL/KIMI_BASE_URL/KIMI_API_KEY override is present. Kimi
+# Code CLI reads its config from $KIMI_CODE_HOME/config.toml.
 mkdir -p "$KIMI_CODE_HOME"
 
 if [ -f /app/config/config.toml ]; then
-  if [ -n "${KIMI_MODEL:-}" ] || [ -n "${KIMI_BASE_URL:-}" ]; then
+  if [ -n "${KIMI_MODEL:-}" ] || [ -n "${KIMI_BASE_URL:-}" ] || [ -n "${KIMI_API_KEY:-}" ]; then
     cp /app/config/config.toml "$KIMI_CODE_HOME/config.toml"
     if [ -n "${KIMI_MODEL:-}" ]; then
       # Override default_model in the config.toml.
@@ -106,7 +106,21 @@ with open(path, "w") as f:
     f.write(text)
 PY
     fi
-    log "Config generated with overrides (model=${KIMI_MODEL:-<default>}, base_url=${KIMI_BASE_URL:-<default>})"
+    if [ -n "${KIMI_API_KEY:-}" ]; then
+      # Inject the API key (baked default ships api_key = "").
+      python3 - "$KIMI_CODE_HOME/config.toml" <<'PY'
+import os, re, sys
+path = sys.argv[1]
+with open(path, "r") as f:
+    text = f.read()
+key = os.environ.get("KIMI_API_KEY", "").strip()
+if key:
+    text = re.sub(r'api_key\s*=\s*"[^"]*"', f'api_key = "{key}"', text, count=1)
+with open(path, "w") as f:
+    f.write(text)
+PY
+    fi
+    log "Config generated with overrides (model=${KIMI_MODEL:-<default>}, base_url=${KIMI_BASE_URL:-<default>}, api_key=${KIMI_API_KEY:+set})"
   else
     cp /app/config/config.toml "$KIMI_CODE_HOME/config.toml"
     log "Config copied: /app/config/config.toml -> $KIMI_CODE_HOME/config.toml"
@@ -149,7 +163,6 @@ case "$MODE" in
     export WS_STATE_FILE
     export WORKSPACE_ROOT
     export KIMI_MODE
-    export KIMI_VERSION
 
     node /app/scripts/lunarwing_bridge.js &
     BRIDGE_PID=$!

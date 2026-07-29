@@ -4,10 +4,10 @@ import { spawn } from "node:child_process"
 import { mkdtempSync, writeFileSync, chmodSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { executeTask } from "./kimi_task_executor.ts"
-import type { TaskRequest, TaskResult } from "./lunarwing_runtime.ts"
+import { executeTask } from "./kimi_task_executor.js"
+import type { TaskRequest, TaskResult } from "./lunarwing_runtime.js"
 
-function makeMockKimi(behavior: "success" | "empty" | "error"): string {
+function makeMockKimi(behavior: "success" | "empty" | "error" | "env"): string {
   const dir = mkdtempSync(join(tmpdir(), "kimi-mock-"))
   const binPath = join(dir, "mock-kimi")
   let script: string
@@ -33,6 +33,17 @@ process.exit(0)
       script = `#!/usr/bin/env node
 process.stderr.write("kimi failed to start\\n")
 process.exit(1)
+`
+      break
+    case "env":
+      script = `#!/usr/bin/env node
+const messages = [
+  { role: "assistant", content: "env=" + (process.env.MOCK_LEAK_CHECK || "<unset>") },
+]
+for (const m of messages) {
+  process.stdout.write(JSON.stringify(m) + "\\n")
+}
+process.exit(0)
 `
       break
   }
@@ -119,6 +130,23 @@ test("executeTask: missing task_id or prompt — returns immediate error", async
   // empty fields — it should still spawn and handle gracefully. The mock
   // produces valid output, so the task should succeed with the mock's text.
   assert.ok(result, "result was not emitted")
+})
+
+test("executeTask: context.environment reaches child env without polluting process.env", async () => {
+  const bin = makeMockKimi("env")
+  const request: TaskRequest = {
+    task_id: "env-test",
+    prompt: "check env",
+    timeout_ms: 10_000,
+    context: { environment: { MOCK_LEAK_CHECK: "present" } },
+  }
+  const { result } = await runExecutor(request, bin)
+  assert.ok(result, "result was not emitted")
+  assert.equal(result!.status, "success")
+  assert.equal(result!.output, "env=present")
+  // The bridge's own process must never see the per-task variable — with
+  // concurrent tasks, mutation of shared process.env would leak across tasks.
+  assert.equal(process.env.MOCK_LEAK_CHECK, undefined)
 })
 
 console.log("kimi task executor self-check passed")

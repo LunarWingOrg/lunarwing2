@@ -20,11 +20,13 @@ import {
   WORKER_ID,
   WORKER_VERSION,
   type Envelope,
+  type TaskProgress,
   type TaskRequest,
+  type TaskResult,
   type WsState,
-} from "./lunarwing_runtime"
-import { executeTask } from "./kimi_task_executor"
-import { expandWorkspacePath } from "./workspace_path"
+} from "./lunarwing_runtime.js"
+import { executeTask } from "./kimi_task_executor.js"
+import { expandWorkspacePath } from "./workspace_path.js"
 
 // A single malformed frame or a stray async error must not take the whole
 // worker process down (which would drop every in-flight task). Log and survive.
@@ -162,11 +164,11 @@ async function handleTaskRequest(
   try {
     await executeTask(
       request,
-      (progress) => {
+      (progress: TaskProgress) => {
         const msg = createEnvelope("task_progress", progress as unknown as Record<string, unknown>)
         ws.send(JSON.stringify(msg))
       },
-      (result) => {
+      (result: TaskResult) => {
         const msg = createEnvelope("task_result", result as unknown as Record<string, unknown>)
         ws.send(JSON.stringify(msg))
         console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
@@ -310,19 +312,19 @@ async function startClient(): Promise<void> {
         sendReady(bridgeSocket)
       })
 
-      ws.addEventListener("message", (event: MessageEvent) => {
+      ws.addEventListener("message", (event: WebSocket.MessageEvent) => {
         const data = typeof event.data === "string" ? event.data : ""
         void handleMessage(data, bridgeSocket)
       })
 
-      ws.addEventListener("close", (event: CloseEvent) => {
+      ws.addEventListener("close", (event: WebSocket.CloseEvent) => {
         abortSocketTasks(bridgeSocket)
         console.log(`[bridge] disconnected from hub: ${event.code} ${event.reason}`)
         updateState(false)
         scheduleReconnect()
       })
 
-      ws.addEventListener("error", (event: Event) => {
+      ws.addEventListener("error", (event: WebSocket.ErrorEvent) => {
         console.error("[bridge] WebSocket error:", event)
         updateState(false)
       })

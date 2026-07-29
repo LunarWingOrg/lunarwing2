@@ -3,6 +3,8 @@
  * Verifies health endpoint and WebSocket handshake.
  */
 
+import type { WebSocket as WsType } from "ws"
+
 const WS_HOST = process.env.SMOKE_WS_HOST || "127.0.0.1"
 const WS_PORT = process.env.SMOKE_WS_PORT || "9090"
 const HEALTH_PORT = process.env.SMOKE_HEALTH_PORT || "8443"
@@ -12,7 +14,7 @@ const WS_PATH = process.env.WS_PATH || "/ws/agent"
 async function checkHealth(): Promise<boolean> {
   try {
     const res = await fetch(`http://${WS_HOST}:${HEALTH_PORT}/health`)
-    const data = await res.json()
+    const data = (await res.json()) as { status?: string; uptime_seconds?: number }
     if (data.status === "ok") {
       console.log(`[smoke] health: OK (uptime=${data.uptime_seconds}s)`)
       return true
@@ -28,7 +30,7 @@ async function checkHealth(): Promise<boolean> {
 async function checkReady(): Promise<boolean> {
   try {
     const res = await fetch(`http://${WS_HOST}:${HEALTH_PORT}/ready`)
-    const data = await res.json()
+    const data = (await res.json()) as { ready?: boolean }
     if (data.ready) {
       console.log(`[smoke] ready: OK`)
       return true
@@ -57,7 +59,7 @@ async function checkWebSocket(): Promise<boolean> {
       resolve(false)
     }, 10_000)
 
-    ws.addEventListener("message", (event: MessageEvent) => {
+    ws.addEventListener("message", (event: WsType.MessageEvent) => {
       try {
         const msg = JSON.parse(typeof event.data === "string" ? event.data : "")
         if (msg.type === "ready") {
@@ -71,13 +73,13 @@ async function checkWebSocket(): Promise<boolean> {
       }
     })
 
-    ws.addEventListener("error", (event: Event) => {
+    ws.addEventListener("error", (event: WsType.ErrorEvent) => {
       console.error(`[smoke] websocket: error:`, event)
       clearTimeout(timeout)
       resolve(false)
     })
 
-    ws.addEventListener("close", (event: CloseEvent) => {
+    ws.addEventListener("close", (event: WsType.CloseEvent) => {
       if (event.code !== 1000 && event.code !== 1001) {
         console.error(`[smoke] websocket: closed unexpectedly: ${event.code} ${event.reason}`)
         clearTimeout(timeout)

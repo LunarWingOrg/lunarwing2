@@ -16,13 +16,21 @@ import {
   type TaskProgress,
   type TaskResult,
   DEFAULT_TIMEOUT_MS,
-} from "./lunarwing_runtime"
-import { extractAssistantText, kimiErrorMessage, type KimiMessage } from "./kimi_result"
-import { expandWorkspacePath } from "./workspace_path"
+} from "./lunarwing_runtime.js"
+import { extractAssistantText, kimiErrorMessage, type KimiMessage } from "./kimi_result.js"
+import { expandWorkspacePath } from "./workspace_path.js"
 
-const KIMI_BIN = process.env.KIMI_BIN || "kimi"
-const KIMI_CODE_HOME = process.env.KIMI_CODE_HOME || ""
-const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
+// Read env lazily: binding these at module load freezes the values at import
+// time, which breaks per-task overrides (and tests that set env after import).
+function kimiBin(): string {
+  return process.env.KIMI_BIN || "kimi"
+}
+function kimiCodeHome(): string {
+  return process.env.KIMI_CODE_HOME || ""
+}
+function workspaceRoot(): string {
+  return process.env.WORKSPACE_ROOT || "/workspace"
+}
 
 function boundedEnvInteger(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number.parseInt(process.env[name] ?? "", 10)
@@ -100,17 +108,7 @@ export async function executeTask(
   const killGrace = killGraceMs()
   const workDir = request.context?.project_dir
     ? resolveWorkDir(request.context.project_dir)
-    : WORKSPACE_ROOT
-
-  const injectedKeys: string[] = []
-  const savedValues: Record<string, string | undefined> = {}
-  if (request.context?.environment) {
-    for (const [key, value] of Object.entries(request.context.environment)) {
-      injectedKeys.push(key)
-      savedValues[key] = process.env[key]
-      process.env[key] = value
-    }
-  }
+    : workspaceRoot()
 
   let output = ""
   const collectedMessages: KimiMessage[] = []
@@ -118,6 +116,21 @@ export async function executeTask(
   let proc: ChildProcessWithoutNullStreams | undefined
   let stderrBuffer = ""
   let lastProgressAt = Date.now()
+
+  // Bounds on in-memory accumulation for long/verbose runs (default task
+  // timeout is 1h). Progress is streamed live, so truncating loses nothing
+  // operationally; the canonical result only needs the LAST non-empty
+  // assistant message, so old messages can be dropped safely.
+  const STDERR_CAP = 65_536
+  const OUTPUT_CAP = 1_048_576
+  const MESSAGES_CAP = 1_000
+  const appendOutput = (text: string) => {
+    if (output.length < OUTPUT_CAP) output += text
+  }
+  const appendStderr = (text: string) => {
+    stderrBuffer += text
+    if (stderrBuffer.length > STDERR_CAP) stderrBuffer = stderrBuffer.slice(-STDERR_CAP)
+  }
 
   const emitProgress = (delta: string) => {
     lastProgressAt = Date.now()
@@ -159,16 +172,23 @@ export async function executeTask(
 
   try {
     const promptText = buildTaskPrompt(request)
-    const args = ["-p", promptText, "--output-format", "stream-json", "--yolo"]
-    const env: Record<string, string> = { ...process.env }
-    if (KIMI_CODE_HOME) {
-      env.KIMI_CODE_HOME = KIMI_CODE_HOME
+    // No --yolo flag: this kimi-code version rejects it in combination with
+    // -p (print mode). Auto-approval comes from the baked config.toml
+    // (default_permission_mode = "yolo") instead.
+    const args = ["-p", promptText, "--output-format", "stream-json"]
+    // Per-task env is assembled, never injected into the bridge's shared
+    // process.env — concurrent tasks in different workspaces must not see
+    // each other's variables (no mutation means nothing to leak or restore).
+    const env: NodeJS.ProcessEnv = { ...process.env, ...request.context?.environment }
+    const kimiHome = kimiCodeHome()
+    if (kimiHome) {
+      env.KIMI_CODE_HOME = kimiHome
     }
     // Auto-update and telemetry: disable to keep CI/headless runs deterministic.
     env.KIMI_CODE_NO_AUTO_UPDATE = env.KIMI_CODE_NO_AUTO_UPDATE || "1"
     env.KIMI_DISABLE_TELEMETRY = env.KIMI_DISABLE_TELEMETRY || "1"
 
-    proc = spawn(KIMI_BIN, args, {
+    proc = spawn(kimiBin(), args, {
       cwd: workDir,
       env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -189,7 +209,7 @@ export async function executeTask(
       })
 
       proc!.stderr.on("data", (chunk: Buffer) => {
-        stderrBuffer += chunk.toString("utf-8")
+        appendStderr(chunk.toString("utf-8"))
       })
 
       proc!.on("error", (err) => {
@@ -219,7 +239,8 @@ export async function executeTask(
           return
         }
 
-        // Collect for final output extraction.
+        // Collect for final output extraction. Bounded: only the tail is
+        // needed to find the last non-empty assistant message.
         const msg: KimiMessage = {
           role: parsed.role ?? "",
           content: typeof parsed.content === "string" ? parsed.content : undefined,
@@ -227,11 +248,12 @@ export async function executeTask(
           tool_call_id: parsed.tool_call_id,
         }
         collectedMessages.push(msg)
+        if (collectedMessages.length > MESSAGES_CAP) collectedMessages.shift()
 
         if (isAssistantMessage(parsed)) {
           const text = typeof parsed.content === "string" ? parsed.content.trim() : ""
           if (text) {
-            output += text + "\n"
+            appendOutput(text + "\n")
             emitProgress(text)
           }
           // Surface tool-call activity so the agent sees live progress.
@@ -245,7 +267,7 @@ export async function executeTask(
           const toolOutput = typeof parsed.content === "string" ? parsed.content.trim() : ""
           if (toolOutput) {
             const delta = `[tool result] ${toolOutput}`
-            output += delta + "\n"
+            appendOutput(delta + "\n")
             emitProgress(delta)
           }
         } else if (isMetaMessage(parsed)) {
@@ -308,16 +330,9 @@ export async function executeTask(
     if (proc && !proc.killed) {
       proc.kill("SIGKILL")
     }
-    for (const key of injectedKeys) {
-      if (savedValues[key] === undefined) {
-        delete process.env[key]
-      } else {
-        process.env[key] = savedValues[key]
-      }
-    }
   }
 }
 
 function resolveWorkDir(path: string): string {
-  return resolve(expandWorkspacePath(path, WORKSPACE_ROOT))
+  return resolve(expandWorkspacePath(path, workspaceRoot()))
 }
