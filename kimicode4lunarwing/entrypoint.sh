@@ -163,7 +163,6 @@ case "$MODE" in
     export WS_STATE_FILE
     export WORKSPACE_ROOT
     export KIMI_MODE
-    export KIMI_VERSION
 
     node /app/scripts/lunarwing_bridge.js &
     BRIDGE_PID=$!

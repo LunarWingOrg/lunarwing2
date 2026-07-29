@@ -11,7 +11,7 @@ RUN set -e; \
     (apt-get update 2>/dev/null || { \
       echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
       sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-      apt-get update 2>/dev/null || apt-get update -o Acquire::AllowInsecureRepositories=true; \
+      apt-get update; \
     }) && \
     apt-get install -y --no-install-recommends \
       python3 make g++ ca-certificates && \
@@ -25,6 +25,7 @@ WORKDIR /build/scripts
 RUN npm install --omit=dev --ignore-scripts && \
     npm install --no-save typescript@5.9.3 @types/node@22.20.1 @types/ws@8.18.1 && \
     npx tsc -p tsconfig.json && \
+    npm test && \
     rm -rf node_modules/.cache
 
 # ──────────────────────────────
@@ -45,7 +46,7 @@ RUN set -e; \
     (apt-get update 2>/dev/null || { \
       echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
       sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-      apt-get update 2>/dev/null || apt-get update -o Acquire::AllowInsecureRepositories=true; \
+      apt-get update; \
     }) && \
     apt-get install -y --no-install-recommends \
       tini \
@@ -66,7 +67,7 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       (apt-get update 2>/dev/null || { \
         echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
         sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-        apt-get update 2>/dev/null || apt-get update -o Acquire::AllowInsecureRepositories=true; \
+        apt-get update; \
       }) && \
       apt-get install -y --no-install-recommends \
         build-essential \
