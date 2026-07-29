@@ -18,6 +18,10 @@
   tags:
     - "$CI_LINT_RUNNER_TAG"
   stage: containers
+  # Start immediately, independent of earlier stages — image builds don't
+  # consume test artifacts, and stage gating would block the manual trigger
+  # behind the full Rust suite.
+  needs: []
   before_script:
     - mkdir -p /kaniko/.docker
     - |
