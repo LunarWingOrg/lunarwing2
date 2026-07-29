@@ -1,7 +1,4 @@
-# PRE-RELEASE CHECKLIST for LunarWing v2.0.3.0 Codename `UNKNOWN`
-
-## Release Codename:  UNKNOWN
-## English Context:   UNKNOWN
+# PRE-RELEASE CHECKLIST for LunarWing v2.0.3.0
 
 **Open TODOs (v2.0.3.0) — To be done before release**
 
