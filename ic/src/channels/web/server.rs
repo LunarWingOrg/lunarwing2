@@ -22,6 +22,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowHeaders, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use uuid::Uuid;
@@ -596,7 +597,8 @@ pub async fn start_server(
         .route("/i18n/index.js", get(i18n_index_handler))
         .route("/i18n/en.js", get(i18n_en_handler))
         .route("/i18n/zh-CN.js", get(i18n_zh_handler))
-        .route("/i18n-app.js", get(i18n_app_handler));
+        .route("/i18n-app.js", get(i18n_app_handler))
+        .layer(CompressionLayer::new().gzip(true));
 
     // Project file serving (behind auth to prevent unauthorized file access).
     let projects = Router::new()

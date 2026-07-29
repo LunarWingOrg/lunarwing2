@@ -19,12 +19,25 @@ async def test_sse_reconnect_after_disconnect(page):
         'document.getElementById("sse-status").textContent === "Connected"',
         timeout=5000,
     )
+    await page.wait_for_function(
+        "currentThreadId !== null && !document.querySelector('#chat-messages .skeleton-container')",
+        timeout=5000,
+    )
+
+    history_requests = []
+    page.on(
+        "request",
+        lambda request: history_requests.append(request.url)
+        if "/api/chat/history?" in request.url
+        else None,
+    )
 
     # Close the EventSource to simulate disconnect
     await page.evaluate("if (eventSource) eventSource.close()")
 
     # Reconnect
-    await page.evaluate("connectSSE()")
+    async with page.expect_request(lambda request: "/api/chat/history?" in request.url):
+        await page.evaluate("connectSSE()")
 
     # Wait for reconnection
     await page.wait_for_function(
@@ -34,6 +47,8 @@ async def test_sse_reconnect_after_disconnect(page):
     status = page.locator(SEL["sse_status"])
     text = await status.text_content()
     assert text == "Connected"
+    await page.wait_for_timeout(250)
+    assert len(history_requests) == 1, "Reconnect should issue one history reconciliation"
 
 
 async def test_sse_reconnect_preserves_chat_history(page):
