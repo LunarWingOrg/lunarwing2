@@ -336,7 +336,7 @@ with another tenant's user ID; automatic scope namespacing is not implemented.
 ```rust
 SearchConfig {
     limit: 10,                          // max results returned
-    rrf_k: 60,                          // RRF constant (higher = favor top results more)
+    rrf_k: 60,                          // RRF constant (higher = flatter rank differences)
     use_fts: true,                      // enable full-text search
     use_vector: true,                   // enable vector search
     min_score: 0.0,                     // threshold [0, 1]

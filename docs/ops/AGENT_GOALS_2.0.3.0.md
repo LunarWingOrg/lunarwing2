@@ -78,20 +78,20 @@
 22. [x] (S) review kawarimi adapter. make improvements (only if necessary)
 23. [x] go over release notes for 2.0.2.0 and see what else still needs to be added to next release, see documents about this if unsure of each item. create new doc under docs/proposals for items that should be included in 2.0.3.0 (you must focus on enginev2 related fixes/polishing)
 24. [x] (S) Refactor mt admin. The existing document plans have SERIOUS issues. Therefore, I'm going with a COMPLETELY different plan for this. Please see the following branch: mtadminrefactor/meta4/v2.0.3.0
-25. [ ] Review recent work on XMPP file transfer — remaining polish (further hardening), see documents about this if unsure. create new doc detailing findings in docs/ops called XMPP_FT_REVIEW_R.md (yes, it is intentional to have this goal defined twice)
+25. [x] Review recent work on XMPP file transfer — remaining polish (further hardening), see documents about this if unsure. create new doc detailing findings in docs/ops called XMPP_FT_REVIEW_R.md (yes, it is intentional to have this goal defined twice) — DONE 2026-07-28 (codex worker, branch feat/item-25-xmpp-ft-review-r): docs/ops/XMPP_FT_REVIEW_R.md added; 15 findings (5 High / 5 Medium / 4 Low / 1 Nit); 13 file:line citations spot-verified; written independently of REVIEW_A
 26. [x] Review recent work on Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure. create new doc detailing findings in docs/ops called XMPP_FT_REVIEW_A.md (yes, it is intentional to have this goal defined twice)
 27. [x] Review recent changes for: Gut proprietary tunnel providers and add support for netbird. improve if necessary
 28. [x] ensure dependency list is updated for gentoo and include archlinux dependency list if not present as well. be sure to include python packages not listed in these dep lists currently
 29. [x] review darkirc key exchange implementation (only if item 20 was completed). if #20 is not done, check this off — #20 not completed, checked off per instruction
-30. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
+30. [x] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs — DONE 2026-07-28 (codex worker, branch feat/item-30-arch-docs-refresh): 6 of 9 docs updated (+70/−46), 3 audited clean (SSH_AGENT_HARNESS, SSH_DELIVERY_MECHANISMS, XMPP_FILE_TRANSFERS); 13 changed claims re-verified against code
 31. [x] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
 32. [x] (S) update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs
 33. [x] write up proper plan document in docs/proposals for integrating docs/proposals/MULTIAGENTTEAMORCHESTRATION into the next release, 2.0.4.0
 34. [x] (S) Work on reflex compiler. see docs/proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED in docs/proposals - ALSO, see the following branches: rc2/aragents/v2.0.3.0 and anattemptatreflexcompilerv2 for work as inspiration
 35. [x] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
-36. [ ] update docs/README.md
-37. [ ] update README.md at repo root
-38. [ ] come up with codename ideas for release. put into new doc.
+36. [x] update docs/README.md — DONE 2026-07-28 (codex worker, branch feat/item-36-docs-readme): 75 missing entries added, 4 broken rows removed, 1 renamed link fixed; 262 referenced paths verified with 0 missing; REVIEW_R + CODENAME docs indexed at merge time
+37. [x] update README.md at repo root — DONE 2026-07-28 (codex worker, branch feat/item-37-root-readme): added XEP-0363 file attachments, WeeChat buffer restoration, and host-local stdio MCP lifecycle bullets; NetBird named in integrations; Gentoo/Arch package lists linked in host prep; all 22 repo-relative links verified; final pass still due under item 40
+38. [x] come up with codename ideas for release. put into new doc. — DONE 2026-07-28 (codex worker, branch feat/item-38-release-codename): docs/ops/CODENAME_IDEAS_v2.0.3.0.md with 10 candidates following the kanji + English-context convention, no collisions with past codenames; top pick Sashiko (刺し子)
 39. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.3.0 explaining all relevant changes since v2.0.2.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is: `UNKNOWN` — The file you write will be RELEASE-v2.0.3.0.md and should be written to the ROOT of the repo. When complete with draft, move on to another task, which is: Improve accuracy of the first draft of release notes (from previous task) - RELEASE-v2.0.3.0.md
 40. [ ] review README.md and release notes from item #39 in root of repo and do a final pass. you may also shorten superfluous information
 
