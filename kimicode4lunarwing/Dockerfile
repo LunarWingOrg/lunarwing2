@@ -23,7 +23,7 @@ COPY scripts/*.ts ./scripts/
 
 WORKDIR /build/scripts
 RUN npm install --omit=dev --ignore-scripts && \
-    npm install --no-save typescript@5.5.0 @types/node@22.0.0 @types/ws@8.5.0 && \
+    npm install --no-save typescript@5.9.3 @types/node@22.20.1 @types/ws@8.18.1 && \
     npx tsc -p tsconfig.json && \
     rm -rf node_modules/.cache
 
