@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { extractAssistantText, kimiErrorMessage } from "./kimi_result.ts"
+import { extractAssistantText, kimiErrorMessage } from "./kimi_result.js"
 
 test("extractAssistantText returns the last non-empty assistant message", () => {
   const messages = [

@@ -5,13 +5,16 @@
 
 export function extractAssistantText(messages: readonly KimiMessage[]): string {
   if (!Array.isArray(messages)) return ""
-  const assistantTexts: string[] = []
-  for (const msg of messages) {
+  // The canonical result is the LAST assistant message with non-empty
+  // content — intermediate thinking/tool-call messages are progress, not
+  // the answer (matches collectOutput in the task executor).
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
     if (!msg || msg.role !== "assistant") continue
-    const content = typeof msg.content === "string" ? msg.content : ""
-    if (content.length > 0) assistantTexts.push(content)
+    const content = typeof msg.content === "string" ? msg.content.trim() : ""
+    if (content.length > 0) return content
   }
-  return assistantTexts.join("\n").trim()
+  return ""
 }
 
 export function kimiErrorMessage(error: unknown): string {

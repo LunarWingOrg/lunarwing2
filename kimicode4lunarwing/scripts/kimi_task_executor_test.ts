@@ -4,8 +4,8 @@ import { spawn } from "node:child_process"
 import { mkdtempSync, writeFileSync, chmodSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { executeTask } from "./kimi_task_executor.ts"
-import type { TaskRequest, TaskResult } from "./lunarwing_runtime.ts"
+import { executeTask } from "./kimi_task_executor.js"
+import type { TaskRequest, TaskResult } from "./lunarwing_runtime.js"
 
 function makeMockKimi(behavior: "success" | "empty" | "error"): string {
   const dir = mkdtempSync(join(tmpdir(), "kimi-mock-"))

@@ -16,13 +16,21 @@ import {
   type TaskProgress,
   type TaskResult,
   DEFAULT_TIMEOUT_MS,
-} from "./lunarwing_runtime"
-import { extractAssistantText, kimiErrorMessage, type KimiMessage } from "./kimi_result"
-import { expandWorkspacePath } from "./workspace_path"
+} from "./lunarwing_runtime.js"
+import { extractAssistantText, kimiErrorMessage, type KimiMessage } from "./kimi_result.js"
+import { expandWorkspacePath } from "./workspace_path.js"
 
-const KIMI_BIN = process.env.KIMI_BIN || "kimi"
-const KIMI_CODE_HOME = process.env.KIMI_CODE_HOME || ""
-const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
+// Read env lazily: binding these at module load freezes the values at import
+// time, which breaks per-task overrides (and tests that set env after import).
+function kimiBin(): string {
+  return process.env.KIMI_BIN || "kimi"
+}
+function kimiCodeHome(): string {
+  return process.env.KIMI_CODE_HOME || ""
+}
+function workspaceRoot(): string {
+  return process.env.WORKSPACE_ROOT || "/workspace"
+}
 
 function boundedEnvInteger(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number.parseInt(process.env[name] ?? "", 10)
@@ -100,7 +108,7 @@ export async function executeTask(
   const killGrace = killGraceMs()
   const workDir = request.context?.project_dir
     ? resolveWorkDir(request.context.project_dir)
-    : WORKSPACE_ROOT
+    : workspaceRoot()
 
   const injectedKeys: string[] = []
   const savedValues: Record<string, string | undefined> = {}
@@ -160,15 +168,16 @@ export async function executeTask(
   try {
     const promptText = buildTaskPrompt(request)
     const args = ["-p", promptText, "--output-format", "stream-json", "--yolo"]
-    const env: Record<string, string> = { ...process.env }
-    if (KIMI_CODE_HOME) {
-      env.KIMI_CODE_HOME = KIMI_CODE_HOME
+    const env: NodeJS.ProcessEnv = { ...process.env }
+    const kimiHome = kimiCodeHome()
+    if (kimiHome) {
+      env.KIMI_CODE_HOME = kimiHome
     }
     // Auto-update and telemetry: disable to keep CI/headless runs deterministic.
     env.KIMI_CODE_NO_AUTO_UPDATE = env.KIMI_CODE_NO_AUTO_UPDATE || "1"
     env.KIMI_DISABLE_TELEMETRY = env.KIMI_DISABLE_TELEMETRY || "1"
 
-    proc = spawn(KIMI_BIN, args, {
+    proc = spawn(kimiBin(), args, {
       cwd: workDir,
       env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -319,5 +328,5 @@ export async function executeTask(
 }
 
 function resolveWorkDir(path: string): string {
-  return resolve(expandWorkspacePath(path, WORKSPACE_ROOT))
+  return resolve(expandWorkspacePath(path, workspaceRoot()))
 }

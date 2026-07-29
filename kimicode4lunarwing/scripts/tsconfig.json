@@ -15,5 +15,5 @@
     "lib": ["ES2022"]
   },
   "include": ["*.ts"],
-  "exclude": ["*.test.ts", "*.test.mjs", "smoke_test.ts"]
+  "exclude": ["node_modules"]
 }
