@@ -35,27 +35,34 @@ entrypoint — nothing else to configure).
 
 ### 1b. Traefik route
 
-Add these labels to the GitLab container (same style as the existing
-`gitlab` router; note the service port is 5050 and there is **no**
-`server.scheme=websecure` — the registry backend speaks plain HTTP inside the
-container):
+Routes live in Traefik's **file provider** (`traefik-dynamic.yaml`) — the
+`traefik.*` labels on the GitLab container are inert (`traefik.enable=false`).
+Add to `traefik-dynamic.yaml`:
+
+Under `http.routers` (sibling to the existing `gitlab:` router):
 
 ```yaml
-labels:
-  # GitLab Container Registry
-  - traefik.http.routers.gitlab-registry.rule=Host(`registry.git.lunarwing.org`)
-  - traefik.http.routers.gitlab-registry.entrypoints=websecure
-  - traefik.http.routers.gitlab-registry.tls.certresolver=letsencrypt
-  - traefik.http.services.gitlab-registry.loadbalancer.server.port=5050
+  gitlab-registry:
+    rule: "Host(`registry.git.lunarwing.org`)"
+    entryPoints:
+      - websecure
+    tls:
+      certResolver: letsencrypt
+    service: gitlab-registry
 ```
 
-**Gotcha:** the current compose has `traefik.enable=false` on the GitLab
-container, which makes *all* of its Traefik labels inert. If
-`git.lunarwing.org` works today, its route must be defined somewhere else
-(e.g. Traefik file provider) — in that case define the
-`gitlab-registry` router/service there instead. Otherwise flip
-`traefik.enable` to `true` (after confirming the existing `gitlab` router
-labels take over the main route cleanly).
+Under `http.services` (sibling to the existing `gitlab:` service; plain HTTP
+backend, same as the main `gitlab:8181` service):
+
+```yaml
+  gitlab-registry:
+    loadBalancer:
+      servers:
+        - url: "http://gitlab:5050"
+```
+
+The file provider hot-reloads on save — no Traefik restart needed. The
+`letsencrypt` certresolver issues the cert automatically once DNS resolves.
 
 No host port publish is needed: Traefik reaches the container's 5050 over the
 shared `proxy` network.
