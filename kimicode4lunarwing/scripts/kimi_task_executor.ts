@@ -167,7 +167,10 @@ export async function executeTask(
 
   try {
     const promptText = buildTaskPrompt(request)
-    const args = ["-p", promptText, "--output-format", "stream-json", "--yolo"]
+    // No --yolo flag: this kimi-code version rejects it in combination with
+    // -p (print mode). Auto-approval comes from the baked config.toml
+    // (default_permission_mode = "yolo") instead.
+    const args = ["-p", promptText, "--output-format", "stream-json"]
     const env: NodeJS.ProcessEnv = { ...process.env }
     const kimiHome = kimiCodeHome()
     if (kimiHome) {
