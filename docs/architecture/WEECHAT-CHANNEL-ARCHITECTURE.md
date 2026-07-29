@@ -114,13 +114,14 @@ principal; the WASM wrapper then resolves that scope through the persisted full 
 [`IRC-SENDER-IDENTITY.md`](IRC-SENDER-IDENTITY.md) for principal formats, threat boundaries, and
 migration behavior.
 
-### Watermarks & new buffers (poll mode only)
+### Watermarks & new buffers
 
 In the polling fallback, `do_poll` seeds a per-buffer watermark the **first time** it sees a
-buffer and does **not** emit that first batch (avoids replaying history on startup). See §5 for the
-consequence on freshly-created DM/query buffers. Long-poll mode has no per-buffer watermarks — it
-tracks a single global cursor seeded to the adapter's current `event_cursor` at `on_start`, so it
-neither replays history nor needs per-buffer discovery.
+channel buffer and does **not** emit that first batch (avoids replaying history on startup).
+Freshly-created DM/query buffers are the exception: their first batch is emitted. Long-poll
+uses a single global cursor seeded to the adapter's current `event_cursor` at `on_start` for
+primary ordering, and also updates per-buffer watermarks so fallback polling and replay
+deduplication do not re-emit lines.
 
 ---
 
@@ -131,13 +132,14 @@ The daemon consumes the adapter in one of two modes, chosen at `on_start` by pro
 
 ### Long-poll mode (default when the adapter supports it)
 
-The adapter keeps a **global ordered event log** (`event_seq` + `event_log`) and records every
+The adapter keeps a **global ordered event log** (`event_seq` + a 2,000-entry `event_log`) and records every
 `buffer_line_added` into it. A line names its buffer by `buffer_id`; for a **brand-new** query/DM
 buffer not yet in the adapter's cached buffer list, the adapter refreshes the list
 **synchronously and retries** before recording, so the *first* line in a new buffer is captured
-rather than dropped (see §5 — that drop was the real first-DM bug, below both the cursor and the
-WASM). Its blocking endpoint **`GET /api/wait?cursor=<n>&timeout=<s>`** returns immediately with
-all events `seq > cursor`, or blocks until a line arrives (or a ~20s heartbeat). If
+rather than dropped when the retry resolves the buffer; a still-unknown buffer is logged and
+dropped (see §5 — that drop was the real first-DM bug, below both the cursor and the WASM).
+Its blocking endpoint **`GET /api/wait?cursor=<n>&timeout=<s>`** returns immediately with
+all retained events `seq > cursor`, or blocks until a line arrives (or a ~20s heartbeat). If
 `cursor > event_seq` (the adapter restarted and its in-memory seq reset below the client) it
 **replays the post-restart backlog** (treats the cursor as 0) instead of reporting "caught up", so
 a line recorded right after a restart isn't skipped. `on_start` seeds the WASM's
@@ -312,7 +314,7 @@ Then restart the daemon so `on_start` re-resolves.
 | **Channel debug logs invisible** | `debug_logging=true` produced nothing in the journal | The host forwarded all guest `Info/Debug/Trace` logs via `tracing::debug!`, dropped by the default `RUST_LOG=lunarwing=info`. | **Fixed** — faithful level mapping (`Info→info!`, `Trace→trace!`); `debug_logging` is now visible at `info`. |
 | **Guest 3s interval is clamped to 30s** | A message can wait after an early `/api/wait` return even though the adapter already buffered it | The guest and capabilities file request 3000ms, but host `MIN_POLL_INTERVAL_MS=30000` wins during schema conversion and startup validation. | **Open / documented** — long-poll is immediate only while a wait is active. `MissedTickBehavior::Skip` prevents catch-up bursts but does not remove the host floor. |
 | **`poll_interval_ms` ignored** | Configuring the interval did nothing | Caps `config` key was `poll_interval_ms` but the struct field is `poll_interval_seconds` — different name ⇒ value dropped, struct default (3) used. | **Fixed** — caps key renamed to `poll_interval_seconds`. |
-| **First DM in a new buffer swallowed** | First message after a query buffer is created never reaches the agent; the *second* does | A DM/query buffer is created *by* the first message. The **adapter** resolves a line's buffer by `buffer_id` against a cached `buffer_list` that doesn't include the new buffer yet, so it **dropped the first line entirely** — never recorded to `line_buffer` *or* the event log. Nothing downstream (neither the long-poll cursor nor the poll path) can deliver a line the adapter never recorded. (The poll path additionally seed-skipped a new buffer's first batch.) | **Fixed** — the adapter now refreshes its buffer list **synchronously and retries** before recording, so a new buffer's first line is captured (`record_event`); the long-poll global cursor then delivers it immediately (§3). `/api/wait` also replays the post-restart backlog so a DM right after an adapter restart isn't skipped. The poll fallback still emits the first batch for new **DM/query** buffers (`is_dm_buffer`). |
+| **First DM in a new buffer swallowed** | First message after a query buffer is created never reaches the agent; the *second* does | A DM/query buffer is created *by* the first message. The **adapter** resolves a line's buffer by `buffer_id` against a cached `buffer_list` that doesn't include the new buffer yet, so it **dropped the first line entirely** — never recorded to `line_buffer` *or* the event log. Nothing downstream (neither the long-poll cursor nor the poll path) can deliver a line the adapter never recorded. (The poll path additionally seed-skipped a new buffer's first batch.) | **Fixed for the normal new-buffer race** — the adapter now refreshes its buffer list **synchronously and retries** before recording, so a resolved new buffer's first line is captured (`record_event`); if the buffer is still unknown after the retry, it is warned and dropped. The long-poll global cursor delivers captured lines immediately (§3). `/api/wait` also replays the post-restart backlog so a DM right after an adapter restart isn't skipped. The poll fallback emits the first batch for new **DM/query** buffers (`is_dm_buffer`). |
 | **Mirror loop (long-poll mode)** | Agent answers its own messages endlessly; `event_cursor` climbs steadily with no human input | The `irc_privmsg`/`self_msg`/`no_log` tag filter lived **only** in `poll_buffer`. `do_longpoll` feeds events straight to `handle_inbound_line`, which had no tag check — so in long-poll mode the agent's own `self_msg` replies were ingested and re-answered, each reply becoming the next event. Shipped in the original long-poll commit; not the adapter work. | **Fixed** — tag filter moved into `handle_inbound_line` (`tags_allow_ingest`), the single choke point **both** ingest paths share; `poll_buffer` keeps its pre-filter. Regression test `test_tags_allow_ingest`. |
 | **Password is the *second* blocker** | After ports are fixed, the adapter returns 401 | The adapter authenticates incoming WASM requests against the per-tenant `RELAY_PASSWORD` (`check_auth`); the WASM must send it. | Handled by the port fix (relay_password injection) — see archived `WEECHAT-MULTITENANT-PORT-BUG.md` in `docs/internal/history/archive/ops/`. |
 | **Stale `setup_fields` shadowing** | Caps/env edits "don't take" | Highest-precedence DB layer (§4). | Documented (§4); see §6 for the proposed precedence redesign. |
@@ -345,8 +347,9 @@ Then restart the daemon so `on_start` re-resolves.
 - `network_allowed()` wildcard for `all`/`*` (`lib.rs`, with a regression test).
 - `poll_interval_seconds` caps key fix (`weechat.capabilities.json`).
 - **First-DM delivery (real fix is at the adapter):** the adapter refreshes its buffer list
-  **synchronously and retries** before recording, so a new buffer's first line is captured into the
-  event log instead of dropped (`ws_adapter.py`); the long-poll cursor then delivers it, and
+  **synchronously and retries** before recording, so a resolved new buffer's first line is captured
+  into the event log instead of dropped (`ws_adapter.py`; a still-unknown buffer is warned and
+  dropped); the long-poll cursor then delivers it, and
   `/api/wait` replays the post-restart backlog. The poll fallback still emits the first batch for
   new **DM/query** buffers (`is_dm_buffer`, `lib.rs`, with a regression test).
 - **Mirror-loop guard:** the `irc_privmsg`/`self_msg`/`no_log` tag filter now lives in
@@ -386,7 +389,7 @@ The adapter and WASM must update **together** (the WASM probes `/api/health` for
 `event_cursor` and only long-polls if present; otherwise it falls back to polling). Per tenant:
 `git pull` in the tenant home → `build-tenant <t> --with-wasm` → `install-wasm <t>` →
 `restart-tenant <t>` (restarts both the daemon and the adapter service). New tenants created via
-`create-tenant-*` get all three from the start. No behavior changes until they are redeployed.
+`add-tenant` get all three from the start. No behavior changes until they are redeployed.
 
 ---
 

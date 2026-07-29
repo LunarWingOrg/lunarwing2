@@ -3,7 +3,7 @@
 The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
-uses Engine V2 by default when enabled. The bridge router (`src/bridge/router.rs`)
+uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
 keeps other channels on the legacy path unless an eligible channel name is
 present in `ENGINE_V2_CHANNELS` (case-insensitive exact matching).
 
@@ -36,7 +36,7 @@ ic/crates/lunarwing_engine/src/
     error.rs              EngineError, ThreadError, StepError, CapabilityError
   traits/                 External dependency abstractions (host implements these)
     llm.rs                LlmBackend trait
-    store.rs              Store trait (31 CRUD methods)
+    store.rs              Store trait (33 CRUD methods)
     effect.rs             EffectExecutor trait
   capability/             Capability management
     registry.rs           CapabilityRegistry (register/get/list capabilities)
@@ -82,6 +82,7 @@ Created --> Running --> Waiting --> Running (resume)
 ```
 
 All transitions are validated by `ThreadState::can_transition_to()`. Terminal states: `Done`, `Failed`. Invalid transitions return `ThreadError::InvalidTransition`.
+`Created`, `Running`, `Waiting`, and `Suspended` can all transition to `Failed`.
 
 ### Thread Types
 
@@ -98,7 +99,7 @@ Threads form a tree via `ThreadTree`. Parent threads can spawn children, and chi
 ```
 1. Check signals (Stop, InjectMessage) via mpsc::Receiver
 2. Build context (messages + available actions from active leases)
-3. Call LLM via LlmBackend::complete()
+3. Call LLM via `LlmBackend::complete_stream()` (with a `complete()` fallback for non-streaming backends)
 4. If Text: check tool intent nudge, return if final response
 5. If ActionCalls (Tier 0): find lease -> check policy -> consume use -> execute -> record
 6. If Code (Tier 1): execute Python via Monty with context-as-variables
@@ -143,7 +144,8 @@ The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execut
   `__list_skills__`, `__record_skill_usage__`, `__propose_skill_patch__`, and
   `__propose_skill_prune__`. Skill mutation/usage tracking is inert unless
   `SKILL_SELF_IMPROVEMENT=true`.
-- Can be patched by the self-improvement mission and versioned in the Store
+- Can be patched by the self-improvement mission and versioned in the Store when
+  `ORCHESTRATOR_SELF_MODIFY=true`
 - Falls back to compiled-in default (v0) if disabled or patches fail (3+ consecutive failures triggers rollback)
 - Async dispatch of tool calls with `asyncio.gather()` for parallel execution
 - Default orchestrator source: `ic/crates/lunarwing_engine/orchestrator/default.py`
@@ -180,9 +182,9 @@ The `PolicyEngine` evaluates actions against leases deterministically:
 - Every action declares its side effects via `EffectType`. The policy engine uses these for allow/deny decisions
 - **Provenance types**: origin labels exist for user, system, tool, LLM, and
   memory-retrieval data. `PolicyEngine::evaluate_with_provenance()` implements
-  targeted approval rules for LLM-generated or tool-sourced data, but the
-  production execution paths still call `evaluate()`, so provenance-aware
-  enforcement is not wired into runtime action dispatch yet.
+  targeted approval rules for LLM-generated or tool-sourced data. Structured,
+  scripting, and orchestrator action dispatch all call the provenance-aware
+  evaluator for LLM-generated action inputs.
 
 ## Execution Gates
 
@@ -312,9 +314,9 @@ Confidence: `1.0` if no recorded outcomes (benefit of the doubt), else `success_
 
 ## Bridge Adapters
 
-The daemon integrates the engine via three adapters in `src/bridge/`:
+The daemon integrates the engine via three adapters in `ic/src/bridge/`:
 
-### LlmBridgeAdapter (`src/bridge/llm_adapter.rs`)
+### LlmBridgeAdapter (`ic/src/bridge/llm_adapter.rs`)
 
 Wraps `LlmProvider` as `LlmBackend`:
 - Converts between `ThreadMessage` and `ChatMessage`
@@ -323,16 +325,16 @@ Wraps `LlmProvider` as `LlmBackend`:
 - Returns provider text to the engine; `LlmResponse::from_text()` in
   `types/step.rs` classifies fenced Python as CodeAct code
 
-### EffectBridgeAdapter (`src/bridge/effect_adapter.rs`)
+### EffectBridgeAdapter (`ic/src/bridge/effect_adapter.rs`)
 
 Wraps tool execution and safety layer as `EffectExecutor`:
 - Maps engine action calls to tool registry execution
 - Applies safety checks, timeout, serialization
 
-### HybridStore (`src/bridge/store_adapter.rs`)
+### HybridStore (`ic/src/bridge/store_adapter.rs`)
 
 Wraps the `Workspace` as the engine's `Store` trait:
-- 31 CRUD methods for threads, steps, events, projects, docs, leases, missions, conversations
+- 33 CRUD methods for threads, steps, events, projects, docs, leases, missions, conversations
 - In-memory `HashMap` caches backed by workspace files under `engine/`
 - Human-readable knowledge/orchestrator files plus JSON runtime state under
   `engine/.runtime/`
@@ -415,8 +417,8 @@ The engine defines three traits that the host crate implements. This boundary en
 
 | Trait | Signature | Host wraps |
 |-------|-----------|------------|
-| `LlmBackend` | `complete(messages, actions, config) -> LlmOutput` | `LlmProvider` |
-| `Store` | 31 CRUD methods for all engine types | Workspace-backed `HybridStore` |
+| `LlmBackend` | `complete(...) -> LlmOutput`; `complete_stream(...) -> LlmStream` | `LlmProvider` |
+| `Store` | 33 CRUD methods for all engine types | Workspace-backed `HybridStore` |
 | `EffectExecutor` | `execute_action(name, params, lease, ctx) -> ActionResult` | `ToolRegistry` + `SafetyLayer` |
 
 ## Data Retention Policy
@@ -440,10 +442,14 @@ in-memory cache entries to bound RAM; workspace files remain. `load_thread()`,
 
 ## Event Sourcing
 
-Every thread records a complete event log via `ThreadEvent`. The `EventKind` enum has 20 variants covering the full lifecycle: thread creation, state transitions, message receipt, LLM calls, action execution, gate decisions, mission triggers, and more.
+Threads persist significant lifecycle and execution events via `ThreadEvent`.
+The 20 `EventKind` variants cover state, step, action, lease, message, child,
+approval, self-improvement, skill-activation, and orchestrator-rollback events.
+`ResponseDelta` is broadcast for live delivery but is not persisted.
 
 This enables:
-- Full replay of any thread's execution history
+- Inspection of recorded thread execution history (mid-thread replay/resume is
+  not generally supported)
 - Retrospective analysis via `executor/trace.rs`
 - Learning mission triggers based on event patterns
 - Debugging and auditing
@@ -456,11 +462,14 @@ ENGINE_V2_CHANNELS=            # Gateway only (default)
 ENGINE_V2_CHANNELS=xmpp        # Add XMPP
 ENGINE_V2_CHANNELS=xmpp,weechat # Add exact eligible channels
 SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle
+ORCHESTRATOR_SELF_MODIFY=false # Use only compiled orchestrator v0; block LLM-authored patches
 ```
 
 The engine inherits most configuration from the host daemon (LLM provider settings, database config, tool registry, safety settings). Engine-specific behavior is controlled through `ThreadConfig` at thread spawn time.
 
 ## Build & Test
+
+Run these commands from `ic/`:
 
 ```bash
 taskset -c 0-5 cargo check -j6 -p lunarwing_engine
@@ -472,7 +481,7 @@ taskset -c 0-5 cargo test -j6 -p lunarwing_engine -- --test-threads=6
 
 1. **No dependency on main crate** -- clean separation, testable in isolation
 2. **No safety logic in engine** -- sanitization/leak detection applied at the adapter boundary (`EffectExecutor` impl)
-3. **Event sourcing from day one** -- every thread records a complete event log
+3. **Event sourcing from day one** -- threads persist significant lifecycle and execution events
 4. **Tier 0 + Tier 1** -- structured tool calls and embedded Python via Monty coexist
 5. **Engine owns its message type** -- `ThreadMessage` is simpler than `ChatMessage`; bridge adapters handle conversion
 6. **RLM pattern** -- context as variable (not attention input), recursive `llm_query()`, compact output metadata between steps
