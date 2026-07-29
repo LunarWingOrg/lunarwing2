@@ -222,7 +222,7 @@ here while they are still present in `proposals/`.
 | [`DARKIRC_SECURE_KEY_EXCHANGE.md`](proposals/DARKIRC_SECURE_KEY_EXCHANGE.md) | Open | Secure contact-key exchange design; Phase 0 prerequisite is not implemented |
 | [`DARKIRC_THINGS_TO_ADD.md`](proposals/DARKIRC_THINGS_TO_ADD.md) | Partial | Disabled-by-default behavior shipped; Tor and seed work remain open |
 | [`ENGINE_LLM_STREAMING.md`](proposals/ENGINE_LLM_STREAMING.md) | Implemented | Engine streaming and cancellation phases 0-5; channel rollout validation remains operational |
-| [`ENGINE_V2_POLISH_v2.0.3.0.md`](proposals/ENGINE_V2_POLISH_v2.0.3.0.md) | Open | Source-verified v2.0.3.0 Engine V2 fixes for provenance, mission controls, gates, budgets, and memory |
+| [`ENGINE_V2_POLISH_v2.0.3.0.md`](proposals/ENGINE_V2_POLISH_v2.0.3.0.md) | Implemented | v2.0.3.0 Engine V2 fixes for provenance, mission controls, gates, and memory; P1/P2 landed, P3 partially deferred |
 | [`EXTERNAL-WORKER-AUDIT-2026-06-23.md`](proposals/EXTERNAL-WORKER-AUDIT-2026-06-23.md) | Implemented / historical | External-worker security findings and landed fixes |
 | [`EXTERNAL-WORKER-PLAN-UPGRADES.md`](proposals/EXTERNAL-WORKER-PLAN-UPGRADES.md) | Implemented | Context, pooling, load balancing, and surviving worker updates landed |
 | [`EXTERNAL-WORKER-PROMPT-CONTEXT.md`](proposals/EXTERNAL-WORKER-PROMPT-CONTEXT.md) | Implemented | Typed, bounded, opt-in conversation context propagation for OpenCode, Nanocode, and Pebble workers |
@@ -245,7 +245,7 @@ here while they are still present in `proposals/`.
 | [`LUNARVISION_POLISHING.md`](proposals/LUNARVISION_POLISHING.md) | Superseded | Health wiring and `vision_health` allocation landed elsewhere |
 | [`MEMORY_MAINTENANCE_ROUTINES.md`](proposals/MEMORY_MAINTENANCE_ROUTINES.md) | Open | Routine-pack and reviewed memory-maintenance proposal/apply design |
 | [`MT-1.1.0-TO-1.1.4-UPGRADE.md`](proposals/MT-1.1.0-TO-1.1.4-UPGRADE.md) | Implemented / verification pending | Rootless-flip tooling shipped; exact production flip remains unvalidated |
-| [`MT-ADMIN-DECOMPOSITION.md`](proposals/MT-ADMIN-DECOMPOSITION.md) | Ready for implementation | Reviewed plan to split the multi-tenant admin script into sourced, init-aware libraries |
+| [`MT-ADMIN-DECOMPOSITION.md`](proposals/MT-ADMIN-DECOMPOSITION.md) | Superseded | Rejected split plan; item #24 chose the `mtadminrefactor/meta4/v2.0.3.0` mt-admin-lib decomposition instead |
 | [`MT-LEGACY-UPGRADE-CHERRYPICK-PLAN.md`](proposals/MT-LEGACY-UPGRADE-CHERRYPICK-PLAN.md) | Implemented / historical | Executed legacy-upgrade fix plan; production run remained operator-gated |
 | [`MT-LEGACY-UPGRADE-QA-PLAN.md`](proposals/MT-LEGACY-UPGRADE-QA-PLAN.md) | Verification pending | Live legacy-upgrade operator checklist |
 | [`MT-LEGACY-UPGRADE-VERIFICATION.md`](proposals/MT-LEGACY-UPGRADE-VERIFICATION.md) | Verification pending | Legacy harness canary, rollback, soak, and sign-off plan |
