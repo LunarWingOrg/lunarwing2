@@ -1,6 +1,6 @@
 [Unit]
 Description=LunarWing XMPP Bridge Service
-Documentation=https://github.com/LunarWingOrg/lunarwing/tree/main/bridges/xmpp-bridge
+Documentation=https://git.lunarwing.org/lunarwing/lunarwing2/-/tree/master/ic/bridges/xmpp-bridge
 After=network.target
 Wants=network.target
 PartOf=lunarwing.service

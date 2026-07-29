@@ -1299,6 +1299,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
             &context,
             &[],
             &serde_json::json!({}),
+            None,
         )
         .await
         .expect("CodeAct execution should complete");

@@ -31,7 +31,7 @@
       "xmpp_bridge_token"
     ],
     "shared_auth": null,
-    "setup_url": "https://github.com/LunarWingOrg/lunarwing/tree/main/ic/bridges/xmpp-bridge"
+    "setup_url": "https://git.lunarwing.org/lunarwing/lunarwing2/-/tree/master/ic/bridges/xmpp-bridge"
   },
   "tags": [
     "messaging"

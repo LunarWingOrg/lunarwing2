@@ -77,12 +77,13 @@ ic/crates/lunarwing_engine/src/
 ```
 Created --> Running --> Waiting --> Running (resume)
                    --> Suspended --> Running (resume)
-                   --> Completed --> Done
+                   --> Completed --> Done | Failed (finalization error)
                    --> Failed
 ```
 
 All transitions are validated by `ThreadState::can_transition_to()`. Terminal states: `Done`, `Failed`. Invalid transitions return `ThreadError::InvalidTransition`.
-`Created`, `Running`, `Waiting`, and `Suspended` can all transition to `Failed`.
+`Created`, `Running`, `Waiting`, `Suspended`, and `Completed` can transition to
+`Failed`; the last case closes failures during final persistence.
 
 ### Thread Types
 
@@ -241,6 +242,13 @@ boundaries.
 `MissionManager::ensure_learning_missions()` provisions three baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, two additional skill-improvement
 missions. They are event-driven; not every mission runs after thread completion.
+Event payloads are seeded into the mission thread's initial persisted state as
+`state["trigger_payload"]` before execution. Terminal thread events are published
+after final thread persistence so listeners can load complete source state.
+Initial mission state remains available across approval/authentication pauses,
+while normal terminal cleanup removes it. Conversation-insight cadence is
+tracked per project and user, preventing one user's completions from advancing
+another user's mission.
 
 ### Error Diagnosis (`self-improvement`)
 
@@ -273,6 +281,14 @@ missions. They are event-driven; not every mission runs after thread completion.
 
 `self-improvement` is also feature-gated. With the flag disabled, skill usage
 tracking, automatic demotion, patch proposals, and prune proposals are inert.
+
+Capability leases are revoked in memory and persistence when their owning thread
+reaches `Done` or `Failed`. Startup cleanup also reconciles valid leases left by
+older versions for terminal or missing threads; waiting and suspended thread
+leases remain active for resume. Spawn/resume persistence failures roll back any
+leases granted during that attempt. Startup also revokes persisted leases absent
+from their owner's `capability_leases` list. Per-thread resume locks prevent
+duplicate approval/authentication callbacks from starting concurrent loops.
 
 ## V2 Skill System
 

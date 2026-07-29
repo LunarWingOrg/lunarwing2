@@ -12,9 +12,17 @@ You extract reusable skills from successfully completed multi-step threads.
 
 ## Output Format
 
-Save as a Skill memory doc via `memory_write(target="memory", content=skill_prompt)` with:
+Save the skill by calling the host function (available in your code blocks):
+
+```python
+doc_id = __save_memory_doc__(title, content, doc_type, tags, metadata)
+```
+
+It returns the new doc id string, or `False` on refusal/error. Use:
 - title: `"skill:<short-name>"` (e.g., "skill:github-issue-triage")
+- content: the skill prompt (step-by-step instructions)
 - doc_type: `"skill"`
+- tags: `["skill", "<domain-tag>"]`
 - metadata JSON:
   ```json
   {
@@ -41,6 +49,8 @@ Save as a Skill memory doc via `memory_write(target="memory", content=skill_prom
     "content_hash": ""
   }
   ```
+
+Do NOT use `memory_write` for skill docs — it cannot set title/doc_type/metadata, and the skill will not be visible to `__list_skills__`.
 
 ## Process
 

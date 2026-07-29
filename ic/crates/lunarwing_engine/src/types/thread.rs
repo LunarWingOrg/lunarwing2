@@ -40,7 +40,7 @@ impl Default for ThreadId {
 /// ```text
 /// Created → Running → Waiting → Running (resume)
 ///                   → Suspended → Running (resume)
-///                   → Completed → Done
+///                   → Completed → Done | Failed
 ///                   → Failed
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -82,6 +82,7 @@ impl ThreadState {
             | (Self::Suspended, Self::Failed)
             // From Completed
             | (Self::Completed, Self::Done)
+            | (Self::Completed, Self::Failed)
         )
     }
 
@@ -412,6 +413,11 @@ mod tests {
     #[test]
     fn completed_can_transition_to_done() {
         assert!(ThreadState::Completed.can_transition_to(ThreadState::Done));
+    }
+
+    #[test]
+    fn completed_can_transition_to_failed_during_finalization() {
+        assert!(ThreadState::Completed.can_transition_to(ThreadState::Failed));
     }
 
     #[test]

@@ -238,6 +238,7 @@ impl ConversationManager {
                         user_id,
                         history,
                         preferred_thread_id,
+                        None,
                     )
                     .await?;
 
