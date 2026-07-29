@@ -65,6 +65,15 @@ Local and Docker `create_job` workers default to 200 tool-call iterations. Set
 `max_iterations: 300` (up to 500) for large multi-fix write tasks. Named
 external workers manage their own iteration policy and reject this option.
 
+### Skills and self-improvement
+
+Skills extend the agent with reusable prompt-driven capabilities. When
+`SKILL_SELF_IMPROVEMENT` is enabled, learning missions can extract reusable
+Skill documents from completed threads: terminal thread events fire the
+missions with their trigger payload, and the results persist into workspace
+memory. Skill patches and prunes remain propose-only until explicit user
+approval.
+
 ### Model providers
 
 | Provider path | Intended use |
