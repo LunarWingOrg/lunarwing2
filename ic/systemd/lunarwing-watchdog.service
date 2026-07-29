@@ -1,6 +1,6 @@
 [Unit]
 Description=LunarWing service watchdog
-Documentation=https://github.com/LunarWingOrg/lunarwing
+Documentation=https://git.lunarwing.org/lunarwing/lunarwing2
 
 [Service]
 Type=oneshot

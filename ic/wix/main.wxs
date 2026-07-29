@@ -173,7 +173,7 @@
         <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
         <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
 
-        <Property Id='ARPHELPLINK' Value='https://github.com/LunarWingOrg/lunarwing'/>
+        <Property Id='ARPHELPLINK' Value='https://git.lunarwing.org/lunarwing/lunarwing2'/>
         
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>
