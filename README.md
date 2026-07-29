@@ -55,7 +55,7 @@ DarkIRC is opt-in. It is neither rendered nor built for a new tenant unless the 
 
 ### External workers
 
-LunarWing can attach persistent NanoCode, Pebble, or OpenCode worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant.
+LunarWing can attach persistent NanoCode, Pebble, OpenCode, or Kimi Code worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant.
 
 External `create_job` calls default to no conversation history. Set
 `context_scope: "recent"` to send bounded user/assistant messages from current
@@ -158,8 +158,8 @@ See the [Python onboarding CLI reference](lunarwing_mt_onboard/README.md) for re
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh doctor
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-opencode
-sudo ic/scripts/lunarwing-mt-admin.sh build-tenant ruffles --with-wasm --with-opencode
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-opencode --with-kimi
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant ruffles --with-wasm --with-opencode --with-kimi
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant ruffles
 sudo ic/scripts/lunarwing-mt-admin.sh status ruffles
 ```

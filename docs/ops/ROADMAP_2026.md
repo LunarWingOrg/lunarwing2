@@ -8,7 +8,7 @@ Add
 
 ### update opencode to new version
 
-### add kimicode harness!
+### add kimicode harness! — DONE v2.0.3.0
 
 | Feature | Target |
 |---------|--------|
@@ -38,4 +38,3 @@ Add
 | A surprise | v2.1.0 |
 
 ---
-

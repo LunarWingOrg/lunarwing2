@@ -15,6 +15,7 @@ TOOLCHAIN = ROOT / "ic" / "rust-toolchain.toml"
 WORKSPACE_MANIFEST = ROOT / "ic" / "Cargo.toml"
 DEFAULTS = ROOT / ".gitlab" / "ci" / "defaults.yml"
 OPENCODE_DOCKERFILE = ROOT / "opencode4lunarwing" / "Dockerfile"
+KIMI_DOCKERFILE = ROOT / "kimicode4lunarwing" / "Dockerfile"
 EXPECTED_RUST_VERSION = "1.96.1"
 EXPECTED_INCLUDES = [
     "/.gitlab/ci/workflow.yml",
@@ -135,6 +136,17 @@ def main() -> int:
             )
     else:
         errors.append("opencode4lunarwing/Dockerfile missing")
+
+    if KIMI_DOCKERFILE.is_file():
+        dockerfile_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
+        toolchain_match = re.search(r"--default-toolchain\s+([^\s\\]+)", dockerfile_text)
+        if toolchain_match and toolchain_match.group(1) != EXPECTED_RUST_VERSION:
+            errors.append(
+                "kimicode4lunarwing/Dockerfile Rust toolchain "
+                f"{toolchain_match.group(1)!r} != expected {EXPECTED_RUST_VERSION!r}"
+            )
+    else:
+        errors.append("kimicode4lunarwing/Dockerfile missing")
 
     if rust_image is not None:
         rust_tag, rust_digest = rust_image

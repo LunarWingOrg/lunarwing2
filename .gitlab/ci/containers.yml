@@ -79,3 +79,20 @@ worker-opencode-image:
       changes:
         - opencode4lunarwing/**/*
     - when: manual
+
+worker-kimi-image:
+  extends: .container-job
+  variables:
+    KIMI_CODE_VERSION: "0.30.0"
+  script:
+    - /kaniko/executor
+      --context "$CI_PROJECT_DIR/kimicode4lunarwing"
+      --dockerfile "$CI_PROJECT_DIR/kimicode4lunarwing/Dockerfile"
+      --build-arg "KIMI_CODE_VERSION=$KIMI_CODE_VERSION"
+      --destination "$CI_REGISTRY_IMAGE/worker-kimi:$CI_COMMIT_SHORT_SHA"
+      --destination "$CI_REGISTRY_IMAGE/worker-kimi:latest"
+  rules:
+    - if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+      changes:
+        - kimicode4lunarwing/**/*
+    - when: manual

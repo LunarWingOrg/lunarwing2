@@ -170,6 +170,12 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
         args.extend(["--opencode-model", config.opencode_model])
     if config.opencode_base_url:
         args.extend(["--opencode-base-url", config.opencode_base_url])
+    if config.kimi_model:
+        args.extend(["--kimi-model", config.kimi_model])
+    if config.kimi_base_url:
+        args.extend(["--kimi-base-url", config.kimi_base_url])
+    if config.kimi_api_key:
+        args.extend(["--kimi-api-key", config.kimi_api_key])
     if config.enable_darkirc:
         args.append("--enable-darkirc")
     # Persist the tenant's external-worker selection at add-tenant so
@@ -183,6 +189,8 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
         args.append("--with-pebble")
     if WorkerType.OPENCODE in config.workers:
         args.append("--with-opencode")
+    if WorkerType.KIMI in config.workers:
+        args.append("--with-kimi")
     if config.no_ssh:
         args.append("--no-ssh")
     if config.no_health:
@@ -202,6 +210,8 @@ def build_build_tenant_args(config: "TenantConfig") -> list[str]:
         args.append("--with-pebble")
     if WorkerType.OPENCODE in config.workers:
         args.append("--with-opencode")
+    if WorkerType.KIMI in config.workers:
+        args.append("--with-kimi")
     if config.toolchains:
         args.append("--with-toolchains")
     return args

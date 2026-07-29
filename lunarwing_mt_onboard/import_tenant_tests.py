@@ -28,6 +28,7 @@ class TestImportConfigSerialization(unittest.TestCase):
             with_nanocode=True,
             with_pebble=True,
             with_opencode=True,
+            with_kimi=True,
             with_toolchains=True,
             with_vision=True,
             docker_group=True,
@@ -156,6 +157,7 @@ class TestImportArgs(unittest.TestCase):
                 with_nanocode=True,
                 with_pebble=True,
                 with_opencode=True,
+                with_kimi=True,
                 with_toolchains=True,
                 with_vision=True,
                 docker_group=True,
@@ -170,6 +172,7 @@ class TestImportArgs(unittest.TestCase):
         self.assertIn("--with-nanocode", args)
         self.assertIn("--with-pebble", args)
         self.assertIn("--with-opencode", args)
+        self.assertIn("--with-kimi", args)
         self.assertIn("--with-toolchains", args)
         self.assertIn("--with-vision", args)
         self.assertIn("--docker-group", args)
