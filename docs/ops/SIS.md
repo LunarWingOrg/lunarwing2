@@ -1,3 +1,7 @@
+> **Resolved 2026-07-29:** See
+> [`SELF_IMPROVING_SKILLS_REPAIR_PROPOSAL.md`](SELF_IMPROVING_SKILLS_REPAIR_PROPOSAL.md)
+> for source findings, implementation, tests, and remaining limits.
+
 [02:31:03] [02:30:00] ## Skill Extraction Mission — Thread #2
 
 Status: No trigger payload propagated to state. last_trigger_payload in mission.json is null. This is thread #2 of 3 allowed today (2026-07-29).
