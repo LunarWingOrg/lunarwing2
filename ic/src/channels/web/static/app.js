@@ -113,10 +113,14 @@ const CAVEPONY_MODES = {
 
 // --- Frame-coalesced rendering state ---
 let _streamBuffer = '';
+let _streamParts = [];
 let _streamRenderFrame = null;
 let _streamingMessage = null;
 let _streamingThreadId = null;
+const _streamSnapshots = new Map();
 let _chatScrollFrame = null;
+let _chatAutoScroll = true;
+let _chatScrollForced = false;
 let _codeHighlightFrame = null;
 const _codeHighlightRoots = new Set();
 
@@ -210,8 +214,6 @@ function authenticate() {
       startGatewayStatusPolling();
       checkTeeStatus();
       loadThreads();
-      loadMemoryTree();
-      loadJobs();
       loadCaveponyMode();
       // Apply URL log_level param if present, otherwise just sync the dropdown
       if (urlLogLevel) {
@@ -481,7 +483,10 @@ function updateRestartButtonVisibility() {
 
 function connectSSE() {
   if (eventSource) eventSource.close();
-  resetStreamingState();
+  if (!hasActiveStreamForThread(currentThreadId)) {
+    if (_streamingThreadId) stashStreamingState();
+    else resetStreamingState();
+  }
 
   eventSource = new EventSource('/api/chat/events?token=' + encodeURIComponent(token));
 
@@ -497,15 +502,10 @@ function connectSSE() {
     }
     const lostBanner = document.getElementById('connection-banner');
     if (lostBanner) {
-      const wasDisconnectedLong = _connectionLostAt && (Date.now() - _connectionLostAt > 10000);
       lostBanner.textContent = 'Reconnected';
       lostBanner.className = 'connection-banner connection-banner-success';
       setTimeout(() => { lostBanner.remove(); }, 2000);
       _connectionLostAt = null;
-      // If disconnected >10s, reload chat history to catch missed messages
-      if (wasDisconnectedLong && currentThreadId) {
-        loadHistory();
-      }
     }
 
     // If we were restarting, close the modal and reset button now that server is back
@@ -521,6 +521,8 @@ function connectSSE() {
 
     if (sseHasConnectedBefore && currentThreadId) {
       finalizeActivityGroup();
+      // Reconcile events missed during disconnect. loadHistory() snapshots and
+      // restores any response still streaming for this thread.
       loadHistory();
     }
     sseHasConnectedBefore = true;
@@ -554,7 +556,7 @@ function connectSSE() {
   eventSource.addEventListener('response', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) {
-      if (_streamingThreadId === data.thread_id) resetStreamingState();
+      clearStreamingSnapshot(data.thread_id);
       if (data.thread_id) {
         unreadThreads.set(data.thread_id, (unreadThreads.get(data.thread_id) || 0) + 1);
         debouncedLoadThreads();
@@ -629,6 +631,9 @@ function connectSSE() {
   eventSource.addEventListener('status', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) {
+      if (data.message === 'Done' || data.message === 'Awaiting approval') {
+        clearStreamingSnapshot(data.thread_id);
+      }
       if (data.thread_id) debouncedLoadThreads();
       return;
     }
@@ -686,8 +691,11 @@ function connectSSE() {
   eventSource.addEventListener('error', (e) => {
     if (e.data) {
       const data = JSON.parse(e.data);
-      if (!isCurrentThread(data.thread_id)) return;
-      resetStreamingState();
+      if (!isCurrentThread(data.thread_id)) {
+        clearStreamingSnapshot(data.thread_id);
+        return;
+      }
+      clearStreamingSnapshot(data.thread_id);
       finalizeActivityGroup();
       addMessage('system', 'Error: ' + data.message);
       enableChatInput();
@@ -821,6 +829,7 @@ function sendMessage() {
   const content = input.value.trim();
   if (!content && stagedImages.length === 0) return;
 
+  _chatAutoScroll = true;
   const userMsg = addMessage('user', content || '(images attached)');
   input.value = '';
   autoResizeTextarea(input);
@@ -1129,10 +1138,12 @@ function copyCodeBlock(btn) {
 function copyMessage(btn) {
   const message = btn.closest('.message');
   if (!message) return;
-  const text = message.getAttribute('data-copy-text')
-    || message.getAttribute('data-raw')
-    || message.textContent
-    || '';
+  const text = message === _streamingMessage
+    ? currentStreamingText()
+    : message.getAttribute('data-copy-text')
+      || message.getAttribute('data-raw')
+      || message.textContent
+      || '';
   navigator.clipboard.writeText(text).then(() => {
     btn.textContent = 'Copied';
     setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
@@ -1165,12 +1176,23 @@ function maybeInsertTimeSeparator(container, timestamp) {
   container.appendChild(sep);
 }
 
-function scheduleChatScrollToBottom() {
+function isChatNearBottom(container) {
+  return container.scrollHeight - container.scrollTop - container.clientHeight <= 80;
+}
+
+function scheduleChatScrollToBottom(force) {
+  if (force) _chatScrollForced = true;
+  if (!force && !_chatAutoScroll) return;
   if (_chatScrollFrame !== null) return;
   _chatScrollFrame = requestAnimationFrame(() => {
     _chatScrollFrame = null;
     const container = document.getElementById('chat-messages');
-    if (container) container.scrollTop = container.scrollHeight;
+    const shouldScroll = _chatScrollForced || _chatAutoScroll;
+    _chatScrollForced = false;
+    if (container && shouldScroll) {
+      container.scrollTop = container.scrollHeight;
+      _chatAutoScroll = true;
+    }
   });
 }
 
@@ -1204,9 +1226,35 @@ function resetStreamingState() {
     _streamRenderFrame = null;
   }
   _streamBuffer = '';
+  _streamParts = [];
   if (_streamingMessage) _streamingMessage.removeAttribute('data-streaming');
   _streamingMessage = null;
   _streamingThreadId = null;
+}
+
+function currentStreamingText() {
+  return _streamParts.join('') + _streamBuffer;
+}
+
+function hasActiveStreamForThread(threadId) {
+  return !!(
+    threadId
+    && _streamingThreadId === threadId
+    && _streamingMessage?.isConnected
+  );
+}
+
+function stashStreamingState() {
+  if (_streamingThreadId) {
+    _streamSnapshots.set(_streamingThreadId, currentStreamingText());
+  }
+  resetStreamingState();
+}
+
+function clearStreamingSnapshot(threadId) {
+  if (!threadId) return;
+  _streamSnapshots.delete(threadId);
+  if (_streamingThreadId === threadId) resetStreamingState();
 }
 
 function getOrCreateStreamingMessage(threadId) {
@@ -1214,12 +1262,17 @@ function getOrCreateStreamingMessage(threadId) {
     return _streamingMessage;
   }
 
-  resetStreamingState();
+  if (_streamingThreadId) stashStreamingState();
+  else resetStreamingState();
+
+  const initialText = _streamSnapshots.get(threadId) || '';
+  _streamSnapshots.delete(threadId);
   const container = document.getElementById('chat-messages');
   maybeInsertTimeSeparator(container);
-  const message = createMessageElement('assistant', '', { plainText: true });
+  const message = createMessageElement('assistant', initialText, { plainText: true, streaming: true });
   message.setAttribute('data-streaming', 'true');
   container.appendChild(message);
+  _streamParts = initialText ? [initialText] : [];
   _streamingMessage = message;
   _streamingThreadId = threadId;
   scheduleChatScrollToBottom();
@@ -1230,9 +1283,7 @@ function flushStreamBuffer() {
   if (!_streamBuffer || !_streamingMessage?.isConnected) return;
   const chunk = _streamBuffer;
   _streamBuffer = '';
-  const raw = (_streamingMessage.getAttribute('data-raw') || '') + chunk;
-  _streamingMessage.setAttribute('data-raw', raw);
-  _streamingMessage.setAttribute('data-copy-text', raw);
+  _streamParts.push(chunk);
   const content = _streamingMessage.querySelector('.message-content');
   if (content?.firstChild) {
     content.firstChild.appendData(chunk);
@@ -1251,23 +1302,24 @@ function scheduleStreamRender() {
 }
 
 function finalizeStreamingMessage(threadId, content) {
+  _streamSnapshots.delete(threadId);
   if (!_streamingMessage?.isConnected || _streamingThreadId !== threadId) {
-    resetStreamingState();
     return false;
   }
 
   if (_streamRenderFrame !== null) cancelAnimationFrame(_streamRenderFrame);
   const message = _streamingMessage;
-  const streamedText = (message.getAttribute('data-raw') || '') + _streamBuffer;
+  const streamedText = currentStreamingText();
   const finalText = typeof content === 'string' ? content : streamedText;
   _streamRenderFrame = null;
   _streamBuffer = '';
+  _streamParts = [];
   _streamingMessage = null;
   _streamingThreadId = null;
 
   message.removeAttribute('data-streaming');
   message.setAttribute('data-raw', finalText);
-  message.setAttribute('data-copy-text', finalText);
+  message.removeAttribute('data-copy-text');
   const contentElement = message.querySelector('.message-content');
   if (contentElement) {
     contentElement.innerHTML = renderMarkdown(finalText);
@@ -1900,14 +1952,20 @@ function loadHistory(before) {
   }
 
   const isPaginating = !!before;
+  const preserveActiveStream = !isPaginating && hasActiveStreamForThread(requestedThreadId);
   if (isPaginating) loadingOlder = true;
 
   // Show skeleton while loading (only for fresh loads)
   if (!isPaginating) {
-    resetStreamingState();
-    const chatContainer = document.getElementById('chat-messages');
-    chatContainer.innerHTML = '';
-    chatContainer.appendChild(renderSkeleton('message', 3));
+    _lastMessageDate = null;
+    if (!preserveActiveStream) {
+      _chatAutoScroll = true;
+      if (_streamingThreadId) stashStreamingState();
+      else resetStreamingState();
+      const chatContainer = document.getElementById('chat-messages');
+      chatContainer.innerHTML = '';
+      chatContainer.appendChild(renderSkeleton('message', 3));
+    }
   }
 
   apiFetch(historyUrl).then((data) => {
@@ -1915,6 +1973,11 @@ function loadHistory(before) {
     const container = document.getElementById('chat-messages');
 
     if (!isPaginating) {
+      const preservedScrollTop = preserveActiveStream ? container.scrollTop : null;
+      // Chunks may have arrived while history was loading. Keep latest text
+      // before replacing current DOM in one mutation.
+      if (_streamingThreadId) stashStreamingState();
+
       // Fresh load: build off-DOM, then replace the skeleton in one mutation.
       const fragment = document.createDocumentFragment();
       for (const turn of data.turns) {
@@ -1938,13 +2001,22 @@ function loadHistory(before) {
       // Show processing indicator if the last turn is still in-progress
       var lastTurn = data.turns.length > 0 ? data.turns[data.turns.length - 1] : null;
       if (lastTurn && !lastTurn.response && lastTurn.state === 'Processing') {
-        showActivityThinking('Processing...');
+        if (_streamSnapshots.has(requestedThreadId)) {
+          getOrCreateStreamingMessage(requestedThreadId);
+        } else {
+          showActivityThinking('Processing...');
+        }
+      } else {
+        _streamSnapshots.delete(requestedThreadId);
       }
       // Re-render pending approval card if the thread is awaiting approval
       if (data.pending_approval) {
         showApproval(data.pending_approval);
       }
-      scheduleChatScrollToBottom();
+      if (preservedScrollTop !== null && !_chatAutoScroll) {
+        container.scrollTop = preservedScrollTop;
+      }
+      scheduleChatScrollToBottom(!preserveActiveStream);
     } else {
       // Pagination: prepend older messages
       const savedHeight = container.scrollHeight;
@@ -1995,7 +2067,7 @@ function createMessageElement(role, content, options) {
   if (role === 'user' || role === 'system') {
     contentEl.textContent = content;
   } else {
-    div.setAttribute('data-raw', content);
+    if (!options?.streaming) div.setAttribute('data-raw', content);
     if (options?.plainText) {
       contentEl.textContent = content;
     } else {
@@ -2007,7 +2079,7 @@ function createMessageElement(role, content, options) {
 
   if (role === 'assistant' || role === 'user') {
     div.classList.add('has-copy');
-    div.setAttribute('data-copy-text', content);
+    if (role === 'user') div.setAttribute('data-copy-text', content);
     const copyBtn = document.createElement('button');
     copyBtn.className = 'message-copy-btn';
     copyBtn.type = 'button';
@@ -2291,6 +2363,7 @@ function switchThread(threadId) {
 
 function createNewThread() {
   apiFetch('/api/chat/thread/new', { method: 'POST' }).then((data) => {
+    if (_streamingThreadId) stashStreamingState();
     currentThreadId = data.id || null;
     document.getElementById('chat-messages').innerHTML = '';
     showWelcomeCard();
@@ -2391,6 +2464,7 @@ chatInput.addEventListener('blur', () => {
 
 // Infinite scroll: load older messages when scrolled near the top
 document.getElementById('chat-messages').addEventListener('scroll', function () {
+  _chatAutoScroll = isChatNearBottom(this);
   if (this.scrollTop < 100 && hasMore && !loadingOlder) {
     loadingOlder = true;
     // Show spinner at top
@@ -2440,7 +2514,10 @@ function switchTab(tab) {
   if (tab === 'memory') loadMemoryTree();
   if (tab === 'jobs') loadJobs();
   if (tab === 'routines') loadRoutines();
-  if (tab === 'logs') scheduleLogFilters();
+  if (tab === 'logs') {
+    flushDeferredLogEntries();
+    scheduleLogFilters();
+  }
   if (tab === 'settings') {
     loadSettingsSubtab(currentSettingsSubtab);
   } else {
@@ -2722,9 +2799,15 @@ function highlightQuery(text, query) {
 const LOG_MAX_ENTRIES = 2000;
 let logsPaused = false;
 let logBuffer = []; // buffer while paused
+let _deferredLogEntries = [];
 let _pendingLogEntries = [];
 let _logRenderFrame = null;
 let _logFilterFrame = null;
+
+function appendCappedLogEntry(buffer, entry) {
+  buffer.push(entry);
+  if (buffer.length > LOG_MAX_ENTRIES) buffer.shift();
+}
 
 function connectLogSSE() {
   if (logEventSource) logEventSource.close();
@@ -2734,8 +2817,7 @@ function connectLogSSE() {
   logEventSource.addEventListener('log', (e) => {
     const entry = JSON.parse(e.data);
     if (logsPaused) {
-      logBuffer.push(entry);
-      if (logBuffer.length > LOG_MAX_ENTRIES) logBuffer.shift();
+      appendCappedLogEntry(logBuffer, entry);
       return;
     }
     queueLogEntry(entry);
@@ -2793,6 +2875,14 @@ function flushLogEntries() {
   _logRenderFrame = null;
   if (_pendingLogEntries.length === 0) return;
 
+  if (currentTab !== 'logs') {
+    for (const entry of _pendingLogEntries) {
+      appendCappedLogEntry(_deferredLogEntries, entry);
+    }
+    _pendingLogEntries = [];
+    return;
+  }
+
   const output = document.getElementById('logs-output');
   const entries = _pendingLogEntries;
   _pendingLogEntries = [];
@@ -2817,14 +2907,24 @@ function flushLogEntries() {
 }
 
 function queueLogEntry(entry) {
-  _pendingLogEntries.push(entry);
-  if (_pendingLogEntries.length > LOG_MAX_ENTRIES) _pendingLogEntries.shift();
+  if (currentTab !== 'logs') {
+    appendCappedLogEntry(_deferredLogEntries, entry);
+    return;
+  }
+  appendCappedLogEntry(_pendingLogEntries, entry);
   if (_logRenderFrame !== null) return;
   _logRenderFrame = requestAnimationFrame(flushLogEntries);
 }
 
 function queueLogEntries(entries) {
   for (const entry of entries) queueLogEntry(entry);
+}
+
+function flushDeferredLogEntries() {
+  if (_deferredLogEntries.length === 0) return;
+  const entries = _deferredLogEntries;
+  _deferredLogEntries = [];
+  queueLogEntries(entries);
 }
 
 function toggleLogsPause() {
@@ -2847,6 +2947,7 @@ function clearLogs() {
   if (!confirm('Clear all logs?')) return;
   document.getElementById('logs-output').innerHTML = '';
   logBuffer = [];
+  _deferredLogEntries = [];
   _pendingLogEntries = [];
   if (_logRenderFrame !== null) cancelAnimationFrame(_logRenderFrame);
   _logRenderFrame = null;

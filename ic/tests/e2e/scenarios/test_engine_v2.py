@@ -217,3 +217,51 @@ async def test_engine_v2_interrupts_long_stream_and_recovers_same_thread(
     calls = await _mock_calls(mock_llm_server)
     assert calls["long_stream"] == 1
     assert calls["recovery"] == 1
+
+
+async def test_engine_v2_stream_survives_reconnect_and_thread_switch(
+    engine_v2_page,
+    mock_llm_server,
+):
+    await _reset_mock(mock_llm_server)
+    await engine_v2_page.wait_for_function("currentThreadId !== null", timeout=5000)
+    original_thread = await engine_v2_page.evaluate("currentThreadId")
+
+    await _send(engine_v2_page, LONG_STREAM)
+    await _wait_for_assistant_text(engine_v2_page, "engine-v2 long partial", timeout=5000)
+
+    async with engine_v2_page.expect_response(
+        lambda response: "/api/chat/history?" in response.url
+    ):
+        await engine_v2_page.evaluate("eventSource.close(); connectSSE()")
+    await engine_v2_page.wait_for_function(
+        "document.getElementById('sse-status').textContent === 'Connected'",
+        timeout=5000,
+    )
+    await engine_v2_page.wait_for_function(
+        """
+        () => {
+          const message = document.querySelector('#chat-messages .message.assistant[data-streaming="true"]');
+          return (message?.textContent || '').includes('engine-v2 long partial');
+        }
+        """,
+        timeout=2000,
+    )
+
+    other_thread = await engine_v2_page.evaluate(
+        "apiFetch('/api/chat/thread/new', {method: 'POST'}).then(data => data.id)"
+    )
+    await engine_v2_page.evaluate("threadId => switchThread(threadId)", other_thread)
+    await engine_v2_page.evaluate("threadId => switchThread(threadId)", original_thread)
+    await engine_v2_page.wait_for_function(
+        """
+        () => {
+          const message = document.querySelector('#chat-messages .message.assistant[data-streaming="true"]');
+          return (message?.textContent || '').includes('engine-v2 long partial');
+        }
+        """,
+        timeout=3000,
+    )
+
+    await _send(engine_v2_page, "/interrupt")
+    await _wait_for_assistant_text(engine_v2_page, "Interrupted.", timeout=2000)
