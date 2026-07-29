@@ -102,6 +102,7 @@ Deployment, operations, multitenancy, and production guides.
 | [`KUMOGAKURE_INSTRUCT.md`](ops/KUMOGAKURE_INSTRUCT.md) | Pointer to the external Notes vault |
 | [`AGENT_GOALS_2.0.3.0.md`](ops/AGENT_GOALS_2.0.3.0.md) | Agent-assigned pre-release checklist for LunarWing v2.0.3.0 |
 | [`CICD_LOGIC_REVIEW.md`](ops/CICD_LOGIC_REVIEW.md) | GitLab CI/CD logic review, resolved priority findings, and remaining hardening suggestions |
+| [`CODENAME_IDEAS_v2.0.3.0.md`](ops/CODENAME_IDEAS_v2.0.3.0.md) | Release codename candidates for v2.0.3.0 with English context and top picks |
 | [`CRATE_AUDIT_STATUS.md`](ops/CRATE_AUDIT_STATUS.md) | v2.0.2.0 workspace and satellite-crate dependency audit status |
 | [`CRATE_AUDIT_v2.0.3.0.md`](ops/CRATE_AUDIT_v2.0.3.0.md) | v2.0.3.0 dependency audit, applied updates, and deferred major-version upgrades |
 | [`CRL.MD`](ops/CRL.MD) | CRL 4.1.1.6 reference stub |
@@ -128,6 +129,7 @@ Deployment, operations, multitenancy, and production guides.
 | [`WEECHAT_SERVICES_FOR_MT_INFODUMP.md`](ops/WEECHAT_SERVICES_FOR_MT_INFODUMP.md) | Historical WeeChat multi-tenant services infodump superseded by the active operations guide |
 | [`WEECHAT_SERVICES_VERIFICATION.md`](ops/WEECHAT_SERVICES_VERIFICATION.md) | Verification report for the historical WeeChat services infodump and resolved discrepancies |
 | [`XMPP_FT_REVIEW_A.md`](ops/XMPP_FT_REVIEW_A.md) | XMPP file-transfer and LunarVision review covering verified behavior and security findings |
+| [`XMPP_FT_REVIEW_R.md`](ops/XMPP_FT_REVIEW_R.md) | Independent XMPP file-transfer hardening review with severity-ranked findings |
 
 Versioned release notes live in [`releases/`](releases/). Shipped per-release prep checklists are
 archived in [`ops/history/`](ops/history/).
