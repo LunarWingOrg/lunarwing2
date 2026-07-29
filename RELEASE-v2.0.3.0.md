@@ -21,12 +21,13 @@ the background.
 The release also replaces the proprietary Cloudflare/ngrok/tailscale tunnel
 providers with a self-hosted NetBird provider, hardens DarkIRC outbound delivery
 with a paced adapter outbox, completes the WeeChat buffer-restore handoff that
-v2.0.2.0 left broken, adds bounded context and retry logic to external workers,
-makes the web gateway UI keep streaming answers across thread switches and
-reconnects while rendering faster, introduces Study Notes as a read/write skill
-with an MCP integration, repairs the self-improving skills pipeline so learning
-missions actually fire and persist extracted skills, and refreshes architecture
-docs, bug docs, and the docs README index against current source.
+v2.0.2.0 left broken, adds bounded context and retry logic to external workers
+and a fourth persistent worker option (Kimi Code), makes the web gateway UI keep
+streaming answers across thread switches and reconnects while rendering faster,
+introduces Study Notes as a read/write skill with an MCP integration, repairs
+the self-improving skills pipeline so learning missions actually fire and
+persist extracted skills, and refreshes architecture docs, bug docs, and the
+docs README index against current source.
 
 The release, tag, and this document use `2.0.3.0`.
 
