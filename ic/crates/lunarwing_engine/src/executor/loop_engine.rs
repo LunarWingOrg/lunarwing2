@@ -22,7 +22,8 @@ use crate::types::message::ThreadMessage;
 use crate::types::step::Step;
 use crate::types::thread::{Thread, ThreadState};
 
-const RUNTIME_CHECKPOINT_METADATA_KEY: &str = "runtime_checkpoint";
+pub(crate) const RUNTIME_CHECKPOINT_METADATA_KEY: &str = "runtime_checkpoint";
+pub(crate) const INITIAL_PERSISTED_STATE_METADATA_KEY: &str = "initial_persisted_state";
 
 /// Persisted state from a prior execution, used to resume threads.
 /// The Python orchestrator manages loop counters internally; Rust only
@@ -155,8 +156,25 @@ impl ExecutionLoop {
         self.thread.updated_at = chrono::Utc::now();
     }
 
+    /// Transition thread state and broadcast the `StateChanged` event so
+    /// subscribers (e.g. the mission event listener) observe it. Unlike
+    /// `emit_event`, this validates the transition via `Thread::transition_to`.
+    fn transition_to_broadcast(
+        &mut self,
+        new_state: crate::types::thread::ThreadState,
+        reason: Option<String>,
+    ) -> Result<(), EngineError> {
+        self.thread.transition_to(new_state, reason)?;
+        if let Some(ref tx) = self.event_tx
+            && let Some(event) = self.thread.events.last()
+        {
+            let _ = tx.send(event.clone());
+        }
+        Ok(())
+    }
+
     fn load_runtime_checkpoint(&self) -> RuntimeCheckpoint {
-        let persisted_state = self
+        let mut persisted_state = self
             .thread
             .metadata
             .get(RUNTIME_CHECKPOINT_METADATA_KEY)
@@ -164,12 +182,28 @@ impl ExecutionLoop {
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
 
+        if !persisted_state.is_object() {
+            persisted_state = serde_json::json!({});
+        }
+        if let Some(initial_state) = self
+            .thread
+            .metadata
+            .get(INITIAL_PERSISTED_STATE_METADATA_KEY)
+            .and_then(serde_json::Value::as_object)
+            && let Some(state) = persisted_state.as_object_mut()
+        {
+            for (key, value) in initial_state {
+                state.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+
         RuntimeCheckpoint { persisted_state }
     }
 
     fn clear_runtime_checkpoint(&mut self) {
         if let Some(metadata) = self.thread.metadata.as_object_mut() {
             metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
+            metadata.remove(INITIAL_PERSISTED_STATE_METADATA_KEY);
         }
         self.thread.updated_at = chrono::Utc::now();
     }
@@ -349,7 +383,9 @@ impl ExecutionLoop {
                 }
                 let _ = &orch_result.tokens_used;
 
-                self.clear_runtime_checkpoint();
+                if !matches!(orch_result.outcome, ThreadOutcome::GatePaused { .. }) {
+                    self.clear_runtime_checkpoint();
+                }
                 self.persist_runtime_state(None, &mut persisted_event_count)
                     .await?;
                 Ok(orch_result.outcome)
@@ -387,7 +423,7 @@ impl ExecutionLoop {
                     && self.thread.state != ThreadState::Failed
                     && self.thread.state != ThreadState::Done
                 {
-                    let _ = self.thread.transition_to(
+                    let _ = self.transition_to_broadcast(
                         ThreadState::Failed,
                         Some(format!("orchestrator error: {e}")),
                     );
@@ -701,6 +737,61 @@ mod tests {
     }
 
     // ── Tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn gate_pause_preserves_initial_trigger_payload() {
+        let gate_error = EngineError::GatePaused {
+            gate_name: "approval".into(),
+            action_name: "test_tool".into(),
+            call_id: "call-1".into(),
+            parameters: Box::new(serde_json::json!({})),
+            resume_kind: Box::new(crate::gate::ResumeKind::Approval {
+                allow_always: false,
+            }),
+            resume_output: None,
+        };
+        let (mut exec, _signal_tx) = make_loop(
+            vec![action_response("test_tool", "call-1")],
+            vec![Err(gate_error)],
+            ThreadConfig::default(),
+        )
+        .await;
+        exec.thread.metadata = serde_json::json!({
+            INITIAL_PERSISTED_STATE_METADATA_KEY: {
+                "trigger_payload": {"source_thread_id": "source-1"}
+            }
+        });
+
+        let outcome = exec.run().await.expect("gate pause should be an outcome");
+
+        assert!(matches!(outcome, ThreadOutcome::GatePaused { .. }));
+        assert_eq!(
+            exec.thread
+                .metadata
+                .pointer("/runtime_checkpoint/persisted_state/trigger_payload/source_thread_id"),
+            Some(&serde_json::json!("source-1"))
+        );
+        assert!(
+            exec.thread
+                .metadata
+                .get(INITIAL_PERSISTED_STATE_METADATA_KEY)
+                .is_some()
+        );
+
+        exec.clear_runtime_checkpoint();
+        assert!(
+            exec.thread
+                .metadata
+                .get(RUNTIME_CHECKPOINT_METADATA_KEY)
+                .is_none()
+        );
+        assert!(
+            exec.thread
+                .metadata
+                .get(INITIAL_PERSISTED_STATE_METADATA_KEY)
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn channel_context_is_injected_into_system_prompt() {

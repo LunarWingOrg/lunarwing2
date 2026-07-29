@@ -76,6 +76,27 @@ Agent-facing dispatch uses `create_job(title: "...", description: "...", mode: "
 
 Multi-tenant worker configuration sets the task deadline to `3600000ms` (one hour), configurable for new tenant entries with `LUNARWING_MT_EXTERNAL_WORKER_TIMEOUT_MS`. Re-running mt-admin migrates exact legacy `300000ms` entries; set `LUNARWING_MT_MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS=false` to preserve an intentional five-minute value. External jobs default to asynchronous dispatch (`wait=false`) so they outlive the current conversation turn; completion and progress remain available through job events/status. Explicit `wait=true` remains available for short tasks, but synchronous execution is still bounded by the parent conversation deadline.
 
+## Kimi Code Worker
+
+MoonshotAI/kimi-code is integrated as a persistent LunarWing external worker. A Node.js/TypeScript bridge spawns a `kimi -p` subprocess for each task and translates its streamed output to the `lunarwing-agent-v1` WebSocket protocol. Health is exposed on 8443 and WebSocket traffic on 9090.
+
+**Dockerfile:** `kimicode4lunarwing/Dockerfile`
+
+```bash
+cd kimicode4lunarwing
+docker build -t lunarwing-worker-kimi:latest .
+
+# Or via the mt-admin lifecycle
+sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker
+
+# Or as part of tenant provisioning and build
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-kimi
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <name> --with-kimi
+
+# Configure per-tenant provider settings
+sudo ic/scripts/lunarwing-mt-admin.sh configure-kimi <name> --model <model> --base-url <url> --api-key <key>
+```
+
 ## OpenCode Worker (old section)
 
 Bun-based upstream opencode agent (sst/opencode). Runs opencode headless server internally (port 4096) with a TypeScript bridge to the WebSocket protocol. Health on 8443, WebSocket on 9090.

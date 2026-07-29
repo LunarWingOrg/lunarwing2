@@ -55,7 +55,7 @@ DarkIRC is opt-in. It is neither rendered nor built for a new tenant unless the 
 
 ### External workers
 
-LunarWing can attach persistent NanoCode, Pebble, or OpenCode worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant.
+LunarWing can attach persistent NanoCode, Pebble, OpenCode, or Kimi Code worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant.
 
 External `create_job` calls default to no conversation history. Set
 `context_scope: "recent"` to send bounded user/assistant messages from current
@@ -64,6 +64,15 @@ thread as untrusted reference context; task description remains authoritative.
 Local and Docker `create_job` workers default to 200 tool-call iterations. Set
 `max_iterations: 300` (up to 500) for large multi-fix write tasks. Named
 external workers manage their own iteration policy and reject this option.
+
+### Skills and self-improvement
+
+Skills extend the agent with reusable prompt-driven capabilities. When
+`SKILL_SELF_IMPROVEMENT` is enabled, learning missions can extract reusable
+Skill documents from completed threads: terminal thread events fire the
+missions with their trigger payload, and the results persist into workspace
+memory. Skill patches and prunes remain propose-only until explicit user
+approval.
 
 ### Model providers
 
@@ -149,8 +158,8 @@ See the [Python onboarding CLI reference](lunarwing_mt_onboard/README.md) for re
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh doctor
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-opencode
-sudo ic/scripts/lunarwing-mt-admin.sh build-tenant ruffles --with-wasm --with-opencode
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-opencode --with-kimi
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant ruffles --with-wasm --with-opencode --with-kimi
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant ruffles
 sudo ic/scripts/lunarwing-mt-admin.sh status ruffles
 ```

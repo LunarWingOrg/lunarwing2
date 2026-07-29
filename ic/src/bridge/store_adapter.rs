@@ -195,11 +195,75 @@ impl HybridStore {
     /// `load_thread()` will lazy-reload from disk on the next access.
     ///
     /// Also writes a compact archive summary for human-browsable indexing
-    /// and cleans up expired/revoked leases (from memory only — lease files
-    /// stay on disk).
+    /// and reconciles leases owned by terminal or missing threads before
+    /// cleaning dead leases from memory. Lease files stay on disk for audit
+    /// history — reconciliation persists `revoked`, so they reload as revoked
+    /// and are filtered out rather than counted active again.
+    ///
+    /// The orphan predicate treats a lease whose thread is absent from the
+    /// in-memory map as dead, which is only sound because the sole caller runs
+    /// this immediately after `load_state_from_workspace()` has eagerly loaded
+    /// every thread. Do not move this call after lazy eviction.
     pub async fn cleanup_terminal_state(&self, min_age: chrono::Duration) -> usize {
         let mut cleaned = 0;
         let now = chrono::Utc::now();
+
+        let (known_thread_ids, terminal_thread_ids, referenced_lease_ids) = {
+            let threads = self.threads.read().await;
+            let known = threads.keys().copied().collect::<HashSet<_>>();
+            let terminal = threads
+                .values()
+                .filter(|thread| {
+                    matches!(
+                        thread.state,
+                        ThreadState::Done | ThreadState::Failed | ThreadState::Completed
+                    )
+                })
+                .map(|thread| thread.id)
+                .collect::<HashSet<_>>();
+            let referenced = threads
+                .values()
+                .flat_map(|thread| thread.capability_leases.iter().copied())
+                .collect::<HashSet<_>>();
+            (known, terminal, referenced)
+        };
+
+        // Older versions left non-expiring leases valid after their owning
+        // thread finished. Revoke those durably before evicting thread state.
+        let (terminal_lease_ids, orphaned_lease_ids) = {
+            let leases = self.leases.read().await;
+            let mut terminal = Vec::new();
+            let mut orphaned = Vec::new();
+            for lease in leases.values().filter(|lease| lease.is_valid()) {
+                if !known_thread_ids.contains(&lease.thread_id)
+                    || !referenced_lease_ids.contains(&lease.id)
+                {
+                    orphaned.push(lease.id);
+                } else if terminal_thread_ids.contains(&lease.thread_id) {
+                    terminal.push(lease.id);
+                }
+            }
+            (terminal, orphaned)
+        };
+        for lease_id in &terminal_lease_ids {
+            if let Err(error) = self
+                .revoke_lease(*lease_id, "owning thread reached terminal state")
+                .await
+            {
+                warn!(?lease_id, %error, "failed to reconcile terminal thread lease");
+            }
+        }
+        for lease_id in &orphaned_lease_ids {
+            if let Err(error) = self
+                .revoke_lease(
+                    *lease_id,
+                    "owning thread is missing or does not reference lease",
+                )
+                .await
+            {
+                warn!(?lease_id, %error, "failed to reconcile orphaned lease");
+            }
+        }
 
         // 1. Evict terminal threads from in-memory maps (disk files stay)
         let terminal: Vec<Thread> = self
@@ -233,13 +297,30 @@ impl HybridStore {
             cleaned += 1;
         }
 
-        // 2. Clean up revoked/expired leases from memory
+        // 2. Evict dead leases from memory. Leases are granted without TTL and
+        //    historically were never revoked, so without this they accumulate
+        //    forever (the "active leases" leak). The reconciliation above has
+        //    already persisted `revoked` for terminal/orphaned leases, so this
+        //    is a memory-only eviction and the disk copy stays as audit history.
+        let live_threads: std::collections::HashSet<ThreadId> = self
+            .threads
+            .read()
+            .await
+            .values()
+            .filter(|t| {
+                !matches!(
+                    t.state,
+                    ThreadState::Done | ThreadState::Failed | ThreadState::Completed
+                )
+            })
+            .map(|t| t.id)
+            .collect();
         let dead_leases: Vec<LeaseId> = self
             .leases
             .read()
             .await
             .iter()
-            .filter(|(_, l)| l.revoked || !l.is_valid())
+            .filter(|(_, l)| l.revoked || !l.is_valid() || !live_threads.contains(&l.thread_id))
             .map(|(id, _)| *id)
             .collect();
         for lid in &dead_leases {
@@ -415,21 +496,28 @@ impl HybridStore {
     }
 
     async fn persist_json<T: serde::Serialize>(&self, path: String, value: &T) {
-        let Some(ws) = self.workspace.as_ref() else {
-            return;
-        };
-
-        let json = match serde_json::to_string_pretty(value) {
-            Ok(json) => json,
-            Err(e) => {
-                debug!(path = %path, "failed to serialize engine state: {e}");
-                return;
-            }
-        };
-
-        if let Err(e) = ws.write(&path, &json).await {
-            debug!(path = %path, "failed to persist engine state: {e}");
+        if let Err(error) = self.persist_json_result(&path, value).await {
+            debug!(path = %path, %error, "failed to persist engine state");
         }
+    }
+
+    async fn persist_json_result<T: serde::Serialize>(
+        &self,
+        path: &str,
+        value: &T,
+    ) -> Result<(), EngineError> {
+        let Some(ws) = self.workspace.as_ref() else {
+            return Ok(());
+        };
+        let json = serde_json::to_string_pretty(value).map_err(|error| EngineError::Store {
+            reason: format!("failed to serialize engine state at {path}: {error}"),
+        })?;
+        ws.write(path, &json)
+            .await
+            .map(|_| ())
+            .map_err(|error| EngineError::Store {
+                reason: format!("failed to persist engine state at {path}: {error}"),
+            })
     }
 
     async fn persist_text(&self, path: String, content: &str) {
@@ -1278,8 +1366,9 @@ fn truncate_for_readme(s: &str, max: usize) -> String {
 #[async_trait::async_trait]
 impl Store for HybridStore {
     async fn save_thread(&self, thread: &Thread) -> Result<(), EngineError> {
+        self.persist_json_result(&thread_path(thread.id), thread)
+            .await?;
         self.threads.write().await.insert(thread.id, thread.clone());
-        self.persist_json(thread_path(thread.id), thread).await;
         Ok(())
     }
 
@@ -1526,8 +1615,9 @@ impl Store for HybridStore {
     }
 
     async fn save_lease(&self, lease: &CapabilityLease) -> Result<(), EngineError> {
+        self.persist_json_result(&lease_path(lease.id), lease)
+            .await?;
         self.leases.write().await.insert(lease.id, lease.clone());
-        self.persist_json(lease_path(lease.id), lease).await;
         Ok(())
     }
 
@@ -1545,19 +1635,15 @@ impl Store for HybridStore {
             .collect())
     }
 
-    async fn revoke_lease(&self, lease_id: LeaseId, _reason: &str) -> Result<(), EngineError> {
-        let updated = {
-            let mut leases = self.leases.write().await;
-            if let Some(lease) = leases.get_mut(&lease_id) {
-                lease.revoked = true;
-                Some(lease.clone())
-            } else {
-                None
-            }
+    async fn revoke_lease(&self, lease_id: LeaseId, reason: &str) -> Result<(), EngineError> {
+        let Some(mut lease) = self.leases.read().await.get(&lease_id).cloned() else {
+            return Ok(());
         };
-        if let Some(lease) = updated.as_ref() {
-            self.persist_json(lease_path(lease_id), lease).await;
-        }
+        lease.revoked = true;
+        lease.revoked_reason = Some(reason.to_string());
+        self.persist_json_result(&lease_path(lease_id), &lease)
+            .await?;
+        self.leases.write().await.insert(lease_id, lease);
         Ok(())
     }
 
@@ -1772,6 +1858,313 @@ mod tests {
                 "{}/mission.json",
                 mission_dir("default--project", "Daily report", id)
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_revokes_valid_leases_for_terminal_threads() {
+        let store = HybridStore::new(None);
+        let mut thread = Thread::new(
+            "finished work",
+            lunarwing_engine::ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            lunarwing_engine::ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Done;
+        thread.completed_at = Some(chrono::Utc::now());
+        store.save_thread(&thread).await.unwrap();
+
+        let lease = CapabilityLease {
+            id: LeaseId::new(),
+            thread_id: thread.id,
+            capability_name: "tools".into(),
+            granted_actions: lunarwing_engine::GrantedActions::All,
+            granted_at: chrono::Utc::now(),
+            expires_at: None,
+            max_uses: None,
+            uses_remaining: None,
+            revoked: false,
+            revoked_reason: None,
+        };
+        store.save_lease(&lease).await.unwrap();
+        assert_eq!(store.load_active_leases(thread.id).await.unwrap().len(), 1);
+
+        let cleaned = store
+            .cleanup_terminal_state(chrono::Duration::hours(1))
+            .await;
+
+        assert_eq!(
+            cleaned, 1,
+            "fresh thread stays cached; its lease is cleaned"
+        );
+        assert!(
+            store
+                .load_active_leases(thread.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_revokes_valid_leases_without_owner_threads() {
+        let store = HybridStore::new(None);
+        let missing_thread_id = ThreadId::new();
+        let lease = CapabilityLease {
+            id: LeaseId::new(),
+            thread_id: missing_thread_id,
+            capability_name: "tools".into(),
+            granted_actions: lunarwing_engine::GrantedActions::All,
+            granted_at: chrono::Utc::now(),
+            expires_at: None,
+            max_uses: None,
+            uses_remaining: None,
+            revoked: false,
+            revoked_reason: None,
+        };
+        store.save_lease(&lease).await.unwrap();
+
+        let cleaned = store
+            .cleanup_terminal_state(chrono::Duration::hours(1))
+            .await;
+
+        assert_eq!(cleaned, 1);
+        assert!(
+            store
+                .load_active_leases(missing_thread_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_revokes_live_thread_leases_missing_from_thread_record() {
+        let store = HybridStore::new(None);
+        let mut thread = Thread::new(
+            "waiting work",
+            lunarwing_engine::ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            lunarwing_engine::ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Waiting;
+        store.save_thread(&thread).await.unwrap();
+        let lease = CapabilityLease {
+            id: LeaseId::new(),
+            thread_id: thread.id,
+            capability_name: "tools".into(),
+            granted_actions: lunarwing_engine::GrantedActions::All,
+            granted_at: chrono::Utc::now(),
+            expires_at: None,
+            max_uses: None,
+            uses_remaining: None,
+            revoked: false,
+            revoked_reason: None,
+        };
+        store.save_lease(&lease).await.unwrap();
+
+        let cleaned = store
+            .cleanup_terminal_state(chrono::Duration::hours(1))
+            .await;
+
+        assert_eq!(cleaned, 1);
+        assert!(
+            store
+                .load_active_leases(thread.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn terminal_lease_cleanup_survives_workspace_reload() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("lease-cleanup.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "lease-cleanup-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let mut thread = Thread::new(
+            "finished work",
+            lunarwing_engine::ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            lunarwing_engine::ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Done;
+        thread.completed_at = Some(chrono::Utc::now());
+        let lease = CapabilityLease {
+            id: LeaseId::new(),
+            thread_id: thread.id,
+            capability_name: "tools".into(),
+            granted_actions: lunarwing_engine::GrantedActions::All,
+            granted_at: chrono::Utc::now(),
+            expires_at: None,
+            max_uses: None,
+            uses_remaining: None,
+            revoked: false,
+            revoked_reason: None,
+        };
+        thread.capability_leases.push(lease.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_lease(&lease).await.unwrap();
+
+        store
+            .cleanup_terminal_state(chrono::Duration::hours(1))
+            .await;
+
+        let reloaded = HybridStore::new(Some(workspace));
+        reloaded.load_state_from_workspace().await.unwrap();
+        assert!(
+            reloaded
+                .load_active_leases(thread.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let reloaded_lease = reloaded
+            .leases
+            .read()
+            .await
+            .get(&lease.id)
+            .cloned()
+            .expect("revoked lease should remain as audit history");
+        assert!(reloaded_lease.revoked);
+        assert_eq!(
+            reloaded_lease.revoked_reason.as_deref(),
+            Some("owning thread reached terminal state")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn cleanup_terminal_state_evicts_orphaned_leases_and_retains_files() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::types::capability::GrantedActions;
+        use lunarwing_engine::types::thread::{ThreadConfig, ThreadType};
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("lease-sweep.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "lease-sweep-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+
+        let make_lease = |thread_id: ThreadId| CapabilityLease {
+            id: LeaseId::new(),
+            thread_id,
+            capability_name: "test".into(),
+            granted_actions: GrantedActions::All,
+            granted_at: chrono::Utc::now(),
+            expires_at: None,
+            max_uses: None,
+            uses_remaining: None,
+            revoked: false,
+            revoked_reason: None,
+        };
+
+        // A live (running) thread, a terminal (done) thread, and a lease whose
+        // thread no longer exists at all.
+        let mut live_thread = Thread::new(
+            "live",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        live_thread.state = ThreadState::Running;
+        let mut dead_thread = Thread::new(
+            "dead",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        dead_thread.state = ThreadState::Done;
+
+        let live_lease = make_lease(live_thread.id);
+        let dead_lease = make_lease(dead_thread.id);
+        let missing_lease = make_lease(ThreadId::new());
+
+        // Real spawns record granted lease IDs on the owning thread. A lease its
+        // thread does not reference is itself treated as orphaned, so the
+        // fixture must mirror that or the live case is indistinguishable.
+        live_thread.capability_leases.push(live_lease.id);
+        dead_thread.capability_leases.push(dead_lease.id);
+        store.save_thread(&live_thread).await.expect("save live");
+        store.save_thread(&dead_thread).await.expect("save dead");
+
+        for lease in [&live_lease, &dead_lease, &missing_lease] {
+            store.save_lease(lease).await.expect("save lease");
+        }
+        assert!(
+            workspace.read(&lease_path(dead_lease.id)).await.is_ok(),
+            "lease file persisted before sweep"
+        );
+
+        let cleaned = store.cleanup_terminal_state(chrono::Duration::zero()).await;
+
+        // Orphaned leases (terminal or missing thread) are evicted from memory;
+        // the live thread's lease survives.
+        assert!(cleaned >= 3, "expected terminal thread + 2 orphaned leases");
+        assert_eq!(
+            store
+                .load_active_leases(live_thread.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "live thread keeps its lease"
+        );
+        assert!(
+            store
+                .load_active_leases(dead_thread.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "terminal thread's lease evicted"
+        );
+
+        // Files are retained as audit history, but durably marked revoked so a
+        // restart reloads them as revoked rather than counting them active.
+        for (lease_id, label) in [
+            (dead_lease.id, "terminal-thread lease"),
+            (missing_lease.id, "missing-thread lease"),
+        ] {
+            let doc = workspace
+                .read(&lease_path(lease_id))
+                .await
+                .unwrap_or_else(|_| panic!("{label} file retained"));
+            let persisted: CapabilityLease =
+                serde_json::from_str(&doc.content).expect("lease deserializes");
+            assert!(persisted.revoked, "{label} persisted as revoked");
+        }
+
+        let live_doc = workspace
+            .read(&lease_path(live_lease.id))
+            .await
+            .expect("live lease file preserved");
+        let persisted_live: CapabilityLease =
+            serde_json::from_str(&live_doc.content).expect("lease deserializes");
+        assert!(
+            !persisted_live.revoked,
+            "live thread's lease must not be revoked"
         );
     }
 

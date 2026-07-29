@@ -98,6 +98,7 @@ Deployment, operations, multitenancy, and production guides.
 | [`SELF_REPAIR_IMPROVEMENTS_GENTOO.md`](ops/SELF_REPAIR_IMPROVEMENTS_GENTOO.md) | Self-heal fd-leak fix found on a live OpenRC MT host |
 | [`ROADMAP_2026.md`](ops/ROADMAP_2026.md) | 2026 roadmap |
 | [`GITHOOKS_HOW_TO.md`](ops/GITHOOKS_HOW_TO.md) | How to install githooks |
+| [`GITLAB_CONTAINER_REGISTRY.md`](ops/GITLAB_CONTAINER_REGISTRY.md) | Enabling GitLab's built-in container registry and building/pulling worker images from CI |
 | [`IMPORT_EXPORT_EXAMPLE.txt`](ops/IMPORT_EXPORT_EXAMPLE.txt) | Worker import/export example |
 | [`KUMOGAKURE_INSTRUCT.md`](ops/KUMOGAKURE_INSTRUCT.md) | Pointer to the external Notes vault |
 | [`AGENT_GOALS_2.0.3.0.md`](ops/AGENT_GOALS_2.0.3.0.md) | Agent-assigned pre-release checklist for LunarWing v2.0.3.0 |
@@ -122,6 +123,8 @@ Deployment, operations, multitenancy, and production guides.
 | [`P1_GAP_FINDINGS_v2.0.3.0.md`](ops/P1_GAP_FINDINGS_v2.0.3.0.md) | Verified v2.0.3.0 P1 gap findings across backends, workers, security, and operations |
 | [`questions.md`](ops/questions.md) | Notes on migrating the development loop from GitHub to Codeberg |
 | [`REVIEW_2.0.2.0_CHANGES.md`](ops/REVIEW_2.0.2.0_CHANGES.md) | Review of source changes and findings between v2.0.1.0 and v2.0.2.0 |
+| [`SIS.md`](ops/SIS.md) | Field notes from the 2026-07-28/29 self-improving-skills mission test runs |
+| [`SIS_FIX_PROPOSAL.md`](ops/SIS_FIX_PROPOSAL.md) | Self-improving-skills fix proposal (item 41): four source-verified root causes and implemented fixes for terminal event propagation, trigger-payload seeding, capability-lease leak, and the missing mission write path for skill docs |
 | [`SUBMODULEGIT.md`](ops/SUBMODULEGIT.md) | Pebble submodule reference stub |
 | [`TEST-SCRIPTS-STATUS.md`](ops/TEST-SCRIPTS-STATUS.md) | Automated test-script inventory, fixes, coverage gaps, and follow-up recommendations |
 | [`v2GOALS.md`](ops/v2GOALS.md) | LunarWing v2 roadmap snapshot with feature targets through v2.0.8 |
@@ -220,7 +223,7 @@ here while they are still present in `proposals/`.
 | [`DARKIRC_SECURE_KEY_EXCHANGE.md`](proposals/DARKIRC_SECURE_KEY_EXCHANGE.md) | Open | Secure contact-key exchange design; Phase 0 prerequisite is not implemented |
 | [`DARKIRC_THINGS_TO_ADD.md`](proposals/DARKIRC_THINGS_TO_ADD.md) | Partial | Disabled-by-default behavior shipped; Tor and seed work remain open |
 | [`ENGINE_LLM_STREAMING.md`](proposals/ENGINE_LLM_STREAMING.md) | Implemented | Engine streaming and cancellation phases 0-5; channel rollout validation remains operational |
-| [`ENGINE_V2_POLISH_v2.0.3.0.md`](proposals/ENGINE_V2_POLISH_v2.0.3.0.md) | Open | Source-verified v2.0.3.0 Engine V2 fixes for provenance, mission controls, gates, budgets, and memory |
+| [`ENGINE_V2_POLISH_v2.0.3.0.md`](proposals/ENGINE_V2_POLISH_v2.0.3.0.md) | Implemented | v2.0.3.0 Engine V2 fixes for provenance, mission controls, gates, and memory; P1/P2 landed, P3 partially deferred |
 | [`EXTERNAL-WORKER-AUDIT-2026-06-23.md`](proposals/EXTERNAL-WORKER-AUDIT-2026-06-23.md) | Implemented / historical | External-worker security findings and landed fixes |
 | [`EXTERNAL-WORKER-PLAN-UPGRADES.md`](proposals/EXTERNAL-WORKER-PLAN-UPGRADES.md) | Implemented | Context, pooling, load balancing, and surviving worker updates landed |
 | [`EXTERNAL-WORKER-PROMPT-CONTEXT.md`](proposals/EXTERNAL-WORKER-PROMPT-CONTEXT.md) | Implemented | Typed, bounded, opt-in conversation context propagation for OpenCode, Nanocode, and Pebble workers |
@@ -243,7 +246,7 @@ here while they are still present in `proposals/`.
 | [`LUNARVISION_POLISHING.md`](proposals/LUNARVISION_POLISHING.md) | Superseded | Health wiring and `vision_health` allocation landed elsewhere |
 | [`MEMORY_MAINTENANCE_ROUTINES.md`](proposals/MEMORY_MAINTENANCE_ROUTINES.md) | Open | Routine-pack and reviewed memory-maintenance proposal/apply design |
 | [`MT-1.1.0-TO-1.1.4-UPGRADE.md`](proposals/MT-1.1.0-TO-1.1.4-UPGRADE.md) | Implemented / verification pending | Rootless-flip tooling shipped; exact production flip remains unvalidated |
-| [`MT-ADMIN-DECOMPOSITION.md`](proposals/MT-ADMIN-DECOMPOSITION.md) | Ready for implementation | Reviewed plan to split the multi-tenant admin script into sourced, init-aware libraries |
+| [`MT-ADMIN-DECOMPOSITION.md`](proposals/MT-ADMIN-DECOMPOSITION.md) | Superseded | Rejected split plan; item #24 chose the `mtadminrefactor/meta4/v2.0.3.0` mt-admin-lib decomposition instead |
 | [`MT-LEGACY-UPGRADE-CHERRYPICK-PLAN.md`](proposals/MT-LEGACY-UPGRADE-CHERRYPICK-PLAN.md) | Implemented / historical | Executed legacy-upgrade fix plan; production run remained operator-gated |
 | [`MT-LEGACY-UPGRADE-QA-PLAN.md`](proposals/MT-LEGACY-UPGRADE-QA-PLAN.md) | Verification pending | Live legacy-upgrade operator checklist |
 | [`MT-LEGACY-UPGRADE-VERIFICATION.md`](proposals/MT-LEGACY-UPGRADE-VERIFICATION.md) | Verification pending | Legacy harness canary, rollback, soak, and sign-off plan |

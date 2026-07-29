@@ -7,7 +7,7 @@ publish = false
 authors = ["LunarWing Team"]                                                                                                                 
 license = "AGPL-3.0-or-later"                                                                                                                
 homepage = "https://lunarwing.org"                                                                                       
-repository = "https://github.com/LunarWingOrg/lunarwing"                                                                                     
+repository = "https://git.lunarwing.org/lunarwing/lunarwing2"                                                                                     
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

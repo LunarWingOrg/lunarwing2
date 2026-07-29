@@ -9,7 +9,7 @@
 
 [Unit]
 Description=LunarWing AI assistant
-Documentation=https://github.com/LunarWingOrg/lunarwing
+Documentation=https://git.lunarwing.org/lunarwing/lunarwing2
 After=network-online.target xmpp-bridge.service
 Wants=network-online.target xmpp-bridge.service
 StartLimitIntervalSec=60

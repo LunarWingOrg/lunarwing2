@@ -48,6 +48,9 @@ class ProvisionRequest(RequestModel):
     nanocode_base_url: str = ""
     opencode_model: str = ""
     opencode_base_url: str = ""
+    kimi_model: str = ""
+    kimi_base_url: str = ""
+    kimi_api_key: str = ""
     llm_api_key: str = ""
     secrets_master_key: str = ""
     no_ssh: bool = False
@@ -106,6 +109,13 @@ class ProvisionRequest(RequestModel):
                 if WorkerType.OPENCODE in workers
                 else ""
             ),
+            kimi_model=(
+                self.kimi_model.strip() if WorkerType.KIMI in workers else ""
+            ),
+            kimi_base_url=(
+                self.kimi_base_url.strip() if WorkerType.KIMI in workers else ""
+            ),
+            kimi_api_key=(self.kimi_api_key if WorkerType.KIMI in workers else ""),
             llm_api_key=self.llm_api_key,
             secrets_master_key=self.secrets_master_key.strip(),
             no_ssh=self.no_ssh,
@@ -191,6 +201,7 @@ class ImportRequest(RequestModel):
     with_nanocode: bool = False
     with_pebble: bool = False
     with_opencode: bool = False
+    with_kimi: bool = False
     with_toolchains: bool = False
     with_vision: bool = False
     docker_group: bool = False
@@ -222,6 +233,7 @@ class ImportRequest(RequestModel):
             with_nanocode=self.with_nanocode,
             with_pebble=self.with_pebble,
             with_opencode=self.with_opencode,
+            with_kimi=self.with_kimi,
             with_toolchains=self.with_toolchains,
             with_vision=self.with_vision,
             docker_group=self.docker_group,

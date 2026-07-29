@@ -36,7 +36,15 @@ class TestTenantNameValidation(unittest.TestCase):
         self.assertIsNotNone(err)
 
     def test_reserved_prefix_rejected(self):
-        for prefix in ("pg-", "proxy-", "nanocode-", "pebble-", "opencode-", "weechat-"):
+        for prefix in (
+            "pg-",
+            "proxy-",
+            "nanocode-",
+            "pebble-",
+            "opencode-",
+            "kimi-",
+            "weechat-",
+        ):
             with self.subTest(prefix=prefix):
                 err = TenantConfig.validate_name(f"{prefix}1")
                 self.assertIsNotNone(err)
@@ -49,7 +57,7 @@ class TestConfigSerialization(unittest.TestCase):
             gateway_host="0.0.0.0",
             xmpp_enabled=True,
             xmpp_jid="alpha@xmpp.localhost",
-            workers=[WorkerType.NANOCODE, WorkerType.OPENCODE],
+            workers=[WorkerType.NANOCODE, WorkerType.OPENCODE, WorkerType.KIMI],
             secrets_master_key="ab" * 32,
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -59,7 +67,10 @@ class TestConfigSerialization(unittest.TestCase):
         self.assertEqual(loaded.name, "alpha")
         self.assertEqual(loaded.gateway_host, "0.0.0.0")
         self.assertTrue(loaded.xmpp_enabled)
-        self.assertEqual(loaded.workers, [WorkerType.NANOCODE, WorkerType.OPENCODE])
+        self.assertEqual(
+            loaded.workers,
+            [WorkerType.NANOCODE, WorkerType.OPENCODE, WorkerType.KIMI],
+        )
         self.assertEqual(loaded.secrets_master_key, "ab" * 32)
 
     def test_current_llm_and_worker_overrides_round_trip(self):
@@ -70,6 +81,8 @@ class TestConfigSerialization(unittest.TestCase):
             nanocode_base_url="http://nano.test/v1",
             opencode_model="open-model",
             opencode_base_url="http://open.test/v1",
+            kimi_model="kimi-model",
+            kimi_base_url="http://kimi.test/v1",
         )
         self.assertEqual(TenantConfig.from_dict(config.to_dict()), config)
 
@@ -84,10 +97,13 @@ class TestConfigSerialization(unittest.TestCase):
     def test_from_dict_accepts_string_workers(self):
         data = {
             "name": "gamma",
-            "workers": ["nanocode", "opencode"],
+            "workers": ["nanocode", "opencode", "kimi"],
         }
         config = TenantConfig.from_dict(data)
-        self.assertEqual(config.workers, [WorkerType.NANOCODE, WorkerType.OPENCODE])
+        self.assertEqual(
+            config.workers,
+            [WorkerType.NANOCODE, WorkerType.OPENCODE, WorkerType.KIMI],
+        )
 
     def test_json_file_permissions(self):
         config = TenantConfig(name="perms")
@@ -239,6 +255,8 @@ class TestProvisionerArgs(unittest.TestCase):
                         nanocode_base_url="http://nano.test/v1",
                         opencode_model="open-model",
                         opencode_base_url="http://open.test/v1",
+                        kimi_model="kimi-model",
+                        kimi_base_url="http://kimi.test/v1",
                     )
                 )
             finally:
@@ -250,6 +268,8 @@ class TestProvisionerArgs(unittest.TestCase):
             ("--nanocode-base-url", "http://nano.test/v1"),
             ("--opencode-model", "open-model"),
             ("--opencode-base-url", "http://open.test/v1"),
+            ("--kimi-model", "kimi-model"),
+            ("--kimi-base-url", "http://kimi.test/v1"),
         ):
             self.assertIn(flag, args)
             self.assertIn(value, args)
@@ -269,7 +289,7 @@ class TestProvisionerArgs(unittest.TestCase):
             try:
                 config = TenantConfig(
                     name="alpha",
-                    workers=[WorkerType.NANOCODE, WorkerType.OPENCODE],
+                    workers=[WorkerType.NANOCODE, WorkerType.OPENCODE, WorkerType.KIMI],
                 )
                 add_args = provisioner.build_add_tenant_args(config)
                 build_args = provisioner.build_build_tenant_args(config)
@@ -279,11 +299,13 @@ class TestProvisionerArgs(unittest.TestCase):
         # Selected workers appear on add-tenant (the persisted selection).
         self.assertIn("--with-nanocode", add_args)
         self.assertIn("--with-opencode", add_args)
+        self.assertIn("--with-kimi", add_args)
         # Unselected worker is omitted from add-tenant.
         self.assertNotIn("--with-pebble", add_args)
         # build-tenant still gets the same selection (to build the images).
         self.assertIn("--with-nanocode", build_args)
         self.assertIn("--with-opencode", build_args)
+        self.assertIn("--with-kimi", build_args)
         self.assertNotIn("--with-pebble", build_args)
 
     def test_no_workers_selected_emits_no_worker_flags(self):
@@ -301,7 +323,12 @@ class TestProvisionerArgs(unittest.TestCase):
             finally:
                 provisioner.MT_ADMIN_SCRIPT = previous
 
-        for flag in ("--with-nanocode", "--with-pebble", "--with-opencode"):
+        for flag in (
+            "--with-nanocode",
+            "--with-pebble",
+            "--with-opencode",
+            "--with-kimi",
+        ):
             self.assertNotIn(flag, add_args)
 
     def test_weechat_bootstrap_opt_out_is_forwarded(self):

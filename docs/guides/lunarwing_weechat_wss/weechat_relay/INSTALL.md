@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- [LunarWing](https://github.com/LunarWingOrg/lunarwing) installed and running
+- [LunarWing](https://git.lunarwing.org/lunarwing/lunarwing2) installed and running
 - [WeeChat](https://weechat.org) >= 4.0 with API relay enabled
 - Rust toolchain with `wasm32-wasip2` target
 - Python 3 with `aiohttp` (`pip install aiohttp`)

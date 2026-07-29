@@ -44,7 +44,7 @@ const MAX_REDIRECTS: usize = 3;
 const USER_AGENT: &str = concat!(
     "LunarWing-Agent/",
     env!("CARGO_PKG_VERSION"),
-    " (https://github.com/LunarWingOrg/lunarwing)"
+    " (https://git.lunarwing.org/lunarwing/lunarwing2)"
 );
 
 /// Tool for making HTTP requests.

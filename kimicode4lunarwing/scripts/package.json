@@ -1,0 +1,23 @@
+{
+  "name": "kimicode4lunarwing-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LunarWing WebSocket bridge for Kimi Code CLI",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test kimi_result_test.mjs kimi_task_executor_test.mjs task_prompt_test.mjs path_expand_test.mjs",
+    "smoke": "node smoke_test.mjs"
+  },
+  "dependencies": {
+    "ws": "8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

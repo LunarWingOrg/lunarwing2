@@ -387,6 +387,6 @@ MIT
 
 ## See Also
 
-- [LunarWing Documentation](https://github.com/LunarWingOrg/lunarwing)
+- [LunarWing Documentation](https://git.lunarwing.org/lunarwing/lunarwing2)
 - [WeeChat Relay Protocol](https://weechat.org/files/doc/stable/weechat_relay_protocol.en.html)
 - [WeeChat API Relay](https://weechat.org/doc/api/relay/)

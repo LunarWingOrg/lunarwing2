@@ -1,6 +1,6 @@
 [Unit]
 Description=LunarWing Vision OCR Sidecar (Podman rootless)
-Documentation=https://github.com/LunarWingOrg/lunarwing/tree/main/projects/ocr-sidecar
+Documentation=https://git.lunarwing.org/lunarwing/lunarwing2/-/tree/master/projects/ocr-sidecar
 After=podman.service
 Requires=podman.service
 

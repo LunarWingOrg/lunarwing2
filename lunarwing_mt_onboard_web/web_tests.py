@@ -59,14 +59,17 @@ class ModelMappingTests(unittest.TestCase):
     def test_provision_maps_fields_and_workers(self) -> None:
         req = ProvisionRequest(
             name="  sphinx  ",
-            workers=["nanocode", "opencode"],
+            workers=["nanocode", "opencode", "kimi"],
             no_ssh=True,
             no_weechat_bootstrap=True,
             xmpp_allow_from=["a@x", "  ", "b@y"],
         )
         cfg = req.to_tenant_config()
         self.assertEqual(cfg.name, "sphinx")
-        self.assertEqual(cfg.workers, [WorkerType.NANOCODE, WorkerType.OPENCODE])
+        self.assertEqual(
+            cfg.workers,
+            [WorkerType.NANOCODE, WorkerType.OPENCODE, WorkerType.KIMI],
+        )
         self.assertTrue(cfg.no_ssh)
         self.assertTrue(cfg.no_weechat_bootstrap)
         self.assertEqual(cfg.xmpp_allow_from, ["a@x", "b@y"])
@@ -103,6 +106,7 @@ class ModelMappingTests(unittest.TestCase):
             start=True,
             old_stopped=True,
             with_opencode=True,
+            with_kimi=True,
             with_toolchains=True,
             with_nanocode=True,
             with_pebble=True,
@@ -119,6 +123,7 @@ class ModelMappingTests(unittest.TestCase):
         self.assertTrue(cfg.start)
         self.assertTrue(cfg.old_stopped)
         self.assertTrue(cfg.with_opencode)
+        self.assertTrue(cfg.with_kimi)
         self.assertTrue(cfg.with_toolchains)
         self.assertTrue(cfg.with_nanocode)
         self.assertTrue(cfg.with_pebble)
@@ -131,12 +136,14 @@ class ModelMappingTests(unittest.TestCase):
     def test_current_provision_fields_map_to_tenant_config(self) -> None:
         cfg = ProvisionRequest(
             name="sphinx",
-            workers=["nanocode", "opencode"],
+            workers=["nanocode", "opencode", "kimi"],
             llm_base_url=" http://llm.test/v1 ",
             nanocode_model=" nano ",
             nanocode_base_url=" http://nano.test/v1 ",
             opencode_model=" open ",
             opencode_base_url=" http://open.test/v1 ",
+            kimi_model=" kimi ",
+            kimi_base_url=" http://kimi.test/v1 ",
         ).to_tenant_config()
 
         self.assertEqual(cfg.llm_base_url, "http://llm.test/v1")
@@ -144,15 +151,23 @@ class ModelMappingTests(unittest.TestCase):
         self.assertEqual(cfg.nanocode_base_url, "http://nano.test/v1")
         self.assertEqual(cfg.opencode_model, "open")
         self.assertEqual(cfg.opencode_base_url, "http://open.test/v1")
+        self.assertEqual(cfg.kimi_model, "kimi")
+        self.assertEqual(cfg.kimi_base_url, "http://kimi.test/v1")
 
     def test_worker_overrides_are_dropped_when_worker_is_not_selected(self) -> None:
         cfg = ProvisionRequest(
             name="sphinx",
             nanocode_model="stale-nano",
             opencode_model="stale-open",
+            kimi_model="stale-kimi",
+            kimi_base_url="http://stale-kimi.test/v1",
+            kimi_api_key="stale-secret",
         ).to_tenant_config()
         self.assertEqual(cfg.nanocode_model, "")
         self.assertEqual(cfg.opencode_model, "")
+        self.assertEqual(cfg.kimi_model, "")
+        self.assertEqual(cfg.kimi_base_url, "")
+        self.assertEqual(cfg.kimi_api_key, "")
 
     def test_invalid_master_key_and_skip_build_start_mismatch_are_rejected(self) -> None:
         with self.assertRaises(ValidationError):
@@ -210,9 +225,20 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("b" * 64, audit.redact_text("token=" + "b" * 64))
 
     def test_redact_argv_after_secret_flag(self) -> None:
-        argv = ["mt", "add-tenant", "x", "--xmpp-password", "hunter2", "--gateway-host", "127.0.0.1"]
+        argv = [
+            "mt",
+            "add-tenant",
+            "x",
+            "--xmpp-password",
+            "hunter2",
+            "--kimi-api-key",
+            "kimi-secret",
+            "--gateway-host",
+            "127.0.0.1",
+        ]
         red = audit.redact_argv(argv)
         self.assertNotIn("hunter2", red)
+        self.assertNotIn("kimi-secret", red)
         self.assertIn("127.0.0.1", red)  # non-secret flags untouched
 
     def test_plain_line_unchanged(self) -> None:
@@ -544,6 +570,7 @@ class ImportUiTests(unittest.TestCase):
             "old_stopped",
             "force",
             "with_opencode",
+            "with_kimi",
             "with_toolchains",
             "with_nanocode",
             "with_pebble",

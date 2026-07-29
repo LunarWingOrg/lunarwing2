@@ -52,6 +52,7 @@ class ImportConfig:
     with_nanocode: bool = False
     with_pebble: bool = False
     with_opencode: bool = False
+    with_kimi: bool = False
     with_toolchains: bool = False
     with_vision: bool = False
     docker_group: bool = False
@@ -81,6 +82,7 @@ class ImportConfig:
             "with_nanocode": self.with_nanocode,
             "with_pebble": self.with_pebble,
             "with_opencode": self.with_opencode,
+            "with_kimi": self.with_kimi,
             "with_toolchains": self.with_toolchains,
             "with_vision": self.with_vision,
             "docker_group": self.docker_group,
@@ -106,6 +108,7 @@ class ImportConfig:
             with_nanocode=_bool_value(data.get("with_nanocode", False)),
             with_pebble=_bool_value(data.get("with_pebble", False)),
             with_opencode=_bool_value(data.get("with_opencode", False)),
+            with_kimi=_bool_value(data.get("with_kimi", False)),
             with_toolchains=_bool_value(data.get("with_toolchains", False)),
             with_vision=_bool_value(data.get("with_vision", False)),
             docker_group=_bool_value(data.get("docker_group", False)),
@@ -161,6 +164,8 @@ def build_import_args(cfg: ImportConfig) -> list[str]:
         args.append("--with-pebble")
     if cfg.with_opencode:
         args.append("--with-opencode")
+    if cfg.with_kimi:
+        args.append("--with-kimi")
     if cfg.with_toolchains:
         args.append("--with-toolchains")
     if cfg.with_vision:

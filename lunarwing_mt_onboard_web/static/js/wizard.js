@@ -4,7 +4,7 @@
   const LW = (window.LW = window.LW || {});
 
   const NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
-  const RESERVED = ['pg-', 'proxy-', 'nanocode-', 'pebble-', 'opencode-', 'weechat-'];
+  const RESERVED = ['pg-', 'proxy-', 'nanocode-', 'pebble-', 'opencode-', 'kimi-', 'weechat-'];
 
   function validateName(name) {
     if (!name) return 'tenant name is required';
@@ -77,7 +77,8 @@
       enable_darkirc: false,
       xmpp_enabled: false, xmpp_jid: '', xmpp_password: '', xmpp_allow_from: '',
       gotify_enabled: false, gotify_url: '', gotify_title: '',
-      w_nanocode: false, w_pebble: false, w_opencode: false, toolchains: false,
+      w_nanocode: false, w_pebble: false, w_opencode: false,
+      w_kimi: false, kimi_model: '', kimi_base_url: '', kimi_api_key: '', toolchains: false,
       llm_base_url: '',
       model_choice: 'lunarwing', model_custom: '',
       nanocode_model: '', nanocode_base_url: '',
@@ -192,6 +193,17 @@
         opencode.appendChild(textField(data, 'opencode_base_url', 'OpenCode base URL override (optional)', {}));
         b.appendChild(opencode);
       }
+      b.appendChild(checkField(data, 'w_kimi', 'kimi (MoonshotAI/kimi-code)', (checked) => {
+        if (!checked) { data.kimi_model = ''; data.kimi_base_url = ''; data.kimi_api_key = ''; }
+        render();
+      }));
+      if (data.w_kimi) {
+        const kimi = h('div', { class: 'subgroup' });
+        kimi.appendChild(textField(data, 'kimi_model', 'Kimi model override (optional)', {}));
+        kimi.appendChild(textField(data, 'kimi_base_url', 'Kimi base URL override (optional)', {}));
+        kimi.appendChild(textField(data, 'kimi_api_key', 'Kimi API key override (optional)', { type: 'password' }));
+        b.appendChild(kimi);
+      }
       b.appendChild(checkField(data, 'toolchains', 'Include Rust/Go/C++ toolchains (+~5GB image)'));
     }
 
@@ -220,7 +232,7 @@
     }
 
     function stepReview(b) {
-      const workers = [data.w_nanocode && 'nanocode', data.w_pebble && 'pebble', data.w_opencode && 'opencode'].filter(Boolean);
+      const workers = [data.w_nanocode && 'nanocode', data.w_pebble && 'pebble', data.w_opencode && 'opencode', data.w_kimi && 'kimi'].filter(Boolean);
       const rows = [
         ['Tenant', data.name || '(unset)'],
         ['Gateway host', data.gateway_host],
@@ -251,6 +263,7 @@
       if (data.w_nanocode) workers.push('nanocode');
       if (data.w_pebble) workers.push('pebble');
       if (data.w_opencode) workers.push('opencode');
+      if (data.w_kimi) workers.push('kimi');
       let model = 'tensorzero::function_name::lunarwing';
       if (data.model_choice === 'FrontierCODE') model = 'tensorzero::function_name::FrontierCODE';
       else if (data.model_choice === 'custom') model = data.model_custom.trim();
@@ -274,6 +287,9 @@
         nanocode_base_url: data.nanocode_base_url.trim(),
         opencode_model: data.opencode_model.trim(),
         opencode_base_url: data.opencode_base_url.trim(),
+        kimi_model: data.kimi_model.trim(),
+        kimi_base_url: data.kimi_base_url.trim(),
+        kimi_api_key: data.kimi_api_key,
         llm_api_key: data.llm_api_key,
         secrets_master_key: data.secrets_master_key.trim(),
         no_ssh: !data.ssh_harness,
@@ -357,7 +373,7 @@
     simpleForm(host, 'Import a tenant', 'stage-only by default; start requires old host stopped', (b, data) => {
       Object.assign(data, {
         bundle: '', name: '', apply: false, start: false, old_stopped: false, force: false,
-        with_opencode: false, with_toolchains: false, with_nanocode: false,
+        with_opencode: false, with_kimi: false, with_toolchains: false, with_nanocode: false,
         with_pebble: false, with_vision: false, docker_group: false,
         owner_scope: '', passphrase: '',
       });
@@ -370,6 +386,7 @@
       b.appendChild(checkField(data, 'force', 'Force import (--force)'));
       const workers = h('div', { class: 'subgroup' });
       workers.appendChild(checkField(data, 'with_opencode', 'Build opencode worker'));
+      workers.appendChild(checkField(data, 'with_kimi', 'Build kimi worker'));
       workers.appendChild(checkField(data, 'with_toolchains', 'Include worker toolchains'));
       workers.appendChild(checkField(data, 'with_nanocode', 'Build nanocode worker'));
       workers.appendChild(checkField(data, 'with_pebble', 'Build pebble worker'));

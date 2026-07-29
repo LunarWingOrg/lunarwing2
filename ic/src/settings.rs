@@ -1340,7 +1340,7 @@ impl Settings {
              # Uncomment and edit values to override defaults.\n\
              # Run `lunarwing config init` to regenerate this file.\n\
              #\n\
-             # Documentation: https://github.com/LunarWingOrg/lunarwing\n\
+             # Documentation: https://git.lunarwing.org/lunarwing/lunarwing2\n\
              \n\
              {raw}"
         );
