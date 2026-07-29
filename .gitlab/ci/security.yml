@@ -3,6 +3,11 @@ cargo-deny:
   stage: security
   needs:
     - cargo-metadata
+  rules:
+    # Full suite only on the default branch (and MRs into it) — see slim set.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
+    - when: never
   script:
     - bash .gitlab/scripts/install-cargo-deny.sh
     - PATH="$CI_PROJECT_DIR/.ci-bin:$PATH" bash .gitlab/scripts/cargo-ci.sh deny check
