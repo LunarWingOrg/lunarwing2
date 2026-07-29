@@ -46,7 +46,10 @@ Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 
 - Browser gateway, CLI, and HTTP interfaces
 - WASM channels for XMPP, WeeChat, DarkIRC, and Multica
-- Optional Gotify notifications, SSH tooling, and LunarVision OCR integration
+- XMPP file attachments via XEP-0363 HTTP File Upload
+- WeeChat buffer restoration across service restarts and clean reboots
+- Host-local stdio MCP servers with install, activate, and deactivate lifecycle controls
+- Optional Gotify notifications, SSH tooling, NetBird tunnels, and LunarVision OCR integration
 
 DarkIRC is opt-in. It is neither rendered nor built for a new tenant unless the operator enables it during tenant creation and builds its supporting service.
 
@@ -86,6 +89,8 @@ Demo mode does not create tenants or modify host services. The launcher still cr
 ### 2. Prepare the production host
 
 The supported production path assumes Python 3.10 or newer with `venv` and pip, a Linux host using systemd or OpenRC, root or sudo access, Docker or Podman, `jq`, `git`, download access on first launch, and adequate time and disk space for builds.
+
+For distro-specific prerequisites, use the [Gentoo/OpenRC package list](docs/guides/GENTOO_PACKAGE_LIST.md) or the [Arch Linux/systemd package list](docs/guides/ARCHLINUX_PACKAGE_LIST.md).
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh doctor
