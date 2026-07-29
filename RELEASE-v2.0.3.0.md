@@ -5,7 +5,8 @@
 > *Sashiko* (刺し子) is a Japanese folk embroidery tradition — reinforcing worn
 > fabric with running stitches. LunarWing v2.0.3.0 reinforces the v2 foundation:
 > it stitches together Engine V2 security and lifecycle gaps, hardens external
-> workers and DarkIRC delivery, replaces proprietary tunnel providers with
+> workers and DarkIRC delivery, adds a Kimi Code external worker alongside
+> NanoCode, Pebble, and OpenCode, replaces proprietary tunnel providers with
 > self-hosted NetBird, completes the WeeChat session-restore handoff, and
 > refreshes documentation across the tree.
 
@@ -21,12 +22,13 @@ the background.
 The release also replaces the proprietary Cloudflare/ngrok/tailscale tunnel
 providers with a self-hosted NetBird provider, hardens DarkIRC outbound delivery
 with a paced adapter outbox, completes the WeeChat buffer-restore handoff that
-v2.0.2.0 left broken, adds bounded context and retry logic to external workers,
-makes the web gateway UI keep streaming answers across thread switches and
-reconnects while rendering faster, introduces Study Notes as a read/write skill
-with an MCP integration, repairs the self-improving skills pipeline so learning
-missions actually fire and persist extracted skills, and refreshes architecture
-docs, bug docs, and the docs README index against current source.
+v2.0.2.0 left broken, adds bounded context and retry logic to external workers
+and a fourth persistent worker option (Kimi Code), makes the web gateway UI keep
+streaming answers across thread switches and reconnects while rendering faster,
+introduces Study Notes as a read/write skill with an MCP integration, repairs
+the self-improving skills pipeline so learning missions actually fire and
+persist extracted skills, and refreshes architecture docs, bug docs, and the
+docs README index against current source.
 
 The release, tag, and this document use `2.0.3.0`.
 
@@ -69,6 +71,10 @@ for historical notes.
   `--chuid`.
 - Added bounded context, retry logic, and extended runtime to external workers;
   hardened worker cancellation, terminal state, and timeout handling.
+- Added the Kimi Code external worker (`kimicode4lunarwing`): a Node.js/
+  TypeScript WebSocket bridge that spawns an isolated `kimi -p` subprocess per
+  task, with full mt-admin lifecycle support (`--with-kimi`,
+  `build-kimi-worker`, `configure-kimi`) on systemd and OpenRC.
 - Added Study Notes as a read/write skill with an approved write path and a
   read-only MCP integration.
 - Repaired the self-improving skills pipeline: terminal thread events now
@@ -115,6 +121,7 @@ for historical notes.
 | Hermes import | PostgreSQL-only preview; dry-run by default; live apply requires root/container host |
 | WeeChat managed stop | Graceful save/quit with corrected FIFO payload, 20-second helper wait, forced tmux fallback, OpenRC runs helper as tenant UID |
 | WeeChat startup | Uses restore helper with `--upgrade` |
+| External worker roster | NanoCode, Pebble, OpenCode, and Kimi Code (new in v2.0.3.0); multiple workers may be selected per tenant |
 | Tenant upgrade | Explicit target, PostgreSQL backup by default, strict fresh WASM build, unit render by default, OpenCode workspace ownership migration |
 | Native build helper | Linux x86_64/aarch64; release profile; locked Cargo; `--wasm` is a compatibility no-op |
 | GitLab CI | Phase-one source verification only; no package, release artifact, or deployment jobs |
@@ -208,6 +215,41 @@ and the new start helper are installed.
   possible.
 - Updated the OpenCode worker Rust toolchain.
 - Persist external job diagnostics across restarts.
+
+### Kimi Code External Worker
+
+MoonshotAI's Kimi Code CLI is now integrated as a persistent external worker,
+parallel to OpenCode, bringing the worker roster to NanoCode, Pebble, OpenCode,
+and Kimi Code. Worker selection is stored per tenant at creation time.
+
+- Added the `kimicode4lunarwing/` harness: a Node.js/TypeScript WebSocket
+  bridge speaking the `lunarwing-agent-v1` protocol. Unlike the OpenCode
+  worker's persistent headless server, each task spawns a fresh
+  `kimi -p --output-format stream-json` subprocess, so tasks get isolated
+  sessions with no cross-task state leakage.
+- The executor parses the JSONL event stream into `task_progress` envelopes,
+  emits a persisted progress heartbeat (60-second default,
+  `KIMI_PROGRESS_HEARTBEAT_MS`), and on timeout or cancellation sends
+  `SIGTERM` then `SIGKILL` after a bounded five-second grace instead of
+  leaving orphaned work. Only one active task may modify a resolved workspace
+  path at a time.
+- Container image: Node 22 plus `@moonshot-ai/kimi-code` 0.30.0 with a pinned
+  npm toolchain (typescript 5.9.3, `@types/node` 22.20.1, `@types/ws` 8.18.1),
+  running as UID 10002. Health on 8443, WebSocket on 9090.
+- mt-admin: `--with-kimi` on `add-tenant`, `build-tenant`, `build-all`, and
+  `upgrade-tenant`; new `build-kimi-worker` and `configure-kimi` (model, base
+  URL, API key) commands; quadlet and OpenRC unit rendering; worker lifecycle,
+  status, doctor, and list integration.
+- Port registry v12 migration: dedicated `kimi` range (30000–39999, block
+  size 2) so Kimi worker ports do not collide with the full extended block.
+- No Rust daemon changes were required: the external-worker manager is
+  generic, and the `kimi` worker name appears automatically in the
+  `create_job` mode schema.
+- Onboarding CLI and web console, tenant import/export, host health checks,
+  and CI container builds updated for the new worker.
+- The entrypoint injects `KIMI_MODEL`, `KIMI_BASE_URL`, and `KIMI_API_KEY`
+  into the runtime configuration, logging only whether the key is set, never
+  the secret value.
 
 ### Study Notes Skill and MCP Integration
 
@@ -489,6 +531,9 @@ Committed tests cover:
   `--chuid` rendering;
 - external worker bounded context, retry, cancellation, terminal state, and
   timeout handling;
+- Kimi Code worker bridge: 18 unit tests covering task prompt assembly, JSONL
+  result extraction, executor success/failure paths, and workspace path
+  expansion, plus a WebSocket smoke test;
 - Study Notes read/write skill and MCP integration;
 - self-improving skills: trigger-payload seeding, persist-before-broadcast
   terminal events, gate-pause payload retention, lease revoke/rollback/startup
