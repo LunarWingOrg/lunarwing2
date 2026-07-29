@@ -30,7 +30,7 @@ x-worker-base: &worker-base
     AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:-}
     LUNARWING_WORKER_ID: ${LUNARWING_WORKER_ID:-worker-opencode-01}
     WORKSPACE_ROOT: /workspace
-    OPENCODE_ROOT: /app/opencode/packages/opencode
+    OPENCODE_BIN: ${OPENCODE_BIN:-/usr/local/bin/opencode}
     FILE_UMASK: ${FILE_UMASK:-0002}
     GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     GH_TOKEN: ${GH_TOKEN:-}

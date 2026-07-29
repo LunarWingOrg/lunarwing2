@@ -12,7 +12,7 @@ OPENCODE_SERVE_HOST="${OPENCODE_SERVE_HOST:-127.0.0.1}"
 WS_ROLE="${WS_ROLE:-server}"
 WS_STATE_FILE="${WS_STATE_FILE:-/tmp/lunarwing_ws_state.json}"
 FILE_UMASK="${FILE_UMASK:-0002}"
-OPENCODE_ROOT="${OPENCODE_ROOT:-/app/opencode/packages/opencode}"
+OPENCODE_BIN="${OPENCODE_BIN:-/usr/local/bin/opencode}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace}"
 
 umask "$FILE_UMASK"
@@ -193,20 +193,20 @@ case "$MODE" in
   cli)
     log "Mode: CLI — running opencode with args: $*"
     cd "$WORKSPACE_ROOT"
-    exec bun run --cwd "$OPENCODE_ROOT" src/index.ts run "$@"
+    exec "$OPENCODE_BIN" run "$@"
     ;;
 
   acp)
     log "Mode: ACP — launching opencode ACP bridge"
     cd "$WORKSPACE_ROOT"
-    exec bun run --cwd "$OPENCODE_ROOT" src/index.ts acp "$@"
+    exec "$OPENCODE_BIN" acp "$@"
     ;;
 
   websocket)
     log "Mode: WebSocket — starting opencode headless server"
 
     cd "$WORKSPACE_ROOT"
-    bun run --cwd "$OPENCODE_ROOT" src/index.ts serve \
+    "$OPENCODE_BIN" serve \
       --port "$OPENCODE_SERVE_PORT" \
       --hostname "$OPENCODE_SERVE_HOST" &
     OPENCODE_PID=$!
@@ -214,11 +214,9 @@ case "$MODE" in
     log "Waiting for opencode server on port $OPENCODE_SERVE_PORT..."
     RETRIES=0
     MAX_RETRIES=30
-    # Ready = the server speaks HTTP on this port. Use `curl -s` (NOT `-sf`):
-    # opencode `serve` returns 404 on bare `/` (it only serves the built SPA
-    # there, which this image does not build), so `-sf`/`--fail` would loop until
-    # timeout even though the API is healthy. Any HTTP response (incl. 404) means
-    # ready; only a refused/no-connection keeps the loop waiting.
+    # Ready = the server speaks HTTP on this port. Use `curl -s` (not `-sf`)
+    # because some OpenCode releases return 404 on `/`; any HTTP response means
+    # ready, while a refused connection keeps the loop waiting.
     until curl -s --max-time 2 -o /dev/null "http://$OPENCODE_SERVE_HOST:$OPENCODE_SERVE_PORT/" 2>/dev/null; do
       RETRIES=$((RETRIES + 1))
       if [ $RETRIES -ge $MAX_RETRIES ]; then

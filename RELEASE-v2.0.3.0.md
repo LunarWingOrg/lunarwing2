@@ -210,6 +210,42 @@ and the new start helper are installed.
 - Updated the OpenCode worker Rust toolchain.
 - Persist external job diagnostics across restarts.
 
+### Kimi Code External Worker
+
+MoonshotAI's Kimi Code CLI is now integrated as a persistent external worker,
+parallel to OpenCode, bringing the worker roster to NanoCode, Pebble, OpenCode,
+and Kimi Code. Worker selection is stored per tenant at creation time.
+
+- Added the `kimicode4lunarwing/` harness: a Node.js/TypeScript WebSocket
+  bridge speaking the `lunarwing-agent-v1` protocol. Unlike the OpenCode
+    worker's persistent headless server, each task spawns a fresh
+      `kimi -p --output-format stream-json` subprocess, so tasks get isolated
+        sessions with no cross-task state leakage.
+        - The executor parses the JSONL event stream into `task_progress` envelopes,
+          emits a persisted progress heartbeat (60-second default,
+            `KIMI_PROGRESS_HEARTBEAT_MS`), and on timeout or cancellation sends
+              `SIGTERM` then `SIGKILL` after a bounded five-second grace instead of
+                leaving orphaned work. Only one active task may modify a resolved workspace
+                  path at a time.
+                  - Container image: Node 22 plus `@moonshot-ai/kimi-code` 0.30.0 with a pinned
+                    npm toolchain (typescript 5.9.3, `@types/node` 22.20.1, `@types/ws` 8.18.1),
+                      running as UID 10002. Health on 8443, WebSocket on 9090.
+                      - mt-admin: `--with-kimi` on `add-tenant`, `build-tenant`, `build-all`, and
+                        `upgrade-tenant`; new `build-kimi-worker` and `configure-kimi` (model, base
+                          URL, API key) commands; quadlet and OpenRC unit rendering; worker lifecycle,
+                            status, doctor, and list integration.
+                            - Port registry v12 migration: dedicated `kimi` range (30000–39999, block
+                              size 2) so Kimi worker ports do not collide with the full extended block.
+                              - No Rust daemon changes were required: the external-worker manager is
+                                generic, and the `kimi` worker name appears automatically in the
+                                  `create_job` mode schema.
+                                  - Onboarding CLI and web console, tenant import/export, host health checks,
+                                    and CI container builds updated for the new worker.
+                                    - The entrypoint injects `KIMI_MODEL`, `KIMI_BASE_URL`, and `KIMI_API_KEY`
+                                      into the runtime configuration, logging only whether the key is set, never
+                                        the secret value.
+
+
 ### Study Notes Skill and MCP Integration
 
 - Added `ic/skills/study-notes/SKILL.md` as a read/write skill for managing
