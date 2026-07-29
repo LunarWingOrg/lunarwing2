@@ -23,6 +23,7 @@ EXPECTED_INCLUDES = [
     "/.gitlab/ci/rust.yml",
     "/.gitlab/ci/integration.yml",
     "/.gitlab/ci/security.yml",
+    "/.gitlab/ci/containers.yml",
 ]
 IMAGE_PATTERN = re.compile(r"@sha256:[0-9a-f]{64}$")
 DIGEST_PATTERN = re.compile(r"sha256:([0-9a-f]{64})")

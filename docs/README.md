@@ -98,6 +98,7 @@ Deployment, operations, multitenancy, and production guides.
 | [`SELF_REPAIR_IMPROVEMENTS_GENTOO.md`](ops/SELF_REPAIR_IMPROVEMENTS_GENTOO.md) | Self-heal fd-leak fix found on a live OpenRC MT host |
 | [`ROADMAP_2026.md`](ops/ROADMAP_2026.md) | 2026 roadmap |
 | [`GITHOOKS_HOW_TO.md`](ops/GITHOOKS_HOW_TO.md) | How to install githooks |
+| [`GITLAB_CONTAINER_REGISTRY.md`](ops/GITLAB_CONTAINER_REGISTRY.md) | Enabling GitLab's built-in container registry and building/pulling worker images from CI |
 | [`IMPORT_EXPORT_EXAMPLE.txt`](ops/IMPORT_EXPORT_EXAMPLE.txt) | Worker import/export example |
 | [`KUMOGAKURE_INSTRUCT.md`](ops/KUMOGAKURE_INSTRUCT.md) | Pointer to the external Notes vault |
 | [`AGENT_GOALS_2.0.3.0.md`](ops/AGENT_GOALS_2.0.3.0.md) | Agent-assigned pre-release checklist for LunarWing v2.0.3.0 |

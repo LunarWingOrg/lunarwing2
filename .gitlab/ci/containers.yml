@@ -1,0 +1,77 @@
+# Container image builds for the external workers, published to this project's
+# GitLab container registry ($CI_REGISTRY_IMAGE). Requires the built-in registry
+# to be enabled on the GitLab server — see docs/ops/GITLAB_CONTAINER_REGISTRY.md
+# for the server-side setup and for how MT hosts/tenants pull these images.
+#
+# Images are built with Kaniko (unprivileged, works on any docker-executor
+# runner; produces docker-format images so the Dockerfiles' HEALTHCHECKs
+# survive). Jobs run automatically on the default branch when a worker
+# directory changes, and are available manually on any pipeline.
+#
+# If gcr.io is unreachable from the runners, mirror the executor image into
+# our own registry first (bootstrap notes in docs/ops/GITLAB_CONTAINER_REGISTRY.md).
+
+.container-job:
+  image:
+    name: "gcr.io/kaniko-project/executor:v1.23.2-debug@sha256:c3109d5926a997b100c4343944e06c6b30a6804b2f9abe0994d3de6ef92b028e"
+    entrypoint: [""]
+  tags:
+    - "$CI_LINT_RUNNER_TAG"
+  stage: containers
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - |
+      printf '{"auths":{"%s":{"username":"%s","password":"%s"}}}' \
+        "$CI_REGISTRY" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" \
+        > /kaniko/.docker/config.json
+
+worker-nanocode-image:
+  extends: .container-job
+  variables:
+    NANOCODE_REF: "v1.2.28"
+  script:
+    - /kaniko/executor
+      --context "$CI_PROJECT_DIR/lunarcode4lunarwing"
+      --dockerfile "$CI_PROJECT_DIR/lunarcode4lunarwing/Dockerfile"
+      --build-arg "NANOCODE_REF=$NANOCODE_REF"
+      --destination "$CI_REGISTRY_IMAGE/worker-nanocode:$CI_COMMIT_SHORT_SHA"
+      --destination "$CI_REGISTRY_IMAGE/worker-nanocode:latest"
+  rules:
+    - if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+      changes:
+        - lunarcode4lunarwing/**/*
+    - when: manual
+
+worker-pebble-image:
+  extends: .container-job
+  script:
+    - /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile "$CI_PROJECT_DIR/pebble4lunarwing/Dockerfile"
+      --destination "$CI_REGISTRY_IMAGE/worker-pebble:$CI_COMMIT_SHORT_SHA"
+      --destination "$CI_REGISTRY_IMAGE/worker-pebble:latest"
+  rules:
+    - if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+      changes:
+        - pebble4lunarwing/**/*
+        - pebble/**/*
+    - when: manual
+
+worker-opencode-image:
+  extends: .container-job
+  variables:
+    # Mirrors mt-admin's build_opencode_worker: slim by default; set
+    # WITH_TOOLCHAINS=true on a manual pipeline for the fat toolchain image.
+    WITH_TOOLCHAINS: "false"
+  script:
+    - /kaniko/executor
+      --context "$CI_PROJECT_DIR/opencode4lunarwing"
+      --dockerfile "$CI_PROJECT_DIR/opencode4lunarwing/Dockerfile"
+      --build-arg "WITH_TOOLCHAINS=$WITH_TOOLCHAINS"
+      --destination "$CI_REGISTRY_IMAGE/worker-opencode:$CI_COMMIT_SHORT_SHA"
+      --destination "$CI_REGISTRY_IMAGE/worker-opencode:latest"
+  rules:
+    - if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+      changes:
+        - opencode4lunarwing/**/*
+    - when: manual

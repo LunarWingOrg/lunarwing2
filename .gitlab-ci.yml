@@ -5,10 +5,12 @@ include:
   - local: "/.gitlab/ci/rust.yml"
   - local: "/.gitlab/ci/integration.yml"
   - local: "/.gitlab/ci/security.yml"
+  - local: "/.gitlab/ci/containers.yml"
 
 stages:
   - validate
   - check
   - test
   - security
+  - containers
   - observe
