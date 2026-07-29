@@ -110,6 +110,7 @@ Deployment, operations, multitenancy, and production guides.
 | [`GOAL_GAP_SUGGESTIONS.md`](ops/GOAL_GAP_SUGGESTIONS.md) | Source-verified release work missing from the v2.0.3.0 goals checklist |
 | [`HUMAN_GOALS_2.0.1.0.md`](ops/HUMAN_GOALS_2.0.1.0.md) | Human pre-release checklist for v2.0.1.0, including Kawarimi encryption work |
 | [`ISSUE_STATUS_REPORT.md`](ops/ISSUE_STATUS_REPORT.md) | GitHub issue status review with closure and follow-up recommendations |
+| [`UI_FIX_SUGGESTIONS.md`](ops/UI_FIX_SUGGESTIONS.md) | Web gateway UI fix suggestions: source-verified findings with priorities and implementation order |
 | [`KUMOGAKURE_RECENT_REV_T.md`](ops/KUMOGAKURE_RECENT_REV_T.md) | v2 branch sentinel with Hermes adapter and mt-admin decomposition review notes |
 | [`MCP_ADDITIONS.md`](ops/MCP_ADDITIONS.md) | Host-local stdio MCP installation record and follow-up lifecycle and diagnostics ideas |
 | [`MEMORY_IMPL.md`](ops/MEMORY_IMPL.md) | Planning stub for importing or integrating memory cleanup, de-duplication, and correction routines |
