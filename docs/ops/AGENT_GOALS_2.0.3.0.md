@@ -73,7 +73,7 @@
 20. [x] (S) dark irc key exchange. automate the process securely. For this task I have already prepared a document you can use for implementation: /docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md -  There is also substantial work on some branches already done - You can use the following document for reference on next steps: docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md You may attempt to use the following work from failed/partial work on the following branches: rarity/item-20-20260722-1501 and darkirckeyex/aragents/v2.0.3.0 and feat/darkirc-key-exchange-v1
 21. [x] (S) continue to work on external workers, in particular for opencode
 22. [x] (S) review kawarimi adapter. make improvements (only if necessary)
-23. [x] go over release notes for 2.0.2.0 and see what else still needs to be added to next release, see documents about this if unsure of each item. create new doc under docs/proposals for items that should be included in 2.0.3.0 (you must focus on enginev2 related fixes/polishing)
+23. [ ] Review new worker container (kimicode). create review document in docs/reviews or docs/ops
 24. [x] (S) Refactor mt admin. The existing document plans have SERIOUS issues. Therefore, I'm going with a COMPLETELY different plan for this. Please see the following branch: mtadminrefactor/meta4/v2.0.3.0
 25. [ ] Suggest additional UI fixes a new document in docs/ops — update docs/ops/UI_FIX_SUGGESTIONS.md with any additional findings
 26. [x] Review recent work on Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure. create new doc detailing findings in docs/ops called XMPP_FT_REVIEW_A.md (yes, it is intentional to have this goal defined twice)
