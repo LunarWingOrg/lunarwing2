@@ -324,5 +324,17 @@ if grep -Eq -- 'image prune|--layers=false' "$build_calls"; then
 fi
 
 grep -Fq 'bun pm cache rm' "$dockerfile"
+grep -Fq 'COPY --from=builder /out/bin/opencode /usr/local/bin/opencode' "$dockerfile"
+grep -Fq 'COPY --from=builder /out/sdk /app/node_modules/@opencode-ai/sdk' "$dockerfile"
+if grep -Fq 'COPY --from=builder /build/opencode /app/opencode' "$dockerfile"; then
+  printf 'OpenCode runtime image copies full upstream build tree\n' >&2
+  exit 1
+fi
+
+entrypoint="$SCRIPT_DIR/../../opencode4lunarwing/entrypoint.sh"
+executor="$SCRIPT_DIR/../../opencode4lunarwing/scripts/opencode_task_executor.ts"
+grep -Fq 'OPENCODE_BIN="${OPENCODE_BIN:-/usr/local/bin/opencode}"' "$entrypoint"
+grep -Fq '"$OPENCODE_BIN" serve' "$entrypoint"
+grep -Fq 'from "@opencode-ai/sdk/v2/client"' "$executor"
 
 printf 'Study MCP worker mount tests passed\n'

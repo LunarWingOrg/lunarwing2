@@ -11,6 +11,10 @@ docker compose build
 docker compose up -d lunarwing-worker
 ```
 
+Build stage compiles one native OpenCode binary. Runtime image copies that
+binary and generated SDK client only; upstream monorepo and build dependencies
+remain builder-only to keep image size and Kaniko memory use bounded.
+
 ### CLI mode (one-shot)
 
 The prompt is passed via the `TASK_PROMPT` environment variable:
