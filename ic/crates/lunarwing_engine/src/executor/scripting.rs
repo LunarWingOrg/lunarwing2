@@ -248,6 +248,7 @@ pub async fn execute_code(
     context: &ThreadExecutionContext,
     capability_policies: &[crate::types::capability::PolicyRule],
     persisted_state: &serde_json::Value,
+    store: Option<&Arc<dyn crate::traits::store::Store>>,
 ) -> Result<CodeExecutionResult, EngineError> {
     execute_code_with_skills(
         code,
@@ -260,6 +261,7 @@ pub async fn execute_code(
         capability_policies,
         persisted_state,
         &[],
+        store,
     )
     .await
 }
@@ -280,6 +282,7 @@ pub async fn execute_code_with_skills(
     capability_policies: &[crate::types::capability::PolicyRule],
     persisted_state: &serde_json::Value,
     skill_snippet_names: &[String],
+    store: Option<&Arc<dyn crate::traits::store::Store>>,
 ) -> Result<CodeExecutionResult, EngineError> {
     let mut stdout = String::new();
     let mut action_results = Vec::new();
@@ -307,6 +310,13 @@ pub async fn execute_code_with_skills(
     // These resolve in NameLookup so the LLM can call them as Python functions.
     for name in skill_snippet_names {
         known_actions.insert(name.clone());
+    }
+
+    // Mission threads get a host-level memory-doc writer (for skill extraction,
+    // fix patterns, orchestrator versions). Registered only for missions so
+    // ordinary threads cannot mint `trust: "trusted"` skill docs.
+    if thread.thread_type == crate::types::thread::ThreadType::Mission {
+        known_actions.insert("__save_memory_doc__".into());
     }
 
     // Parse and compile (wrap in catch_unwind — Monty 0.0.x can panic)
@@ -448,6 +458,10 @@ pub async fn execute_code_with_skills(
                         )
                         .await,
                     ),
+                    // Mission-only memory-doc writer (skill extraction output).
+                    "__save_memory_doc__" => {
+                        Some(handle_save_memory_doc(&call.args, thread, store).await)
+                    }
                     "globals" | "locals" => {
                         let entries: Vec<(MontyObject, MontyObject)> = known_actions
                             .iter()
@@ -1404,6 +1418,91 @@ async fn resolve_llm_future(
 
 // ── Helpers ─────────────────────────────────────────────────
 
+/// Handle `__save_memory_doc__(title, content, doc_type, tags=None, metadata=None, shared=False)`.
+///
+/// Creates a MemoryDoc (e.g. an extracted Skill, a fix-pattern update, an
+/// orchestrator version) from a **Mission thread** and returns the new doc id
+/// string. Refused (returns `False`) for non-mission threads: ordinary threads
+/// must not be able to mint `trust: "trusted"` skill docs.
+///
+/// With `shared=True` the doc is written under the shared owner — required for
+/// docs the engine loads from the shared space (prompt overlay, orchestrator
+/// versions, fix-pattern database). Skill/insight docs should stay user-scoped
+/// (the default) so they remain attributable to the mission's user.
+async fn handle_save_memory_doc(
+    args: &[MontyObject],
+    thread: &Thread,
+    store: Option<&Arc<dyn crate::traits::store::Store>>,
+) -> ExtFunctionResult {
+    if thread.thread_type != crate::types::thread::ThreadType::Mission {
+        debug!("__save_memory_doc__: refused for non-mission thread");
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    }
+    let Some(store) = store else {
+        debug!("__save_memory_doc__: no store available");
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    };
+
+    let title = args.first().map(monty_to_string).unwrap_or_default();
+    let content = args.get(1).map(monty_to_string).unwrap_or_default();
+    let doc_type_str = args.get(2).map(monty_to_string).unwrap_or_default();
+    if title.is_empty() || content.is_empty() {
+        debug!("__save_memory_doc__: title and content are required");
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    }
+
+    use crate::types::memory::DocType;
+    let doc_type = match doc_type_str.to_ascii_lowercase().as_str() {
+        "summary" => DocType::Summary,
+        "lesson" => DocType::Lesson,
+        "issue" => DocType::Issue,
+        "spec" => DocType::Spec,
+        "note" => DocType::Note,
+        "skill" => DocType::Skill,
+        "plan" => DocType::Plan,
+        other => {
+            debug!("__save_memory_doc__: unknown doc_type: {other}");
+            return ExtFunctionResult::Return(MontyObject::Bool(false));
+        }
+    };
+
+    let tags: Vec<String> = args
+        .get(3)
+        .map(monty_to_json)
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let metadata = args
+        .get(4)
+        .map(monty_to_json)
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let shared = args.get(5).is_some_and(|o| matches!(o, MontyObject::Bool(true)));
+
+    let owner = if shared {
+        crate::types::shared_owner_id()
+    } else {
+        thread.user_id.as_str()
+    };
+    let mut doc = crate::types::memory::MemoryDoc::new(
+        thread.project_id,
+        owner,
+        doc_type,
+        title,
+        content,
+    )
+    .with_source_thread(thread.id)
+    .with_tags(tags);
+    doc.metadata = metadata;
+
+    let doc_id = doc.id.0.to_string();
+    if let Err(e) = store.save_memory_doc(&doc).await {
+        debug!("__save_memory_doc__: failed to save: {e}");
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    }
+
+    ExtFunctionResult::Return(MontyObject::String(doc_id))
+}
+
 fn extract_string_arg(
     args: &[MontyObject],
     kwargs: &[(MontyObject, MontyObject)],
@@ -1521,6 +1620,7 @@ mod tests {
     use crate::capability::lease::LeaseManager;
     use crate::capability::policy::PolicyEngine;
     use crate::traits::effect::ThreadExecutionContext;
+    use crate::traits::store::Store;
     use crate::types::capability::{ActionDef, CapabilityLease, EffectType, GrantedActions};
     use crate::types::project::ProjectId;
     use crate::types::step::{ActionResult, StepId};
@@ -1672,8 +1772,171 @@ mod tests {
             &ctx,
             &[],
             &serde_json::json!({}),
+            None,
         )
         .await
+    }
+
+    // ── Mission memory-doc writer ────────────────────────────
+
+    #[tokio::test]
+    async fn save_memory_doc_writes_skill_for_mission_thread() {
+        let store = Arc::new(crate::tests::InMemoryStore::new());
+        let thread = Thread::new(
+            "extract a skill",
+            ThreadType::Mission,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let ctx = make_exec_context(&thread);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let leases = LeaseManager::new();
+        let policy = PolicyEngine::new();
+
+        let code = r#"
+doc_id = __save_memory_doc__(
+    "skill:external-worker-dispatch",
+    "1. Check worker env\n2. Dispatch job",
+    "skill",
+    ["skill", "worker"],
+    {"name": "external-worker-dispatch", "source": "extracted", "trust": "trusted"},
+)
+FINAL(doc_id)
+"#;
+        let result = execute_code(
+            code,
+            &thread,
+            &(Arc::new(StubLlm) as Arc<dyn crate::traits::llm::LlmBackend>),
+            &effects,
+            &leases,
+            &policy,
+            &ctx,
+            &[],
+            &serde_json::json!({}),
+            Some(&(Arc::clone(&store) as Arc<dyn crate::traits::store::Store>)),
+        )
+        .await
+        .unwrap();
+
+        let docs = store
+            .list_memory_docs(thread.project_id, "test-user")
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 1, "skill doc persisted");
+        let doc = &docs[0];
+        assert_eq!(doc.title, "skill:external-worker-dispatch");
+        assert_eq!(doc.doc_type, crate::types::memory::DocType::Skill);
+        assert_eq!(doc.source_thread_id, Some(thread.id));
+        assert_eq!(doc.tags, vec!["skill".to_string(), "worker".to_string()]);
+        assert_eq!(doc.metadata["source"], serde_json::json!("extracted"));
+        assert_eq!(doc.metadata["trust"], serde_json::json!("trusted"));
+        // FINAL received the new doc id returned by the host function.
+        assert_eq!(
+            result.final_answer.as_deref(),
+            Some(doc.id.0.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn save_memory_doc_shared_flag_sets_shared_owner() {
+        let store = Arc::new(crate::tests::InMemoryStore::new());
+        let thread = Thread::new(
+            "patch overlay",
+            ThreadType::Mission,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let ctx = make_exec_context(&thread);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let leases = LeaseManager::new();
+        let policy = PolicyEngine::new();
+
+        let code = r#"
+doc_id = __save_memory_doc__(
+    "prompt:codeact_preamble",
+    "Never call web_fetch — use http() instead",
+    "note",
+    ["prompt_overlay"],
+    {},
+    True,
+)
+FINAL(doc_id)
+"#;
+        execute_code(
+            code,
+            &thread,
+            &(Arc::new(StubLlm) as Arc<dyn crate::traits::llm::LlmBackend>),
+            &effects,
+            &leases,
+            &policy,
+            &ctx,
+            &[],
+            &serde_json::json!({}),
+            Some(&(Arc::clone(&store) as Arc<dyn crate::traits::store::Store>)),
+        )
+        .await
+        .unwrap();
+
+        // Shared docs are what the engine loaders read (overlay, orchestrator).
+        let shared = store
+            .list_shared_memory_docs(thread.project_id)
+            .await
+            .unwrap();
+        assert_eq!(shared.len(), 1, "overlay doc written as shared");
+        assert_eq!(shared[0].title, "prompt:codeact_preamble");
+        assert!(
+            store
+                .list_memory_docs(thread.project_id, "test-user")
+                .await
+                .unwrap()
+                .is_empty(),
+            "shared doc must not be user-scoped"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_memory_doc_unavailable_for_non_mission_thread() {
+        let store = Arc::new(crate::tests::InMemoryStore::new());
+        let thread = make_test_thread(); // Foreground
+        let ctx = make_exec_context(&thread);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let leases = LeaseManager::new();
+        let policy = PolicyEngine::new();
+
+        // The name is not even registered for non-mission threads (NameError),
+        // and the handler double-checks thread type — either way no doc is
+        // created and no trusted skill can be minted.
+        let code = r#"
+try:
+    doc_id = __save_memory_doc__("skill:x", "body", "skill", [], {})
+except NameError:
+    doc_id = "unavailable"
+FINAL(doc_id)
+"#;
+        let _ = execute_code(
+            code,
+            &thread,
+            &(Arc::new(StubLlm) as Arc<dyn crate::traits::llm::LlmBackend>),
+            &effects,
+            &leases,
+            &policy,
+            &ctx,
+            &[],
+            &serde_json::json!({}),
+            Some(&(Arc::clone(&store) as Arc<dyn crate::traits::store::Store>)),
+        )
+        .await;
+
+        assert!(
+            store
+                .list_memory_docs(thread.project_id, "test-user")
+                .await
+                .unwrap()
+                .is_empty(),
+            "non-mission thread must not create memory docs"
+        );
     }
 
     // ── Execute-time gate propagation ──────────────────────
@@ -2366,6 +2629,7 @@ except Exception as e:
             &ctx,
             &[],
             &serde_json::json!({}),
+            None,
         )
         .await
         .unwrap();
