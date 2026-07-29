@@ -75,7 +75,7 @@
 22. [x] (S) review kawarimi adapter. make improvements (only if necessary)
 23. [x] Review new worker container (kimicode). create review document in docs/reviews or docs/ops
 24. [x] (S) Refactor mt admin. The existing document plans have SERIOUS issues. Therefore, I'm going with a COMPLETELY different plan for this. Please see the following branch: mtadminrefactor/meta4/v2.0.3.0
-25. [ ] Suggest additional UI fixes a new document in docs/ops — update docs/ops/UI_FIX_SUGGESTIONS.md with any additional findings
+25. [x] Suggest additional UI fixes a new document in docs/ops — update docs/ops/UI_FIX_SUGGESTIONS.md with any additional findings — DONE 2026-07-29 (branch rarity/kimi-25-20260729-2104): second-pass static audit of `ic/src/channels/web/static/` appended to `docs/ops/UI_FIX_SUGGESTIONS.md` — new findings M5 (no 401 handling → infinite reconnect), M6 (`loadThreads()` reverts translated Assistant label), M7 (hover-only gateway/TEE popovers unreachable on touch/keyboard), M8 (memory viewer read race), M9 (more hardcoded English in job/routine detail + widgets), L5 (`escapeHtml()` not attribute-safe, CSP-mitigated), L6 (toasts/aria screen-reader gaps); implementation order updated
 26. [x] Review recent work on Further polishing of Lunarvision AND XMPP file sharing integration, see documents about this if unsure. create new doc detailing findings in docs/ops called XMPP_FT_REVIEW_A.md (yes, it is intentional to have this goal defined twice)
 27. [x] Review recent changes for: Gut proprietary tunnel providers and add support for netbird. improve if necessary
 28. [x] ensure dependency list is updated for gentoo and include archlinux dependency list if not present as well. be sure to include python packages not listed in these dep lists currently
