@@ -44,6 +44,7 @@ How-to guides, build instructions, and setup walkthroughs.
 | [`TUNNEL_PROVIDER_MIGRATION.md`](guides/TUNNEL_PROVIDER_MIGRATION.md) | Migrate from removed managed Cloudflare/ngrok/Tailscale tunnels |
 | [`VISION_OCR_SIDECAR.md`](guides/VISION_OCR_SIDECAR.md) | Vision/OCR sidecar service overview |
 | [`GENTOO_PACKAGE_LIST.md`](guides/GENTOO_PACKAGE_LIST.md) | Gentoo package list + rootless-podman MT prerequisites |
+| [`ARCHLINUX_PACKAGE_LIST.md`](guides/ARCHLINUX_PACKAGE_LIST.md) | Arch Linux package list (systemd MT equivalent of the Gentoo list) |
 | [`MULTICA_DEPLOYMENT.md`](guides/MULTICA_DEPLOYMENT.md) | Multica/Lunartica deployment guide |
 | [`human-delay-mode.md`](guides/human-delay-mode.md) | Human-delay mode overview |
 | [`DEBUG_LOG.md`](guides/DEBUG_LOG.md) | Catalog of debug/info log points by `file:line` |
