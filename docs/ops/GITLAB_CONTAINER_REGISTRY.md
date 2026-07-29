@@ -1,69 +1,101 @@
 # GitLab Container Registry — setup and usage
 
-Goal: enable GitLab's built-in container registry on `git.lunarwing.org` and
-publish the external-worker images (`worker-nanocode`, `worker-pebble`,
+Goal: enable GitLab's built-in container registry for `lunarwing/lunarwing2`
+and publish the external-worker images (`worker-nanocode`, `worker-pebble`,
 `worker-opencode`) from CI, so MT hosts can pull prebuilt images instead of
 building locally on every upgrade.
 
 The CI side lives in `.gitlab/ci/containers.yml` (branch
 `c0ntainers/mcr/v2.0.3.0`). The server side must be done once on the GitLab
-host by someone with access (GitLab runs as a Docker container).
+host by someone with access.
+
+**Environment (confirmed 2026-07-29):** GitLab runs as a Docker container
+behind **Traefik** (`proxy` network, `websecure` entrypoint, `letsencrypt`
+certresolver). Traefik terminates TLS — the GitLab container itself holds no
+certs. Registry URL: **`https://registry.git.lunarwing.org`** (subdomain
+through Traefik; the port-5050-direct alternative doesn't apply here because
+omnibus has no certificates of its own).
 
 ## 1. Server-side: enable the registry (run on the GitLab host)
 
-### 1a. Recommended: port 5050 on the existing domain
+Three parts: DNS, Traefik route, omnibus config.
 
-Using `https://git.lunarwing.org:5050` reuses the **existing TLS certificate**
-for `git.lunarwing.org` — no new DNS record and no new certificate. Omnibus
-looks up the registry vhost certificate by URL hostname, so
-`/etc/gitlab/ssl/git.lunarwing.org.crt` (already present) is used.
+### 1a. DNS
 
-Add to the container's `GITLAB_OMNIBUS_CONFIG` environment (docker run `-e` or
-docker-compose `environment:`):
+Add an A record so the subdomain actually resolves (the previously sketched
+`regisitry.sobe.world` was both typo'd and unregistered — discard it):
+
+```
+registry.git.lunarwing.org.  A  104.36.84.181   ; same IP as git.lunarwing.org
+```
+
+Traefik's `letsencrypt` certresolver will issue the cert automatically once
+DNS resolves and the route exists (HTTP-01 via the existing `websecure`
+entrypoint — nothing else to configure).
+
+### 1b. Traefik route
+
+Add these labels to the GitLab container (same style as the existing
+`gitlab` router; note the service port is 5050 and there is **no**
+`server.scheme=websecure` — the registry backend speaks plain HTTP inside the
+container):
+
+```yaml
+labels:
+  # GitLab Container Registry
+  - traefik.http.routers.gitlab-registry.rule=Host(`registry.git.lunarwing.org`)
+  - traefik.http.routers.gitlab-registry.entrypoints=websecure
+  - traefik.http.routers.gitlab-registry.tls.certresolver=letsencrypt
+  - traefik.http.services.gitlab-registry.loadbalancer.server.port=5050
+```
+
+**Gotcha:** the current compose has `traefik.enable=false` on the GitLab
+container, which makes *all* of its Traefik labels inert. If
+`git.lunarwing.org` works today, its route must be defined somewhere else
+(e.g. Traefik file provider) — in that case define the
+`gitlab-registry` router/service there instead. Otherwise flip
+`traefik.enable` to `true` (after confirming the existing `gitlab` router
+labels take over the main route cleanly).
+
+No host port publish is needed: Traefik reaches the container's 5050 over the
+shared `proxy` network.
+
+### 1c. GitLab omnibus config
+
+Add to the container's `GITLAB_OMNIBUS_CONFIG` environment (docker run `-e`
+or compose `environment:`):
 
 ```ruby
-registry_external_url 'https://git.lunarwing.org:5050'
+registry_external_url 'https://registry.git.lunarwing.org'
+registry_nginx['listen_port'] = 5050
+registry_nginx['listen_https'] = false   # Traefik terminates TLS
 ```
 
-Publish the port (same place you publish 443):
+Setting `registry_external_url` auto-enables the registry in gitlab-rails.
+The two `registry_nginx` lines keep the in-container registry listener on
+plain HTTP :5050, matching the Traefik service above.
 
-```bash
--p 5050:5050
-```
-
-Recreate/restart the container (`docker compose up -d` or `docker restart
-gitlab`); omnibus reconfigures automatically from the env config on boot.
-
-### 1b. Alternative: dedicated subdomain
-
-If you prefer `https://registry.git.lunarwing.org`:
-
-- Add a DNS A record for `registry.git.lunarwing.org`.
-- Provide `/etc/gitlab/ssl/registry.git.lunarwing.org.crt` (+ `.key`) in the
-  container's config volume (or enable omnibus Let's Encrypt for the registry
-  vhost).
-- `registry_external_url 'https://registry.git.lunarwing.org'` — no port
-  publish needed beyond 443 if a reverse proxy routes it; otherwise the
-  registry nginx listens on 443 inside the container alongside the main one.
-
-### 1c. If a reverse proxy fronts GitLab
-
-The registry API (`/v2/`) needs large-request support and proper
-`X-Forwarded-*` headers. Pointing clients directly at
-`git.lunarwing.org:5050` (option 1a) bypasses the proxy entirely and avoids
-this class of issues.
+Recreate/restart the container (`docker compose up -d`); omnibus reconfigures
+from the env config on boot.
 
 ### 1d. Verify (from anywhere)
 
 ```bash
-curl -i https://git.lunarwing.org:5050/v2/
+curl -i https://registry.git.lunarwing.org/v2/
 # expect: HTTP/2 401 with a Docker-Distribution-Api-Version header — registry up
 
-docker login git.lunarwing.org:5050   # GitLab username + PAT with read_registry/write_registry
+docker login registry.git.lunarwing.org   # GitLab username + PAT with read_registry/write_registry
 ```
 
 In the GitLab UI: project → Deploy → Container Registry should now list an
 (empty) registry for `lunarwing/lunarwing2`.
+
+### 1e. Large-image notes for Traefik
+
+Worker images can be multi-GB (especially opencode with toolchains). Traefik
+streams request bodies by default, which is fine; if very large layer pushes
+ever stall, raise `forwardingTimeouts` on the entrypoint or on the
+`gitlab-registry` router (`serversTransport`). Leave request buffering off.
 
 ## 2. CI: build and push worker images
 
@@ -77,10 +109,12 @@ In the GitLab UI: project → Deploy → Container Registry should now list an
 
 Details:
 
-- Builds use **Kaniko** (`gcr.io/kaniko-project/executor:v1.23.2-debug`) —
-  unprivileged, works on any docker-executor runner, produces docker-format
-  images so the Dockerfiles' `HEALTHCHECK`s survive (matches the mt-admin
-  `--format docker` convention).
+- `$CI_REGISTRY` / `$CI_REGISTRY_IMAGE` resolve automatically from
+  `registry_external_url` once section 1 is live — no CI variable changes.
+- Builds use **Kaniko** (`gcr.io/kaniko-project/executor`, pinned by sha256
+  digest per repo convention) — unprivileged, works on any docker-executor
+  runner, produces docker-format images so the Dockerfiles' `HEALTHCHECK`s
+  survive (matches the mt-admin `--format docker` convention).
 - Auth uses the automatic `$CI_REGISTRY_USER` / `$CI_REGISTRY_PASSWORD`
   per-job credentials — nothing to configure.
 - Jobs run **automatically on the default branch** when the relevant worker
@@ -89,26 +123,25 @@ Details:
 - Variables: `NANOCODE_REF` (default `v1.2.28`), `WITH_TOOLCHAINS` for
   opencode (default `false`; set `true` on a manual pipeline run for the fat
   toolchain image — mirrors mt-admin's `--with-toolchains`).
-- The Kaniko executor image is pinned by sha256 digest (repo convention,
-  enforced by `validate_config.py`). If gcr.io is unreachable from the
-  runners, pull the executor image elsewhere, push it into our registry once
-  section 1 is done, and update `.container-job`'s `image:name`.
+- If gcr.io is unreachable from the runners, pull the executor image
+  elsewhere, push it into our registry once section 1 is done, and update
+  `.container-job`'s `image:name`.
 
 ## 3. Using the images on MT hosts
 
-Images are named `git.lunarwing.org:5050/lunarwing/lunarwing2/worker-<name>`.
+Images are named `registry.git.lunarwing.org/lunarwing/lunarwing2/worker-<name>`.
 
 One-time login on the host (rootful runtime that mt-admin builds with):
 
 ```bash
-podman login git.lunarwing.org:5050    # or docker login; use a read_registry PAT
+podman login registry.git.lunarwing.org    # or docker login; use a read_registry PAT
 ```
 
 Then, instead of building locally during upgrades:
 
 ```bash
-podman pull git.lunarwing.org:5050/lunarwing/lunarwing2/worker-opencode:latest
-podman tag  git.lunarwing.org:5050/lunarwing/lunarwing2/worker-opencode:latest \
+podman pull registry.git.lunarwing.org/lunarwing/lunarwing2/worker-opencode:latest
+podman tag  registry.git.lunarwing.org/lunarwing/lunarwing2/worker-opencode:latest \
             lunarwing-worker-opencode:latest
 ```
 
