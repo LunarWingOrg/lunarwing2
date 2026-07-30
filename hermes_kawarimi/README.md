@@ -21,14 +21,15 @@ HermesAgentSnapshot            neutral in-memory IR
 MappedAgent                    owner-agnostic LunarWing rows
    │  loader.py    (--apply only)
    ▼
-mt-admin add/build/start → schema → stop → populate live DB + secrets
+mt-admin add/build/start → schema → stop → start-pg → populate live DB + secrets
 ```
 
 **Why start-then-stop for schema:** LunarWing creates its schema via the daemon's
 refinery runner at first boot (`ic/src/app.rs`), and `V1__initial.sql` uses bare
 `CREATE TABLE`, so hand-applying SQL would collide. The loader boots the tenant
-once to create the schema, stops the daemon (PostgreSQL stays up), then populates
-with no daemon racing.
+once to create the schema, stops the daemon, then re-ups PostgreSQL only
+(`mt-admin start-pg` — `stop-tenant` stops PG too) and populates with no daemon
+racing.
 
 **Owner-scope safety:** every row is written under the freshly-provisioned
 tenant's `LUNARWING_OWNER_ID`, so the `KAWARIMI-OWNER-SCOPE-CONTINUITY`
