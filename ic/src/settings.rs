@@ -867,10 +867,12 @@ pub struct ExternalWorkerSettings {
     pub name: String,
     /// WebSocket URL (e.g., "ws://localhost:9090/ws/agent").
     pub url: String,
-    /// Bearer token for authentication (empty = no auth). Secret-bearing: not
-    /// serialized out (SecretString has no Serialize impl); `Debug` redacts via
-    /// secrecy. merge_from preserves auth_token via a direct post-merge fixup
-    /// because skip_serializing drops it during the serde_json transport.
+    /// Bearer token for authentication (empty = no auth). Secret-bearing:
+    /// skipped by serde so it never leaks through JSON/API transports;
+    /// `Debug` redacts via secrecy. `save_toml` re-injects it into the
+    /// on-disk config (the source of truth provisioned by mt-admin), and
+    /// `merge_from` preserves it via a direct post-merge fixup because
+    /// skip_serializing drops it during the serde_json transport.
     #[serde(default, skip_serializing)]
     pub auth_token: Option<SecretString>,
     /// Default task timeout in milliseconds.

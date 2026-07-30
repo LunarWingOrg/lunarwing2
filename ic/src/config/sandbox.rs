@@ -147,11 +147,11 @@ impl SandboxModeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerEndpoint {
     pub url: String,
-    // Secret-bearing: never serialized out (`SecretString` has no `Serialize`
-    // impl by design). `Debug` auto-redacts via secrecy's `[REDACTED]`.
-    // merge_from preserves auth_token via a direct post-merge fixup in
-    // Settings::merge_from because skip_serializing drops it during the
-    // serde_json transport.
+    // Secret-bearing: skipped by serde so it never leaks through JSON/API
+    // transports; `Debug` auto-redacts via secrecy's `[REDACTED]`.
+    // `Settings::save_toml` re-injects it into the on-disk config, and
+    // `Settings::merge_from` preserves it via a direct post-merge fixup
+    // because skip_serializing drops it during the serde_json transport.
     #[serde(skip_serializing, default)]
     pub auth_token: Option<SecretString>,
     pub weight: Option<u32>,
