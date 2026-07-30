@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -29,6 +30,7 @@ pub struct StdioMcpTransport {
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     stderr_handle: Mutex<Option<JoinHandle<()>>>,
     child: Arc<Mutex<Child>>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl StdioMcpTransport {
@@ -107,7 +109,35 @@ impl StdioMcpTransport {
             reader_handle: Mutex::new(Some(reader_handle)),
             stderr_handle: Mutex::new(Some(stderr_handle)),
             child: Arc::new(Mutex::new(child)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Whether an intentional shutdown has been initiated for this transport.
+    ///
+    /// The process supervisor uses this to distinguish a crash (restart) from
+    /// an operator-requested stop (no restart).
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+    }
+
+    /// Non-blocking check for child process exit.
+    ///
+    /// Returns `Some(status)` once the child has exited, `None` while it is
+    /// still running (or if the exit state cannot be determined).
+    pub async fn poll_exit_status(&self) -> Option<std::process::ExitStatus> {
+        let mut child = self.child.lock().await;
+        match child.try_wait() {
+            Ok(status) => status,
+            Err(e) => {
+                tracing::debug!(
+                    "[{}] Failed to poll MCP server child status: {}",
+                    self.server_name,
+                    e
+                );
+                None
+            }
+        }
     }
 }
 
@@ -129,6 +159,10 @@ impl McpTransport for StdioMcpTransport {
     }
 
     async fn shutdown(&self) -> Result<(), ToolError> {
+        // Flag intentional shutdown first so the crash supervisor does not
+        // treat the upcoming kill as a crash and restart the server.
+        self.shutting_down.store(true, Ordering::Release);
+
         // Kill the child process.
         {
             let mut child = self.child.lock().await;

@@ -517,6 +517,8 @@ impl AppBuilder {
 
         let mcp_session_manager = Arc::new(McpSessionManager::new());
         let mcp_process_manager = Arc::new(McpProcessManager::new());
+        // Automatically restart crashed stdio MCP servers (crash-loop guarded).
+        mcp_process_manager.start_supervisor();
 
         // Create WASM tool runtime eagerly so extensions installed after startup
         // (e.g. via the web UI) can still be activated. The tools directory is only
