@@ -88,7 +88,10 @@ impl McpProcessManager {
             .insert(name.clone(), spawn_config);
 
         // A deliberate (re)spawn resets the crash-loop guard.
-        self.restart_history.lock().await.insert(name.clone(), Vec::new());
+        self.restart_history
+            .lock()
+            .await
+            .insert(name.clone(), Vec::new());
 
         self.transports
             .write()
@@ -179,7 +182,9 @@ impl McpProcessManager {
     async fn supervise_once(self: &Arc<Self>) {
         let snapshot: Vec<(String, Arc<StdioMcpTransport>)> = {
             let map = self.transports.read().await;
-            map.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect()
+            map.iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
         };
 
         for (name, transport) in snapshot {
@@ -441,15 +446,12 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_clears_restart_state() {
         let manager = McpProcessManager::new();
-        manager.restart_history.lock().await.insert(
-            "srv".to_string(),
-            vec![Instant::now()],
-        );
         manager
-            .restarting
+            .restart_history
             .lock()
             .await
-            .insert("srv".to_string());
+            .insert("srv".to_string(), vec![Instant::now()]);
+        manager.restarting.lock().await.insert("srv".to_string());
 
         manager
             .spawn_stdio("srv", "cat", Vec::new(), HashMap::new())
@@ -485,8 +487,14 @@ mod tests {
         // still consistent.
         tokio::time::sleep(Duration::from_secs(5)).await;
 
+        let attempts_recorded = manager
+            .restart_history
+            .lock()
+            .await
+            .get("srv")
+            .is_some_and(|v| !v.is_empty());
         assert!(
-            manager.restart_history.lock().await.contains_key("srv"),
+            attempts_recorded,
             "supervisor must have recorded restart attempts for the crashed server"
         );
 

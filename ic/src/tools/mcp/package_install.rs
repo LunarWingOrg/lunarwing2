@@ -54,11 +54,7 @@ pub async fn ensure_package_installed(
         ),
         McpPackageManager::Pip => (
             "pip",
-            vec![
-                "install".into(),
-                "--user".into(),
-                install.package.clone(),
-            ],
+            vec!["install".into(), "--user".into(), install.package.clone()],
         ),
     };
 
@@ -88,11 +84,7 @@ pub async fn ensure_package_installed(
 }
 
 /// Run one installer command with a timeout, mapping failures to ToolError.
-async fn run_installer(
-    server_name: &str,
-    program: &str,
-    args: &[String],
-) -> Result<(), ToolError> {
+async fn run_installer(server_name: &str, program: &str, args: &[String]) -> Result<(), ToolError> {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(std::process::Stdio::null())

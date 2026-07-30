@@ -1267,17 +1267,18 @@ fn validate_auto_install_package(install: &McpAutoInstall) -> Result<(), ConfigE
         McpPackageManager::Npm => {
             package.len() <= 214
                 && !package.starts_with('.')
-                && package
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '/' | '.' | '_' | '~' | '-'))
+                && package.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '@' | '/' | '.' | '_' | '~' | '-')
+                })
         }
         // pip: name[==version] with conservative PEP 508-ish charset.
         McpPackageManager::Pip => {
             package.len() <= 214
                 && !package.starts_with('.')
-                && package
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '=' | '[' | ']' | ',' | '+' | '!'))
+                && package.chars().all(|c| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, '.' | '_' | '-' | '=' | '[' | ']' | ',' | '+' | '!')
+                })
         }
     };
 
