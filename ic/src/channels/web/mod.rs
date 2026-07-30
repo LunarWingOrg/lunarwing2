@@ -25,6 +25,11 @@ pub mod types;
 pub(crate) mod util;
 pub mod ws;
 
+// Coordination admin API (Phase 3): localhost-only server started from main.
+pub use handlers::coord::{
+    coord_admin_port_from_env, coord_admin_router, start_coord_admin_server,
+};
+
 /// Test helpers for gateway integration tests.
 ///
 /// Always compiled (not behind `#[cfg(test)]`) so that integration tests in
