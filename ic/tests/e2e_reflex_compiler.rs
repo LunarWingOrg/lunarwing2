@@ -197,6 +197,7 @@ fn make_compiler(
         Duration::from_secs(3600),
         min_match,
         max_per_run,
+        50,
     )
 }
 

@@ -627,6 +627,7 @@ pub struct ReflexCompiler {
     check_interval: Duration,
     min_match_count: u32,
     max_patterns_per_run: usize,
+    max_patterns_per_user: usize,
 }
 
 impl ReflexCompiler {
@@ -638,6 +639,7 @@ impl ReflexCompiler {
         check_interval: Duration,
         min_match_count: u32,
         max_patterns_per_run: usize,
+        max_patterns_per_user: usize,
     ) -> Self {
         Self {
             builder,
@@ -646,6 +648,7 @@ impl ReflexCompiler {
             check_interval,
             min_match_count,
             max_patterns_per_run,
+            max_patterns_per_user,
         }
     }
 
@@ -697,6 +700,26 @@ impl ReflexCompiler {
                 return;
             }
             _ => {}
+        }
+
+        // Enforce the per-user active pattern cap.
+        match self.store.list_reflex_patterns(&self.user_id).await {
+            Ok(existing) => {
+                let active = existing.iter().filter(|p| p.status == "active").count();
+                if active >= self.max_patterns_per_user {
+                    tracing::warn!(
+                        "Reflex pattern cap reached for user '{}' ({} active, max {}); skipping '{}'",
+                        self.user_id,
+                        active,
+                        self.max_patterns_per_user,
+                        normalized
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Failed to count reflex patterns for cap check: {}", e);
+            }
         }
 
         tracing::info!("Reflex compiler triggered for pattern: {}", description);
@@ -859,6 +882,7 @@ pub fn spawn_reflex_compiler(
     check_interval: Duration,
     min_match_count: u32,
     max_patterns_per_run: usize,
+    max_patterns_per_user: usize,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let compiler = ReflexCompiler::new(
@@ -868,6 +892,7 @@ pub fn spawn_reflex_compiler(
             check_interval,
             min_match_count,
             max_patterns_per_run,
+            max_patterns_per_user,
         );
         compiler.run_loop().await;
     })
