@@ -9,7 +9,7 @@
 
 ---
 
-1. [ ] Bump lunarwing crate versions and wasm channel crates for lunarwing that have same version. they are at 2.0.3. we need bump to 2.0.4
+1. [x] Bump lunarwing crate versions and wasm channel crates for lunarwing that have same version. they are at 2.0.3. we need bump to 2.0.4
 2. [x] Per-tenant WeeChat health-glob gate (fix the flap /render-units footgun) — DONE 2026-07-30 (branch aj/kimi-2-20260730-0601): per-tenant `enable_weechat` flag in the ports registry (default enabled; explicit on new tenants) + `mt-admin enable-weechat/disable-weechat <name>` verbs; `health-openrc.sh` and `health-systemd.sh` classify down `lunarwing-weechat-<t>`/`-adapter-<t>` units as `skipped` (never critical) for disabled tenants, so self-heal no longer restart-storms them and `render-units` is safe; fail-safe on absent flag/unreadable registry; fixed jq `//` false-coalescing in all three readers; coverage: test-health-openrc S9–S11, test-health-systemd E–F (full suite 260/260 green); docs/proposals/RENDER_UNITS_SMALL_BUG.md marked FIXED (option 3, the tmux duplicate-session start failure, remains open). NOTE: task briefing referenced docs/ops/AGENT_GOALS_2.0.3.0.md but this item lives in AGENT_GOALS_2.0.4.0.md — checked off here.
 3. [ ] Inspect status of ALL cargo crates. check audit doc in docs/ops and start updating crates and verifying successful build
 4. [ ] continue to work on kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. SEE: SECTION: hermes_kawarimi — review notes in docs/ops/KUMOGAKURE_RECENT_REV_T.md for suggestedm improvements/concerns. live verify hermes agent and migrate it to lunarwing as a new tenant
