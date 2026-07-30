@@ -528,6 +528,7 @@ impl Agent {
                         user_id: message.user_id.clone(),
                         thread_id: thread_id.to_string(),
                         response: response.clone(),
+                        channel: Some(message.channel.clone()),
                     };
                     match self.hooks().run(&event).await {
                         Err(crate::hooks::HookError::Rejected { reason }) => {
