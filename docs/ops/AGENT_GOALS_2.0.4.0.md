@@ -24,7 +24,7 @@
 11. [x] implement tier 1 updates in docs/ops/CRATE_AUDIT_v2.0.3.0.md
 12. [ ] Several CI/CD tests are FAILING - INVESTIGATE - python-syntax, registry-json, shell-syntax, version-policy, wasm-channel-test-artifacts - NOTE: Its quite possible these are transient errors with my connected runner and not the fault of the test itself - in that case, all good
 13. [x] implement tier 2 updates in docs/ops/CRATE_AUDIT_v2.0.3.0.md
-14. [x] implement priority 3 items in docs/proposals/ENGINE_V2_POLISH_v2.0.3.0.md
+14. [ ] followup to number 12 - wtf does this mean? ERROR: Job failed: failed to pull image "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b" with specified policies [always]: Error response from daemon: toomanyrequests: You have reached your unauthenticated pull rate limit. https://www.docker.com/increase-rate-limit (manager.go:343:124s)
 15. [x] take look at Advisory Status (`deny.toml`) in docs/ops/CRATE_AUDIT_v2.0.3.0.md and install cargo-deny using rustup, cargo, then remove items marked as`now unblocked`
 16. [x] address p0 issues in docs/ops/GOAL_GAP_SUGGESTIONS.md
 17. [x] address 2. Priority findings in docs/ops/CICD_LOGIC_REVIEW.md
