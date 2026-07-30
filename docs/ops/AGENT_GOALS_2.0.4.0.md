@@ -58,7 +58,7 @@
 45. [ ] The roadmap document - which can be found at`docs/ops/ROADMAP_2026.md` - needs proper updating - the things we discussed and have documents for in docs/proposals which are not already in there should be added for 2.0.6.0 and 2.0.8.0 and 2.1.0.0 - spread them out if possible
 46. [ ] create a document in docs/ops to give a list of all the things that were changed since 2.0.3.0 and what to test thoroughly on upgraded testing tenants
 47. [ ] ensure roadmap doc in docs/ops is up to date - this is a followup from previous item and not a duplicate
-48. [ ] inspect darkirc adapter code quality and improve if possible
+48. [ ] inspect darkirc adapter code quality and improve if possible - do nothing if already good
 49. [ ] inspect weechat service code quality and improve if possible (gentoo)
 50. [ ] ensure roadmap doc in docs/ops is up to date and update if necessary - this is a followup from previous item and not a duplicate
 51. [ ] inspect code for reflex compiler accuracy again
