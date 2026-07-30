@@ -88,10 +88,7 @@ mod tests {
     use crate::gate::violation_store::ViolationStoreConfig;
 
     fn disabled_store() -> Arc<ViolationStore> {
-        let dir = std::env::temp_dir().join(format!(
-            "coord-gate-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("coord-gate-test-{}", std::process::id()));
         let store = ViolationStore::new(
             dir.join("violations.json"),
             ViolationStoreConfig {

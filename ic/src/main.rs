@@ -20,7 +20,8 @@ use lunarwing::{
         run_status_command, run_tool_command,
     },
     config::Config,
-    hooks::bootstrap_hooks,
+    gate::violation_store::{ViolationStore, ViolationStoreConfig},
+    hooks::{CoordinationHookConfig, bootstrap_hooks, register_coordination_hooks},
     llm::create_session_manager,
     orchestrator::{ReaperConfig, SandboxReaper},
     pairing::PairingStore,
@@ -651,6 +652,28 @@ async fn async_main() -> anyhow::Result<()> {
         errors = hook_bootstrap.errors,
         "Lifecycle hooks initialized"
     );
+
+    // Multi-agent coordination hooks (Phase 2/3 of the coordination pipeline).
+    // Only active when COORD_ENABLED=true with COORD_AGENT_ID/COORD_CHANNELS set.
+    let coordination_config = CoordinationHookConfig::from_env();
+    let coordination_store: Option<Arc<ViolationStore>> =
+        coordination_config.is_actionable().then(|| {
+            Arc::new(ViolationStore::with_default_path(
+                ViolationStoreConfig::from_env(),
+            ))
+        });
+    let coordination_summary = register_coordination_hooks(
+        &components.hooks,
+        coordination_config.clone(),
+        coordination_store.clone(),
+    )
+    .await;
+    if coordination_summary.hooks > 0 {
+        tracing::info!(
+            hooks = coordination_summary.hooks,
+            "Coordination hooks initialized"
+        );
+    }
 
     // Reuse the shared agent session manager prepared by AppBuilder.
     let session_manager = Arc::clone(&components.agent_session_manager);

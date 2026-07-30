@@ -114,6 +114,7 @@ fn now_secs() -> u64 {
 
 /// Persistent violation store shared by coordination hooks and the
 /// coordination gate. Cheap to clone: wrap in `Arc`.
+#[derive(Debug)]
 pub struct ViolationStore {
     path: PathBuf,
     config: ViolationStoreConfig,
@@ -229,7 +230,9 @@ fn lock(
 ) -> std::sync::MutexGuard<'_, HashMap<String, AgentViolations>> {
     // Poisoning means another thread panicked mid-update; the in-memory map is
     // still the best available state, so recover it rather than crash.
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn prune_decayed(entry: &mut AgentViolations, now: u64, decay_secs: u64) {
@@ -243,7 +246,9 @@ fn prune_decayed(entry: &mut AgentViolations, now: u64, decay_secs: u64) {
 
 fn status_of(entry: &AgentViolations, now: u64) -> ViolationStatus {
     if entry.manual_disabled {
-        return ViolationStatus::Disabled { until_secs: u64::MAX };
+        return ViolationStatus::Disabled {
+            until_secs: u64::MAX,
+        };
     }
     if let Some(until) = entry.disabled_until_secs
         && until > now
