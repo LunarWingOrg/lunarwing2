@@ -177,11 +177,11 @@ def run_import(
     # 4. populate (daemon down, PostgreSQL still up)
     try:
         counts = _populate(db_url, owner_id, mapped)
+        result.counts = counts  # set before _insert_secrets adds counts["secrets"]
         _insert_secrets(db_url, master_key, owner_id, mapped, result)
     except Exception as exc:  # psycopg2 / crypto errors
         result.error = f"populate failed: {exc}"
         return result
-    result.counts = counts
 
     # 5. cut over or stage
     if plan.start:

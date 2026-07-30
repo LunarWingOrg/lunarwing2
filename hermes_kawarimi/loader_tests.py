@@ -122,6 +122,39 @@ class RunImportSequenceTest(unittest.TestCase):
         verbs = self._run_phases(ImportPlan(tenant="t1", apply=True, start=True))
         self.assertEqual(verbs[-2:], ["start-pg", "start-tenant"])
 
+    def test_secret_count_survives_in_result(self) -> None:
+        """_insert_secrets writes counts["secrets"]; a later counts assignment
+        must not clobber it (the CLI report depends on it)."""
+
+        def fake_insert_secrets(_db, _mk, _owner, _mapped, result):  # noqa: ANN202
+            result.counts["secrets"] = 3
+
+        env = {
+            "DATABASE_BACKEND": "postgres",
+            "DATABASE_URL": "postgres://example",
+            "SECRETS_MASTER_KEY": "key",
+            "LUNARWING_OWNER_ID": "owner",
+        }
+        with (
+            mock.patch("hermes_kawarimi.loader.ensure_mt_admin", return_value="mt"),
+            mock.patch(
+                "hermes_kawarimi.loader.run_command",
+                return_value=PhaseResult(name="x", returncode=0),
+            ),
+            mock.patch.object(loader.secrets_ops, "parse_tenant_env", return_value=env),
+            mock.patch("hermes_kawarimi.loader._wait_for_schema"),
+            mock.patch(
+                "hermes_kawarimi.loader._populate", return_value={"memory_docs": 1}
+            ),
+            mock.patch(
+                "hermes_kawarimi.loader._insert_secrets",
+                side_effect=fake_insert_secrets,
+            ),
+        ):
+            result = loader.run_import(ImportPlan(tenant="t1", apply=True), MappedAgent())
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.counts, {"memory_docs": 1, "secrets": 3})
+
 
 if __name__ == "__main__":
     unittest.main()
