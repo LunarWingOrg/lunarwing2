@@ -40,3 +40,6 @@ tests/fixtures/llm_traces/live/github_dev_workflow_full_loop.log
 # Claude↔Codex orchestration
 **/.codex-runs/
 **/.codex-prompt.md
+
+# Local venv for the hermes_kawarimi import tooling (psycopg2 etc.)
+/.venv-kawarimi/
