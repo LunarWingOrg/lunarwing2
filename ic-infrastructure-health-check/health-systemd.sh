@@ -123,6 +123,16 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
     # start-ed (F3-A). One bounded show per tenant.
     tdaemon_active=false
     [ "$(_tenant_uctl "$tuser" "$tuid" show --value -p ActiveState "lunarwing-$tname.service")" = "active" ] && tdaemon_active=true
+    # Per-tenant weechat gate (docs/proposals/RENDER_UNITS_SMALL_BUG.md): the
+    # optional weechat backend/adapter can be rendered for a tenant whose relay
+    # was never configured — where it cannot stay up. mt-admin records that as
+    # .tenants[<t>].enable_weechat = false; a NON-ACTIVE weechat unit on such a
+    # tenant is the expected state -> `skipped` (never critical, and self-heal
+    # honours `skipped` by not remediating — no restart-storm flap). Read via
+    # tostring: jq's `//` treats false as empty. Absent key -> ON (legacy
+    # fail-loud default preserved); a running weechat is classified normally.
+    tweechat_off=false
+    [ "$(jq -r --arg t "$tname" '.tenants[$t].enable_weechat | tostring' "$TENANTS_FILE" 2>/dev/null)" = "false" ] && tweechat_off=true
     # Enumerate ALL of this tenant's lunarwing-*/xmpp-bridge-*/weechat-* user
     # units — the systemd analog of health-openrc.sh's /etc/init.d/lunarwing-*
     # glob — instead of a hardcoded pair. Covers pg, the workers, proxy,
@@ -143,6 +153,10 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
       uactive=${_uf[1]:-unknown}; usub=${_uf[2]:-unknown}; urestarts=${_uf[3]:-0}
       [[ "$urestarts" =~ ^[0-9]+$ ]] || urestarts=0
       ustatus="healthy"; uexit=0
+      _wgated=false
+      case "$tunit" in
+        lunarwing-weechat-*|weechat-*) [ "$tweechat_off" = "true" ] && _wgated=true ;;
+      esac
       case "$uactive/$usub" in
         active/*)
           if [ "$urestarts" -ge 3 ]; then
@@ -150,10 +164,17 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
           fi
           ;;
         failed/*|*/auto-restart)
-          # Ran and broke (crashed / crash-looping) — a fault regardless of enable state.
-          ustatus="critical"; uexit=2; issues+=("$tunit ($tuser) not healthy: $uactive/$usub")
+          if [ "$_wgated" = "true" ]; then
+            # Optional weechat intentionally unused for this tenant: expected-down.
+            ustatus="skipped"; uexit=0
+          else
+            # Ran and broke (crashed / crash-looping) — a fault regardless of enable state.
+            ustatus="critical"; uexit=2; issues+=("$tunit ($tuser) not healthy: $uactive/$usub")
+          fi
           ;;
         *)
+          if [ "$_wgated" = "true" ]; then
+            ustatus="skipped"; uexit=0
           # inactive/dead etc. Distinguish a genuine outage from an intentionally-
           # not-running unit. A down unit is a real fault when the tenant is started
           # (primary daemon active — covers a stopped `generated` Quadlet pg/worker,
@@ -162,7 +183,7 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
           # probe): an enabled or inconclusive (empty/unknown) enable-state fails
           # LOUD as critical (never mask); only a not-started tenant's
           # disabled/static/generated unit is the expected `skipped` case.
-          if [ "$tdaemon_active" = "true" ]; then
+          elif [ "$tdaemon_active" = "true" ]; then
             ustatus="critical"; uexit=2; issues+=("$tunit ($tuser) down while tenant running: $uactive/$usub")
           else
             case "$(_tenant_uctl "$tuser" "$tuid" show --value -p UnitFileState "$tunit")" in
