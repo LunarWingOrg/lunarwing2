@@ -1563,7 +1563,10 @@ ports_set_weechat() {
   require_cmd jq
   case "$enabled" in true|false) ;; *) die "ports_set_weechat: enabled must be true or false" ;; esac
   local current
-  current="$(jq -r ".tenants[\"$name\"].enable_weechat // true" "$PORTS_REGISTRY" 2>/dev/null || true)"
+  # Explicit ==false test: jq's `//` treats false as empty, so
+  # `.enable_weechat // true` would misread a disabled tenant as enabled and
+  # `enable-weechat` could never flip it back.
+  current="$(jq -r --arg name "$name" 'if .tenants[$name].enable_weechat == false then "false" else "true" end' "$PORTS_REGISTRY" 2>/dev/null || true)"
   [[ "$current" == "$enabled" ]] && { say "weechat for tenant '$name': already $enabled" >&2; return 0; }
 
   local tmp

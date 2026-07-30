@@ -211,7 +211,8 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
       unit_results+=("$(unit_json "$tunit" "$uactive" "$usub" "$urestarts" \
         "$(jq -n --arg u "$tuser" --arg h "$uhealth" '{tenant_user:$u} + (if $h=="" then {} else {container_health:$h} end)')" "$ustatus")")
     done
-  done < <(jq -r '.tenants // {} | to_entries[] | "\(.key)\t\(.value.user)\t\(.value.enable_weechat // true)"' "$TENANTS_FILE" 2>/dev/null || true)
+  # enable_weechat: explicit ==false test (jq `//` treats false as empty).
+  done < <(jq -r '.tenants // {} | to_entries[] | "\(.key)\t\(.value.user)\t\(if .value.enable_weechat == false then "false" else "true" end)"' "$TENANTS_FILE" 2>/dev/null || true)
 fi
 
 issues_json="[]"

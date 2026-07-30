@@ -164,7 +164,9 @@ weechat_unit_disabled() {
   [ -n "$tenant" ] || return 1
   [ -r "$TENANTS_FILE" ] || return 1
   command -v jq >/dev/null 2>&1 || return 1
-  [ "$(jq -r --arg t "$tenant" '.tenants[$t].enable_weechat // true' "$TENANTS_FILE" 2>/dev/null)" = "false" ]
+  # NOTE: jq's `//` treats false as empty, so the explicit `== false` test is
+  # required — `.enable_weechat // true` would read a disabled tenant as enabled.
+  [ "$(jq -r --arg t "$tenant" 'if .tenants[$t].enable_weechat == false then "false" else "true" end' "$TENANTS_FILE" 2>/dev/null)" = "false" ]
 }
 
 for svc in "${SERVICES_ARR[@]}"; do
