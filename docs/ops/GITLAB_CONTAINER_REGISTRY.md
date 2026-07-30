@@ -1,8 +1,8 @@
 # GitLab Container Registry — setup and usage
 
 Goal: enable GitLab's built-in container registry for `lunarwing/lunarwing2`
-and publish the external-worker images (`worker-nanocode`, `worker-pebble`,
-`worker-opencode`) from CI, so MT hosts can pull prebuilt images instead of
+and publish the external-worker images (`worker-pebble`, `worker-opencode`,
+`worker-kimi`) from CI, so MT hosts can pull prebuilt images instead of
 building locally on every upgrade.
 
 The CI side lives in `.gitlab/ci/containers.yml` (branch
@@ -141,9 +141,9 @@ ever stall, raise `forwardingTimeouts` on the entrypoint or on the
 
 | Job | Context | Image pushed |
 |---|---|---|
-| `worker-nanocode-image` | `lunarcode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-nanocode:{sha,latest}` |
 | `worker-pebble-image` | repo root (Dockerfile in `pebble4lunarwing/`) | `$CI_REGISTRY_IMAGE/worker-pebble:{sha,latest}` |
 | `worker-opencode-image` | `opencode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-opencode:{sha,latest}` |
+| `worker-kimi-image` | `kimicode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-kimi:{sha,latest}` |
 
 Details:
 
@@ -158,9 +158,9 @@ Details:
 - Jobs run **automatically on the default branch** when the relevant worker
   directory changes, and are **manual** on every other pipeline (run the
   pipeline, click the job).
-- Variables: `NANOCODE_REF` (default `v1.2.28`), `WITH_TOOLCHAINS` for
-  opencode (default `false`; set `true` on a manual pipeline run for the fat
-  toolchain image — mirrors mt-admin's `--with-toolchains`).
+- Variables: `WITH_TOOLCHAINS` for opencode (default `false`; set `true` on a
+  manual pipeline run for the fat toolchain image) and `KIMI_CODE_VERSION` for
+  Kimi Code.
 - If gcr.io is unreachable from the runners, pull the executor image
   elsewhere, push it into our registry once section 1 is done, and update
   `.container-job`'s `image:name`.

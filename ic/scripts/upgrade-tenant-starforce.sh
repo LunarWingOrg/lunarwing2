@@ -87,8 +87,7 @@ else
 fi
 say ""
 say "Tenant repo hand-edited TRACKED files (untracked data dirs are ignored — git pull never touches them):"
-# --untracked-files=no so normal runtime dirs (env/, state/, logs/, backups/,
-# nanocode-workspace/) don't masquerade as hand-edits.
+# --untracked-files=no so normal runtime dirs don't masquerade as hand-edits.
 dirty="$(sudo -u "$TENANT" git -C "$HOME_DIR" status --short --untracked-files=no 2>/dev/null || true)"
 if [[ -n "$dirty" ]]; then
   printf '%s\n' "$dirty" | sed 's/^/  /'

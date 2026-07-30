@@ -851,7 +851,7 @@ warn_if_sshd_unreachable() { :; }
 DEFAULT_SSH_ENABLED="false" SSH_OPT_OUT="true" CONTAINER_RT="podman" \
   VISION_SIDECAR_IMAGE="dummy" INIT_SYSTEM="systemd" \
   DEFAULT_HEALTH_ENABLED="false" HEALTH_OPT_OUT="true" \
-  add_tenant "auto-boot-tenant" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
+  add_tenant "auto-boot-tenant" \
   >/dev/null 2>&1 || true
 
 # Verify ordering: env-created before weechat-bootstrap before postgres
@@ -882,7 +882,7 @@ bootstrap_fail_mode="fail"
 DEFAULT_SSH_ENABLED="false" SSH_OPT_OUT="true" CONTAINER_RT="podman" \
   VISION_SIDECAR_IMAGE="dummy" INIT_SYSTEM="systemd" \
   DEFAULT_HEALTH_ENABLED="false" HEALTH_OPT_OUT="true" \
-  add_tenant "auto-boot-fail" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
+  add_tenant "auto-boot-fail" \
   >/dev/null 2>&1 || true
 
 # postgres should still be called (base provisioning continues)
@@ -907,7 +907,7 @@ WEECHAT_BOOTSTRAP_OPT_OUT=true
 DEFAULT_SSH_ENABLED="false" SSH_OPT_OUT="true" CONTAINER_RT="podman" \
   VISION_SIDECAR_IMAGE="dummy" INIT_SYSTEM="systemd" \
   DEFAULT_HEALTH_ENABLED="false" HEALTH_OPT_OUT="true" \
-  add_tenant "auto-boot-disabled" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
+  add_tenant "auto-boot-disabled" \
   >"$MT_FIXTURE/disabled-output" 2>&1 || true
 
 assert_fail "opt-out does not invoke WeeChat bootstrap" \

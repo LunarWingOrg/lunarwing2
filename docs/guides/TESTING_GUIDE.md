@@ -44,7 +44,6 @@ The original functional smoke tests—now grouped under a dedicated section.
 
 #### Workers
 
-- [ ] **Nanocode external worker** – submit job, verify execution + completion signaling
 - [ ] **Opencode external worker** – submit job, verify WebSocket protocol + completion signaling
 - [ ] **Pebble external worker** – submit job, verify NDJSON event streaming + completion signaling
 - [ ] **Docker sandbox worker** – submit job, verify execution + result return
@@ -152,7 +151,6 @@ The original functional smoke tests—now grouped under a dedicated section.
   - XMPP channel (needs live bridge + OMEMO)
   - WeeChat channel (no test stub)
   - Sandbox/Docker workers (need Docker daemon + built images)
-  - Nanocode worker (use its own smoke test)
   - GitHub integration (needs credentials)
   - Image/vision tools (needs LLM provider)
   - Web search (needs LLM backend)

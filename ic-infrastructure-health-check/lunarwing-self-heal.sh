@@ -183,7 +183,6 @@ unit_tenant() {
         lunarwing-proxy-*)           printf '%s' "${u#lunarwing-proxy-}" ;;
         ironclaw-proxy-*)            printf '%s' "${u#ironclaw-proxy-}" ;;
         lunarwing-pg-*)              printf '%s' "${u#lunarwing-pg-}" ;;
-        lunarwing-nanocode-*)        printf '%s' "${u#lunarwing-nanocode-}" ;;
         lunarwing-opencode-*)        printf '%s' "${u#lunarwing-opencode-}" ;;
         lunarwing-kimi-*)            printf '%s' "${u#lunarwing-kimi-}" ;;
         lunarwing-pebble-*)          printf '%s' "${u#lunarwing-pebble-}" ;;

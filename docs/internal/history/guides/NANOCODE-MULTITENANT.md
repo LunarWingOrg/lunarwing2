@@ -1,4 +1,7 @@
-# Nanocode Worker: Multi-Tenant Setup
+# Nanocode Worker: Multi-Tenant Setup (Archived)
+
+> Historical only. Nanocode external-worker support was removed in v2.0.4.0.
+> Current mt-admin, onboarding, health, and CI paths neither build nor start it.
 
 Guide for deploying the nanocode external worker in a multi-tenant LunarWing environment.
 

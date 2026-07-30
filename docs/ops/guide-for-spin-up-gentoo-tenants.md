@@ -33,36 +33,30 @@ Creates the OS user, allocates the 10-port block in `/etc/lunarwing/ports.json`,
 
 ```bash
 sudo LUNARWING_SERVICE_MANAGER=openrc LUNARWING_CONTAINER_RUNTIME=podman \
-  ic/scripts/lunarwing-mt-admin.sh add-tenant luna1 --docker-group
+  ic/scripts/lunarwing-mt-admin.sh add-tenant luna1 --docker-group --with-pebble
 ```
 
 Optional `add-tenant` flags (all take a value except booleans `--docker-group`/`--no-health`/`--enable-darkirc`): `--xmpp-jid <jid>` (default `luna1@xmpp.localhost`), `--xmpp-password <pass>`, `--llm-api-key <key>`, `--llm-base-url <url>`, `--tensorzero-url <url>`, `--gotify-url <url>`, `--no-health`, `--enable-darkirc` (enables DarkIRC daemon and adapter services; disabled by default).
 
 ## 2. Build everything (binary + WASM + workers)
 
-One canonical command. `build-tenant` is flock-serialized (OOM-safe) and builds in order: `lunarwing` binary → xmpp-bridge → WASM (built **and installed** with `--with-wasm`) → nanocode + pebble worker images. Worker images are host-global and must exist before `start-tenant` will launch those workers. **This is the slow first build** — if base images were wiped by a `podman system reset`, rust/debian/bun re-pull and recompile here.
+One canonical command. `build-tenant` is flock-serialized (OOM-safe) and builds in order: `lunarwing` binary → xmpp-bridge → WASM (built **and installed** with `--with-wasm`) → selected worker images. Worker images are host-global and must exist before `start-tenant` launches them.
 
 ```bash
 sudo LUNARWING_SERVICE_MANAGER=openrc LUNARWING_CONTAINER_RUNTIME=podman \
-  ic/scripts/lunarwing-mt-admin.sh build-tenant luna1 --with-wasm --with-nanocode --with-pebble
+  ic/scripts/lunarwing-mt-admin.sh build-tenant luna1 --with-wasm --with-pebble
 ```
 
 Standalone rebuilds of the shared worker images, if ever needed:
 
 ```bash
-sudo LUNARWING_CONTAINER_RUNTIME=podman ic/scripts/lunarwing-mt-admin.sh build-nanocode-worker   # [--no-cache]
 sudo LUNARWING_CONTAINER_RUNTIME=podman ic/scripts/lunarwing-mt-admin.sh build-pebble-worker     # [--no-cache]
 sudo ic/scripts/lunarwing-mt-admin.sh install-wasm luna1   # only if WASM built without install
 ```
 
-Manual fallback ONLY where mt-admin doesn't reach — the exact podman commands mt-admin would run (nanocode needs its source copied first because `COPY` can't follow symlinks; `--network=host --format docker` are podman-only):
+Manual fallback ONLY where mt-admin doesn't reach (`--network=host --format docker` are podman-only):
 
 ```bash
-# nanocode image (context = lunarcode4lunarwing/)
-cp -rL /home/eris/lunarwing/nanocode-config/nanocode /home/eris/lunarwing/lunarcode4lunarwing/nanocode
-podman build --network=host --format docker -t lunarwing-worker-nanocode:latest \
-  /home/eris/lunarwing/lunarcode4lunarwing
-
 # pebble image (Dockerfile in pebble4lunarwing/, context = repo root)
 podman build --network=host --format docker -t lunarwing-worker-pebble:latest \
   -f /home/eris/lunarwing/pebble4lunarwing/Dockerfile /home/eris/lunarwing
@@ -76,7 +70,7 @@ podman build --network=host --format docker -t lunarwing-worker-pebble:latest \
 sudo ic/scripts/lunarwing-mt-admin.sh configure-pebble luna1 --nanogpt-api-key <key>   # optional: --model openai/gpt-5.2
 ```
 
-> **Workers** are nanocode, pebble, and opencode only. The codex worker has been removed; `codex4lunarwing/` no longer exists.
+> Supported workers are Pebble, OpenCode, and Kimi Code. Nanocode and Codex are retired.
 
 ## 3. Start + enable services (OpenRC)
 
@@ -121,8 +115,8 @@ tail -f /home/luna1/lunarwing/logs/lunarwing.log
 
 ## Notes / placeholders
 
-- **Tenant name** is lowercased and sanitized to `[a-z0-9-]`. Reserved prefixes `pg-*`, `proxy-*`, `nanocode-*`, `pebble-*`, `weechat-*` are rejected. Substitute your own name everywhere `luna1` appears, including rendered unit names `lunarwing-<name>`, `lunarwing-pg-<name>`, `xmpp-bridge-<name>`, `lunarwing-proxy-<name>`, `lunarwing-weechat-<name>`, `lunarwing-weechat-adapter-<name>`, and worker units `lunarwing-nanocode-<name>` / `lunarwing-pebble-<name>`.
-- **Ports** auto-allocated by `add-tenant` into `/etc/lunarwing/ports.json` (range `10000–19999`, 10-port aligned blocks; first block base `10000` on a fresh registry). Offsets within the block: `gateway=base+0`, `http=+1`, `bridge=+2`, `postgres=+3`, `proxy=+4`, `weechat=+5`, `orchestrator=+6`, `nanocode_wss=+7`, `pebble_wss=+8`, `weechat_adapter=+9`. Always read the actual numbers from `status`/`list-tenants`.
+- **Tenant name** is lowercased and sanitized to `[a-z0-9-]`. Reserved prefixes `pg-*`, `proxy-*`, `nanocode-*`, `pebble-*`, `opencode-*`, `kimi-*`, and `weechat-*` are rejected. The legacy `nanocode-*` reservation remains to prevent unit-name collisions during cleanup.
+- **Ports** auto-allocated by `add-tenant` into `/etc/lunarwing/ports.json` (range `10000–19999`, 10-port aligned blocks; first block base `10000` on a fresh registry). Offset `+7` remains reserved as legacy `nanocode_wss`; supported Pebble uses `+8`. Always read actual numbers from `status`/`list-tenants`.
 - **Base dir / layout** for `luna1`: home `/home/luna1`; LunarWing root `/home/luna1/lunarwing`; repo clone `/home/luna1/lunarwing/ic`; env dir `/home/luna1/lunarwing/env` (holds `lunarwing.env`, `pg.secret`, and `pebble.env` if configured); **state dir = `LUNARWING_BASE_DIR` = `/home/luna1/lunarwing/state`**; logs `/home/luna1/lunarwing/logs`; run/pids `/home/luna1/lunarwing/run`.
 - **Init-system / runtime selection** — no `--init-system` flag. Selection is the env override `LUNARWING_SERVICE_MANAGER=openrc|systemd` (else autodetected: `/run/openrc/softlevel` ⇒ openrc) and `LUNARWING_CONTAINER_RUNTIME=podman|docker` (else autodetected). Exporting both, as in step 0, makes the run deterministic. With podman the script sets `MT_ROOTLESS=true`: all per-tenant pg/worker containers run as the tenant user against their own rootless store (override with `LUNARWING_MT_ROOTLESS` if ever needed). Per-tenant image cleanup later lives in `/home/luna1/.local/share/containers`, **not** root's store.
 - **OpenRC vs systemd caveat** — on OpenRC the units are **system-level** init scripts in `/etc/init.d/` using `supervise-daemon` with `command_user=<tenant>`; logs go to `/home/luna1/lunarwing/logs/lunarwing.log` (tail it, there is no `journalctl --user`). Boot persistence is `rc-update add lunarwing-luna1 default` (already done by `start-tenant`). The systemd-only concepts in the docs — `~/.config/systemd/user/` units, `loginctl enable-linger`, podman Quadlet `.container` files — do **not** apply here. One overlap: `add-tenant` still calls `loginctl enable-linger luna1`, which works under elogind to keep the rootless runtime dir across reboots (not a systemd dependency).

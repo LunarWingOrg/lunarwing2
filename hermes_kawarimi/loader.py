@@ -208,8 +208,6 @@ def _add_tenant_args(mt: str, plan: ImportPlan) -> list[str]:
 
 def _worker_flags(plan: ImportPlan) -> list[str]:
     flags: list[str] = []
-    if plan.with_nanocode:
-        flags.append("--with-nanocode")
     if plan.with_pebble:
         flags.append("--with-pebble")
     if plan.with_opencode:

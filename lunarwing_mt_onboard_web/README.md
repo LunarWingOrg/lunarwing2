@@ -107,7 +107,7 @@ relay without re-running provisioning.
 Import (Kawarimi) forms do not expose a WeeChat opt-out control.
 
 The provision form also exposes current controls for the daemon LLM base URL
-and Nanocode/OpenCode model and base-URL
+and OpenCode model and base-URL
 overrides. The XMPP control customizes the identity; leaving it off uses the
 default `<tenant>@xmpp.localhost` bridge rather than disabling XMPP.
 

@@ -44,8 +44,6 @@ class ProvisionRequest(RequestModel):
     toolchains: bool = False
     llm_base_url: str = ""
     llm_model: str = "tensorzero::function_name::lunarwing"
-    nanocode_model: str = ""
-    nanocode_base_url: str = ""
     opencode_model: str = ""
     opencode_base_url: str = ""
     kimi_model: str = ""
@@ -89,16 +87,6 @@ class ProvisionRequest(RequestModel):
             toolchains=self.toolchains,
             llm_base_url=self.llm_base_url.strip(),
             llm_model=self.llm_model.strip(),
-            nanocode_model=(
-                self.nanocode_model.strip()
-                if WorkerType.NANOCODE in workers
-                else ""
-            ),
-            nanocode_base_url=(
-                self.nanocode_base_url.strip()
-                if WorkerType.NANOCODE in workers
-                else ""
-            ),
             opencode_model=(
                 self.opencode_model.strip()
                 if WorkerType.OPENCODE in workers
@@ -198,7 +186,6 @@ class ImportRequest(RequestModel):
     name: str = ""
     start: bool = False
     old_stopped: bool = False
-    with_nanocode: bool = False
     with_pebble: bool = False
     with_opencode: bool = False
     with_kimi: bool = False
@@ -230,7 +217,6 @@ class ImportRequest(RequestModel):
             name=self.name.strip(),
             start=self.start,
             old_stopped=self.old_stopped,
-            with_nanocode=self.with_nanocode,
             with_pebble=self.with_pebble,
             with_opencode=self.with_opencode,
             with_kimi=self.with_kimi,

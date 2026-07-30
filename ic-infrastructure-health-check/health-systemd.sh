@@ -134,6 +134,7 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
     [ -n "$tunits" ] || tunits="lunarwing-$tname.service xmpp-bridge-$tname.service"
     for tunit in $tunits; do
       [ "$SECONDS" -lt "$_deadline" ] || break
+      case "$tunit" in lunarwing-nanocode-*) continue ;; esac
       # One show call per unit (LoadState/ActiveState/SubState/NRestarts, in
       # systemd's canonical order for a .service) instead of four round-trips —
       # leaner and bounds hang exposure on a slow tenant bus.
@@ -197,7 +198,7 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
       # but not serving) is caught instead of reported healthy.
       uhealth=""
       case "$tunit" in
-        lunarwing-pg-*|lunarwing-nanocode-*|lunarwing-opencode-*|lunarwing-kimi-*|lunarwing-pebble-*)
+        lunarwing-pg-*|lunarwing-opencode-*|lunarwing-kimi-*|lunarwing-pebble-*)
           uhealth=$(_tenant_ctr_health "$tuser" "$tuid" "${tunit%.service}")
           if [ "$uhealth" = "unhealthy" ] && [ "$uexit" -lt 2 ]; then
             ustatus="critical"; uexit=2; issues+=("$tunit ($tuser) container unhealthy")
