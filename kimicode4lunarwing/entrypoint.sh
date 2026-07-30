@@ -76,7 +76,9 @@ if [ -f /app/config/config.toml ]; then
   if [ -n "${KIMI_MODEL:-}" ] || [ -n "${KIMI_BASE_URL:-}" ] || [ -n "${KIMI_API_KEY:-}" ]; then
     cp /app/config/config.toml "$KIMI_CODE_HOME/config.toml"
     if [ -n "${KIMI_MODEL:-}" ]; then
-      # Override default_model in the config.toml.
+      # Override default_model in the config.toml. Replacement goes through a
+      # lambda so re.sub never interprets backslashes in the value, and the
+      # value is TOML-escaped so quotes/backslashes can't corrupt the file.
       python3 - "$KIMI_CODE_HOME/config.toml" <<'PY'
 import os, re, sys
 path = sys.argv[1]
@@ -84,16 +86,17 @@ with open(path, "r") as f:
     text = f.read()
 model = os.environ.get("KIMI_MODEL", "").strip()
 if model:
+    escaped = model.replace("\\", "\\\\").replace('"', '\\"')
     if re.search(r'^default_model\s*=', text, re.MULTILINE):
-        text = re.sub(r'^default_model\s*=.*$', f'default_model = "{model}"', text, count=1, flags=re.MULTILINE)
+        text = re.sub(r'^default_model\s*=.*$', lambda m: f'default_model = "{escaped}"', text, count=1, flags=re.MULTILINE)
     else:
-        text = f'default_model = "{model}"\n' + text
+        text = f'default_model = "{escaped}"\n' + text
 with open(path, "w") as f:
     f.write(text)
 PY
     fi
     if [ -n "${KIMI_BASE_URL:-}" ]; then
-      # Override provider base_url in config.toml.
+      # Override provider base_url in config.toml (same escaping as above).
       python3 - "$KIMI_CODE_HOME/config.toml" <<'PY'
 import os, re, sys
 path = sys.argv[1]
@@ -101,13 +104,14 @@ with open(path, "r") as f:
     text = f.read()
 base = os.environ.get("KIMI_BASE_URL", "").strip()
 if base:
-    text = re.sub(r'base_url\s*=\s*"[^"]*"', f'base_url = "{base}"', text, count=1)
+    escaped = base.replace("\\", "\\\\").replace('"', '\\"')
+    text = re.sub(r'base_url\s*=\s*"[^"]*"', lambda m: f'base_url = "{escaped}"', text, count=1)
 with open(path, "w") as f:
     f.write(text)
 PY
     fi
     if [ -n "${KIMI_API_KEY:-}" ]; then
-      # Inject the API key (baked default ships api_key = "").
+      # Inject the API key (baked default ships api_key = ""). Same escaping.
       python3 - "$KIMI_CODE_HOME/config.toml" <<'PY'
 import os, re, sys
 path = sys.argv[1]
@@ -115,7 +119,8 @@ with open(path, "r") as f:
     text = f.read()
 key = os.environ.get("KIMI_API_KEY", "").strip()
 if key:
-    text = re.sub(r'api_key\s*=\s*"[^"]*"', f'api_key = "{key}"', text, count=1)
+    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+    text = re.sub(r'api_key\s*=\s*"[^"]*"', lambda m: f'api_key = "{escaped}"', text, count=1)
 with open(path, "w") as f:
     f.write(text)
 PY
