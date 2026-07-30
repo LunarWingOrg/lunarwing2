@@ -3,6 +3,7 @@
 //! Encapsulates the transport dispatch logic (stdio, Unix socket, HTTP)
 //! so that callers don't need to match on `EffectiveTransport` themselves.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::secrets::SecretsStore;
@@ -43,9 +44,37 @@ pub async fn create_client_from_config(
     })?;
 
     match server.effective_transport() {
-        EffectiveTransport::Stdio { command, args, env } => {
+        EffectiveTransport::Stdio {
+            command,
+            args,
+            env,
+            env_secrets,
+            auto_install,
+        } => {
+            if let Some(install) = auto_install {
+                crate::tools::mcp::package_install::ensure_package_installed(
+                    &server_name,
+                    command,
+                    install,
+                )
+                .await
+                .map_err(|e| McpFactoryError::StdioSpawn {
+                    name: server_name.clone(),
+                    reason: e.to_string(),
+                })?;
+            }
+
+            let resolved_env = resolve_stdio_env(
+                &server_name,
+                env,
+                env_secrets,
+                secrets.as_deref(),
+                user_id,
+            )
+            .await?;
+
             let transport = process_manager
-                .spawn_stdio(&server_name, command, args.to_vec(), env.clone())
+                .spawn_stdio(&server_name, command, args.to_vec(), resolved_env)
                 .await
                 .map_err(|e| McpFactoryError::StdioSpawn {
                     name: server_name.clone(),
@@ -124,6 +153,59 @@ pub async fn create_client_from_config(
     }
 }
 
+/// Resolve the environment for a stdio MCP server, injecting values from the
+/// secrets store for every entry in `env_secrets` (env var name -> secret name).
+///
+/// Fails closed: a missing/unreadable secret — or a missing secrets store —
+/// aborts the spawn. Secret values are decrypted at spawn time, never logged,
+/// and never persisted in the server configuration. Note that crash restarts
+/// reuse the environment resolved at the initial spawn; rotating a secret
+/// requires deactivating and reactivating the server.
+async fn resolve_stdio_env(
+    server_name: &str,
+    env: &HashMap<String, String>,
+    env_secrets: &HashMap<String, String>,
+    secrets: Option<&(dyn SecretsStore + Send + Sync)>,
+    user_id: &str,
+) -> Result<HashMap<String, String>, McpFactoryError> {
+    let mut resolved = env.clone();
+    if env_secrets.is_empty() {
+        return Ok(resolved);
+    }
+
+    let secrets = secrets.ok_or_else(|| McpFactoryError::InvalidConfig {
+        name: server_name.to_string(),
+        reason: format!(
+            "stdio env_secrets requires a secrets store, but none is available ({} variable(s) requested)",
+            env_secrets.len()
+        ),
+    })?;
+
+    for (var, secret_name) in env_secrets {
+        let secret =
+            secrets
+                .get_decrypted(user_id, secret_name)
+                .await
+                .map_err(|e| McpFactoryError::InvalidConfig {
+                    name: server_name.to_string(),
+                    reason: format!(
+                        "failed to resolve secret '{secret_name}' for environment variable '{var}': {e}"
+                    ),
+                })?;
+        if resolved
+            .insert(var.clone(), secret.expose().to_string())
+            .is_some()
+        {
+            tracing::warn!(
+                "MCP server '{}': env_secrets entry overrides plain env variable '{}'",
+                server_name,
+                var
+            );
+        }
+    }
+    Ok(resolved)
+}
+
 /// Release all runtime state associated with an MCP client.
 pub(crate) async fn shutdown_client_runtime(
     server_name: &str,
@@ -157,6 +239,91 @@ pub(crate) async fn shutdown_client_runtime(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn test_secrets_store() -> Arc<crate::secrets::InMemorySecretsStore> {
+        // 32-byte test master key (same constraint as production crypto).
+        let key = secrecy::SecretString::from("test-master-key-32-bytes-long!!!".to_string());
+        let crypto = Arc::new(crate::secrets::SecretsCrypto::new(key).expect("test crypto"));
+        Arc::new(crate::secrets::InMemorySecretsStore::new(crypto))
+    }
+
+    async fn create_secret(store: &Arc<crate::secrets::InMemorySecretsStore>, name: &str, value: &str) {
+        store
+            .create(
+                "user",
+                crate::secrets::CreateSecretParams {
+                    name: name.to_string(),
+                    value: secrecy::SecretString::from(value.to_string()),
+                    provider: Some("test".to_string()),
+                    expires_at: None,
+                },
+            )
+            .await
+            .expect("create test secret");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stdio_env_passthrough_without_secret_mappings() {
+        let env = HashMap::from([("PLAIN".to_string(), "value".to_string())]);
+        let resolved = resolve_stdio_env("srv", &env, &HashMap::new(), None, "user")
+            .await
+            .expect("no mappings must not need a store");
+        assert_eq!(resolved, env);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stdio_env_fails_closed_without_store() {
+        let mappings = HashMap::from([("TOKEN".to_string(), "my_token".to_string())]);
+        let err = resolve_stdio_env("srv", &HashMap::new(), &mappings, None, "user")
+            .await
+            .expect_err("env_secrets without a store must fail");
+        assert!(err.to_string().contains("secrets store"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stdio_env_fails_closed_for_missing_secret() {
+        let store = test_secrets_store();
+        let mappings = HashMap::from([("TOKEN".to_string(), "missing_token".to_string())]);
+        let err = resolve_stdio_env(
+            "srv",
+            &HashMap::new(),
+            &mappings,
+            Some(store.as_ref()),
+            "user",
+        )
+        .await
+        .expect_err("missing secret must fail closed");
+        assert!(err.to_string().contains("missing_token"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stdio_env_injects_secret_values() {
+        let store = test_secrets_store();
+        create_secret(&store, "github_token", "ghp_test_value").await;
+
+        let env = HashMap::from([("PLAIN".to_string(), "value".to_string())]);
+        let mappings = HashMap::from([("GITHUB_TOKEN".to_string(), "github_token".to_string())]);
+        let resolved = resolve_stdio_env("srv", &env, &mappings, Some(store.as_ref()), "user")
+            .await
+            .expect("secret injection must succeed");
+
+        assert_eq!(resolved.get("PLAIN").unwrap(), "value");
+        assert_eq!(resolved.get("GITHUB_TOKEN").unwrap(), "ghp_test_value");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stdio_env_secret_overrides_plain_env() {
+        let store = test_secrets_store();
+        create_secret(&store, "api_key", "secret_value").await;
+
+        let env = HashMap::from([("API_KEY".to_string(), "plaintext".to_string())]);
+        let mappings = HashMap::from([("API_KEY".to_string(), "api_key".to_string())]);
+        let resolved = resolve_stdio_env("srv", &env, &mappings, Some(store.as_ref()), "user")
+            .await
+            .expect("secret injection must succeed");
+
+        assert_eq!(resolved.get("API_KEY").unwrap(), "secret_value");
+    }
 
     #[tokio::test]
     async fn test_factory_non_oauth_http_has_session_manager() {
