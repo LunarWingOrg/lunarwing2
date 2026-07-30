@@ -342,6 +342,25 @@ impl Agent {
         }
         let scheduler = Arc::new(scheduler);
 
+        // Extract the embedding provider before moving `deps` into the struct.
+        let embedding_provider = deps
+            .workspace
+            .as_ref()
+            .and_then(|ws| ws.embedding_provider());
+
+        let reflex_router = {
+            let mut router = crate::agent::reflex::ReflexRouter::new()
+                .with_fuzzy_config(crate::agent::reflex::FuzzyConfig {
+                    threshold: config.reflex.fuzzy_threshold,
+                    ..Default::default()
+                })
+                .with_semantic_threshold(config.reflex.semantic_threshold);
+            if let Some(provider) = embedding_provider {
+                router = router.with_embedding_provider(provider);
+            }
+            Arc::new(router)
+        };
+
         Self {
             config,
             deps,
@@ -356,7 +375,7 @@ impl Agent {
             routine_config,
             routine_engine_slot: Arc::new(tokio::sync::RwLock::new(None)),
             mission_manager_slot: Arc::new(tokio::sync::RwLock::new(None)),
-            reflex_router: Arc::new(crate::agent::reflex::ReflexRouter::new()),
+            reflex_router,
         }
     }
 
@@ -801,10 +820,12 @@ impl Agent {
             None
         };
 
-        // Spawn reflex compiler and cache refresh if enabled
-        let (_reflex_compiler_handle, _reflex_cache_handle) = if self.config.reflex.enabled {
-            let compiler_handle =
-                if let (Some(store), Some(builder)) = (self.store(), self.deps.builder.clone()) {
+        // Spawn reflex compiler, cache refresh, and evictor if enabled
+        let (_reflex_compiler_handle, _reflex_cache_handle, _reflex_evictor_handle) =
+            if self.config.reflex.enabled {
+                let compiler_handle = if let (Some(store), Some(builder)) =
+                    (self.store(), self.deps.builder.clone())
+                {
                     tracing::info!(
                         "Reflex compiler enabled: checking every {}s, min {} matches",
                         self.config.reflex.check_interval.as_secs(),
@@ -813,6 +834,7 @@ impl Agent {
                     Some(crate::agent::reflex::spawn_reflex_compiler(
                         builder,
                         Arc::clone(store),
+                        self.owner_id().to_string(),
                         self.config.reflex.check_interval,
                         self.config.reflex.min_match_count,
                         self.config.reflex.max_patterns_per_run,
@@ -822,25 +844,42 @@ impl Agent {
                     None
                 };
 
-            let cache_handle = if let Some(store) = self.store() {
-                tracing::debug!(
-                    "Reflex cache refresh enabled: refreshing every {}s",
-                    self.config.reflex.check_interval.as_secs()
-                );
-                Some(crate::agent::reflex::spawn_reflex_cache_refresh(
-                    Arc::clone(&self.reflex_router),
-                    Arc::clone(store),
-                    self.owner_id().to_string(),
-                    self.config.reflex.check_interval,
-                ))
-            } else {
-                None
-            };
+                let cache_handle = if let Some(store) = self.store() {
+                    tracing::debug!(
+                        "Reflex cache refresh enabled: refreshing every {}s",
+                        self.config.reflex.check_interval.as_secs()
+                    );
+                    Some(crate::agent::reflex::spawn_reflex_cache_refresh(
+                        Arc::clone(&self.reflex_router),
+                        Arc::clone(store),
+                        self.owner_id().to_string(),
+                        self.config.reflex.check_interval,
+                    ))
+                } else {
+                    None
+                };
 
-            (compiler_handle, cache_handle)
-        } else {
-            (None, None)
-        };
+                let evictor_handle = if let Some(store) = self.store() {
+                    tracing::info!(
+                        "Spawning reflex evictor (stale_after_days: {}, check_interval: {}s)",
+                        self.config.reflex.eviction_stale_days,
+                        self.config.reflex.eviction_check_interval.as_secs()
+                    );
+                    Some(crate::agent::reflex::spawn_reflex_evictor(
+                        Arc::clone(store),
+                        crate::agent::reflex::EvictionConfig::new(
+                            self.config.reflex.eviction_check_interval,
+                            self.config.reflex.eviction_stale_days,
+                        ),
+                    ))
+                } else {
+                    None
+                };
+
+                (compiler_handle, cache_handle, evictor_handle)
+            } else {
+                (None, None, None)
+            };
 
         // Spawn routine engine if enabled
         let routine_handle = if let Some(ref rt_config) = self.routine_config {
