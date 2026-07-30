@@ -1330,7 +1330,10 @@ impl Settings {
 
     /// Write a well-commented TOML config file with current settings.
     pub fn save_toml(&self, path: &std::path::Path) -> Result<(), String> {
-        let raw = toml::to_string_pretty(self)
+        let mut value = toml::Value::try_from(self)
+            .map_err(|e| format!("failed to serialize settings: {}", e))?;
+        self.reinject_external_worker_tokens(&mut value);
+        let raw = toml::to_string_pretty(&value)
             .map_err(|e| format!("failed to serialize settings: {}", e))?;
 
         let content = format!(
@@ -1352,6 +1355,59 @@ impl Settings {
 
         std::fs::write(path, content)
             .map_err(|e| format!("failed to write {}: {}", path.display(), e))
+    }
+
+    /// Re-inject external-worker `auth_token` values into the serialized TOML
+    /// tree before it is written to disk.
+    ///
+    /// `auth_token` is `skip_serializing` so it can never leak through
+    /// JSON/API transports, but the on-disk config is the source of truth
+    /// provisioned by mt-admin. Without this re-injection, every full-config
+    /// rewrite (`/model`, profile persistence, CLI model changes,
+    /// `config init`) would drop the tokens and the daemon would get a 401
+    /// from every external worker on its next connect.
+    fn reinject_external_worker_tokens(&self, value: &mut toml::Value) {
+        use secrecy::ExposeSecret;
+
+        let Some(worker_values) = value
+            .get_mut("sandbox")
+            .and_then(|sandbox| sandbox.get_mut("external_workers"))
+            .and_then(toml::Value::as_array_mut)
+        else {
+            return;
+        };
+
+        for (worker_value, worker) in worker_values
+            .iter_mut()
+            .zip(self.sandbox.external_workers.iter())
+        {
+            if let Some(table) = worker_value.as_table_mut()
+                && let Some(token) = &worker.auth_token
+            {
+                table.insert(
+                    "auth_token".to_string(),
+                    toml::Value::String(token.expose_secret().to_string()),
+                );
+            }
+            let Some(endpoint_values) = worker_value
+                .get_mut("endpoints")
+                .and_then(toml::Value::as_array_mut)
+            else {
+                continue;
+            };
+            for (endpoint_value, endpoint) in
+                endpoint_values.iter_mut().zip(worker.endpoints.iter())
+            {
+                if let Some(table) = endpoint_value.as_table_mut()
+                    && let Some(token) = &endpoint.auth_token
+                {
+                    table.insert(
+                        "auth_token".to_string(),
+                        toml::Value::String(token.expose_secret().to_string()),
+                    );
+                }
+            }
+        }
     }
 
     /// Merge values from `other` into `self`, preferring `other` for
@@ -1849,6 +1905,83 @@ mod tests {
         assert_eq!(loaded.agent.name, "toml-bot");
         assert!(loaded.heartbeat.enabled);
         assert_eq!(loaded.heartbeat.interval_secs, 900);
+    }
+
+    #[test]
+    fn toml_round_trip_preserves_external_worker_auth_tokens() {
+        use secrecy::{ExposeSecret, SecretString};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut settings = Settings::default();
+        settings
+            .sandbox
+            .external_workers
+            .push(ExternalWorkerSettings {
+                name: "kimi".to_string(),
+                url: "ws://127.0.0.1:30000/ws/agent".to_string(),
+                auth_token: Some(SecretString::from("tok-kimi-123")),
+                timeout_ms: 3_600_000,
+                endpoints: vec![crate::config::WorkerEndpoint {
+                    url: "ws://127.0.0.1:30002/ws/agent".to_string(),
+                    auth_token: Some(SecretString::from("tok-kimi-endpoint")),
+                    weight: None,
+                }],
+                load_balance: crate::config::LoadBalanceStrategy::default(),
+                prompt_context: lunarwing_common::PromptContextLimits::default(),
+            });
+
+        settings.save_toml(&path).unwrap();
+
+        // The on-disk file must carry the tokens (mt-admin provisions them
+        // there), even though JSON/API transports keep them redacted.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("tok-kimi-123"),
+            "worker auth_token must be written to config.toml"
+        );
+        assert!(
+            raw.contains("tok-kimi-endpoint"),
+            "endpoint auth_token must be written to config.toml"
+        );
+
+        let loaded = Settings::load_toml(&path).unwrap().unwrap();
+        let worker = &loaded.sandbox.external_workers[0];
+        assert_eq!(
+            worker.auth_token.as_ref().map(|s| s.expose_secret()),
+            Some("tok-kimi-123"),
+            "worker auth_token must survive a save/load round-trip"
+        );
+        assert_eq!(
+            worker.endpoints[0]
+                .auth_token
+                .as_ref()
+                .map(|s| s.expose_secret()),
+            Some("tok-kimi-endpoint"),
+            "endpoint auth_token must survive a save/load round-trip"
+        );
+
+        // A second full rewrite (the `/model` pattern: load, mutate, save)
+        // must not drop the tokens either.
+        let mut rewritten = loaded;
+        rewritten.selected_model = Some("some-model".to_string());
+        rewritten.save_toml(&path).unwrap();
+        let reloaded = Settings::load_toml(&path).unwrap().unwrap();
+        let worker = &reloaded.sandbox.external_workers[0];
+        assert_eq!(
+            worker.auth_token.as_ref().map(|s| s.expose_secret()),
+            Some("tok-kimi-123"),
+            "worker auth_token must survive repeated full-config rewrites"
+        );
+        assert_eq!(
+            worker.endpoints[0]
+                .auth_token
+                .as_ref()
+                .map(|s| s.expose_secret()),
+            Some("tok-kimi-endpoint"),
+            "endpoint auth_token must survive repeated full-config rewrites"
+        );
     }
 
     #[test]
