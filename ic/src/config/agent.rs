@@ -52,6 +52,16 @@ pub struct ReflexConfig {
     pub min_match_count: u32,
     /// Maximum patterns to compile per check cycle (default: 5).
     pub max_patterns_per_run: usize,
+    /// Fuzzy matching threshold (Jaro-Winkler similarity, default: 0.85).
+    pub fuzzy_threshold: f64,
+    /// Semantic matching threshold (cosine similarity, default: 0.75).
+    pub semantic_threshold: f64,
+    /// How often the evictor checks for stale patterns (default: 24 hours).
+    pub eviction_check_interval: Duration,
+    /// Days without a match before a pattern is considered stale (default: 30).
+    pub eviction_stale_days: i32,
+    /// Maximum number of active patterns per user (default: 50).
+    pub max_patterns_per_user: usize,
 }
 
 impl Default for ReflexConfig {
@@ -61,6 +71,11 @@ impl Default for ReflexConfig {
             check_interval: Duration::from_secs(1800),
             min_match_count: 3,
             max_patterns_per_run: 5,
+            fuzzy_threshold: 0.85,
+            semantic_threshold: 0.75,
+            eviction_check_interval: Duration::from_secs(86400),
+            eviction_stale_days: 30,
+            max_patterns_per_user: 50,
         }
     }
 }
@@ -168,6 +183,17 @@ impl AgentConfig {
                 )?),
                 min_match_count: parse_optional_env("REFLEX_MIN_MATCH_COUNT", 3u32)?,
                 max_patterns_per_run: parse_optional_env("REFLEX_MAX_PATTERNS_PER_RUN", 5usize)?,
+                fuzzy_threshold: parse_optional_env("REFLEX_FUZZY_THRESHOLD", 0.85f64)?,
+                semantic_threshold: parse_optional_env("REFLEX_SEMANTIC_THRESHOLD", 0.75f64)?,
+                eviction_check_interval: Duration::from_secs(parse_optional_env(
+                    "REFLEX_EVICTION_INTERVAL_SECS",
+                    86400u64,
+                )?),
+                eviction_stale_days: parse_optional_env("REFLEX_EVICTION_STALE_DAYS", 30i32)?,
+                max_patterns_per_user: parse_optional_env(
+                    "REFLEX_MAX_PATTERNS_PER_USER",
+                    50usize,
+                )?,
             },
         })
     }
