@@ -6,6 +6,29 @@
 
 ---
 
+## 0. Status Update (2026-07-30, v2.0.4.0, branch `rarity/kimi-5-20260730-1201`)
+
+The wiring gaps in §5 were addressed (adapted from branch `anattemptatreflexcompilerv2`):
+
+| Gap | Status |
+|-----|--------|
+| 5.1 Embedding provider never wired | **FIXED** — `Workspace::embedding_provider()` accessor; `Agent::new()` attaches it to the router |
+| 5.2 `bump_reflex_pattern_match()` never called | **FIXED** — dispatcher bumps match count after successful fast-path execution |
+| 5.3 `ReflexEvictor` never spawned | **FIXED** — spawned in `Agent::run()` with `EvictionConfig` from `ReflexConfig` |
+| 5.4 Hardcoded `"default"` user_id | **FIXED** — `ReflexCompiler` takes `user_id`; `find_recurring_job_patterns` filters per-user in both backends |
+| 5.5 `compilation_attempts` never incremented | **FIXED** — incremented on build failure; pattern auto-disabled after 3 attempts |
+| 5.6 No v2 safety/hooks/approval on reflex path | OPEN — architectural (intentional fast-path); needs design decision |
+| 5.7 `FuzzyConfig` defined but unused | **FIXED** — wired into `ReflexRouter` (`with_fuzzy_config`, router fields) |
+| 5.8 Missing config options | **FIXED** — `fuzzy_threshold`, `semantic_threshold`, `eviction_check_interval`, `eviction_stale_days`, `max_patterns_per_user` added with env overrides; the per-user cap is enforced by the compiler |
+| 5.9 libSQL boolean divergence | OPEN — documented, correct as-is |
+| 5.10 PG prune re-query missing embedding columns | **FIXED** |
+| 5.11 No engine v2 bridge adapter | OPEN — large architectural effort |
+| 5.12 Dead code / unused exports | **FIXED** — `FuzzyConfig`, `EvictionConfig`, `spawn_reflex_evictor`, semantic search are now all live |
+
+Verification: 47 reflex unit tests + 8 e2e integration tests pass; `cargo clippy --lib --tests --features libsql -- -D warnings` clean.
+
+---
+
 ## 1. What the Reflex Compiler Does
 
 ### Purpose
