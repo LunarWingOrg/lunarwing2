@@ -178,6 +178,15 @@ impl Agent {
             let params = serde_json::json!({"input": message.content});
             match self.execute_chat_tool(&tool_name, &params, &job_ctx).await {
                 Ok(output) => {
+                    if let Some(store) = self.store() {
+                        let normalized = crate::agent::reflex::normalize_pattern(&message.content);
+                        if let Err(e) = store
+                            .bump_reflex_pattern_match(&message.user_id, &normalized)
+                            .await
+                        {
+                            tracing::debug!("Failed to bump reflex pattern match: {}", e);
+                        }
+                    }
                     return Ok(AgenticLoopResult::Response(output));
                 }
                 Err(e) => {
