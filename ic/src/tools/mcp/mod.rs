@@ -33,6 +33,7 @@ mod client;
 pub mod config;
 pub mod factory;
 pub(crate) mod http_transport;
+pub mod package_install;
 pub(crate) mod process;
 mod protocol;
 pub mod session;
@@ -43,7 +44,7 @@ pub(crate) mod unix_transport;
 
 pub use auth::{is_authenticated, refresh_access_token};
 pub use client::McpClient;
-pub use config::{McpServerConfig, McpServersFile, OAuthConfig};
+pub use config::{McpAutoInstall, McpPackageManager, McpServerConfig, McpServersFile, OAuthConfig};
 pub use factory::{McpFactoryError, create_client_from_config};
 pub use process::McpProcessManager;
 pub use protocol::{InitializeResult, McpRequest, McpResponse, McpTool};

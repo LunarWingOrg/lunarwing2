@@ -577,7 +577,13 @@ impl ToolUpdateTool {
                 "Unsupported MCP transport '{other}'"
             ))),
             None => match existing.effective_transport() {
-                EffectiveTransport::Stdio { command, args, env } => {
+                EffectiveTransport::Stdio {
+                    command,
+                    args,
+                    env,
+                    env_secrets,
+                    auto_install,
+                } => {
                     let cmd = params
                         .get("command")
                         .and_then(|v| v.as_str())
@@ -590,7 +596,19 @@ impl ToolUpdateTool {
                         .get("env")
                         .and_then(|v| serde_json::from_value(v.clone()).ok())
                         .unwrap_or_else(|| env.clone());
-                    Ok(McpServerConfig::new_stdio(&existing.name, cmd, a, e))
+                    let mut config = McpServerConfig::new_stdio(&existing.name, cmd, a, e);
+                    // Preserve secret-env injection and auto-install settings
+                    // across config updates.
+                    if let Some(crate::tools::mcp::config::McpTransportConfig::Stdio {
+                        env_secrets: es,
+                        auto_install: ai,
+                        ..
+                    }) = &mut config.transport
+                    {
+                        *es = env_secrets.clone();
+                        *ai = auto_install.cloned();
+                    }
+                    Ok(config)
                 }
                 EffectiveTransport::Http => {
                     let url = params
@@ -1003,7 +1021,9 @@ mod tests {
             .expect("valid request")
             .expect("MCP config");
         match config.effective_transport() {
-            EffectiveTransport::Stdio { command, args, env } => {
+            EffectiveTransport::Stdio {
+                command, args, env, ..
+            } => {
                 assert_eq!(command, "npx");
                 assert_eq!(
                     args,
