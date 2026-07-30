@@ -1,10 +1,12 @@
 # Multi-tenant external-worker configuration
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-07-28).**
-> Tenant provisioning now generates Nanocode, Pebble, and OpenCode endpoint
-> blocks. In-memory settings merges preserve their bearer tokens, but a later
-> full TOML rewrite (for example `/model`) still omits `auth_token` and can make
-> the worker return 401 after reload. Provisioning is fixed; persistence is open.
+> **Status: FIXED (2026-07-30, branch rarity/kimi-21-20260730-2101).**
+> Tenant provisioning generates Nanocode, Pebble, OpenCode, and Kimi endpoint
+> blocks. In-memory settings merges preserve their bearer tokens, and
+> `Settings::save_toml` now re-injects the tokens into the on-disk TOML, so
+> full-config rewrites (`/model`, profile persistence, CLI model changes,
+> `config init`) no longer log the daemon out of its workers. A save/load and
+> repeated-rewrite round-trip regression test covers the persistence path.
 
 This consolidates `MISSING-CONFIG-FOR-NANOCODE.md` and the current config
 round-trip finding.
@@ -44,39 +46,34 @@ selection and the start path gates workers on that selection
 
 ## 2. Auth-token loss on settings rewrites
 
-**Status: STILL-OPEN (unverified runtime, source-confirmed risk).**
+**Status: FIXED (2026-07-30, branch rarity/kimi-21-20260730-2101).**
 
-`ExternalWorkerSettings.auth_token` is `Option<SecretString>` with
-`#[serde(default, skip_serializing)]` (`ic/src/settings.rs:874-875`). The
-settings writer serializes the whole struct (`settings.rs:1332-1355`), and the
-`/model` command loads, changes, and saves that struct
-(`ic/src/agent/commands.rs:885-942`). Other full-TOML writers include profile
-persistence (`ic/src/tools/builtin/memory.rs:604-610`), CLI model changes
+`ExternalWorkerSettings.auth_token` remains `Option<SecretString>` with
+`#[serde(default, skip_serializing)]` (`ic/src/settings.rs`), so it still
+cannot leak through JSON/API transports. `Settings::save_toml` now serializes
+through a `toml::Value` and re-injects the worker- and endpoint-level
+`auth_token` values into the TOML tree before writing
+(`Settings::reinject_external_worker_tokens`). Every full-TOML writer funnels
+through `save_toml` — the `/model` command
+(`ic/src/agent/commands.rs:885-959`), profile persistence
+(`ic/src/tools/builtin/memory.rs:604-611`), CLI model changes
 (`ic/src/cli/models.rs:121-143`), and `config init`
-(`ic/src/cli/config.rs:204-223`). A save round-trip therefore omits the worker
-token. `ExternalWorkerConfig::resolve_from_settings` then receives the missing
-token (`ic/src/config/sandbox.rs:186-197`), so the daemon can connect to the
-worker without the bearer expected by `AGENT_AUTH_TOKEN`.
+(`ic/src/cli/config.rs:204-223`) — and each loads the TOML before saving, so
+the in-memory token is rewritten to disk on every save.
 
-`Settings::merge_from` now restores skipped worker and endpoint tokens directly
-from the TOML-parsed overlay after its JSON merge
-(`ic/src/settings.rs:1383-1407`). That fixes token loss during an in-memory
-configuration merge; it cannot recover a token that an earlier `save_toml`
-rewrite already removed from disk.
-
-The existing config tests prove TOML parsing and multi-worker shape, but no test
-currently proves that an auth token survives `Settings::save_toml` and a later
-load. The post-merge fixup is not a persistence test, so the generator's old
-claim that the block "survives" daemon writers remains unsupported.
-
-Potential fixes include a secret-preserving config merge, an env/DB source of
-truth for worker tokens, or an explicit post-save re-injection. Do not mark this
-closed until a round-trip test and runtime auth check exist.
+The regression test
+`settings::tests::toml_round_trip_preserves_external_worker_auth_tokens`
+asserts the tokens land in the written file and survive both a save/load
+round-trip and a repeated load/mutate/save rewrite (the `/model` pattern).
+JSON-side redaction is unchanged: `merge_from`'s post-merge fixup still covers
+the in-memory serde_json path.
 
 ## Verification record
 
 The provisioning status was verified by current shell call sites and in-tree
-config tests. The persistence status was derived from the current serde
-attributes, post-merge fixup, and save/load call path; no Cargo command, daemon
-restart, or worker connection was run. Re-verified on 2026-07-28 with updated
-source line references.
+config tests. The persistence fix was verified on 2026-07-30 with
+`cargo test --lib settings::` (56/56 passing, including the new
+`toml_round_trip_preserves_external_worker_auth_tokens`), `cargo clippy --lib
+--tests` (zero warnings), and `rustfmt --check` on the touched files. No live
+daemon/worker reconnect was run; the round-trip test exercises the exact
+save/load path the writers use.
