@@ -675,6 +675,19 @@ async fn async_main() -> anyhow::Result<()> {
         );
     }
 
+    // Phase 3: localhost-only admin endpoints for coordination violations.
+    if let Some(store) = coordination_store.clone() {
+        let port = lunarwing::channels::web::coord_admin_port_from_env();
+        match lunarwing::channels::web::start_coord_admin_server(store, port).await {
+            Ok(addr) => tracing::info!(%addr, "Coordination admin endpoints listening"),
+            Err(err) => tracing::warn!(
+                error = %err,
+                port = port,
+                "Coordination admin server failed to bind; continuing without it"
+            ),
+        }
+    }
+
     // Reuse the shared agent session manager prepared by AppBuilder.
     let session_manager = Arc::clone(&components.agent_session_manager);
 
