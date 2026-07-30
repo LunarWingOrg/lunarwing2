@@ -152,7 +152,26 @@ conversational `tool_install` tool:
 Installation persists configuration only. Activation starts the child process,
 negotiates MCP, and registers its tools. Treat the executable as trusted installed
 code: stdio servers are not sandboxed. Values in `env` are plain configuration,
-not secret storage; use LunarWing's credential systems for secrets.
+not secret storage; use `env_secrets` (below) for credentials.
+
+The stdio transport accepts two additional optional fields:
+
+- `env_secrets` maps an environment variable name to a secret name in the
+  owner's secrets store. Values are decrypted at spawn time and never logged or
+  persisted in the MCP configuration; activation fails closed if a secret is
+  missing. Crash restarts reuse the initially resolved environment, so rotate a
+  secret by deactivating and reactivating the server.
+- `auto_install` (`{"manager": "npm"|"pip", "package": "<name>"}`) installs the
+  named package (`npm install -g` / `pip[3] install --user`) when the configured
+  command is not found on `PATH`. Package specs are validated, installers run
+  without a shell under a 300s timeout, and nothing is installed without this
+  explicit opt-in.
+
+Managed stdio servers are supervised: a background task polls child processes
+and automatically restarts servers that exit unexpectedly (exponential backoff,
+1s→16s, 5 attempts per restart). A crash-loop guard stops restarting a server
+after 5 restarts within 10 minutes until it is manually reactivated.
+Intentional deactivation/shutdown is never restarted.
 
 MCP servers can be deactivated without uninstalling them. Deactivation unloads
 only that server's registered tools, closes its transport and session, stops a
