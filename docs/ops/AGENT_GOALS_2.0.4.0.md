@@ -9,7 +9,7 @@
 
 ---
 
-1. [ ] Bump lunarwing crate versions and wasm channel crates for lunarwing that have same version. they are at 2.0.3. we need bump to 2.0.4
+1. [x] Bump lunarwing crate versions and wasm channel crates for lunarwing that have same version. they are at 2.0.3. we need bump to 2.0.4 — DONE 2026-07-30: bumped to 2.0.4 (ic/Cargo.toml + lunarwing_common/engine/skills/safety + channels-src xmpp/multica + darkirc + weechat_relay + xmpp-bridge; all Cargo.lock files updated; cargo check clean)
 2. [ ] Per-tenant WeeChat health-glob gate (fix the flap /render-units footgun)
 3. [ ] Inspect status of ALL cargo crates. check audit doc in docs/ops and start updating crates and verifying successful build
 4. [ ] continue to work on kawarimi adapter (for lack of a better name): create a method for migrating a hermes agent to lunarwing v2 safely. SEE: SECTION: hermes_kawarimi — review notes in docs/ops/KUMOGAKURE_RECENT_REV_T.md for suggestedm improvements/concerns. live verify hermes agent and migrate it to lunarwing as a new tenant
