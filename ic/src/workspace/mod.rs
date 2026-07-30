@@ -103,11 +103,17 @@ const SYSTEM_PROMPT_FILES: &[&str] = &[
     paths::PROFILE,
 ];
 
+/// Lorebook JSON files are injected into the system prompt when their
+/// keywords match the conversation (see `crate::lorebook`), so writes under
+/// this directory get the same prompt-injection scan as identity files.
+const LOREBOOK_DIR_PREFIX: &str = "lorebooks/";
+
 /// Returns true if `path` (already normalized) is a system-prompt-injected file.
 fn is_system_prompt_file(path: &str) -> bool {
     SYSTEM_PROMPT_FILES
         .iter()
         .any(|p| path.eq_ignore_ascii_case(p))
+        || path.to_ascii_lowercase().starts_with(LOREBOOK_DIR_PREFIX)
 }
 
 /// Shared sanitizer instance — avoids rebuilding Aho-Corasick + regexes on every write.
@@ -1978,6 +1984,8 @@ mod tests {
             ("context/assistant-directives.md", true),
             ("context/profile.json", true),
             ("soul.md", true),
+            ("lorebooks/fantasy.json", true),
+            ("lorebooks/WORLD.JSON", true),
             ("notes/foo.md", false),
             ("daily/2024-01-01.md", false),
             ("projects/readme.md", false),
