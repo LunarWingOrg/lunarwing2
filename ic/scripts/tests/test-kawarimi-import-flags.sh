@@ -76,14 +76,20 @@ ENV
 }
 
 make_test_scripts() {
-  local work="$1"
-  mkdir -p "$work/scripts" "$work/bin" "$work/home/kawarimi/lunarwing/env"
+  local work="$1" fixture_uid fixture_gid
+  fixture_uid="$(id -u)"
+  fixture_gid="$(id -g)"
+  mkdir -p "$work/scripts" "$work/bin" "$work/home/kawarimi/lunarwing/env" \
+    "$work/home/kawarimi/lunarwing/state"
+  chmod 0700 "$work/home/kawarimi/lunarwing/env"
   cp "$IMPORT_SRC" "$work/scripts/import-tenant.sh"
 
   cat >"$work/scripts/lunarwing-mt-admin.sh" <<'MT'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${KAWARIMI_TEST_WORK:?}/mt-admin.log"
 case "${1:-}" in
+  stop-writers) exit 0 ;;
+  writers-active) exit 1 ;;
   owner-scopes)
     if [[ -f "$KAWARIMI_TEST_WORK/scope-migrated" ]]; then
       printf 'kawarimi\t12\n'
@@ -107,12 +113,18 @@ printf 'preflight %s\n' "${1:-}" >> "${KAWARIMI_TEST_WORK:?}/preflight.log"
 PREFLIGHT
   chmod +x "$work/scripts/import-tenant.sh" "$work/scripts/lunarwing-weechat-preflight.sh"
 
-  cat >"$work/bin/id" <<'ID'
+  cat >"$work/bin/id" <<ID
 #!/usr/bin/env bash
-if [[ "${1:-}" == "-u" ]]; then
-  printf '0\n'
+if [[ "\${1:-}" == "-u" && \$# -eq 1 ]]; then
+  if [[ "\${KAWARIMI_FAKE_TENANT:-}" == 1 ]]; then
+    printf '%s\n' "$fixture_uid"
+  else
+    printf '0\n'
+  fi
+elif [[ "\${1:-}" == "-u" && "\${2:-}" == "kawarimi" ]]; then
+  printf '%s\n' "$fixture_uid"
 else
-  exec /usr/bin/id "$@"
+  exec /usr/bin/id "\$@"
 fi
 ID
   chmod +x "$work/bin/id"
@@ -120,12 +132,22 @@ ID
   cat >"$work/bin/getent" <<GETENT
 #!/usr/bin/env bash
 if [[ "\${1:-}" == "passwd" && "\${2:-}" == "kawarimi" ]]; then
-  printf 'kawarimi:x:1000:1000::%s/home/kawarimi:/bin/bash\n' "$work"
+  printf 'kawarimi:x:$fixture_uid:$fixture_gid::%s/home/kawarimi:/bin/bash\n' "$work"
 else
   exit 2
 fi
 GETENT
   chmod +x "$work/bin/getent"
+
+  cat >"$work/bin/sudo" <<'SUDO'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -u ]]; then
+  shift 2
+  export KAWARIMI_FAKE_TENANT=1
+fi
+exec "$@"
+SUDO
+  chmod +x "$work/bin/sudo"
 }
 
 echo "=== import-tenant dry-run flag passthrough ==="
@@ -227,6 +249,7 @@ cat >"$tmp/home/kawarimi/lunarwing/env/vision.env" <<'ENV'
 VL_MODEL=throwaway
 LUNARWING_AUTH_TOKEN=target-vision-token
 ENV
+chmod 0600 "$tmp/home/kawarimi/lunarwing/env/"*.env
 auto_output="$(
   PATH="$tmp/bin:$PATH" \
   LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
@@ -403,24 +426,28 @@ assert_file_not_contains "export keeps passphrase out of 7z argv" "$EXPORT_SRC" 
 assert_file_not_contains "import keeps passphrase out of 7z argv" "$IMPORT_SRC" "-p\"\$KAWARIMI"
 
 echo "=== export rejects missing passphrase before quiescence ==="
-mkdir -p "$tmp/export-home/alpha/lunarwing/env" "$tmp/export-bin" "$tmp/export-out"
+mkdir -p "$tmp/export-home/alpha/lunarwing/env" \
+  "$tmp/export-home/alpha/lunarwing/state" "$tmp/export-bin" "$tmp/export-out"
+export_fixture_uid="$(id -u)"
+export_fixture_gid="$(id -g)"
 cat >"$tmp/export-home/alpha/lunarwing/env/lunarwing.env" <<'ENV'
 DATABASE_BACKEND=postgres
 DATABASE_URL=postgres://lunarwing:test@127.0.0.1/lunarwing
 SECRETS_MASTER_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ENV
-cat >"$tmp/export-bin/id" <<'ID'
+chmod 0600 "$tmp/export-home/alpha/lunarwing/env/lunarwing.env"
+cat >"$tmp/export-bin/id" <<ID
 #!/usr/bin/env bash
-if [[ "${1:-}" == "-u" ]]; then
-  if [[ $# -eq 1 ]]; then printf '0\n'; else printf '1000\n'; fi
+if [[ "\${1:-}" == "-u" ]]; then
+  if [[ \$# -eq 1 ]]; then printf '0\n'; else printf '%s\n' "$export_fixture_uid"; fi
   exit 0
 fi
-[[ "${1:-}" == "alpha" ]] && exit 0
-exec /usr/bin/id "$@"
+[[ "\${1:-}" == "alpha" ]] && exit 0
+exec /usr/bin/id "\$@"
 ID
 cat >"$tmp/export-bin/getent" <<GETENT
 #!/usr/bin/env bash
-printf 'alpha:x:1000:1000::%s/export-home/alpha:/bin/bash\n' "$tmp"
+printf 'alpha:x:$export_fixture_uid:$export_fixture_gid::%s/export-home/alpha:/bin/bash\n' "$tmp"
 GETENT
 cat >"$tmp/export-bin/docker" <<'DOCKER'
 #!/usr/bin/env bash
@@ -455,6 +482,7 @@ set +e
 missing_output="$(
   PATH="$tmp/export-bin:$PATH" \
   KAWARIMI_TEST_WORK="$tmp" \
+  LUNARWING_MT_ADMIN="$tmp/scripts/lunarwing-mt-admin.sh" \
   KAWARIMI_PASS='' KAWARIMI_PASS_FILE='' KAWARIMI_PASS_FD='' \
   bash "$EXPORT_SRC" alpha --out-dir "$tmp/export-out" </dev/null 2>&1
 )"
@@ -477,10 +505,12 @@ printf 'XMPP_PASSWORD=daemon-password\n' >>"$tmp/export-home/alpha/lunarwing/env
 cat >"$tmp/export-home/alpha/lunarwing/env/xmpp-bridge.env" <<'ENV'
 XMPP_PASSWORD=bridge-password
 ENV
+chmod 0600 "$tmp/export-home/alpha/lunarwing/env/xmpp-bridge.env"
 set +e
 mismatch_output="$(
   PATH="$tmp/export-bin:$PATH" \
   KAWARIMI_TEST_WORK="$tmp" \
+  LUNARWING_MT_ADMIN="$tmp/scripts/lunarwing-mt-admin.sh" \
   KAWARIMI_PASS='valid-export-passphrase' \
   bash "$EXPORT_SRC" alpha --out-dir "$tmp/export-out" </dev/null 2>&1
 )"
@@ -514,6 +544,7 @@ full_export_output="$(
   exec 8<"$tmp/full-passphrase"
   PATH="$tmp/export-bin:$PATH" \
   KAWARIMI_TEST_WORK="$tmp" \
+  LUNARWING_MT_ADMIN="$tmp/scripts/lunarwing-mt-admin.sh" \
   KAWARIMI_PASS_FD=8 \
   bash "$EXPORT_SRC" alpha --out-dir "$tmp/export-out" 2>&1
 )" || {

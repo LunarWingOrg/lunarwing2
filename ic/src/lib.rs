@@ -47,6 +47,7 @@ pub mod channels;
 pub mod cli;
 pub mod config;
 pub mod context;
+pub mod darkirc_key_manager;
 pub mod db;
 pub mod document_extraction;
 pub mod error;
