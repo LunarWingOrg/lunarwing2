@@ -28,6 +28,8 @@ workspace/
 ├── daily/                 <- Daily logs
 │   ├── 2024-01-15.md
 │   └── 2024-01-16.md
+├── lorebooks/             <- SillyTavern-style world info, keyword-triggered into system prompt
+│   └── fantasy.json
 ├── projects/              <- Arbitrary structure
 │   └── alpha/
 │       ├── README.md
@@ -121,6 +123,7 @@ When a workspace has additional read scopes (via `with_additional_read_scopes`),
 | IDENTITY.md | `read_primary()` | Identity is per-user |
 | TOOLS.md | `read_primary()` | Tool config is per-user |
 | BOOTSTRAP.md | `read_primary()` | Onboarding is per-user |
+| lorebooks/*.json | `list_primary()`/`read_primary()` | World lore is agent configuration, per-user |
 | MEMORY.md | `read()` | Shared memory is a feature |
 | daily/*.md | `read()` | Shared daily logs are a feature |
 
