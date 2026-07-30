@@ -385,6 +385,8 @@ Commands:
   start-tenant <name>             Start all services for a tenant
   stop-tenant <name>              Stop all services for a tenant
   restart-tenant <name>           Stop then start
+  start-pg <name>                 Start only the tenant's PostgreSQL (daemon stays down)
+  stop-pg <name>                  Stop only the tenant's PostgreSQL
   start-worker <name> <worker>    Start one enabled external worker
   stop-worker <name> <worker>     Gracefully stop one external worker
   restart-worker <name> <worker>  Restart one external worker
@@ -8498,6 +8500,24 @@ main() {
       require_root
       [[ -n "${1:-}" ]] || die "usage: restart-tenant <name>"
       restart_tenant "$1"
+      ;;
+
+    start-pg)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: start-pg <name>"
+      # PG-only window for offline population (e.g. hermes_kawarimi loader):
+      # daemon stays down while rows are written with nothing racing.
+      _pg_only_name="$(sanitize_name "$1")"
+      tenant_exists_in_registry "$_pg_only_name" || die "tenant '$1' not found in registry"
+      start_tenant_postgres "$_pg_only_name"
+      ;;
+
+    stop-pg)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: stop-pg <name>"
+      _pg_only_name="$(sanitize_name "$1")"
+      tenant_exists_in_registry "$_pg_only_name" || die "tenant '$1' not found in registry"
+      stop_tenant_postgres "$_pg_only_name"
       ;;
 
     start-worker|stop-worker|restart-worker|kill-worker)
