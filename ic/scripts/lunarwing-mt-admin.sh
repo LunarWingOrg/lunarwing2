@@ -234,6 +234,20 @@ tenant_proxy_enabled() {
   [[ "$val" == "true" ]]
 }
 
+# Whether the WeeChat backend/adapter is expected to run for this tenant. Gates
+# the per-tenant health glob (health-openrc.sh / health-systemd.sh): a down
+# weechat unit on a weechat-disabled tenant is `skipped`, never critical, so
+# self-heal does not restart-storm an optional unit that can't come up (the
+# render-units flap footgun; docs/proposals/RENDER_UNITS_SMALL_BUG.md).
+# ABSENT key = true (ON): tenants provisioned before this flag existed keep
+# their current fail-loud behavior; opt out explicitly via disable-weechat.
+tenant_weechat_enabled() {
+  local name="$1"
+  local val
+  val="$(jq -r ".tenants[\"$name\"].enable_weechat // true" "$PORTS_REGISTRY" 2>/dev/null)"
+  [[ "$val" != "false" ]]
+}
+
 # Whether a given external worker (nanocode|pebble|opencode) is selected for this
 # tenant. The selection is persisted at add-tenant into
 # .tenants[<name>].workers.<worker> and gates start_tenant_<worker> — otherwise a
@@ -441,6 +455,14 @@ Commands:
   configure-weechat-relay <name>   Generate WeeChat relay config for a tenant.
                                    Preserves existing config: fails on any
                                    non-empty ~/.config/weechat without modifying it.
+
+  enable-weechat <name>            Mark weechat expected for a tenant: the health
+                                   glob reports a down weechat unit as critical
+                                   and self-heal will remediate it.
+  disable-weechat <name>           Mark weechat intentionally unused for a tenant:
+                                   a down weechat unit is `skipped` (never
+                                   critical, never auto-restarted). Use this to
+                                   stop a half-configured backend from flapping.
 
   patch-env <name>                 Add missing env vars (e.g. ORCHESTRATOR_PORT)
   patch-env-all                    Patch env for all registered tenants
@@ -1539,6 +1561,33 @@ ports_enable_proxy() {
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
   say "proxy for tenant '$name': disabled -> enabled" >&2
+}
+
+# Set the per-tenant WeeChat enablement flag in the registry (bidirectional:
+# true <-> false, unlike the one-directional darkirc/proxy helpers). Written by
+# add-tenant from the relay-bootstrap outcome, set true by a successful
+# configure-weechat-relay, and flipped manually via enable-weechat /
+# disable-weechat. Returns 1 (no die) on failure so a registry hiccup cannot
+# strand a successful relay bootstrap or an in-progress add-tenant.
+ports_set_weechat() {  # <name> <true|false>
+  local name="$1" enabled="$2"
+  require_cmd jq
+  [[ "$enabled" == "true" || "$enabled" == "false" ]] || return 1
+
+  local current
+  current="$(jq -r ".tenants[\"$name\"].enable_weechat // true" "$PORTS_REGISTRY" 2>/dev/null || true)"
+  [[ "$current" == "$enabled" ]] && return 0
+
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  if ! jq --arg name "$name" --argjson enabled "$enabled" '.tenants[$name].enable_weechat = $enabled' \
+      "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "weechat for tenant '$name': $current -> $enabled" >&2
 }
 
 # Mark a single external worker (nanocode|pebble|opencode) enabled for a tenant
@@ -2745,6 +2794,11 @@ configure_weechat_relay() {  # <tenant>
     printf 'error: unable to set WeeChat config ownership: %s\n' "$target_home" >&2
     return 1
   fi
+  # Relay is verifiably configured — mark weechat expected for this tenant so
+  # the health glob treats a down weechat unit as a real outage again
+  # (non-fatal: the config itself already succeeded).
+  ports_set_weechat "$tenant" true || \
+    say "WARNING: could not persist enable_weechat=true for tenant '$tenant' (registry write failed)" >&2
   say "WeeChat relay configured for tenant '$tenant' (port $relay_port, loopback)"
 }
 
@@ -7271,6 +7325,20 @@ add_tenant() {
     say ""
   fi
 
+  # Persist the per-tenant weechat enablement flag from the bootstrap outcome:
+  # only a verified-configured relay marks weechat "expected". An opted-out or
+  # failed bootstrap leaves the backend half-configured and unable to stay up —
+  # flagging it disabled keeps the health glob from reporting it critical and
+  # self-heal from restart-storming it (the render-units flap footgun).
+  # Non-fatal: the tenant itself is already provisioned.
+  if [[ "$weechat_bootstrap_ok" == "configured" ]]; then
+    ports_set_weechat "$name" true || \
+      say "WARNING: could not persist enable_weechat=true for tenant '$name' (registry write failed)" >&2
+  else
+    ports_set_weechat "$name" false || \
+      say "WARNING: could not persist enable_weechat=false for tenant '$name' (registry write failed)" >&2
+  fi
+
   # SSH harness: config.toml [[ssh.hosts]] block + ed25519 key pair.
   # Enabled by default; opt out with --no-ssh or LUNARWING_MT_SSH_ENABLED=false.
   if [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]]; then
@@ -8672,6 +8740,25 @@ main() {
       ports_registry_init
       tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
       configure_weechat_relay "$name"
+      ;;
+
+    enable-weechat|disable-weechat)
+      [[ -n "${1:-}" ]] || die "usage: $command_name <name>"
+      [[ $# -eq 1 ]]   || die "usage: $command_name <name> (unexpected extra arguments)"
+      require_root
+      local name
+      name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+      if [[ "$command_name" == "enable-weechat" ]]; then
+        ports_set_weechat "$name" true || die "failed to set enable_weechat for tenant '$name'"
+        say "weechat enabled for tenant '$name': down weechat units now report critical and self-heal will remediate them."
+        say "If the relay was never configured, run: sudo $0 configure-weechat-relay $name"
+      else
+        ports_set_weechat "$name" false || die "failed to set enable_weechat for tenant '$name'"
+        say "weechat disabled for tenant '$name': down weechat units now report skipped (never critical, never auto-restarted)."
+        say "Rendered unit files are left in place; re-run render-units/start-tenant only if you also want the units pruned."
+      fi
       ;;
 
     patch-env)
