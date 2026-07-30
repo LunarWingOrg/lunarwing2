@@ -35,6 +35,7 @@ ports_get() {
     nanocode_wss) printf '21008\n' ;;
     pebble_wss) printf '21009\n' ;;
     opencode_wss) printf '21010\n' ;;
+    kimi_wss) printf '21011\n' ;;
     *) return 1 ;;
   esac
 }
