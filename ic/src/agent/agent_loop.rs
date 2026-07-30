@@ -830,6 +830,7 @@ impl Agent {
                         self.config.reflex.check_interval,
                         self.config.reflex.min_match_count,
                         self.config.reflex.max_patterns_per_run,
+                        self.config.reflex.max_patterns_per_user,
                     ))
                 } else {
                     tracing::warn!("Reflex compiler enabled but store or builder not available");
