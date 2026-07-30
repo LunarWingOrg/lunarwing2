@@ -115,12 +115,10 @@ impl CoalesceConfig {
             return false;
         }
         let channel = channel.to_lowercase();
-        self.coordination_channels
-            .iter()
-            .any(|c| {
-                let c = c.to_lowercase();
-                channel == c || channel.contains(&c)
-            })
+        self.coordination_channels.iter().any(|c| {
+            let c = c.to_lowercase();
+            channel == c || channel.contains(&c)
+        })
     }
 }
 
@@ -375,11 +373,15 @@ mod tests {
         let buffer = CoalesceBuffer::new(test_config());
         let (flush, sent) = collector();
         assert_eq!(
-            buffer.submit(key(), "STATUS: one".into(), flush.clone()).await,
+            buffer
+                .submit(key(), "STATUS: one".into(), flush.clone())
+                .await,
             CoalesceDecision::Buffered
         );
         assert_eq!(
-            buffer.submit(key(), "STATUS: two".into(), flush.clone()).await,
+            buffer
+                .submit(key(), "STATUS: two".into(), flush.clone())
+                .await,
             CoalesceDecision::Buffered
         );
         // Wait past the window.

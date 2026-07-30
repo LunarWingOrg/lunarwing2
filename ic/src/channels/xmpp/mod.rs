@@ -1170,7 +1170,8 @@ impl Channel for XmppChannel {
                     .or_else(|| msg.thread_id.clone())
                     .unwrap_or_default(),
             );
-            let flush = self.build_coalesce_flush(target_jid.clone(), groupchat, preferred_device_id);
+            let flush =
+                self.build_coalesce_flush(target_jid.clone(), groupchat, preferred_device_id);
             match buffer.submit(key, response.content.clone(), flush).await {
                 crate::channels::coalesce::CoalesceDecision::SendNow(content) => {
                     return self

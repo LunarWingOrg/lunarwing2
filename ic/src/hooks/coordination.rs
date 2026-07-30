@@ -85,8 +85,10 @@ impl Default for CoordinationHookConfig {
 impl CoordinationHookConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
-        let mut config = Self::default();
-        config.enabled = env_flag("COORD_ENABLED");
+        let mut config = Self {
+            enabled: env_flag("COORD_ENABLED"),
+            ..Self::default()
+        };
         if let Ok(v) = std::env::var("COORD_AGENT_ID") {
             config.agent_id = v.trim().to_string();
         }
@@ -321,7 +323,7 @@ fn is_allowlisted_token(token: &str) -> bool {
 }
 
 /// Extract the primary content from inbound/outbound events.
-fn event_content<'a>(event: &'a HookEvent) -> Option<(&'a str, &'a str, &'a str)> {
+fn event_content(event: &HookEvent) -> Option<(&str, &str, &str)> {
     match event {
         HookEvent::Inbound {
             user_id,

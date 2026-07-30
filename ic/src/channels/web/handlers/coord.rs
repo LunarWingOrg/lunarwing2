@@ -195,9 +195,14 @@ mod tests {
     fn test_status_labels() {
         assert_eq!(status_label(&ViolationStatus::Active), "active");
         assert_eq!(status_label(&ViolationStatus::Warning), "warning");
-        assert_eq!(status_label(&ViolationStatus::FinalWarning), "final_warning");
         assert_eq!(
-            status_label(&ViolationStatus::Disabled { until_secs: u64::MAX }),
+            status_label(&ViolationStatus::FinalWarning),
+            "final_warning"
+        );
+        assert_eq!(
+            status_label(&ViolationStatus::Disabled {
+                until_secs: u64::MAX
+            }),
             "disabled_manual"
         );
         assert_eq!(
@@ -253,7 +258,12 @@ mod tests {
             Ok(v) => v,
             Err(err) => panic!("invalid JSON after disable: {err}"),
         };
-        assert!(body["status"].as_str().unwrap_or_default().starts_with("disabled"));
+        assert!(
+            body["status"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("disabled")
+        );
 
         // Clear re-enables.
         let resp = match client
