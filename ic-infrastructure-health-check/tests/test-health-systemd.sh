@@ -70,9 +70,13 @@ EOF
 
 unit_set() { printf '%s\n' "$3" > "$1/units/$2"; }   # <sb> <unit> "<ls> <as> <ss> <nr> <uf>"
 
-run_hs() {  # <sb> <tenant> <user> -> health-systemd.sh JSON on stdout
-    local sb="$1" t="$2" u="$3"
-    jq -n --arg t "$t" --arg u "$u" '{tenants:{($t):{user:$u}}}' > "$sb/ports.json"
+run_hs() {  # <sb> <tenant> <user> [weechat:true|false|absent] -> health-systemd.sh JSON on stdout
+    local sb="$1" t="$2" u="$3" w="${4:-absent}"
+    if [[ "$w" == absent ]]; then
+        jq -n --arg t "$t" --arg u "$u" '{tenants:{($t):{user:$u}}}' > "$sb/ports.json"
+    else
+        jq -n --arg t "$t" --arg u "$u" --argjson w "$w" '{tenants:{($t):{user:$u, enable_weechat:$w}}}' > "$sb/ports.json"
+    fi
     env PATH="$sb/bin:$PATH" HS_UNIT_DIR="$sb/units" \
         LUNARWING_SERVICE_MANAGER=systemd LUNARWING_TENANTS_FILE="$sb/ports.json" \
         bash "$HS" 2>/dev/null
@@ -125,5 +129,48 @@ oD="$(run_hs "$d" acme acme)"
 assert_eq "$(ustat "$oD" xmpp-bridge-acme.service)"     "critical" "D1: auto-restart -> critical"
 assert_eq "$(ustat "$oD" lunarwing-proxy-acme.service)" "degraded" "D2: active w/ restart_count>=3 -> degraded"
 assert_eq "$(oall "$oD")"                               "critical" "D3: overall critical (auto-restart dominates)"
+
+# ── E: weechat-DISABLED tenant (enable_weechat=false) — down weechat -> skipped ──
+# The render-units footgun scenario on systemd: optional weechat user units that
+# cannot start must not read critical (and self-heal must not restart-storm them)
+# once the operator disabled weechat for the tenant.
+echo "=== Section E: weechat-disabled tenant -> down weechat units skipped ==="
+e="$(sb)"; mk_hs_mock "$e"
+unit_set "$e" lunarwing-acme.service                  "loaded active running 0 enabled"
+unit_set "$e" lunarwing-weechat-acme.service          "loaded inactive dead 0 enabled"
+unit_set "$e" lunarwing-weechat-adapter-acme.service  "loaded failed failed 0 enabled"
+unit_set "$e" lunarwing-proxy-acme.service            "loaded inactive dead 0 enabled"
+oE="$(run_hs "$e" acme acme false)"
+assert_eq "$(ustat "$oE" lunarwing-weechat-acme.service)"         "skipped"  "E1: disabled tenant's down weechat -> skipped"
+assert_eq "$(ustat "$oE" lunarwing-weechat-adapter-acme.service)" "skipped"  "E2: disabled tenant's failed weechat-adapter -> skipped (no restart-storm)"
+assert_eq "$(ustat "$oE" lunarwing-proxy-acme.service)"           "critical" "E3: non-weechat down unit still critical (gate is weechat-only)"
+assert_eq "$(oall "$oE")"                                         "critical" "E4: overall critical (driven by proxy, not weechat)"
+
+# ── F: disabled weechat the ONLY thing down -> host healthy; running weechat unaffected ──
+echo "=== Section F: disabled weechat only-down -> healthy; gate inert when enabled ==="
+f="$(sb)"; mk_hs_mock "$f"
+unit_set "$f" lunarwing-acme.service        "loaded active running 0 enabled"
+unit_set "$f" lunarwing-weechat-acme.service "loaded inactive dead 0 enabled"
+oF="$(run_hs "$f" acme acme false)"
+assert_eq "$(ustat "$oF" lunarwing-weechat-acme.service)" "skipped" "F1: down weechat on disabled tenant -> skipped"
+assert_eq "$(oall "$oF")"                               "healthy" "F2: overall healthy — the render-units footgun is closed"
+
+f2="$(sb)"; mk_hs_mock "$f2"
+unit_set "$f2" lunarwing-acme.service        "loaded active running 0 enabled"
+unit_set "$f2" lunarwing-weechat-acme.service "loaded active running 0 enabled"
+oF2="$(run_hs "$f2" acme acme false)"
+assert_eq "$(ustat "$oF2" lunarwing-weechat-acme.service)" "healthy" "F3: running weechat on disabled tenant still classified normally"
+
+f3="$(sb)"; mk_hs_mock "$f3"
+unit_set "$f3" lunarwing-acme.service        "loaded active running 0 enabled"
+unit_set "$f3" lunarwing-weechat-acme.service "loaded inactive dead 0 enabled"
+oF3="$(run_hs "$f3" acme acme true)"
+assert_eq "$(ustat "$oF3" lunarwing-weechat-acme.service)" "critical" "F4: flag true -> down weechat still critical (gate inert)"
+
+f4="$(sb)"; mk_hs_mock "$f4"
+unit_set "$f4" lunarwing-acme.service        "loaded active running 0 enabled"
+unit_set "$f4" lunarwing-weechat-acme.service "loaded inactive dead 0 enabled"
+oF4="$(run_hs "$f4" acme acme)"   # absent flag = pre-gate tenant entry
+assert_eq "$(ustat "$oF4" lunarwing-weechat-acme.service)" "critical" "F5: flag absent -> down weechat still critical (backward compat)"
 
 finish
