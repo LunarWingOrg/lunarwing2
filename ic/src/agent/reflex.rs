@@ -130,6 +130,10 @@ pub struct ReflexRouter {
     fuzzy_hits: Arc<RwLock<HashMap<String, u32>>>,
     /// Similarity threshold for fuzzy matching.
     fuzzy_threshold: f64,
+    /// How many fuzzy matches before a pattern is promoted to exact cache.
+    promotion_threshold: u32,
+    /// Maximum fuzzy candidates to evaluate per route call.
+    max_candidates: usize,
     /// Embedding provider for semantic matching (None = tier disabled).
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     /// Cosine similarity threshold for semantic matching.
@@ -141,10 +145,13 @@ pub struct ReflexRouter {
 impl ReflexRouter {
     /// Create a new empty reflex router with the default threshold.
     pub fn new() -> Self {
+        let fuzzy = FuzzyConfig::default();
         Self {
             patterns: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_hits: Arc::new(RwLock::new(HashMap::new())),
-            fuzzy_threshold: DEFAULT_FUZZY_THRESHOLD,
+            fuzzy_threshold: fuzzy.threshold,
+            promotion_threshold: fuzzy.promotion_threshold,
+            max_candidates: fuzzy.max_candidates,
             embedding_provider: None,
             semantic_threshold: DEFAULT_SEMANTIC_THRESHOLD,
             pattern_embeddings: Arc::new(RwLock::new(HashMap::new())),
@@ -157,6 +164,8 @@ impl ReflexRouter {
             patterns: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_hits: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_threshold: threshold.clamp(0.0, 1.0),
+            promotion_threshold: PROMOTION_THRESHOLD,
+            max_candidates: MAX_FUZZY_CANDIDATES,
             embedding_provider: None,
             semantic_threshold: DEFAULT_SEMANTIC_THRESHOLD,
             pattern_embeddings: Arc::new(RwLock::new(HashMap::new())),
@@ -172,6 +181,14 @@ impl ReflexRouter {
     /// Override the default semantic similarity threshold.
     pub fn with_semantic_threshold(mut self, threshold: f64) -> Self {
         self.semantic_threshold = threshold.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Configure fuzzy matching parameters.
+    pub fn with_fuzzy_config(mut self, config: FuzzyConfig) -> Self {
+        self.fuzzy_threshold = config.threshold.clamp(0.0, 1.0);
+        self.promotion_threshold = config.promotion_threshold;
+        self.max_candidates = config.max_candidates;
         self
     }
 
@@ -259,7 +276,7 @@ impl ReflexRouter {
             }
 
             // Cap the scan to avoid pathological cases
-            if candidates.len() >= MAX_FUZZY_CANDIDATES {
+            if candidates.len() >= self.max_candidates {
                 break;
             }
         }
@@ -343,7 +360,7 @@ impl ReflexRouter {
         let count = hits.entry(normalized_input.to_string()).or_insert(0);
         *count += 1;
 
-        if *count >= PROMOTION_THRESHOLD {
+        if *count >= self.promotion_threshold {
             // Promote: insert this specific input variant into the exact-match cache
             // so subsequent calls are O(1) instead of fuzzy.
             let mut patterns = self.patterns.write().await;
@@ -396,7 +413,7 @@ impl ReflexRouter {
                     score,
                 });
             }
-            if candidates.len() >= MAX_FUZZY_CANDIDATES {
+            if candidates.len() >= self.max_candidates {
                 break;
             }
         }
@@ -606,6 +623,7 @@ impl Default for FuzzyConfig {
 pub struct ReflexCompiler {
     builder: Arc<dyn SoftwareBuilder>,
     store: Arc<dyn Database>,
+    user_id: String,
     check_interval: Duration,
     min_match_count: u32,
     max_patterns_per_run: usize,
@@ -616,6 +634,7 @@ impl ReflexCompiler {
     pub fn new(
         builder: Arc<dyn SoftwareBuilder>,
         store: Arc<dyn Database>,
+        user_id: String,
         check_interval: Duration,
         min_match_count: u32,
         max_patterns_per_run: usize,
@@ -623,6 +642,7 @@ impl ReflexCompiler {
         Self {
             builder,
             store,
+            user_id,
             check_interval,
             min_match_count,
             max_patterns_per_run,
@@ -649,6 +669,7 @@ impl ReflexCompiler {
         match self
             .store
             .find_recurring_job_patterns(
+                &self.user_id,
                 self.min_match_count as i32,
                 self.max_patterns_per_run as i32,
             )
@@ -670,7 +691,7 @@ impl ReflexCompiler {
         let normalized = normalize_pattern(description);
 
         // Check if already compiled
-        match self.store.get_reflex_pattern("default", &normalized).await {
+        match self.store.get_reflex_pattern(&self.user_id, &normalized).await {
             Ok(Some((_, status))) if status == "active" => {
                 tracing::debug!("Reflex pattern already compiled: {}", normalized);
                 return;
@@ -702,7 +723,7 @@ impl ReflexCompiler {
                     );
                     if let Err(e) = self
                         .store
-                        .upsert_reflex_pattern("default", &normalized, description, &safe_name)
+                        .upsert_reflex_pattern(&self.user_id, &normalized, description, &safe_name)
                         .await
                     {
                         tracing::warn!(
@@ -718,6 +739,13 @@ impl ReflexCompiler {
                         description,
                         result.error
                     );
+                    if let Err(e) = self
+                        .store
+                        .increment_reflex_compilation_attempts(&self.user_id, &normalized, 3)
+                        .await
+                    {
+                        tracing::debug!("Failed to increment compilation attempts: {}", e);
+                    }
                 }
             }
             Err(e) => {
@@ -744,6 +772,16 @@ impl Default for EvictionConfig {
         Self {
             check_interval: Duration::from_secs(24 * 60 * 60), // daily
             stale_after_days: 30,
+        }
+    }
+}
+
+impl EvictionConfig {
+    /// Create an `EvictionConfig` from reflex config values.
+    pub fn new(check_interval: Duration, stale_after_days: i32) -> Self {
+        Self {
+            check_interval,
+            stale_after_days,
         }
     }
 }
@@ -817,6 +855,7 @@ impl ReflexEvictor {
 pub fn spawn_reflex_compiler(
     builder: Arc<dyn SoftwareBuilder>,
     store: Arc<dyn Database>,
+    user_id: String,
     check_interval: Duration,
     min_match_count: u32,
     max_patterns_per_run: usize,
@@ -825,6 +864,7 @@ pub fn spawn_reflex_compiler(
         let compiler = ReflexCompiler::new(
             builder,
             store,
+            user_id,
             check_interval,
             min_match_count,
             max_patterns_per_run,

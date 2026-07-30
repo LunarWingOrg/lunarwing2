@@ -74,6 +74,7 @@ const SELECT_COLS: &str = "id, user_id, normalized_pattern, original_pattern, to
 impl ReflexStore for LibSqlBackend {
     async fn find_recurring_job_patterns(
         &self,
+        user_id: &str,
         min_count: i32,
         limit: i32,
     ) -> Result<Vec<String>, DatabaseError> {
@@ -82,13 +83,13 @@ impl ReflexStore for LibSqlBackend {
             .query(
                 r#"
                 SELECT description FROM agent_jobs
-                WHERE status = 'completed' AND success = 1
+                WHERE status = 'completed' AND success = 1 AND user_id = ?1
                 GROUP BY description
-                HAVING COUNT(*) >= ?1
+                HAVING COUNT(*) >= ?2
                 ORDER BY COUNT(*) DESC
-                LIMIT ?2
+                LIMIT ?3
                 "#,
-                params![min_count as i64, limit as i64],
+                params![user_id, min_count as i64, limit as i64],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -212,6 +213,32 @@ impl ReflexStore for LibSqlBackend {
                 WHERE user_id = ?1 AND normalized_pattern = ?2
                 "#,
             params![user_id, normalized_pattern, now],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn increment_reflex_compilation_attempts(
+        &self,
+        user_id: &str,
+        normalized_pattern: &str,
+        max_attempts: i32,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let now = fmt_ts(&Utc::now());
+        conn.execute(
+            r#"
+                UPDATE reflex_patterns
+                SET compilation_attempts = compilation_attempts + 1,
+                    updated_at = ?3,
+                    status = CASE
+                        WHEN compilation_attempts + 1 >= ?4 THEN 'disabled'
+                        ELSE status
+                    END
+                WHERE user_id = ?1 AND normalized_pattern = ?2
+                "#,
+            params![user_id, normalized_pattern, now, max_attempts as i64],
         )
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?;
