@@ -1,0 +1,14 @@
+# Environment
+.env
+
+# Node
+scripts/node_modules/
+scripts/package-lock.json
+
+# tsc build output (compiled in-image by the Dockerfile; local builds
+# emit .js next to the .ts sources)
+scripts/*.js
+
+# Volumes
+workspace/*
+!workspace/.gitkeep
