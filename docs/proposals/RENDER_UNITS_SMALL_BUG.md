@@ -1,6 +1,23 @@
 # Explanation
 
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** The `render-units`
+> **Current status (2026-07-30, branch `aj/kimi-2-20260730-0301`): FIXED (option 1).**
+> The optional-WeeChat footgun is closed by a per-tenant health-glob gate:
+> `.tenants[<name>].enable_weechat` in the ports registry (absent = true,
+> preserving legacy fail-loud behavior) now gates weechat classification in
+> `ic-infrastructure-health-check/health-openrc.sh` and `health-systemd.sh` —
+> a non-active `lunarwing-weechat(-adapter)-<t>` unit on a weechat-disabled
+> tenant reports `skipped` (never critical; self-heal already honours
+> `skipped`, so no restart-storm flap). mt-admin persists the flag from the
+> add-tenant relay-bootstrap outcome, sets it true on successful
+> `configure-weechat-relay`, and exposes manual `enable-weechat` /
+> `disable-weechat` verbs. Re-running `render-units` on a half-configured
+> tenant no longer creates criticals once the tenant is flagged (and fresh
+> `--no-weechat-bootstrap` / failed-bootstrap tenants are flagged at
+> provision time). Option 2 (generator-side pruning of rendered units) and
+> option 3 (the tmux duplicate-session start failure itself) remain open
+> follow-ups; the rendered units are intentionally left in place.
+
+> **Former status (2026-07-20, rev `50c8f99`): PARTIAL.** The `render-units`
 > verb and PostgreSQL readiness fix landed. The optional-WeeChat footgun surfaced
 > here remains open: backend units are still rendered without a tenant-level
 > enablement gate and can be classified unhealthy when intentionally unused.
