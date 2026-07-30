@@ -1242,6 +1242,7 @@ impl IdentityStore for PgBackend {
 impl ReflexStore for PgBackend {
     async fn find_recurring_job_patterns(
         &self,
+        user_id: &str,
         min_count: i32,
         limit: i32,
     ) -> Result<Vec<String>, DatabaseError> {
@@ -1249,12 +1250,12 @@ impl ReflexStore for PgBackend {
         let rows = conn
             .query(
                 "SELECT description FROM agent_jobs \
-                 WHERE status = 'completed' AND success = true \
+                 WHERE status = 'completed' AND success = true AND user_id = $1 \
                  GROUP BY description \
-                 HAVING COUNT(*) >= $1 \
+                 HAVING COUNT(*) >= $2 \
                  ORDER BY COUNT(*) DESC \
-                 LIMIT $2",
-                &[&min_count, &limit],
+                 LIMIT $3",
+                &[&user_id, &min_count, &limit],
             )
             .await?;
         Ok(rows
@@ -1351,6 +1352,28 @@ impl ReflexStore for PgBackend {
         Ok(())
     }
 
+    async fn increment_reflex_compilation_attempts(
+        &self,
+        user_id: &str,
+        normalized_pattern: &str,
+        max_attempts: i32,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.pool().get().await?;
+        conn.execute(
+            "UPDATE reflex_patterns
+             SET compilation_attempts = compilation_attempts + 1,
+                 updated_at = NOW(),
+                 status = CASE
+                     WHEN compilation_attempts + 1 >= $3 THEN 'disabled'
+                     ELSE status
+                 END
+             WHERE user_id = $1 AND normalized_pattern = $2",
+            &[&user_id, &normalized_pattern, &max_attempts],
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn prune_stale_reflex_patterns(
         &self,
         stale_after_days: i32,
@@ -1387,7 +1410,8 @@ impl ReflexStore for PgBackend {
             let rows = conn
                 .query(
                     "SELECT id, user_id, normalized_pattern, original_pattern, tool_name, \
-                     match_count, last_matched_at, created_at, updated_at, status, compilation_attempts \
+                     match_count, last_matched_at, created_at, updated_at, status, compilation_attempts, \
+                     embedding, embedding_model \
                      FROM reflex_patterns \
                      WHERE id = ANY($1) \
                      ORDER BY COALESCE(last_matched_at, created_at) ASC",

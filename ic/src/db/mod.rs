@@ -733,10 +733,11 @@ pub trait SettingsStore: Send + Sync {
 
 #[async_trait]
 pub trait ReflexStore: Send + Sync {
-    /// Find job descriptions that appear at least `min_count` times.
+    /// Find job descriptions that appear at least `min_count` times for a given user.
     /// Returns up to `limit` recurring patterns.
     async fn find_recurring_job_patterns(
         &self,
+        user_id: &str,
         min_count: i32,
         limit: i32,
     ) -> Result<Vec<String>, DatabaseError>;
@@ -771,6 +772,17 @@ pub trait ReflexStore: Send + Sync {
         &self,
         user_id: &str,
         normalized_pattern: &str,
+    ) -> Result<(), DatabaseError>;
+
+    /// Increment `compilation_attempts` for a reflex pattern.
+    ///
+    /// If the count reaches `max_attempts`, the pattern is disabled
+    /// (status set to `'disabled'`) so the compiler stops retrying it.
+    async fn increment_reflex_compilation_attempts(
+        &self,
+        user_id: &str,
+        normalized_pattern: &str,
+        max_attempts: i32,
     ) -> Result<(), DatabaseError>;
 
     /// Prune (auto-disable) reflex patterns that haven't been matched
