@@ -409,7 +409,13 @@ async fn list_servers(
                 EffectiveTransport::Http => {
                     println!("      URL: {}", server.url);
                 }
-                EffectiveTransport::Stdio { command, args, env } => {
+                EffectiveTransport::Stdio {
+                    command,
+                    args,
+                    env,
+                    env_secrets,
+                    auto_install,
+                } => {
                     println!("      Command: {}", command);
                     if !args.is_empty() {
                         println!("      Args: {}", args.join(", "));
@@ -418,6 +424,21 @@ async fn list_servers(
                         // Only print env var names, not values (may contain secrets).
                         let env_keys: Vec<&str> = env.keys().map(|k| k.as_str()).collect();
                         println!("      Env: {}", env_keys.join(", "));
+                    }
+                    if !env_secrets.is_empty() {
+                        // Print the env var -> secret name mapping only, never values.
+                        let mut mappings: Vec<String> = env_secrets
+                            .iter()
+                            .map(|(var, secret)| format!("{var} <- {secret}"))
+                            .collect();
+                        mappings.sort();
+                        println!("      Env secrets: {}", mappings.join(", "));
+                    }
+                    if let Some(install) = auto_install {
+                        println!(
+                            "      Auto-install: {:?} package '{}'",
+                            install.manager, install.package
+                        );
                     }
                 }
                 EffectiveTransport::Unix { socket_path } => {

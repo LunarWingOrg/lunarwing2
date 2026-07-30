@@ -29,6 +29,30 @@ const STUDY_NOTES_MANAGED_DESCRIPTION_PREFIX: &str = "Managed Study Notes MCP";
 const LEGACY_STUDY_NOTES_DESCRIPTION: &str =
     "Shared read-only LunarWing codebase study notes (managed by LW2STUDYMCP_HOME)";
 
+/// Package manager used for opt-in automatic installation of a stdio MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpPackageManager {
+    /// Node.js packages installed via `npm install -g <package>`.
+    Npm,
+    /// Python packages installed via `pip install --user <package>`.
+    Pip,
+}
+
+/// Opt-in automatic package installation for a stdio MCP server.
+///
+/// When present, the factory checks whether the configured `command` resolves
+/// on `PATH` before spawning; if it does not, the named package is installed
+/// once using the selected package manager. Installation is explicit per
+/// server — it never happens implicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpAutoInstall {
+    /// Package manager used to perform the install.
+    pub manager: McpPackageManager,
+    /// Package name passed to the package manager (e.g. `@modelcontextprotocol/server-filesystem`).
+    pub package: String,
+}
+
 /// Transport configuration for an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "lowercase")]
@@ -42,6 +66,19 @@ pub enum McpTransportConfig {
         args: Vec<String>,
         #[serde(default)]
         env: HashMap<String, String>,
+        /// Environment variables injected from the secrets store at spawn time.
+        ///
+        /// Maps an environment variable name to the name of a secret in the
+        /// owner's `SecretsStore`. Values are decrypted at spawn time and are
+        /// never persisted in this configuration or logged. Spawn fails
+        /// closed if a named secret is missing or no secrets store is
+        /// available.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        env_secrets: HashMap<String, String>,
+        /// Opt-in automatic installation of the server package when the
+        /// configured `command` is not found on `PATH`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_install: Option<McpAutoInstall>,
     },
     /// Unix domain socket transport.
     Unix { socket_path: String },
@@ -114,6 +151,8 @@ impl McpServerConfig {
                 command: command.into(),
                 args,
                 env,
+                env_secrets: HashMap::new(),
+                auto_install: None,
             }),
             headers: HashMap::new(),
             oauth: None,
@@ -170,9 +209,19 @@ impl McpServerConfig {
     pub fn effective_transport(&self) -> EffectiveTransport<'_> {
         match &self.transport {
             Some(McpTransportConfig::Http) | None => EffectiveTransport::Http,
-            Some(McpTransportConfig::Stdio { command, args, env }) => {
-                EffectiveTransport::Stdio { command, args, env }
-            }
+            Some(McpTransportConfig::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+                auto_install,
+            }) => EffectiveTransport::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+                auto_install: auto_install.as_ref(),
+            },
             Some(McpTransportConfig::Unix { socket_path }) => {
                 EffectiveTransport::Unix { socket_path }
             }
@@ -203,7 +252,13 @@ impl McpServerConfig {
                     });
                 }
             }
-            EffectiveTransport::Stdio { command, args, env } => {
+            EffectiveTransport::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+                auto_install,
+            } => {
                 if command.is_empty() {
                     return Err(ConfigError::InvalidConfig {
                         reason: "Stdio transport command cannot be empty".to_string(),
@@ -215,11 +270,7 @@ impl McpServerConfig {
                     });
                 }
                 for (name, value) in env {
-                    if name.is_empty() || name.contains(['=', '\0']) {
-                        return Err(ConfigError::InvalidConfig {
-                            reason: format!("Invalid stdio environment variable name '{name}'"),
-                        });
-                    }
+                    validate_env_var_name(name)?;
                     if value.contains('\0') {
                         return Err(ConfigError::InvalidConfig {
                             reason: format!(
@@ -227,6 +278,19 @@ impl McpServerConfig {
                             ),
                         });
                     }
+                }
+                for (name, secret_name) in env_secrets {
+                    validate_env_var_name(name)?;
+                    if secret_name.is_empty() || secret_name.contains('\0') {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!(
+                                "Invalid secret name for stdio environment variable '{name}'"
+                            ),
+                        });
+                    }
+                }
+                if let Some(install) = auto_install {
+                    validate_auto_install_package(install)?;
                 }
             }
             EffectiveTransport::Unix { socket_path } => {
@@ -1159,6 +1223,73 @@ pub(crate) fn is_localhost_url(url: &str) -> bool {
     }
 }
 
+/// Validate an environment variable name for stdio transports.
+fn validate_env_var_name(name: &str) -> Result<(), ConfigError> {
+    if name.is_empty() || name.contains(['=', '\0']) {
+        return Err(ConfigError::InvalidConfig {
+            reason: format!("Invalid stdio environment variable name '{name}'"),
+        });
+    }
+    Ok(())
+}
+
+/// Validate an opt-in auto-install package spec.
+///
+/// Installers are spawned with argument arrays (no shell), so the primary
+/// risks are option injection (leading `-`) and unexpected characters. The
+/// allowed character sets are deliberately conservative.
+fn validate_auto_install_package(install: &McpAutoInstall) -> Result<(), ConfigError> {
+    let package = install.package.trim();
+    let reject = |reason: String| Err(ConfigError::InvalidConfig { reason });
+
+    if package.is_empty() {
+        return reject("Auto-install package name cannot be empty".to_string());
+    }
+    if package.starts_with('-') {
+        return reject(format!(
+            "Auto-install package '{package}' cannot start with '-' (option injection)"
+        ));
+    }
+    if package != install.package || package.chars().any(char::is_whitespace) {
+        return reject(format!(
+            "Auto-install package '{}' cannot contain whitespace",
+            install.package
+        ));
+    }
+    if package.contains("..") {
+        return reject(format!(
+            "Auto-install package '{package}' cannot contain '..'"
+        ));
+    }
+
+    let valid = match install.manager {
+        // npm: [@scope/]name[@version] — see npm package-spec rules (len cap 214).
+        McpPackageManager::Npm => {
+            package.len() <= 214
+                && !package.starts_with('.')
+                && package
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '/' | '.' | '_' | '~' | '-'))
+        }
+        // pip: name[==version] with conservative PEP 508-ish charset.
+        McpPackageManager::Pip => {
+            package.len() <= 214
+                && !package.starts_with('.')
+                && package
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '=' | '[' | ']' | ',' | '+' | '!'))
+        }
+    };
+
+    if !valid {
+        return reject(format!(
+            "Auto-install package '{package}' contains characters that are not allowed for {:?}",
+            install.manager
+        ));
+    }
+    Ok(())
+}
+
 /// Resolved transport type (borrows from config).
 #[derive(Debug)]
 pub enum EffectiveTransport<'a> {
@@ -1167,6 +1298,8 @@ pub enum EffectiveTransport<'a> {
         command: &'a str,
         args: &'a [String],
         env: &'a HashMap<String, String>,
+        env_secrets: &'a HashMap<String, String>,
+        auto_install: Option<&'a McpAutoInstall>,
     },
     Unix {
         socket_path: &'a str,
@@ -1267,7 +1400,9 @@ mod tests {
         assert!(config.enabled);
         assert!(config.always_require_approval.is_empty());
         match config.effective_transport() {
-            EffectiveTransport::Stdio { command, args, env } => {
+            EffectiveTransport::Stdio {
+                command, args, env, ..
+            } => {
                 assert_eq!(command, "python3");
                 assert!(args.iter().any(|arg| arg.ends_with("study_notes_mcp.py")));
                 assert!(args.iter().any(|arg| arg.ends_with("agent-notes.sqlite3")));
@@ -1567,6 +1702,7 @@ mod tests {
                 command,
                 args,
                 env: e,
+                ..
             }) => {
                 assert_eq!(command, "npx");
                 assert_eq!(
@@ -1633,6 +1769,166 @@ mod tests {
             HashMap::from([("GOOD_NAME".to_string(), "bad\0value".to_string())]),
         );
         assert!(invalid_value.validate().is_err());
+    }
+
+    fn stdio_transport_with_extras(
+        env_secrets: HashMap<String, String>,
+        auto_install: Option<McpAutoInstall>,
+    ) -> McpServerConfig {
+        let mut config = McpServerConfig::new_stdio("server", "npx", vec![], HashMap::new());
+        if let Some(McpTransportConfig::Stdio {
+            env_secrets: es,
+            auto_install: ai,
+            ..
+        }) = &mut config.transport
+        {
+            *es = env_secrets;
+            *ai = auto_install;
+        }
+        config
+    }
+
+    #[test]
+    fn test_stdio_env_secrets_validation() {
+        // Valid: well-formed env var -> secret name mapping
+        let config = stdio_transport_with_extras(
+            HashMap::from([("GITHUB_TOKEN".to_string(), "github_token".to_string())]),
+            None,
+        );
+        assert!(config.validate().is_ok());
+
+        // Invalid: bad env var name
+        let config = stdio_transport_with_extras(
+            HashMap::from([("BAD=NAME".to_string(), "github_token".to_string())]),
+            None,
+        );
+        assert!(config.validate().is_err());
+
+        // Invalid: empty secret name
+        let config = stdio_transport_with_extras(
+            HashMap::from([("GITHUB_TOKEN".to_string(), String::new())]),
+            None,
+        );
+        assert!(config.validate().is_err());
+
+        // Invalid: NUL in secret name
+        let config = stdio_transport_with_extras(
+            HashMap::from([("GITHUB_TOKEN".to_string(), "bad\0secret".to_string())]),
+            None,
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_stdio_auto_install_validation() {
+        // Valid npm specs
+        for package in [
+            "server-filesystem",
+            "@modelcontextprotocol/server-filesystem",
+            "@scope/pkg@1.2.3",
+        ] {
+            let config = stdio_transport_with_extras(
+                HashMap::new(),
+                Some(McpAutoInstall {
+                    manager: McpPackageManager::Npm,
+                    package: package.to_string(),
+                }),
+            );
+            assert!(config.validate().is_ok(), "npm package '{package}'");
+        }
+
+        // Valid pip specs
+        for package in ["mcp-server", "mcp[cli]", "mcp==1.2.3"] {
+            let config = stdio_transport_with_extras(
+                HashMap::new(),
+                Some(McpAutoInstall {
+                    manager: McpPackageManager::Pip,
+                    package: package.to_string(),
+                }),
+            );
+            assert!(config.validate().is_ok(), "pip package '{package}'");
+        }
+
+        // Invalid specs for both managers
+        for manager in [McpPackageManager::Npm, McpPackageManager::Pip] {
+            for package in [
+                "",
+                "-g",
+                "--evil",
+                "pkg; rm -rf /",
+                "pkg && curl evil.sh",
+                "pkg name",
+                "../escape",
+                ".hidden",
+            ] {
+                let config = stdio_transport_with_extras(
+                    HashMap::new(),
+                    Some(McpAutoInstall {
+                        manager,
+                        package: package.to_string(),
+                    }),
+                );
+                assert!(
+                    config.validate().is_err(),
+                    "{manager:?} package '{package}' must be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_stdio_transport_backward_compat_without_new_fields() {
+        // Configs written before env_secrets/auto_install existed must still load.
+        let json = r#"{
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "server"],
+            "env": {"KEY": "val"}
+        }"#;
+        let parsed: McpTransportConfig = serde_json::from_str(json).unwrap();
+        match parsed {
+            McpTransportConfig::Stdio {
+                env_secrets,
+                auto_install,
+                ..
+            } => {
+                assert!(env_secrets.is_empty());
+                assert!(auto_install.is_none());
+            }
+            other => panic!("Expected Stdio, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stdio_transport_serde_roundtrip_with_extras() {
+        let transport = McpTransportConfig::Stdio {
+            command: "npx".to_string(),
+            args: vec!["-y".to_string(), "server".to_string()],
+            env: HashMap::new(),
+            env_secrets: HashMap::from([("API_KEY".to_string(), "api_key".to_string())]),
+            auto_install: Some(McpAutoInstall {
+                manager: McpPackageManager::Npm,
+                package: "@scope/server".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&transport).unwrap();
+        assert!(json.contains("\"env_secrets\""));
+        assert!(json.contains("\"auto_install\""));
+
+        let parsed: McpTransportConfig = serde_json::from_str(&json).unwrap();
+        match parsed {
+            McpTransportConfig::Stdio {
+                env_secrets,
+                auto_install,
+                ..
+            } => {
+                assert_eq!(env_secrets.get("API_KEY").unwrap(), "api_key");
+                let install = auto_install.expect("auto_install must roundtrip");
+                assert_eq!(install.manager, McpPackageManager::Npm);
+                assert_eq!(install.package, "@scope/server");
+            }
+            other => panic!("Expected Stdio, got {:?}", other),
+        }
     }
 
     #[test]
@@ -1815,6 +2111,8 @@ mod tests {
             command: "npx".to_string(),
             args: vec!["-y".to_string(), "server".to_string()],
             env: HashMap::from([("KEY".to_string(), "val".to_string())]),
+            env_secrets: HashMap::new(),
+            auto_install: None,
         };
         let json = serde_json::to_string(&transport).unwrap();
         assert!(json.contains("\"transport\":\"stdio\""));
@@ -1822,7 +2120,9 @@ mod tests {
 
         let parsed: McpTransportConfig = serde_json::from_str(&json).unwrap();
         match parsed {
-            McpTransportConfig::Stdio { command, args, env } => {
+            McpTransportConfig::Stdio {
+                command, args, env, ..
+            } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args, vec!["-y".to_string(), "server".to_string()]);
                 assert_eq!(env.get("KEY").unwrap(), "val");
@@ -1888,7 +2188,9 @@ mod tests {
         assert_eq!(parsed.description.as_deref(), Some("A test server"));
 
         match &parsed.transport {
-            Some(McpTransportConfig::Stdio { command, args, env }) => {
+            Some(McpTransportConfig::Stdio {
+                command, args, env, ..
+            }) => {
                 assert_eq!(command, "node");
                 assert_eq!(args, &["server.js".to_string()]);
                 assert_eq!(env.get("NODE_ENV").unwrap(), "production");

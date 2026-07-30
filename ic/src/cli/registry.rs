@@ -528,7 +528,9 @@ mod tests {
             Some("Read files from an approved local directory")
         );
         match config.effective_transport() {
-            EffectiveTransport::Stdio { command, args, env } => {
+            EffectiveTransport::Stdio {
+                command, args, env, ..
+            } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args.last().map(String::as_str), Some("/srv/data"));
                 assert_eq!(env.get("LOG_LEVEL").map(String::as_str), Some("warn"));
