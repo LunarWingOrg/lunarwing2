@@ -112,7 +112,7 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
   # (each bounded per-probe) must not consume the whole window and blank the
   # component. Past the deadline we stop probing and emit a partial report.
   _deadline=24
-  while IFS=$'\t' read -r tname tuser; do
+  while IFS=$'\t' read -r tname tuser tweechat; do
     [ "$SECONDS" -lt "$_deadline" ] || break
     [ -n "$tname" ] && [ -n "$tuser" ] || continue
     tuid=$(id -u "$tuser" 2>/dev/null || echo "")
@@ -143,6 +143,24 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
       uactive=${_uf[1]:-unknown}; usub=${_uf[2]:-unknown}; urestarts=${_uf[3]:-0}
       [[ "$urestarts" =~ ^[0-9]+$ ]] || urestarts=0
       ustatus="healthy"; uexit=0
+      # Per-tenant WeeChat health-gate (RENDER_UNITS_SMALL_BUG follow-up): on a
+      # weechat-DISABLED tenant (enable_weechat=false in the registry) a
+      # not-running optional weechat backend/adapter unit is the expected
+      # state, not an outage — report `skipped` so the host stays healthy and
+      # self-heal never restart-storms a unit that cannot come up. A RUNNING
+      # weechat unit still falls through to normal classification below.
+      if [ "$tweechat" = "false" ]; then
+        case "$tunit" in
+          lunarwing-weechat-*|weechat-*)
+            case "$uactive" in
+              active) ;;  # running anyway: keep normal classification
+              *)
+                unit_results+=("$(unit_json "$tunit" "$uactive" "$usub" "$urestarts" \
+                  "$(jq -n --arg u "$tuser" '{tenant_user:$u, weechat_enabled:false}')" "skipped")")
+                continue ;;
+            esac ;;
+        esac
+      fi
       case "$uactive/$usub" in
         active/*)
           if [ "$urestarts" -ge 3 ]; then
@@ -193,7 +211,8 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
       unit_results+=("$(unit_json "$tunit" "$uactive" "$usub" "$urestarts" \
         "$(jq -n --arg u "$tuser" --arg h "$uhealth" '{tenant_user:$u} + (if $h=="" then {} else {container_health:$h} end)')" "$ustatus")")
     done
-  done < <(jq -r '.tenants // {} | to_entries[] | "\(.key)\t\(.value.user)"' "$TENANTS_FILE" 2>/dev/null || true)
+  # enable_weechat: explicit ==false test (jq `//` treats false as empty).
+  done < <(jq -r '.tenants // {} | to_entries[] | "\(.key)\t\(.value.user)\t\(if .value.enable_weechat == false then "false" else "true" end)"' "$TENANTS_FILE" 2>/dev/null || true)
 fi
 
 issues_json="[]"

@@ -88,6 +88,14 @@ probe_status() {
 # can point at a fake runlevels tree without touching the host.
 RUNLEVELS_DIR="${RUNLEVELS_DIR:-/etc/runlevels}"
 
+# Multi-tenant registry (lunarwing-mt-admin.sh ports.json). Used ONLY for the
+# per-tenant WeeChat health-gate: tenants with `enable_weechat: false` get their
+# optional weechat units classified `skipped` when down (never critical), so
+# self-heal does not restart-storm an intentionally unused backend. Same env
+# override chain as health-systemd.sh. Absent/unreadable file => gate inert
+# (fail safe: every tenant counts as weechat-enabled, nothing is masked).
+TENANTS_FILE="${SELF_HEAL_TENANTS_FILE:-${LUNARWING_TENANTS_FILE:-/etc/lunarwing/ports.json}}"
+
 # Extract the tenant name from a unit, or "" for single-instance / non-tenant
 # units. Known per-service roles are stripped so every unit maps to its tenant:
 #   lunarwing-acme -> acme   lunarwing-proxy-acme -> acme
@@ -137,6 +145,30 @@ tenant_started() {
   return 1
 }
 
+# Per-tenant WeeChat health-gate (RENDER_UNITS_SMALL_BUG follow-up). The
+# lunarwing-weechat-<t> / lunarwing-weechat-adapter-<t> units are OPTIONAL and
+# match the lunarwing-* discovery glob, so an intentionally unused weechat
+# backend that cannot start would otherwise read critical and self-heal would
+# restart-storm it (flap). `mt-admin disable-weechat <tenant>` records
+# enable_weechat=false in the registry; down weechat units for such a tenant
+# are then classified `skipped` (self-heal honours `skipped`).
+# Fail safe everywhere: non-weechat unit, empty tenant, missing jq, or an
+# unreadable registry all return 1 (NOT disabled => normal classification).
+weechat_unit_disabled() {
+  local svc="$1" tenant
+  case "$svc" in
+    lunarwing-weechat-*) ;;   # glob covers both backend and -adapter roles
+    *) return 1 ;;
+  esac
+  tenant="$(unit_tenant "$svc")"
+  [ -n "$tenant" ] || return 1
+  [ -r "$TENANTS_FILE" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  # NOTE: jq's `//` treats false as empty, so the explicit `== false` test is
+  # required — `.enable_weechat // true` would read a disabled tenant as enabled.
+  [ "$(jq -r --arg t "$tenant" 'if .tenants[$t].enable_weechat == false then "false" else "true" end' "$TENANTS_FILE" 2>/dev/null)" = "false" ]
+}
+
 for svc in "${SERVICES_ARR[@]}"; do
   # Init script must exist.
   if ! rc-service --exists "$svc" >/dev/null 2>&1; then
@@ -173,7 +205,13 @@ for svc in "${SERVICES_ARR[@]}"; do
 
   case "$state" in
     stopped|crashed)
-      if tenant_started "$(unit_tenant "$svc")"; then
+      if weechat_unit_disabled "$svc"; then
+        # Optional WeeChat unit on a weechat-DISABLED tenant: down is the
+        # expected state, not an outage. `skipped` keeps the host report
+        # healthy and self-heal away (no restart-storm of a unit that cannot
+        # come up). Applies whether or not the tenant is started.
+        local_status="skipped"; local_exit=0
+      elif tenant_started "$(unit_tenant "$svc")"; then
         local_status="critical"; local_exit=2
         issues+=("$svc not running: $state")
       else
