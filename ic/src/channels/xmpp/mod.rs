@@ -182,7 +182,9 @@ pub struct XmppChannel {
     encrypted_room_states: Arc<RwLock<HashMap<String, EncryptedRoomState>>>,
     /// Sender half for outbound stanzas.
     outbound_tx: mpsc::Sender<OutboundMessage>,
-    outbound_rate_limiter: tokio::sync::Mutex<OutboundRateLimiter>,
+    outbound_rate_limiter: Arc<tokio::sync::Mutex<OutboundRateLimiter>>,
+    /// Phase 4 coalesce buffer for coordination channels (`None` when disabled).
+    coalesce: Option<crate::channels::coalesce::CoalesceBuffer>,
     /// Receiver half taken by `start()` on the first call.
     outbound_rx: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<OutboundMessage>>>>,
     /// Cached JID of the discovered XEP-0363 HTTP upload service (per-server,
@@ -205,8 +207,13 @@ impl XmppChannel {
                 reason: "reply target cache capacity must be non-zero".into(),
             })?;
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(64);
-        let outbound_rate_limiter =
-            tokio::sync::Mutex::new(OutboundRateLimiter::new(config.max_messages_per_hour));
+        let outbound_rate_limiter = Arc::new(tokio::sync::Mutex::new(OutboundRateLimiter::new(
+            config.max_messages_per_hour,
+        )));
+        let coalesce_config = crate::channels::coalesce::CoalesceConfig::from_env();
+        let coalesce = (coalesce_config.enabled
+            && !coalesce_config.coordination_channels.is_empty())
+        .then(|| crate::channels::coalesce::CoalesceBuffer::new(coalesce_config));
 
         Ok(Self {
             config,
@@ -216,6 +223,7 @@ impl XmppChannel {
             encrypted_room_states: Arc::new(RwLock::new(HashMap::new())),
             outbound_tx,
             outbound_rate_limiter,
+            coalesce,
             outbound_rx: Arc::new(tokio::sync::Mutex::new(Some(outbound_rx))),
             http_upload_service: Arc::new(RwLock::new(None)),
         })
@@ -283,6 +291,49 @@ impl XmppChannel {
                 name: "xmpp".into(),
                 reason: "outbound channel closed (client task exited)".into(),
             })
+    }
+
+    /// Flush callback for the coalesce buffer: applies the same hourly rate
+    /// limit as `queue_outbound`, then enqueues the merged message.
+    fn build_coalesce_flush(
+        &self,
+        target_jid: String,
+        groupchat: bool,
+        preferred_device_id: Option<u32>,
+    ) -> crate::channels::coalesce::FlushFn {
+        let tx = self.outbound_tx.clone();
+        let limiter = Arc::clone(&self.outbound_rate_limiter);
+        Arc::new(move |content| {
+            let tx = tx.clone();
+            let limiter = Arc::clone(&limiter);
+            let jid = target_jid.clone();
+            Box::pin(async move {
+                if let Err(active_limit) = limiter.lock().await.try_acquire() {
+                    tracing::warn!(
+                        to = %jid,
+                        limit_per_hour = active_limit,
+                        "XMPP coalesced message dropped by hourly rate limit"
+                    );
+                    return;
+                }
+                if let Err(err) = tx
+                    .send(OutboundMessage {
+                        to: jid.clone(),
+                        body: content,
+                        groupchat,
+                        preferred_device_id,
+                        attachments: Vec::new(),
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        to = %jid,
+                        error = %err,
+                        "XMPP coalesced flush failed to queue"
+                    );
+                }
+            })
+        })
     }
 
     /// Send a proactive message with file attachments to a target JID.
@@ -1106,11 +1157,35 @@ impl Channel for XmppChannel {
             reason: format!("no routing target for message {}", msg.id),
         })?;
 
+        let groupchat = metadata_is_groupchat(&msg.metadata);
+        let preferred_device_id = xmpp_sender_device_id_from_metadata(&msg.metadata);
+
+        // Phase 4: coalesce rapid-fire messages on coordination channels.
+        if let Some(buffer) = &self.coalesce {
+            let key = crate::channels::coalesce::ChannelKey::new(
+                bare_jid(&self.config.jid),
+                target_jid.clone(),
+                msg.conversation_scope_id
+                    .clone()
+                    .or_else(|| msg.thread_id.clone())
+                    .unwrap_or_default(),
+            );
+            let flush = self.build_coalesce_flush(target_jid.clone(), groupchat, preferred_device_id);
+            match buffer.submit(key, response.content.clone(), flush).await {
+                crate::channels::coalesce::CoalesceDecision::SendNow(content) => {
+                    return self
+                        .queue_outbound(target_jid, content, groupchat, preferred_device_id)
+                        .await;
+                }
+                crate::channels::coalesce::CoalesceDecision::Buffered => return Ok(()),
+            }
+        }
+
         self.queue_outbound(
             target_jid,
             response.content.clone(),
-            metadata_is_groupchat(&msg.metadata),
-            xmpp_sender_device_id_from_metadata(&msg.metadata),
+            groupchat,
+            preferred_device_id,
         )
         .await
     }
@@ -1244,6 +1319,14 @@ impl Channel for XmppChannel {
     }
 
     async fn health_check(&self) -> Result<(), ChannelError> {
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), ChannelError> {
+        // Flush any pending coalesced messages before going away.
+        if let Some(buffer) = &self.coalesce {
+            buffer.flush_all().await;
+        }
         Ok(())
     }
 
