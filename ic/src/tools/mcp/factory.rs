@@ -64,14 +64,9 @@ pub async fn create_client_from_config(
                 })?;
             }
 
-            let resolved_env = resolve_stdio_env(
-                &server_name,
-                env,
-                env_secrets,
-                secrets.as_deref(),
-                user_id,
-            )
-            .await?;
+            let resolved_env =
+                resolve_stdio_env(&server_name, env, env_secrets, secrets.as_deref(), user_id)
+                    .await?;
 
             let transport = process_manager
                 .spawn_stdio(&server_name, command, args.to_vec(), resolved_env)
@@ -182,16 +177,15 @@ async fn resolve_stdio_env(
     })?;
 
     for (var, secret_name) in env_secrets {
-        let secret =
-            secrets
-                .get_decrypted(user_id, secret_name)
-                .await
-                .map_err(|e| McpFactoryError::InvalidConfig {
-                    name: server_name.to_string(),
-                    reason: format!(
-                        "failed to resolve secret '{secret_name}' for environment variable '{var}': {e}"
-                    ),
-                })?;
+        let secret = secrets
+            .get_decrypted(user_id, secret_name)
+            .await
+            .map_err(|e| McpFactoryError::InvalidConfig {
+                name: server_name.to_string(),
+                reason: format!(
+                    "failed to resolve secret '{secret_name}' for environment variable '{var}': {e}"
+                ),
+            })?;
         if resolved
             .insert(var.clone(), secret.expose().to_string())
             .is_some()
@@ -247,7 +241,11 @@ mod tests {
         Arc::new(crate::secrets::InMemorySecretsStore::new(crypto))
     }
 
-    async fn create_secret(store: &Arc<crate::secrets::InMemorySecretsStore>, name: &str, value: &str) {
+    async fn create_secret(
+        store: &Arc<crate::secrets::InMemorySecretsStore>,
+        name: &str,
+        value: &str,
+    ) {
         store
             .create(
                 "user",
