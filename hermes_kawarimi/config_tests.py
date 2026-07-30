@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from hermes_kawarimi.config import ImportPlan
+from hermes_kawarimi.cli import _plan_from_args, build_parser
 
 
 class ImportPlanSerializationTest(unittest.TestCase):
@@ -18,6 +19,9 @@ class ImportPlanSerializationTest(unittest.TestCase):
             apply=True,
             start=True,
             force=True,
+            with_pebble=True,
+            with_opencode=True,
+            with_kimi=True,
             with_toolchains=True,
             with_vision=False,
             tensorzero_url="http://tz:3000",
@@ -32,6 +36,9 @@ class ImportPlanSerializationTest(unittest.TestCase):
         self.assertTrue(loaded.apply)
         self.assertTrue(loaded.start)
         self.assertTrue(loaded.force)
+        self.assertTrue(loaded.with_pebble)
+        self.assertTrue(loaded.with_opencode)
+        self.assertTrue(loaded.with_kimi)
         self.assertTrue(loaded.with_toolchains)
         self.assertFalse(loaded.with_vision)
         self.assertEqual(loaded.tensorzero_url, "http://tz:3000")
@@ -74,6 +81,14 @@ class ImportPlanValidationTest(unittest.TestCase):
         plan = ImportPlan(tenant="   ")
         err = plan.validate()
         self.assertIsNotNone(err)
+
+
+class ImportPlanCliTest(unittest.TestCase):
+    def test_kimi_flag_reaches_plan(self) -> None:
+        args = build_parser().parse_args(
+            ["import", "--tenant", "testimport", "--with-kimi"]
+        )
+        self.assertTrue(_plan_from_args(args).with_kimi)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,6 @@ class ImportConfig:
     name: str = ""
     start: bool = False
     old_stopped: bool = False
-    with_nanocode: bool = False
     with_pebble: bool = False
     with_opencode: bool = False
     with_kimi: bool = False
@@ -79,7 +78,6 @@ class ImportConfig:
             "name": self.name,
             "start": self.start,
             "old_stopped": self.old_stopped,
-            "with_nanocode": self.with_nanocode,
             "with_pebble": self.with_pebble,
             "with_opencode": self.with_opencode,
             "with_kimi": self.with_kimi,
@@ -100,12 +98,13 @@ class ImportConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, ImportValue]) -> ImportConfig:
+        if _bool_value(data.get("with_nanocode", False)):
+            raise ImportConfigFormatError("nanocode worker is no longer supported")
         return cls(
             bundle=_str_value(data.get("bundle", "")),
             name=_str_value(data.get("name", "")),
             start=_bool_value(data.get("start", False)),
             old_stopped=_bool_value(data.get("old_stopped", False)),
-            with_nanocode=_bool_value(data.get("with_nanocode", False)),
             with_pebble=_bool_value(data.get("with_pebble", False)),
             with_opencode=_bool_value(data.get("with_opencode", False)),
             with_kimi=_bool_value(data.get("with_kimi", False)),
@@ -158,8 +157,6 @@ def build_import_args(cfg: ImportConfig) -> list[str]:
         args.append("--start")
     if cfg.old_stopped:
         args.append("--old-stopped")
-    if cfg.with_nanocode:
-        args.append("--with-nanocode")
     if cfg.with_pebble:
         args.append("--with-pebble")
     if cfg.with_opencode:

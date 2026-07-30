@@ -7,13 +7,13 @@
 # total recovery time is under the configured threshold.
 #
 # Usage:
-#   fault-inject-respawn.sh --tenant <name> [--container-type pg|nanocode|pebble|opencode|kimi]
+#   fault-inject-respawn.sh --tenant <name> [--container-type pg|pebble|opencode|kimi]
 #   fault-inject-respawn.sh --container <container-name> [--user <os-user>]
 #   fault-inject-respawn.sh --dry-run --tenant <name>
 #
 # Options:
 #   --tenant <name>         Target tenant (derives container name + user)
-#   --container-type <type> Container type: pg, nanocode, pebble, opencode, kimi (default: pg)
+#   --container-type <type> Container type: pg, pebble, opencode, kimi (default: pg)
 #   --container <name>      Explicit container name (bypasses tenant lookup)
 #   --user <os-user>        OS user owning the rootless container (required with --container)
 #   --threshold <secs>      Max acceptable respawn time in seconds (default: 4)
@@ -88,12 +88,12 @@ while [[ $# -gt 0 ]]; do
         --yes|-y)         YES=true; shift ;;
         --verbose|-v)     VERBOSE=true; shift ;;
         --help|-h)
-            printf 'Usage: %s --tenant <name> [--container-type pg|nanocode|pebble|opencode|kimi] [options]\n' "$SCRIPT_NAME"
+            printf 'Usage: %s --tenant <name> [--container-type pg|pebble|opencode|kimi] [options]\n' "$SCRIPT_NAME"
             printf '       %s --container <name> --user <os-user> [options]\n\n' "$SCRIPT_NAME"
             printf 'Fault-injection test: kills a supervised container and measures respawn latency.\n\n'
             printf 'Options:\n'
             printf '  --tenant <name>         Target tenant name\n'
-            printf '  --container-type <type> Container type (pg, nanocode, pebble, opencode, kimi; default: pg)\n'
+            printf '  --container-type <type> Container type (pg, pebble, opencode, kimi; default: pg)\n'
             printf '  --container <name>      Explicit container name\n'
             printf '  --user <os-user>        OS user for rootless podman\n'
             printf '  --threshold <secs>      Max acceptable respawn time (default: 4)\n'
@@ -112,11 +112,10 @@ done
 if [[ -n "$TENANT" ]]; then
     case "$CONTAINER_TYPE" in
         pg)       CONTAINER="lunarwing-pg-${TENANT}" ;;
-        nanocode) CONTAINER="lunarwing-nanocode-${TENANT}" ;;
         pebble)   CONTAINER="lunarwing-pebble-${TENANT}" ;;
         opencode) CONTAINER="lunarwing-opencode-${TENANT}" ;;
         kimi)     CONTAINER="lunarwing-kimi-${TENANT}" ;;
-        *) die "unknown container-type: $CONTAINER_TYPE (expected pg, nanocode, pebble, opencode, kimi)" ;;
+        *) die "unknown container-type: $CONTAINER_TYPE (expected pg, pebble, opencode, kimi)" ;;
     esac
     USER="${USER:-$TENANT}"
 fi

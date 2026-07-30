@@ -26,8 +26,8 @@ ports_get() {
   case "$2" in
     opencode_wss) echo 19090 ;;
     opencode_health) echo 18443 ;;
-    nanocode_wss) echo 29090 ;;
-    nanocode_health) echo 28443 ;;
+    pebble_wss) echo 29090 ;;
+    pebble_health) echo 28443 ;;
     *) return 1 ;;
   esac
 }
@@ -194,10 +194,10 @@ if grep -q 'LW2STUDYMCP_ALLOW_WRITE' "$opencode_unit"; then
   exit 1
 fi
 
-render_worker_quadlet test nanocode 8443
-nanocode_unit="$(tenant_quadlet_dir test)/lunarwing-nanocode-test.container"
-if grep -q 'LW2STUDYMCP\|/opt/lw2studymcp\|/var/lib/lw2studymcp\|UserNS=keep-id' "$nanocode_unit"; then
-  printf 'Study Notes mount leaked into nanocode quadlet\n' >&2
+render_worker_quadlet test pebble 8443
+pebble_unit="$(tenant_quadlet_dir test)/lunarwing-pebble-test.container"
+if grep -q 'LW2STUDYMCP\|/opt/lw2studymcp\|/var/lib/lw2studymcp\|UserNS=keep-id' "$pebble_unit"; then
+  printf 'Study Notes mount leaked into Pebble quadlet\n' >&2
   exit 1
 fi
 

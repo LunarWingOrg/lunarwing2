@@ -60,7 +60,7 @@ lifecycle/status commands go through `lunarwing-mt-admin.sh` — never bare
 - **Tenants must re-render units on v2.0.3.0** to pick up both halves (this
   applies even to tenants already re-rendered on v2.0.2).
 
-### 1.4 External worker hardening (opencode / nanocode / pebble / kimi)
+### 1.4 External worker hardening (opencode / pebble / kimi)
 
 - Bounded context so oversized prompts cannot exhaust the worker context window.
 - Retry logic for transient OpenCode routing failures and provider timeouts.
@@ -73,9 +73,11 @@ lifecycle/status commands go through `lunarwing-mt-admin.sh` — never bare
   images tolerated when a rebuild is impossible.
 - OpenCode worker Rust toolchain updated; Podman build storage reduced.
 - External job diagnostics now persist across restarts.
-- Kimi Code added as a fourth persistent external worker option
+- Kimi Code added as a persistent external worker option
   (`--with-kimi`, `build-kimi-worker`, `configure-kimi`; see
   `docs/ops/WORKER-CONTAINERS.md`).
+- Nanocode retired. Provision/build/config surfaces reject it; tenant upgrade
+  stops legacy supervision and removes routing/env entries without deleting data.
 
 ### 1.5 MCP management
 
@@ -235,7 +237,7 @@ Verify the backup exists first: `sudo lunarwing-mt-admin.sh list-backups <name>`
 ### T4 — External workers
 
 For each worker type the tenant selected (`--with-opencode`, `--with-pebble`,
-`--with-nanocode`, `--with-kimi`):
+`--with-kimi`):
 
 1. After upgrade, `sudo lunarwing-mt-admin.sh status <name>` shows the worker
    container up; if the worker was rebuilt during upgrade, confirm the new

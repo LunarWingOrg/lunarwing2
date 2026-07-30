@@ -1,7 +1,7 @@
 # Multi-tenant external-worker configuration
 
 > **Status: PARTIALLY-FIXED (verified against current source on 2026-07-28).**
-> Tenant provisioning now generates Nanocode, Pebble, and OpenCode endpoint
+> Tenant provisioning now generates Pebble, OpenCode, and Kimi endpoint
 > blocks. In-memory settings merges preserve their bearer tokens, but a later
 > full TOML rewrite (for example `/model`) still omits `auth_token` and can make
 > the worker return 401 after reload. Provisioning is fixed; persistence is open.
@@ -13,13 +13,13 @@ round-trip finding.
 
 **Status: FIXED.**
 
-Fresh tenants previously lacked `[[sandbox.external_workers]]`, so
-`create_job(mode: "nanocode")` had no route until an operator edited
+Fresh tenants previously lacked `[[sandbox.external_workers]]`, so named
+`create_job` modes had no route until an operator edited
 `config.toml`. The current generator is idempotent and writes the per-tenant WSS
 URL, timeout, and gateway token:
 
 - `ensure_external_worker_config` (`ic/scripts/lunarwing-mt-admin.sh:2896-2959`)
-- `add-tenant` calls it for Nanocode, Pebble, and OpenCode (`:6356-6358`)
+- `add-tenant` calls it for Pebble, OpenCode, and Kimi
 - retrofit calls are present in `patch-env` (`:3372-3374`)
 - TOML shape is covered by `ic/src/config/sandbox.rs:155-156,169-179`
 
@@ -27,8 +27,8 @@ The generated shape remains:
 
 ```toml
 [[sandbox.external_workers]]
-name = "nanocode"
-url = "ws://127.0.0.1:<nanocode_wss>/ws/agent"
+name = "opencode"
+url = "ws://127.0.0.1:<opencode_wss>/ws/agent"
 auth_token = "<tenant GATEWAY_AUTH_TOKEN>"
 timeout_ms = 300000
 ```

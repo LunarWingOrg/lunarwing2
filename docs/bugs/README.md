@@ -22,7 +22,6 @@ Some superseded files remain as compatibility pointers, including pointers in
 | [BUG-agent-worker-lifecycle.md](BUG-agent-worker-lifecycle.md) | PARTIAL | `wait=true` still occupies the originating turn; priority interrupts are handled and ordinary messages are deferred in a bounded FIFO; the old completion race is fixed | `job.rs`, `agent_loop.rs`, `dispatch.rs`, `job_monitor.rs`, interrupt regressions; source-only |
 | [BUG-e2e-test-bugs.md](BUG-e2e-test-bugs.md) | PARTIAL | Bootstrap/tool tests fixed; Gmail OAuth fixture retired; bootstrap E2E tests are now `#[ignore]`'d (harness race); clipboard test remains unverified | `agent_loop.rs`, E2E scenarios; current environment lacks both Pytest and Playwright |
 | [BUG-external-worker-config-persistence.md](BUG-external-worker-config-persistence.md) | PARTIAL | Provisioning and in-memory token merges work; full TOML rewrites can still drop worker bearer tokens | `lunarwing-mt-admin.sh`, `settings.rs`, `commands.rs`, `config/sandbox.rs` |
-| [BUG-mt-nanocode-image-size.md](BUG-mt-nanocode-image-size.md) | OPEN | Large Nanocode image is copied per tenant with `save|load` | `lunarwing-mt-admin.sh:606-649,3709-3727`, Dockerfile |
 | [BUG-kawarimi-import-flag-parity.md](BUG-kawarimi-import-flag-parity.md) | OPEN | Import rejects an explicit `--with-wasm` although it adds the flag internally | `ic/scripts/import-tenant.sh:51-69,283-289`; fresh related flag harness |
 | [BUG-ssh-git-ref-and-remote-head.md](BUG-ssh-git-ref-and-remote-head.md) | PARTIAL | Null-like refs fixed; bare remote HEAD mismatch still reports success for an empty checkout, with only raw Git stderr | `ssh_git.rs`, null-ref tests, local bare-Git reproduction |
 | [BUG-weechat-relay-rand-check.md](BUG-weechat-relay-rand-check.md) | PARTIAL | Unused import fixed; `rand_check` still always returns false | `lunarwing_weechat_wss/weechat_relay/src/lib.rs:46-50,2164-2172` |
@@ -39,7 +38,6 @@ These are the unresolved pieces inside grouped reports:
 | Concurrent ordinary-turn scheduling or an async/session registry for default `wait=true` calls | [agent/worker lifecycle](BUG-agent-worker-lifecycle.md#1-synchronous-worker-jobs-built-in-and-external) |
 | Clipboard test runtime behavior | [E2E test bugs](BUG-e2e-test-bugs.md#2-clipboard-copy-test) |
 | Preserve external-worker auth tokens across `Settings::save_toml` | [external-worker config](BUG-external-worker-config-persistence.md#2-auth-token-loss-on-settings-rewrites) |
-| Slim/share Nanocode image distribution | [MT image size](BUG-mt-nanocode-image-size.md) |
 | Detect bare remote HEAD mismatch after `ssh_git clone` | [SSH Git](BUG-ssh-git-ref-and-remote-head.md#2-bare-remote-head-mismatch) |
 | Implement or remove WeeChat `rand_check` | [WeeChat relay](BUG-weechat-relay-rand-check.md#open-latent-behavior-bug) |
 | Normalize prompt-generated worker paths and Pebble `project_dir` | [worker paths](BUG-worker-workspace-path-expansion.md#remaining-gaps) |

@@ -1,8 +1,7 @@
-# Multi-tenant Nanocode image distribution is too large
+# Multi-tenant Nanocode image distribution was too large
 
-> **Status: STILL-OPEN (verified against current source on 2026-07-28).** The worker
-> image build and healthcheck issues from the 1.1.4 systemd pass are fixed, but
-> the Nanocode image remains large and is copied into each rootless tenant store.
+> **Status: CLOSED BY REMOVAL.** Nanocode external-worker support was removed in
+> v2.0.4.0; LunarWing no longer builds or distributes this image.
 
 ## Finding
 

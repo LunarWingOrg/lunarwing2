@@ -30,7 +30,6 @@ class ImportPlan:
     old_stopped: bool = False
     force: bool = False
     docker_group: bool = False
-    with_nanocode: bool = False
     with_pebble: bool = False
     with_opencode: bool = False
     with_kimi: bool = False
@@ -60,7 +59,6 @@ class ImportPlan:
             "old_stopped": self.old_stopped,
             "force": self.force,
             "docker_group": self.docker_group,
-            "with_nanocode": self.with_nanocode,
             "with_pebble": self.with_pebble,
             "with_opencode": self.with_opencode,
             "with_kimi": self.with_kimi,
@@ -78,6 +76,8 @@ class ImportPlan:
 
     @classmethod
     def from_dict(cls, data: dict[str, PlanValue]) -> ImportPlan:
+        if _bool(data.get("with_nanocode", False)):
+            raise ImportPlanFormatError("nanocode worker is no longer supported")
         return cls(
             source=_str(data.get("source", "")),
             tenant=_str(data.get("tenant", "")),
@@ -86,7 +86,6 @@ class ImportPlan:
             old_stopped=_bool(data.get("old_stopped", False)),
             force=_bool(data.get("force", False)),
             docker_group=_bool(data.get("docker_group", False)),
-            with_nanocode=_bool(data.get("with_nanocode", False)),
             with_pebble=_bool(data.get("with_pebble", False)),
             with_opencode=_bool(data.get("with_opencode", False)),
             with_kimi=_bool(data.get("with_kimi", False)),

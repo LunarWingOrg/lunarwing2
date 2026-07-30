@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from lunarwing_mt_onboard import import_tenant
-from lunarwing_mt_onboard.import_tenant import ImportConfig
+from lunarwing_mt_onboard.import_tenant import ImportConfig, ImportConfigFormatError
 
 
 class TestImportConfigDefaults(unittest.TestCase):
@@ -25,7 +25,6 @@ class TestImportConfigSerialization(unittest.TestCase):
             name="alpha-new",
             start=True,
             old_stopped=True,
-            with_nanocode=True,
             with_pebble=True,
             with_opencode=True,
             with_kimi=True,
@@ -71,6 +70,10 @@ class TestImportConfigSerialization(unittest.TestCase):
         self.assertFalse(cfg.start)
         self.assertFalse(cfg.auto_yes)
         self.assertEqual(ImportConfig.from_dict(cfg.to_dict()), cfg)
+
+    def test_legacy_nanocode_selection_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ImportConfigFormatError, "no longer supported"):
+            ImportConfig.from_dict({"bundle": "/tmp/beta.tar", "with_nanocode": True})
 
 
 class TestImportConfigValidation(unittest.TestCase):
@@ -154,7 +157,6 @@ class TestImportArgs(unittest.TestCase):
             ImportConfig(
                 bundle="/tmp/alpha.tar",
                 name="alpha-new",
-                with_nanocode=True,
                 with_pebble=True,
                 with_opencode=True,
                 with_kimi=True,
@@ -169,7 +171,7 @@ class TestImportArgs(unittest.TestCase):
 
         self.assertIn("--name", args)
         self.assertIn("alpha-new", args)
-        self.assertIn("--with-nanocode", args)
+        self.assertNotIn("--with-nanocode", args)
         self.assertIn("--with-pebble", args)
         self.assertIn("--with-opencode", args)
         self.assertIn("--with-kimi", args)
