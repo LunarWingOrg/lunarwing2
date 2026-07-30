@@ -535,6 +535,14 @@ impl Workspace {
         self
     }
 
+    /// Get the embedding provider, if configured.
+    ///
+    /// Used to share the workspace embedding provider with other subsystems
+    /// (e.g. the reflex router for semantic matching).
+    pub fn embedding_provider(&self) -> Option<Arc<dyn EmbeddingProvider>> {
+        self.embeddings.clone()
+    }
+
     /// Set the default search configuration from workspace search config.
     pub fn with_search_config(mut self, config: &crate::config::WorkspaceSearchConfig) -> Self {
         self.search_defaults = SearchConfig::default()
