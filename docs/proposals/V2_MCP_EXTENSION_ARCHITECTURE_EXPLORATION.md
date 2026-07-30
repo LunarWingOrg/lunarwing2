@@ -1,9 +1,15 @@
 # V2 MCP and Extension Runtime Architecture Exploration
 
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL / EXPLORATORY.** Phase 0
-> host-local stdio installation is implemented. The runtime-neutral package
-> model, adapter boundary, worker-local MCP, marketplace provenance, and
-> MCP-over-WASM phases remain unimplemented design work.
+> **Current status (2026-07-30, branch `rarity/kimi-19-20260730-1801`): PARTIAL / EXPLORATORY.** Phase 0
+> host-local stdio installation is implemented. Host-local lifecycle hardening
+> is now implemented as well: secret injection into stdio process env
+> (`env_secrets`, resolved from the secrets store at spawn, fail-closed),
+> opt-in automatic npm/pip package installation (`auto_install`), and
+> automatic crash restart via a supervised `McpProcessManager`
+> (2s polling, exponential backoff, 5-restarts-per-10-min crash-loop guard).
+> The runtime-neutral package model, adapter boundary, worker-local MCP,
+> marketplace provenance, and MCP-over-WASM phases remain unimplemented
+> design work.
 
 **Status:** Exploratory V2 architecture; host-local stdio installation surfaces
 implemented as the first near-term step on 2026-07-09  
@@ -90,6 +96,36 @@ structured host-local stdio configuration. Installation persists the configurati
 without running it; activation starts the managed child and discovers its tools.
 A supergateway can still be operationally useful, but it is not required to
 connect a stdio server.
+
+### Host-local stdio lifecycle is supervised and credential-aware
+
+Three lifecycle gaps called out by this exploration have since been closed
+(2026-07-30):
+
+- **Secret injection through process env.** The stdio transport config accepts
+  `env_secrets` mapping an environment variable name to a secret name in the
+  owner's secrets store. The factory decrypts values at spawn time
+  (`resolve_stdio_env` in `ic/src/tools/mcp/factory.rs`), never logs or
+  persists them, and fails closed when a secret is missing or no secrets
+  store is available. Crash restarts reuse the environment resolved at the
+  initial spawn, so rotating a secret requires re-activation.
+- **Opt-in automatic npm/pip install.** `auto_install` (`{manager: npm|pip,
+  package}`) on the stdio config installs the named package
+  (`npm install -g` / `pip[3] install --user`) only when the configured
+  command does not resolve on `PATH` (`ic/src/tools/mcp/package_install.rs`).
+  Package specs are validated against conservative character sets, installers
+  run with argument arrays (no shell) under a 300s timeout, and installation
+  never happens without an explicit config entry.
+- **Automatic crash restart.** `McpProcessManager::start_supervisor` (wired in
+  `ic/src/app.rs`) polls managed children every 2s and restarts unexpected
+  exits with the existing exponential backoff (1s→16s, 5 attempts). A
+  crash-loop guard (5 restarts per 10 minutes) retires flapping servers until
+  manual re-activation; intentional shutdowns set a flag on the transport and
+  are never restarted.
+
+Gateway install/toggle/update flows persist `McpServerConfig` through the
+existing extension handlers, so the new fields are available through the web
+gateway and CLI without additional endpoints.
 
 ### Worker containers do not currently load MCP extensions
 
