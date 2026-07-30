@@ -442,6 +442,13 @@ Commands:
                                    Preserves existing config: fails on any
                                    non-empty ~/.config/weechat without modifying it.
 
+  disable-weechat <name>           Mark WeeChat disabled for a tenant: health checks
+  enable-weechat <name>            report its (optional) weechat units `skipped` when
+                                   down instead of critical, so self-heal will not
+                                   restart-storm an intentionally unused backend.
+                                   Does NOT stop/disable/un-render the units.
+                                   Default is enabled (enable-weechat restores it).
+
   patch-env <name>                 Add missing env vars (e.g. ORCHESTRATOR_PORT)
   patch-env-all                    Patch env for all registered tenants
 
@@ -1454,6 +1461,7 @@ ports_allocate() {
         created_at: $ts,
         enable_darkirc: $darkirc,
         enable_proxy: $proxy,
+        enable_weechat: true,
         workers: $workers,
         ports: {
           gateway:          ($base + 0),
@@ -1539,6 +1547,35 @@ ports_enable_proxy() {
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
   say "proxy for tenant '$name': disabled -> enabled" >&2
+}
+
+# Set the per-tenant WeeChat health-gate flag in the registry (bidirectional).
+# enable_weechat=false tells the infrastructure health checks (health-openrc.sh /
+# health-systemd.sh) to classify the tenant's OPTIONAL lunarwing-weechat-<t> and
+# lunarwing-weechat-adapter-<t> units as `skipped` when down, so an intentionally
+# unused WeeChat backend no longer reads critical and self-heal does not
+# restart-storm (flap) a unit that cannot come up. Absent flag == enabled, so
+# tenants created before this field existed keep the old behavior.
+# This gates HEALTH/SELF-HEAL classification only — it does not stop, disable, or
+# un-render the units themselves.
+ports_set_weechat() {
+  local name="$1" enabled="$2"
+  require_cmd jq
+  case "$enabled" in true|false) ;; *) die "ports_set_weechat: enabled must be true or false" ;; esac
+  local current
+  current="$(jq -r ".tenants[\"$name\"].enable_weechat // true" "$PORTS_REGISTRY" 2>/dev/null || true)"
+  [[ "$current" == "$enabled" ]] && { say "weechat for tenant '$name': already $enabled" >&2; return 0; }
+
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  if ! jq --arg name "$name" --argjson enabled "$enabled" '.tenants[$name].enable_weechat = $enabled' \
+      "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    die "failed to set weechat flag for tenant '$name'"
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "weechat for tenant '$name': $current -> $enabled" >&2
 }
 
 # Mark a single external worker (nanocode|pebble|opencode) enabled for a tenant
@@ -8672,6 +8709,24 @@ main() {
       ports_registry_init
       tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
       configure_weechat_relay "$name"
+      ;;
+
+    disable-weechat|enable-weechat)
+      [[ -n "${1:-}" ]] || die "usage: $command_name <name>"
+      [[ $# -eq 1 ]]   || die "usage: $command_name <name> (unexpected extra arguments)"
+      require_root
+      local name
+      name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+      if [[ "$command_name" == "disable-weechat" ]]; then
+        ports_set_weechat "$name" false
+        say "WeeChat health-gate disabled for tenant '$name': down weechat units now report skipped (never critical)"
+        say "NOTE: rendered units are untouched — stop them manually if running: stop-tenant leaves optional weechat units alone"
+      else
+        ports_set_weechat "$name" true
+        say "WeeChat health-gate enabled for tenant '$name': down weechat units report critical again"
+      fi
       ;;
 
     patch-env)
