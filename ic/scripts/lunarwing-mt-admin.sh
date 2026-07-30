@@ -241,10 +241,11 @@ tenant_proxy_enabled() {
 # render-units flap footgun; docs/proposals/RENDER_UNITS_SMALL_BUG.md).
 # ABSENT key = true (ON): tenants provisioned before this flag existed keep
 # their current fail-loud behavior; opt out explicitly via disable-weechat.
+# NB: jq's `//` treats false as empty, so compare via tostring, not `// true`.
 tenant_weechat_enabled() {
   local name="$1"
   local val
-  val="$(jq -r ".tenants[\"$name\"].enable_weechat // true" "$PORTS_REGISTRY" 2>/dev/null)"
+  val="$(jq -r ".tenants[\"$name\"].enable_weechat | tostring" "$PORTS_REGISTRY" 2>/dev/null)"
   [[ "$val" != "false" ]]
 }
 
@@ -1575,8 +1576,10 @@ ports_set_weechat() {  # <name> <true|false>
   [[ "$enabled" == "true" || "$enabled" == "false" ]] || return 1
 
   local current
-  current="$(jq -r ".tenants[\"$name\"].enable_weechat // true" "$PORTS_REGISTRY" 2>/dev/null || true)"
-  [[ "$current" == "$enabled" ]] && return 0
+  current="$(jq -r ".tenants[\"$name\"].enable_weechat | tostring" "$PORTS_REGISTRY" 2>/dev/null || true)"
+  # Absent key reads "null" — semantically ON (legacy default) but still needs
+  # the explicit write when the caller asked for false.
+  [[ "$current" == "$enabled" || ( "$current" == "null" && "$enabled" == "true" ) ]] && return 0
 
   local tmp
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
