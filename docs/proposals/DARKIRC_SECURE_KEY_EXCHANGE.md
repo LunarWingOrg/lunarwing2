@@ -1,10 +1,21 @@
 # Secure Automated DarkIRC Key Exchange
 
-> **Current status (2026-07-27): PHASE 0/1 AND STAGE A IMPLEMENTED.** Config
-> regeneration is contact-preserving and journaled. Typed public-offer exchange
-> commands, protected pending records, replay tombstones, compatibility
-> attestation, structured migration, and recovery now exist. Activation/rollback,
-> rotation, revocation, same-host pairing, and web delivery remain planned.
+> **Current status (2026-07-30): PHASE 0/1 AND STAGE A MERGED into the release
+> tree** (branch `aj/kimi-20-20260730-2101`, salvaged from
+> `darkirckeyex/aragents/v2.0.3.0` implemented 2026-07-27). Config regeneration
+> is contact-preserving and journaled. Typed public-offer exchange commands
+> (`darkirc-contact prepare/respond/complete/cancel/exchanges`), protected
+> pending records, replay tombstones, compatibility attestation, structured
+> migration, recovery, and `darkirc-health --strict` now exist in
+> `ic/scripts/lunarwing-mt-admin.sh`, backed by `ic/src/darkirc_key_manager.rs`
+> and the `lunarwing-darkirc-key-helper` binary. Activation/rollback, rotation,
+> revocation, same-host pairing, and web delivery remain planned (see
+> `docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md`).
+>
+> **Merge note:** the salvaged branch's ports-registry scope-ID migration was
+> renumbered v12 -> v13 because the kimi worker port-range migration already
+> owns registry v12 on this tree. `ports_migrate_v13` remains unconditional and
+> repair-style; the scope-ID semantics are unchanged.
 
 **Status:** Authoritative design plus implementation boundary. Stage A installs
 contacts with deferred activation; later lifecycle surfaces described below do

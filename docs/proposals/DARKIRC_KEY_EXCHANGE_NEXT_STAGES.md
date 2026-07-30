@@ -1,6 +1,9 @@
 # DarkIRC Secure Key Exchange: Next Stages
 
-**Status:** Stage A implemented on 2026-07-27. Stage B/C sections remain an
+**Status:** Stage A implemented on 2026-07-27 and merged into the release tree
+on 2026-07-30 (branch `aj/kimi-20-20260730-2101`; ports-registry scope-ID
+migration renumbered v12 -> v13 on merge to coexist with the kimi worker port
+migration, no semantic change). Stage B/C sections remain an
 implementation plan and do not claim those APIs or commands exist. Authoritative
 security design remains `docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md`.
 
