@@ -9,8 +9,11 @@ import os
 import unittest
 from unittest import mock
 
+from hermes_kawarimi import loader
 from hermes_kawarimi.config import ImportPlan
 from hermes_kawarimi.loader import _build_flags, _worker_flags, _schema_wait_seconds
+from hermes_kawarimi.model import MappedAgent
+from lunarwing_mt_onboard.provisioner import PhaseResult
 
 
 class WorkerFlagsTest(unittest.TestCase):
@@ -64,6 +67,60 @@ class SchemaWaitSecondsTest(unittest.TestCase):
     def test_zero_or_negative_falls_back(self) -> None:
         with mock.patch.dict(os.environ, {"KAWARIMI_SCHEMA_WAIT_SECONDS": "0"}):
             self.assertEqual(_schema_wait_seconds(), 90)
+
+
+class RunImportSequenceTest(unittest.TestCase):
+    """The populate window must be daemon-down + PG-up.
+
+    Regression test: mt-admin's stop-tenant also stops PostgreSQL, so the
+    loader must issue start-pg after stop-tenant and before populate,
+    otherwise the populate connection is refused.
+    """
+
+    def _run_phases(self, plan: ImportPlan) -> list[str]:
+        verbs: list[str] = []
+
+        def fake_run_command(args, **_kw):  # noqa: ANN001, ANN202
+            verbs.append(args[1])
+            return PhaseResult(name=args[1], returncode=0)
+
+        env = {
+            "DATABASE_BACKEND": "postgres",
+            "DATABASE_URL": "postgres://example",
+            "SECRETS_MASTER_KEY": "key",
+            "LUNARWING_OWNER_ID": "owner",
+        }
+        with (
+            mock.patch("hermes_kawarimi.loader.ensure_mt_admin", return_value="mt"),
+            mock.patch(
+                "hermes_kawarimi.loader.run_command", side_effect=fake_run_command
+            ),
+            mock.patch.object(loader.secrets_ops, "parse_tenant_env", return_value=env),
+            mock.patch("hermes_kawarimi.loader._wait_for_schema"),
+            mock.patch("hermes_kawarimi.loader._populate", return_value={}),
+            mock.patch("hermes_kawarimi.loader._insert_secrets"),
+        ):
+            result = loader.run_import(plan, MappedAgent())
+        self.assertTrue(result.ok, result.error)
+        return verbs
+
+    def test_start_pg_between_stop_tenant_and_populate(self) -> None:
+        verbs = self._run_phases(ImportPlan(tenant="t1", apply=True))
+        self.assertEqual(
+            verbs,
+            [
+                "add-tenant",
+                "build-tenant",
+                "install-wasm",
+                "start-tenant",
+                "stop-tenant",
+                "start-pg",
+            ],
+        )
+
+    def test_start_after_populate_when_requested(self) -> None:
+        verbs = self._run_phases(ImportPlan(tenant="t1", apply=True, start=True))
+        self.assertEqual(verbs[-2:], ["start-pg", "start-tenant"])
 
 
 if __name__ == "__main__":
