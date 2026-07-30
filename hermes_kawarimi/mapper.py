@@ -150,7 +150,13 @@ def _map_conversations(snap: HermesAgentSnapshot, out: MappedAgent) -> None:
 
 
 def _message_content(content: str | None, tool_calls: str | None) -> str:
-    """conversation_messages.content is NOT NULL; coalesce a usable string."""
+    """conversation_messages.content is NOT NULL; coalesce a usable string.
+
+    Assistant messages that carry only a ``tool_name`` (no content, no
+    tool_calls) land as empty strings. Acceptable for v1; future enrichment
+    could synthesize a placeholder (e.g. "[tool: name]") so the imported
+    transcript keeps the tool-call marker visible.
+    """
     if content:
         return content
     if tool_calls:
