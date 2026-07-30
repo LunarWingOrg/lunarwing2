@@ -71,6 +71,10 @@ pub enum HookEvent {
         user_id: String,
         thread_id: String,
         response: String,
+        /// Destination channel, when known. `None` for non-channel-scoped
+        /// transforms. Added for coordination tag-schema enforcement.
+        #[serde(default)]
+        channel: Option<String>,
     },
 }
 

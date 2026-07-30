@@ -29,6 +29,7 @@
 
 pub mod budget;
 mod channel;
+pub mod coalesce;
 mod http;
 mod manager;
 mod repl;
