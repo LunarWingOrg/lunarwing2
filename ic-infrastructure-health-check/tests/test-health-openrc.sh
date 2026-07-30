@@ -30,10 +30,13 @@ assert_eq() { if [[ "$1" == "$2" ]]; then ok "$3"; else bad "$3" "got [$1] want 
 assert_json() { if jq -e . >/dev/null 2>&1 <<<"$1"; then ok "$2"; else bad "$2" "invalid JSON: $1"; fi; }
 
 # A scenario sandbox: $s/initd (fake /etc/init.d), $s/fix (status fixtures),
-# $s/bin/rc-service (mock). Echoes $s.
+# $s/bin/rc-service (mock). Echoes $s. Each scenario also gets an EMPTY tenant
+# registry ($s/ports.json) that run_hc points LUNARWING_TENANTS_FILE at, so the
+# weechat gate never reads the host's real registry (hermetic on MT hosts).
 new_scenario() {
   local s; s="$(mktemp -d "$ROOT/s.XXXXXX")"
   mkdir -p "$s/initd" "$s/fix" "$s/bin" "$s/runlevels/default"
+  printf '{}\n' > "$s/ports.json"
   cat >"$s/bin/rc-service" <<'MOCK'
 #!/usr/bin/env bash
 # Mock OpenRC rc-service: honours $INITD_DIR for --exists and $RC_FIX for status.
@@ -69,7 +72,7 @@ fix_set() {
 # run_hc <s> [ENV=VAL ...] -> sets OUT (stdout+stderr) and RC (exit code).
 run_hc() {
   local s="$1"; shift
-  OUT="$(env PATH="$s/bin:$PATH" INITD_DIR="$s/initd" RUNLEVELS_DIR="$s/runlevels" RC_FIX="$s/fix" SERVICES='' "$@" bash "$HC" 2>&1)"
+  OUT="$(env PATH="$s/bin:$PATH" INITD_DIR="$s/initd" RUNLEVELS_DIR="$s/runlevels" RC_FIX="$s/fix" SERVICES='' LUNARWING_TENANTS_FILE="$s/ports.json" "$@" bash "$HC" 2>&1)"
   RC=$?
 }
 svc_field() { jq -r --arg n "$2" '.metrics.services[] | select(.name==$n) | .'"$3" <<<"$1"; }
@@ -168,6 +171,40 @@ assert_eq "$(svc_field "$OUT" lunarwing-proxy-live status)" "critical" "S8: star
 assert_eq "$(svc_field "$OUT" lunarwing-fresh status)"      "skipped"  "S8: not-started tenant's down unit → skipped"
 assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S8: overall critical (driven by the started tenant)"
 assert_eq "$RC" 2 "S8: exit 2"
+
+# ── S9: weechat gate — disabled tenant's down weechat units -> skipped (never critical) ──
+# enable_weechat=false (e.g. --no-weechat-bootstrap or a failed relay bootstrap):
+# the optional backend/adapter cannot stay up, and that expected-down state must
+# NOT flip the host critical nor feed self-heal a restart target (the flap).
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;                  fix_set "$s" lunarwing-acme                  " * status: started" 0
+mk_unit "$s" lunarwing-weechat-acme;          fix_set "$s" lunarwing-weechat-acme          " * status: stopped" 3
+mk_unit "$s" lunarwing-weechat-adapter-acme;  fix_set "$s" lunarwing-weechat-adapter-acme  " * status: crashed" 1
+mk_unit "$s" lunarwing-gamma;                 fix_set "$s" lunarwing-gamma                 " * status: started" 0
+mk_unit "$s" lunarwing-weechat-gamma;         fix_set "$s" lunarwing-weechat-gamma         " * status: started" 0
+enable_unit "$s" lunarwing-acme; enable_unit "$s" lunarwing-gamma   # both tenants started
+jq -n '{tenants:{acme:{user:"acme",enable_weechat:false}, gamma:{user:"gamma",enable_weechat:false}}}' > "$s/ports.json"
+run_hc "$s"
+assert_eq "$(svc_field "$OUT" lunarwing-weechat-acme status)"         "skipped" "S9: gated-off weechat backend stopped -> skipped"
+assert_eq "$(svc_field "$OUT" lunarwing-weechat-adapter-acme status)" "skipped" "S9: gated-off weechat adapter crashed -> skipped"
+assert_eq "$(svc_field "$OUT" lunarwing-weechat-gamma status)"        "healthy" "S9: running weechat on gated tenant still healthy"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S9: overall healthy (gate did not flip host critical)"
+assert_eq "$RC" 0 "S9: exit 0"
+
+# ── S10: weechat gate fail-open — absent key and explicit true stay critical ──
+# Legacy tenants (no enable_weechat key) and enabled tenants keep the pre-gate
+# fail-loud behavior: a down weechat unit on a started tenant is a real outage.
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-legacy;            fix_set "$s" lunarwing-legacy            " * status: started" 0
+mk_unit "$s" lunarwing-weechat-legacy;    fix_set "$s" lunarwing-weechat-legacy    " * status: stopped" 3
+mk_unit "$s" lunarwing-beta;              fix_set "$s" lunarwing-beta              " * status: started" 0
+mk_unit "$s" lunarwing-weechat-beta;      fix_set "$s" lunarwing-weechat-beta      " * status: stopped" 3
+enable_unit "$s" lunarwing-legacy; enable_unit "$s" lunarwing-beta
+jq -n '{tenants:{legacy:{user:"legacy"}, beta:{user:"beta",enable_weechat:true}}}' > "$s/ports.json"
+run_hc "$s"
+assert_eq "$(svc_field "$OUT" lunarwing-weechat-legacy status)" "critical" "S10: absent enable_weechat key -> critical (fail-open default)"
+assert_eq "$(svc_field "$OUT" lunarwing-weechat-beta status)"   "critical" "S10: enable_weechat=true -> critical preserved"
+assert_eq "$RC" 2 "S10: exit 2"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

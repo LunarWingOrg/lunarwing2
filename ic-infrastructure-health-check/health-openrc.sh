@@ -88,6 +88,11 @@ probe_status() {
 # can point at a fake runlevels tree without touching the host.
 RUNLEVELS_DIR="${RUNLEVELS_DIR:-/etc/runlevels}"
 
+# Tenant registry (same resolution as health-systemd.sh). Consulted ONLY for the
+# per-tenant weechat enablement gate below; unreadable/absent registry fails
+# open (weechat treated as expected — the pre-gate behavior).
+TENANTS_FILE="${SELF_HEAL_TENANTS_FILE:-${LUNARWING_TENANTS_FILE:-/etc/lunarwing/ports.json}}"
+
 # Extract the tenant name from a unit, or "" for single-instance / non-tenant
 # units. Known per-service roles are stripped so every unit maps to its tenant:
 #   lunarwing-acme -> acme   lunarwing-proxy-acme -> acme
@@ -137,6 +142,31 @@ tenant_started() {
   return 1
 }
 
+# Is this unit a WeeChat backend/adapter unit? Covers the post-fold-in-A
+# `lunarwing-weechat(-adapter)-<t>` names and the pre-rename bare `weechat-<t>`.
+is_weechat_unit() {
+  case "$1" in
+    lunarwing-weechat-*|weechat-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Per-tenant WeeChat health-glob gate (docs/proposals/RENDER_UNITS_SMALL_BUG.md):
+# the weechat backend is optional and can be rendered for a tenant whose relay
+# was never configured — where it cannot stay up. mt-admin records that as
+# .tenants[<t>].enable_weechat = false; a down weechat unit on such a tenant is
+# the EXPECTED state, so it must classify `skipped` (never critical, and
+# self-heal honours `skipped` by not remediating — no restart-storm flap).
+# Fail OPEN on any doubt (no tenant, no registry, no jq, absent key): treat
+# weechat as expected, preserving the pre-gate fail-loud behavior.
+weechat_gated_off() {
+  local tenant="$1"
+  [ -n "$tenant" ] || return 1
+  [ -r "$TENANTS_FILE" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [ "$(jq -r --arg t "$tenant" '.tenants[$t].enable_weechat | tostring' "$TENANTS_FILE" 2>/dev/null)" = "false" ]
+}
+
 for svc in "${SERVICES_ARR[@]}"; do
   # Init script must exist.
   if ! rc-service --exists "$svc" >/dev/null 2>&1; then
@@ -173,7 +203,13 @@ for svc in "${SERVICES_ARR[@]}"; do
 
   case "$state" in
     stopped|crashed)
-      if tenant_started "$(unit_tenant "$svc")"; then
+      svc_tenant="$(unit_tenant "$svc")"
+      if is_weechat_unit "$svc" && weechat_gated_off "$svc_tenant"; then
+        # Optional weechat backend intentionally unused for this tenant
+        # (enable_weechat=false): expected-down — never critical, and self-heal
+        # honours `skipped` (no restart-storm of a unit that can't come up).
+        local_status="skipped"; local_exit=0
+      elif tenant_started "$svc_tenant"; then
         local_status="critical"; local_exit=2
         issues+=("$svc not running: $state")
       else
