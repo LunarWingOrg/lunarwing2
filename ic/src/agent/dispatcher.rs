@@ -83,7 +83,7 @@ impl Agent {
         );
         let prompt_context = prompt_context_from_chat_messages(&initial_messages);
 
-        let system_prompt = if let Some(ws) = self.workspace() {
+        let mut system_prompt = if let Some(ws) = self.workspace() {
             match ws
                 .system_prompt_for_context_tz(is_group_chat, user_tz)
                 .await
@@ -98,6 +98,22 @@ impl Agent {
         } else {
             None
         };
+
+        // Activate workspace lorebooks (SillyTavern-style world info) against
+        // the recent conversation and append matched entries to the system
+        // prompt. Lorebooks are character/world lore, so they also apply in
+        // group chats (unlike MEMORY.md, which stays DM-only).
+        let lorebook_config = crate::lorebook::LorebookConfig::from_env();
+        if lorebook_config.enabled
+            && let Some(ws) = self.workspace()
+            && let Some(block) =
+                crate::lorebook::build_active_block(ws, &initial_messages, &lorebook_config).await
+        {
+            system_prompt = Some(match system_prompt {
+                Some(prompt) => format!("{prompt}\n\n{block}"),
+                None => block,
+            });
+        }
 
         // Select and prepare active skills (if skills system is enabled).
         let cavepony_activation = self.resolve_cavepony_activation(message).await;
