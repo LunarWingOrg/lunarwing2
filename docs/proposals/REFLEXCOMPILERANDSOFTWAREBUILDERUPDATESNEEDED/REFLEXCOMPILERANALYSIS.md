@@ -6,6 +6,31 @@
 
 ---
 
+## 0. Status Update (2026-07-31, v2.0.4.0, branches `rarity/kimi-5-20260730-1201` + `aj/kimi-6-20260731-0902`)
+
+The wiring gaps in §5 were addressed (first pass adapted from branch `anattemptatreflexcompilerv2`; second pass review fixes on `aj/kimi-6-20260731-0902`):
+
+| Gap | Status |
+|-----|--------|
+| 5.1 Embedding provider never wired | **FIXED** — `Workspace::embedding_provider()` accessor; `Agent::new()` attaches it to the router |
+| 5.2 `bump_reflex_pattern_match()` never called | **FIXED** — dispatcher bumps match count after successful fast-path execution |
+| 5.3 `ReflexEvictor` never spawned | **FIXED** — spawned in `Agent::run()` with `EvictionConfig` from `ReflexConfig` |
+| 5.4 Hardcoded `"default"` user_id | **FIXED** — `ReflexCompiler` takes `user_id`; `find_recurring_job_patterns` filters per-user in both backends |
+| 5.5 `compilation_attempts` never incremented | **FIXED** (2nd pass) — first-pass `increment_reflex_compilation_attempts` was a 0-row UPDATE (rows only exist after a successful upsert); replaced with `record_reflex_compilation_failure` upsert that inserts `status='failed'` rows and auto-disables after 3 attempts; successful retry reactivates with the new tool name and resets the counter |
+| 5.6 No v2 safety/hooks/approval on reflex path | OPEN — architectural (intentional fast-path); needs design decision |
+| 5.7 `FuzzyConfig` defined but unused | **FIXED** — wired into `ReflexRouter` (`with_fuzzy_config`, router fields) |
+| 5.8 Missing config options | **FIXED** — `fuzzy_threshold`, `semantic_threshold`, `eviction_check_interval`, `eviction_stale_days`, `max_patterns_per_user` added with env overrides; the per-user cap is enforced by the compiler |
+| 5.9 libSQL boolean divergence | OPEN — documented, correct as-is |
+| 5.10 PG prune re-query missing embedding columns | **FIXED** |
+| 5.11 No engine v2 bridge adapter | OPEN — large architectural effort |
+| 5.12 Dead code / unused exports | **FIXED** — `FuzzyConfig`, `EvictionConfig`, `spawn_reflex_evictor`, semantic search are now all live |
+
+Additional second-pass fix (not in original gap list): `compile_pattern` only skipped `status='active'`, so user-disabled patterns (CLI `reflex delete`) and attempt-capped patterns were recompiled and resurrected on the next sweep. The compiler now skips `disabled` too; `failed`/`evicted` still fall through to retry.
+
+Verification: 49 reflex unit tests + 10 e2e integration tests pass on `aj/kimi-6-20260731-0902`; `cargo check --all-targets` clean.
+
+---
+
 ## 1. What the Reflex Compiler Does
 
 ### Purpose
