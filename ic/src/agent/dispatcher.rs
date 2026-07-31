@@ -1343,6 +1343,7 @@ mod tests {
             builder: None,
             llm_backend: "lunarwing_cloud".to_string(),
             coordination_gate: None,
+            coordination_coalesce: None,
         };
 
         Agent::new(
@@ -2233,6 +2234,7 @@ mod tests {
             builder: None,
             llm_backend: "lunarwing_cloud".to_string(),
             coordination_gate: None,
+            coordination_coalesce: None,
         };
 
         Agent::new(
@@ -2363,6 +2365,7 @@ mod tests {
                 builder: None,
                 llm_backend: "lunarwing_cloud".to_string(),
                 coordination_gate: None,
+                coordination_coalesce: None,
             };
 
             Agent::new(

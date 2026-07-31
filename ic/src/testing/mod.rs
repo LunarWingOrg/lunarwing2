@@ -584,6 +584,7 @@ impl TestHarnessBuilder {
             builder: None,
             llm_backend: "lunarwing_cloud".to_string(),
             coordination_gate: None,
+            coordination_coalesce: None,
         };
 
         TestHarness {

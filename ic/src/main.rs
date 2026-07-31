@@ -672,6 +672,14 @@ async fn async_main() -> anyhow::Result<()> {
                 coordination_config.agent_id.clone(),
             ))
         });
+    // Phase 4: shared outbound coalesce buffer at the agent boundary, so the
+    // deployed installable (WASM) XMPP path coalesces exactly like the native
+    // channel did (ISSUE-002).
+    let coordination_coalesce = {
+        let coalesce_config = lunarwing::channels::coalesce::CoalesceConfig::from_env();
+        (coalesce_config.enabled && !coalesce_config.coordination_channels.is_empty())
+            .then(|| lunarwing::channels::coalesce::CoalesceBuffer::new(coalesce_config))
+    };
     let coordination_summary = register_coordination_hooks(
         &components.hooks,
         coordination_config.clone(),
@@ -1063,6 +1071,7 @@ async fn async_main() -> anyhow::Result<()> {
         builder: components.builder,
         llm_backend: config.llm.backend.clone(),
         coordination_gate,
+        coordination_coalesce,
     };
 
     let channels_for_warnings = Arc::clone(&channels);
