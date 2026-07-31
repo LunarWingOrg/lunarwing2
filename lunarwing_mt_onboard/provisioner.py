@@ -138,7 +138,7 @@ def ensure_mt_admin() -> str:
 def build_add_tenant_args(config: "TenantConfig") -> list[str]:
     """Construct the argv list for ``mt-admin add-tenant``.
 
-    Secret values (XMPP password, LLM API key) are intentionally NOT placed
+    Secret values (XMPP password, LLM/Kimi API keys) are intentionally NOT placed
     on the argv — they would be visible in ``/proc/<pid>/cmdline``. Instead,
     ``add-tenant`` auto-generates throwaway values, and the secrets module
     overwrites them in ``lunarwing.env`` before ``start-tenant`` runs.
@@ -174,8 +174,6 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
         args.extend(["--kimi-model", config.kimi_model])
     if config.kimi_base_url:
         args.extend(["--kimi-base-url", config.kimi_base_url])
-    if config.kimi_api_key:
-        args.extend(["--kimi-api-key", config.kimi_api_key])
     if config.enable_darkirc:
         args.append("--enable-darkirc")
     # Persist the tenant's external-worker selection at add-tenant so
@@ -289,6 +287,8 @@ def _inject_secrets(config: "TenantConfig") -> None:
         secrets["XMPP_PASSWORD"] = config.xmpp_password
     if config.llm_api_key:
         secrets["LLM_API_KEY"] = config.llm_api_key
+    if config.kimi_api_key:
+        secrets["KIMI_API_KEY"] = config.kimi_api_key
     if config.secrets_master_key:
         secrets["SECRETS_MASTER_KEY"] = config.secrets_master_key
 

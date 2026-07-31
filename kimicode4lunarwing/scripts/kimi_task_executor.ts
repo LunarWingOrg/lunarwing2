@@ -7,18 +7,19 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
-import { resolve } from "node:path"
-import { EventEmitter } from "node:events"
 
 import {
   buildTaskPrompt,
+  isRecord,
+  truncateUtf8,
+  utf8ByteLength,
   type TaskRequest,
   type TaskProgress,
   type TaskResult,
   DEFAULT_TIMEOUT_MS,
 } from "./lunarwing_runtime.js"
 import { extractAssistantText, kimiErrorMessage, type KimiMessage } from "./kimi_result.js"
-import { expandWorkspacePath } from "./workspace_path.js"
+import { resolveWorkspacePath } from "./workspace_path.js"
 
 // Read env lazily: binding these at module load freezes the values at import
 // time, which breaks per-task overrides (and tests that set env after import).
@@ -44,6 +45,18 @@ function progressHeartbeatMs(): number {
 
 function killGraceMs(): number {
   return boundedEnvInteger("KIMI_KILL_GRACE_MS", 5_000, 100, 30_000)
+}
+
+function maxOutputBytes(): number {
+  return boundedEnvInteger("KIMI_MAX_OUTPUT_BYTES", 1_048_576, 1_024, 16_777_216)
+}
+
+function maxStdoutLineBytes(): number {
+  return boundedEnvInteger("KIMI_MAX_STDOUT_LINE_BYTES", 1_048_576, 1_024, 16_777_216)
+}
+
+function maxProgressBytes(): number {
+  return boundedEnvInteger("KIMI_MAX_PROGRESS_BYTES", 65_536, 256, 1_048_576)
 }
 
 type StopReason = "timeout" | "cancelled"
@@ -106,14 +119,19 @@ export async function executeTask(
   const timeoutMs = request.timeout_ms ?? DEFAULT_TIMEOUT_MS
   const heartbeatMs = progressHeartbeatMs()
   const killGrace = killGraceMs()
-  const workDir = request.context?.project_dir
-    ? resolveWorkDir(request.context.project_dir)
-    : workspaceRoot()
+  const outputCap = maxOutputBytes()
+  const stdoutLineCap = maxStdoutLineBytes()
+  const progressCap = maxProgressBytes()
+  const workDir = resolveWorkDir(request.context?.project_dir || workspaceRoot())
 
   let output = ""
+  let outputBytes = 0
   const collectedMessages: KimiMessage[] = []
+  let collectedBytes = 0
   let stopReason: StopReason | undefined
   let proc: ChildProcessWithoutNullStreams | undefined
+  let procClosed = false
+  let killEscalation: NodeJS.Timeout | undefined
   let stderrBuffer = ""
   let lastProgressAt = Date.now()
 
@@ -122,19 +140,34 @@ export async function executeTask(
   // operationally; the canonical result only needs the LAST non-empty
   // assistant message, so old messages can be dropped safely.
   const STDERR_CAP = 65_536
-  const OUTPUT_CAP = 1_048_576
   const MESSAGES_CAP = 1_000
   const appendOutput = (text: string) => {
-    if (output.length < OUTPUT_CAP) output += text
+    const remaining = outputCap - outputBytes
+    if (remaining <= 0) return
+    const appended = truncateUtf8(text, remaining)
+    output += appended
+    outputBytes += utf8ByteLength(appended)
   }
   const appendStderr = (text: string) => {
-    stderrBuffer += text
-    if (stderrBuffer.length > STDERR_CAP) stderrBuffer = stderrBuffer.slice(-STDERR_CAP)
+    stderrBuffer = truncateUtf8(stderrBuffer + text, STDERR_CAP)
   }
 
   const emitProgress = (delta: string) => {
     lastProgressAt = Date.now()
-    onProgress({ task_id: request.task_id, delta, done: false })
+    onProgress({ task_id: request.task_id, delta: truncateUtf8(delta, progressCap), done: false })
+  }
+
+  const stoppedResult = (reason: StopReason): TaskResult => ({
+    task_id: request.task_id,
+    status: reason === "timeout" ? "timed_out" : "cancelled",
+    output: truncateUtf8(output.trim(), outputCap),
+    error: reason === "timeout" ? `Task timed out after ${timeoutMs}ms` : null,
+    duration_ms: Date.now() - startTime,
+  })
+
+  if (abortSignal?.aborted) {
+    onResult(stoppedResult("cancelled"))
+    return
   }
 
   const progressHeartbeat =
@@ -146,6 +179,7 @@ export async function executeTask(
       : undefined
 
   const timeout = setTimeout(() => {
+    if (stopReason) return
     stopReason = "timeout"
     killProc()
   }, timeoutMs)
@@ -159,15 +193,39 @@ export async function executeTask(
   if (abortSignal?.aborted) handleAbort()
 
   function killProc() {
-    if (!proc || proc.killed) return
-    // SIGTERM first for graceful shutdown (kimi drains stdio + closes sessions).
-    proc.kill("SIGTERM")
-    // Force-kill after a grace period so a wedged process can't hang the task.
-    setTimeout(() => {
-      if (proc && !proc.killed) {
-        proc.kill("SIGKILL")
-      }
+    if (!proc || procClosed) return
+    signalProcessGroup("SIGTERM")
+    if (killEscalation) return
+    killEscalation = setTimeout(() => {
+      signalProcessGroup("SIGKILL")
     }, killGrace)
+  }
+
+  function signalProcessGroup(signal: NodeJS.Signals): void {
+    if (!proc) return
+    try {
+      if (process.platform !== "win32" && proc.pid) process.kill(-proc.pid, signal)
+      else proc.kill(signal)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return
+      try {
+        proc.kill(signal)
+      } catch (fallbackError) {
+        if ((fallbackError as NodeJS.ErrnoException).code !== "ESRCH") {
+          console.error(`[kimi executor] failed to send ${signal}:`, fallbackError)
+        }
+      }
+    }
+  }
+
+  function processGroupExists(): boolean {
+    if (!proc?.pid || process.platform === "win32") return false
+    try {
+      process.kill(-proc.pid, 0)
+      return true
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ESRCH"
+    }
   }
 
   try {
@@ -192,19 +250,32 @@ export async function executeTask(
       cwd: workDir,
       env,
       stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     })
+    if (stopReason) killProc()
 
     await new Promise<void>((resolveTask, rejectTask) => {
-      let stdoutBuffer = ""
+      let stdoutBuffer = Buffer.alloc(0)
+      let streamError: Error | undefined
 
       proc!.stdout.on("data", (chunk: Buffer) => {
-        stdoutBuffer += chunk.toString("utf-8")
-        let newlineIndex: number
-        while ((newlineIndex = stdoutBuffer.indexOf("\n")) >= 0) {
-          const line = stdoutBuffer.slice(0, newlineIndex).trim()
-          stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1)
-          if (line.length === 0) continue
-          processStreamLine(line)
+        if (streamError) return
+        stdoutBuffer = Buffer.concat([stdoutBuffer, chunk])
+        let newlineIndex = stdoutBuffer.indexOf(0x0a)
+        while (newlineIndex >= 0) {
+          if (newlineIndex > stdoutLineCap) {
+            streamError = new Error(`kimi stdout line exceeds ${stdoutLineCap} bytes`)
+            killProc()
+            return
+          }
+          const line = stdoutBuffer.subarray(0, newlineIndex).toString("utf8").trim()
+          stdoutBuffer = stdoutBuffer.subarray(newlineIndex + 1)
+          if (line.length > 0) processStreamLine(line)
+          newlineIndex = stdoutBuffer.indexOf(0x0a)
+        }
+        if (stdoutBuffer.length > stdoutLineCap) {
+          streamError = new Error(`kimi stdout line exceeds ${stdoutLineCap} bytes`)
+          killProc()
         }
       })
 
@@ -218,8 +289,14 @@ export async function executeTask(
       })
 
       proc!.on("close", (code) => {
+        procClosed = true
+        if (killEscalation && !processGroupExists()) clearTimeout(killEscalation)
         if (stopReason) {
           rejectTask(new TaskStoppedError(stopReason))
+          return
+        }
+        if (streamError) {
+          rejectTask(streamError)
           return
         }
         if (code !== null && code !== 0) {
@@ -232,23 +309,42 @@ export async function executeTask(
       })
 
       function processStreamLine(line: string): void {
-        let parsed: StreamJsonLine
+        let value: unknown
         try {
-          parsed = JSON.parse(line)
+          value = JSON.parse(line)
         } catch {
           return
+        }
+        if (!isRecord(value)) return
+        const parsed: StreamJsonLine = {
+          role: typeof value.role === "string" ? value.role : undefined,
+          content: typeof value.content === "string" ? value.content : undefined,
+          type: typeof value.type === "string" ? value.type : undefined,
+          tool_call_id: typeof value.tool_call_id === "string" ? value.tool_call_id : undefined,
+          tool_calls: Array.isArray(value.tool_calls)
+            ? value.tool_calls.filter((call): call is NonNullable<KimiMessage["tool_calls"]>[number] =>
+                isRecord(call) && typeof call.id === "string" && typeof call.type === "string" &&
+                isRecord(call.function) && typeof call.function.name === "string" &&
+                typeof call.function.arguments === "string")
+            : undefined,
         }
 
         // Collect for final output extraction. Bounded: only the tail is
         // needed to find the last non-empty assistant message.
+        const content = typeof parsed.content === "string"
+          ? truncateUtf8(parsed.content, outputCap)
+          : undefined
         const msg: KimiMessage = {
           role: parsed.role ?? "",
-          content: typeof parsed.content === "string" ? parsed.content : undefined,
-          tool_calls: parsed.tool_calls,
+          content,
           tool_call_id: parsed.tool_call_id,
         }
         collectedMessages.push(msg)
-        if (collectedMessages.length > MESSAGES_CAP) collectedMessages.shift()
+        collectedBytes += content ? utf8ByteLength(content) : 0
+        while (collectedMessages.length > MESSAGES_CAP || collectedBytes > outputCap) {
+          const removed = collectedMessages.shift()
+          if (removed?.content) collectedBytes -= utf8ByteLength(removed.content)
+        }
 
         if (isAssistantMessage(parsed)) {
           const text = typeof parsed.content === "string" ? parsed.content.trim() : ""
@@ -281,7 +377,7 @@ export async function executeTask(
 
     // Process exited cleanly — assemble the result.
     const canonicalOutput = collectOutput(collectedMessages)
-    const resultOutput = canonicalOutput || output.trim()
+    const resultOutput = truncateUtf8(canonicalOutput || output.trim(), outputCap)
     const durationMs = Date.now() - startTime
 
     if (!resultOutput) {
@@ -306,20 +402,14 @@ export async function executeTask(
     const durationMs = Date.now() - startTime
     const stopped = stopReason ?? (err instanceof TaskStoppedError ? err.reason : undefined)
     if (stopped) {
-      onResult({
-        task_id: request.task_id,
-        status: stopped === "timeout" ? "timed_out" : "cancelled",
-        output: output.trim(),
-        error: stopped === "timeout" ? `Task timed out after ${timeoutMs}ms` : null,
-        duration_ms: Date.now() - startTime,
-      })
+      onResult(stoppedResult(stopped))
       return
     }
-    const errorMsg = kimiErrorMessage(err)
+    const errorMsg = truncateUtf8(kimiErrorMessage(err), STDERR_CAP)
     onResult({
       task_id: request.task_id,
       status: "error",
-      output: output.trim(),
+      output: truncateUtf8(output.trim(), outputCap),
       error: errorMsg,
       duration_ms: durationMs,
     })
@@ -327,12 +417,10 @@ export async function executeTask(
     clearTimeout(timeout)
     if (progressHeartbeat) clearInterval(progressHeartbeat)
     abortSignal?.removeEventListener("abort", handleAbort)
-    if (proc && !proc.killed) {
-      proc.kill("SIGKILL")
-    }
+    if (proc && !procClosed) signalProcessGroup("SIGKILL")
   }
 }
 
 function resolveWorkDir(path: string): string {
-  return resolve(expandWorkspacePath(path, workspaceRoot()))
+  return resolveWorkspacePath(path, workspaceRoot())
 }

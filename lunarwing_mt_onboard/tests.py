@@ -274,6 +274,32 @@ class TestProvisionerArgs(unittest.TestCase):
             self.assertIn(flag, args)
             self.assertIn(value, args)
 
+    def test_kimi_api_key_uses_secret_injection_not_argv(self):
+        secret = "kimi-secret-value"
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "lunarwing-mt-admin.sh")
+            with open(script, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(script, 0o700)
+            previous = provisioner.MT_ADMIN_SCRIPT
+            provisioner.MT_ADMIN_SCRIPT = script
+            try:
+                config = TenantConfig(name="alpha", kimi_api_key=secret)
+                args = provisioner.build_add_tenant_args(config)
+            finally:
+                provisioner.MT_ADMIN_SCRIPT = previous
+
+        self.assertNotIn("--kimi-api-key", args)
+        self.assertNotIn(secret, args)
+        with patch.object(provisioner.os.path, "isfile", return_value=True), patch.object(
+            provisioner, "_write_env_values"
+        ) as write_values:
+            provisioner._inject_secrets(config)
+        write_values.assert_called_once_with(
+            "/home/alpha/lunarwing/env/lunarwing.env",
+            {"KIMI_API_KEY": secret},
+        )
+
     def test_worker_selection_is_forwarded_to_add_tenant(self):
         # start-tenant gates workers on the per-tenant registry flag persisted at
         # add-tenant, so build_add_tenant_args must emit --with-* for selected

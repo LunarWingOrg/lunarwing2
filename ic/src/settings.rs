@@ -867,10 +867,10 @@ pub struct ExternalWorkerSettings {
     pub name: String,
     /// WebSocket URL (e.g., "ws://localhost:9090/ws/agent").
     pub url: String,
-    /// Bearer token for authentication (empty = no auth). Secret-bearing: not
-    /// serialized out (SecretString has no Serialize impl); `Debug` redacts via
-    /// secrecy. merge_from preserves auth_token via a direct post-merge fixup
-    /// because skip_serializing drops it during the serde_json transport.
+    /// Bearer token for authentication (empty = no auth). Secret-bearing:
+    /// skipped by serde so JSON/API transports cannot expose it; `Debug`
+    /// redacts via secrecy. `save_toml` explicitly re-injects it into the
+    /// on-disk config, while `merge_from` preserves it across its JSON merge.
     #[serde(default, skip_serializing)]
     pub auth_token: Option<SecretString>,
     /// Default task timeout in milliseconds.
@@ -1330,7 +1330,10 @@ impl Settings {
 
     /// Write a well-commented TOML config file with current settings.
     pub fn save_toml(&self, path: &std::path::Path) -> Result<(), String> {
-        let raw = toml::to_string_pretty(self)
+        let mut value = toml::Value::try_from(self)
+            .map_err(|e| format!("failed to serialize settings: {}", e))?;
+        self.reinject_external_worker_tokens(&mut value)?;
+        let raw = toml::to_string_pretty(&value)
             .map_err(|e| format!("failed to serialize settings: {}", e))?;
 
         let content = format!(
@@ -1352,6 +1355,81 @@ impl Settings {
 
         std::fs::write(path, content)
             .map_err(|e| format!("failed to write {}: {}", path.display(), e))
+    }
+
+    /// Restore secrets skipped by serde only into the TOML tree written to disk.
+    fn reinject_external_worker_tokens(&self, value: &mut toml::Value) -> Result<(), String> {
+        use secrecy::ExposeSecret;
+
+        let worker_values = value
+            .get_mut("sandbox")
+            .and_then(|sandbox| sandbox.get_mut("external_workers"))
+            .and_then(toml::Value::as_array_mut)
+            .ok_or_else(|| {
+                "serialized settings missing sandbox.external_workers array".to_string()
+            })?;
+
+        if worker_values.len() != self.sandbox.external_workers.len() {
+            return Err("serialized external worker count mismatch".to_string());
+        }
+
+        for (worker_index, worker) in self.sandbox.external_workers.iter().enumerate() {
+            let worker_table = worker_values[worker_index].as_table_mut().ok_or_else(|| {
+                format!("serialized external worker {worker_index} is not a table")
+            })?;
+            if worker_table.get("name").and_then(toml::Value::as_str) != Some(worker.name.as_str())
+            {
+                return Err(format!(
+                    "serialized external worker order mismatch at index {worker_index}"
+                ));
+            }
+            if let Some(token) = &worker.auth_token {
+                worker_table.insert(
+                    "auth_token".to_string(),
+                    toml::Value::String(token.expose_secret().to_string()),
+                );
+            }
+
+            let endpoint_values = worker_table
+                .get_mut("endpoints")
+                .and_then(toml::Value::as_array_mut)
+                .ok_or_else(|| {
+                    format!("serialized external worker {worker_index} missing endpoints array")
+                })?;
+            if endpoint_values.len() != worker.endpoints.len() {
+                return Err(format!(
+                    "serialized endpoint count mismatch for external worker {worker_index}"
+                ));
+            }
+
+            for (endpoint_index, endpoint) in worker.endpoints.iter().enumerate() {
+                let endpoint_table =
+                    endpoint_values[endpoint_index]
+                        .as_table_mut()
+                        .ok_or_else(|| {
+                            format!(
+                                "serialized endpoint {endpoint_index} for external worker \
+                             {worker_index} is not a table"
+                            )
+                        })?;
+                if endpoint_table.get("url").and_then(toml::Value::as_str)
+                    != Some(endpoint.url.as_str())
+                {
+                    return Err(format!(
+                        "serialized endpoint order mismatch at external worker {worker_index}, \
+                         endpoint {endpoint_index}"
+                    ));
+                }
+                if let Some(token) = &endpoint.auth_token {
+                    endpoint_table.insert(
+                        "auth_token".to_string(),
+                        toml::Value::String(token.expose_secret().to_string()),
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Merge values from `other` into `self`, preferring `other` for
@@ -1849,6 +1927,114 @@ mod tests {
         assert_eq!(loaded.agent.name, "toml-bot");
         assert!(loaded.heartbeat.enabled);
         assert_eq!(loaded.heartbeat.interval_secs, 900);
+    }
+
+    #[test]
+    fn toml_save_preserves_external_worker_auth_tokens() {
+        use secrecy::ExposeSecret;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[sandbox.external_workers]]
+name = "without-token"
+url = "ws://127.0.0.1:10001/ws/agent"
+
+[[sandbox.external_workers]]
+name = "with-token"
+url = "ws://127.0.0.1:10002/ws/agent"
+auth_token = "worker-secret"
+"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load_toml(&path).unwrap().unwrap();
+        loaded.save_toml(&path).unwrap();
+        let reloaded = Settings::load_toml(&path).unwrap().unwrap();
+
+        assert_eq!(reloaded.sandbox.external_workers[0].name, "without-token");
+        assert!(reloaded.sandbox.external_workers[0].auth_token.is_none());
+        assert_eq!(reloaded.sandbox.external_workers[1].name, "with-token");
+        assert_eq!(
+            reloaded.sandbox.external_workers[1]
+                .auth_token
+                .as_ref()
+                .map(|token| token.expose_secret()),
+            Some("worker-secret")
+        );
+    }
+
+    #[test]
+    fn toml_save_preserves_external_worker_endpoint_auth_tokens() {
+        use secrecy::ExposeSecret;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[sandbox.external_workers]]
+name = "multi-endpoint"
+url = "ws://127.0.0.1:10000/ws/agent"
+
+[[sandbox.external_workers.endpoints]]
+url = "ws://127.0.0.1:10001/ws/agent"
+
+[[sandbox.external_workers.endpoints]]
+url = "ws://127.0.0.1:10002/ws/agent"
+auth_token = "endpoint-secret"
+"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load_toml(&path).unwrap().unwrap();
+        loaded.save_toml(&path).unwrap();
+        let reloaded = Settings::load_toml(&path).unwrap().unwrap();
+        let endpoints = &reloaded.sandbox.external_workers[0].endpoints;
+
+        assert_eq!(endpoints[0].url, "ws://127.0.0.1:10001/ws/agent");
+        assert!(endpoints[0].auth_token.is_none());
+        assert_eq!(endpoints[1].url, "ws://127.0.0.1:10002/ws/agent");
+        assert_eq!(
+            endpoints[1]
+                .auth_token
+                .as_ref()
+                .map(|token| token.expose_secret()),
+            Some("endpoint-secret")
+        );
+    }
+
+    #[test]
+    fn toml_save_keeps_absent_external_worker_tokens_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[sandbox.external_workers]]
+name = "no-auth"
+url = "ws://127.0.0.1:10000/ws/agent"
+
+[[sandbox.external_workers.endpoints]]
+url = "ws://127.0.0.1:10001/ws/agent"
+"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load_toml(&path).unwrap().unwrap();
+        loaded.save_toml(&path).unwrap();
+        let reloaded = Settings::load_toml(&path).unwrap().unwrap();
+        let worker = &reloaded.sandbox.external_workers[0];
+
+        assert!(worker.auth_token.is_none());
+        assert!(worker.endpoints[0].auth_token.is_none());
+        assert!(
+            !std::fs::read_to_string(path)
+                .unwrap()
+                .contains("auth_token")
+        );
     }
 
     #[test]

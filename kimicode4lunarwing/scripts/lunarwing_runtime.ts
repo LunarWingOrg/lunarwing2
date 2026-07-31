@@ -29,14 +29,34 @@ export function createEnvelope(type: string, payload: Record<string, unknown>): 
 
 export function parseEnvelope(data: string): Envelope | null {
   try {
-    const msg = JSON.parse(data)
-    if (msg && typeof msg.type === "string" && msg.payload !== null && typeof msg.payload === "object") {
-      return msg as Envelope
+    const msg: unknown = JSON.parse(data)
+    if (
+      isRecord(msg) &&
+      typeof msg.type === "string" &&
+      isRecord(msg.payload)
+    ) {
+      return msg as unknown as Envelope
     }
     return null
   } catch {
     return null
   }
+}
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+export function utf8ByteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8")
+}
+
+export function truncateUtf8(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8")
+  if (bytes.length <= maxBytes) return value
+  let end = Math.max(0, maxBytes)
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--
+  return bytes.subarray(0, end).toString("utf8")
 }
 
 // ── Message Types ─────────────────────────────────────────────────────────────
@@ -54,6 +74,55 @@ export interface TaskRequest {
   prompt: string
   context?: TaskContext
   timeout_ms?: number
+}
+
+export interface TaskRequestLimits {
+  maxPromptBytes: number
+  maxEnvironmentBytes: number
+}
+
+export function validateTaskRequest(
+  payload: unknown,
+  limits: TaskRequestLimits,
+): { request?: TaskRequest; error?: string; taskId: string } {
+  const taskId = isRecord(payload) && typeof payload.task_id === "string" ? payload.task_id : "unknown"
+  if (!isRecord(payload)) return { error: "Task payload must be a JSON object", taskId }
+  if (typeof payload.task_id !== "string" || payload.task_id.length === 0) {
+    return { error: "Missing or invalid task_id", taskId }
+  }
+  if (typeof payload.prompt !== "string" || payload.prompt.length === 0) {
+    return { error: "Missing or invalid prompt", taskId }
+  }
+  if (utf8ByteLength(payload.prompt) > limits.maxPromptBytes) {
+    return { error: `Prompt exceeds ${limits.maxPromptBytes} UTF-8 bytes`, taskId }
+  }
+  if (payload.timeout_ms !== undefined &&
+      (typeof payload.timeout_ms !== "number" || !Number.isSafeInteger(payload.timeout_ms) ||
+       payload.timeout_ms <= 0 || payload.timeout_ms > 2_147_483_647)) {
+    return { error: "timeout_ms must be an integer between 1 and 2147483647", taskId }
+  }
+  if (payload.context !== undefined && !isRecord(payload.context)) {
+    return { error: "context must be a JSON object", taskId }
+  }
+  if (isRecord(payload.context) && payload.context.project_dir !== undefined &&
+      typeof payload.context.project_dir !== "string") {
+    return { error: "context.project_dir must be a string", taskId }
+  }
+  const environment = isRecord(payload.context) ? payload.context.environment : undefined
+  if (environment !== undefined) {
+    if (!isRecord(environment)) return { error: "context.environment must be a JSON object", taskId }
+    let environmentBytes = 0
+    for (const [key, value] of Object.entries(environment)) {
+      if (typeof value !== "string") {
+        return { error: "context.environment values must be strings", taskId }
+      }
+      environmentBytes += utf8ByteLength(key) + utf8ByteLength(value)
+      if (environmentBytes > limits.maxEnvironmentBytes) {
+        return { error: `Environment exceeds ${limits.maxEnvironmentBytes} UTF-8 bytes`, taskId }
+      }
+    }
+  }
+  return { request: payload as unknown as TaskRequest, taskId }
 }
 
 const MAX_HISTORY_MESSAGES = 50

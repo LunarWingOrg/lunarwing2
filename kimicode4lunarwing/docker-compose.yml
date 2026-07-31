@@ -2,6 +2,8 @@ x-worker-base: &worker-base
   build:
     context: .
     dockerfile: Dockerfile
+    args:
+      WITH_TOOLCHAINS: ${WITH_TOOLCHAINS:-false}
   image: lunarwing-worker-kimi:latest
   working_dir: /workspace
   group_add:

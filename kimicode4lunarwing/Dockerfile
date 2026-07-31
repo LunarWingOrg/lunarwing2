@@ -33,13 +33,14 @@ RUN npm install --omit=dev --ignore-scripts && \
 # ──────────────────────────────
 FROM docker.io/library/node:22-bookworm-slim AS runtime
 
-LABEL org.opencontainers.image.title="LunarWing Kimi Code Worker" \
-      org.opencontainers.image.description="Persistent Kimi Code CLI worker with WebSocket agent communication" \
-      org.opencontainers.image.version="1.0.0"
-
 # WITH_TOOLCHAINS=false (default): slim runtime — no Rust/Go/C++ toolchains.
 # Pass --build-arg WITH_TOOLCHAINS=true for the fat image (CI, dev tenants).
 ARG WITH_TOOLCHAINS=false
+
+LABEL org.opencontainers.image.title="LunarWing Kimi Code Worker" \
+      org.opencontainers.image.description="Persistent Kimi Code CLI worker with WebSocket agent communication" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
 # Runtime packages: always installed (needed by the worker itself).
 RUN set -e; \
@@ -51,6 +52,8 @@ RUN set -e; \
     apt-get install -y --no-install-recommends \
       tini \
       python3 \
+      python3-pip \
+      python3-venv \
       git \
       ripgrep \
       curl \
@@ -70,15 +73,35 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         apt-get update; \
       }) && \
       apt-get install -y --no-install-recommends \
+        python3-dev \
         build-essential \
         gcc \
         g++ \
         libc-dev \
+        binutils \
         cmake \
         ninja-build \
+        clang \
+        lld \
+        llvm \
+        libclang-dev \
         pkg-config \
         libssl-dev \
         zlib1g-dev \
+        libsqlite3-dev \
+        libpq-dev \
+        libffi-dev \
+        liblzma-dev \
+        libzstd-dev \
+        libcurl4-openssl-dev \
+        libxml2-dev \
+        protobuf-compiler \
+        libprotobuf-dev \
+        musl-tools \
+        autoconf \
+        automake \
+        libtool \
+        meson \
         nodejs \
         npm \
       && rm -rf /var/lib/apt/lists/*; \
@@ -94,14 +117,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Rust toolchain (only with WITH_TOOLCHAINS=true) ───────────────────────────
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
+ENV RUSTUP_HOME=/usr/local/rustup
 
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain 1.96.1 \
-      && chmod -R a+r /usr/local/rustup /usr/local/cargo; \
+        | CARGO_HOME=/usr/local/cargo sh -s -- -y --default-toolchain 1.96.1 \
+      && chmod -R a+rX /usr/local/rustup /usr/local/cargo; \
     fi
 
 # ── Go toolchain (only with WITH_TOOLCHAINS=true) ──────────────────────────────
@@ -112,7 +133,8 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
     fi
 ENV GOROOT=/usr/local/go \
     GOPATH=/home/kimi/go \
-    PATH=/usr/local/go/bin:/home/kimi/go/bin:$PATH
+    CARGO_HOME=/home/kimi/.cargo \
+    PATH=/home/kimi/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/kimi/go/bin:$PATH
 
 # ── non-root user ──────────────────────
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh. Rootless Podman

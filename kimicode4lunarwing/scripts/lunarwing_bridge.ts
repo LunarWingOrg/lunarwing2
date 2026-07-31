@@ -8,12 +8,13 @@
  *   client — connects outbound to a hub
  */
 
-import { resolve } from "node:path"
 import { WebSocketServer, WebSocket } from "ws"
 
 import {
   createEnvelope,
+  isRecord,
   parseEnvelope,
+  validateTaskRequest,
   writeWsState,
   SUBPROTOCOL,
   LEGACY_SUBPROTOCOL,
@@ -26,7 +27,7 @@ import {
   type WsState,
 } from "./lunarwing_runtime.js"
 import { executeTask } from "./kimi_task_executor.js"
-import { expandWorkspacePath } from "./workspace_path.js"
+import { resolveWorkspacePath } from "./workspace_path.js"
 
 // A single malformed frame or a stray async error must not take the whole
 // worker process down (which would drop every in-flight task). Log and survive.
@@ -46,6 +47,22 @@ const RECONNECT_MS = parseInt(process.env.RECONNECT_MS || "3000", 10)
 const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || "20000", 10)
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
 
+function envInteger(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw === "") return fallback
+  if (!/^\d+$/.test(raw)) throw new Error(`${name} must be an integer between ${min} and ${max}`)
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}`)
+  }
+  return value
+}
+
+const WS_MAX_PAYLOAD_BYTES = envInteger("WS_MAX_PAYLOAD_BYTES", 1_048_576, 1_024, 16_777_216)
+const KIMI_MAX_PROMPT_BYTES = envInteger("KIMI_MAX_PROMPT_BYTES", 524_288, 1, 8_388_608)
+const KIMI_MAX_ENVIRONMENT_BYTES = envInteger("KIMI_MAX_ENVIRONMENT_BYTES", 65_536, 0, 1_048_576)
+const KIMI_MAX_CONCURRENT_TASKS = envInteger("KIMI_MAX_CONCURRENT_TASKS", 4, 1, 128)
+
 // ── Active Tasks ──────────────────────────────────────────────────────────────
 
 type BridgeSocket = { send(data: string): void }
@@ -55,7 +72,7 @@ const activeTasks = new Map<string, ActiveTask>()
 const activeWorkspaces = new Map<string, string>()
 
 function taskWorkspace(request: TaskRequest): string {
-  return resolve(expandWorkspacePath(request.context?.project_dir || WORKSPACE_ROOT, WORKSPACE_ROOT))
+  return resolveWorkspacePath(request.context?.project_dir || WORKSPACE_ROOT, WORKSPACE_ROOT)
 }
 
 function abortSocketTasks(socket: BridgeSocket): void {
@@ -89,13 +106,13 @@ async function handleMessage(data: string, ws: BridgeSocket): Promise<void> {
   try {
     switch (envelope.type) {
       case "task_request":
-        void handleTaskRequest(envelope.payload as unknown as TaskRequest, ws).catch((error) => {
+        void handleTaskRequest(envelope.payload, ws).catch((error) => {
           console.error("[bridge] asynchronous task handler failed:", error)
         })
         break
 
       case "cancel":
-        handleCancel(envelope.payload as { task_id: string })
+        handleCancel(envelope.payload)
         break
 
       case "ping":
@@ -111,20 +128,25 @@ async function handleMessage(data: string, ws: BridgeSocket): Promise<void> {
 }
 
 async function handleTaskRequest(
-  request: TaskRequest,
+  payload: unknown,
   ws: BridgeSocket,
 ): Promise<void> {
-  if (!request.task_id || !request.prompt) {
+  const validated = validateTaskRequest(payload, {
+    maxPromptBytes: KIMI_MAX_PROMPT_BYTES,
+    maxEnvironmentBytes: KIMI_MAX_ENVIRONMENT_BYTES,
+  })
+  if (!validated.request) {
     const errMsg = createEnvelope("task_result", {
-      task_id: request.task_id || "unknown",
+      task_id: validated.taskId,
       status: "error",
       output: "",
-      error: "Missing task_id or prompt",
+      error: validated.error || "Invalid task request",
       duration_ms: 0,
     })
     ws.send(JSON.stringify(errMsg))
     return
   }
+  const request = validated.request
 
   console.log(`[bridge] task ${request.task_id}: starting`)
 
@@ -138,7 +160,30 @@ async function handleTaskRequest(
     return
   }
 
-  const workspace = taskWorkspace(request)
+  if (activeTasks.size >= KIMI_MAX_CONCURRENT_TASKS) {
+    ws.send(JSON.stringify(createEnvelope("task_result", {
+      task_id: request.task_id,
+      status: "error",
+      output: "",
+      error: `Worker concurrency limit reached (${KIMI_MAX_CONCURRENT_TASKS})`,
+      duration_ms: 0,
+    })))
+    return
+  }
+
+  let workspace: string
+  try {
+    workspace = taskWorkspace(request)
+  } catch (error) {
+    ws.send(JSON.stringify(createEnvelope("task_result", {
+      task_id: request.task_id,
+      status: "error",
+      output: "",
+      error: error instanceof Error ? error.message : "Invalid workspace path",
+      duration_ms: 0,
+    })))
+    return
+  }
   const workspaceTask = activeWorkspaces.get(workspace)
   if (workspaceTask) {
     const result = createEnvelope("task_result", {
@@ -181,7 +226,11 @@ async function handleTaskRequest(
   }
 }
 
-function handleCancel(payload: { task_id: string }): void {
+function handleCancel(payload: unknown): void {
+  if (!isRecord(payload) || typeof payload.task_id !== "string" || payload.task_id.length === 0) {
+    console.warn("[bridge] cancel: invalid payload")
+    return
+  }
   const task = activeTasks.get(payload.task_id)
   if (task) {
     console.log(`[bridge] task ${payload.task_id}: cancelled`)
@@ -194,6 +243,9 @@ function handleCancel(payload: { task_id: string }): void {
 // ── Server Role ───────────────────────────────────────────────────────────────
 
 function startServer(): void {
+  if (!AGENT_AUTH_TOKEN && !isLoopbackHost(WS_BIND_HOST)) {
+    throw new Error("AGENT_AUTH_TOKEN is required for non-loopback WS_BIND_HOST")
+  }
   let connectionCount = 0
 
   function updateState(ready: boolean): void {
@@ -213,6 +265,7 @@ function startServer(): void {
     host: WS_BIND_HOST,
     port: WS_PORT,
     path: WS_PATH,
+    maxPayload: WS_MAX_PAYLOAD_BYTES,
     // Validate subprotocol: accept the primary name or the legacy alias, and
     // echo back the matched offered value (preferring the primary). Old
     // daemons offer only the legacy name and reject an echo they never
@@ -303,7 +356,10 @@ async function startClient(): Promise<void> {
     }
 
     try {
-      const ws = new WebSocket(uri, [SUBPROTOCOL, LEGACY_SUBPROTOCOL], { headers })
+      const ws = new WebSocket(uri, [SUBPROTOCOL, LEGACY_SUBPROTOCOL], {
+        headers,
+        maxPayload: WS_MAX_PAYLOAD_BYTES,
+      })
       const bridgeSocket: BridgeSocket = { send: (data) => ws.send(data) }
 
       ws.addEventListener("open", () => {
@@ -344,6 +400,11 @@ async function startClient(): Promise<void> {
   await connect()
 
   await new Promise(() => {})
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.toLowerCase().replace(/^\[|\]$/g, "")
+  return normalized === "localhost" || normalized === "::1" || /^127(?:\.\d{1,3}){3}$/.test(normalized)
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────

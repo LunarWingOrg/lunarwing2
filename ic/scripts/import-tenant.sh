@@ -485,7 +485,8 @@ $WITH_DOCKER_GROUP && add_args+=(--docker-group)
 [[ -n "$OPENCODE_BASE_URL" ]] && add_args+=(--opencode-base-url "$OPENCODE_BASE_URL")
 [[ -n "$KIMI_MODEL" ]] && add_args+=(--kimi-model "$KIMI_MODEL")
 [[ -n "$KIMI_BASE_URL" ]] && add_args+=(--kimi-base-url "$KIMI_BASE_URL")
-[[ -n "$KIMI_API_KEY" ]] && add_args+=(--kimi-api-key "$KIMI_API_KEY")
+# KIMI_API_KEY is secret-bearing. add-tenant generates placeholder config;
+# manifest injection below replaces it without exposing value through argv/logs.
 [[ -n "$GOTIFY_URL" ]] && add_args+=(--gotify-url "$GOTIFY_URL")
 # Persist the operator's worker selection at add-tenant (not just build-tenant):
 # start-tenant now gates on the per-tenant registry flag, so an imported tenant

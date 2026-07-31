@@ -78,6 +78,8 @@ services:
     build:
       context: ../opencode4lunarwing
       dockerfile: Dockerfile
+      args:
+        WITH_TOOLCHAINS: ${WITH_TOOLCHAINS:-false}
     environment:
       - AGENT_AUTH_TOKEN=${HARNESS_AUTH_TOKEN:-test-token}
       - TENSORZERO_API_KEY=${MOCK_API_KEY:-test-key}
@@ -96,6 +98,8 @@ services:
     build:
       context: ../kimicode4lunarwing
       dockerfile: Dockerfile
+      args:
+        WITH_TOOLCHAINS: ${WITH_TOOLCHAINS:-false}
     environment:
       - AGENT_AUTH_TOKEN=${HARNESS_AUTH_TOKEN:-test-token}
       - KIMI_API_KEY=${MOCK_API_KEY:-test-key}

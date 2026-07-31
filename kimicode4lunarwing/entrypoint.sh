@@ -11,6 +11,7 @@ WS_STATE_FILE="${WS_STATE_FILE:-/tmp/lunarwing_ws_state.json}"
 FILE_UMASK="${FILE_UMASK:-0002}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace}"
 KIMI_CODE_HOME="${KIMI_CODE_HOME:-/home/kimi/.kimi-code}"
+KIMI_CONFIG_SOURCE="${KIMI_CONFIG_SOURCE:-/app/config/config.toml}"
 
 umask "$FILE_UMASK"
 
@@ -72,58 +73,57 @@ done
 # Code CLI reads its config from $KIMI_CODE_HOME/config.toml.
 mkdir -p "$KIMI_CODE_HOME"
 
-if [ -f /app/config/config.toml ]; then
+if [ -f "$KIMI_CONFIG_SOURCE" ]; then
+  python3 - "$KIMI_CONFIG_SOURCE" "$KIMI_CODE_HOME/config.toml" <<'PY'
+import os, re, sys, tempfile, tomllib
+
+source, target = sys.argv[1:]
+with open(source, "r", encoding="utf-8") as config_file:
+    text = config_file.read()
+
+def toml_string(value):
+    escapes = {'"': '\\"', '\\': '\\\\', '\b': '\\b', '\t': '\\t', '\n': '\\n', '\f': '\\f', '\r': '\\r'}
+    return '"' + ''.join(escapes.get(char, f"\\u{ord(char):04x}" if ord(char) < 0x20 or ord(char) == 0x7f else char) for char in value) + '"'
+
+def replace_setting(config, name, value, required):
+    if not value:
+        return config
+    pattern = re.compile(rf'^(\s*{re.escape(name)}\s*=).*$' , re.MULTILINE)
+    if pattern.search(config):
+        return pattern.sub(lambda match: f'{match.group(1)} {toml_string(value)}', config, count=1)
+    if required:
+        raise ValueError(f"config missing {name}")
+    return f'{name} = {toml_string(value)}\n{config}'
+
+text = replace_setting(text, "default_model", os.environ.get("KIMI_MODEL", ""), False)
+text = replace_setting(text, "base_url", os.environ.get("KIMI_BASE_URL", ""), True)
+text = replace_setting(text, "api_key", os.environ.get("KIMI_API_KEY", ""), True)
+tomllib.loads(text)
+
+fd, temporary = tempfile.mkstemp(prefix=".config.toml.", dir=os.path.dirname(target))
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as config_file:
+        config_file.write(text)
+        config_file.flush()
+        os.fsync(config_file.fileno())
+    os.replace(temporary, target)
+    os.chmod(target, 0o600)
+except BaseException:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
   if [ -n "${KIMI_MODEL:-}" ] || [ -n "${KIMI_BASE_URL:-}" ] || [ -n "${KIMI_API_KEY:-}" ]; then
-    cp /app/config/config.toml "$KIMI_CODE_HOME/config.toml"
-    if [ -n "${KIMI_MODEL:-}" ]; then
-      # Override default_model in the config.toml.
-      python3 - "$KIMI_CODE_HOME/config.toml" <<'PY'
-import os, re, sys
-path = sys.argv[1]
-with open(path, "r") as f:
-    text = f.read()
-model = os.environ.get("KIMI_MODEL", "").strip()
-if model:
-    if re.search(r'^default_model\s*=', text, re.MULTILINE):
-        text = re.sub(r'^default_model\s*=.*$', f'default_model = "{model}"', text, count=1, flags=re.MULTILINE)
-    else:
-        text = f'default_model = "{model}"\n' + text
-with open(path, "w") as f:
-    f.write(text)
-PY
-    fi
-    if [ -n "${KIMI_BASE_URL:-}" ]; then
-      # Override provider base_url in config.toml.
-      python3 - "$KIMI_CODE_HOME/config.toml" <<'PY'
-import os, re, sys
-path = sys.argv[1]
-with open(path, "r") as f:
-    text = f.read()
-base = os.environ.get("KIMI_BASE_URL", "").strip()
-if base:
-    text = re.sub(r'base_url\s*=\s*"[^"]*"', f'base_url = "{base}"', text, count=1)
-with open(path, "w") as f:
-    f.write(text)
-PY
-    fi
-    if [ -n "${KIMI_API_KEY:-}" ]; then
-      # Inject the API key (baked default ships api_key = "").
-      python3 - "$KIMI_CODE_HOME/config.toml" <<'PY'
-import os, re, sys
-path = sys.argv[1]
-with open(path, "r") as f:
-    text = f.read()
-key = os.environ.get("KIMI_API_KEY", "").strip()
-if key:
-    text = re.sub(r'api_key\s*=\s*"[^"]*"', f'api_key = "{key}"', text, count=1)
-with open(path, "w") as f:
-    f.write(text)
-PY
-    fi
     log "Config generated with overrides (model=${KIMI_MODEL:-<default>}, base_url=${KIMI_BASE_URL:-<default>}, api_key=${KIMI_API_KEY:+set})"
   else
-    cp /app/config/config.toml "$KIMI_CODE_HOME/config.toml"
-    log "Config copied: /app/config/config.toml -> $KIMI_CODE_HOME/config.toml"
+    log "Config copied: $KIMI_CONFIG_SOURCE -> $KIMI_CODE_HOME/config.toml"
   fi
 fi
 
@@ -139,9 +139,9 @@ sleep 1
 
 cleanup() {
   log "Shutting down..."
-  kill "$BRIDGE_PID" 2>/dev/null || true
+  [ -z "${BRIDGE_PID:-}" ] || kill "$BRIDGE_PID" 2>/dev/null || true
   kill "$HEALTH_PID" 2>/dev/null || true
-  wait "$BRIDGE_PID" 2>/dev/null || true
+  [ -z "${BRIDGE_PID:-}" ] || wait "$BRIDGE_PID" 2>/dev/null || true
   wait "$HEALTH_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -150,9 +150,10 @@ trap cleanup EXIT INT TERM
 case "$MODE" in
 
   cli)
-    log "Mode: CLI — running kimi with args: $*"
+    [ $# -gt 0 ] || die "CLI mode requires prompt arguments"
+    log "Mode: CLI — running kimi in print/stream-json mode"
     cd "$WORKSPACE_ROOT"
-    exec kimi "$@"
+    exec kimi -p "$*" --output-format stream-json
     ;;
 
   websocket)

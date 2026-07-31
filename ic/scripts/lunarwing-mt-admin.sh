@@ -349,6 +349,8 @@ Commands:
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
     --with-kimi                    Also build the kimi worker Docker image
+    --with-toolchains              Include toolchains in selected nanocode,
+                                   opencode, and kimi worker images (default: slim)
 
   build-all                        Build each tenant sequentially
     --with-wasm                    Also build WASM extensions
@@ -356,6 +358,8 @@ Commands:
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
     --with-kimi                    Also build the kimi worker Docker image
+    --with-toolchains              Include toolchains in selected nanocode,
+                                   opencode, and kimi worker images (default: slim)
 
   build-nanocode-worker            Build the nanocode worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
@@ -2049,7 +2053,7 @@ build_tenant() {
   if [[ "$with_kimi" == "true" ]]; then
     say ""
     say "=== Building kimi worker image ==="
-    build_kimi_worker "false" "$with_toolchains"
+    build_kimi_worker "false" "$with_toolchains" "0.30.0" "$(tenant_lw_root "$name")"
   fi
 
   # After a rebuild, the tenant will be restarted with the new binary. If the
@@ -2165,7 +2169,10 @@ build_all() {
   if [[ "$with_kimi" == "true" ]]; then
     say ""
     say "=== Building kimi worker image ==="
-    build_kimi_worker "false" "$with_toolchains"
+    local kimi_source_tenant
+    kimi_source_tenant="${names%%$'\n'*}"
+    build_kimi_worker "false" "$with_toolchains" "0.30.0" \
+      "$(tenant_lw_root "$kimi_source_tenant")"
   fi
 
   while IFS= read -r name; do
@@ -2283,7 +2290,8 @@ build_kimi_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
   local kimi_code_version="${3:-0.30.0}"
-  local kimi_dir="${LUNARWING_ROOT}/kimicode4lunarwing"
+  local source_root="${4:-$LUNARWING_ROOT}"
+  local kimi_dir="${source_root}/kimicode4lunarwing"
 
   [[ -d "$kimi_dir" ]] || die "kimi worker dir not found at $kimi_dir"
 
@@ -3321,6 +3329,11 @@ ensure_external_worker_config() {
   local port_key="$3"  # ports-registry key for its WSS port (e.g. "nanocode_wss")
 
   local state_dir env_path config_path wss_port auth_token
+
+  if [[ "$worker" == "kimi" ]] && ! tenant_worker_enabled "$name" kimi; then
+    say "kimi worker not selected for $name (skipping external-worker config)"
+    return 0
+  fi
   state_dir="$(tenant_state_dir "$name")"
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   config_path="$state_dir/config.toml"
@@ -4764,6 +4777,23 @@ stop_tenant_opencode() {
 
 # ── Kimi Code worker container ────────────────────────────────────────────────
 
+prepare_worker_workspace() {
+  local name="$1" worker="$2" workspace_dir tenant_gid
+  workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
+  mkdir -p "$workspace_dir"
+
+  if [[ "$worker" == "kimi" && "$MT_ROOTLESS" != "true" ]]; then
+    # Rootful runtimes do not apply keep-id. Image UID 10002 owns files while
+    # tenant's primary group retains host access; setgid preserves that group.
+    tenant_gid="$(id -g "$name")" || die "cannot resolve gid for tenant '$name'"
+    chown -R "$KIMI_CONTAINER_UID:$tenant_gid" "$workspace_dir"
+  else
+    chown -R "$name:$name" "$workspace_dir"
+  fi
+  chmod 2770 "$workspace_dir"
+  printf '%s\n' "$workspace_dir"
+}
+
 configure_kimi() {
   local name="$1"
   local model="${2:-}"
@@ -4779,7 +4809,13 @@ configure_kimi() {
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
 
-  local tmp
+  local tmp existing_model existing_base_url existing_api_key
+  existing_model="$(_read_env_value "$env_path" KIMI_MODEL)"
+  existing_base_url="$(_read_env_value "$env_path" KIMI_BASE_URL)"
+  existing_api_key="$(_read_env_value "$env_path" KIMI_API_KEY)"
+  [[ -n "$model" ]] || model="$existing_model"
+  [[ -n "$base_url" ]] || base_url="$existing_base_url"
+  [[ -n "$api_key" ]] || api_key="$existing_api_key"
   tmp="$(mktemp)"
   grep -v -e '^KIMI_MODEL=' -e '^KIMI_BASE_URL=' -e '^KIMI_API_KEY=' "$env_path" >"$tmp" || true
   [[ -n "$model" ]]    && printf 'KIMI_MODEL=%s\n'    "$model"    >>"$tmp"
@@ -4908,10 +4944,7 @@ start_tenant_kimi() {
     fi
 
     local workspace_dir
-    workspace_dir="$(tenant_lw_root "$name")/kimi-workspace"
-    mkdir -p "$workspace_dir"
-    chown -R "$name:$name" "$workspace_dir"
-    chmod 777 "$workspace_dir"
+    workspace_dir="$(prepare_worker_workspace "$name" kimi)"
 
     local -a restart_arg=()
     [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
@@ -5790,13 +5823,15 @@ render_worker_quadlet() {
   worker_env_path="$env_dir/${worker}.env"
   workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
   mkdir -p "$workspace_dir"
-  if [[ "$worker" == "opencode" || "$worker" == "kimi" ]]; then
+  if [[ "$worker" == "kimi" ]]; then
+    workspace_dir="$(prepare_worker_workspace "$name" "$worker")"
+  elif [[ "$worker" == "opencode" ]]; then
     # Migrate files created under older rootless UID mappings.
     chown -R "$name:$name" "$workspace_dir"
   else
     chown "$name:$name" "$workspace_dir"
   fi
-  chmod 777 "$workspace_dir"
+  [[ "$worker" == "kimi" ]] || chmod 777 "$workspace_dir"
   mkdir -p "$qdir"
 
   local agent_token tz_key
@@ -5906,6 +5941,9 @@ EOF
     kimi_model="$(_read_env_value "$tenant_env_path" KIMI_MODEL)"
     kimi_base_url="$(_read_env_value "$tenant_env_path" KIMI_BASE_URL)"
     kimi_api_key="$(_read_env_value "$tenant_env_path" KIMI_API_KEY)"
+    kimi_model="${kimi_model//%/%%}"
+    kimi_base_url="${kimi_base_url//%/%%}"
+    kimi_api_key="${kimi_api_key//%/%%}"
     [[ "$worker" == "kimi" && -n "$kimi_model" ]] && printf 'Environment=KIMI_MODEL=%s\n' "$kimi_model"
     [[ "$worker" == "kimi" && -n "$kimi_base_url" ]] && printf 'Environment=KIMI_BASE_URL=%s\n' "$kimi_base_url"
     [[ "$worker" == "kimi" && -n "$kimi_api_key" ]] && printf 'Environment=KIMI_API_KEY=%s\n' "$kimi_api_key"
