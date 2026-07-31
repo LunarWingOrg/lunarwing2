@@ -593,7 +593,8 @@ impl TagSchemaHook {
                 // get() returns None when the boundary splits a multi-byte
                 // char, so non-ASCII prefixes can't panic here.
                 Some(prefix) => {
-                    prefix.eq_ignore_ascii_case(tag) && trimmed.as_bytes()[tag.len()] == b':'
+                    prefix.eq_ignore_ascii_case(tag)
+                        && trimmed.as_bytes().get(tag.len()) == Some(&b':')
                 }
                 None => false,
             }
@@ -1128,6 +1129,44 @@ mod tests {
             hook.execute(&long, &ctx()).await,
             Ok(HookOutcome::Reject { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_tag_schema_exact_tag_only_does_not_panic() {
+        // ISSUE-011 regression: content equal to exactly an allowed tag (no
+        // colon) previously indexed past the end of the byte slice.
+        let config = test_config();
+        let hook = TagSchemaHook::new(
+            test_state(),
+            config.agent_id,
+            config.allowed_tags.clone(),
+            config.max_message_length,
+        );
+        for tag in &config.allowed_tags {
+            for content in [
+                tag.to_string(),
+                tag.to_lowercase(),
+                format!("{tag} "),
+                String::new(),
+            ] {
+                let event = outbound("agent-1", "coord@conference.example", &content);
+                let outcome = hook.execute(&event, &ctx()).await;
+                assert!(
+                    matches!(outcome, Ok(HookOutcome::Reject { .. })),
+                    "content {content:?} must be rejected without panic"
+                );
+            }
+            // Tag plus colon (with body) is well-formed and passes.
+            let ok = outbound(
+                "agent-1",
+                "coord@conference.example",
+                &format!("{tag}: body"),
+            );
+            assert!(matches!(
+                hook.execute(&ok, &ctx()).await,
+                Ok(HookOutcome::Continue { .. })
+            ));
+        }
     }
 
     #[tokio::test]
