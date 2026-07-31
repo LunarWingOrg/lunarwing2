@@ -4503,13 +4503,12 @@ retire_tenant_nanocode() {
       say "WARNING: tenant systemd reload failed after Nanocode retirement; next start will reload it" >&2
     fi
   else
+    # _deregister_babysitter stops, rc-update-dels, and removes the -sup unit.
     _deregister_babysitter "$container_name"
-    rc-update del "${container_name}-sup" default >/dev/null 2>&1 \
-      || say "note: retired Nanocode supervisor was not enabled"
     rc-update del "$container_name" default >/dev/null 2>&1 \
       || say "note: retired Nanocode service was not enabled"
-    rm -f "/etc/init.d/${container_name}-sup" "/etc/conf.d/${container_name}-sup" \
-          "/etc/init.d/${container_name}" "/etc/conf.d/${container_name}"
+    rm -f "/etc/init.d/${container_name}" "/etc/conf.d/${container_name}" \
+          "/etc/conf.d/${container_name}-sup"
   fi
   remove_retired_nanocode_config "$name"
 }
