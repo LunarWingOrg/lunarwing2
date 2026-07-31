@@ -27,7 +27,7 @@
 #
 # Usage (run as root on the new host):
 #   sudo ic/scripts/import-tenant.sh <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped]
-#        [--with-nanocode] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]
+#        [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]
 #        [--with-vision] [--docker-group]
 #        [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]
 # Encrypted bundles read their passphrase from KAWARIMI_PASS_FD, KAWARIMI_PASS,
@@ -40,7 +40,6 @@ NAME_OVERRIDE=""
 DO_START=false
 OLD_STOPPED=false
 WITH_DOCKER_GROUP=false
-WITH_NANOCODE=false
 WITH_PEBBLE=false
 WITH_OPENCODE=false
 WITH_KIMI=false
@@ -60,7 +59,7 @@ while [[ $# -gt 0 ]]; do
     --start)         DO_START=true; shift ;;
     --old-stopped)   OLD_STOPPED=true; shift ;;
     --docker-group)  WITH_DOCKER_GROUP=true; shift ;;
-    --with-nanocode) WITH_NANOCODE=true; shift ;;
+    --with-nanocode) printf '%s\n' "--with-nanocode was retired with the Nanocode worker in v2.0.4.0; supported workers: --with-pebble/--with-opencode/--with-kimi" >&2; exit 2 ;;
     --with-pebble)   WITH_PEBBLE=true; shift ;;
     --with-opencode)   WITH_OPENCODE=true; shift ;;
     --with-kimi)       WITH_KIMI=true; shift ;;
@@ -177,7 +176,10 @@ validate_manifest() {
     [[ -z "${seen[$key]+x}" ]] || die "$kind manifest contains duplicate key '$key'"
     seen["$key"]=1
     case "$kind:$key" in
-      lunarwing:SECRETS_MASTER_KEY|lunarwing:XMPP_JID|lunarwing:XMPP_PASSWORD|lunarwing:XMPP_DM_POLICY|lunarwing:XMPP_ALLOW_FROM|lunarwing:XMPP_ALLOW_ROOMS|lunarwing:XMPP_ENCRYPTED_ROOMS|lunarwing:XMPP_ALLOW_PLAINTEXT_FALLBACK|lunarwing:XMPP_OMEMO_DEVICE_ID|lunarwing:LLM_API_KEY|lunarwing:LLM_MODEL|lunarwing:LLM_BASE_URL|lunarwing:NANOCODE_MODEL|lunarwing:NANOCODE_BASE_URL|lunarwing:OPENCODE_MODEL|lunarwing:OPENCODE_BASE_URL|lunarwing:KIMI_MODEL|lunarwing:KIMI_BASE_URL|lunarwing:KIMI_API_KEY|lunarwing:GOTIFY_URL|lunarwing:GATEWAY_HOST|lunarwing:HTTP_HOST) ;;
+      # Accepted only so pre-removal bundles remain importable. Injection drops
+      # these retired settings below; they never reach the target tenant.
+      lunarwing:NANOCODE_MODEL|lunarwing:NANOCODE_BASE_URL) ;;
+      lunarwing:SECRETS_MASTER_KEY|lunarwing:XMPP_JID|lunarwing:XMPP_PASSWORD|lunarwing:XMPP_DM_POLICY|lunarwing:XMPP_ALLOW_FROM|lunarwing:XMPP_ALLOW_ROOMS|lunarwing:XMPP_ENCRYPTED_ROOMS|lunarwing:XMPP_ALLOW_PLAINTEXT_FALLBACK|lunarwing:XMPP_OMEMO_DEVICE_ID|lunarwing:LLM_API_KEY|lunarwing:LLM_MODEL|lunarwing:LLM_BASE_URL|lunarwing:OPENCODE_MODEL|lunarwing:OPENCODE_BASE_URL|lunarwing:KIMI_MODEL|lunarwing:KIMI_BASE_URL|lunarwing:KIMI_API_KEY|lunarwing:GOTIFY_URL|lunarwing:GATEWAY_HOST|lunarwing:HTTP_HOST) ;;
       bridge:XMPP_JID|bridge:XMPP_PASSWORD|bridge:XMPP_DM_POLICY|bridge:XMPP_ALLOW_FROM_JSON|bridge:XMPP_ALLOW_ROOMS_JSON|bridge:XMPP_ENCRYPTED_ROOMS_JSON|bridge:XMPP_DEVICE_ID|bridge:XMPP_ALLOW_PLAINTEXT_FALLBACK) ;;
       vision:VL_URL|vision:VL_MODEL|vision:LUNARWING_AUTH_TOKEN) ;;
       *) die "$kind manifest contains unsupported key '$key'" ;;
@@ -271,14 +273,22 @@ acquire_import_passphrase() {
 # Inject KEY=value lines from a manifest into a live env file, backslash-safe (awk
 # ENVIRON, not -v) and CR-tolerant; preserves the live file's inode/owner/mode. The
 # read loop's `|| [[ -n "$line" ]]` keeps a final line without a trailing newline.
-inject_keys() {  # <manifest> <live_env> [skip_key]
-  local man="$1" live="$2" skip_key="${3:-}" line key tmp
+inject_keys() {  # <manifest> <live_env> [skip_key ...]
+  local man="$1" live="$2" line key tmp skip_key should_skip
+  shift 2
   [[ -f "$man" && -f "$live" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     [[ "$line" == *=* ]] || continue
     key="${line%%=*}"
-    [[ -n "$skip_key" && "$key" == "$skip_key" ]] && continue
+    should_skip=false
+    for skip_key in "$@"; do
+      if [[ "$key" == "$skip_key" ]]; then
+        should_skip=true
+        break
+      fi
+    done
+    $should_skip && continue
     grep -qxF "$line" "$live" 2>/dev/null && continue
     tmp="$(mktemp)"
     if grep -q "^${key}=" "$live"; then
@@ -358,7 +368,7 @@ reconcile_owner_scope() {
   note "owner-scope continuity verified for '$TENANT'"
 }
 
-[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] [--with-vision] [--docker-group] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
+[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] [--with-vision] [--docker-group] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
 [[ -f "$BUNDLE" ]] || die "bundle not found: $BUNDLE"
 [[ "$MAX_BUNDLE_BYTES" =~ ^[1-9][0-9]*$ && "$MAX_STATE_BYTES" =~ ^[1-9][0-9]*$ && "$MAX_STATE_ENTRIES" =~ ^[1-9][0-9]*$ ]] \
   || die "Kawarimi archive limits must be positive integers"
@@ -465,8 +475,6 @@ GATEWAY_HOST="$(manifest_value GATEWAY_HOST)"
 [[ -n "$GATEWAY_HOST" ]] || GATEWAY_HOST="$(manifest_value HTTP_HOST)"
 LLM_MODEL="$(manifest_value LLM_MODEL)"
 LLM_BASE_URL="$(manifest_value LLM_BASE_URL)"
-NANOCODE_MODEL="$(manifest_value NANOCODE_MODEL)"
-NANOCODE_BASE_URL="$(manifest_value NANOCODE_BASE_URL)"
 OPENCODE_MODEL="$(manifest_value OPENCODE_MODEL)"
 OPENCODE_BASE_URL="$(manifest_value OPENCODE_BASE_URL)"
 KIMI_MODEL="$(manifest_value KIMI_MODEL)"
@@ -485,8 +493,6 @@ $WITH_DOCKER_GROUP && add_args+=(--docker-group)
 [[ -n "$GATEWAY_HOST" ]] && add_args+=(--gateway-host "$GATEWAY_HOST")
 [[ -n "$LLM_MODEL" ]] && add_args+=(--llm-model "$LLM_MODEL")
 [[ -n "$LLM_BASE_URL" ]] && add_args+=(--llm-base-url "$LLM_BASE_URL")
-[[ -n "$NANOCODE_MODEL" ]] && add_args+=(--nanocode-model "$NANOCODE_MODEL")
-[[ -n "$NANOCODE_BASE_URL" ]] && add_args+=(--nanocode-base-url "$NANOCODE_BASE_URL")
 [[ -n "$OPENCODE_MODEL" ]] && add_args+=(--opencode-model "$OPENCODE_MODEL")
 [[ -n "$OPENCODE_BASE_URL" ]] && add_args+=(--opencode-base-url "$OPENCODE_BASE_URL")
 [[ -n "$KIMI_MODEL" ]] && add_args+=(--kimi-model "$KIMI_MODEL")
@@ -499,7 +505,6 @@ $WITH_DOCKER_GROUP && add_args+=(--docker-group)
 # started with --start would build its workers but never start them unless the
 # selection is recorded here too. Mirrors the --with-* flags passed to
 # build-tenant below. See PER_TENANT_WORKER_GATING.md.
-$WITH_NANOCODE && add_args+=(--with-nanocode)
 $WITH_PEBBLE  && add_args+=(--with-pebble)
 $WITH_OPENCODE && add_args+=(--with-opencode)
 $WITH_KIMI && add_args+=(--with-kimi)
@@ -514,7 +519,6 @@ VISION_ENVF="$LWROOT/env/vision.env"
 # ---- 2. build daemon + workers -----------------------------------------------
 banner "2/7  Build"
 build_args=(build-tenant "$TENANT" --with-wasm)
-$WITH_NANOCODE && build_args+=(--with-nanocode)
 $WITH_PEBBLE  && build_args+=(--with-pebble)
 $WITH_OPENCODE && build_args+=(--with-opencode)
 $WITH_KIMI && build_args+=(--with-kimi)
@@ -528,7 +532,8 @@ if $DRY_RUN; then
   note "[dry-run] would inject manifest-lunarwing.env -> $ENVF and manifest-bridge.env -> $BRIDGE_ENVF (incl. SECRETS_MASTER_KEY, XMPP password, XMPP/LLM config)"
   [[ -s "$WORK/manifest-vision.env" ]] && note "[dry-run] would inject manifest-vision.env -> $VISION_ENVF (VL_URL and VL_MODEL; target-generated auth token retained)"
 else
-  inject_keys "$WORK/manifest-lunarwing.env" "$ENVF"
+  inject_keys "$WORK/manifest-lunarwing.env" "$ENVF" \
+    NANOCODE_MODEL NANOCODE_BASE_URL
   [[ -f "$WORK/manifest-bridge.env" ]] && inject_keys "$WORK/manifest-bridge.env" "$BRIDGE_ENVF"
   if [[ -s "$WORK/manifest-vision.env" ]]; then
     [[ -f "$VISION_ENVF" ]] || die "bundle carries vision config, but target mt-admin did not render $VISION_ENVF"

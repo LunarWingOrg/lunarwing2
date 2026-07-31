@@ -57,7 +57,6 @@ ENABLE_SSH=true                     # SSH harness (key pair, agent, config.toml)
 ENABLE_HEALTH=true                  # Host-global health/self-heal pipeline
 ENABLE_WEECHAT_BOOTSTRAP=true       # Generate relay.conf during add-tenants
 BUILD_WASM=true                     # Build + install WASM tools and channels
-BUILD_NANOCODE=true                 # Build nanocode worker Docker image
 BUILD_PEBBLE=true                   # Build pebble worker Docker image
 BUILD_DARKIRC=true                  # Build darkirc daemon binary
 BUILD_VISION=true                   # Build vision/OCR sidecar Docker image
@@ -275,7 +274,6 @@ phase_2() {
 
   local -a build_flags=()
   [[ "$BUILD_WASM" == true ]]     && build_flags+=(--with-wasm)
-  [[ "$BUILD_NANOCODE" == true ]] && build_flags+=(--with-nanocode)
   [[ "$BUILD_PEBBLE" == true ]]   && build_flags+=(--with-pebble)
 
   if [[ ${#build_flags[@]} -gt 0 ]]; then
@@ -402,7 +400,6 @@ main() {
   say "  SSH:           $ENABLE_SSH"
   say "  Health:        $ENABLE_HEALTH"
   say "  Build WASM:    $BUILD_WASM"
-  say "  Nanocode:      $BUILD_NANOCODE"
   say "  Pebble:        $BUILD_PEBBLE"
   say "  DarkIRC build: $BUILD_DARKIRC"
   say "  Vision:        $BUILD_VISION"

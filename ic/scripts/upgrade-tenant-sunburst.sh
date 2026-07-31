@@ -61,9 +61,8 @@ if [[ -f "$CAPS_FILE" ]]; then cp -a "$CAPS_FILE" "$BACKUP_DIR/weechat.capabilit
 chown -R "$TENANT:$TENANT" "$HOME_DIR/backups" 2>/dev/null || true
 
 banner "2/7  tenant repo status (surfaces any hand-edited TRACKED files)"
-# --untracked-files=no: ignore the tenant's runtime data dirs (env/, state/,
-# logs/, backups/, nanocode-workspace/) that live next to the clone — git pull
-# never touches untracked files, so only modified TRACKED files are a hazard.
+# --untracked-files=no: ignore tenant runtime data dirs. Git pull never touches
+# untracked files, so only modified TRACKED files are a hazard.
 dirty="$(sudo -u "$TENANT" git -C "$HOME_DIR" status --short --untracked-files=no 2>/dev/null || true)"
 if [[ -n "$dirty" ]]; then
   say "  MODIFIED TRACKED files detected in $HOME_DIR:"
