@@ -36,6 +36,7 @@ ports_get() {
     pebble_wss) printf '21009\n' ;;
     opencode_wss) printf '21010\n' ;;
     kimi_wss) printf '21011\n' ;;
+    coord_admin) printf '21019\n' ;;
     *) return 1 ;;
   esac
 }

@@ -4234,9 +4234,9 @@ generate_darkirc_config() {
   rpc_port="$(ports_get "$name" darkirc_rpc)" || die "no darkirc_rpc port for tenant '$name'"
   log_dir="$(tenant_log_dir "$name")"
   scope_id="$(ensure_darkirc_scope_id "$name")"
-  if [[ "$registry_lock_owned" == true ]]; then
-    release_ports_lock
-  fi
+  # The registry lock stays held through the helper commit: it serializes the
+  # scope/port snapshot with the config write so a concurrent patch-env and a
+  # contact operation cannot diverge config and ledger state.
   if [[ "$DARKIRC_WRITER_LOCK_HELD" != true ]]; then
     darkirc_writer_lock "$name"
     writer_lock_owned=true
@@ -4266,6 +4266,9 @@ generate_darkirc_config() {
     || die "DarkIRC helper did not produce a config for '$name'"
   if [[ "$writer_lock_owned" == true ]]; then
     darkirc_writer_unlock
+  fi
+  if [[ "$registry_lock_owned" == true ]]; then
+    release_ports_lock
   fi
   say "darkirc config updated for $name (irc=$irc_port rpc=$rpc_port scope=$scope_id)"
 }

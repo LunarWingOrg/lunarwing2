@@ -105,6 +105,7 @@ ports_get() {
     opencode_wss) printf '21015\n' ;;
     weechat_adapter) printf '21016\n' ;;
     weechat) printf '21017\n' ;;
+    coord_admin) printf '21018\n' ;;
     *) return 1 ;;
   esac
 }

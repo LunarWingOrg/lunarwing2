@@ -10,6 +10,10 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$ADMIN_SCRIPT"
 
+# Keep the root-side writer lock fixture hermetic (production default stays
+# the fixed /run/lunarwing; tests run unprivileged).
+DARKIRC_WRITER_LOCK_ROOT="$TMP_ROOT/writer-locks"
+
 TENANT="fixture"
 CONFIG_ROOT="$TMP_ROOT/lunarwing"
 STATE_ROOT="$CONFIG_ROOT/state"
@@ -55,6 +59,11 @@ sudo() {
 say() { :; }
 ensure_darkirc_scope_id() {
   [[ "$REGISTRY_LOCKED" == true ]] || return 1
+  printf '00112233445566778899aabbccddeeff\n'
+}
+# The writer lock re-reads the scope from the registry; keep the fixture
+# hermetic instead of depending on host /etc/lunarwing/ports.json state.
+darkirc_scope_id() {
   printf '00112233445566778899aabbccddeeff\n'
 }
 run_darkirc_key_helper() {
