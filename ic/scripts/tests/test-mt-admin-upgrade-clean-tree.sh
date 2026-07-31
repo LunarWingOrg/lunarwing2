@@ -191,7 +191,7 @@ else
   fail "upgrade did not pin moving target commit: $output"
 fi
 if [[ -f "$build_args_file" ]] \
-  && [[ "$(<"$build_args_file")" == "fixture true false false true false false true" ]]; then
+  && [[ "$(<"$build_args_file")" == "fixture true false true false false true" ]]; then
   pass 'upgrade rebuilds selected OpenCode worker with strict WASM build (kimi not selected)'
 else
   fail "upgrade forwarded wrong build flags: $(cat "$build_args_file" 2>/dev/null || true)"
