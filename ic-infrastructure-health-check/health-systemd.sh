@@ -20,6 +20,16 @@ else
   UNITS_ARR=("${UNITS_DEFAULT[@]}")
 fi
 
+# Old health.env files may still list retired Nanocode units explicitly. Apply
+# retirement filtering after override resolution so configured and discovered
+# paths agree.
+FILTERED_UNITS=()
+for unit in "${UNITS_ARR[@]}"; do
+  case "$unit" in lunarwing-nanocode-*) continue ;; esac
+  FILTERED_UNITS+=("$unit")
+done
+UNITS_ARR=("${FILTERED_UNITS[@]}")
+
 # Multi-tenant host? (a tenant registry exists). On MT hosts the base system-
 # level units (lunarwing.service, …) are not expected — tenants run per-user
 # units — so a missing base unit is skipped instead of flagged critical.
@@ -208,6 +218,7 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
     [ -n "$tunits" ] || tunits="lunarwing-$tname.service xmpp-bridge-$tname.service"
     for tunit in $tunits; do
       [ "$SECONDS" -lt "$_deadline" ] || { _sweep_incomplete=true; _tenant_sweep_cut_short=true; break; }
+      case "$tunit" in lunarwing-nanocode-*) continue ;; esac   # retired worker
       # One show call per unit (LoadState/ActiveState/SubState/NRestarts, in
       # systemd's canonical order for a .service) instead of four round-trips —
       # leaner and bounds hang exposure on a slow tenant bus.
@@ -288,7 +299,7 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
       # but not serving) is caught instead of reported healthy.
       uhealth=""
       case "$tunit" in
-        lunarwing-pg-*|lunarwing-nanocode-*|lunarwing-opencode-*|lunarwing-kimi-*|lunarwing-pebble-*)
+        lunarwing-pg-*|lunarwing-opencode-*|lunarwing-kimi-*|lunarwing-pebble-*)
           uhealth=$(_tenant_ctr_health "$tuser" "$tuid" "${tunit%.service}")
           if [ "$uhealth" = "unhealthy" ] && [ "$uexit" -lt 2 ]; then
             ustatus="critical"; uexit=2; issues+=("$tunit ($tuser) container unhealthy")

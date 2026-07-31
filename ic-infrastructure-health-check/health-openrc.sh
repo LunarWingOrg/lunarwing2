@@ -30,14 +30,16 @@ discover_services() {
   done
 
   # Multi-tenant. The `lunarwing-*` glob already covers lunarwing-<t> AND every
-  # per-service unit (lunarwing-proxy-<t>, lunarwing-pg-<t>, lunarwing-nanocode-<t>,
+  # per-service unit (lunarwing-proxy-<t>, lunarwing-pg-<t>,
   # lunarwing-pebble-<t>, lunarwing-opencode-<t>, lunarwing-kimi-<t>, lunarwing-weechat-<t>,
   # lunarwing-weechat-adapter-<t>), so a separate lunarwing-proxy-* glob would only
-  # double-list it. Dedup via `seen`.
+  # double-list it. Dedup via `seen`. Retired Nanocode units are skipped: a
+  # leftover pre-removal unit must not read critical after retirement.
   for initscript in "$INITD_DIR"/lunarwing-* "$INITD_DIR"/xmpp-bridge-*; do
     [ -x "$initscript" ] || continue
     name=$(basename "$initscript")
     case "$name" in lunarwing|xmpp-bridge) continue ;; esac   # base names already handled
+    case "$name" in lunarwing-nanocode-*) continue ;; esac    # retired worker
     [ -n "${seen[$name]:-}" ] && continue
     seen[$name]=1; svcs+=("$name")
   done
@@ -54,6 +56,15 @@ if [ -n "${SERVICES:-}" ]; then
 else
   mapfile -t SERVICES_ARR < <(discover_services)
 fi
+
+# Old health.env files may still list retired Nanocode services explicitly.
+# Filter after override resolution so configured and discovered paths agree.
+FILTERED_SERVICES=()
+for service in "${SERVICES_ARR[@]}"; do
+  case "$service" in lunarwing-nanocode-*) continue ;; esac
+  FILTERED_SERVICES+=("$service")
+done
+SERVICES_ARR=("${FILTERED_SERVICES[@]}")
 
 issues=()
 svc_results=()
@@ -113,7 +124,6 @@ unit_tenant() {
       case "$rest" in
         proxy-*)             rest="${rest#proxy-}" ;;
         pg-*)                rest="${rest#pg-}" ;;
-        nanocode-*)          rest="${rest#nanocode-}" ;;
         opencode-*)          rest="${rest#opencode-}" ;;
         kimi-*)              rest="${rest#kimi-}" ;;
         pebble-*)            rest="${rest#pebble-}" ;;

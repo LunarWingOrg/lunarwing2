@@ -320,4 +320,17 @@ oR="$(run_hs_registry "$r" HS_FAIL_UFS_USER=acme)"
 assert_eq "$(oall "$oR")" "critical" "R1: inconclusive enable-state for down unit fails loud"
 assert_contains "$oR" "probe(s) failed" "R2: enable-state probe failure surfaced"
 
+# ── S: retired Nanocode unit is ignored even when failed ─────────────────────
+echo "=== Section S: retired Nanocode unit -> ignored ==="
+s="$(sb)"; mk_hs_mock "$s"
+unit_set "$s" lunarwing-acme.service          "loaded active running 0 enabled"
+unit_set "$s" lunarwing-nanocode-acme.service "loaded failed failed 8 generated"
+oS="$(run_hs "$s" acme acme)"
+assert_eq "$(ustat "$oS" lunarwing-nanocode-acme.service)" "ABSENT" "S1: retired Nanocode unit absent from report"
+assert_eq "$(oall "$oS")" "healthy" "S2: retired Nanocode failure does not affect overall health"
+
+oS2="$(UNITS='lunarwing-nanocode-acme.service' run_hs "$s" acme acme)"
+assert_eq "$(ustat "$oS2" lunarwing-nanocode-acme.service)" "ABSENT" "S3: explicit retired Nanocode unit absent from report"
+assert_eq "$(oall "$oS2")" "healthy" "S4: explicit retired Nanocode failure does not affect overall health"
+
 finish
