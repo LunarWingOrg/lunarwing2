@@ -3,7 +3,7 @@ import { test } from "node:test"
 import { mkdirSync, mkdtempSync, symlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { expandWorkspacePath, resolveWorkspacePath } from "./workspace_path.js"
+import { expandWorkspacePath, resolveWorkspacePath, workspacePathsOverlap } from "./workspace_path.js"
 
 const workspaceRoot = "/workspace"
 
@@ -42,6 +42,13 @@ test("resolveWorkspacePath: rejects traversal and escaping symlinks", () => {
   symlinkSync(outside, join(root, "escape"))
   assert.throws(() => resolveWorkspacePath("..", root), /escapes WORKSPACE_ROOT/)
   assert.throws(() => resolveWorkspacePath("escape", root), /escapes WORKSPACE_ROOT/)
+})
+
+test("workspacePathsOverlap: rejects equal and parent-child workspaces only", () => {
+  assert.equal(workspacePathsOverlap("/workspace/project", "/workspace/project"), true)
+  assert.equal(workspacePathsOverlap("/workspace/project", "/workspace/project/src"), true)
+  assert.equal(workspacePathsOverlap("/workspace/project/src", "/workspace/project"), true)
+  assert.equal(workspacePathsOverlap("/workspace/project-a", "/workspace/project-b"), false)
 })
 
 console.log("path expand self-check passed")

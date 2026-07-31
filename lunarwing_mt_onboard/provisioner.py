@@ -314,8 +314,10 @@ def _write_env_values(env_file: str, values: dict[str, str]) -> None:
         lines = f.readlines()
 
     def _fmt(key: str, val: str) -> str:
-        escaped = val.replace("\\", "\\\\").replace("'", "\\'")
-        return f"{key}='{escaped}'\n"
+        if any(character in val for character in ("\0", "\r", "\n")):
+            raise ValueError(f"{key} cannot contain NUL or newline characters")
+        escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+        return f'{key}="{escaped}"\n'
 
     seen = set()
     new_lines = []

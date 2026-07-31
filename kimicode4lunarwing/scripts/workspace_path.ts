@@ -16,3 +16,10 @@ export function resolveWorkspacePath(path: string, workspaceRoot: string): strin
   if (fromRoot === "" || (!fromRoot.startsWith("..") && !isAbsolute(fromRoot))) return candidate
   throw new Error(`Workspace path escapes WORKSPACE_ROOT: ${path}`)
 }
+
+export function workspacePathsOverlap(left: string, right: string): boolean {
+  const fromLeft = relative(left, right)
+  if (fromLeft === "" || (!fromLeft.startsWith("..") && !isAbsolute(fromLeft))) return true
+  const fromRight = relative(right, left)
+  return fromRight === "" || (!fromRight.startsWith("..") && !isAbsolute(fromRight))
+}

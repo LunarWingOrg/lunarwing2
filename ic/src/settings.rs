@@ -8,6 +8,7 @@
 //! environment variables, as documented on their respective types.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 
 use secrecy::SecretString;
@@ -1348,13 +1349,31 @@ impl Settings {
              {raw}"
         );
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
-        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
 
-        std::fs::write(path, content)
-            .map_err(|e| format!("failed to write {}: {}", path.display(), e))
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|e| format!("failed to create temporary config: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            temporary
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("failed to secure temporary config: {e}"))?;
+        }
+        temporary
+            .write_all(content.as_bytes())
+            .and_then(|()| temporary.as_file_mut().sync_all())
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        temporary
+            .persist(path)
+            .map(|_| ())
+            .map_err(|e| format!("failed to replace {}: {}", path.display(), e.error))
     }
 
     /// Restore secrets skipped by serde only into the TOML tree written to disk.
@@ -1439,6 +1458,7 @@ impl Settings {
     /// overlay TOML values on top. Only fields that the TOML file
     /// explicitly changed (i.e. differ from Default) are applied.
     pub fn merge_from(&mut self, other: &Self) {
+        let base_workers = self.sandbox.external_workers.clone();
         let default_json = match serde_json::to_value(Self::default()) {
             Ok(v) => v,
             Err(_) => return,
@@ -1454,35 +1474,46 @@ impl Settings {
 
         merge_non_default(&mut self_json, &other_json, &default_json);
 
-        if let Ok(merged) = serde_json::from_value(self_json) {
-            *self = merged;
-        }
+        let Ok(mut merged) = serde_json::from_value::<Self>(self_json) else {
+            return;
+        };
 
-        // Post-merge fixup: `skip_serializing` fields (auth_token on
-        // ExternalWorkerSettings and WorkerEndpoint) are dropped by the
-        // serde_json::to_value round-trip above. Restore them directly from
-        // the TOML-parsed `other` so the daemon can authenticate to workers.
-        // Without this, the daemon connects without a Bearer token and gets
-        // a 401 from every external worker.
-        for self_ew in &mut self.sandbox.external_workers {
-            if let Some(other_ew) = other
+        // `skip_serializing` drops worker secrets from the JSON merge transport.
+        // Restore overlay secrets first, then retain matching base secrets.
+        for worker in &mut merged.sandbox.external_workers {
+            let overlay = other
                 .sandbox
                 .external_workers
                 .iter()
-                .find(|o| o.name == self_ew.name)
-            {
-                if self_ew.auth_token.is_none() {
-                    self_ew.auth_token = other_ew.auth_token.clone();
-                }
-                for self_ep in &mut self_ew.endpoints {
-                    if let Some(other_ep) = other_ew.endpoints.iter().find(|o| o.url == self_ep.url)
-                        && self_ep.auth_token.is_none()
-                    {
-                        self_ep.auth_token = other_ep.auth_token.clone();
-                    }
-                }
+                .find(|candidate| candidate.name == worker.name);
+            let base = base_workers
+                .iter()
+                .find(|candidate| candidate.name == worker.name);
+            worker.auth_token = overlay
+                .and_then(|candidate| candidate.auth_token.clone())
+                .or_else(|| base.and_then(|candidate| candidate.auth_token.clone()));
+
+            for endpoint in &mut worker.endpoints {
+                endpoint.auth_token = overlay
+                    .and_then(|candidate| {
+                        candidate
+                            .endpoints
+                            .iter()
+                            .find(|item| item.url == endpoint.url)
+                    })
+                    .and_then(|candidate| candidate.auth_token.clone())
+                    .or_else(|| {
+                        base.and_then(|candidate| {
+                            candidate
+                                .endpoints
+                                .iter()
+                                .find(|item| item.url == endpoint.url)
+                        })
+                        .and_then(|candidate| candidate.auth_token.clone())
+                    });
             }
         }
+        *self = merged;
     }
 
     /// Get a setting value by dotted path (e.g., "agent.max_parallel_jobs").
@@ -1929,6 +1960,24 @@ mod tests {
         assert_eq!(loaded.heartbeat.interval_secs, 900);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn toml_save_is_private_even_when_replacing_permissive_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "old config").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        Settings::default().save_toml(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn toml_save_preserves_external_worker_auth_tokens() {
         use secrecy::ExposeSecret;
@@ -2034,6 +2083,81 @@ url = "ws://127.0.0.1:10001/ws/agent"
             !std::fs::read_to_string(path)
                 .unwrap()
                 .contains("auth_token")
+        );
+    }
+
+    #[test]
+    fn merge_preserves_base_external_worker_tokens() {
+        use secrecy::ExposeSecret;
+
+        let mut base: Settings = toml::from_str(
+            r#"
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:10000/ws/agent"
+auth_token = "base-worker-token"
+
+[[sandbox.external_workers.endpoints]]
+url = "ws://127.0.0.1:10001/ws/agent"
+auth_token = "base-endpoint-token"
+"#,
+        )
+        .unwrap();
+        let overlay = Settings {
+            selected_model: Some("unrelated-model".to_string()),
+            ..Default::default()
+        };
+
+        base.merge_from(&overlay);
+
+        let worker = &base.sandbox.external_workers[0];
+        assert_eq!(
+            worker
+                .auth_token
+                .as_ref()
+                .map(|token| token.expose_secret()),
+            Some("base-worker-token")
+        );
+        assert_eq!(
+            worker.endpoints[0]
+                .auth_token
+                .as_ref()
+                .map(|token| token.expose_secret()),
+            Some("base-endpoint-token")
+        );
+    }
+
+    #[test]
+    fn merge_prefers_overlay_external_worker_tokens() {
+        use secrecy::ExposeSecret;
+
+        let mut base: Settings = toml::from_str(
+            r#"
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:10000/ws/agent"
+auth_token = "base-token"
+"#,
+        )
+        .unwrap();
+        let overlay: Settings = toml::from_str(
+            r#"
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:10000/ws/agent"
+auth_token = "overlay-token"
+"#,
+        )
+        .unwrap();
+
+        base.merge_from(&overlay);
+
+        assert_eq!(
+            base.sandbox.external_workers[0]
+                .auth_token
+                .as_ref()
+                .map(|token| token.expose_secret()),
+            Some("overlay-token")
         );
     }
 

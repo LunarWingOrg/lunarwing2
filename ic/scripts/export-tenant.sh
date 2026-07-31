@@ -115,10 +115,14 @@ read_env_value() {
   local file="$1" key="$2" value
   value="$(sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -1)"
   value="${value%$'\r'}"
-  if [[ "$value" == \'*\' && "${#value}" -ge 2 ]]; then
-    value="${value:1:${#value}-2}"
-  elif [[ "$value" == \"*\" && "${#value}" -ge 2 ]]; then
-    value="${value:1:${#value}-2}"
+  if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\"/\"}"
+    value="${value//\\\\/\\}"
+  elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\'/\'}"
+    value="${value//\\\\/\\}"
   fi
   printf '%s' "$value"
 }

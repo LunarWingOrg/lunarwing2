@@ -17,7 +17,7 @@ RUN set -e; \
       python3 make g++ ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Install ws (WebSocket library) and typescript. The package.json pins ws@8.18.3.
+# Install ws (WebSocket library) and typescript. package.json pins a reviewed release.
 COPY scripts/package.json scripts/tsconfig.json ./scripts/
 COPY scripts/*.ts ./scripts/
 
@@ -91,6 +91,7 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         libsqlite3-dev \
         libpq-dev \
         libffi-dev \
+        libz-dev \
         liblzma-dev \
         libzstd-dev \
         libcurl4-openssl-dev \
@@ -161,6 +162,8 @@ RUN npm install -g @moonshot-ai/kimi-code@${KIMI_CODE_VERSION} && \
 
 # ── XDG directories for kimi state ────────────────────────────────────────────
 RUN mkdir -p /home/kimi/.kimi-code \
+             /home/kimi/.cargo \
+             /home/kimi/go \
              /workspace \
              /var/log/lunarwing \
              /app/results \
@@ -172,7 +175,7 @@ EXPOSE 9090
 
 # ── health check ───────────────────────
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -sf http://127.0.0.1:8443/health || exit 1
+  CMD curl -sf http://127.0.0.1:8443/ready || exit 1
 
 USER 10002:10002
 

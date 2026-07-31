@@ -398,6 +398,35 @@ class TestProvisionerArgs(unittest.TestCase):
             ],
         )
 
+    def test_write_env_values_uses_systemd_safe_quotes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = os.path.join(tmp, "lunarwing.env")
+            with open(env_file, "w") as handle:
+                handle.write("UNCHANGED=value\nKIMI_API_KEY=old\n")
+
+            provisioner._write_env_values(
+                env_file,
+                {"KIMI_API_KEY": "key'with\\slashes"},
+            )
+
+            with open(env_file) as handle:
+                content = handle.read()
+            self.assertIn("UNCHANGED=value\n", content)
+            self.assertIn('KIMI_API_KEY="key\'with\\\\slashes"\n', content)
+            self.assertNotIn("KIMI_API_KEY='", content)
+
+    def test_write_env_values_rejects_multiline_secret(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = os.path.join(tmp, "lunarwing.env")
+            with open(env_file, "w") as handle:
+                handle.write("")
+
+            with self.assertRaisesRegex(ValueError, "cannot contain"):
+                provisioner._write_env_values(
+                    env_file,
+                    {"KIMI_API_KEY": "first\nsecond"},
+                )
+
     def test_skip_build_also_skips_start(self):
         phase = provisioner.PhaseResult(name="add-tenant", returncode=0)
         with patch.object(provisioner, "build_add_tenant_args", return_value=["mt", "add"]), patch.object(

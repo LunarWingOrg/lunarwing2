@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -51,4 +51,26 @@ api_key = ""
 
 test("entrypoint CLI mode forces print and stream-json", () => {
   assert.match(entrypoint, /exec kimi -p "\$\*" --output-format stream-json/)
+})
+
+test("entrypoint rejects missing config source instead of reusing stale config", () => {
+  assert.ok(configSectionEnd > 0)
+  const root = mkdtempSync(join(tmpdir(), "kimi-missing-config-"))
+  const home = join(root, "home")
+  const stale = join(home, "config.toml")
+  mkdirSync(home)
+  writeFileSync(stale, 'api_key = "stale-secret"\n', { mode: 0o600 })
+
+  const result = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      KIMI_CODE_HOME: home,
+      KIMI_CONFIG_SOURCE: join(root, "missing.toml"),
+    },
+  })
+
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /Kimi config source not found/)
+  assert.equal(readFileSync(stale, "utf8"), 'api_key = "stale-secret"\n')
 })

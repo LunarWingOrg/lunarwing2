@@ -6,7 +6,7 @@
  * Adapted for the Kimi Code worker (upstream MoonshotAI/kimi-code).
  */
 
-import { randomUUID } from "crypto"
+import { createHash, randomUUID, timingSafeEqual } from "crypto"
 import { writeFileSync, readFileSync } from "fs"
 
 // ── Protocol Envelope ─────────────────────────────────────────────────────────
@@ -59,6 +59,55 @@ export function truncateUtf8(value: string, maxBytes: number): string {
   return bytes.subarray(0, end).toString("utf8")
 }
 
+export function truncateUtf8Tail(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8")
+  if (bytes.length <= maxBytes) return value
+  let start = Math.max(0, bytes.length - maxBytes)
+  while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++
+  return bytes.subarray(start).toString("utf8")
+}
+
+export function bearerTokenMatches(header: string | undefined, expected: string): boolean {
+  if (!header || !expected) return false
+  const match = /^Bearer\s+([^\s]+)$/i.exec(header)
+  if (!match) return false
+  const suppliedDigest = createHash("sha256").update(match[1], "utf8").digest()
+  const expectedDigest = createHash("sha256").update(expected, "utf8").digest()
+  return timingSafeEqual(suppliedDigest, expectedDigest)
+}
+
+export function serializeEnvelopeWithinLimit(envelope: Envelope, maxBytes: number): string {
+  const limited: Envelope = { ...envelope, payload: { ...envelope.payload } }
+  let serialized = JSON.stringify(limited)
+  if (utf8ByteLength(serialized) <= maxBytes) return serialized
+
+  for (const field of ["output", "delta", "error"] as const) {
+    const value = limited.payload[field]
+    if (typeof value !== "string") continue
+    let low = 0
+    let high = utf8ByteLength(value)
+    let best = ""
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2)
+      const candidate = truncateUtf8(value, middle)
+      limited.payload[field] = candidate
+      const encoded = JSON.stringify(limited)
+      if (utf8ByteLength(encoded) <= maxBytes) {
+        best = candidate
+        serialized = encoded
+        low = middle + 1
+      } else {
+        high = middle - 1
+      }
+    }
+    limited.payload[field] = best
+    serialized = JSON.stringify(limited)
+    if (utf8ByteLength(serialized) <= maxBytes) return serialized
+  }
+
+  throw new Error(`WebSocket envelope exceeds ${maxBytes} bytes`)
+}
+
 // ── Message Types ─────────────────────────────────────────────────────────────
 
 export interface TaskContext {
@@ -77,8 +126,10 @@ export interface TaskRequest {
 }
 
 export interface TaskRequestLimits {
+  maxTaskIdBytes: number
   maxPromptBytes: number
   maxEnvironmentBytes: number
+  maxTimeoutMs: number
 }
 
 export function validateTaskRequest(
@@ -90,6 +141,12 @@ export function validateTaskRequest(
   if (typeof payload.task_id !== "string" || payload.task_id.length === 0) {
     return { error: "Missing or invalid task_id", taskId }
   }
+  if (utf8ByteLength(payload.task_id) > limits.maxTaskIdBytes || /[\u0000-\u001f\u007f]/.test(payload.task_id)) {
+    return {
+      error: `task_id must contain no control characters and fit within ${limits.maxTaskIdBytes} UTF-8 bytes`,
+      taskId: "invalid",
+    }
+  }
   if (typeof payload.prompt !== "string" || payload.prompt.length === 0) {
     return { error: "Missing or invalid prompt", taskId }
   }
@@ -98,8 +155,8 @@ export function validateTaskRequest(
   }
   if (payload.timeout_ms !== undefined &&
       (typeof payload.timeout_ms !== "number" || !Number.isSafeInteger(payload.timeout_ms) ||
-       payload.timeout_ms <= 0 || payload.timeout_ms > 2_147_483_647)) {
-    return { error: "timeout_ms must be an integer between 1 and 2147483647", taskId }
+       payload.timeout_ms <= 0 || payload.timeout_ms > limits.maxTimeoutMs)) {
+    return { error: `timeout_ms must be an integer between 1 and ${limits.maxTimeoutMs}`, taskId }
   }
   if (payload.context !== undefined && !isRecord(payload.context)) {
     return { error: "context must be a JSON object", taskId }

@@ -12,6 +12,7 @@ import {
   buildTaskPrompt,
   isRecord,
   truncateUtf8,
+  truncateUtf8Tail,
   utf8ByteLength,
   type TaskRequest,
   type TaskProgress,
@@ -114,6 +115,7 @@ export async function executeTask(
   onProgress: ProgressCallback,
   onResult: ResultCallback,
   abortSignal?: AbortSignal,
+  resolvedWorkDir?: string,
 ): Promise<void> {
   const startTime = Date.now()
   const timeoutMs = request.timeout_ms ?? DEFAULT_TIMEOUT_MS
@@ -122,8 +124,6 @@ export async function executeTask(
   const outputCap = maxOutputBytes()
   const stdoutLineCap = maxStdoutLineBytes()
   const progressCap = maxProgressBytes()
-  const workDir = resolveWorkDir(request.context?.project_dir || workspaceRoot())
-
   let output = ""
   let outputBytes = 0
   const collectedMessages: KimiMessage[] = []
@@ -149,7 +149,7 @@ export async function executeTask(
     outputBytes += utf8ByteLength(appended)
   }
   const appendStderr = (text: string) => {
-    stderrBuffer = truncateUtf8(stderrBuffer + text, STDERR_CAP)
+    stderrBuffer = truncateUtf8Tail(stderrBuffer + text, STDERR_CAP)
   }
 
   const emitProgress = (delta: string) => {
@@ -229,6 +229,7 @@ export async function executeTask(
   }
 
   try {
+    const workDir = resolvedWorkDir ?? resolveWorkDir(request.context?.project_dir || workspaceRoot())
     const promptText = buildTaskPrompt(request)
     // No --yolo flag: this kimi-code version rejects it in combination with
     // -p (print mode). Auto-approval comes from the baked config.toml
@@ -291,6 +292,14 @@ export async function executeTask(
       proc!.on("close", (code) => {
         procClosed = true
         if (killEscalation && !processGroupExists()) clearTimeout(killEscalation)
+        if (!streamError && stdoutBuffer.length > 0) {
+          if (stdoutBuffer.length > stdoutLineCap) {
+            streamError = new Error(`kimi stdout line exceeds ${stdoutLineCap} bytes`)
+          } else {
+            const line = stdoutBuffer.toString("utf8").trim()
+            if (line.length > 0) processStreamLine(line)
+          }
+        }
         if (stopReason) {
           rejectTask(new TaskStoppedError(stopReason))
           return
@@ -334,16 +343,14 @@ export async function executeTask(
         const content = typeof parsed.content === "string"
           ? truncateUtf8(parsed.content, outputCap)
           : undefined
-        const msg: KimiMessage = {
-          role: parsed.role ?? "",
-          content,
-          tool_call_id: parsed.tool_call_id,
-        }
-        collectedMessages.push(msg)
-        collectedBytes += content ? utf8ByteLength(content) : 0
-        while (collectedMessages.length > MESSAGES_CAP || collectedBytes > outputCap) {
-          const removed = collectedMessages.shift()
-          if (removed?.content) collectedBytes -= utf8ByteLength(removed.content)
+        if (isAssistantMessage(parsed)) {
+          const msg: KimiMessage = { role: "assistant", content }
+          collectedMessages.push(msg)
+          collectedBytes += content ? utf8ByteLength(content) : 0
+          while (collectedMessages.length > MESSAGES_CAP || collectedBytes > outputCap) {
+            const removed = collectedMessages.shift()
+            if (removed?.content) collectedBytes -= utf8ByteLength(removed.content)
+          }
         }
 
         if (isAssistantMessage(parsed)) {
@@ -369,7 +376,7 @@ export async function executeTask(
         } else if (isMetaMessage(parsed)) {
           // Meta messages (resume hints, retry notices, version) go to stderr only.
           if (typeof parsed.type === "string") {
-            console.error(`[kimi meta] ${parsed.type}`)
+            console.error(`[kimi meta] ${truncateUtf8(parsed.type, progressCap)}`)
           }
         }
       }

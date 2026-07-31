@@ -7,7 +7,7 @@ import { join } from "node:path"
 import { executeTask } from "./kimi_task_executor.js"
 import type { TaskRequest, TaskResult } from "./lunarwing_runtime.js"
 
-function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "hang" | "large" | "longline"): string {
+function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "hang" | "large" | "longline" | "no-newline" | "stderr-tail"): string {
   const dir = mkdtempSync(join(tmpdir(), "kimi-mock-"))
   const binPath = join(dir, "mock-kimi")
   let script: string
@@ -61,6 +61,17 @@ process.stdout.write(JSON.stringify({ role: "assistant", content: "😀".repeat(
       script = `#!/usr/bin/env node
 process.stdout.write("x".repeat(2000))
 setInterval(() => {}, 1000)
+`
+      break
+    case "no-newline":
+      script = `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ role: "assistant", content: "final without newline" }))
+`
+      break
+    case "stderr-tail":
+      script = `#!/usr/bin/env node
+process.stderr.write("x".repeat(70000) + "FINAL-ERROR")
+process.exit(1)
 `
       break
   }
@@ -222,6 +233,41 @@ test("executeTask: rejects oversized stdout line", async () => {
   delete process.env.KIMI_MAX_STDOUT_LINE_BYTES
   assert.equal(result?.status, "error")
   assert.match(result?.error || "", /stdout line exceeds 1024 bytes/)
+})
+
+test("executeTask: parses final JSONL record without trailing newline", async () => {
+  const bin = makeMockKimi("no-newline")
+  const { result } = await runExecutor(
+    { task_id: "no-newline", prompt: "finish", timeout_ms: 10_000 },
+    bin,
+  )
+  assert.equal(result?.status, "success")
+  assert.equal(result?.output, "final without newline")
+})
+
+test("executeTask: keeps actionable stderr tail", async () => {
+  const bin = makeMockKimi("stderr-tail")
+  const { result } = await runExecutor(
+    { task_id: "stderr-tail", prompt: "fail", timeout_ms: 10_000 },
+    bin,
+  )
+  assert.equal(result?.status, "error")
+  assert.match(result?.error || "", /FINAL-ERROR$/)
+  assert.ok(Buffer.byteLength(result?.error || "") <= 65_536)
+})
+
+test("executeTask: invalid workspace emits one error result", async () => {
+  const bin = makeMockKimi("success")
+  const { result } = await runExecutor(
+    {
+      task_id: "missing-workspace",
+      prompt: "never spawn",
+      timeout_ms: 10_000,
+      context: { project_dir: "/tmp/definitely-missing-kimi-workspace" },
+    },
+    bin,
+  )
+  assert.equal(result?.status, "error")
 })
 
 console.log("kimi task executor self-check passed")

@@ -73,6 +73,10 @@ done
 # Code CLI reads its config from $KIMI_CODE_HOME/config.toml.
 mkdir -p "$KIMI_CODE_HOME"
 
+if [ ! -f "$KIMI_CONFIG_SOURCE" ]; then
+  die "Kimi config source not found: $KIMI_CONFIG_SOURCE"
+fi
+
 if [ -f "$KIMI_CONFIG_SOURCE" ]; then
   python3 - "$KIMI_CONFIG_SOURCE" "$KIMI_CODE_HOME/config.toml" <<'PY'
 import os, re, sys, tempfile, tomllib

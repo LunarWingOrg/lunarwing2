@@ -89,13 +89,22 @@ docker build -t lunarwing-worker-kimi:latest .
 # Or via the mt-admin lifecycle
 sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker
 
+# Include same Rust/Go/C/C++/Python/native toolchains as OpenCode worker
+sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker --with-toolchains
+
 # Or as part of tenant provisioning and build
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-kimi
 sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <name> --with-kimi
 
 # Configure per-tenant provider settings
-sudo ic/scripts/lunarwing-mt-admin.sh configure-kimi <name> --model <model> --base-url <url> --api-key <key>
+sudo ic/scripts/lunarwing-mt-admin.sh configure-kimi <name> --model <model> --base-url <url> --api-key-file /secure/path/kimi-api-key
 ```
+
+Default Kimi image is slim. `--with-toolchains` enables Rust 1.96.1, Go 1.24.3,
+C/C++, Python headers, native build systems, and same development libraries as
+OpenCode profile. Server mode requires `AGENT_AUTH_TOKEN`, even on loopback.
+mt-admin keeps Kimi API key out of process arguments by materializing private
+`kimi-runtime.env`; API key input uses file path rather than plaintext argv.
 
 ## OpenCode Worker (old section)
 

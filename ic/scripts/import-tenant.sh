@@ -427,8 +427,14 @@ manifest_value() {
   local key="$1" file="${2:-$WORK/manifest-lunarwing.env}" value
   value="$(sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -1)"
   value="${value%$'\r'}"
-  if [[ ${#value} -ge 2 && ( "$value" == \"*\" || "$value" == \'*\' ) ]]; then
-    value="${value:1:${#value}-2}"
+  if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\"/\"}"
+    value="${value//\\\\/\\}"
+  elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\'/\'}"
+    value="${value//\\\\/\\}"
   fi
   printf '%s' "$value"
 }
