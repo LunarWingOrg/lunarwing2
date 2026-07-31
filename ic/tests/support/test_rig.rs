@@ -913,6 +913,8 @@ impl TestRigBuilder {
             sandbox_readiness: lunarwing::agent::SandboxReadiness::Available, // tests don't use real Docker
             builder: None,
             llm_backend: "lunarwing_cloud".to_string(),
+            coordination_gate: None,
+            coordination_coalesce: None,
         };
 
         // 7. Create TestChannel and ChannelManager.

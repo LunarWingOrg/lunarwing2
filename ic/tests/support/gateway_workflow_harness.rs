@@ -272,6 +272,8 @@ impl GatewayWorkflowHarness {
                 sandbox_readiness: lunarwing::agent::SandboxReadiness::DisabledByConfig,
                 builder: None,
                 llm_backend: "lunarwing_cloud".to_string(),
+                coordination_gate: None,
+                coordination_coalesce: None,
             },
             channels,
             None,
