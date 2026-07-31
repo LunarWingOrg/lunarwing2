@@ -25,9 +25,11 @@ The wiring gaps in §5 were addressed (first pass adapted from branch `anattempt
 | 5.11 No engine v2 bridge adapter | OPEN — large architectural effort |
 | 5.12 Dead code / unused exports | **FIXED** — `FuzzyConfig`, `EvictionConfig`, `spawn_reflex_evictor`, semantic search are now all live |
 
-Additional second-pass fix (not in original gap list): `compile_pattern` only skipped `status='active'`, so user-disabled patterns (CLI `reflex delete`) and attempt-capped patterns were recompiled and resurrected on the next sweep. The compiler now skips `disabled` too; `failed`/`evicted` still fall through to retry.
+Additional second-pass fixes (not in original gap list):
+- `compile_pattern` only skipped `status='active'`, so user-disabled patterns (CLI `reflex delete`) and attempt-capped patterns were recompiled and resurrected on the next sweep. The compiler now skips `disabled` too; `failed`/`evicted` still fall through to retry.
+- The dispatcher bumped `bump_reflex_pattern_match` with the normalized raw input, so fuzzy/semantic hits and promoted input variants updated a nonexistent row (5.2 was only half-fixed for exact repeats). `ReflexRouter::try_route_match` now reports the canonical matched pattern (fuzzy/semantic hits resolve to the stored pattern; promoted variants resolve via a `promoted_variants` side map), and the dispatcher bumps that row.
 
-Verification: 49 reflex unit tests + 10 e2e integration tests pass on `aj/kimi-6-20260731-0902`; `cargo check --all-targets` clean.
+Verification: 50 reflex unit tests + 10 e2e integration tests pass on `aj/kimi-6-20260731-0902`; `cargo check --all-targets` and `cargo clippy --all --benches --tests --examples -- -D warnings` clean; rustfmt clean.
 
 ---
 
