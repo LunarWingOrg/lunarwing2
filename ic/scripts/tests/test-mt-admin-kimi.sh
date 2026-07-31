@@ -161,7 +161,9 @@ fi
 printf 'file-only-secret\n' >"$fixture/kimi-api-key"
 chmod 600 "$fixture/kimi-api-key"
 CAPTURED_KIMI_KEY=''
-add_tenant() { CAPTURED_KIMI_KEY="${*: -1}"; }
+# add_tenant's trailing argument is now darkirc_scope_override; the Kimi key is
+# the second-to-last positional parameter.
+add_tenant() { CAPTURED_KIMI_KEY="${@: -2:1}"; }
 main add-tenant root --kimi-api-key-file "$fixture/kimi-api-key"
 if [[ "$CAPTURED_KIMI_KEY" == 'file-only-secret' ]]; then
   pass 'add-tenant reads Kimi API key from file'
