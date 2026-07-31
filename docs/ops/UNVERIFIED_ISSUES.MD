@@ -3,7 +3,9 @@
 **Review date:** 2026-07-30
 **Reviewed implementation range:** `961521a..a80c4f4` (39 branch-only commits at review time)
 **Initial report commit:** `271d2b8`
-**Overall status:** Not release-ready
+**Overall status:** Not release-ready (at review time)
+
+**Verification pass (2026-07-31, branch aj/kimi-2-20260731-0001):** all 14 issues independently verified against the code; every one was confirmed real. ISSUE-001 through ISSUE-012 and ISSUE-014 are fixed in the commits noted per issue below; ISSUE-013 is addressed via the doc-accuracy path the recommended fix allows (shared backend deferred). Each fix carries regression tests; suites: hooks 83/83, coordination+gate+coalesce green, xmpp 76/76, agent 459/459, health-systemd 34/34, health-openrc 43/43.
 
 This report covers coordination core, web/XMPP integration, init and health
 changes, dependency/version updates, merge integrity, and CI coverage. The
@@ -39,7 +41,7 @@ test coverage that compile-time checks do not exercise.
 ### ISSUE-001: Coordination hooks receive transport name instead of room identity
 
 **Severity:** High
-**Status:** Confirmed
+**Status:** Confirmed real — FIXED in `52ce1bd`
 **Affected code:** `ic/src/agent/thread_ops.rs:525-532`,
 `ic/src/agent/agent_loop.rs:1179-1185`,
 `ic/src/channels/wasm/wrapper.rs:2653-2665`,
@@ -89,7 +91,7 @@ the canonical destination.
 ### ISSUE-002: XMPP coalescing is not present in the deployed channel path
 
 **Severity:** High
-**Status:** Confirmed
+**Status:** Confirmed real — FIXED in `c995575`
 **Affected code:** `ic/src/main.rs:379-384`, `ic/src/main.rs:523-554`,
 `ic/src/channels/xmpp/mod.rs:1145-1192`,
 `docs/proposals/MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md:74-87`,
@@ -133,7 +135,7 @@ Until that lands, mark Phase 4 partial rather than implemented.
 ### ISSUE-003: Three-strike disable gate is not registered in production
 
 **Severity:** High
-**Status:** Confirmed
+**Status:** Confirmed real — FIXED in `32cb470`
 **Affected code:** `ic/src/gate/coordination.rs:17-83`,
 `ic/src/main.rs:656-689`
 
@@ -174,7 +176,7 @@ effect.
 ### ISSUE-004: Violation accounting can strike the wrong agent or count one event twice
 
 **Severity:** High
-**Status:** Confirmed
+**Status:** Confirmed real — FIXED in `52ce1bd`
 **Affected code:** `ic/src/agent/agent_loop.rs:1179-1185`,
 `ic/src/agent/agent_loop.rs:1456-1478`,
 `ic/src/agent/thread_ops.rs:525-545`,
@@ -215,7 +217,7 @@ or mark already-evaluated responses so the same policy cannot record twice.
 ### ISSUE-005: Coalesce buffer has lost-update and stale-timer races
 
 **Severity:** High
-**Status:** Confirmed
+**Status:** Confirmed real — FIXED in `0d4228c`
 **Affected code:** `ic/src/channels/coalesce.rs:163-237`
 
 #### Observed behavior
@@ -252,7 +254,7 @@ by each pending entry. A stale timer must never match a replacement entry.
 ### ISSUE-006: `disable-weechat` changes health classification but not service lifecycle
 
 **Severity:** High
-**Status:** Confirmed
+**Status:** Confirmed real — FIXED in `346c9f1`
 **Affected code:** `ic/scripts/lunarwing-mt-admin.sh:1554-1583`,
 `ic/scripts/lunarwing-mt-admin.sh:5941-5965`,
 `ic/scripts/lunarwing-mt-admin.sh:6012-6026`,
@@ -297,7 +299,7 @@ both init systems.
 ### ISSUE-007: Multi-tenant systemd health can report healthy when discovery fails
 
 **Severity:** High
-**Status:** Confirmed
+**Status:** Confirmed real — FIXED in `9d372f5`
 **Affected code:** `ic-infrastructure-health-check/health-systemd.sh:23-27`,
 `ic-infrastructure-health-check/health-systemd.sh:48-55`,
 `ic-infrastructure-health-check/health-systemd.sh:93-104`,
@@ -348,7 +350,7 @@ the distinction between an absent unit and a failed probe.
 ### ISSUE-008: Expired automatic disable cannot rearm until every strike decays
 
 **Severity:** Medium
-**Status:** Confirmed
+**Status:** Confirmed real — FIXED in `0d4228c`
 **Affected code:** `ic/src/gate/violation_store.rs:145-171`,
 `ic/src/gate/violation_store.rs:238-262`
 
@@ -386,7 +388,7 @@ a new violation, and encode that policy explicitly.
 ### ISSUE-009: Coordination admin mutation endpoints have no authentication
 
 **Severity:** Medium
-**Status:** Confirmed security weakness
+**Status:** Confirmed real (security weakness) — FIXED in `82b81be`
 **Affected code:** `ic/src/channels/web/handlers/coord.rs:1-12`,
 `ic/src/channels/web/handlers/coord.rs:79-136`,
 `ic/src/channels/web/handlers/coord.rs:139-159`
@@ -425,7 +427,7 @@ server loopback-only as defense in depth.
 ### ISSUE-010: Declarative coordination rules apply to every channel
 
 **Severity:** Medium
-**Status:** Confirmed
+**Status:** Confirmed real — FIXED in `90405e0`
 **Affected code:** `ic/config/hooks/coordination.hook.json:3-68`,
 `ic/src/hooks/bundled.rs:439-477`
 
@@ -463,7 +465,7 @@ destinations.
 ### ISSUE-011: A response containing only an allowed tag can panic
 
 **Severity:** Medium
-**Status:** Confirmed
+**Status:** Confirmed real — FIXED in `0137177`
 **Affected code:** `ic/src/hooks/coordination.rs:589-601`
 
 #### Observed behavior
@@ -494,7 +496,7 @@ indexing on untrusted response text.
 ### ISSUE-012: WeeChat registry updates can race and health can retain an obsolete registry
 
 **Severity:** Medium
-**Status:** Confirmed
+**Status:** Confirmed real — FIXED in `346c9f1`
 **Affected code:** `ic/scripts/lunarwing-mt-admin.sh:1554-1583`,
 `ic/scripts/lunarwing-mt-admin.sh:1615-1619`,
 `ic/scripts/lunarwing-mt-admin.sh:7108-7160`
@@ -536,7 +538,7 @@ file ownership, mode, and unrelated operator settings.
 ### ISSUE-013: First-responder claims are process-local, not host-wide or team-wide
 
 **Severity:** Medium
-**Status:** Confirmed limitation
+**Status:** Confirmed real (limitation) — addressed in `7a5495f`: feature re-documented as process-local; shared compare-and-insert claim backend explicitly deferred (doc-accuracy path per the recommended fix)
 **Affected code:** `ic/src/hooks/coordination.rs:155-180`,
 `ic/src/hooks/coordination.rs:472-545`,
 `ic/src/hooks/coordination.rs:738-763`
@@ -574,7 +576,7 @@ remove claims of deployed multi-agent deduplication.
 ### ISSUE-014: Violation-store tests share temporary paths under parallel execution
 
 **Severity:** Low
-**Status:** Confirmed
+**Status:** Confirmed real — FIXED in `0d4228c`
 **Affected code:** `ic/src/gate/violation_store.rs:318-368`
 
 #### Observed behavior
@@ -618,11 +620,9 @@ shared `.tmp` rename target.
 
 ## Release Recommendation
 
-Do not treat coordination or the WeeChat health-gate work as complete yet.
-`docs/ops/AGENT_GOALS_2.0.4.0.md:15` overstates the effect of
-`disable-weechat`, and line 19 overstates four-phase coordination deployment.
-
-Fix ISSUE-001 through ISSUE-007 before release. Then add runtime end-to-end
-coverage that starts the same channel, hook, gate, init, and health paths used
-in production. Component-only tests and a clean compile cannot validate these
-integration boundaries.
+Superseded by the 2026-07-31 verification pass: ISSUE-001 through ISSUE-007
+(and 008-012, 014) are fixed and tested; ISSUE-013 is documented as
+process-local with the shared backend deferred. Remaining pre-release work
+from this review: runtime end-to-end coverage that starts the same channel,
+hook, gate, init, and health paths used in production — component-only tests
+and a clean compile cannot validate these integration boundaries.

@@ -68,9 +68,7 @@ impl CoordinationGate {
             None
         };
         disabled_agent.map(|agent| {
-            format!(
-                "{SILENT_DENY_PREFIX}agent '{agent}' auto-disabled for coordination violations"
-            )
+            format!("{SILENT_DENY_PREFIX}agent '{agent}' auto-disabled for coordination violations")
         })
     }
 }

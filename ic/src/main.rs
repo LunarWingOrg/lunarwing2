@@ -700,8 +700,7 @@ async fn async_main() -> anyhow::Result<()> {
         match lunarwing::channels::web::coord_admin_token_from_env() {
             Some(token) => {
                 let port = lunarwing::channels::web::coord_admin_port_from_env();
-                match lunarwing::channels::web::start_coord_admin_server(store, token, port).await
-                {
+                match lunarwing::channels::web::start_coord_admin_server(store, token, port).await {
                     Ok(addr) => tracing::info!(%addr, "Coordination admin endpoints listening"),
                     Err(err) => tracing::warn!(
                         error = %err,
@@ -710,9 +709,9 @@ async fn async_main() -> anyhow::Result<()> {
                     ),
                 }
             }
-            None => tracing::warn!(
-                "COORD_ADMIN_TOKEN is not set; coordination admin server disabled"
-            ),
+            None => {
+                tracing::warn!("COORD_ADMIN_TOKEN is not set; coordination admin server disabled")
+            }
         }
     }
 

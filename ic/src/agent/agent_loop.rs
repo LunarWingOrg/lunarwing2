@@ -1236,7 +1236,9 @@ impl Agent {
                 let channels = Arc::clone(&channels);
                 let msg = msg.clone();
                 Box::pin(async move {
-                    if let Err(error) = channels.respond(&msg, OutgoingResponse::text(content)).await
+                    if let Err(error) = channels
+                        .respond(&msg, OutgoingResponse::text(content))
+                        .await
                     {
                         tracing::error!(
                             channel = %msg.channel,

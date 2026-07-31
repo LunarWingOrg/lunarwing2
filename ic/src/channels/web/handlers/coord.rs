@@ -202,10 +202,7 @@ pub fn coord_admin_router(store: Arc<ViolationStore>, token: SecretString) -> Ro
         .route("/coord/clear/{agent}", post(clear_agent))
         .route("/coord/disable/{agent}", post(disable_agent))
         .route("/coord/enable/{agent}", post(enable_agent))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_auth,
-        ))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state)
 }
 
@@ -398,12 +395,9 @@ mod tests {
 
         // Overlong identifier.
         let long = "x".repeat(MAX_AGENT_ID_LEN + 1);
-        let resp = match authed(
-            &client,
-            client.post(format!("{base}/coord/disable/{long}")),
-        )
-        .send()
-        .await
+        let resp = match authed(&client, client.post(format!("{base}/coord/disable/{long}")))
+            .send()
+            .await
         {
             Ok(r) => r,
             Err(err) => panic!("POST overlong id failed: {err}"),
@@ -455,12 +449,9 @@ mod tests {
         assert_eq!(body["agents"][0]["agent"], "agent-x");
         assert_eq!(body["agents"][0]["status"], "warning");
 
-        let resp = match authed(
-            &client,
-            client.get(format!("{base}/coord/status/agent-x")),
-        )
-        .send()
-        .await
+        let resp = match authed(&client, client.get(format!("{base}/coord/status/agent-x")))
+            .send()
+            .await
         {
             Ok(r) => r,
             Err(err) => panic!("GET /coord/status/agent-x failed: {err}"),
@@ -469,12 +460,9 @@ mod tests {
 
         // Second strike disables (max_violations = 2).
         store.record_violation("agent-x", "r2", "hook", "chan");
-        let resp = match authed(
-            &client,
-            client.get(format!("{base}/coord/status/agent-x")),
-        )
-        .send()
-        .await
+        let resp = match authed(&client, client.get(format!("{base}/coord/status/agent-x")))
+            .send()
+            .await
         {
             Ok(r) => r,
             Err(err) => panic!("GET after disable failed: {err}"),
@@ -491,12 +479,9 @@ mod tests {
         );
 
         // Clear re-enables.
-        let resp = match authed(
-            &client,
-            client.post(format!("{base}/coord/clear/agent-x")),
-        )
-        .send()
-        .await
+        let resp = match authed(&client, client.post(format!("{base}/coord/clear/agent-x")))
+            .send()
+            .await
         {
             Ok(r) => r,
             Err(err) => panic!("POST /coord/clear failed: {err}"),
@@ -508,9 +493,12 @@ mod tests {
         assert_eq!(body["status"], "active");
 
         // Manual disable/enable round-trip.
-        let _ = authed(&client, client.post(format!("{base}/coord/disable/agent-y")))
-            .send()
-            .await;
+        let _ = authed(
+            &client,
+            client.post(format!("{base}/coord/disable/agent-y")),
+        )
+        .send()
+        .await;
         assert!(store.is_disabled("agent-y"));
         let _ = authed(&client, client.post(format!("{base}/coord/enable/agent-y")))
             .send()

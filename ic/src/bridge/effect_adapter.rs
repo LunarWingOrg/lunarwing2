@@ -1548,12 +1548,10 @@ FINAL(echoed + "|" + http_result["error"])"#,
         ));
         store.record_violation("bad-agent", "r", "hook", "chan");
         adapter
-            .set_coordination_gate(Arc::new(
-                crate::gate::coordination::CoordinationGate::new(
-                    Arc::clone(&store),
-                    "good-agent".to_string(),
-                ),
-            ))
+            .set_coordination_gate(Arc::new(crate::gate::coordination::CoordinationGate::new(
+                Arc::clone(&store),
+                "good-agent".to_string(),
+            )))
             .await;
 
         // Disabled user: silent deny before any tool side effect.
@@ -1575,7 +1573,9 @@ FINAL(echoed + "|" + http_result["error"])"#,
         }
 
         // Clean user still executes (auto-approved to skip the approval pause).
-        adapter.auto_approve_tool("good-user", "approval_test").await;
+        adapter
+            .auto_approve_tool("good-user", "approval_test")
+            .await;
         let mut good_ctx = exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_good"));
         good_ctx.user_id = "good-user".to_string();
         let result = adapter

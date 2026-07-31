@@ -535,14 +535,18 @@ mod tests {
         config.window = Duration::from_millis(100);
         let buffer = CoalesceBuffer::new(config);
         let (flush, sent) = collector();
-        buffer.submit(key(), "STATUS: old".into(), flush.clone()).await;
+        buffer
+            .submit(key(), "STATUS: old".into(), flush.clone())
+            .await;
         // Early flush: "old" is delivered now, but its window timer is armed.
         buffer.flush_all().await;
         // Reinsert halfway through the old window; the new entry gets a
         // fresh generation, so the old timer (due at ~100ms from the first
         // submit) must ignore it.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        buffer.submit(key(), "STATUS: new".into(), flush.clone()).await;
+        buffer
+            .submit(key(), "STATUS: new".into(), flush.clone())
+            .await;
         // At ~120ms: old timer has fired, the new entry's timer has not.
         tokio::time::sleep(Duration::from_millis(70)).await;
         assert_eq!(

@@ -1027,11 +1027,8 @@ mod tests {
         // ISSUE-001 regression: the WASM XMPP path sets the event channel to
         // the transport name ("xmpp"); the room JID arrives via policy_scope.
         let config = test_config();
-        let hook = EngagementPolicyHook::new(
-            test_state(),
-            config.agent_id.clone(),
-            config.agent_aliases,
-        );
+        let hook =
+            EngagementPolicyHook::new(test_state(), config.agent_id.clone(), config.agent_aliases);
         let scoped_inbound = |scope: &str| HookEvent::Inbound {
             user_id: "agent-2".to_string(),
             channel: "xmpp".to_string(),
