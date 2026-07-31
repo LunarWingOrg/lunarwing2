@@ -120,6 +120,9 @@ impl ReflexStore for LibSqlBackend {
                 (id, user_id, normalized_pattern, original_pattern, tool_name, match_count, last_matched_at, created_at, updated_at, status, compilation_attempts)
                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, ?6, 'active', 0)
                 ON CONFLICT (user_id, normalized_pattern) DO UPDATE SET
+                    tool_name = excluded.tool_name,
+                    status = 'active',
+                    compilation_attempts = 0,
                     match_count = reflex_patterns.match_count + 1,
                     last_matched_at = ?6,
                     updated_at = ?6
@@ -219,26 +222,38 @@ impl ReflexStore for LibSqlBackend {
         Ok(())
     }
 
-    async fn increment_reflex_compilation_attempts(
+    async fn record_reflex_compilation_failure(
         &self,
         user_id: &str,
         normalized_pattern: &str,
+        original_pattern: &str,
+        tool_name: &str,
         max_attempts: i32,
     ) -> Result<(), DatabaseError> {
         let conn = self.connect().await?;
         let now = fmt_ts(&Utc::now());
         conn.execute(
             r#"
-                UPDATE reflex_patterns
-                SET compilation_attempts = compilation_attempts + 1,
-                    updated_at = ?3,
+                INSERT INTO reflex_patterns
+                (id, user_id, normalized_pattern, original_pattern, tool_name, match_count, last_matched_at, created_at, updated_at, status, compilation_attempts)
+                VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, ?6, ?6, 'failed', 1)
+                ON CONFLICT (user_id, normalized_pattern) DO UPDATE SET
+                    compilation_attempts = reflex_patterns.compilation_attempts + 1,
+                    updated_at = ?6,
                     status = CASE
-                        WHEN compilation_attempts + 1 >= ?4 THEN 'disabled'
-                        ELSE status
+                        WHEN reflex_patterns.compilation_attempts + 1 >= ?7 THEN 'disabled'
+                        ELSE 'failed'
                     END
-                WHERE user_id = ?1 AND normalized_pattern = ?2
                 "#,
-            params![user_id, normalized_pattern, now, max_attempts as i64],
+            params![
+                Uuid::new_v4().to_string(),
+                user_id,
+                normalized_pattern,
+                original_pattern,
+                tool_name,
+                now,
+                max_attempts as i64
+            ],
         )
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?;

@@ -693,10 +693,17 @@ impl ReflexCompiler {
     async fn compile_pattern(&self, description: &str) {
         let normalized = normalize_pattern(description);
 
-        // Check if already compiled
+        // Check if already compiled — active patterns are done, and disabled
+        // patterns stay disabled (user-deleted via CLI or auto-disabled after
+        // repeated build failures); 'failed' and 'evicted' rows fall through
+        // so they are retried.
         match self.store.get_reflex_pattern(&self.user_id, &normalized).await {
-            Ok(Some((_, status))) if status == "active" => {
-                tracing::debug!("Reflex pattern already compiled: {}", normalized);
+            Ok(Some((_, status))) if status == "active" || status == "disabled" => {
+                tracing::debug!(
+                    "Reflex pattern skipped (status {}): {}",
+                    status,
+                    normalized
+                );
                 return;
             }
             _ => {}
@@ -764,10 +771,16 @@ impl ReflexCompiler {
                     );
                     if let Err(e) = self
                         .store
-                        .increment_reflex_compilation_attempts(&self.user_id, &normalized, 3)
+                        .record_reflex_compilation_failure(
+                            &self.user_id,
+                            &normalized,
+                            description,
+                            &safe_name,
+                            3,
+                        )
                         .await
                     {
-                        tracing::debug!("Failed to increment compilation attempts: {}", e);
+                        tracing::debug!("Failed to record compilation failure: {}", e);
                     }
                 }
             }
@@ -1415,6 +1428,107 @@ mod tests {
 
         let patterns = backend.list_reflex_patterns("test-user").await.unwrap();
         assert_eq!(patterns[0].status, "disabled");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "libsql")]
+    async fn test_reflex_store_record_compilation_failure() {
+        use crate::db::libsql::LibSqlBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test_reflex_failure.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // First failure inserts a 'failed' row with attempts = 1.
+        backend
+            .record_reflex_compilation_failure(
+                "test-user",
+                "broken pattern",
+                "Broken pattern",
+                "reflex_aaa",
+                3,
+            )
+            .await
+            .unwrap();
+
+        let patterns = backend.list_reflex_patterns("test-user").await.unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].status, "failed");
+        assert_eq!(patterns[0].compilation_attempts, 1);
+        assert_eq!(patterns[0].match_count, 0);
+
+        // Second failure increments; still below the limit.
+        backend
+            .record_reflex_compilation_failure(
+                "test-user",
+                "broken pattern",
+                "Broken pattern",
+                "reflex_bbb",
+                3,
+            )
+            .await
+            .unwrap();
+        let patterns = backend.list_reflex_patterns("test-user").await.unwrap();
+        assert_eq!(patterns[0].status, "failed");
+        assert_eq!(patterns[0].compilation_attempts, 2);
+
+        // Third failure hits the limit and disables the pattern.
+        backend
+            .record_reflex_compilation_failure(
+                "test-user",
+                "broken pattern",
+                "Broken pattern",
+                "reflex_ccc",
+                3,
+            )
+            .await
+            .unwrap();
+        let patterns = backend.list_reflex_patterns("test-user").await.unwrap();
+        assert_eq!(patterns[0].status, "disabled");
+        assert_eq!(patterns[0].compilation_attempts, 3);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "libsql")]
+    async fn test_reflex_store_upsert_reactivates_failed_pattern() {
+        use crate::db::libsql::LibSqlBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test_reflex_reactivate.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // Two failed attempts, then a successful build upsert.
+        for name in ["reflex_aaa", "reflex_bbb"] {
+            backend
+                .record_reflex_compilation_failure(
+                    "test-user",
+                    "flaky pattern",
+                    "Flaky pattern",
+                    name,
+                    3,
+                )
+                .await
+                .unwrap();
+        }
+
+        backend
+            .upsert_reflex_pattern("test-user", "flaky pattern", "Flaky pattern", "reflex_good")
+            .await
+            .unwrap();
+
+        let patterns = backend.list_reflex_patterns("test-user").await.unwrap();
+        assert_eq!(patterns.len(), 1, "no duplicate rows");
+        assert_eq!(patterns[0].status, "active", "success reactivates");
+        assert_eq!(
+            patterns[0].tool_name, "reflex_good",
+            "success records the new tool name"
+        );
+        assert_eq!(
+            patterns[0].compilation_attempts, 0,
+            "success resets the failure counter"
+        );
     }
 
     #[tokio::test]

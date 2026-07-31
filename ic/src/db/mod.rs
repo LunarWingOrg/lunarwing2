@@ -743,6 +743,10 @@ pub trait ReflexStore: Send + Sync {
     ) -> Result<Vec<String>, DatabaseError>;
 
     /// Insert or update a reflex pattern mapping.
+    ///
+    /// On conflict (pattern already known), the row is (re)activated with the
+    /// new `tool_name` and `compilation_attempts` is reset, so a successful
+    /// build always supersedes earlier failed attempts.
     async fn upsert_reflex_pattern(
         &self,
         user_id: &str,
@@ -774,14 +778,19 @@ pub trait ReflexStore: Send + Sync {
         normalized_pattern: &str,
     ) -> Result<(), DatabaseError>;
 
-    /// Increment `compilation_attempts` for a reflex pattern.
+    /// Record a failed compilation attempt for a reflex pattern.
     ///
-    /// If the count reaches `max_attempts`, the pattern is disabled
-    /// (status set to `'disabled'`) so the compiler stops retrying it.
-    async fn increment_reflex_compilation_attempts(
+    /// Inserts the pattern with status `'failed'` when it is not yet known,
+    /// otherwise increments `compilation_attempts`. If the count reaches
+    /// `max_attempts`, the pattern is disabled (status set to `'disabled'`)
+    /// so the compiler stops retrying it. A later successful build reactivates
+    /// the row via `upsert_reflex_pattern`.
+    async fn record_reflex_compilation_failure(
         &self,
         user_id: &str,
         normalized_pattern: &str,
+        original_pattern: &str,
+        tool_name: &str,
         max_attempts: i32,
     ) -> Result<(), DatabaseError>;
 

@@ -1278,6 +1278,9 @@ impl ReflexStore for PgBackend {
              VALUES (gen_random_uuid(), $1, $2, $3, $4, 1, NOW(), NOW(), NOW(), 'active', 0) \
              ON CONFLICT (user_id, normalized_pattern) \
              DO UPDATE SET \
+                 tool_name = EXCLUDED.tool_name, \
+                 status = 'active', \
+                 compilation_attempts = 0, \
                  match_count = reflex_patterns.match_count + 1, \
                  last_matched_at = NOW(), \
                  updated_at = NOW()",
@@ -1352,23 +1355,34 @@ impl ReflexStore for PgBackend {
         Ok(())
     }
 
-    async fn increment_reflex_compilation_attempts(
+    async fn record_reflex_compilation_failure(
         &self,
         user_id: &str,
         normalized_pattern: &str,
+        original_pattern: &str,
+        tool_name: &str,
         max_attempts: i32,
     ) -> Result<(), DatabaseError> {
         let conn = self.store.pool().get().await?;
         conn.execute(
-            "UPDATE reflex_patterns
-             SET compilation_attempts = compilation_attempts + 1,
+            "INSERT INTO reflex_patterns
+             (id, user_id, normalized_pattern, original_pattern, tool_name, match_count, last_matched_at, created_at, updated_at, status, compilation_attempts)
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, 0, NULL, NOW(), NOW(), 'failed', 1)
+             ON CONFLICT (user_id, normalized_pattern)
+             DO UPDATE SET
+                 compilation_attempts = reflex_patterns.compilation_attempts + 1,
                  updated_at = NOW(),
                  status = CASE
-                     WHEN compilation_attempts + 1 >= $3 THEN 'disabled'
-                     ELSE status
-                 END
-             WHERE user_id = $1 AND normalized_pattern = $2",
-            &[&user_id, &normalized_pattern, &max_attempts],
+                     WHEN reflex_patterns.compilation_attempts + 1 >= $5 THEN 'disabled'
+                     ELSE 'failed'
+                 END",
+            &[
+                &user_id,
+                &normalized_pattern,
+                &original_pattern,
+                &tool_name,
+                &max_attempts,
+            ],
         )
         .await?;
         Ok(())
