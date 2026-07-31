@@ -9939,6 +9939,17 @@ main() {
       say "Run '$0 restart-tenant $name' to start the daemon and upload the key to the secrets store"
       ;;
 
+    configure-weechat-relay)
+      [[ -n "${1:-}" ]] || die "usage: configure-weechat-relay <name>"
+      [[ $# -eq 1 ]]   || die "usage: configure-weechat-relay <name> (unexpected extra arguments)"
+      require_root
+      local name
+      name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+      configure_weechat_relay "$name"
+      ;;
+
     darkirc-contact)
       require_root
       local contact_action="" contact_tenant="" contact_name="" adopt_yes=false doctor_all=false migration_in=false migration_json=false
