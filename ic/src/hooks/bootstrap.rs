@@ -36,6 +36,7 @@ impl HookBootstrapSummary {
 }
 
 /// Register bundled hooks, then load plugin and workspace hook bundles.
+#[allow(clippy::too_many_arguments)]
 pub async fn bootstrap_hooks(
     registry: &Arc<HookRegistry>,
     workspace: Option<&Arc<Workspace>>,

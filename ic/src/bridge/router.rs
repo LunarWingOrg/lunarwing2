@@ -620,7 +620,15 @@ async fn execute_pending_gate_action(
 
     state.effect_adapter.reset_call_count();
     let event_rx = state.thread_manager.subscribe_events();
-    match state
+    // Register the resolving window so /interrupt can see and cancel the
+    // inline action — otherwise the interrupt either reports "nothing to
+    // interrupt" while the side effect runs, or finalizes the waiting state
+    // invisibly mid-execution.
+    let resolve_token = state
+        .thread_manager
+        .begin_resolving(pending.thread_id)
+        .await;
+    let exec_result = state
         .effect_adapter
         .execute_resolved_pending_action(
             &pending.action_name,
@@ -629,10 +637,29 @@ async fn execute_pending_gate_action(
             &exec_ctx,
             approval.already_granted,
         )
-        .await
-    {
+        .await;
+    state.thread_manager.end_resolving(pending.thread_id).await;
+    match exec_result {
         Ok(result) => {
-            if approval.enable_always_after_success {
+            if resolve_token.is_cancelled() {
+                // Interrupted mid-action: the side effect already happened, so
+                // persist its result directly for audit (the waiting thread
+                // may already be finalized), then stop without resuming.
+                let event = resolved_action_event(pending, exec_ctx.step_id, &result);
+                if let Err(error) = state
+                    .store
+                    .append_events(&[lunarwing_engine::ThreadEvent::new(pending.thread_id, event)])
+                    .await
+                {
+                    debug!(thread_id = %pending.thread_id, %error, "failed to persist interrupted action result");
+                }
+                let _ = finalize_silently_stopped_pending_thread(state, pending).await;
+                return Ok(PendingActionOutcome::ExecutionStopped);
+            }
+            // Only a genuinely successful action earns AlwaysAllow: tool-level
+            // failures arrive as Ok(ActionResult { is_error: true }) and must
+            // not permanently auto-approve the tool.
+            if approval.enable_always_after_success && !result.is_error {
                 enable_always_allow(state, pending).await;
             }
             state
@@ -897,14 +924,14 @@ async fn reconcile_pending_gate_state(
     Ok(())
 }
 
-async fn fail_threads_for_expired_gates(
-    store: &Arc<dyn Store>,
-    pending_gates: &crate::gate::store::PendingGateStore,
-    expired_gates: &[PendingGate],
-) {
+async fn fail_threads_for_expired_gates(state: &EngineState, expired_gates: &[PendingGate]) {
     for gate in expired_gates {
         let key = gate.key();
-        let Some(mut thread) = store.load_thread(gate.thread_id).await.ok().flatten() else {
+        // Load + state checks happen BEFORE taking the gate-store lock: a
+        // replacement gate inserted while the load was in flight must win,
+        // so the presence check runs last (run_if_absent holds the lock
+        // across the finalization).
+        let Some(thread) = state.store.load_thread(gate.thread_id).await.ok().flatten() else {
             continue;
         };
         if thread.state != lunarwing_engine::ThreadState::Waiting
@@ -912,17 +939,31 @@ async fn fail_threads_for_expired_gates(
         {
             continue;
         }
-        pending_gates
+        state
+            .pending_gates
             .run_if_absent(&key, || async {
-                if let Err(error) = thread.transition_to(
-                    lunarwing_engine::ThreadState::Failed,
-                    Some("pending gate expired".into()),
-                ) {
-                    debug!(thread_id = %thread.id, %error, "failed to expire waiting thread");
-                    return;
-                }
-                if let Err(error) = store.save_thread(&thread).await {
-                    tracing::warn!(thread_id = %thread.id, %error, "failed to save expired waiting thread");
+                // Route through the ThreadManager so expiry finalizes like any
+                // other terminal path: terminal transition, lease revocation,
+                // events — then untrack from conversation state.
+                match state
+                    .thread_manager
+                    .finalize_waiting_thread_as_failed(
+                        gate.thread_id,
+                        &gate.user_id,
+                        "pending gate expired",
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        state
+                            .conversation_manager
+                            .untrack_thread_everywhere(gate.thread_id)
+                            .await;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        debug!(thread_id = %gate.thread_id, %error, "failed to expire waiting thread");
+                    }
                 }
             })
             .await;
@@ -946,31 +987,18 @@ async fn fail_orphaned_waiting_thread_if_needed(
         return Ok(false);
     }
 
-    let Some(mut thread) = state
-        .store
-        .load_thread(thread_id)
+    let finalized = state
+        .thread_manager
+        .finalize_waiting_thread_as_failed(thread_id, user_id, "pending gate missing before resume")
         .await
-        .map_err(|e| engine_err("load thread", e))?
-    else {
-        return Ok(false);
-    };
-
-    if !thread.is_owned_by(user_id) || thread.state != lunarwing_engine::ThreadState::Waiting {
-        return Ok(false);
-    }
-
-    thread
-        .transition_to(
-            lunarwing_engine::ThreadState::Failed,
-            Some("pending gate missing before resume".into()),
-        )
         .map_err(|e| engine_err("reconcile waiting thread", e))?;
-    state
-        .store
-        .save_thread(&thread)
-        .await
-        .map_err(|e| engine_err("save reconciled thread", e))?;
-    Ok(true)
+    if finalized {
+        state
+            .conversation_manager
+            .untrack_thread_everywhere(thread_id)
+            .await;
+    }
+    Ok(finalized)
 }
 
 async fn fail_scoped_orphaned_waiting_threads_if_needed(
@@ -1424,7 +1452,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         start_skill_update_sweep(owner_id.clone());
     }
 
-    start_pending_gate_sweep(sweep_gates, store_dyn);
+    start_pending_gate_sweep(sweep_gates);
 
     Ok(())
 }
@@ -1809,7 +1837,9 @@ pub async fn has_interruptible_engine_state(message: &IncomingMessage) -> bool {
         return false;
     };
     for tid in &conversation.active_threads {
-        if state.thread_manager.is_running(*tid).await {
+        if state.thread_manager.is_running(*tid).await
+            || state.thread_manager.is_resolving(*tid).await
+        {
             return true;
         }
     }
@@ -2304,7 +2334,18 @@ async fn interrupt_engine_conversation(
 
     let mut stopped = 0u32;
     for tid in &active_threads {
-        if state.thread_manager.is_running(*tid).await {
+        if state.thread_manager.is_resolving(*tid).await {
+            // A gate action is executing inline: cancel the resolving window
+            // (the approval task finalizes the thread once the action returns)
+            // and stop the visible waiting state now.
+            state.thread_manager.cancel_resolving(*tid).await;
+            match finalize_silently_stopped_thread(state, conv_id, *tid, &message.user_id).await {
+                Ok(()) => stopped += 1,
+                Err(error) => {
+                    debug!(thread_id = %tid, %error, "engine v2: failed to finalize resolving thread");
+                }
+            }
+        } else if state.thread_manager.is_running(*tid).await {
             if let Err(e) = state
                 .thread_manager
                 .stop_thread(*tid, &message.user_id)
@@ -2710,7 +2751,7 @@ async fn handle_with_engine_inner(
             expired_gates = expired_gates.len(),
             "engine v2: removed expired pending gates"
         );
-        fail_threads_for_expired_gates(&state.store, &state.pending_gates, &expired_gates).await;
+        fail_threads_for_expired_gates(state, &expired_gates).await;
     }
 
     debug!(
@@ -4861,10 +4902,7 @@ fn start_skill_update_sweep(user_id: String) {
 ///
 /// Without this, a thread waiting on an expired gate blocks until
 /// the next ingress triggers cleanup via `drain_expired()`.
-fn start_pending_gate_sweep(
-    pending_gates: Arc<crate::gate::store::PendingGateStore>,
-    store: Arc<dyn Store>,
-) {
+fn start_pending_gate_sweep(pending_gates: Arc<crate::gate::store::PendingGateStore>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(PENDING_GATE_SWEEP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -4876,7 +4914,14 @@ fn start_pending_gate_sweep(
                     removed = expired.len(),
                     "background sweep removed expired pending gates"
                 );
-                fail_threads_for_expired_gates(&store, &pending_gates, &expired).await;
+                let Some(lock) = ENGINE_STATE.get() else {
+                    continue;
+                };
+                let guard = lock.read().await;
+                let Some(state) = guard.as_ref() else {
+                    continue;
+                };
+                fail_threads_for_expired_gates(state, &expired).await;
             }
         }
     });
@@ -5449,7 +5494,7 @@ mod tests {
     #[tokio::test]
     async fn expired_gate_sweep_fails_waiting_thread_without_ingress() {
         let store = Arc::new(TestStore::new());
-        let store_dyn: Arc<dyn Store> = store.clone();
+        let state = make_expected_test_state(store.clone());
         let gates = crate::gate::store::PendingGateStore::in_memory();
         let project_id = lunarwing_engine::ProjectId::new();
         let mut thread = lunarwing_engine::Thread::new(
@@ -5478,7 +5523,7 @@ mod tests {
         gates.insert(gate).await.unwrap();
         let expired = gates.drain_expired().await;
         assert_eq!(expired.len(), 1);
-        fail_threads_for_expired_gates(&store_dyn, &gates, &expired).await;
+        fail_threads_for_expired_gates(&state, &expired).await;
 
         let saved = store.load_thread(thread.id).await.unwrap().unwrap();
         assert_eq!(saved.state, lunarwing_engine::ThreadState::Failed);
@@ -5487,7 +5532,7 @@ mod tests {
     #[tokio::test]
     async fn expired_gate_sweep_does_not_fail_unrelated_waiting_thread() {
         let store = Arc::new(TestStore::new());
-        let store_dyn: Arc<dyn Store> = store.clone();
+        let state = make_expected_test_state(store.clone());
         let gates = crate::gate::store::PendingGateStore::in_memory();
         let project_id = lunarwing_engine::ProjectId::new();
         let mut expired_thread = lunarwing_engine::Thread::new(
@@ -5534,7 +5579,7 @@ mod tests {
             .unwrap();
 
         let expired = gates.drain_expired().await;
-        fail_threads_for_expired_gates(&store_dyn, &gates, &expired).await;
+        fail_threads_for_expired_gates(&state, &expired).await;
 
         assert_eq!(
             store
@@ -5559,7 +5604,6 @@ mod tests {
     #[tokio::test]
     async fn expired_gate_sweep_does_not_fail_thread_with_replacement_gate() {
         let store = Arc::new(TestStore::new());
-        let store_dyn: Arc<dyn Store> = store.clone();
         let gates = Arc::new(crate::gate::store::PendingGateStore::in_memory());
         let mut thread = lunarwing_engine::Thread::new(
             "replaced",
@@ -5588,10 +5632,10 @@ mod tests {
         let expired = gates.drain_expired().await;
 
         store.block_next_thread_load.store(true, Ordering::SeqCst);
-        let sweep_store = Arc::clone(&store_dyn);
-        let sweep_gates = Arc::clone(&gates);
+        let mut state = make_expected_test_state(store.clone());
+        state.pending_gates = Arc::clone(&gates);
         let sweep = tokio::spawn(async move {
-            fail_threads_for_expired_gates(&sweep_store, &sweep_gates, &expired).await;
+            fail_threads_for_expired_gates(&state, &expired).await;
         });
         store.thread_load_started.notified().await;
         let replacement = sample_pending_gate(
@@ -7246,6 +7290,87 @@ mod tests {
             state.thread_manager.join_thread(tid_b),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_resolving_window_and_finalizes_waiting_thread() {
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let project_id = state.default_project_id;
+
+        let conv = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:resolving", "alice")
+            .await
+            .unwrap();
+
+        // Track a thread in the conversation, then retire it so its record can
+        // be re-saved as Waiting under the same id — production resolving
+        // threads are Waiting and absent from the running map.
+        let tid = state
+            .conversation_manager
+            .handle_user_message(
+                conv,
+                "hi",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = state.thread_manager.stop_thread(tid, "alice").await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.thread_manager.join_thread(tid),
+        )
+        .await;
+
+        let mut waiting = lunarwing_engine::Thread::new(
+            "waiting",
+            lunarwing_engine::ThreadType::Foreground,
+            project_id,
+            "alice",
+            ThreadConfig::default(),
+        );
+        waiting.id = tid;
+        waiting
+            .transition_to(lunarwing_engine::ThreadState::Running, None)
+            .unwrap();
+        waiting
+            .transition_to(lunarwing_engine::ThreadState::Waiting, None)
+            .unwrap();
+        state.store.save_thread(&waiting).await.unwrap();
+
+        // Mark the resolving window (approved action executing inline).
+        let token = state.thread_manager.begin_resolving(tid).await;
+
+        let msg = IncomingMessage::new("gateway", "alice", "/interrupt")
+            .with_conversation_scope("resolving");
+        let result = interrupt_engine_conversation(&state, &msg)
+            .await
+            .expect("interrupt should succeed");
+
+        assert_eq!(result, Some("Interrupted.".to_string()));
+        assert!(
+            token.is_cancelled(),
+            "interrupt must cancel the resolving token"
+        );
+        let saved = state.store.load_thread(tid).await.unwrap().unwrap();
+        assert!(
+            saved.state.is_terminal(),
+            "waiting thread must be finalized, got {:?}",
+            saved.state
+        );
+        let conv_after = state
+            .conversation_manager
+            .get_conversation(conv)
+            .await
+            .unwrap();
+        assert!(
+            conv_after.active_threads.is_empty(),
+            "finalized thread must be untracked"
+        );
     }
 
     #[tokio::test]

@@ -1193,7 +1193,17 @@ async fn assert_transform_hook_case(behavior: HookBehavior, expected_response: O
             assert_eq!(responses[0].content, expected);
         }
         None => {
-            wait_for_engine_completion().await;
+            // The rejection produces no delivery, so waiting for the thread's
+            // Done state is not enough: the transform hook runs in the
+            // handler AFTER the finisher marks the thread Done. Wait for the
+            // hook itself — the deterministic post-turn signal.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while calls.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("transform hook should run");
             assert!(rig.captured_responses().is_empty());
         }
     }

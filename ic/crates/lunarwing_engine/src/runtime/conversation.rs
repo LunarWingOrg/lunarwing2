@@ -272,6 +272,18 @@ impl ConversationManager {
         }
     }
 
+    /// Untrack a thread from every conversation's active set.
+    ///
+    /// Reconciliation paths (gate expiry/orphan finalization) finalize a
+    /// thread without a conversation id at hand; without this the thread
+    /// stays "active" in conversation state forever.
+    pub async fn untrack_thread_everywhere(&self, thread_id: ThreadId) {
+        let mut convs = self.conversations.write().await;
+        for conv in convs.values_mut() {
+            conv.untrack_thread(thread_id);
+        }
+    }
+
     /// Record a thread's outcome in its conversation.
     pub async fn record_thread_outcome(
         &self,

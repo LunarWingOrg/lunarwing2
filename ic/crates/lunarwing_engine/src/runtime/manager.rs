@@ -51,6 +51,11 @@ pub struct ThreadManager {
     resume_locks: AsyncMutex<HashMap<ThreadId, Weak<AsyncMutex<()>>>>,
     running: Arc<RwLock<HashMap<ThreadId, RunningThread>>>,
     completed: Arc<RwLock<HashMap<ThreadId, ThreadOutcome>>>,
+    /// Threads whose approved gate action is executing inline in the
+    /// approval-handling task (the "resolving" window between gate removal
+    /// and thread resume). Lets interrupt see and cancel that window instead
+    /// of reporting "nothing to interrupt" while a side effect runs.
+    resolving: Arc<RwLock<HashMap<ThreadId, CancellationToken>>>,
     /// Broadcast channel for thread events (for live status updates).
     event_tx: tokio::sync::broadcast::Sender<crate::types::event::ThreadEvent>,
     /// Tenant identity/persona preamble (from workspace IDENTITY.md/SOUL.md/
@@ -84,6 +89,7 @@ impl ThreadManager {
             resume_locks: AsyncMutex::new(HashMap::new()),
             running: Arc::new(RwLock::new(HashMap::new())),
             completed: Arc::new(RwLock::new(HashMap::new())),
+            resolving: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             identity_preamble: None,
             skill_feedback_enabled: crate::skill_self_improvement_enabled(),
@@ -107,6 +113,37 @@ impl ThreadManager {
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::types::event::ThreadEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Mark a thread as resolving (approved gate action executing inline in
+    /// the approval task). Returns the token an interrupt can cancel.
+    pub async fn begin_resolving(&self, thread_id: ThreadId) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.resolving
+            .write()
+            .await
+            .insert(thread_id, token.clone());
+        token
+    }
+
+    /// Clear a thread's resolving marker after its inline action completes.
+    pub async fn end_resolving(&self, thread_id: ThreadId) {
+        self.resolving.write().await.remove(&thread_id);
+    }
+
+    /// Whether a thread is currently resolving a gate action inline.
+    pub async fn is_resolving(&self, thread_id: ThreadId) -> bool {
+        self.resolving.read().await.contains_key(&thread_id)
+    }
+
+    /// Cancel a thread's resolving window. Returns true when a marker existed.
+    pub async fn cancel_resolving(&self, thread_id: ThreadId) -> bool {
+        if let Some(token) = self.resolving.read().await.get(&thread_id) {
+            token.cancel();
+            true
+        } else {
+            false
+        }
     }
 
     /// Persist and broadcast an event produced while a thread awaits a gate.
@@ -823,6 +860,60 @@ impl ThreadManager {
         Ok(())
     }
 
+    /// Finalize a waiting thread as Failed (gate expiry/orphan reconciliation).
+    ///
+    /// Terminal transition with checkpoint strip, lease revocation, event
+    /// persistence, and broadcast — the same cleanup the stopped variant
+    /// performs, which direct store writes historically skipped (leaking
+    /// no-TTL leases and stale conversation tracking). Returns `Ok(false)`
+    /// when the thread is missing, not owned by `user_id`, not `Waiting`,
+    /// or currently running.
+    pub async fn finalize_waiting_thread_as_failed(
+        &self,
+        thread_id: ThreadId,
+        user_id: &str,
+        reason: &str,
+    ) -> Result<bool, EngineError> {
+        let resume_lock = self.resume_lock(thread_id).await;
+        let _resume_guard = resume_lock.lock().await;
+        if self.is_running(thread_id).await {
+            return Ok(false);
+        }
+
+        let mut thread = match self.store.load_thread(thread_id).await? {
+            Some(thread) => thread,
+            None => return Ok(false),
+        };
+        if !thread.is_owned_by(user_id) || thread.state != ThreadState::Waiting {
+            return Ok(false);
+        }
+
+        let new_event_start = thread.events.len();
+        thread.transition_to(ThreadState::Failed, Some(reason.to_string()))?;
+        if let Some(metadata) = thread.metadata.as_object_mut() {
+            metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
+            metadata.remove(INITIAL_PERSISTED_STATE_METADATA_KEY);
+        }
+        self.store.save_thread(&thread).await?;
+        if let Err(error) = self
+            .store
+            .append_events(&thread.events[new_event_start..])
+            .await
+        {
+            debug!(thread_id = %thread_id, %error, "failed to append finalize-failed events");
+        }
+        self.revoke_lease_ids(
+            &thread.capability_leases,
+            "owning thread finalized as failed",
+        )
+        .await;
+        self.completed.write().await.remove(&thread_id);
+        if let Some(event) = thread.events.last().cloned() {
+            let _ = self.event_tx.send(event);
+        }
+        Ok(true)
+    }
+
     /// Stop a running thread without ownership check (system operations).
     pub async fn stop_thread_system(&self, thread_id: ThreadId) -> Result<(), EngineError> {
         self.request_stop(thread_id).await
@@ -1444,6 +1535,21 @@ mod tests {
                 .is_none()
         );
         assert!(!mgr.is_running(thread_id).await);
+    }
+
+    #[tokio::test]
+    async fn resolving_window_tracks_cancellation() {
+        let mgr = make_manager(MockLlm::text("done"));
+        let tid = ThreadId::new();
+        assert!(!mgr.is_resolving(tid).await);
+        let token = mgr.begin_resolving(tid).await;
+        assert!(mgr.is_resolving(tid).await);
+        assert!(!token.is_cancelled());
+        assert!(mgr.cancel_resolving(tid).await);
+        assert!(token.is_cancelled());
+        mgr.end_resolving(tid).await;
+        assert!(!mgr.is_resolving(tid).await);
+        assert!(!mgr.cancel_resolving(tid).await);
     }
 
     #[tokio::test]

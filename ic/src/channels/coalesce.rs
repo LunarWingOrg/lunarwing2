@@ -302,8 +302,13 @@ fn is_alert(content: &str) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case("alert:"))
 }
 
-fn spawn_flush(flush: FlushFn, content: String, _guard: OwnedRwLockReadGuard<()>) {
+fn spawn_flush(flush: FlushFn, content: String, guard: OwnedRwLockReadGuard<()>) {
     tokio::spawn(async move {
+        // Hold the delivery-barrier read guard for the callback's lifetime:
+        // `flush_all`'s write guard must wait for detached deliveries. The
+        // guard must be moved INTO the task — binding it only as a function
+        // parameter drops it when this function returns.
+        let _guard = guard;
         flush(content).await;
     });
 }
