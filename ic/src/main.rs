@@ -662,6 +662,16 @@ async fn async_main() -> anyhow::Result<()> {
                 ViolationStoreConfig::from_env(),
             ))
         });
+    // Phase 3: execution gate sharing the hooks' violation store, so a
+    // strike-three (or manual) disable actually blocks tool execution
+    // instead of only filtering channel traffic (ISSUE-003).
+    let coordination_gate: Option<Arc<lunarwing::gate::coordination::CoordinationGate>> =
+        coordination_store.clone().map(|store| {
+            Arc::new(lunarwing::gate::coordination::CoordinationGate::new(
+                store,
+                coordination_config.agent_id.clone(),
+            ))
+        });
     let coordination_summary = register_coordination_hooks(
         &components.hooks,
         coordination_config.clone(),
@@ -1052,6 +1062,7 @@ async fn async_main() -> anyhow::Result<()> {
         },
         builder: components.builder,
         llm_backend: config.llm.backend.clone(),
+        coordination_gate,
     };
 
     let channels_for_warnings = Arc::clone(&channels);

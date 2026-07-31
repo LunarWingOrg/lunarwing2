@@ -48,6 +48,31 @@ impl CoordinationGate {
             permissive,
         }
     }
+
+    /// Silent-deny reason when this agent (or `user_id`) is disabled.
+    ///
+    /// Returns `None` in permissive mode or when neither identity is
+    /// disabled. Callers that cannot build a full [`GateContext`] (e.g. the
+    /// effect bridge adapter) use this directly; they must treat the
+    /// [`SILENT_DENY_PREFIX`] reason as log-only and stop execution before
+    /// any tool side effect.
+    pub fn deny_reason(&self, user_id: &str) -> Option<String> {
+        if self.permissive {
+            return None;
+        }
+        let disabled_agent = if self.store.is_disabled(&self.agent_id) {
+            Some(self.agent_id.as_str())
+        } else if self.store.is_disabled(user_id) {
+            Some(user_id)
+        } else {
+            None
+        };
+        disabled_agent.map(|agent| {
+            format!(
+                "{SILENT_DENY_PREFIX}agent '{agent}' auto-disabled for coordination violations"
+            )
+        })
+    }
 }
 
 #[async_trait]
@@ -61,22 +86,8 @@ impl ExecutionGate for CoordinationGate {
     }
 
     async fn evaluate(&self, ctx: &GateContext<'_>) -> GateDecision {
-        if self.permissive {
-            return GateDecision::Allow;
-        }
-        let disabled_agent = if self.store.is_disabled(&self.agent_id) {
-            Some(self.agent_id.as_str())
-        } else if self.store.is_disabled(ctx.user_id) {
-            Some(ctx.user_id)
-        } else {
-            None
-        };
-        match disabled_agent {
-            Some(agent) => GateDecision::Deny {
-                reason: format!(
-                    "{SILENT_DENY_PREFIX}agent '{agent}' auto-disabled for coordination violations"
-                ),
-            },
+        match self.deny_reason(ctx.user_id) {
+            Some(reason) => GateDecision::Deny { reason },
             None => GateDecision::Allow,
         }
     }

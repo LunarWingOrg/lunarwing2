@@ -255,6 +255,10 @@ pub struct AgentDeps {
     /// Resolved LLM backend identifier (e.g., "lunarwing_cloud", "openai_compatible", "ollama").
     /// Used by `/model` persistence to determine which env var to update.
     pub llm_backend: String,
+    /// Coordination gate shared with the hooks' violation store. When set,
+    /// the engine v2 effect adapter blocks tool execution for disabled
+    /// agents (ISSUE-003).
+    pub coordination_gate: Option<Arc<crate::gate::coordination::CoordinationGate>>,
 }
 
 /// The main agent that coordinates all components.

@@ -1342,6 +1342,7 @@ mod tests {
             sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
             builder: None,
             llm_backend: "lunarwing_cloud".to_string(),
+            coordination_gate: None,
         };
 
         Agent::new(
@@ -2231,6 +2232,7 @@ mod tests {
             sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
             builder: None,
             llm_backend: "lunarwing_cloud".to_string(),
+            coordination_gate: None,
         };
 
         Agent::new(
@@ -2360,6 +2362,7 @@ mod tests {
                 sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
                 builder: None,
                 llm_backend: "lunarwing_cloud".to_string(),
+                coordination_gate: None,
             };
 
             Agent::new(

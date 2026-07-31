@@ -996,6 +996,10 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     if let Some(store) = agent.deps.store.clone() {
         effect_adapter.set_settings_store_from_db(store).await;
     }
+    if let Some(gate) = agent.deps.coordination_gate.clone() {
+        effect_adapter.set_coordination_gate(gate).await;
+        debug!("engine v2: coordination gate set on effect adapter");
+    }
 
     // Build centralized auth manager for pre-flight credential checks.
     let secrets_store = agent.tools().secrets_store().cloned();
