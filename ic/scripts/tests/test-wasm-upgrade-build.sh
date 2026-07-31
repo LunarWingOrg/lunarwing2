@@ -167,6 +167,12 @@ for wrapper in \
   fi
 done
 
+if grep -q -- '--with-nanocode' "$TEST_DIR/../upgrade-tenant.sh.old"; then
+  fail 'executable old upgrade script still exposes retired Nanocode option'
+else
+  pass 'executable old upgrade script omits retired Nanocode option'
+fi
+
 if output="$(bash "$TEST_DIR/../upgrade-tenant.sh" fixture --skip-build 2>&1)"; then
   fail 'live upgrade should reject --skip-build'
 elif [[ "$output" == *'--skip-build is unsafe for live upgrades'* ]]; then

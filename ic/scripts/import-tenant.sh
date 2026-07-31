@@ -175,6 +175,9 @@ validate_manifest() {
     [[ -z "${seen[$key]+x}" ]] || die "$kind manifest contains duplicate key '$key'"
     seen["$key"]=1
     case "$kind:$key" in
+      # Accepted only so pre-removal bundles remain importable. Injection drops
+      # these retired settings below; they never reach the target tenant.
+      lunarwing:NANOCODE_MODEL|lunarwing:NANOCODE_BASE_URL) ;;
       lunarwing:SECRETS_MASTER_KEY|lunarwing:XMPP_JID|lunarwing:XMPP_PASSWORD|lunarwing:XMPP_DM_POLICY|lunarwing:XMPP_ALLOW_FROM|lunarwing:XMPP_ALLOW_ROOMS|lunarwing:XMPP_ENCRYPTED_ROOMS|lunarwing:XMPP_ALLOW_PLAINTEXT_FALLBACK|lunarwing:XMPP_OMEMO_DEVICE_ID|lunarwing:LLM_API_KEY|lunarwing:LLM_MODEL|lunarwing:LLM_BASE_URL|lunarwing:OPENCODE_MODEL|lunarwing:OPENCODE_BASE_URL|lunarwing:KIMI_MODEL|lunarwing:KIMI_BASE_URL|lunarwing:KIMI_API_KEY|lunarwing:GOTIFY_URL|lunarwing:GATEWAY_HOST|lunarwing:HTTP_HOST) ;;
       bridge:XMPP_JID|bridge:XMPP_PASSWORD|bridge:XMPP_DM_POLICY|bridge:XMPP_ALLOW_FROM_JSON|bridge:XMPP_ALLOW_ROOMS_JSON|bridge:XMPP_ENCRYPTED_ROOMS_JSON|bridge:XMPP_DEVICE_ID|bridge:XMPP_ALLOW_PLAINTEXT_FALLBACK) ;;
       vision:VL_URL|vision:VL_MODEL|vision:LUNARWING_AUTH_TOKEN) ;;
@@ -269,14 +272,22 @@ acquire_import_passphrase() {
 # Inject KEY=value lines from a manifest into a live env file, backslash-safe (awk
 # ENVIRON, not -v) and CR-tolerant; preserves the live file's inode/owner/mode. The
 # read loop's `|| [[ -n "$line" ]]` keeps a final line without a trailing newline.
-inject_keys() {  # <manifest> <live_env> [skip_key]
-  local man="$1" live="$2" skip_key="${3:-}" line key tmp
+inject_keys() {  # <manifest> <live_env> [skip_key ...]
+  local man="$1" live="$2" line key tmp skip_key should_skip
+  shift 2
   [[ -f "$man" && -f "$live" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     [[ "$line" == *=* ]] || continue
     key="${line%%=*}"
-    [[ -n "$skip_key" && "$key" == "$skip_key" ]] && continue
+    should_skip=false
+    for skip_key in "$@"; do
+      if [[ "$key" == "$skip_key" ]]; then
+        should_skip=true
+        break
+      fi
+    done
+    $should_skip && continue
     grep -qxF "$line" "$live" 2>/dev/null && continue
     tmp="$(mktemp)"
     if grep -q "^${key}=" "$live"; then
@@ -513,7 +524,8 @@ if $DRY_RUN; then
   note "[dry-run] would inject manifest-lunarwing.env -> $ENVF and manifest-bridge.env -> $BRIDGE_ENVF (incl. SECRETS_MASTER_KEY, XMPP password, XMPP/LLM config)"
   [[ -s "$WORK/manifest-vision.env" ]] && note "[dry-run] would inject manifest-vision.env -> $VISION_ENVF (VL_URL and VL_MODEL; target-generated auth token retained)"
 else
-  inject_keys "$WORK/manifest-lunarwing.env" "$ENVF"
+  inject_keys "$WORK/manifest-lunarwing.env" "$ENVF" \
+    NANOCODE_MODEL NANOCODE_BASE_URL
   [[ -f "$WORK/manifest-bridge.env" ]] && inject_keys "$WORK/manifest-bridge.env" "$BRIDGE_ENVF"
   if [[ -s "$WORK/manifest-vision.env" ]]; then
     [[ -f "$VISION_ENVF" ]] || die "bundle carries vision config, but target mt-admin did not render $VISION_ENVF"

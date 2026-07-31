@@ -14,6 +14,10 @@ images, stopped containers, and historical port-registry fields remain available
 for manual backup or cleanup. Tenant removal still recognizes legacy Nanocode
 units so old installations can be torn down safely.
 
+Machine-migration imports accept legacy `NANOCODE_MODEL` and
+`NANOCODE_BASE_URL` manifest entries for backward compatibility, but discard
+them instead of writing retired settings to the target tenant.
+
 ## Operator Check
 
 After upgrading a tenant:

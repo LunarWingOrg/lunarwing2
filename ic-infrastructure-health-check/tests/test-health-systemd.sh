@@ -173,4 +173,13 @@ unit_set "$f4" lunarwing-weechat-acme.service "loaded inactive dead 0 enabled"
 oF4="$(run_hs "$f4" acme acme)"   # absent flag = pre-gate tenant entry
 assert_eq "$(ustat "$oF4" lunarwing-weechat-acme.service)" "critical" "F5: flag absent -> down weechat still critical (backward compat)"
 
+# ── G: retired Nanocode unit is ignored even when failed ─────────────────────
+echo "=== Section G: retired Nanocode unit -> ignored ==="
+g="$(sb)"; mk_hs_mock "$g"
+unit_set "$g" lunarwing-acme.service          "loaded active running 0 enabled"
+unit_set "$g" lunarwing-nanocode-acme.service "loaded failed failed 8 generated"
+oG="$(run_hs "$g" acme acme)"
+assert_eq "$(ustat "$oG" lunarwing-nanocode-acme.service)" "ABSENT" "G1: retired Nanocode unit absent from report"
+assert_eq "$(oall "$oG")" "healthy" "G2: retired Nanocode failure does not affect overall health"
+
 finish

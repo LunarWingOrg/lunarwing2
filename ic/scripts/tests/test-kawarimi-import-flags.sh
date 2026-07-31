@@ -28,6 +28,16 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    fail "$label"
+    printf '        unexpectedly contains: %s\n' "$needle"
+  else
+    pass "$label"
+  fi
+}
+
 assert_file_contains() {
   local label="$1" file="$2" needle="$3"
   if grep -qF -- "$needle" "$file"; then
@@ -61,6 +71,8 @@ META
 SECRETS_MASTER_KEY="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 XMPP_JID=kawarimi@example.test
 GATEWAY_HOST=0.0.0.0
+NANOCODE_MODEL=retired-nanocode-model
+NANOCODE_BASE_URL=https://retired-nanocode.example.test/openai/v1
 OPENCODE_MODEL=test-opencode-model
 OPENCODE_BASE_URL=https://opencode.example.test/openai/v1
 ENV
@@ -154,6 +166,8 @@ output="$(
 assert_contains "passes --docker-group to add-tenant" "$output" "--docker-group"
 assert_contains "preserves opencode model override" "$output" "--opencode-model test-opencode-model"
 assert_contains "preserves opencode base URL override" "$output" "--opencode-base-url https://opencode.example.test/openai/v1"
+assert_not_contains "does not forward retired Nanocode model" "$output" "retired-nanocode-model"
+assert_not_contains "does not forward retired Nanocode base URL" "$output" "retired-nanocode.example.test"
 assert_contains "builds vision sidecar when requested" "$output" "build-vision-sidecar"
 assert_contains "injects vision manifest" "$output" "manifest-vision.env ->"
 assert_contains "runs WeeChat preflight before start" "$output" "lunarwing-weechat-preflight.sh kawarimi"
@@ -243,6 +257,8 @@ assert_file_contains "auto-migrates default owner scope" "$tmp/mt-admin.log" "mi
 assert_file_contains "import keeps target sidecar token" "$tmp/home/kawarimi/lunarwing/env/vision.env" "LUNARWING_AUTH_TOKEN=target-vision-token"
 assert_file_contains "import keeps matching daemon token" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "VISION_AUTH_TOKEN=target-vision-token"
 assert_file_not_contains "import ignores carried sidecar token" "$tmp/home/kawarimi/lunarwing/env/vision.env" "LUNARWING_AUTH_TOKEN=vision-token"
+assert_file_not_contains "import drops retired Nanocode model" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "NANOCODE_MODEL="
+assert_file_not_contains "import drops retired Nanocode base URL" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "NANOCODE_BASE_URL="
 
 echo "=== export-tenant vision manifest coverage ==="
 assert_file_contains "export writes a vision manifest" "$EXPORT_SRC" "manifest-vision.env"

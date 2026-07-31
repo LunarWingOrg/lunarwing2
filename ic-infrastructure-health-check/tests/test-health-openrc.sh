@@ -227,5 +227,16 @@ mk_unit "$s" lunarwing-weechat-acme; fix_set "$s" lunarwing-weechat-acme " * sta
 run_hc "$s" LUNARWING_TENANTS_FILE="$s/nonexistent.json"
 assert_eq "$(svc_field "$OUT" lunarwing-weechat-acme status)" "critical" "S11: unreadable registry → down weechat still critical (never masks)"
 
+# ── S12: retired Nanocode units are ignored even when failed ─────────────────
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0; enable_unit "$s" lunarwing-acme
+mk_unit "$s" lunarwing-nanocode-acme; fix_set "$s" lunarwing-nanocode-acme " * status: crashed" 1
+mk_unit "$s" lunarwing-nanocode-acme-sup; fix_set "$s" lunarwing-nanocode-acme-sup " * status: stopped" 3
+run_hc "$s"
+assert_eq "$(jq '[.metrics.services[] | select(.name | startswith("lunarwing-nanocode-"))] | length' <<<"$OUT")" 0 \
+  "S12: retired Nanocode units absent from report"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S12: retired Nanocode failures do not affect overall health"
+assert_eq "$RC" 0 "S12: retired Nanocode failures keep exit 0"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
