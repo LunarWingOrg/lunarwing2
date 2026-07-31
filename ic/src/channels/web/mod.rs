@@ -27,7 +27,8 @@ pub mod ws;
 
 // Coordination admin API (Phase 3): localhost-only server started from main.
 pub use handlers::coord::{
-    coord_admin_port_from_env, coord_admin_router, start_coord_admin_server,
+    coord_admin_port_from_env, coord_admin_router, coord_admin_token_from_env,
+    start_coord_admin_server,
 };
 
 /// Test helpers for gateway integration tests.

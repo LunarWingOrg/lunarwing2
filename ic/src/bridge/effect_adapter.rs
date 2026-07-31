@@ -49,6 +49,9 @@ pub struct EffectBridgeAdapter {
     mission_manager: RwLock<Option<Arc<lunarwing_engine::MissionManager>>>,
     /// Centralized auth manager for pre-flight credential checks.
     auth_manager: RwLock<Option<Arc<AuthManager>>>,
+    /// Coordination gate: silently blocks all tool execution for agents
+    /// disabled by coordination violations (ISSUE-003).
+    coordination_gate: RwLock<Option<Arc<crate::gate::coordination::CoordinationGate>>>,
 }
 
 impl EffectBridgeAdapter {
@@ -67,6 +70,7 @@ impl EffectBridgeAdapter {
             rate_limiter: RateLimiter::new(),
             mission_manager: RwLock::new(None),
             auth_manager: RwLock::new(None),
+            coordination_gate: RwLock::new(None),
         }
     }
 
@@ -110,6 +114,14 @@ impl EffectBridgeAdapter {
     /// Set the auth manager for pre-flight credential checks.
     pub async fn set_auth_manager(&self, mgr: Arc<AuthManager>) {
         *self.auth_manager.write().await = Some(mgr);
+    }
+
+    /// Set the coordination gate for pre-flight disabled-agent checks.
+    pub async fn set_coordination_gate(
+        &self,
+        gate: Arc<crate::gate::coordination::CoordinationGate>,
+    ) {
+        *self.coordination_gate.write().await = Some(gate);
     }
 
     /// Set the mission manager (called after engine init).
@@ -505,6 +517,21 @@ impl EffectBridgeAdapter {
         approval_already_granted: bool,
     ) -> Result<ActionResult, EngineError> {
         let start = Instant::now();
+
+        // ── Coordination gate (priority 5 — first check, before any side
+        // effect). A disabled agent must not execute tools at all. Return typed
+        // control flow so executors stop without putting policy text in model
+        // context or channel status (ISSUE-003).
+        if let Some(gate) = self.coordination_gate.read().await.as_ref()
+            && gate.deny_reason(&context.user_id).is_some()
+        {
+            tracing::debug!(
+                user = %context.user_id,
+                tool = %action_name,
+                "coordination gate: tool execution silently denied"
+            );
+            return Err(EngineError::ExecutionStopped);
+        }
 
         let resolved_name = self.tools.resolve_name(action_name).await;
         let lookup_name = resolved_name.as_deref().unwrap_or(action_name);
@@ -1485,6 +1512,82 @@ FINAL(echoed + "|" + http_result["error"])"#,
             }
             other => panic!("expected GatePaused, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn coordination_gate_blocks_disabled_agent_tools() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalTestTool)).await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+
+        // Violation store with one disabled agent (max_violations = 1).
+        let dir = std::env::temp_dir().join(format!(
+            "coord-gate-adapter-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let store = Arc::new(crate::gate::violation_store::ViolationStore::new(
+            dir.join("violations.json"),
+            crate::gate::violation_store::ViolationStoreConfig {
+                max_violations: 1,
+                disable_duration_secs: 3600,
+                decay_secs: 600,
+            },
+        ));
+        store.record_violation("bad-agent", "r", "hook", "chan");
+        adapter
+            .set_coordination_gate(Arc::new(crate::gate::coordination::CoordinationGate::new(
+                Arc::clone(&store),
+                "good-agent".to_string(),
+            )))
+            .await;
+
+        // Disabled user: silent deny before any tool side effect.
+        let mut bad_ctx = exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_bad"));
+        bad_ctx.user_id = "bad-agent".to_string();
+        let result = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &bad_ctx,
+            )
+            .await;
+        assert!(matches!(result, Err(EngineError::ExecutionStopped)));
+
+        // Clean user still executes (auto-approved to skip the approval pause).
+        adapter
+            .auto_approve_tool("good-user", "approval_test")
+            .await;
+        let mut good_ctx = exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_good"));
+        good_ctx.user_id = "good-user".to_string();
+        let result = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &good_ctx,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Ok(ActionResult {
+                is_error: false,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

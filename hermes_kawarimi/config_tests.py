@@ -18,6 +18,7 @@ class ImportPlanSerializationTest(unittest.TestCase):
             apply=True,
             start=True,
             force=True,
+            with_kimi=True,
             with_toolchains=True,
             with_vision=False,
             tensorzero_url="http://tz:3000",
@@ -32,6 +33,7 @@ class ImportPlanSerializationTest(unittest.TestCase):
         self.assertTrue(loaded.apply)
         self.assertTrue(loaded.start)
         self.assertTrue(loaded.force)
+        self.assertTrue(loaded.with_kimi)
         self.assertTrue(loaded.with_toolchains)
         self.assertFalse(loaded.with_vision)
         self.assertEqual(loaded.tensorzero_url, "http://tz:3000")

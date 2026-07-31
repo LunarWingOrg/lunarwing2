@@ -255,6 +255,14 @@ pub struct AgentDeps {
     /// Resolved LLM backend identifier (e.g., "lunarwing_cloud", "openai_compatible", "ollama").
     /// Used by `/model` persistence to determine which env var to update.
     pub llm_backend: String,
+    /// Coordination gate shared with the hooks' violation store. When set,
+    /// the engine v2 effect adapter blocks tool execution for disabled
+    /// agents (ISSUE-003).
+    pub coordination_gate: Option<Arc<crate::gate::coordination::CoordinationGate>>,
+    /// Shared outbound coalesce buffer for coordination channels (Phase 4,
+    /// ISSUE-002). Transport-independent: lives at the agent's outbound
+    /// boundary so native and installable WASM channels coalesce alike.
+    pub coordination_coalesce: Option<crate::channels::coalesce::CoalesceBuffer>,
 }
 
 /// The main agent that coordinates all components.
@@ -1115,6 +1123,11 @@ impl Agent {
         if let Some((cron_handle, _)) = routine_handle {
             cron_handle.abort();
         }
+        // Flush pending coalesced coordination messages before channels go
+        // away so buffered content is not lost on shutdown (ISSUE-002).
+        if let Some(buffer) = &self.deps.coordination_coalesce {
+            buffer.flush_all().await;
+        }
         self.scheduler.stop_all().await;
         self.channels.shutdown_all().await?;
 
@@ -1182,39 +1195,83 @@ impl Agent {
             channel: message.channel.clone(),
             content: response.clone(),
             thread_id: message.thread_id.clone(),
+            policy_scope: crate::channels::routing_target_from_metadata(&message.metadata),
         };
-        match self.hooks().run(&event).await {
+        // Hooks first (they may modify or block), then the shared coalesce
+        // buffer, then the channel send (whose transport rate limiter sees
+        // only flushed messages) — the ordering ISSUE-002 requires.
+        let final_text = match self.hooks().run(&event).await {
             Err(error) => {
                 tracing::warn!("BeforeOutbound hook blocked response: {error}");
+                None
             }
             Ok(crate::hooks::HookOutcome::Continue {
                 modified: Some(new_content),
-            }) => {
-                if let Err(error) = self
-                    .channels
-                    .respond(message, OutgoingResponse::text(new_content))
-                    .await
-                {
-                    tracing::error!(
-                        channel = %message.channel,
-                        error = %error,
-                        "Failed to send response to channel"
-                    );
+            }) => Some(new_content),
+            _ => Some(response),
+        };
+        let Some(text) = final_text else {
+            return;
+        };
+
+        // Phase 4: transport-independent coalescing for coordination
+        // channels. Applies to every channel kind (native and installable
+        // WASM alike) because it lives at the agent's outbound boundary
+        // rather than inside any one channel (ISSUE-002).
+        if let Some(buffer) = &self.deps.coordination_coalesce {
+            let destination = crate::channels::routing_target_from_metadata(&message.metadata)
+                .unwrap_or_else(|| message.channel.clone());
+            let key = crate::channels::coalesce::ChannelKey::new(
+                self.deps.owner_id.clone(),
+                message.channel.clone(),
+                destination,
+                message
+                    .conversation_scope_id
+                    .clone()
+                    .or_else(|| message.thread_id.clone())
+                    .unwrap_or_default(),
+            );
+            let channels = Arc::clone(&self.channels);
+            let msg = message.clone();
+            let flush: crate::channels::coalesce::FlushFn = Arc::new(move |content| {
+                let channels = Arc::clone(&channels);
+                let msg = msg.clone();
+                Box::pin(async move {
+                    if let Err(error) = channels
+                        .respond(&msg, OutgoingResponse::text(content))
+                        .await
+                    {
+                        tracing::error!(
+                            channel = %msg.channel,
+                            error = %error,
+                            "Failed to send coalesced response to channel"
+                        );
+                    }
+                })
+            });
+            match buffer.submit(key, text, flush).await {
+                crate::channels::coalesce::CoalesceDecision::SendNow(content) => {
+                    self.respond_and_log(message, content).await;
                 }
+                crate::channels::coalesce::CoalesceDecision::Buffered => {}
             }
-            _ => {
-                if let Err(error) = self
-                    .channels
-                    .respond(message, OutgoingResponse::text(response))
-                    .await
-                {
-                    tracing::error!(
-                        channel = %message.channel,
-                        error = %error,
-                        "Failed to send response to channel"
-                    );
-                }
-            }
+            return;
+        }
+
+        self.respond_and_log(message, text).await;
+    }
+
+    async fn respond_and_log(&self, message: &IncomingMessage, content: String) {
+        if let Err(error) = self
+            .channels
+            .respond(message, OutgoingResponse::text(content))
+            .await
+        {
+            tracing::error!(
+                channel = %message.channel,
+                error = %error,
+                "Failed to send response to channel"
+            );
         }
     }
 
@@ -1460,13 +1517,30 @@ impl Agent {
                 channel: message.channel.clone(),
                 content: content.clone(),
                 thread_id: message.thread_id.clone(),
+                policy_scope: crate::channels::routing_target_from_metadata(&message.metadata),
             };
             match self.hooks().run(&event).await {
                 Err(crate::hooks::HookError::Rejected { reason }) => {
-                    return Ok(Some(format!("[Message rejected: {}]", reason)));
+                    // Typed suppression (ISSUE-004): return the empty response,
+                    // which the delivery layer drops, instead of manufacturing
+                    // channel text that would re-enter outbound hooks and be
+                    // mis-scored as this agent's own policy violation.
+                    tracing::debug!(
+                        channel = %message.channel,
+                        user = %message.user_id,
+                        reason = %reason,
+                        "Inbound hook rejected message; suppressing response"
+                    );
+                    return Ok(Some(String::new()));
                 }
                 Err(err) => {
-                    return Ok(Some(format!("[Message blocked by hook policy: {}]", err)));
+                    tracing::warn!(
+                        channel = %message.channel,
+                        user = %message.user_id,
+                        error = %err,
+                        "Inbound hook blocked message; suppressing response"
+                    );
+                    return Ok(Some(String::new()));
                 }
                 Ok(crate::hooks::HookOutcome::Continue {
                     modified: Some(new_content),
@@ -1896,6 +1970,7 @@ impl Agent {
                     Ok(Some(content))
                 }
             }
+            SubmissionResult::Suppressed => Ok(Some(String::new())),
             SubmissionResult::Ok { message } => Ok(message),
             SubmissionResult::Error { message } => Ok(Some(format!("Error: {}", message))),
             SubmissionResult::Interrupted => Ok(Some("Interrupted.".into())),

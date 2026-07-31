@@ -272,6 +272,18 @@ impl ConversationManager {
         }
     }
 
+    /// Untrack a thread from every conversation's active set.
+    ///
+    /// Reconciliation paths (gate expiry/orphan finalization) finalize a
+    /// thread without a conversation id at hand; without this the thread
+    /// stays "active" in conversation state forever.
+    pub async fn untrack_thread_everywhere(&self, thread_id: ThreadId) {
+        let mut convs = self.conversations.write().await;
+        for conv in convs.values_mut() {
+            conv.untrack_thread(thread_id);
+        }
+    }
+
     /// Record a thread's outcome in its conversation.
     pub async fn record_thread_outcome(
         &self,
@@ -283,7 +295,9 @@ impl ConversationManager {
         if let Some(conv) = convs.get_mut(&conversation_id) {
             match outcome {
                 ThreadOutcome::Completed { response } => {
-                    if let Some(text) = response {
+                    if let Some(text) = response
+                        && !text.is_empty()
+                    {
                         conv.add_entry(ConversationEntry::agent(thread_id, text));
                     }
                     conv.untrack_thread(thread_id);
@@ -883,6 +897,33 @@ mod tests {
             conv.entries[0].sender,
             EntrySender::Agent { thread_id } if thread_id == tid
         ));
+    }
+
+    #[tokio::test]
+    async fn record_outcome_skips_empty_response() {
+        let (_, cm) = make_conv_manager();
+        let conv_id = cm.get_or_create_conversation("cli", "user1").await.unwrap();
+        let tid = ThreadId::new();
+
+        cm.conversations
+            .write()
+            .await
+            .get_mut(&conv_id)
+            .unwrap()
+            .track_thread(tid);
+        cm.record_thread_outcome(
+            conv_id,
+            tid,
+            &ThreadOutcome::Completed {
+                response: Some(String::new()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let conv = cm.get_conversation(conv_id).await.unwrap();
+        assert!(conv.active_threads.is_empty());
+        assert!(conv.entries.is_empty());
     }
 
     #[tokio::test]

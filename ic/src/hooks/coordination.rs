@@ -34,6 +34,30 @@ pub const DEFAULT_MAX_MESSAGE_LENGTH: usize = 420;
 /// Default allowed coordination message tags.
 pub const DEFAULT_ALLOWED_TAGS: [&str; 5] = ["STATUS", "ALERT", "COORD", "ANNOUNCE", "QUERY"];
 
+/// Maximum accepted coordination agent identifier length.
+pub const MAX_COORD_AGENT_ID_LEN: usize = 128;
+
+/// Shared coordination agent-ID contract used by hooks and admin routes.
+pub fn valid_coordination_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_COORD_AGENT_ID_LEN
+        && id.bytes().all(|byte| {
+            matches!(byte,
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'
+                | b'@' | b'.' | b'-' | b'_' | b'/' | b':' | b'+' | b'~')
+        })
+}
+
+/// Build shared case-insensitive exact matcher for configured coordination channels.
+pub(crate) fn coordination_channel_guard(channels: &[String]) -> String {
+    let alternatives = channels
+        .iter()
+        .map(|channel| regex::escape(channel))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("(?i)^(?:{alternatives})$")
+}
+
 /// Configuration for the coordination hooks, loaded from environment.
 #[derive(Debug, Clone)]
 pub struct CoordinationHookConfig {
@@ -118,7 +142,9 @@ impl CoordinationHookConfig {
 
     /// Whether the config is usable (enabled and minimally configured).
     pub fn is_actionable(&self) -> bool {
-        self.enabled && !self.agent_id.is_empty() && !self.coordination_channels.is_empty()
+        self.enabled
+            && valid_coordination_agent_id(&self.agent_id)
+            && !self.coordination_channels.is_empty()
     }
 }
 
@@ -164,7 +190,7 @@ struct CoordinationStateInner {
 #[derive(Debug, Clone)]
 pub struct CoordinationState {
     inner: Arc<Mutex<CoordinationStateInner>>,
-    channels: Arc<Vec<String>>,
+    channel_matcher: Arc<Option<regex::Regex>>,
     admins: Arc<Vec<String>>,
     violations: Option<Arc<ViolationStore>>,
 }
@@ -176,26 +202,32 @@ impl CoordinationState {
         admin_users: Vec<String>,
         violations: Option<Arc<ViolationStore>>,
     ) -> Self {
+        let channel_matcher = if coordination_channels.is_empty() {
+            None
+        } else {
+            let guard = coordination_channel_guard(&coordination_channels);
+            match regex::Regex::new(&guard) {
+                Ok(matcher) => Some(matcher),
+                Err(error) => {
+                    tracing::warn!(%error, "Invalid coordination channel matcher; hooks disabled");
+                    None
+                }
+            }
+        };
         Self {
             inner: Arc::new(Mutex::new(CoordinationStateInner::default())),
-            channels: Arc::new(
-                coordination_channels
-                    .into_iter()
-                    .map(|c| c.to_lowercase())
-                    .collect(),
-            ),
+            channel_matcher: Arc::new(channel_matcher),
             admins: Arc::new(admin_users),
             violations,
         }
     }
 
-    /// Case-insensitive match: the event channel equals or contains a
-    /// configured coordination channel JID/name.
+    /// Case-insensitive exact match against a configured channel JID/name.
     pub async fn is_coordination_channel(&self, channel: &str) -> bool {
-        let channel = channel.to_lowercase();
-        self.channels
-            .iter()
-            .any(|c| channel == *c || channel.contains(c.as_str()))
+        self.channel_matcher
+            .as_ref()
+            .as_ref()
+            .is_some_and(|matcher| matcher.is_match(channel))
     }
 
     /// Whether a user id is a configured admin.
@@ -322,21 +354,19 @@ fn is_allowlisted_token(token: &str) -> bool {
     false
 }
 
-/// Extract the primary content from inbound/outbound events.
-fn event_content(event: &HookEvent) -> Option<(&str, &str, &str)> {
+/// Extract (user_id, policy scope, content, is_outbound) from
+/// inbound/outbound events. The scope is the canonical destination from
+/// routing metadata when present (e.g. the XMPP room JID), falling back to
+/// the transport channel name (ISSUE-001).
+fn event_content(event: &HookEvent) -> Option<(&str, &str, &str, bool)> {
+    let scope = event.policy_scope()?;
     match event {
         HookEvent::Inbound {
-            user_id,
-            channel,
-            content,
-            ..
-        }
-        | HookEvent::Outbound {
-            user_id,
-            channel,
-            content,
-            ..
-        } => Some((user_id, channel, content)),
+            user_id, content, ..
+        } => Some((user_id, scope, content, false)),
+        HookEvent::Outbound {
+            user_id, content, ..
+        } => Some((user_id, scope, content, true)),
         _ => None,
     }
 }
@@ -344,15 +374,25 @@ fn event_content(event: &HookEvent) -> Option<(&str, &str, &str)> {
 /// Priority 5 — high-entropy secret detection beyond the Phase 1 regexes.
 pub struct SecretEntropyHook {
     state: CoordinationState,
+    /// This agent's own identifier (`COORD_AGENT_ID`). Outbound violations
+    /// are attributed to it: the event `user_id` is the conversation peer,
+    /// not the emitter (ISSUE-004).
+    agent_id: String,
     entropy_threshold: f64,
     min_length: usize,
 }
 
 impl SecretEntropyHook {
-    /// Create with the given shared state and detection tunables.
-    pub fn new(state: CoordinationState, entropy_threshold: f64, min_length: usize) -> Self {
+    /// Create with the given shared state, local agent id, and tunables.
+    pub fn new(
+        state: CoordinationState,
+        agent_id: String,
+        entropy_threshold: f64,
+        min_length: usize,
+    ) -> Self {
         Self {
             state,
+            agent_id,
             entropy_threshold,
             min_length,
         }
@@ -378,10 +418,10 @@ impl Hook for SecretEntropyHook {
         event: &HookEvent,
         _ctx: &HookContext,
     ) -> Result<HookOutcome, HookError> {
-        let Some((user_id, channel, content)) = event_content(event) else {
+        let Some((user_id, scope, content, is_outbound)) = event_content(event) else {
             return Ok(HookOutcome::ok());
         };
-        if !self.state.is_coordination_channel(channel).await {
+        if !self.state.is_coordination_channel(scope).await {
             return Ok(HookOutcome::ok());
         }
         for token in content.split_whitespace() {
@@ -389,8 +429,15 @@ impl Hook for SecretEntropyHook {
                 && !is_allowlisted_token(token)
                 && shannon_entropy(token) >= self.entropy_threshold
             {
+                // Inbound secrets belong to the remote sender; outbound
+                // secrets are emitted by the local agent (ISSUE-004).
+                let actor = if is_outbound {
+                    self.agent_id.as_str()
+                } else {
+                    user_id
+                };
                 self.state
-                    .record_violation(user_id, "high-entropy token", self.name(), channel)
+                    .record_violation(actor, "high-entropy token", self.name(), scope)
                     .await;
                 return Ok(HookOutcome::reject(
                     "coord: potential secret detected (high entropy)",
@@ -444,15 +491,15 @@ impl Hook for EngagementPolicyHook {
         _ctx: &HookContext,
     ) -> Result<HookOutcome, HookError> {
         let HookEvent::Inbound {
-            user_id,
-            channel,
-            content,
-            ..
+            user_id, content, ..
         } = event
         else {
             return Ok(HookOutcome::ok());
         };
-        if !self.state.is_coordination_channel(channel).await {
+        let Some(scope) = event.policy_scope() else {
+            return Ok(HookOutcome::ok());
+        };
+        if !self.state.is_coordination_channel(scope).await {
             return Ok(HookOutcome::ok());
         }
         // Messages from this agent or from admins always pass.
@@ -470,6 +517,13 @@ impl Hook for EngagementPolicyHook {
 }
 
 /// Priority 16 — first responder wins; duplicates are rejected.
+///
+/// Scope note (ISSUE-013): claims live in this process's in-memory
+/// `CoordinationState`, so deduplication is **process-local** — it covers
+/// hooks sharing one daemon's state, NOT separate tenant daemons watching
+/// the same MUC. Two independent agents can both claim and both respond.
+/// A shared compare-and-insert backend (host-local store or broker op) is
+/// deferred; treat this as opportunistic self-deduplication only.
 pub struct FirstResponderHook {
     state: CoordinationState,
     agent_id: String,
@@ -515,16 +569,16 @@ impl Hook for FirstResponderHook {
         event: &HookEvent,
         _ctx: &HookContext,
     ) -> Result<HookOutcome, HookError> {
-        let HookEvent::Inbound {
-            channel, content, ..
-        } = event
-        else {
+        let HookEvent::Inbound { content, .. } = event else {
             return Ok(HookOutcome::ok());
         };
-        if !self.state.is_coordination_channel(channel).await {
+        let Some(scope) = event.policy_scope() else {
+            return Ok(HookOutcome::ok());
+        };
+        if !self.state.is_coordination_channel(scope).await {
             return Ok(HookOutcome::ok());
         }
-        let id = correlation_id(channel, content);
+        let id = correlation_id(scope, content);
         match self
             .state
             .try_claim(&id, &self.agent_id, self.claim_ttl)
@@ -570,18 +624,15 @@ impl TagSchemaHook {
         }
     }
 
-    /// Event channel/content for outbound-side events. `ResponseTransform`
-    /// events only participate when they carry a channel.
+    /// Event policy-scope/content for outbound-side events.
+    /// `ResponseTransform` events only participate when they carry a
+    /// channel or scope.
     fn outbound_parts<'a>(&self, event: &'a HookEvent) -> Option<(&'a str, &'a str)> {
         match event {
-            HookEvent::Outbound {
-                channel, content, ..
-            } => Some((channel, content)),
-            HookEvent::ResponseTransform {
-                channel: Some(channel),
-                response,
-                ..
-            } => Some((channel, response)),
+            HookEvent::Outbound { content, .. } => Some((event.policy_scope()?, content)),
+            HookEvent::ResponseTransform { response, .. } => {
+                Some((event.policy_scope()?, response))
+            }
             _ => None,
         }
     }
@@ -593,7 +644,8 @@ impl TagSchemaHook {
                 // get() returns None when the boundary splits a multi-byte
                 // char, so non-ASCII prefixes can't panic here.
                 Some(prefix) => {
-                    prefix.eq_ignore_ascii_case(tag) && trimmed.as_bytes()[tag.len()] == b':'
+                    prefix.eq_ignore_ascii_case(tag)
+                        && trimmed.as_bytes().get(tag.len()) == Some(&b':')
                 }
                 None => false,
             }
@@ -608,7 +660,12 @@ impl Hook for TagSchemaHook {
     }
 
     fn hook_points(&self) -> &[HookPoint] {
-        &[HookPoint::BeforeOutbound, HookPoint::TransformResponse]
+        // Single enforcement point (ISSUE-004): every model response passes
+        // TransformResponse exactly once per turn, including drain-loop
+        // intermediate responses that bypass BeforeOutbound. Registering
+        // both stages made one malformed response consume two strikes — the
+        // rejection replacement text reached BeforeOutbound untagged.
+        &[HookPoint::TransformResponse]
     }
 
     fn failure_mode(&self) -> HookFailureMode {
@@ -704,10 +761,13 @@ impl Hook for RateLimitHook {
         event: &HookEvent,
         _ctx: &HookContext,
     ) -> Result<HookOutcome, HookError> {
-        let HookEvent::Outbound { channel, .. } = event else {
+        let HookEvent::Outbound { .. } = event else {
             return Ok(HookOutcome::ok());
         };
-        if !self.state.is_coordination_channel(channel).await {
+        let Some(scope) = event.policy_scope() else {
+            return Ok(HookOutcome::ok());
+        };
+        if !self.state.is_coordination_channel(scope).await {
             return Ok(HookOutcome::ok());
         }
         if self.state.is_disabled(&self.agent_id) {
@@ -715,7 +775,7 @@ impl Hook for RateLimitHook {
                 "coord: agent disabled due to coordination violations",
             ));
         }
-        let key = format!("{}:{}", self.agent_id, channel.to_lowercase());
+        let key = format!("{}:{}", self.agent_id, scope.to_lowercase());
         if !self
             .state
             .try_consume_rate_limit(&key, self.max_messages, self.window)
@@ -723,7 +783,7 @@ impl Hook for RateLimitHook {
         {
             let agent = self.agent_id.clone();
             self.state
-                .record_violation(&agent, "rate limit exceeded", self.name(), channel)
+                .record_violation(&agent, "rate limit exceeded", self.name(), scope)
                 .await;
             return Ok(HookOutcome::reject(format!(
                 "coord: rate limit exceeded ({} messages per {}s in coordination channels)",
@@ -747,10 +807,17 @@ pub async fn register_coordination_hooks(
     let mut summary = HookRegistrationSummary::default();
     if !config.is_actionable() {
         if config.enabled {
-            tracing::warn!(
-                "COORD_ENABLED=true but COORD_AGENT_ID/COORD_CHANNELS missing; \
-                 coordination hooks not registered"
-            );
+            if !valid_coordination_agent_id(&config.agent_id) {
+                tracing::warn!(
+                    "COORD_ENABLED=true but COORD_AGENT_ID is missing or invalid; \
+                     coordination hooks not registered"
+                );
+            } else {
+                tracing::warn!(
+                    "COORD_ENABLED=true but COORD_CHANNELS is missing; \
+                     coordination hooks not registered"
+                );
+            }
             summary.errors += 1;
         }
         return summary;
@@ -766,6 +833,7 @@ pub async fn register_coordination_hooks(
         (
             Arc::new(SecretEntropyHook::new(
                 state.clone(),
+                config.agent_id.clone(),
                 config.entropy_threshold,
                 config.min_secret_length,
             )),
@@ -823,6 +891,24 @@ pub async fn register_coordination_hooks(
 mod tests {
     use super::*;
 
+    #[test]
+    fn coordination_agent_id_contract_matches_admin_paths() {
+        assert!(valid_coordination_agent_id("agent-1"));
+        assert!(valid_coordination_agent_id(
+            "luna@conference.example/resource"
+        ));
+        assert!(valid_coordination_agent_id(
+            &"x".repeat(MAX_COORD_AGENT_ID_LEN)
+        ));
+        assert!(!valid_coordination_agent_id(""));
+        assert!(!valid_coordination_agent_id(
+            &"x".repeat(MAX_COORD_AGENT_ID_LEN + 1)
+        ));
+        for invalid in ["bad id", "bad%20id", "bad\nid", "bad?id", "üni"] {
+            assert!(!valid_coordination_agent_id(invalid));
+        }
+    }
+
     fn test_config() -> CoordinationHookConfig {
         CoordinationHookConfig {
             enabled: true,
@@ -851,6 +937,7 @@ mod tests {
             channel: channel.to_string(),
             content: content.to_string(),
             thread_id: None,
+            policy_scope: None,
         }
     }
 
@@ -860,6 +947,7 @@ mod tests {
             channel: channel.to_string(),
             content: content.to_string(),
             thread_id: None,
+            policy_scope: None,
         }
     }
 
@@ -897,11 +985,23 @@ mod tests {
                 .await
         );
         assert!(
-            state
+            !state
                 .is_coordination_channel("xmpp:coord@conference.example/group")
                 .await
         );
+        assert!(
+            !state
+                .is_coordination_channel("other-coord@conference.example")
+                .await
+        );
         assert!(!state.is_coordination_channel("random-channel").await);
+        let unicode_state =
+            CoordinationState::new(vec!["Ä-team@conference.example".into()], Vec::new(), None);
+        assert!(
+            unicode_state
+                .is_coordination_channel("ä-team@conference.example")
+                .await
+        );
         assert!(state.is_admin("sun"));
         assert!(!state.is_admin("agent-2"));
     }
@@ -969,7 +1069,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_secret_entropy_detects_high_entropy() {
-        let hook = SecretEntropyHook::new(test_state(), 4.8, 32);
+        let hook = SecretEntropyHook::new(test_state(), "agent-1".to_string(), 4.8, 32);
         let event = inbound(
             "agent-2",
             "coord@conference.example",
@@ -981,7 +1081,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_secret_entropy_allows_normal_text() {
-        let hook = SecretEntropyHook::new(test_state(), 4.8, 32);
+        let hook = SecretEntropyHook::new(test_state(), "agent-1".to_string(), 4.8, 32);
         let event = inbound(
             "agent-2",
             "coord@conference.example",
@@ -989,6 +1089,113 @@ mod tests {
         );
         let outcome = hook.execute(&event, &ctx()).await;
         assert!(matches!(outcome, Ok(HookOutcome::Continue { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_policy_scope_drives_channel_matching() {
+        // ISSUE-001 regression: the WASM XMPP path sets the event channel to
+        // the transport name ("xmpp"); the room JID arrives via policy_scope.
+        let config = test_config();
+        let hook =
+            EngagementPolicyHook::new(test_state(), config.agent_id.clone(), config.agent_aliases);
+        let scoped_inbound = |scope: &str| HookEvent::Inbound {
+            user_id: "agent-2".to_string(),
+            channel: "xmpp".to_string(),
+            content: "untargeted room chatter".to_string(),
+            thread_id: None,
+            policy_scope: Some(scope.to_string()),
+        };
+        // Coordination room via scope: untargeted message is rejected even
+        // though the transport name alone would not match.
+        assert!(matches!(
+            hook.execute(&scoped_inbound("coord@conference.example"), &ctx())
+                .await,
+            Ok(HookOutcome::Reject { .. })
+        ));
+        // A different room via scope: out of scope, message passes.
+        assert!(matches!(
+            hook.execute(&scoped_inbound("other@conference.example"), &ctx())
+                .await,
+            Ok(HookOutcome::Continue { .. })
+        ));
+        // Tag enforcement likewise follows the scope, not the transport name.
+        let tag_hook = TagSchemaHook::new(
+            test_state(),
+            config.agent_id.clone(),
+            config.allowed_tags,
+            config.max_message_length,
+        );
+        let rt = HookEvent::ResponseTransform {
+            user_id: config.agent_id,
+            thread_id: "t-1".to_string(),
+            response: "no tag here".to_string(),
+            channel: Some("xmpp".to_string()),
+            policy_scope: Some("coord@conference.example".to_string()),
+        };
+        assert!(matches!(
+            tag_hook.execute(&rt, &ctx()).await,
+            Ok(HookOutcome::Reject { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_secret_entropy_outbound_strikes_local_agent() {
+        // ISSUE-004 regression: an outbound secret must be attributed to the
+        // local emitting agent, not the conversation peer named by the event.
+        let dir = std::env::temp_dir().join(format!(
+            "coord-entropy-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let store = Arc::new(ViolationStore::new(
+            dir.join("violations.json"),
+            crate::gate::violation_store::ViolationStoreConfig {
+                max_violations: 3,
+                disable_duration_secs: 3600,
+                decay_secs: 600,
+            },
+        ));
+        let config = test_config();
+        let state = CoordinationState::new(
+            config.coordination_channels,
+            config.admin_users,
+            Some(Arc::clone(&store)),
+        );
+        let hook = SecretEntropyHook::new(state, config.agent_id, 4.8, 32);
+        let event = outbound(
+            "remote-peer",
+            "coord@conference.example",
+            "STATUS: key A9f3Kx82LmQpZ7wT1vBnR4yUeC6sGhJ0x2 done",
+        );
+        assert!(matches!(
+            hook.execute(&event, &ctx()).await,
+            Ok(HookOutcome::Reject { .. })
+        ));
+        assert_eq!(
+            store.status("agent-1"),
+            crate::gate::violation_store::ViolationStatus::Warning
+        );
+        assert_eq!(
+            store.status("remote-peer"),
+            crate::gate::violation_store::ViolationStatus::Active
+        );
+    }
+
+    #[test]
+    fn test_tag_schema_enforces_at_transform_only() {
+        // ISSUE-004 regression: single enforcement point — one malformed
+        // response must cost exactly one strike.
+        let config = test_config();
+        let hook = TagSchemaHook::new(
+            test_state(),
+            config.agent_id,
+            config.allowed_tags,
+            config.max_message_length,
+        );
+        assert_eq!(hook.hook_points(), &[HookPoint::TransformResponse]);
     }
 
     #[tokio::test]
@@ -1091,6 +1298,7 @@ mod tests {
             thread_id: "t-1".to_string(),
             response: "no tag here".to_string(),
             channel: Some("coord@conference.example".to_string()),
+            policy_scope: None,
         };
         assert!(matches!(
             hook.execute(&rt, &ctx()).await,
@@ -1102,6 +1310,7 @@ mod tests {
             thread_id: "t-1".to_string(),
             response: "no tag here".to_string(),
             channel: None,
+            policy_scope: None,
         };
         assert!(matches!(
             hook.execute(&rt_none, &ctx()).await,
@@ -1128,6 +1337,44 @@ mod tests {
             hook.execute(&long, &ctx()).await,
             Ok(HookOutcome::Reject { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_tag_schema_exact_tag_only_does_not_panic() {
+        // ISSUE-011 regression: content equal to exactly an allowed tag (no
+        // colon) previously indexed past the end of the byte slice.
+        let config = test_config();
+        let hook = TagSchemaHook::new(
+            test_state(),
+            config.agent_id,
+            config.allowed_tags.clone(),
+            config.max_message_length,
+        );
+        for tag in &config.allowed_tags {
+            for content in [
+                tag.to_string(),
+                tag.to_lowercase(),
+                format!("{tag} "),
+                String::new(),
+            ] {
+                let event = outbound("agent-1", "coord@conference.example", &content);
+                let outcome = hook.execute(&event, &ctx()).await;
+                assert!(
+                    matches!(outcome, Ok(HookOutcome::Reject { .. })),
+                    "content {content:?} must be rejected without panic"
+                );
+            }
+            // Tag plus colon (with body) is well-formed and passes.
+            let ok = outbound(
+                "agent-1",
+                "coord@conference.example",
+                &format!("{tag}: body"),
+            );
+            assert!(matches!(
+                hook.execute(&ok, &ctx()).await,
+                Ok(HookOutcome::Continue { .. })
+            ));
+        }
     }
 
     #[tokio::test]

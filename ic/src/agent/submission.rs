@@ -372,6 +372,9 @@ pub enum SubmissionResult {
         content: String,
     },
 
+    /// Turn completed, but response policy suppressed delivery and persistence.
+    Suppressed,
+
     /// Need approval before continuing.
     NeedApproval {
         /// ID of the approval request.

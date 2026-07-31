@@ -152,7 +152,19 @@ impl ViolationStore {
         hook: &str,
         channel: &str,
     ) -> ViolationStatus {
-        let now = now_secs();
+        self.record_violation_at(agent, reason, hook, channel, now_secs())
+    }
+
+    /// `record_violation` with an explicit clock, so tests can exercise
+    /// disable-window expiry and re-arming without sleeping.
+    fn record_violation_at(
+        &self,
+        agent: &str,
+        reason: &str,
+        hook: &str,
+        channel: &str,
+        now: u64,
+    ) -> ViolationStatus {
         let mut guard = lock(&self.inner);
         let entry = guard.entry(agent.to_string()).or_default();
         prune_decayed(entry, now, self.config.decay_secs);
@@ -239,6 +251,12 @@ fn prune_decayed(entry: &mut AgentViolations, now: u64, decay_secs: u64) {
     entry
         .records
         .retain(|r| now.saturating_sub(r.timestamp_secs) < decay_secs);
+    // An expired automatic disable clears independently of strike decay so a
+    // later violation can re-arm the disable window (ISSUE-008). Manual
+    // disables carry no timestamp and are unaffected.
+    if entry.disabled_until_secs.is_some_and(|until| until <= now) {
+        entry.disabled_until_secs = None;
+    }
     if entry.records.is_empty() && !entry.manual_disabled {
         entry.disabled_until_secs = None;
     }
@@ -318,15 +336,26 @@ fn persist(path: &PathBuf, agents: &HashMap<String, AgentViolations>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Unique temp dir per call: PID + nanosecond clock + process-local
+    /// counter, so parallel tests in one binary never share a store file.
+    fn unique_test_dir(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "coord-violations-{tag}-{}-{nanos}-{seq}",
+            std::process::id()
+        ))
+    }
 
     fn test_store() -> ViolationStore {
-        let dir = std::env::temp_dir().join(format!(
-            "coord-violations-test-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
         ViolationStore::new(
-            dir.join("violations.json"),
+            unique_test_dir("store").join("violations.json"),
             ViolationStoreConfig {
                 max_violations: 3,
                 disable_duration_secs: 3600,
@@ -388,13 +417,8 @@ mod tests {
 
     #[test]
     fn test_expired_disable_clears() {
-        let dir = std::env::temp_dir().join(format!(
-            "coord-violations-expiry-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
         let store = ViolationStore::new(
-            dir.join("violations.json"),
+            unique_test_dir("expiry").join("violations.json"),
             ViolationStoreConfig {
                 max_violations: 1,
                 disable_duration_secs: 0, // already expired
@@ -403,5 +427,36 @@ mod tests {
         );
         store.record_violation("agent-e", "r", "hook", "chan");
         assert!(!store.is_disabled("agent-e"));
+    }
+
+    #[test]
+    fn test_expired_autodisable_rearms_on_new_violation() {
+        // ISSUE-008 regression: an expired auto-disable must not block a new
+        // disable window for the remaining strike-decay period.
+        let store = ViolationStore::new(
+            unique_test_dir("rearm").join("violations.json"),
+            ViolationStoreConfig {
+                max_violations: 3,
+                disable_duration_secs: 100,
+                decay_secs: 100_000,
+            },
+        );
+        let t0 = 1_000_000;
+        store.record_violation_at("agent-f", "r1", "hook", "chan", t0);
+        store.record_violation_at("agent-f", "r2", "hook", "chan", t0);
+        let status = store.record_violation_at("agent-f", "r3", "hook", "chan", t0);
+        assert!(
+            matches!(status, ViolationStatus::Disabled { until_secs } if until_secs == t0 + 100)
+        );
+        // Past the disable window but within strike decay: a new violation
+        // re-arms a fresh disable window instead of sitting at FinalWarning.
+        let t1 = t0 + 150;
+        let status = store.record_violation_at("agent-f", "r4", "hook", "chan", t1);
+        assert!(
+            matches!(status, ViolationStatus::Disabled { until_secs } if until_secs == t1 + 100)
+        );
+        // Manual disable is independent of the expiry normalization.
+        store.manual_disable("agent-g");
+        assert!(store.is_disabled("agent-g"));
     }
 }

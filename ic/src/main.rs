@@ -633,10 +633,12 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Register lifecycle hooks.
     let active_tool_names = components.tools.list().await;
+    let coordination_config = CoordinationHookConfig::from_env();
 
     let hook_bootstrap = bootstrap_hooks(
         &components.hooks,
         components.workspace.as_ref(),
+        &coordination_config,
         &config.wasm.tools_dir,
         &config.channels.wasm_channels_dir,
         &active_tool_names,
@@ -655,13 +657,30 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Multi-agent coordination hooks (Phase 2/3 of the coordination pipeline).
     // Only active when COORD_ENABLED=true with COORD_AGENT_ID/COORD_CHANNELS set.
-    let coordination_config = CoordinationHookConfig::from_env();
     let coordination_store: Option<Arc<ViolationStore>> =
         coordination_config.is_actionable().then(|| {
             Arc::new(ViolationStore::with_default_path(
                 ViolationStoreConfig::from_env(),
             ))
         });
+    // Phase 3: execution gate sharing the hooks' violation store, so a
+    // strike-three (or manual) disable actually blocks tool execution
+    // instead of only filtering channel traffic (ISSUE-003).
+    let coordination_gate: Option<Arc<lunarwing::gate::coordination::CoordinationGate>> =
+        coordination_store.clone().map(|store| {
+            Arc::new(lunarwing::gate::coordination::CoordinationGate::new(
+                store,
+                coordination_config.agent_id.clone(),
+            ))
+        });
+    // Phase 4: shared outbound coalesce buffer at the agent boundary, so the
+    // deployed installable (WASM) XMPP path coalesces exactly like the native
+    // channel did (ISSUE-002).
+    let coordination_coalesce = {
+        let coalesce_config = lunarwing::channels::coalesce::CoalesceConfig::from_env();
+        (coalesce_config.enabled && !coalesce_config.coordination_channels.is_empty())
+            .then(|| lunarwing::channels::coalesce::CoalesceBuffer::new(coalesce_config))
+    };
     let coordination_summary = register_coordination_hooks(
         &components.hooks,
         coordination_config.clone(),
@@ -676,15 +695,24 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // Phase 3: localhost-only admin endpoints for coordination violations.
+    // Requires COORD_ADMIN_TOKEN; without it the server stays down (fail
+    // closed) rather than exposing unauthenticated mutations (ISSUE-009).
     if let Some(store) = coordination_store.clone() {
-        let port = lunarwing::channels::web::coord_admin_port_from_env();
-        match lunarwing::channels::web::start_coord_admin_server(store, port).await {
-            Ok(addr) => tracing::info!(%addr, "Coordination admin endpoints listening"),
-            Err(err) => tracing::warn!(
-                error = %err,
-                port = port,
-                "Coordination admin server failed to bind; continuing without it"
-            ),
+        match lunarwing::channels::web::coord_admin_token_from_env() {
+            Some(token) => {
+                let port = lunarwing::channels::web::coord_admin_port_from_env();
+                match lunarwing::channels::web::start_coord_admin_server(store, token, port).await {
+                    Ok(addr) => tracing::info!(%addr, "Coordination admin endpoints listening"),
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        port = port,
+                        "Coordination admin server failed to bind; continuing without it"
+                    ),
+                }
+            }
+            None => {
+                tracing::warn!("COORD_ADMIN_TOKEN is not set; coordination admin server disabled")
+            }
         }
     }
 
@@ -1042,6 +1070,8 @@ async fn async_main() -> anyhow::Result<()> {
         },
         builder: components.builder,
         llm_backend: config.llm.backend.clone(),
+        coordination_gate,
+        coordination_coalesce,
     };
 
     let channels_for_warnings = Arc::clone(&channels);
