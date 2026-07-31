@@ -3519,8 +3519,12 @@ pub fn respond_exchange(
         request.now,
     )?;
     require_live_exchange(initiator.expires_at, request.now)?;
+    // The response carries its own bounded lifetime. It must NOT be capped by
+    // the initiator offer's remaining window: delayed transport would
+    // otherwise make a still-live offer unacceptable whenever the responder's
+    // fresh expiry extends past the initiator's earlier expiry. Each side
+    // re-checks liveness at its own completion time.
     if initiator.offer_id != request.initiator_offer_id
-        || initiator.expires_at < request.expires_at
         || initiator.generation != INITIAL_EXCHANGE_GENERATION
     {
         return Err(KeyManagerError::InvalidExchangeArtifact);
@@ -4007,6 +4011,7 @@ pub fn recover(paths: &TenantPaths, scope_id: &str) -> Result<()> {
 
 fn recover_locked(workspace: &Workspace, scope_id: &str) -> Result<()> {
     recovery_scope_preflight(workspace, scope_id)?;
+    recover_pending_candidates(workspace, scope_id)?;
 
     let candidate_names = secure_directory_files(workspace, CANDIDATES_DIR)?;
     for name in &candidate_names {
@@ -4056,6 +4061,37 @@ fn recover_locked(workspace: &Workspace, scope_id: &str) -> Result<()> {
     recover_journal(workspace, &path, scope_id)?;
     recover_migration_candidate(workspace, scope_id)?;
     for path in journal_candidates {
+        workspace.remove_if_present(&path)?;
+    }
+    Ok(())
+}
+
+// A crash between the fsynced `pending/<offer-id>.json.next` write and its
+// atomic rename strands a candidate that `pending_inventory` must otherwise
+// reject as unknown state (including inside `recover` itself, which would
+// permanently wedge the tenant).  The pre-rename pending record remains the
+// authoritative state, so the candidate is discarded here — but only after it
+// parses, matches its file name, and binds to this scope.  Anything else fails
+// closed for operator repair instead of deleting another tenant's secret.
+fn recover_pending_candidates(workspace: &Workspace, scope_id: &str) -> Result<()> {
+    let pending_names = secure_directory_files(workspace, PENDING_DIR)?;
+    for name in pending_names {
+        let Some(base) = name.strip_suffix(".next") else {
+            continue;
+        };
+        let offer_id = base
+            .strip_suffix(".json")
+            .ok_or(KeyManagerError::RecoveryRequired)?;
+        validate_offer_id(offer_id).map_err(|_| KeyManagerError::RecoveryRequired)?;
+        let path = format!("{PENDING_DIR}/{name}");
+        let bytes = workspace.read_required(&path)?;
+        if bytes.len() > MAX_PENDING_BYTES {
+            return Err(KeyManagerError::RecoveryRequired);
+        }
+        let secret: SecretExchange =
+            serde_json::from_slice(&bytes).map_err(|_| KeyManagerError::RecoveryRequired)?;
+        validate_pending_secret(&secret, offer_id, scope_id)
+            .map_err(|_| KeyManagerError::RecoveryRequired)?;
         workspace.remove_if_present(&path)?;
     }
     Ok(())
@@ -6500,6 +6536,245 @@ my_dm_chacha_secret = "{bob_private}"
         assert_eq!(
             ledger.consumed_exchange_ids["cccccccccccccccccccccccccccccccc"].state,
             "Cancelled"
+        );
+    }
+
+    #[test]
+    fn stage_a_delayed_response_may_outlive_offer_expiry() {
+        // Regression (rejected-MR defect): a response whose fresh expiry
+        // extends past the initiator offer's earlier expiry must not be
+        // rejected. Delayed transport would otherwise make still-live offers
+        // unusable. The offer's own lifetime still bounds completion.
+        let (_initiator_temp, initiator) = fixture();
+        let (_responder_temp, responder) = fixture();
+        let attestation = exchange_attestation();
+        let initiator_public = valid_public(41);
+        let initiator_private = valid_private(42);
+        let offer_ttl = 600_i64;
+        assert!(offer_ttl < DEFAULT_OFFER_TTL_SECONDS);
+        let mut prepare = exchange_request(
+            &attestation,
+            "bob",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &initiator_public,
+            &initiator_private,
+        );
+        prepare.expires_at = EXCHANGE_NOW + offer_ttl;
+        let offer = prepare_exchange(&initiator, SCOPE, &prepare).expect("prepare");
+
+        let responder_public = valid_public(43);
+        let responder_private = valid_private(44);
+        let initiator_fingerprint =
+            PublicFingerprint::from_encoded_public_key(&initiator_public).expect("fingerprint");
+        let respond = RespondExchange {
+            contact_name: "alice",
+            offer_id: "cccccccccccccccccccccccccccccccc",
+            contact_id: "dddddddddddddddddddddddddddddddd",
+            local_public: &responder_public,
+            local_private: &responder_private,
+            initiator_offer_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            expected_initiator_fingerprint: &initiator_fingerprint,
+            label: None,
+            created_at: EXCHANGE_NOW + 1,
+            // Longer than the initiator offer's remaining lifetime.
+            expires_at: EXCHANGE_NOW + DEFAULT_OFFER_TTL_SECONDS,
+            now: EXCHANGE_NOW + 1,
+            attestation: &attestation,
+        };
+        let response = respond_exchange(
+            &responder,
+            SCOPE,
+            offer.public_artifact.as_bytes(),
+            &respond,
+        )
+        .expect("response may outlive the offer expiry");
+        assert_eq!(
+            response.expires_at,
+            EXCHANGE_NOW + DEFAULT_OFFER_TTL_SECONDS
+        );
+
+        let responder_fingerprint =
+            PublicFingerprint::from_encoded_public_key(&responder_public).expect("fingerprint");
+        let initiator_complete = CompleteExchange {
+            exchange_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            contact_name: "bob",
+            expected_peer_fingerprint: &responder_fingerprint,
+            defer_apply: true,
+            now: EXCHANGE_NOW + 2,
+            attestation: &attestation,
+        };
+        complete_exchange(
+            &initiator,
+            SCOPE,
+            response.public_artifact.as_bytes(),
+            &initiator_complete,
+        )
+        .expect("initiator completes while the offer is live");
+        let responder_complete = CompleteExchange {
+            exchange_id: "cccccccccccccccccccccccccccccccc",
+            contact_name: "alice",
+            expected_peer_fingerprint: &initiator_fingerprint,
+            defer_apply: true,
+            now: EXCHANGE_NOW + 2,
+            attestation: &attestation,
+        };
+        complete_exchange(
+            &responder,
+            SCOPE,
+            offer.public_artifact.as_bytes(),
+            &responder_complete,
+        )
+        .expect("responder completes while the response is live");
+    }
+
+    #[test]
+    fn stage_a_offer_expiry_still_bounds_completion() {
+        // Companion boundary: after the initiator offer expires, completion
+        // fails closed even when the response artifact itself is still live.
+        let (_initiator_temp, initiator) = fixture();
+        let (_responder_temp, responder) = fixture();
+        let attestation = exchange_attestation();
+        let initiator_public = valid_public(45);
+        let initiator_private = valid_private(46);
+        let offer_ttl = 600_i64;
+        let mut prepare = exchange_request(
+            &attestation,
+            "bob",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &initiator_public,
+            &initiator_private,
+        );
+        prepare.expires_at = EXCHANGE_NOW + offer_ttl;
+        let offer = prepare_exchange(&initiator, SCOPE, &prepare).expect("prepare");
+
+        let responder_public = valid_public(47);
+        let responder_private = valid_private(48);
+        let initiator_fingerprint =
+            PublicFingerprint::from_encoded_public_key(&initiator_public).expect("fingerprint");
+        let respond = RespondExchange {
+            contact_name: "alice",
+            offer_id: "cccccccccccccccccccccccccccccccc",
+            contact_id: "dddddddddddddddddddddddddddddddd",
+            local_public: &responder_public,
+            local_private: &responder_private,
+            initiator_offer_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            expected_initiator_fingerprint: &initiator_fingerprint,
+            label: None,
+            created_at: EXCHANGE_NOW + 1,
+            expires_at: EXCHANGE_NOW + DEFAULT_OFFER_TTL_SECONDS,
+            now: EXCHANGE_NOW + 1,
+            attestation: &attestation,
+        };
+        let response = respond_exchange(
+            &responder,
+            SCOPE,
+            offer.public_artifact.as_bytes(),
+            &respond,
+        )
+        .expect("respond");
+
+        let responder_fingerprint =
+            PublicFingerprint::from_encoded_public_key(&responder_public).expect("fingerprint");
+        let late_initiator = CompleteExchange {
+            exchange_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            contact_name: "bob",
+            expected_peer_fingerprint: &responder_fingerprint,
+            defer_apply: true,
+            now: EXCHANGE_NOW + offer_ttl,
+            attestation: &attestation,
+        };
+        // The expiry sweep tombstones and removes the initiator's own expired
+        // pending record before completion can proceed; either way it fails.
+        assert!(
+            complete_exchange(
+                &initiator,
+                SCOPE,
+                response.public_artifact.as_bytes(),
+                &late_initiator,
+            )
+            .is_err()
+        );
+        let late_responder = CompleteExchange {
+            exchange_id: "cccccccccccccccccccccccccccccccc",
+            contact_name: "alice",
+            expected_peer_fingerprint: &initiator_fingerprint,
+            defer_apply: true,
+            now: EXCHANGE_NOW + offer_ttl,
+            attestation: &attestation,
+        };
+        assert!(matches!(
+            complete_exchange(
+                &responder,
+                SCOPE,
+                offer.public_artifact.as_bytes(),
+                &late_responder,
+            ),
+            Err(KeyManagerError::InvalidExchangeArtifact)
+        ));
+    }
+
+    #[test]
+    fn recovery_discards_stranded_pending_candidate() {
+        // Regression (crash recovery): a crash between the fsynced
+        // `pending/<id>.json.next` write and its atomic rename must not wedge
+        // the tenant. Recovery discards the scope-bound candidate; a foreign
+        // or malformed candidate fails closed and is preserved.
+        let (_temp, paths) = fixture();
+        let attestation = exchange_attestation();
+        let public = valid_public(49);
+        let private = valid_private(50);
+        let request = exchange_request(
+            &attestation,
+            "bob",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &public,
+            &private,
+        );
+        prepare_exchange(&paths, SCOPE, &request).expect("prepare");
+        let workspace = Workspace::open(paths.clone()).expect("workspace");
+        let stranded =
+            read_pending_secret(&workspace, request.offer_id, SCOPE).expect("pending exchange");
+        workspace
+            .write_new(
+                &format!("{PENDING_DIR}/{}.json.next", request.offer_id),
+                &pending_secret_bytes(&stranded).expect("pending bytes"),
+            )
+            .expect("simulate crash before pending rename");
+        assert!(matches!(
+            pending_inventory(&workspace, SCOPE),
+            Err(KeyManagerError::RecoveryRequired)
+        ));
+        recover_locked(&workspace, SCOPE).expect("recovery discards the stranded candidate");
+        let inventory = pending_inventory(&workspace, SCOPE).expect("inventory after recovery");
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(
+            inventory.entries[0].secret.state,
+            ExchangeState::Prepared.as_str()
+        );
+
+        // A candidate bound to another scope is preserved and fails closed.
+        let mut foreign =
+            read_pending_secret(&workspace, request.offer_id, SCOPE).expect("pending exchange");
+        foreign.scope_id = "11112222333344445555666677778899".to_owned();
+        workspace
+            .write_new(
+                &format!("{PENDING_DIR}/{}.json.next", request.offer_id),
+                &pending_secret_bytes(&foreign).expect("foreign bytes"),
+            )
+            .expect("simulate foreign stranded candidate");
+        assert!(matches!(
+            recover_locked(&workspace, SCOPE),
+            Err(KeyManagerError::RecoveryRequired)
+        ));
+        assert!(
+            paths
+                .darkirc_dir()
+                .join(PENDING_DIR)
+                .join(format!("{}.json.next", request.offer_id))
+                .exists()
         );
     }
 }
