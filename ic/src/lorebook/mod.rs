@@ -400,15 +400,15 @@ mod tests {
 
     #[test]
     fn recent_message_texts_skips_tool_roles_and_tool_calls() {
-        let tool_call_message =
-            ChatMessage::assistant_with_tool_calls(Some("calling a tool".to_string()), vec![
-                crate::llm::ToolCall {
-                    id: "call_1".to_string(),
-                    name: "memory".to_string(),
-                    arguments: serde_json::json!({}),
-                    reasoning: None,
-                },
-            ]);
+        let tool_call_message = ChatMessage::assistant_with_tool_calls(
+            Some("calling a tool".to_string()),
+            vec![crate::llm::ToolCall {
+                id: "call_1".to_string(),
+                name: "memory".to_string(),
+                arguments: serde_json::json!({}),
+                reasoning: None,
+            }],
+        );
         let messages = vec![
             ChatMessage::system("system prompt"),
             ChatMessage::user("first user"),
@@ -441,6 +441,9 @@ mod tests {
             .map(|i| ChatMessage::user(format!("message {i}")))
             .collect();
         let texts = recent_message_texts(&messages, 2);
-        assert_eq!(texts, vec!["message 3".to_string(), "message 4".to_string()]);
+        assert_eq!(
+            texts,
+            vec!["message 3".to_string(), "message 4".to_string()]
+        );
     }
 }
