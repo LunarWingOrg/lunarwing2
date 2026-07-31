@@ -227,6 +227,13 @@ pub async fn execute_action_calls(
         if interrupted_call_needs_refund(&exec_result) {
             let _ = leases.refund_use(lease.id).await;
         }
+        if matches!(&exec_result, Err(EngineError::ExecutionStopped)) {
+            return Ok(ActionBatchResult {
+                results: Vec::new(),
+                events: Vec::new(),
+                need_approval: Some(ThreadOutcome::Stopped),
+            });
+        }
         slot_results[idx] = Some(classify_exec_result(exec_result, call, &exec_ctx));
     } else if runnable_indices.len() > 1 {
         // Multiple calls: execute in parallel via JoinSet
@@ -248,19 +255,31 @@ pub async fn execute_action_calls(
             });
         }
 
+        let mut execution_stopped = false;
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
                 Ok((idx, lease_id, result, call, ctx)) => {
                     if interrupted_call_needs_refund(&result) {
                         let _ = leases.refund_use(lease_id).await;
                     }
-                    slot_results[idx] = Some(classify_exec_result(result, &call, &ctx));
+                    if matches!(&result, Err(EngineError::ExecutionStopped)) {
+                        execution_stopped = true;
+                    } else {
+                        slot_results[idx] = Some(classify_exec_result(result, &call, &ctx));
+                    }
                 }
                 Err(e) => {
                     // Task panicked — should not happen, but handle gracefully
                     tracing::debug!("parallel tool execution task panicked: {e}");
                 }
             }
+        }
+        if execution_stopped {
+            return Ok(ActionBatchResult {
+                results: Vec::new(),
+                events: Vec::new(),
+                need_approval: Some(ThreadOutcome::Stopped),
+            });
         }
     }
 
@@ -403,10 +422,11 @@ fn interrupted_call_needs_refund(result: &Result<ActionResult, EngineError>) -> 
     // successful side-effecting action net zero lease use and bypass `max_uses`.
     matches!(
         result,
-        Err(EngineError::GatePaused {
-            resume_output: None,
-            ..
-        })
+        Err(EngineError::ExecutionStopped)
+            | Err(EngineError::GatePaused {
+                resume_output: None,
+                ..
+            })
     )
 }
 
@@ -933,6 +953,45 @@ mod tests {
         assert!(
             result.need_approval.is_none(),
             "no interruption for regular errors"
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_stopped_interrupts_without_error_result_or_event() {
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("http")],
+            vec![Err(EngineError::ExecutionStopped)],
+        ));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(1))
+            .await
+            .unwrap();
+        let calls = vec![ActionCall {
+            id: "call_stop".into(),
+            action_name: "http".into(),
+            parameters: serde_json::json!({}),
+        }];
+
+        let result = execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[])
+            .await
+            .unwrap();
+
+        assert!(matches!(result.need_approval, Some(ThreadOutcome::Stopped)));
+        assert!(result.results.is_empty());
+        assert!(result.events.is_empty());
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(1)
         );
     }
 

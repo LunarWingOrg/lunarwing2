@@ -26,6 +26,10 @@ pub enum EngineError {
     #[error("effect execution error: {reason}")]
     Effect { reason: String },
 
+    /// Host policy stopped execution without exposing a reason to model/user.
+    #[error("execution stopped")]
+    ExecutionStopped,
+
     #[error("invalid state transition: {from} -> {to}")]
     InvalidTransition { from: ThreadState, to: ThreadState },
 

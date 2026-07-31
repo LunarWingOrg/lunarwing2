@@ -18,6 +18,7 @@ PORT_RANGE_START=10000
 PORT_RANGE_END=19999
 PORT_BLOCK_SIZE=10
 BUILD_LOCK="/var/lock/lunarwing-build.lock"
+TENANT_LIFECYCLE_LOCK_DIR="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/var/lock/lunarwing-tenants}"
 PORTS_LOCK_HELD="false"
 PROFILE="${LUNARWING_MT_PROFILE:-release}"
 SOURCE_REPO="${LUNARWING_MT_SOURCE_REPO:-$LUNARWING_ROOT}"
@@ -30,6 +31,9 @@ DARKIRC_REPO="${LUNARWING_MT_DARKIRC_REPO:-https://github.com/darkrenaissance/da
 DARKIRC_REV="${LUNARWING_MT_DARKIRC_REV:-a05956d412a091e8b54c1cd4f4264c33b941203d}"
 OPENRC_ENV_EXEC_SRC="$SCRIPT_DIR/lunarwing-openrc-env-exec.sh"
 OPENRC_ENV_EXEC="/usr/local/libexec/lunarwing-openrc-env-exec"
+OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}"
+OPENRC_CONFD_DIR="${LUNARWING_MT_OPENRC_CONFD_DIR:-/etc/conf.d}"
+OPENRC_RUNLEVELS_DIR="${LUNARWING_MT_OPENRC_RUNLEVELS_DIR:-/etc/runlevels}"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 DEFAULT_TENSORZERO_URL="${LUNARWING_MT_TENSORZERO_URL:-http://192.168.1.157:3000/openai/v1}"
 # Fleet-wide default VL (vision-language) backend URL the OCR sidecar proxies to.
@@ -121,6 +125,24 @@ release_ports_lock() {
   flock -u 199
   exec 199>&-
   PORTS_LOCK_HELD="false"
+}
+
+with_tenant_lifecycle_lock() {
+  local name="$1"
+  shift
+  require_cmd flock
+  mkdir -p "$TENANT_LIFECYCLE_LOCK_DIR"
+  local lock_fd result
+  exec {lock_fd}>"$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" || return 1
+  if ! flock -x "$lock_fd"; then
+    exec {lock_fd}>&-
+    return 1
+  fi
+  "$@" || result=$?
+  result="${result:-0}"
+  flock -u "$lock_fd" || result=1
+  exec {lock_fd}>&-
+  return "$result"
 }
 
 generate_token() {
@@ -232,6 +254,18 @@ tenant_proxy_enabled() {
   local val
   val="$(jq -r ".tenants[\"$name\"].enable_proxy // false" "$PORTS_REGISTRY" 2>/dev/null)"
   [[ "$val" == "true" ]]
+}
+
+# Whether WeeChat is enabled for this tenant. Default TRUE: the flag is
+# absent on tenants created before the health-gate existed, and a missing or
+# unreadable registry must fail safe to the old behavior (weechat managed).
+# Used to make disable-weechat authoritative for lifecycle, not just health
+# classification (ISSUE-006). Explicit ==false test: jq `//` misreads false.
+tenant_weechat_enabled() {
+  local name="$1"
+  local val
+  val="$(jq -r --arg name "$name" 'if .tenants[$name].enable_weechat == false then "false" else "true" end' "$PORTS_REGISTRY" 2>/dev/null)"
+  [[ "$val" != "false" ]]
 }
 
 # Whether a given external worker (nanocode|pebble|opencode) is selected for this
@@ -448,12 +482,13 @@ Commands:
                                    Preserves existing config: fails on any
                                    non-empty ~/.config/weechat without modifying it.
 
-  disable-weechat <name>           Mark WeeChat disabled for a tenant: health checks
-  enable-weechat <name>            report its (optional) weechat units `skipped` when
-                                   down instead of critical, so self-heal will not
-                                   restart-storm an intentionally unused backend.
-                                   Does NOT stop/disable/un-render the units.
-                                   Default is enabled (enable-weechat restores it).
+  disable-weechat <name>           Disable WeeChat for a tenant: stops its (optional)
+  enable-weechat <name>            weechat units and removes their boot persistence
+                                   (systemd disable / OpenRC runlevel removal), and
+                                   health checks report them `skipped` when down so
+                                   self-heal will not restart-storm them. start-tenant
+                                   leaves them off. enable-weechat re-enables + starts
+                                   them. Default is enabled (absent flag == enabled).
 
   patch-env <name>                 Add missing env vars (e.g. ORCHESTRATOR_PORT)
   patch-env-all                    Patch env for all registered tenants
@@ -996,7 +1031,7 @@ ports_registry_init() {
       registry_needs_repair="true"
     fi
   fi
-  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "12" || "$registry_needs_repair" == "true" ]]; then
+  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "13" || "$registry_needs_repair" == "true" ]]; then
     acquire_ports_lock
   fi
 
@@ -1022,7 +1057,7 @@ ENDJSON
   fi
 
   ports_migrate
-  # ports_migrate may have bumped to v12; verify and release.
+  # ports_migrate may have bumped to the current version; verify and release.
   release_ports_lock
 }
 
@@ -1228,6 +1263,7 @@ ports_migrate() {
   if [[ "$current_version" -lt 10 ]]; then ports_migrate_v10; fi
   if [[ "$current_version" -lt 11 ]]; then ports_migrate_v11; fi
   if [[ "$current_version" -lt 12 ]]; then ports_migrate_v12; fi
+  if [[ "$current_version" -lt 13 ]]; then ports_migrate_v13; fi
 }
 
 # v8 -> v9: rename extended_ports.reserved_5 -> vision_service.
@@ -1382,6 +1418,28 @@ ports_migrate_v12() {
   say "port registry migrated to v12 (kimi_wss + kimi_health dedicated in kimi_range 30000-39999)"
 }
 
+# v12 -> v13: dedicate the final extended slot to the per-tenant coordination
+# admin server. Existing units are unaffected until coordination is enabled.
+ports_migrate_v13() {
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  jq '
+    .version = 13
+    | .tenants |= with_entries(
+        .value |= (
+          if (.extended_base | type) == "number" and ((.extended_ports | type) != "object" or (.extended_ports | has("coord_admin") | not)) then
+            .extended_ports = (if (.extended_ports | type) == "object" then .extended_ports else {} end)
+            | .extended_ports.coord_admin = (.extended_ports.reserved_9 // (.extended_base + 9))
+            | .extended_ports |= del(.reserved_9)
+          else . end
+        )
+      )
+  ' "$PORTS_REGISTRY" >"$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "port registry migrated to v13 (coord_admin dedicated at extended_base+9)"
+}
+
 ports_allocate() {
   local name="$1"
   local enable_darkirc="${2:-false}"
@@ -1492,9 +1550,10 @@ ports_allocate() {
             vision_service: ($ebase + 5),
             vision_health: ($ebase + 6),
             opencode_wss: ($ebase + 7),
-            opencode_health: ($ebase + 8)
+            opencode_health: ($ebase + 8),
+            coord_admin: ($ebase + 9)
           }
-          + (reduce range(9; $ebs) as $i ({}; . + { ("reserved_\($i)"): ($ebase + $i) }))
+          + (reduce range(10; $ebs) as $i ({}; . + { ("reserved_\($i)"): ($ebase + $i) }))
         ),
         kimi_base: $kbase,
         kimi_ports: {
@@ -1562,28 +1621,44 @@ ports_enable_proxy() {
 # unused WeeChat backend no longer reads critical and self-heal does not
 # restart-storm (flap) a unit that cannot come up. Absent flag == enabled, so
 # tenants created before this field existed keep the old behavior.
-# This gates HEALTH/SELF-HEAL classification only — it does not stop, disable, or
-# un-render the units themselves.
+# The flag is authoritative for lifecycle too (ISSUE-006): the
+# disable-weechat / enable-weechat verbs stop/disable resp. enable/start the
+# units after flipping it, and start-tenant respects it on both init systems.
+# This function only mutates the registry (under the shared ports lock).
+# ISSUE-012: runs under the shared ports lock like every other registry
+# mutation, and revalidates tenant existence while holding it — two unlocked
+# read-modify-rename writers could drop each other's updates, and a concurrent
+# remove-tenant could be followed by recreation of a partial tenant object.
 ports_set_weechat() {
   local name="$1" enabled="$2"
   require_cmd jq
   case "$enabled" in true|false) ;; *) die "ports_set_weechat: enabled must be true or false" ;; esac
+  acquire_ports_lock
   local current
+  if ! jq -e ".tenants[\"$name\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
   # Explicit ==false test: jq's `//` treats false as empty, so
   # `.enable_weechat // true` would misread a disabled tenant as enabled and
   # `enable-weechat` could never flip it back.
   current="$(jq -r --arg name "$name" 'if .tenants[$name].enable_weechat == false then "false" else "true" end' "$PORTS_REGISTRY" 2>/dev/null || true)"
-  [[ "$current" == "$enabled" ]] && { say "weechat for tenant '$name': already $enabled" >&2; return 0; }
-
+  if [[ "$current" == "$enabled" ]]; then
+    say "weechat for tenant '$name': already $enabled" >&2
+    release_ports_lock
+    return 0
+  fi
   local tmp
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
   if ! jq --arg name "$name" --argjson enabled "$enabled" '.tenants[$name].enable_weechat = $enabled' \
       "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
     rm -f "$tmp"
+    release_ports_lock
     die "failed to set weechat flag for tenant '$name'"
   fi
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
+  release_ports_lock
   say "weechat for tenant '$name': $current -> $enabled" >&2
 }
 
@@ -1673,6 +1748,12 @@ ports_get() {
   if [[ "$port_name" == "opencode_health" ]]; then
     port="$(jq -r ".tenants[\"$name\"].extended_ports.reserved_8 // empty" "$PORTS_REGISTRY")"
     [[ -n "$port" ]] && { printf '%s' "$port"; return 0; }
+  fi
+  if [[ "$port_name" == "coord_admin" ]]; then
+    port="$(jq -r ".tenants[\"$name\"].extended_ports.reserved_9 // empty" "$PORTS_REGISTRY")"
+    [[ -n "$port" ]] && { printf '%s' "$port"; return 0; }
+    port="$(jq -r ".tenants[\"$name\"].extended_base // empty" "$PORTS_REGISTRY")"
+    [[ "$port" =~ ^[0-9]+$ ]] && { printf '%s' "$((port + 9))"; return 0; }
   fi
   return 1
 }
@@ -2927,12 +3008,24 @@ write_tenant_lunarwing_env() {
   # tokens would break live clients/workers; minting a fresh XMPP_PASSWORD would
   # break the already-registered XMPP account. Generate fresh ONLY on first write.
   local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password darkirc_adapter_secret
+  local coord_enabled coord_agent_id coord_agent_aliases coord_channels coord_admin_users coord_admin_token coord_admin_port
   local study_notes_home study_notes_state_home study_notes_allow_write
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
   relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
   secrets_key="$(_env_existing "$path" SECRETS_MASTER_KEY)";     secrets_key="${secrets_key:-$(generate_token)}"
   webhook_secret="$(_env_existing "$path" HTTP_WEBHOOK_SECRET)"; webhook_secret="${webhook_secret:-$(generate_token)}"
+  coord_enabled="$(_env_existing "$path" COORD_ENABLED)"; coord_enabled="${coord_enabled:-false}"
+  coord_agent_id="$(_env_existing "$path" COORD_AGENT_ID)"; coord_agent_id="${coord_agent_id:-$name}"
+  coord_agent_aliases="$(_env_existing "$path" COORD_AGENT_ALIASES)"
+  coord_channels="$(_env_existing "$path" COORD_CHANNELS)"
+  coord_admin_users="$(_env_existing "$path" COORD_ADMIN_USERS)"
+  coord_admin_token="$(_env_existing "$path" COORD_ADMIN_TOKEN)"; coord_admin_token="${coord_admin_token:-$(generate_token)}"
+  coord_admin_port="$(_env_existing "$path" COORD_ADMIN_PORT)"
+  if [[ -z "$coord_admin_port" ]]; then
+    coord_admin_port="$(ports_get "$name" coord_admin || true)"
+    [[ -n "$coord_admin_port" ]] || die "coordination admin port missing for tenant '$name'"
+  fi
   if tenant_darkirc_enabled "$name"; then
     darkirc_adapter_secret="$(_env_existing "$path" DARKIRC_ADAPTER_SECRET)"
   fi
@@ -3027,6 +3120,15 @@ LLM_CIRCUIT_BREAKER_RECOVERY_SECS=$cb_recovery
 AGENT_NAME=$name
 LUNARWING_OWNER_ID=$name
 SECRETS_MASTER_KEY=$secrets_key
+
+# Multi-agent coordination (disabled until channels are configured explicitly)
+COORD_ENABLED=$coord_enabled
+COORD_AGENT_ID=$coord_agent_id
+COORD_AGENT_ALIASES=$coord_agent_aliases
+COORD_CHANNELS=$coord_channels
+COORD_ADMIN_USERS=$coord_admin_users
+COORD_ADMIN_TOKEN=$coord_admin_token
+COORD_ADMIN_PORT=$coord_admin_port
 
 # XMPP
 XMPP_BRIDGE_URL=http://127.0.0.1:${bridge_port}
@@ -3752,6 +3854,53 @@ upload_tenant_darkirc_secret() {
   fi
 }
 
+patch_tenant_coordination_env() {
+  local name="$1" env_path="$2"
+  local coord_admin_port coord_admin_token
+  chmod 0600 "$env_path"
+  coord_admin_port="$(_env_existing "$env_path" COORD_ADMIN_PORT)"
+  if [[ -z "$coord_admin_port" ]]; then
+    coord_admin_port="$(ports_get "$name" coord_admin || true)"
+    [[ -n "$coord_admin_port" ]] || die "coordination admin port missing for tenant '$name'"
+  fi
+  coord_admin_token="$(_env_existing "$env_path" COORD_ADMIN_TOKEN)"
+  [[ -n "$coord_admin_token" ]] || coord_admin_token="$(generate_token)"
+  if ! grep -q '^COORD_ENABLED=' "$env_path"; then
+    printf '\n# Multi-agent coordination (disabled until channels are configured explicitly)\nCOORD_ENABLED=false\n' >>"$env_path"
+    say "added COORD_ENABLED=false to $env_path"
+  fi
+  if ! grep -q '^COORD_AGENT_ID=' "$env_path"; then
+    printf 'COORD_AGENT_ID=%s\n' "$name" >>"$env_path"
+    say "added COORD_AGENT_ID=$name to $env_path"
+  fi
+  if ! grep -q '^COORD_CHANNELS=' "$env_path"; then
+    printf 'COORD_CHANNELS=\n' >>"$env_path"
+    say "added COORD_CHANNELS to $env_path"
+  fi
+  if ! grep -q '^COORD_AGENT_ALIASES=' "$env_path"; then
+    printf 'COORD_AGENT_ALIASES=\n' >>"$env_path"
+    say "added COORD_AGENT_ALIASES to $env_path"
+  fi
+  if ! grep -q '^COORD_ADMIN_USERS=' "$env_path"; then
+    printf 'COORD_ADMIN_USERS=\n' >>"$env_path"
+    say "added COORD_ADMIN_USERS to $env_path"
+  fi
+  if grep -q '^COORD_ADMIN_TOKEN=$' "$env_path"; then
+    sed -i "s/^COORD_ADMIN_TOKEN=$/COORD_ADMIN_TOKEN=$coord_admin_token/" "$env_path"
+    say "repaired empty COORD_ADMIN_TOKEN in $env_path"
+  elif ! grep -q '^COORD_ADMIN_TOKEN=' "$env_path"; then
+    printf 'COORD_ADMIN_TOKEN=%s\n' "$coord_admin_token" >>"$env_path"
+    say "added COORD_ADMIN_TOKEN to $env_path"
+  fi
+  if grep -q '^COORD_ADMIN_PORT=$' "$env_path"; then
+    sed -i "s/^COORD_ADMIN_PORT=$/COORD_ADMIN_PORT=$coord_admin_port/" "$env_path"
+    say "repaired empty COORD_ADMIN_PORT=$coord_admin_port in $env_path"
+  elif ! grep -q '^COORD_ADMIN_PORT=' "$env_path"; then
+    printf 'COORD_ADMIN_PORT=%s\n' "$coord_admin_port" >>"$env_path"
+    say "added COORD_ADMIN_PORT=$coord_admin_port to $env_path"
+  fi
+}
+
 patch_tenant_env() {
   local name="$1"
   name="$(sanitize_name "$name")"
@@ -3861,6 +4010,8 @@ patch_tenant_env() {
       say "added RELAY_URL=http://127.0.0.1:$weechat_port to $env_path"
     fi
   fi
+
+  patch_tenant_coordination_env "$name" "$env_path"
 
   if tenant_darkirc_enabled "$name"; then
     local darkirc_adapter_port
@@ -6105,6 +6256,8 @@ render_tenant_systemd_units() {
 
   local ws_adapter_path
   ws_adapter_path="$(tenant_lw_root "$name")/lunarwing_weechat_wss/weechat_relay/ws_adapter.py"
+  local weechat_enabled=false
+  tenant_weechat_enabled "$name" && weechat_enabled=true
 
   # Proxy unit (only when enabled)
   if tenant_proxy_enabled "$name"; then
@@ -6126,16 +6279,17 @@ WantedBy=default.target
 EOF
   fi
 
-  # WeeChat unit (runs in tmux so you can attach: tmux -L weechat-${name} attach)
-  local weechat_home
-  weechat_home="$(tenant_home "$name")/.config/weechat"
-  mkdir -p "$weechat_home"
-  chown "$name:$name" "$weechat_home"
+  if [[ "$weechat_enabled" == "true" ]]; then
+    # WeeChat unit (runs in tmux so you can attach: tmux -L weechat-${name} attach)
+    local weechat_home
+    weechat_home="$(tenant_home "$name")/.config/weechat"
+    mkdir -p "$weechat_home"
+    chown "$name:$name" "$weechat_home"
 
-  _render_weechat_systemd_unit "$name" "$user_unit_dir"
+    _render_weechat_systemd_unit "$name" "$user_unit_dir"
 
-  # WeeChat WS adapter unit
-  cat >"$user_unit_dir/lunarwing-weechat-adapter-${name}.service" <<EOF
+    # WeeChat WS adapter unit
+    cat >"$user_unit_dir/lunarwing-weechat-adapter-${name}.service" <<EOF
 [Unit]
 Description=LunarWing WeeChat WS adapter ($name)
 After=network.target lunarwing-weechat-${name}.service
@@ -6154,6 +6308,15 @@ NoNewPrivileges=true
 [Install]
 WantedBy=default.target
 EOF
+  else
+    # Remove stale files and enablement links so render-units also reconciles a
+    # tenant whose registry flag was changed outside the lifecycle command.
+    rm -f \
+      "$user_unit_dir/lunarwing-weechat-${name}.service" \
+      "$user_unit_dir/lunarwing-weechat-adapter-${name}.service" \
+      "$user_unit_dir/default.target.wants/lunarwing-weechat-${name}.service" \
+      "$user_unit_dir/default.target.wants/lunarwing-weechat-adapter-${name}.service"
+  fi
 
   if tenant_darkirc_enabled "$name"; then
     local darkirc_adapter_path
@@ -6238,12 +6401,18 @@ EOF
     proxy_sd_wants=" lunarwing-proxy-${name}.service"
   fi
 
+  local weechat_sd_after="" weechat_sd_wants=""
+  if [[ "$weechat_enabled" == "true" ]]; then
+    weechat_sd_after=" lunarwing-weechat-${name}.service lunarwing-weechat-adapter-${name}.service"
+    weechat_sd_wants=" lunarwing-weechat-${name}.service lunarwing-weechat-adapter-${name}.service"
+  fi
+
   # Main daemon unit
   cat >"$user_unit_dir/lunarwing-${name}.service" <<EOF
 [Unit]
 Description=LunarWing AI assistant ($name)
-After=network.target ${pg_dep_after}xmpp-bridge-${name}.service${proxy_sd_after} lunarwing-weechat-${name}.service lunarwing-weechat-adapter-${name}.service${darkirc_sd_after}
-  Wants=xmpp-bridge-${name}.service${proxy_sd_wants} lunarwing-weechat-${name}.service lunarwing-weechat-adapter-${name}.service${darkirc_sd_wants}
+After=network.target ${pg_dep_after}xmpp-bridge-${name}.service${proxy_sd_after}${weechat_sd_after}${darkirc_sd_after}
+Wants=xmpp-bridge-${name}.service${proxy_sd_wants}${weechat_sd_wants}${darkirc_sd_wants}
 ${pg_dep_requires}
 
 [Service]
@@ -6307,7 +6476,13 @@ start_tenant_systemd() {
   # started by its own start_tenant_* function (which renders the quadlet,
   # reloads the daemon, and starts the unit). The imperative `start` below
   # is belt-and-suspenders for the vision unit (harmless if already running).
-  local enable_list=("lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-weechat-adapter-${name}.service")
+  local enable_list=("lunarwing-${name}.service" "xmpp-bridge-${name}.service")
+  # WeeChat units join the enable list only when the tenant's registry flag
+  # allows them (ISSUE-006): a disabled tenant must not be re-enabled for
+  # future boots by start-tenant.
+  if tenant_weechat_enabled "$name"; then
+    enable_list+=("lunarwing-weechat-${name}.service" "lunarwing-weechat-adapter-${name}.service")
+  fi
   if tenant_proxy_enabled "$name"; then
     enable_list+=("lunarwing-proxy-${name}.service")
   fi
@@ -6506,6 +6681,7 @@ render_tenant_openrc_units() {
   log_dir="$(tenant_log_dir "$name")"
   run_dir="$(tenant_run_dir "$name")"
   install_openrc_env_exec
+  mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR"
 
   local proxy_port bridge_port weechat_port
   proxy_port="$(ports_get "$name" proxy)"
@@ -6521,6 +6697,8 @@ render_tenant_openrc_units() {
   ws_adapter_path="$(tenant_lw_root "$name")/lunarwing_weechat_wss/weechat_relay/ws_adapter.py"
   local ws_adapter_dir
   ws_adapter_dir="$(dirname "$ws_adapter_path")"
+  local weechat_enabled=false
+  tenant_weechat_enabled "$name" && weechat_enabled=true
 
   local darkirc_rc_after=""
   if tenant_darkirc_enabled "$name"; then
@@ -6530,6 +6708,11 @@ render_tenant_openrc_units() {
   local proxy_rc_after=""
   if tenant_proxy_enabled "$name"; then
     proxy_rc_after=" lunarwing-proxy-${name}"
+  fi
+
+  local weechat_rc_after=""
+  if [[ "$weechat_enabled" == "true" ]]; then
+    weechat_rc_after=" lunarwing-weechat-${name} lunarwing-weechat-adapter-${name}"
   fi
 
   local weechat_home
@@ -6549,7 +6732,7 @@ render_tenant_openrc_units() {
   # A first-class unit (not a daemon start_pre side-effect) so the host self-heal
   # pipeline — which auto-discovers /etc/init.d units — can remediate a crashed
   # Postgres independently.
-  cat >"/etc/init.d/lunarwing-pg-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-pg-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing Postgres container ($name)"
@@ -6616,11 +6799,11 @@ status() {
     einfo "\${pg_container}: stopped"; return 3
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-pg-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-pg-${name}"
   render_container_babysitter_unit "$name" pg "$pg_container" "$pg_uid" "$pg_home"
 
   # ── Main daemon init script ──
-  cat >"/etc/init.d/lunarwing-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing AI assistant ($name)"
@@ -6660,8 +6843,9 @@ required_files="\${lunarwing_openrc_env_exec} \${lunarwing_command} \${lunarwing
 
 depend() {
     need net localmount lunarwing-pg-${name}
+    want \${lunarwing_rc_need}
     use dns logger
-    after firewall lunarwing-pg-${name} xmpp-bridge-${name}${proxy_rc_after} weechat-${name} lunarwing-weechat-adapter-${name}${darkirc_rc_after}
+    after firewall lunarwing-pg-${name} xmpp-bridge-${name}${proxy_rc_after}${weechat_rc_after}${darkirc_rc_after}
 }
 
 start_pre() {
@@ -6675,10 +6859,10 @@ start_pre() {
     umask "\${lunarwing_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-${name}"
 
   # ── XMPP bridge init script ──
-  cat >"/etc/init.d/xmpp-bridge-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/xmpp-bridge-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing XMPP bridge ($name)"
@@ -6731,11 +6915,11 @@ start_pre() {
     umask "\${xmpp_bridge_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/xmpp-bridge-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/xmpp-bridge-${name}"
 
   # ── DarkIRC daemon init script (only when enabled) ──
   if tenant_darkirc_enabled "$name"; then
-  cat >"/etc/init.d/lunarwing-darkirc-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-darkirc-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing DarkIRC daemon ($name)"
@@ -6787,12 +6971,12 @@ start_pre() {
     umask "\${darkirc_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-darkirc-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-darkirc-${name}"
   fi
 
   # ── TensorZero proxy init script (only when enabled) ──
   if tenant_proxy_enabled "$name"; then
-  cat >"/etc/init.d/lunarwing-proxy-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-proxy-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing TensorZero proxy ($name)"
@@ -6842,14 +7026,15 @@ start_pre() {
     umask "\${proxy_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-proxy-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-proxy-${name}"
   fi
 
-  # ── WeeChat init script (tmux-based) ──
-  _render_weechat_openrc_unit "$name" "/etc/init.d/lunarwing-weechat-${name}"
+  if [[ "$weechat_enabled" == "true" ]]; then
+    # ── WeeChat init script (tmux-based) ──
+    _render_weechat_openrc_unit "$name" "$OPENRC_INITD_DIR/lunarwing-weechat-${name}"
 
-  # WeeChat WS adapter init script
-  cat >"/etc/init.d/lunarwing-weechat-adapter-${name}" <<INITEOF
+    # WeeChat WS adapter init script
+    cat >"$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing WeeChat WS adapter ($name)"
@@ -6900,7 +7085,16 @@ start_pre() {
     umask "\${adapter_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-weechat-adapter-${name}"
+    chmod 0755 "$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}"
+  else
+    rm -f \
+      "$OPENRC_INITD_DIR/lunarwing-weechat-${name}" \
+      "$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}" \
+      "$OPENRC_CONFD_DIR/lunarwing-weechat-${name}" \
+      "$OPENRC_CONFD_DIR/lunarwing-weechat-adapter-${name}" \
+      "$OPENRC_RUNLEVELS_DIR"/*/"lunarwing-weechat-${name}" \
+      "$OPENRC_RUNLEVELS_DIR"/*/"lunarwing-weechat-adapter-${name}"
+  fi
 
   # DarkIRC adapter init script (only when enabled)
   if tenant_darkirc_enabled "$name"; then
@@ -6908,7 +7102,7 @@ INITEOF
   darkirc_adapter_path="$(tenant_lw_root "$name")/darkirc_channel_for_lunarwing/darkirc/adapter/darkirc_adapter.py"
   darkirc_adapter_dir="$(dirname "$darkirc_adapter_path")"
 
-  cat >"/etc/init.d/lunarwing-darkirc-adapter-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-darkirc-adapter-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing DarkIRC adapter ($name)"
@@ -6959,7 +7153,7 @@ start_pre() {
     umask "\${darkirc_adapter_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-darkirc-adapter-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-darkirc-adapter-${name}"
   fi
 
   # ── Conf.d files ──
@@ -6971,32 +7165,38 @@ INITEOF
   if tenant_proxy_enabled "$name"; then
     proxy_rc_need=" lunarwing-proxy-${name}"
   fi
-  cat >"/etc/conf.d/lunarwing-${name}" <<CONFD
+  local weechat_rc_need=""
+  if [[ "$weechat_enabled" == "true" ]]; then
+    weechat_rc_need=" lunarwing-weechat-${name} lunarwing-weechat-adapter-${name}"
+  fi
+  cat >"$OPENRC_CONFD_DIR/lunarwing-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
-lunarwing_rc_need="xmpp-bridge-${name}${proxy_rc_need} lunarwing-weechat-${name} lunarwing-weechat-adapter-${name}${darkirc_rc_need}"
+lunarwing_rc_need="xmpp-bridge-${name}${proxy_rc_need}${weechat_rc_need}${darkirc_rc_need}"
 CONFD
 
-  cat >"/etc/conf.d/xmpp-bridge-${name}" <<CONFD
+  cat >"$OPENRC_CONFD_DIR/xmpp-bridge-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 xmpp_bridge_rc_before="lunarwing-${name}"
 CONFD
 
   if tenant_proxy_enabled "$name"; then
-    cat >"/etc/conf.d/lunarwing-proxy-${name}" <<CONFD
+    cat >"$OPENRC_CONFD_DIR/lunarwing-proxy-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 CONFD
   fi
 
-  cat >"/etc/conf.d/lunarwing-weechat-${name}" <<CONFD
+  if [[ "$weechat_enabled" == "true" ]]; then
+    cat >"$OPENRC_CONFD_DIR/lunarwing-weechat-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 CONFD
 
-  cat >"/etc/conf.d/lunarwing-weechat-adapter-${name}" <<CONFD
+    cat >"$OPENRC_CONFD_DIR/lunarwing-weechat-adapter-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 CONFD
+  fi
 
   if tenant_darkirc_enabled "$name"; then
-    cat >"/etc/conf.d/lunarwing-darkirc-adapter-${name}" <<CONFD
+    cat >"$OPENRC_CONFD_DIR/lunarwing-darkirc-adapter-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 CONFD
   fi
@@ -7020,9 +7220,15 @@ start_tenant_openrc() {
   # Start PG babysitter (supervises the container via podman wait)
   rc-service "lunarwing-pg-${name}-sup" start 2>/dev/null || true
   # Optional channels next, non-fatal: a missing weechat/aiohttp must not abort
-  # the core stack (the main daemon does not depend on them).
-  rc-service "lunarwing-weechat-${name}" start 2>/dev/null || say "  (lunarwing-weechat-${name} skipped — optional)"
-  rc-service "lunarwing-weechat-adapter-${name}" start 2>/dev/null || say "  (lunarwing-weechat-adapter-${name} skipped — optional)"
+  # the core stack (the main daemon does not depend on them). WeeChat units are
+  # skipped entirely when the tenant's registry flag disables them (ISSUE-006):
+  # start-tenant must not reactivate a service the operator turned off.
+  if tenant_weechat_enabled "$name"; then
+    rc-service "lunarwing-weechat-${name}" start 2>/dev/null || say "  (lunarwing-weechat-${name} skipped — optional)"
+    rc-service "lunarwing-weechat-adapter-${name}" start 2>/dev/null || say "  (lunarwing-weechat-adapter-${name} skipped — optional)"
+  else
+    say "  (weechat disabled for $name — not starting lunarwing-weechat{,-adapter}-${name})"
+  fi
   if tenant_darkirc_enabled "$name"; then
     rc-service "lunarwing-darkirc-${name}" start 2>/dev/null || say "  (lunarwing-darkirc-${name} skipped — optional)"
     rc-service "lunarwing-darkirc-adapter-${name}" start 2>/dev/null || say "  (lunarwing-darkirc-adapter-${name} skipped — optional)"
@@ -7040,7 +7246,10 @@ start_tenant_openrc() {
 
   # Auto-enable on boot whatever is actually running (idempotent, OpenRC only).
   local svc
-  local boot_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "xmpp-bridge-${name}" "lunarwing-${name}" "lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-vision-${name}")
+  local boot_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "xmpp-bridge-${name}" "lunarwing-${name}" "lunarwing-vision-${name}")
+  if tenant_weechat_enabled "$name"; then
+    boot_svcs+=("lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}")
+  fi
   if tenant_proxy_enabled "$name"; then
     boot_svcs+=("lunarwing-proxy-${name}")
   fi
@@ -7086,11 +7295,154 @@ stop_tenant_openrc() {
   say "OpenRC services stopped for $name"
 }
 
+# ISSUE-006: enable_weechat is authoritative for lifecycle, not just health
+# classification. disable-weechat stops the optional weechat units and removes
+# their boot persistence (ending any systemd restart loop); enable-weechat
+# re-enables and starts them. Both are idempotent and tolerate never-rendered
+# or missing units on either init system.
+weechat_lifecycle_stop_disable() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)
+      if ! id -u "$name" >/dev/null 2>&1; then
+        say "tenant user '$name' absent; cannot stop/disable WeeChat" >&2
+        return 1
+      fi
+      local user_unit_dir
+      user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
+      _systemctl_user "$name" show-environment >/dev/null || return 1
+      local units=() unit load_state
+      for unit in "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service"; do
+        if ! load_state="$(_systemctl_user "$name" show --value -p LoadState "$unit" 2>/dev/null)"; then
+          return 1
+        fi
+        if [[ -f "$user_unit_dir/$unit" || ( -n "$load_state" && "$load_state" != "not-found" ) ]]; then
+          units+=("$unit")
+        fi
+      done
+      if ((${#units[@]} > 0)); then
+        _systemctl_user "$name" stop "${units[@]}" || return 1
+        _systemctl_user "$name" disable "${units[@]}" || return 1
+      fi
+      say "stopped + disabled lunarwing-weechat{,-adapter}-${name}.service (systemd)"
+      ;;
+    openrc)
+      local svc link runlevel
+      for svc in "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}"; do
+        if [[ -x "$OPENRC_INITD_DIR/$svc" ]]; then
+          rc-service "$svc" stop || return 1
+        fi
+        for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
+          [[ -e "$link" || -L "$link" ]] || continue
+          runlevel="$(basename "$(dirname "$link")")"
+          rc-update del "$svc" "$runlevel" || return 1
+        done
+      done
+      say "stopped + removed from runlevels: lunarwing-weechat{,-adapter}-${name} (OpenRC)"
+      ;;
+    *)
+      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM" >&2
+      return 1
+      ;;
+  esac
+}
+
+weechat_lifecycle_enable_start() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)
+      if ! id -u "$name" >/dev/null 2>&1; then
+        say "tenant user '$name' absent; cannot enable/start WeeChat" >&2
+        return 1
+      fi
+      local user_unit_dir
+      user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
+      if [[ ! -f "$user_unit_dir/lunarwing-weechat-${name}.service" \
+        || ! -f "$user_unit_dir/lunarwing-weechat-adapter-${name}.service" ]]; then
+        say "weechat units not rendered for '$name'" >&2
+        return 1
+      fi
+      _systemctl_user "$name" daemon-reload || return 1
+      _systemctl_user "$name" enable "lunarwing-weechat-${name}.service" "lunarwing-weechat-adapter-${name}.service" || return 1
+      _systemctl_user "$name" start "lunarwing-weechat-${name}.service" || return 1
+      _systemctl_user "$name" start "lunarwing-weechat-adapter-${name}.service" || return 1
+      say "enabled + started lunarwing-weechat{,-adapter}-${name}.service (systemd)"
+      ;;
+    openrc)
+      if [[ ! -x "$OPENRC_INITD_DIR/lunarwing-weechat-${name}" \
+        || ! -x "$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}" ]]; then
+        say "weechat units not rendered for '$name'" >&2
+        return 1
+      fi
+      rc-update add "lunarwing-weechat-${name}" default || return 1
+      rc-update add "lunarwing-weechat-adapter-${name}" default || return 1
+      rc-service "lunarwing-weechat-${name}" start || return 1
+      rc-service "lunarwing-weechat-adapter-${name}" start || return 1
+      say "enabled + started lunarwing-weechat{,-adapter}-${name} (OpenRC)"
+      ;;
+    *)
+      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM" >&2
+      return 1
+      ;;
+  esac
+}
+
+weechat_reconcile_units() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)
+      (render_tenant_systemd_units "$name") || return 1
+      _systemctl_user "$name" daemon-reload || return 1
+      ;;
+    openrc)
+      (render_tenant_openrc_units "$name") || return 1
+      ;;
+    *)
+      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM" >&2
+      return 1
+      ;;
+  esac
+}
+
+set_tenant_weechat_enabled() {
+  local name="$1" enabled="$2"
+  with_tenant_lifecycle_lock "$name" _set_tenant_weechat_enabled_locked "$name" "$enabled"
+}
+
+_set_tenant_weechat_enabled_locked() {
+  local name="$1" enabled="$2"
+  case "$enabled" in true|false) ;; *) return 2 ;; esac
+
+  ensure_init_system || return 1
+  if [[ "$enabled" == "false" ]]; then
+    # Stop first: health must not mask a unit until init confirms that its
+    # process and boot persistence are gone.
+    weechat_lifecycle_stop_disable "$name" || return 1
+    ports_set_weechat "$name" false || return 1
+    if ! weechat_reconcile_units "$name"; then
+      # Reconciliation failed after the flag changed. Restore fail-loud health
+      # semantics and make a best effort to restore the prior unit graph.
+      say "disabled WeeChat unit reconciliation failed; restoring enabled flag" >&2
+      ports_set_weechat "$name" true \
+        || say "WARNING: failed to restore enable_weechat=true for '$name'" >&2
+      weechat_reconcile_units "$name" \
+        || say "WARNING: failed to restore enabled WeeChat units for '$name'" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  # Enabled is fail-loud: health remains critical if rendering or startup fails.
+  ports_set_weechat "$name" true || return 1
+  weechat_reconcile_units "$name" || return 1
+  weechat_lifecycle_enable_start "$name" || return 1
+}
+
 uninstall_tenant_openrc() {
   local name="$1"
   for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-kimi-${name}-sup"; do
     rc-update del "$svc" default 2>/dev/null || true
-    rm -f "/etc/init.d/$svc" "/etc/conf.d/$svc"
+    rm -f "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc"
   done
   say "uninstalled OpenRC services for $name"
 }
@@ -7273,6 +7625,23 @@ ENVEOF
       cat "$_tmp" > "$HEALTH_ENV_FILE"   # overwrite content, preserve mode/owner
       rm -f "$_tmp"
       say "reconciled LUNARWING_SERVICE_MANAGER=$INIT_SYSTEM in $HEALTH_ENV_FILE"
+    fi
+    # Reconcile the tenants-file line with the ACTIVE ports registry
+    # (ISSUE-012): the file is write-once, so if PORTS_REGISTRY moved after
+    # first install, health kept reading the old registry while admin
+    # commands updated the new one. Same targeted-line rewrite as above;
+    # operator edits and file mode/owner are preserved.
+    if ! grep -q "^SELF_HEAL_TENANTS_FILE=${PORTS_REGISTRY}$" "$HEALTH_ENV_FILE"; then
+      local _tmp2; _tmp2="$(mktemp)"
+      if grep -q '^SELF_HEAL_TENANTS_FILE=' "$HEALTH_ENV_FILE"; then
+        awk -v v="$PORTS_REGISTRY" '/^SELF_HEAL_TENANTS_FILE=/{print "SELF_HEAL_TENANTS_FILE=" v; next} {print}' "$HEALTH_ENV_FILE" > "$_tmp2"
+      else
+        cp "$HEALTH_ENV_FILE" "$_tmp2"
+        printf 'SELF_HEAL_TENANTS_FILE=%s\n' "$PORTS_REGISTRY" >> "$_tmp2"
+      fi
+      cat "$_tmp2" > "$HEALTH_ENV_FILE"   # overwrite content, preserve mode/owner
+      rm -f "$_tmp2"
+      say "reconciled SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY in $HEALTH_ENV_FILE"
     fi
   fi
 
@@ -7559,6 +7928,12 @@ render_tenant_units() {
   local name="$1"
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  with_tenant_lifecycle_lock "$name" _render_tenant_units_locked "$name" \
+    || die "failed to re-render units for tenant '$name'"
+}
+
+_render_tenant_units_locked() {
+  local name="$1"
   ensure_init_system
   say "--- Re-rendering $INIT_SYSTEM units for $name ---"
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
@@ -7613,6 +7988,16 @@ _wait_tenant_gateway() {
   return 0
 }
 
+_start_tenant_init_services() {
+  local name="$1"
+  ensure_init_system || return 1
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    start_tenant_systemd "$name"
+  else
+    start_tenant_openrc "$name"
+  fi
+}
+
 # Restart ONLY the lunarwing daemon unit for a tenant (not the full stack).
 # Used by start_tenant to make a freshly-uploaded SSH key signable: the agent
 # loads keys from the secrets store at startup only ("runtime key add is
@@ -7664,12 +8049,8 @@ start_tenant() {
   start_tenant_postgres "$name"
   start_tenant_vision "$name"
 
-  ensure_init_system
-  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    start_tenant_systemd "$name"
-  else
-    start_tenant_openrc "$name"
-  fi
+  with_tenant_lifecycle_lock "$name" _start_tenant_init_services "$name" \
+    || die "failed to start init services for tenant '$name'"
 
   # Upload the staged SSH key to the secrets store (if one was provisioned by
   # add-tenant but not yet uploaded), BEFORE the workers start. If a key was
@@ -8863,12 +9244,13 @@ main() {
       ports_registry_init
       tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
       if [[ "$command_name" == "disable-weechat" ]]; then
-        ports_set_weechat "$name" false
-        say "WeeChat health-gate disabled for tenant '$name': down weechat units now report skipped (never critical)"
-        say "NOTE: rendered units are untouched — stop them manually if running: stop-tenant leaves optional weechat units alone"
+        set_tenant_weechat_enabled "$name" false \
+          || die "failed to stop/disable WeeChat for tenant '$name'"
+        say "WeeChat disabled for tenant '$name': units stopped + boot persistence removed; health reports them skipped (never critical)"
       else
-        ports_set_weechat "$name" true
-        say "WeeChat health-gate enabled for tenant '$name': down weechat units report critical again"
+        set_tenant_weechat_enabled "$name" true \
+          || die "failed to enable/start WeeChat for tenant '$name'"
+        say "WeeChat enabled for tenant '$name': units enabled + started; health reports critical when down"
       fi
       ;;
 
