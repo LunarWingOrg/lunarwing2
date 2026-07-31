@@ -353,7 +353,51 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <TENANT>
 
 DarkIRC contact key material belongs inline under `[contact."nickname"]` sections in the TOML. The daemon does not consume a separate generated keypair file.
 
-A contact section should include the contact's public key and the tenant's own keypair for that contact. Exchange public keys out of band before enabling private DMs.
+A contact section includes the peer public key and tenant-local private key for
+that contact. Use managed Stage A exchange instead of moving private keys or
+editing contact TOML manually:
+
+```bash
+umask 077
+MT="sudo ic/scripts/lunarwing-mt-admin.sh"
+
+# Initiator: artifact contains public material only.
+$MT darkirc-contact prepare alice bob --out - > /root/alice-to-bob.json
+
+# Responder: verify initiator fingerprint through an independent channel first.
+$MT darkirc-contact respond bob alice --in - --out - \
+  --expect-peer-fingerprint sha256:<alice-public-fingerprint> \
+  < /root/alice-to-bob.json > /root/bob-to-alice.json
+
+# Each side verifies peer fingerprint independently, then installs locally.
+$MT darkirc-contact complete alice bob --exchange-id <alice-offer-id> \
+  --in - --expect-peer-fingerprint sha256:<bob-public-fingerprint> \
+  < /root/bob-to-alice.json
+$MT darkirc-contact complete bob alice --exchange-id <bob-response-id> \
+  --in - --expect-peer-fingerprint sha256:<alice-public-fingerprint> \
+  < /root/alice-to-bob.json
+```
+
+Set `umask 077` before redirecting public artifacts as shown. Named artifact
+paths resolve under tenant home. Helper-created artifact files are mode `0600`;
+existing files are never overwritten.
+`respond` and `complete` reject missing, partial, case-changed, or mismatched
+fingerprints. Private halves remain in tenant-owned protected state and never
+enter artifacts, argv, environment, or command output.
+
+`complete` currently installs config/ledger state with deferred activation. It
+does not restart services or claim connectivity. Restart affected tenants through
+mt-admin during an agreed maintenance window, then run:
+
+```bash
+$MT darkirc-health alice --strict --json
+$MT darkirc-health bob --strict --json
+```
+
+Use `darkirc-contact exchanges <tenant>` for pending status and
+`darkirc-contact cancel <tenant> --exchange-id <id>` to cancel before install.
+Cancelled IDs remain tombstoned and cannot be reused. Rotation, revocation,
+automatic activation/rollback, and same-host pairing remain unimplemented.
 
 ## Tor / Hidden Service Options
 
