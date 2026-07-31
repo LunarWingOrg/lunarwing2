@@ -173,4 +173,63 @@ unit_set "$f4" lunarwing-weechat-acme.service "loaded inactive dead 0 enabled"
 oF4="$(run_hs "$f4" acme acme)"   # absent flag = pre-gate tenant entry
 assert_eq "$(ustat "$oF4" lunarwing-weechat-acme.service)" "critical" "F5: flag absent -> down weechat still critical (backward compat)"
 
+# ── G: malformed tenant registry -> degraded, never healthy-blank (ISSUE-007) ─
+echo "=== Section G: malformed registry -> degraded (ISSUE-007) ==="
+g="$(sb)"; mk_hs_mock "$g"
+unit_set "$g" lunarwing-acme.service "loaded active running 0 enabled"
+echo '{not valid json' > "$g/ports.json"
+oG="$(env PATH="$g/bin:$PATH" HS_UNIT_DIR="$g/units" \
+    LUNARWING_SERVICE_MANAGER=systemd LUNARWING_TENANTS_FILE="$g/ports.json" \
+    bash "$HS" 2>/dev/null)"
+assert_eq "$(oall "$oG")" "degraded" "G1: malformed registry -> degraded"
+assert_contains "$oG" "not valid JSON" "G2: malformed registry issue surfaced"
+
+# ── H: valid registry with zero tenants -> degraded, documented (ISSUE-007) ──
+echo "=== Section H: empty-but-valid registry -> degraded (ISSUE-007) ==="
+h="$(sb)"; mk_hs_mock "$h"
+echo '{"tenants":{}}' > "$h/ports.json"
+oH="$(env PATH="$h/bin:$PATH" HS_UNIT_DIR="$h/units" \
+    LUNARWING_SERVICE_MANAGER=systemd LUNARWING_TENANTS_FILE="$h/ports.json" \
+    bash "$HS" 2>/dev/null)"
+assert_eq "$(oall "$oH")" "degraded" "H1: zero-tenant registry -> degraded (explicit documented status)"
+assert_contains "$oH" "lists no tenants" "H2: zero-tenant issue surfaced"
+
+# ── I: jq missing on an MT host -> degraded JSON, never healthy (ISSUE-007) ──
+echo "=== Section I: missing jq -> degraded (ISSUE-007) ==="
+i="$(sb)"; mk_hs_mock "$i"
+echo '{"tenants":{"acme":{"user":"acme"}}}' > "$i/ports.json"
+REAL_JQ="$(command -v jq)"
+shim="$i/shim"; mkdir -p "$shim"
+for tool in bash date cat awk grep sed sort head tail env chmod timeout; do
+    src="$(command -v "$tool" 2>/dev/null || true)"
+    [ -n "$src" ] && ln -sf "$src" "$shim/$tool"
+done
+for tool in systemctl sudo id; do ln -sf "$i/bin/$tool" "$shim/$tool"; done
+oI="$(env PATH="$shim" HS_UNIT_DIR="$i/units" \
+    LUNARWING_SERVICE_MANAGER=systemd LUNARWING_TENANTS_FILE="$i/ports.json" \
+    bash "$HS" 2>/dev/null)"; rcI=$?
+assert_eq "$rcI" "1" "I1: missing jq -> degraded exit code"
+assert_eq "$("$REAL_JQ" -r '.status' <<<"$oI")" "degraded" "I2: missing jq -> degraded JSON (not healthy)"
+assert_contains "$oI" "discovery unavailable" "I3: missing jq issue surfaced"
+
+# ── J: tenant on bus but zero observable units -> degraded (ISSUE-007) ────────
+echo "=== Section J: zero observable tenant units -> degraded (ISSUE-007) ==="
+j="$(sb)"; mk_hs_mock "$j"   # no unit files at all: tenant bus exposes nothing
+oJ="$(run_hs "$j" acme acme)"
+assert_eq "$(oall "$oJ")" "degraded" "J1: zero observable tenant units -> degraded"
+assert_contains "$oJ" "no tenant units observable" "J2: observability gap issue surfaced"
+
+# ── K: tenant bus probes fail (sudo denied) -> degraded (ISSUE-007) ───────────
+echo "=== Section K: failed tenant probes -> degraded (ISSUE-007) ==="
+k="$(sb)"; mk_hs_mock "$k"
+unit_set "$k" lunarwing-acme.service "loaded active running 0 enabled"
+cat > "$k/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$k/bin/sudo"
+oK="$(run_hs "$k" acme acme)"
+assert_eq "$(oall "$oK")" "degraded" "K1: failed tenant probes -> degraded"
+assert_contains "$oK" "probe(s) failed" "K2: probe failure issue surfaced"
+
 finish

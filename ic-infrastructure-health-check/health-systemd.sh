@@ -26,6 +26,42 @@ fi
 TENANTS_FILE="${SELF_HEAL_TENANTS_FILE:-${LUNARWING_TENANTS_FILE:-/etc/lunarwing/ports.json}}"
 IS_MT=false; [ -r "$TENANTS_FILE" ] && IS_MT=true
 
+# ISSUE-007: a readable registry must not silently blank monitoring. Validate
+# everything tenant discovery needs BEFORE base units are skipped on MT
+# grounds; any gap downgrades the result to degraded with a diagnostic issue
+# instead of letting the component report healthy with zero visibility.
+MT_DISCOVERY_OK=true
+MT_DISCOVERY_NOTE=""
+if [ "$IS_MT" = "true" ]; then
+  if ! command -v jq >/dev/null 2>&1; then
+    MT_DISCOVERY_OK=false; MT_DISCOVERY_NOTE="jq not installed; cannot enumerate tenant registry"
+  elif ! command -v timeout >/dev/null 2>&1; then
+    MT_DISCOVERY_OK=false; MT_DISCOVERY_NOTE="timeout(1) not installed; tenant bus probes would be unbounded"
+  elif ! command -v sudo >/dev/null 2>&1; then
+    MT_DISCOVERY_OK=false; MT_DISCOVERY_NOTE="sudo not installed; cannot reach tenant user buses"
+  elif ! jq -e 'type == "object"' "$TENANTS_FILE" >/dev/null 2>&1; then
+    MT_DISCOVERY_OK=false; MT_DISCOVERY_NOTE="tenant registry is not valid JSON: $TENANTS_FILE"
+  fi
+fi
+
+# Records a non-healthy (degraded) state with a diagnostic issue. Discovery
+# failures degrade rather than critical: they mean "unknown", not "down".
+mt_degrade() {
+  issues+=("$1")
+  if [ "$overall_exit" -lt 1 ]; then
+    overall_exit=1; overall_status="degraded"
+  fi
+}
+
+# jq missing on an MT host: the normal report assembly below needs jq, so
+# emit a minimal degraded report by hand and exit — never a healthy blank.
+if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" != "true" ] \
+  && ! command -v jq >/dev/null 2>&1; then
+  printf '{\n  "component": "systemd",\n  "status": "degraded",\n  "timestamp": "%s",\n  "metrics": {"units": []},\n  "issues": ["multi-tenant discovery unavailable: %s"]\n}\n' \
+    "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$MT_DISCOVERY_NOTE"
+  exit 1
+fi
+
 issues=()
 unit_results=()
 overall_status="healthy"
@@ -97,7 +133,11 @@ done
 # file) — existing behavior is unchanged. Requires root to reach other users'
 # --user buses; any unit we cannot positively load is skipped (no false
 # criticals). Parallels the tenant discovery in health-openrc.sh.
-if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
+_tenants_seen=0
+_tenant_units_loaded=0
+_tenant_probe_failures=0
+_sweep_incomplete=false
+if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
   _tenant_uctl() {  # <user> <uid> <args...> -> systemctl --user output (failure-safe, bounded)
     local u="$1" uid="$2"; shift 2
     timeout -k 2 5 sudo -n -u "$u" env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@" 2>/dev/null || true
@@ -113,8 +153,9 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
   # component. Past the deadline we stop probing and emit a partial report.
   _deadline=24
   while IFS=$'\t' read -r tname tuser tweechat; do
-    [ "$SECONDS" -lt "$_deadline" ] || break
+    [ "$SECONDS" -lt "$_deadline" ] || { _sweep_incomplete=true; break; }
     [ -n "$tname" ] && [ -n "$tuser" ] || continue
+    _tenants_seen=$((_tenants_seen+1))
     tuid=$(id -u "$tuser" 2>/dev/null || echo "")
     [ -n "$tuid" ] || continue
     # Is this tenant "started"? Its primary daemon being active means every other
@@ -133,13 +174,20 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
              | awk '$1 ~ /\.service$/ {print $1}' | sort -u)
     [ -n "$tunits" ] || tunits="lunarwing-$tname.service xmpp-bridge-$tname.service"
     for tunit in $tunits; do
-      [ "$SECONDS" -lt "$_deadline" ] || break
+      [ "$SECONDS" -lt "$_deadline" ] || { _sweep_incomplete=true; break; }
       # One show call per unit (LoadState/ActiveState/SubState/NRestarts, in
       # systemd's canonical order for a .service) instead of four round-trips —
       # leaner and bounds hang exposure on a slow tenant bus.
       mapfile -t _uf < <(_tenant_uctl "$tuser" "$tuid" show --value \
         -p LoadState -p ActiveState -p SubState -p NRestarts "$tunit")
-      [ "${_uf[0]:-}" = "loaded" ] || continue
+      if [ "${_uf[0]:-}" != "loaded" ]; then
+        # Distinguish a genuinely absent unit (LoadState not-found etc.) from
+        # a FAILED probe: zero output means sudo/bus/timeout broke, which must
+        # surface at the end instead of silently dropping the unit (ISSUE-007).
+        [ "${#_uf[@]}" -eq 0 ] && _tenant_probe_failures=$((_tenant_probe_failures+1))
+        continue
+      fi
+      _tenant_units_loaded=$((_tenant_units_loaded+1))
       uactive=${_uf[1]:-unknown}; usub=${_uf[2]:-unknown}; urestarts=${_uf[3]:-0}
       [[ "$urestarts" =~ ^[0-9]+$ ]] || urestarts=0
       ustatus="healthy"; uexit=0
@@ -213,6 +261,25 @@ if [ "$IS_MT" = "true" ] && command -v jq >/dev/null 2>&1; then
     done
   # enable_weechat: explicit ==false test (jq `//` treats false as empty).
   done < <(jq -r '.tenants // {} | to_entries[] | "\(.key)\t\(.value.user)\t\(if .value.enable_weechat == false then "false" else "true" end)"' "$TENANTS_FILE" 2>/dev/null || true)
+fi
+
+# ISSUE-007 final invariants: an MT host must never report healthy when
+# tenant discovery was unavailable, incomplete, or observed nothing —
+# monitoring failure must be distinguishable from service health.
+if [ "$IS_MT" = "true" ]; then
+  if [ "$MT_DISCOVERY_OK" != "true" ]; then
+    mt_degrade "multi-tenant discovery unavailable: $MT_DISCOVERY_NOTE"
+  else
+    [ "$_sweep_incomplete" = "true" ] && \
+      mt_degrade "tenant sweep incomplete: deadline hit; results partial"
+    if [ "$_tenants_seen" -eq 0 ]; then
+      mt_degrade "tenant registry valid but lists no tenants; no units observed on MT host"
+    elif [ "$_tenant_units_loaded" -eq 0 ]; then
+      mt_degrade "no tenant units observable on any of $_tenants_seen tenant bus(es); discovery or bus access broken"
+    fi
+    [ "$_tenant_probe_failures" -gt 0 ] && \
+      mt_degrade "$_tenant_probe_failures tenant unit probe(s) failed (sudo/bus/timeout); results partial"
+  fi
 fi
 
 issues_json="[]"
