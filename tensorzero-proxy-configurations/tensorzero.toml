@@ -1084,7 +1084,7 @@ model = "ds32_openrouter"
 type = "chat_completion"
 model = "gemma4_26b_nanogpt"
 
-# --- LUNARWING (nanocode worker) --------------------------------------------
+# --- LUNARWING daemon --------------------------------------------------------
 [functions.lunarwing]
 type = "chat"
 
