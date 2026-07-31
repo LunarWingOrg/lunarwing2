@@ -893,6 +893,7 @@ Commands:
 
   start-tenant <name>             Start all services for a tenant
   stop-tenant <name>              Stop all services for a tenant
+  stop-tenant-for-upgrade <name>  Verify settled DarkIRC state and stop atomically
   stop-writers <name>             Stop tenant writers but leave PostgreSQL up
   writers-active <name>            Exit 0 when any tenant writer is active
   restart-tenant <name>           Stop then start
@@ -4046,15 +4047,10 @@ darkirc_writer_unlock() {
 generate_darkirc_config() {
   local name="$1"
   local state_dir config_dir datastore_dir irc_port rpc_port log_dir scope_id baseline
-  local registry_lock_owned=false
+  local registry_lock_owned=false writer_lock_owned=false
   state_dir="$(tenant_state_dir "$name")"
   config_dir="$state_dir/darkirc"
   datastore_dir="$config_dir/datastore"
-
-  # Never create/chmod/chown beneath the tenant-controlled state path as root.
-  # The tenant-side setup is guarded component-by-component, then the typed
-  # helper repeats the no-follow and ownership checks before opening anything.
-  darkirc_prepare_tenant_dirs "$name"
 
   if [[ "$PORTS_LOCK_HELD" != true ]]; then
     acquire_ports_lock
@@ -4064,6 +4060,18 @@ generate_darkirc_config() {
   rpc_port="$(ports_get "$name" darkirc_rpc)" || die "no darkirc_rpc port for tenant '$name'"
   log_dir="$(tenant_log_dir "$name")"
   scope_id="$(ensure_darkirc_scope_id "$name")"
+  if [[ "$registry_lock_owned" == true ]]; then
+    release_ports_lock
+  fi
+  if [[ "$DARKIRC_WRITER_LOCK_HELD" != true ]]; then
+    darkirc_writer_lock "$name"
+    writer_lock_owned=true
+  fi
+
+  # Never create/chmod/chown beneath the tenant-controlled state path as root.
+  # The tenant-side setup is guarded component-by-component, then the typed
+  # helper repeats the no-follow and ownership checks before opening anything.
+  darkirc_prepare_tenant_dirs "$name"
   [[ -f "$TEMPLATES_DIR/darkirc_config.toml.template" ]] \
     || die "darkirc config template not found at $TEMPLATES_DIR/darkirc_config.toml.template"
 
@@ -4082,14 +4090,15 @@ generate_darkirc_config() {
     || die "DarkIRC semantic config update failed for tenant '$name'"
   [[ -f "$config_dir/darkirc_config.toml" ]] \
     || die "DarkIRC helper did not produce a config for '$name'"
-  if [[ "$registry_lock_owned" == true ]]; then
-    release_ports_lock
+  if [[ "$writer_lock_owned" == true ]]; then
+    darkirc_writer_unlock
   fi
   say "darkirc config updated for $name (irc=$irc_port rpc=$rpc_port scope=$scope_id)"
 }
 
 darkirc_contact_helper() {
-  local command_name="$1" name="$2" contact=""
+  local command_name="$1" name="$2" contact="" scope_id=""
+  local writer_lock_owned=false
   shift 2
   case "$command_name" in
     status|prepare|respond|complete)
@@ -4108,7 +4117,18 @@ darkirc_contact_helper() {
       tenant_darkirc_enabled "$name" || die "DarkIRC is disabled for tenant '$name'"
       ;;
   esac
-  local scope_id
+  case "$command_name" in
+    adopt|export-migration|stage-migration|import-migration|migration-ready|recover|prepare|respond|complete|cancel)
+      if [[ "$DARKIRC_WRITER_LOCK_HELD" != true ]]; then
+        scope_id="$(ensure_darkirc_scope_id "$name")"
+        darkirc_writer_lock "$name"
+        writer_lock_owned=true
+      else
+        scope_id="$(darkirc_scope_id "$name")"
+        validate_darkirc_scope_id "$scope_id"
+      fi
+      ;;
+  esac
   case "$command_name" in
     list|doctor)
       scope_id="$(darkirc_scope_id "$name")"
@@ -4131,29 +4151,29 @@ darkirc_contact_helper() {
       fi
       ;;
     adopt)
-      scope_id="$(ensure_darkirc_scope_id "$name")"
+      [[ -n "$scope_id" ]] || scope_id="$(ensure_darkirc_scope_id "$name")"
       [[ "${DARKIRC_ADOPT_CONFIRMED:-false}" == true ]] \
         || die "adoption requires explicit --yes; no key is rotated"
       run_darkirc_key_helper "$name" adopt --tenant "$name" --scope-id "$scope_id" --yes --json
       ;;
     export-migration)
-      scope_id="$(ensure_darkirc_scope_id "$name")"
+      [[ -n "$scope_id" ]] || scope_id="$(ensure_darkirc_scope_id "$name")"
       run_darkirc_key_helper "$name" export-migration --tenant "$name" --scope-id "$scope_id" --json
       ;;
     stage-migration)
-      scope_id="$(ensure_darkirc_scope_id "$name")"
+      [[ -n "$scope_id" ]] || scope_id="$(ensure_darkirc_scope_id "$name")"
       run_darkirc_key_helper "$name" stage-migration --tenant "$name" --scope-id "$scope_id" --json
       ;;
     import-migration)
-      scope_id="$(ensure_darkirc_scope_id "$name")"
+      [[ -n "$scope_id" ]] || scope_id="$(ensure_darkirc_scope_id "$name")"
       run_darkirc_key_helper "$name" import-migration --tenant "$name" --scope-id "$scope_id" --json
       ;;
     migration-ready)
-      scope_id="$(ensure_darkirc_scope_id "$name")"
+      [[ -n "$scope_id" ]] || scope_id="$(ensure_darkirc_scope_id "$name")"
       run_darkirc_key_helper "$name" migration-ready --tenant "$name" --scope-id "$scope_id" --json
       ;;
     recover)
-      scope_id="$(darkirc_scope_id "$name")"
+      [[ -n "$scope_id" ]] || scope_id="$(darkirc_scope_id "$name")"
       validate_darkirc_scope_id "$scope_id"
       run_darkirc_key_helper "$name" recover --tenant "$name" --scope-id "$scope_id" --json
       ;;
@@ -4177,12 +4197,16 @@ darkirc_contact_helper() {
       ;;
     *) die "unknown DarkIRC contact operation '$command_name'" ;;
   esac
+  if [[ "$writer_lock_owned" == true ]]; then
+    darkirc_writer_unlock
+  fi
 }
 
 darkirc_exchange_prepare() {
   local name="$1" contact="$2" scope_id
   shift 2
-  scope_id="$(ensure_darkirc_scope_id "$name")"
+  scope_id="$(darkirc_scope_id "$name")"
+  validate_darkirc_scope_id "$scope_id"
   local out_flag=() expires_flag=() json_flag=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -4204,7 +4228,8 @@ darkirc_exchange_prepare() {
 darkirc_exchange_respond() {
   local name="$1" contact="$2" scope_id
   shift 2
-  scope_id="$(ensure_darkirc_scope_id "$name")"
+  scope_id="$(darkirc_scope_id "$name")"
+  validate_darkirc_scope_id "$scope_id"
   local out_flag=() in_flag=() fp_flag=() json_flag=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -4230,7 +4255,8 @@ darkirc_exchange_respond() {
 darkirc_exchange_complete() {
   local name="$1" contact="$2" scope_id
   shift 2
-  scope_id="$(ensure_darkirc_scope_id "$name")"
+  scope_id="$(darkirc_scope_id "$name")"
+  validate_darkirc_scope_id "$scope_id"
   local in_flag=() fp_flag=() id_flag=() json_flag=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -4257,7 +4283,8 @@ darkirc_exchange_complete() {
 darkirc_exchange_cancel() {
   local name="$1" scope_id
   shift
-  scope_id="$(ensure_darkirc_scope_id "$name")"
+  scope_id="$(darkirc_scope_id "$name")"
+  validate_darkirc_scope_id "$scope_id"
   local id_flag=() json_flag=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -8974,6 +9001,28 @@ recover_failed_tenant_checkout() {
   die "git checkout $target failed after repository state changed; tenant remains stopped for inspection"
 }
 
+stop_tenant_for_upgrade() {
+  local name="$1" writer_lock_owned=false
+  if tenant_darkirc_enabled "$name"; then
+    local darkirc_scope
+    if [[ "$DARKIRC_WRITER_LOCK_HELD" != true ]]; then
+      darkirc_scope="$(ensure_darkirc_scope_id "$name")"
+      darkirc_writer_lock "$name"
+      writer_lock_owned=true
+    else
+      darkirc_scope="$(darkirc_scope_id "$name")"
+    fi
+    validate_darkirc_scope_id "$darkirc_scope"
+    run_darkirc_key_helper "$name" migration-ready --tenant "$name" \
+      --scope-id "$darkirc_scope" --json >/dev/null \
+      || die "DarkIRC migration state is not settled; refusing upgrade"
+  fi
+  stop_tenant "$name"
+  if [[ "$writer_lock_owned" == true ]]; then
+    darkirc_writer_unlock
+  fi
+}
+
 # In-place tenant upgrade: composes the verified sequence (backup -> fetch ->
 # clean-tree gate -> stop -> checkout as the tenant user -> rebuild with WASM ->
 # re-render units -> patch env -> start). The verbs it calls dispatch
@@ -8998,15 +9047,6 @@ upgrade_tenant_locked() {
   repo="$(tenant_repo "$name")"
 
   [[ -d "$lw_root/.git" ]] || die "no git checkout at $lw_root; run add-tenant first"
-
-  if tenant_darkirc_enabled "$name"; then
-    local darkirc_scope
-    darkirc_scope="$(darkirc_scope_id "$name")"
-    validate_darkirc_scope_id "$darkirc_scope"
-    run_darkirc_key_helper "$name" migration-ready --tenant "$name" \
-      --scope-id "$darkirc_scope" --json >/dev/null \
-      || die "DarkIRC migration state is not settled; refusing upgrade"
-  fi
 
   local tgit=(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root")
 
@@ -9051,7 +9091,7 @@ upgrade_tenant_locked() {
 
   previous_commit="$("${tgit[@]}" rev-parse --verify HEAD)" \
     || die "failed to record current tenant commit"
-  stop_tenant "$name"
+  stop_tenant_for_upgrade "$name"
 
   say "checking out $target at $target_commit (as $name) ..."
   if [[ "$checkout_ref" != "$target" ]]; then
@@ -9688,6 +9728,14 @@ main() {
       stop_tenant "$1"
       ;;
 
+    stop-tenant-for-upgrade)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: stop-tenant-for-upgrade <name>"
+      ports_registry_init
+      tenant_exists_in_registry "$1" || die "tenant '$1' not found in registry"
+      stop_tenant_for_upgrade "$1"
+      ;;
+
     stop-writers)
       require_root
       [[ -n "${1:-}" ]] || die "usage: stop-writers <name>"
@@ -9999,6 +10047,11 @@ main() {
           contact_tenant="${1:-}"; shift || true
           ;;
         *) die "usage: darkirc-contact {list|status|doctor|adopt|export-migration|stage-migration|import-migration|migration-ready|recover|validate-migration|prepare|respond|complete|cancel|exchanges} ..." ;;
+      esac
+      case "$contact_action" in
+        list|status|doctor|adopt|export-migration|stage-migration|import-migration|migration-ready|recover|exchanges)
+          [[ $# -eq 0 ]] || die "unexpected $contact_action argument: $1"
+          ;;
       esac
       if [[ "$contact_action" == list || "$contact_action" == status || "$contact_action" == doctor || "$contact_action" == exchanges ]]; then
         ports_registry_require_readonly

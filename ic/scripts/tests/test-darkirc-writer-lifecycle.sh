@@ -99,6 +99,29 @@ darkirc_writer_lock "$TENANT"
 }
 darkirc_writer_unlock
 
+UPGRADE_ORDER=()
+tenant_darkirc_enabled() { return 0; }
+ensure_darkirc_scope_id() { printf '00112233445566778899aabbccddeeff\n'; }
+run_darkirc_key_helper() {
+  [[ "$DARKIRC_WRITER_LOCK_HELD" == true ]] || {
+    printf 'migration readiness ran without writer lock\n' >&2
+    return 1
+  }
+  UPGRADE_ORDER+=(ready)
+}
+stop_tenant() {
+  [[ "$DARKIRC_WRITER_LOCK_HELD" == true ]] || {
+    printf 'upgrade stop ran without writer lock\n' >&2
+    return 1
+  }
+  UPGRADE_ORDER+=(stop)
+}
+stop_tenant_for_upgrade "$TENANT"
+[[ "${UPGRADE_ORDER[*]}" == "ready stop" && "$DARKIRC_WRITER_LOCK_HELD" == false ]] || {
+  printf 'upgrade readiness/stop lock ordering failed: %s\n' "${UPGRADE_ORDER[*]}" >&2
+  exit 1
+}
+
 # An intermediate state-path symlink must be rejected before any privileged
 # mkdir/chown/open can touch the symlink target.
 symlink_root="$(mktemp -d)"
@@ -143,7 +166,7 @@ ensure_darkirc_scope_id() { printf '00112233445566778899aabbccddeeff\n'; }
 HELPER_CALLS=()
 run_darkirc_key_helper() { HELPER_CALLS+=("$*"); }
 fingerprint="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-darkirc_contact_helper prepare "$TENANT" alice --out - --expires 1200 --json
+darkirc_contact_helper prepare "$TENANT" alice --out - --expires 1200
 darkirc_contact_helper respond "$TENANT" alice --in - --out response.json \
   --expect-peer-fingerprint "$fingerprint" --json
 darkirc_contact_helper complete "$TENANT" alice --exchange-id 0123456789abcdef0123456789abcdef \
@@ -151,7 +174,7 @@ darkirc_contact_helper complete "$TENANT" alice --exchange-id 0123456789abcdef01
 darkirc_contact_helper cancel "$TENANT" --exchange-id 0123456789abcdef0123456789abcdef --json
 forwarded="$(printf '%s\n' "${HELPER_CALLS[@]}")"
 for expected in \
-  'prepare --tenant fixture --scope-id 00112233445566778899aabbccddeeff --contact alice --out - --expires 1200 --json' \
+  'prepare --tenant fixture --scope-id 00112233445566778899aabbccddeeff --contact alice --out - --expires 1200' \
   'respond --tenant fixture --scope-id 00112233445566778899aabbccddeeff --contact alice --in - --out response.json --expect-peer-fingerprint' \
   'complete --tenant fixture --scope-id 00112233445566778899aabbccddeeff --contact alice --exchange-id 0123456789abcdef0123456789abcdef --in response.json' \
   'cancel --tenant fixture --scope-id 00112233445566778899aabbccddeeff --exchange-id 0123456789abcdef0123456789abcdef --json'; do

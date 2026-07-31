@@ -46,10 +46,13 @@ pub const MIGRATION_SCHEMA: &str = "darkirc-contacts-v1";
 pub const EXCHANGE_SCHEMA: &str = "lunarwing.darkirc.exchange.v1";
 pub const EXCHANGE_SCHEMA_VERSION: &str = "1";
 pub const MAX_PENDING_BYTES: usize = 64 * 1024;
+pub const MAX_PENDING_EXCHANGES: usize = 128;
+pub const MAX_PENDING_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 pub const ACTIVATION_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 pub const EXTENSION_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const DEFAULT_OFFER_TTL_SECONDS: i64 = 30 * 60;
 pub const MAX_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
+const INITIAL_EXCHANGE_GENERATION: u64 = 1;
 
 pub const EXCHANGE_V1_DOMAIN_SEPARATOR: &str = "lunarwing.darkirc.exchange.v1";
 
@@ -289,6 +292,8 @@ pub enum KeyManagerError {
     CompromisedKey,
     #[error("exchange operation not found")]
     ExchangeNotFound,
+    #[error("pending exchange capacity exceeded")]
+    PendingLimit,
 }
 
 impl From<io::Error> for KeyManagerError {
@@ -1496,6 +1501,8 @@ fn validate_ledger(ledger: &Ledger) -> Result<()> {
     if ledger.schema != LEDGER_SCHEMA || validate_scope_id(&ledger.scope_id).is_err() {
         return Err(KeyManagerError::InvalidLedger);
     }
+    let mut contact_ids = HashSet::new();
+    let mut local_fingerprints = HashSet::new();
     for (name, contact) in &ledger.contacts {
         validate_contact_name(name).map_err(|_| KeyManagerError::InvalidLedger)?;
         if !matches!(
@@ -1515,7 +1522,19 @@ fn validate_ledger(ledger: &Ledger) -> Result<()> {
         {
             return Err(KeyManagerError::InvalidLedger);
         }
-        if contact.state.starts_with("legacy-") && contact.generation != 0 {
+        if contact.state.starts_with("legacy-") {
+            if contact.generation != 0
+                || !contact.contact_id.is_empty()
+                || !contact.local_fingerprint.is_empty()
+            {
+                return Err(KeyManagerError::InvalidLedger);
+            }
+        } else if contact.generation == 0
+            || validate_offer_id(&contact.contact_id).is_err()
+            || !valid_hash(&contact.local_fingerprint)
+            || !contact_ids.insert(contact.contact_id.clone())
+            || !local_fingerprints.insert(contact.local_fingerprint.clone())
+        {
             return Err(KeyManagerError::InvalidLedger);
         }
     }
@@ -1524,8 +1543,10 @@ fn validate_ledger(ledger: &Ledger) -> Result<()> {
         validate_offer_id(&tombstone.contact_id).map_err(|_| KeyManagerError::InvalidLedger)?;
         validate_contact_name(&tombstone.contact_name)
             .map_err(|_| KeyManagerError::InvalidLedger)?;
-        if !matches!(tombstone.state.as_str(), "Cancelled" | "Installed")
-            || tombstone.expires_at <= tombstone.created_at
+        if !matches!(
+            tombstone.state.as_str(),
+            "Cancelled" | "Expired" | "Installed"
+        ) || tombstone.expires_at <= tombstone.created_at
             || (tombstone.state == "Installed" && !valid_hash(&tombstone.peer_fingerprint))
             || (!tombstone.peer_fingerprint.is_empty() && !valid_hash(&tombstone.peer_fingerprint))
         {
@@ -2338,6 +2359,7 @@ fn compute_transcript(initiator: &[u8], responder: &[u8]) -> Result<String> {
 
 fn validate_offer_id(value: &str) -> Result<()> {
     if value.len() != 32
+        || value.bytes().all(|byte| byte == b'0')
         || value
             .bytes()
             .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
@@ -2361,6 +2383,13 @@ fn validate_exchange_times(created_at: i64, expires_at: i64, now: i64) -> Result
         || created_at > now.saturating_add(MAX_CLOCK_SKEW_SECONDS)
         || expires_at < now.saturating_sub(MAX_CLOCK_SKEW_SECONDS)
     {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    Ok(())
+}
+
+fn require_live_exchange(expires_at: i64, now: i64) -> Result<()> {
+    if now < 0 || now >= expires_at {
         return Err(KeyManagerError::InvalidExchangeArtifact);
     }
     Ok(())
@@ -2530,17 +2559,223 @@ fn offer_id_path(_workspace: &Workspace, offer_id: &str) -> Result<String> {
     Ok(format!("{}/{}.json", PENDING_DIR, offer_id))
 }
 
-fn read_pending_secret(workspace: &Workspace, offer_id: &str) -> Result<SecretExchange> {
+fn validate_stored_public_exchange(
+    bytes: &[u8],
+    role: ExchangeRole,
+) -> Result<ValidatedPublicArtifact> {
+    let (attestation, created_at) = match role {
+        ExchangeRole::InitiatorOffer => {
+            let artifact: PreparedExchange = serde_json::from_slice(bytes)
+                .map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+            (
+                CompatibilityAttestation::new(
+                    &artifact.generator_profile,
+                    &artifact.binary_sha256,
+                    &artifact.key_format,
+                    &artifact.source_revision,
+                )?,
+                artifact.created_at,
+            )
+        }
+        ExchangeRole::ResponderResponse => {
+            let artifact: ResponderExchange = serde_json::from_slice(bytes)
+                .map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+            (
+                CompatibilityAttestation::new(
+                    &artifact.generator_profile,
+                    &artifact.binary_sha256,
+                    &artifact.key_format,
+                    &artifact.source_revision,
+                )?,
+                artifact.created_at,
+            )
+        }
+    };
+    let artifact = validate_public_exchange_at(bytes, role, &attestation, created_at)?;
+    if artifact.canonical != bytes {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    Ok(artifact)
+}
+
+fn public_artifact_created_at(bytes: &[u8], role: ExchangeRole) -> Result<i64> {
+    match role {
+        ExchangeRole::InitiatorOffer => serde_json::from_slice::<PreparedExchange>(bytes)
+            .map(|artifact| artifact.created_at)
+            .map_err(|_| KeyManagerError::InvalidExchangeArtifact),
+        ExchangeRole::ResponderResponse => serde_json::from_slice::<ResponderExchange>(bytes)
+            .map(|artifact| artifact.created_at)
+            .map_err(|_| KeyManagerError::InvalidExchangeArtifact),
+    }
+}
+
+fn validate_pending_peer(secret: &SecretExchange) -> Result<Option<ValidatedPublicArtifact>> {
+    let Some(peer_bytes) = secret.peer_artifact.as_deref() else {
+        return Ok(None);
+    };
+    let role = match secret.role.as_str() {
+        "initiator_offer" => ExchangeRole::ResponderResponse,
+        "responder_response" => ExchangeRole::InitiatorOffer,
+        _ => return Err(KeyManagerError::InvalidExchangeArtifact),
+    };
+    let peer = validate_stored_public_exchange(peer_bytes.as_bytes(), role)?;
+    if secret.peer_contact_id.as_deref() != Some(peer.sender_contact_id.as_str())
+        || secret.peer_public.as_deref() != Some(peer.public_key.as_str())
+        || secret.peer_fingerprint.as_deref() != Some(peer.public_fingerprint.as_str())
+    {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    Ok(Some(peer))
+}
+
+fn validate_pending_secret(
+    secret: &SecretExchange,
+    path_offer_id: &str,
+    scope_id: &str,
+) -> Result<()> {
+    validate_offer_id(path_offer_id)?;
+    validate_offer_id(&secret.offer_id)?;
+    validate_offer_id(&secret.contact_id)?;
+    validate_contact_name(&secret.contact_name)?;
+    validate_scope_id(&secret.scope_id)?;
+    validate_exchange_times(secret.created_at, secret.expires_at, secret.created_at)?;
+    public_fingerprint(&secret.local_public)?;
+    private_key_bytes(secret.local_private.expose_secret())?;
+    if secret.schema != EXCHANGE_SCHEMA
+        || secret.offer_id != path_offer_id
+        || secret.scope_id != scope_id
+        || secret.operation != ExchangeOperation::Initial.as_str()
+        || secret.generation != INITIAL_EXCHANGE_GENERATION
+        || !matches!(secret.state.as_str(), "Prepared" | "Installed")
+    {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    let role = match secret.role.as_str() {
+        "initiator_offer" => ExchangeRole::InitiatorOffer,
+        "responder_response" => ExchangeRole::ResponderResponse,
+        _ => return Err(KeyManagerError::InvalidExchangeArtifact),
+    };
+    let local = validate_stored_public_exchange(secret.public_artifact.as_bytes(), role)?;
+    if local.offer_id != secret.offer_id
+        || local.sender_contact_id != secret.contact_id
+        || local.public_key != secret.local_public
+        || local.generation != secret.generation
+        || local.created_at != secret.created_at
+        || local.expires_at != secret.expires_at
+    {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    let peer = validate_pending_peer(secret)?;
+    match (role, secret.state.as_str(), peer.as_ref()) {
+        (ExchangeRole::InitiatorOffer, "Prepared", None) => {}
+        (ExchangeRole::InitiatorOffer, "Installed", Some(response))
+            if response.in_reply_to.as_deref() == Some(secret.offer_id.as_str()) => {}
+        (ExchangeRole::ResponderResponse, _, Some(offer))
+            if local.in_reply_to.as_deref() == Some(offer.offer_id.as_str())
+                && local.intended_peer_contact_id.as_deref()
+                    == Some(offer.sender_contact_id.as_str())
+                && local.intended_peer_fingerprint.as_ref() == Some(&offer.public_fingerprint) => {}
+        _ => return Err(KeyManagerError::InvalidExchangeArtifact),
+    }
+    if (secret.state == ExchangeState::Installed.as_str()) != secret.transcript.is_some()
+        || secret
+            .transcript
+            .as_deref()
+            .is_some_and(|value| !valid_hash(value))
+    {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    Ok(())
+}
+
+struct PendingEntry {
+    secret: SecretExchange,
+}
+
+struct PendingInventory {
+    entries: Vec<PendingEntry>,
+    total_bytes: usize,
+}
+
+fn pending_inventory(workspace: &Workspace, scope_id: &str) -> Result<PendingInventory> {
+    let names = secure_directory_files(workspace, PENDING_DIR)?;
+    if names.len() > MAX_PENDING_EXCHANGES {
+        return Err(KeyManagerError::PendingLimit);
+    }
+    let mut entries = Vec::with_capacity(names.len());
+    let mut total_bytes = 0_usize;
+    for name in names {
+        let offer_id = name
+            .strip_suffix(".json")
+            .ok_or(KeyManagerError::RecoveryRequired)?;
+        validate_offer_id(offer_id).map_err(|_| KeyManagerError::RecoveryRequired)?;
+        let path = format!("{PENDING_DIR}/{name}");
+        let bytes = workspace.read_required(&path)?;
+        if bytes.len() > MAX_PENDING_BYTES {
+            return Err(KeyManagerError::InvalidExchangeArtifact);
+        }
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .ok_or(KeyManagerError::PendingLimit)?;
+        if total_bytes > MAX_PENDING_TOTAL_BYTES {
+            return Err(KeyManagerError::PendingLimit);
+        }
+        let secret: SecretExchange =
+            serde_json::from_slice(&bytes).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+        validate_pending_secret(&secret, offer_id, scope_id)?;
+        entries.push(PendingEntry { secret });
+    }
+    let equality_key = private_equality_key();
+    let mut contact_names = HashSet::new();
+    let mut contact_ids = HashSet::new();
+    let mut exchange_ids = HashSet::new();
+    let mut private_tags = HashSet::new();
+    for entry in &entries {
+        if !contact_names.insert(entry.secret.contact_name.to_lowercase())
+            || !contact_ids.insert(entry.secret.contact_id.clone())
+            || !exchange_ids.insert(entry.secret.offer_id.clone())
+            || !private_tags.insert(private_equality_tag(
+                entry.secret.local_private.expose_secret(),
+                &equality_key,
+            )?)
+        {
+            return Err(KeyManagerError::ContactConflict);
+        }
+        if let Some(peer_offer_id) = pending_peer_offer_id(&entry.secret)?
+            && !exchange_ids.insert(peer_offer_id)
+        {
+            return Err(KeyManagerError::OfferConflict);
+        }
+        if let Some(peer_contact_id) = entry.secret.peer_contact_id.as_ref()
+            && !contact_ids.insert(peer_contact_id.clone())
+        {
+            return Err(KeyManagerError::OfferConflict);
+        }
+    }
+    Ok(PendingInventory {
+        entries,
+        total_bytes,
+    })
+}
+
+fn read_pending_secret(
+    workspace: &Workspace,
+    offer_id: &str,
+    scope_id: &str,
+) -> Result<SecretExchange> {
     let path = offer_id_path(workspace, offer_id)?;
     let bytes = workspace.read_required(&path)?;
-    serde_json::from_slice(&bytes).map_err(|_| KeyManagerError::InvalidExchangeArtifact)
+    if bytes.len() > MAX_PENDING_BYTES {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    let secret: SecretExchange =
+        serde_json::from_slice(&bytes).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+    validate_pending_secret(&secret, offer_id, scope_id)?;
+    Ok(secret)
 }
 
 fn pending_secret_bytes(secret: &SecretExchange) -> Result<Zeroizing<Vec<u8>>> {
-    validate_offer_id(&secret.offer_id)?;
-    validate_offer_id(&secret.contact_id)?;
-    public_fingerprint(&secret.local_public)?;
-    private_key_bytes(secret.local_private.expose_secret())?;
+    validate_pending_secret(secret, &secret.offer_id, &secret.scope_id)?;
     let bytes = Zeroizing::new(
         serde_json::to_vec(secret).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?,
     );
@@ -2550,9 +2785,21 @@ fn pending_secret_bytes(secret: &SecretExchange) -> Result<Zeroizing<Vec<u8>>> {
     Ok(bytes)
 }
 
-fn write_new_pending_secret(workspace: &Workspace, secret: &SecretExchange) -> Result<()> {
+fn write_new_pending_secret(
+    workspace: &Workspace,
+    secret: &SecretExchange,
+    inventory: &PendingInventory,
+) -> Result<()> {
     let path = offer_id_path(workspace, &secret.offer_id)?;
     let bytes = pending_secret_bytes(secret)?;
+    let projected_bytes = inventory
+        .total_bytes
+        .checked_add(bytes.len())
+        .ok_or(KeyManagerError::PendingLimit)?;
+    if inventory.entries.len() >= MAX_PENDING_EXCHANGES || projected_bytes > MAX_PENDING_TOTAL_BYTES
+    {
+        return Err(KeyManagerError::PendingLimit);
+    }
     workspace.write_new(&path, &bytes)
 }
 
@@ -2567,21 +2814,85 @@ fn remove_pending(workspace: &Workspace, offer_id: &str) -> Result<()> {
     workspace.remove_if_present(&path)
 }
 
-fn contact_occupied(workspace: &Workspace, contact_name: &str, ledger: &Ledger) -> bool {
-    let config_match = workspace
-        .read_optional(CONFIG_FILE)
-        .ok()
-        .flatten()
-        .is_some_and(|bytes| {
-            parse_document(&bytes).ok().is_some_and(|doc| {
-                doc.table
-                    .get("contact")
-                    .and_then(|v| v.as_table())
-                    .is_some_and(|t| t.contains_key(contact_name))
-            })
-        });
-    let ledger_match = ledger.contacts.contains_key(contact_name);
-    config_match || ledger_match
+fn contact_occupied(workspace: &Workspace, contact_name: &str, ledger: &Ledger) -> Result<bool> {
+    let normalized = contact_name.to_lowercase();
+    let config_match = match workspace.read_optional(CONFIG_FILE)? {
+        Some(bytes) => {
+            let document = parse_document(&bytes)?;
+            validate_document(&document.table)?;
+            document
+                .table
+                .get("contact")
+                .and_then(Value::as_table)
+                .is_some_and(|contacts| {
+                    contacts
+                        .keys()
+                        .any(|name| name.to_lowercase() == normalized)
+                })
+        }
+        None => false,
+    };
+    let ledger_match = ledger
+        .contacts
+        .keys()
+        .any(|name| name.to_lowercase() == normalized);
+    Ok(config_match || ledger_match)
+}
+
+fn private_equality_tag(encoded: &str, equality_key: &[u8; 32]) -> Result<[u8; 32]> {
+    let private = private_key_bytes(encoded)?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(equality_key).map_err(|_| KeyManagerError::InvalidToml)?;
+    mac.update(&private);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn reject_local_private_reuse(
+    workspace: &Workspace,
+    inventory: &PendingInventory,
+    local_private: &str,
+) -> Result<()> {
+    let equality_key = private_equality_key();
+    let candidate = private_equality_tag(local_private, &equality_key)?;
+    if let Some(config) = workspace.read_optional(CONFIG_FILE)? {
+        let contacts = collect_contacts(&config, &equality_key)?;
+        if contacts
+            .iter()
+            .any(|contact| contact.private_equality_tag == candidate)
+        {
+            return Err(KeyManagerError::ContactConflict);
+        }
+    }
+    for entry in &inventory.entries {
+        if private_equality_tag(entry.secret.local_private.expose_secret(), &equality_key)?
+            == candidate
+        {
+            return Err(KeyManagerError::ContactConflict);
+        }
+    }
+    Ok(())
+}
+
+fn reject_pending_reservation(
+    inventory: &PendingInventory,
+    contact_name: &str,
+    contact_id: &str,
+    offer_id: &str,
+) -> Result<()> {
+    let normalized = contact_name.to_lowercase();
+    for entry in &inventory.entries {
+        if entry.secret.offer_id == offer_id
+            || entry.secret.contact_id == contact_id
+            || entry.secret.peer_contact_id.as_deref() == Some(contact_id)
+            || pending_peer_offer_id(&entry.secret)?.as_deref() == Some(offer_id)
+        {
+            return Err(KeyManagerError::OfferConflict);
+        }
+        if entry.secret.contact_name.to_lowercase() == normalized {
+            return Err(KeyManagerError::ContactConflict);
+        }
+    }
+    Ok(())
 }
 
 fn append_ledger_contact(ledger: &mut Ledger, name: &str, contact: LedgerContact) -> Result<()> {
@@ -2626,6 +2937,46 @@ fn insert_exchange_tombstone(
             Ok(())
         }
     }
+}
+
+fn pending_peer_offer_id(secret: &SecretExchange) -> Result<Option<String>> {
+    if secret.role != ExchangeRole::ResponderResponse.as_str() {
+        return Ok(None);
+    }
+    Ok(validate_pending_peer(secret)?.map(|peer| peer.offer_id))
+}
+
+fn expire_pending_locked(workspace: &Workspace, scope_id: &str, now: i64) -> Result<()> {
+    let inventory = pending_inventory(workspace, scope_id)?;
+    let expired = inventory
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.secret.state == ExchangeState::Prepared.as_str() && now >= entry.secret.expires_at
+        })
+        .collect::<Vec<_>>();
+    if expired.is_empty() {
+        return Ok(());
+    }
+    let old_ledger = workspace.read_optional(LEDGER_FILE)?;
+    let mut ledger = match old_ledger.as_deref() {
+        Some(bytes) => parse_ledger(bytes, scope_id)?,
+        None => empty_ledger(scope_id),
+    };
+    for entry in &expired {
+        let secret = &entry.secret;
+        let peer_fingerprint = secret.peer_fingerprint.as_deref().unwrap_or_default();
+        let tombstone = exchange_tombstone(secret, ExchangeState::Expired, peer_fingerprint);
+        insert_exchange_tombstone(&mut ledger, &secret.offer_id, &tombstone)?;
+        if let Some(peer_offer_id) = pending_peer_offer_id(secret)? {
+            insert_exchange_tombstone(&mut ledger, &peer_offer_id, &tombstone)?;
+        }
+    }
+    replace_file(workspace, LEDGER_FILE, &ledger_bytes(&ledger)?)?;
+    for entry in expired {
+        remove_pending(workspace, &entry.secret.offer_id)?;
+    }
+    Ok(())
 }
 
 fn installed_contact_matches(
@@ -2675,11 +3026,35 @@ fn contact_toml_for_new_contact(
     validate_contact_name(contact_name)?;
     public_fingerprint(public)?;
     let _ = private_key_bytes(private)?;
-    let rendered = format!(
-        "[contact.\"{}\"]\ndm_chacha_public = \"{}\"\nmy_dm_chacha_secret = \"{}\"\n",
-        contact_name, public, private
+    let mut fields = Table::new();
+    fields.insert(
+        "dm_chacha_public".to_owned(),
+        Value::String(public.to_owned()),
     );
-    Ok(Zeroizing::new(rendered.into_bytes()))
+    fields.insert(
+        "my_dm_chacha_secret".to_owned(),
+        Value::String(private.to_owned()),
+    );
+    let mut contacts = Table::new();
+    contacts.insert(contact_name.to_owned(), Value::Table(fields));
+    let mut document = SensitiveToml {
+        table: Table::new(),
+    };
+    document
+        .table
+        .insert("contact".to_owned(), Value::Table(contacts));
+    validate_document(&document.table)?;
+    let rendered = serialize_table(&document.table)?;
+    let check = parse_document(&rendered)?;
+    let parsed_contacts = check
+        .table
+        .get("contact")
+        .and_then(Value::as_table)
+        .ok_or(KeyManagerError::InvalidToml)?;
+    if parsed_contacts.len() != 1 || !parsed_contacts.contains_key(contact_name) {
+        return Err(KeyManagerError::InvalidContact);
+    }
+    Ok(rendered)
 }
 
 fn make_initiator_secret(scope_id: &str, request: &PrepareExchange<'_>) -> Result<SecretExchange> {
@@ -2757,7 +3132,7 @@ fn make_responder_secret(
         state: ExchangeState::Prepared.as_str().to_owned(),
         scope_id: scope_id.to_owned(),
         contact_name: request.contact_name.to_owned(),
-        generation: initiator.generation,
+        generation: INITIAL_EXCHANGE_GENERATION,
         created_at: request.created_at,
         expires_at: request.expires_at,
         transcript: None,
@@ -2799,6 +3174,98 @@ fn make_responder_artifact(
         label: label.map(|s| s.to_owned()),
         previous_fingerprint: previous_fingerprint.map(|s| s.to_owned()),
     })
+}
+
+fn prepared_result_from_secret(
+    secret: &SecretExchange,
+    role: ExchangeRole,
+    attestation: &CompatibilityAttestation,
+) -> Result<PreparedResult> {
+    let parsed = validate_public_exchange_at(
+        secret.public_artifact.as_bytes(),
+        role,
+        attestation,
+        secret.created_at,
+    )?;
+    Ok(PreparedResult {
+        offer_id: secret.offer_id.clone(),
+        contact_id: secret.contact_id.clone(),
+        role: role.as_str().to_owned(),
+        public_artifact: secret.public_artifact.clone(),
+        public_fingerprint: parsed.public_fingerprint.as_str().to_owned(),
+        expires_at: secret.expires_at,
+    })
+}
+
+fn replay_prepared_exchange(
+    inventory: &PendingInventory,
+    request: &PrepareExchange<'_>,
+) -> Result<Option<PreparedResult>> {
+    let mut replay = None;
+    for entry in &inventory.entries {
+        if entry.secret.contact_name.to_lowercase() != request.contact_name.to_lowercase() {
+            continue;
+        }
+        if entry.secret.contact_name != request.contact_name
+            || entry.secret.role != ExchangeRole::InitiatorOffer.as_str()
+        {
+            return Err(KeyManagerError::ContactConflict);
+        }
+        let artifact: PreparedExchange = serde_json::from_str(&entry.secret.public_artifact)
+            .map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+        if artifact.intended_peer_contact_id.as_deref() != request.intended_peer_contact_id
+            || artifact.intended_peer_fingerprint.as_deref() != request.intended_peer_fingerprint
+            || artifact.label.as_deref() != request.label
+            || artifact.previous_fingerprint.as_deref() != request.previous_fingerprint
+        {
+            return Err(KeyManagerError::ContactConflict);
+        }
+        if replay.is_some() {
+            return Err(KeyManagerError::RecoveryRequired);
+        }
+        replay = Some(prepared_result_from_secret(
+            &entry.secret,
+            ExchangeRole::InitiatorOffer,
+            request.attestation,
+        )?);
+    }
+    Ok(replay)
+}
+
+fn replay_responded_exchange(
+    inventory: &PendingInventory,
+    request: &RespondExchange<'_>,
+    initiator: &ValidatedPublicArtifact,
+) -> Result<Option<PreparedResult>> {
+    let mut replay = None;
+    for entry in &inventory.entries {
+        let peer_offer_id = pending_peer_offer_id(&entry.secret)?;
+        if peer_offer_id.as_deref() == Some(initiator.offer_id.as_str()) {
+            if entry.secret.role != ExchangeRole::ResponderResponse.as_str()
+                || entry.secret.contact_name != request.contact_name
+                || entry.secret.peer_artifact.as_deref()
+                    != std::str::from_utf8(&initiator.canonical).ok()
+            {
+                return Err(KeyManagerError::OfferConflict);
+            }
+            if replay.is_some() {
+                return Err(KeyManagerError::RecoveryRequired);
+            }
+            replay = Some(prepared_result_from_secret(
+                &entry.secret,
+                ExchangeRole::ResponderResponse,
+                request.attestation,
+            )?);
+            continue;
+        }
+        if entry.secret.offer_id == initiator.offer_id {
+            return Err(KeyManagerError::OfferConflict);
+        }
+        if entry.secret.contact_name.to_lowercase() == request.contact_name.to_lowercase() {
+            return Err(KeyManagerError::ContactConflict);
+        }
+    }
+    Ok(replay)
 }
 
 fn build_install_ledger_contact(
@@ -2953,6 +3420,10 @@ pub fn prepare_exchange(
     validate_offer_id(request.offer_id)?;
     validate_offer_id(request.contact_id)?;
     validate_exchange_times(request.created_at, request.expires_at, request.now)?;
+    require_live_exchange(request.expires_at, request.now)?;
+    if request.generation != INITIAL_EXCHANGE_GENERATION {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
     if let Some(peer_contact_id) = request.intended_peer_contact_id {
         validate_offer_id(peer_contact_id)?;
     }
@@ -2964,47 +3435,29 @@ pub fn prepare_exchange(
     let workspace = Workspace::open(paths.clone())?;
     let _lock = workspace.lock()?;
     recover_locked(&workspace, scope_id)?;
+    expire_pending_locked(&workspace, scope_id, request.now)?;
     let old_ledger = workspace.read_optional(LEDGER_FILE)?;
     let ledger = match old_ledger.as_ref().map(|b| b.as_slice()) {
         Some(bytes) => parse_ledger(bytes, scope_id)?,
         None => empty_ledger(scope_id),
     };
+    let inventory = pending_inventory(&workspace, scope_id)?;
+    if let Some(existing) = replay_prepared_exchange(&inventory, request)? {
+        return Ok(existing);
+    }
     if ledger.consumed_exchange_ids.contains_key(request.offer_id) {
         return Err(KeyManagerError::OfferConflict);
     }
-    if contact_occupied(&workspace, request.contact_name, &ledger) {
+    if contact_occupied(&workspace, request.contact_name, &ledger)? {
         return Err(KeyManagerError::ContactConflict);
     }
-    if let Some(pending) = workspace.read_optional(&offer_id_path(&workspace, request.offer_id)?)? {
-        let existing: SecretExchange = serde_json::from_slice(&pending)
-            .map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
-        if existing.scope_id != scope_id
-            || existing.role != ExchangeRole::InitiatorOffer.as_str()
-            || existing.contact_name != request.contact_name
-            || existing.contact_id != request.contact_id
-            || existing.local_public != request.local_public
-            || existing.local_private.expose_secret() != request.local_private
-            || existing.created_at != request.created_at
-            || existing.expires_at != request.expires_at
-            || existing.generation != request.generation
-        {
-            return Err(KeyManagerError::OfferConflict);
-        }
-        let parsed = validate_public_exchange_at(
-            existing.public_artifact.as_bytes(),
-            ExchangeRole::InitiatorOffer,
-            request.attestation,
-            request.now,
-        )?;
-        return Ok(PreparedResult {
-            offer_id: existing.offer_id,
-            contact_id: existing.contact_id,
-            role: ExchangeRole::InitiatorOffer.as_str().to_owned(),
-            public_artifact: existing.public_artifact,
-            public_fingerprint: parsed.public_fingerprint.as_str().to_owned(),
-            expires_at: existing.expires_at,
-        });
-    }
+    reject_pending_reservation(
+        &inventory,
+        request.contact_name,
+        request.contact_id,
+        request.offer_id,
+    )?;
+    reject_local_private_reuse(&workspace, &inventory, request.local_private)?;
     let secret = make_initiator_secret(scope_id, request)?;
     let artifact = make_initiator_artifact(
         &secret,
@@ -3018,7 +3471,7 @@ pub fn prepare_exchange(
         .map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
     let mut secret = secret;
     secret.public_artifact.clone_from(&public_artifact);
-    write_new_pending_secret(&workspace, &secret)?;
+    write_new_pending_secret(&workspace, &secret, &inventory)?;
     Ok(PreparedResult {
         offer_id: request.offer_id.to_owned(),
         contact_id: request.contact_id.to_owned(),
@@ -3056,6 +3509,7 @@ pub fn respond_exchange(
     validate_offer_id(request.contact_id)?;
     validate_offer_id(request.initiator_offer_id)?;
     validate_exchange_times(request.created_at, request.expires_at, request.now)?;
+    require_live_exchange(request.expires_at, request.now)?;
     let local_fingerprint = public_fingerprint(request.local_public)?;
     let _ = private_key_bytes(request.local_private)?;
     let initiator = validate_public_exchange_at(
@@ -3064,16 +3518,10 @@ pub fn respond_exchange(
         request.attestation,
         request.now,
     )?;
+    require_live_exchange(initiator.expires_at, request.now)?;
     if initiator.offer_id != request.initiator_offer_id
         || initiator.expires_at < request.expires_at
-        || initiator
-            .intended_peer_contact_id
-            .as_deref()
-            .is_some_and(|id| id != request.contact_id)
-        || initiator
-            .intended_peer_fingerprint
-            .as_ref()
-            .is_some_and(|fingerprint| fingerprint.as_str() != local_fingerprint)
+        || initiator.generation != INITIAL_EXCHANGE_GENERATION
     {
         return Err(KeyManagerError::InvalidExchangeArtifact);
     }
@@ -3083,11 +3531,27 @@ pub fn respond_exchange(
     let workspace = Workspace::open(paths.clone())?;
     let _lock = workspace.lock()?;
     recover_locked(&workspace, scope_id)?;
+    expire_pending_locked(&workspace, scope_id, request.now)?;
     let old_ledger = workspace.read_optional(LEDGER_FILE)?;
     let ledger = match old_ledger.as_ref().map(|b| b.as_slice()) {
         Some(bytes) => parse_ledger(bytes, scope_id)?,
         None => empty_ledger(scope_id),
     };
+    let inventory = pending_inventory(&workspace, scope_id)?;
+    if let Some(existing) = replay_responded_exchange(&inventory, request, &initiator)? {
+        return Ok(existing);
+    }
+    if initiator
+        .intended_peer_contact_id
+        .as_deref()
+        .is_some_and(|id| id != request.contact_id)
+        || initiator
+            .intended_peer_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| fingerprint.as_str() != local_fingerprint)
+    {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
     if request.offer_id == initiator.offer_id
         || ledger.consumed_exchange_ids.contains_key(request.offer_id)
         || ledger
@@ -3096,39 +3560,16 @@ pub fn respond_exchange(
     {
         return Err(KeyManagerError::OfferConflict);
     }
-    if contact_occupied(&workspace, request.contact_name, &ledger) {
+    if contact_occupied(&workspace, request.contact_name, &ledger)? {
         return Err(KeyManagerError::ContactConflict);
     }
-    if let Some(pending) = workspace.read_optional(&offer_id_path(&workspace, request.offer_id)?)? {
-        let existing: SecretExchange = serde_json::from_slice(&pending)
-            .map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
-        if existing.scope_id != scope_id
-            || existing.role != ExchangeRole::ResponderResponse.as_str()
-            || existing.contact_name != request.contact_name
-            || existing.contact_id != request.contact_id
-            || existing.local_public != request.local_public
-            || existing.local_private.expose_secret() != request.local_private
-            || existing.peer_artifact.as_deref() != std::str::from_utf8(&initiator.canonical).ok()
-            || existing.created_at != request.created_at
-            || existing.expires_at != request.expires_at
-        {
-            return Err(KeyManagerError::OfferConflict);
-        }
-        let parsed = validate_public_exchange_at(
-            existing.public_artifact.as_bytes(),
-            ExchangeRole::ResponderResponse,
-            request.attestation,
-            request.now,
-        )?;
-        return Ok(PreparedResult {
-            offer_id: existing.offer_id,
-            contact_id: existing.contact_id,
-            role: ExchangeRole::ResponderResponse.as_str().to_owned(),
-            public_artifact: existing.public_artifact,
-            public_fingerprint: parsed.public_fingerprint.as_str().to_owned(),
-            expires_at: existing.expires_at,
-        });
-    }
+    reject_pending_reservation(
+        &inventory,
+        request.contact_name,
+        request.contact_id,
+        request.offer_id,
+    )?;
+    reject_local_private_reuse(&workspace, &inventory, request.local_private)?;
     let secret = make_responder_secret(scope_id, &initiator, request)?;
     let artifact = make_responder_artifact(
         &secret,
@@ -3143,7 +3584,7 @@ pub fn respond_exchange(
         .map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
     let mut secret = secret;
     secret.public_artifact.clone_from(&public_artifact);
-    write_new_pending_secret(&workspace, &secret)?;
+    write_new_pending_secret(&workspace, &secret, &inventory)?;
     Ok(PreparedResult {
         offer_id: request.offer_id.to_owned(),
         contact_id: request.contact_id.to_owned(),
@@ -3196,29 +3637,49 @@ pub fn complete_exchange(
     let workspace = Workspace::open(paths.clone())?;
     let _lock = workspace.lock()?;
     recover_locked(&workspace, scope_id)?;
-    let secret = read_pending_secret(&workspace, request.exchange_id)?;
+    expire_pending_locked(&workspace, scope_id, request.now)?;
+    let secret = read_pending_secret(&workspace, request.exchange_id, scope_id)?;
     if secret.scope_id != scope_id {
         return Err(KeyManagerError::ScopeConflict);
     }
     if secret.contact_name != request.contact_name {
         return Err(KeyManagerError::ContactConflict);
     }
-    validate_exchange_times(secret.created_at, secret.expires_at, request.now)?;
+    let was_installed = secret.state == ExchangeState::Installed.as_str();
+    let validation_now = if was_installed {
+        secret.created_at
+    } else {
+        request.now
+    };
+    validate_exchange_times(secret.created_at, secret.expires_at, validation_now)?;
+    if !was_installed {
+        require_live_exchange(secret.expires_at, request.now)?;
+    }
     let expected_role = match secret.role.as_str() {
         "initiator_offer" => ExchangeRole::ResponderResponse,
         "responder_response" => ExchangeRole::InitiatorOffer,
         _ => return Err(KeyManagerError::InvalidExchangeArtifact),
     };
+    let peer_validation_now = if was_installed {
+        public_artifact_created_at(peer_artifact_bytes, expected_role)?
+    } else {
+        request.now
+    };
     let peer = validate_public_exchange_at(
         peer_artifact_bytes,
         expected_role,
         request.attestation,
-        request.now,
+        peer_validation_now,
     )?;
+    if !was_installed {
+        require_live_exchange(peer.expires_at, request.now)?;
+    }
+    if peer.generation != INITIAL_EXCHANGE_GENERATION {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
     if peer.public_fingerprint != *request.expected_peer_fingerprint {
         return Err(KeyManagerError::FingerprintMismatch);
     }
-    let was_installed = secret.state == ExchangeState::Installed.as_str();
     if was_installed {
         if secret.peer_artifact.as_deref() != std::str::from_utf8(&peer.canonical).ok() {
             return Err(KeyManagerError::OfferConflict);
@@ -3239,7 +3700,7 @@ pub fn complete_exchange(
                 secret.public_artifact.as_bytes(),
                 ExchangeRole::InitiatorOffer,
                 request.attestation,
-                request.now,
+                validation_now,
             )?;
             if local
                 .intended_peer_contact_id
@@ -3266,7 +3727,7 @@ pub fn complete_exchange(
                         stored_peer.as_bytes(),
                         ExchangeRole::InitiatorOffer,
                         request.attestation,
-                        request.now,
+                        validation_now,
                     )?
                     .offer_id
             {
@@ -3276,7 +3737,7 @@ pub fn complete_exchange(
                 secret.public_artifact.as_bytes(),
                 ExchangeRole::ResponderResponse,
                 request.attestation,
-                request.now,
+                validation_now,
             )?;
             if local.in_reply_to.as_deref() != Some(peer.offer_id.as_str())
                 || local.intended_peer_contact_id.as_deref()
@@ -3353,11 +3814,19 @@ pub fn complete_exchange(
             if target_contacts.contains_key(&secret.contact_name) {
                 return Err(KeyManagerError::ContactConflict);
             }
-            if let Some(contact) = source.table.get("contact").and_then(|v| v.as_table()) {
-                for (name, value) in contact {
-                    target_contacts.insert(name.clone(), value.clone());
-                }
+            let source_contacts = source
+                .table
+                .get("contact")
+                .and_then(Value::as_table)
+                .ok_or(KeyManagerError::InvalidToml)?;
+            if source_contacts.len() != 1 {
+                return Err(KeyManagerError::InvalidToml);
             }
+            let value = source_contacts
+                .get(&secret.contact_name)
+                .ok_or(KeyManagerError::InvalidContact)?
+                .clone();
+            target_contacts.insert(secret.contact_name.clone(), value);
             validate_document(&target.table)?;
             serialize_table(&target.table)?
         }
@@ -3418,11 +3887,21 @@ pub fn cancel_exchange(
     scope_id: &str,
     exchange_id: &str,
 ) -> Result<ExchangeStatus> {
+    cancel_exchange_at(paths, scope_id, exchange_id, unix_now()?)
+}
+
+pub fn cancel_exchange_at(
+    paths: &TenantPaths,
+    scope_id: &str,
+    exchange_id: &str,
+    now: i64,
+) -> Result<ExchangeStatus> {
     validate_scope_id(scope_id)?;
     validate_offer_id(exchange_id)?;
     let workspace = Workspace::open(paths.clone())?;
     let _lock = workspace.lock()?;
     recover_locked(&workspace, scope_id)?;
+    expire_pending_locked(&workspace, scope_id, now)?;
     let old_ledger = workspace.read_optional(LEDGER_FILE)?;
     let mut ledger = match old_ledger.as_deref() {
         Some(bytes) => parse_ledger(bytes, scope_id)?,
@@ -3446,7 +3925,7 @@ pub fn cancel_exchange(
             activation_deadline: None,
         });
     }
-    let secret = read_pending_secret(&workspace, exchange_id)?;
+    let secret = read_pending_secret(&workspace, exchange_id, scope_id)?;
     if secret.state != ExchangeState::Prepared.as_str() {
         return Err(KeyManagerError::InvalidExchangeState);
     }
@@ -3488,31 +3967,22 @@ pub fn inspect_exchanges(paths: &TenantPaths, scope_id: &str) -> Result<Vec<Exch
             return Err(KeyManagerError::RecoveryRequired);
         }
     }
-    let pending_dir = workspace.open_relative_dir(PENDING_DIR)?;
-    let mut entries = Vec::new();
-    for entry in pending_dir.read_dir(".").map_err(KeyManagerError::Io)? {
-        let entry = entry.map_err(KeyManagerError::Io)?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| KeyManagerError::UnsafePath)?;
-        if !name.ends_with(".json") {
-            continue;
-        }
-        let path = format!("{}/{}", PENDING_DIR, name);
-        let bytes = match workspace.read_optional(&path)? {
-            Some(b) => b,
-            None => continue,
-        };
-        let secret: SecretExchange = match serde_json::from_slice(&bytes) {
-            Ok(s) => s,
-            Err(_) => continue,
+    let now = unix_now()?;
+    let inventory = pending_inventory(&workspace, scope_id)?;
+    let mut entries = Vec::with_capacity(inventory.entries.len());
+    for entry in inventory.entries {
+        let secret = entry.secret;
+        let state = if secret.state == ExchangeState::Prepared.as_str() && now >= secret.expires_at
+        {
+            ExchangeState::Expired.as_str().to_owned()
+        } else {
+            secret.state
         };
         entries.push(ExchangeStatus {
             contact_name: secret.contact_name,
             contact_id: secret.contact_id,
             offer_id: secret.offer_id,
-            state: secret.state,
+            state,
             peer_fingerprint: secret.peer_fingerprint.unwrap_or_default(),
             created_at: secret.created_at,
             expires_at: secret.expires_at,
@@ -3531,7 +4001,8 @@ pub fn recover(paths: &TenantPaths, scope_id: &str) -> Result<()> {
     validate_scope_id(scope_id)?;
     let workspace = Workspace::open(paths.clone())?;
     let _lock = workspace.lock()?;
-    recover_locked(&workspace, scope_id)
+    recover_locked(&workspace, scope_id)?;
+    expire_pending_locked(&workspace, scope_id, unix_now()?)
 }
 
 fn recover_locked(workspace: &Workspace, scope_id: &str) -> Result<()> {
@@ -5391,6 +5862,162 @@ my_dm_chacha_secret = "{bob_private}"
     }
 
     #[test]
+    fn stage_a_prepare_cli_style_retry_reuses_pending_exchange() {
+        let (_temp, paths) = fixture();
+        let attestation = exchange_attestation();
+        let first_public = valid_public(7);
+        let first_private = valid_private(8);
+        let first_request = exchange_request(
+            &attestation,
+            "bob",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &first_public,
+            &first_private,
+        );
+        let first = prepare_exchange(&paths, SCOPE, &first_request).expect("first prepare");
+
+        let retry_public = valid_public(9);
+        let retry_private = valid_private(10);
+        let mut retry_request = exchange_request(
+            &attestation,
+            "bob",
+            "cccccccccccccccccccccccccccccccc",
+            "dddddddddddddddddddddddddddddddd",
+            &retry_public,
+            &retry_private,
+        );
+        retry_request.created_at += 1;
+        retry_request.now += 1;
+        let retry = prepare_exchange(&paths, SCOPE, &retry_request).expect("semantic replay");
+
+        assert_eq!(retry, first);
+        let workspace = Workspace::open(paths).expect("workspace");
+        assert_eq!(
+            pending_inventory(&workspace, SCOPE)
+                .expect("inventory")
+                .entries
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn contact_toml_serialization_quotes_hostile_names() {
+        let public = valid_public(11);
+        let private = valid_private(12);
+        for name in ["victim\"] #", "a.b", "[table]", "single'quote"] {
+            let rendered =
+                contact_toml_for_new_contact(name, &public, &private).expect("serialize contact");
+            let document = parse_document(&rendered).expect("parse rendered contact");
+            let contacts = document.table["contact"].as_table().expect("contact table");
+            assert_eq!(contacts.len(), 1);
+            assert!(contacts.contains_key(name));
+        }
+    }
+
+    #[test]
+    fn malformed_active_config_blocks_prepare_without_pending_mutation() {
+        let (_temp, paths) = fixture();
+        write_config(&paths, "contact = [invalid");
+        let attestation = exchange_attestation();
+        let public = valid_public(13);
+        let private = valid_private(14);
+        let request = exchange_request(
+            &attestation,
+            "bob",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &public,
+            &private,
+        );
+
+        assert!(matches!(
+            prepare_exchange(&paths, SCOPE, &request),
+            Err(KeyManagerError::InvalidToml)
+        ));
+        let pending = paths.darkirc_dir().join(PENDING_DIR);
+        assert_eq!(fs::read_dir(pending).expect("pending directory").count(), 0);
+    }
+
+    #[test]
+    fn local_private_key_reuse_is_rejected_across_pending_exchanges() {
+        let (_temp, paths) = fixture();
+        let attestation = exchange_attestation();
+        let first_public = valid_public(15);
+        let private = valid_private(16);
+        let first = exchange_request(
+            &attestation,
+            "alice",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &first_public,
+            &private,
+        );
+        prepare_exchange(&paths, SCOPE, &first).expect("first prepare");
+
+        let second_public = valid_public(17);
+        let second = exchange_request(
+            &attestation,
+            "bob",
+            "cccccccccccccccccccccccccccccccc",
+            "dddddddddddddddddddddddddddddddd",
+            &second_public,
+            &private,
+        );
+        assert!(matches!(
+            prepare_exchange(&paths, SCOPE, &second),
+            Err(KeyManagerError::ContactConflict)
+        ));
+    }
+
+    #[test]
+    fn expired_pending_exchange_is_tombstoned_before_new_prepare() {
+        let (_temp, paths) = fixture();
+        let attestation = exchange_attestation();
+        let first_public = valid_public(18);
+        let first_private = valid_private(19);
+        let mut first = exchange_request(
+            &attestation,
+            "alice",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &first_public,
+            &first_private,
+        );
+        first.expires_at = EXCHANGE_NOW + 1;
+        prepare_exchange(&paths, SCOPE, &first).expect("first prepare");
+
+        let second_public = valid_public(20);
+        let second_private = valid_private(21);
+        let mut second = exchange_request(
+            &attestation,
+            "bob",
+            "cccccccccccccccccccccccccccccccc",
+            "dddddddddddddddddddddddddddddddd",
+            &second_public,
+            &second_private,
+        );
+        second.created_at = EXCHANGE_NOW + 1;
+        second.expires_at = second.created_at + DEFAULT_OFFER_TTL_SECONDS;
+        second.now = second.created_at;
+        prepare_exchange(&paths, SCOPE, &second).expect("prepare after cleanup");
+
+        assert!(
+            !paths
+                .darkirc_dir()
+                .join(PENDING_DIR)
+                .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json")
+                .exists()
+        );
+        let ledger = read_ledger(&paths, SCOPE).expect("ledger");
+        assert_eq!(
+            ledger.consumed_exchange_ids["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"].state,
+            "Expired"
+        );
+    }
+
+    #[test]
     fn stage_a_artifact_rejects_unknown_fields_expiry_and_attestation_mismatch() {
         let (_temp, paths) = fixture();
         let measured_attestation = exchange_attestation();
@@ -5482,9 +6109,9 @@ my_dm_chacha_secret = "{bob_private}"
             initiator_offer_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             expected_initiator_fingerprint: &initiator_fingerprint,
             label: None,
-            created_at: EXCHANGE_NOW,
+            created_at: EXCHANGE_NOW + 1,
             expires_at: EXCHANGE_NOW + DEFAULT_OFFER_TTL_SECONDS,
-            now: EXCHANGE_NOW,
+            now: EXCHANGE_NOW + 1,
             attestation: &attestation,
         };
         let response = respond_exchange(
@@ -5494,13 +6121,29 @@ my_dm_chacha_secret = "{bob_private}"
             &respond,
         )
         .expect("respond");
+        let retry_public = valid_public(25);
+        let retry_private = valid_private(26);
+        let retry_request = RespondExchange {
+            contact_name: "alice",
+            offer_id: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            contact_id: "ffffffffffffffffffffffffffffffff",
+            local_public: &retry_public,
+            local_private: &retry_private,
+            initiator_offer_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            expected_initiator_fingerprint: &initiator_fingerprint,
+            label: None,
+            created_at: EXCHANGE_NOW + 2,
+            expires_at: EXCHANGE_NOW + DEFAULT_OFFER_TTL_SECONDS,
+            now: EXCHANGE_NOW + 2,
+            attestation: &attestation,
+        };
         let response_replay = respond_exchange(
             &responder,
             SCOPE,
             offer.public_artifact.as_bytes(),
-            &respond,
+            &retry_request,
         )
-        .expect("idempotent respond");
+        .expect("semantic respond replay");
         assert_eq!(response, response_replay);
         assert!(!response.public_artifact.contains(&responder_private));
         PairFixture {
@@ -5519,6 +6162,104 @@ my_dm_chacha_secret = "{bob_private}"
     }
 
     #[test]
+    fn responder_rejects_remote_generation_as_local_authority() {
+        let (_initiator_temp, initiator) = fixture();
+        let (_responder_temp, responder) = fixture();
+        let attestation = exchange_attestation();
+        let initiator_public = valid_public(27);
+        let initiator_private = valid_private(28);
+        let prepare = exchange_request(
+            &attestation,
+            "bob",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &initiator_public,
+            &initiator_private,
+        );
+        let offer = prepare_exchange(&initiator, SCOPE, &prepare).expect("prepare");
+        let mut artifact: PreparedExchange =
+            serde_json::from_str(&offer.public_artifact).expect("offer artifact");
+        artifact.generation = u64::MAX;
+        let hostile_offer = canonical_artifact_bytes(&artifact).expect("hostile artifact");
+        let responder_public = valid_public(29);
+        let responder_private = valid_private(30);
+        let initiator_fingerprint =
+            PublicFingerprint::from_encoded_public_key(&initiator_public).expect("fingerprint");
+        let request = RespondExchange {
+            contact_name: "alice",
+            offer_id: "cccccccccccccccccccccccccccccccc",
+            contact_id: "dddddddddddddddddddddddddddddddd",
+            local_public: &responder_public,
+            local_private: &responder_private,
+            initiator_offer_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            expected_initiator_fingerprint: &initiator_fingerprint,
+            label: None,
+            created_at: EXCHANGE_NOW + 1,
+            expires_at: EXCHANGE_NOW + DEFAULT_OFFER_TTL_SECONDS,
+            now: EXCHANGE_NOW + 1,
+            attestation: &attestation,
+        };
+
+        assert!(matches!(
+            respond_exchange(&responder, SCOPE, &hostile_offer, &request),
+            Err(KeyManagerError::InvalidExchangeArtifact)
+        ));
+        assert_eq!(
+            pending_inventory(&Workspace::open(responder).expect("workspace"), SCOPE)
+                .expect("inventory")
+                .entries
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn responder_rejects_offer_at_exact_expiry() {
+        let (_initiator_temp, initiator) = fixture();
+        let (_responder_temp, responder) = fixture();
+        let attestation = exchange_attestation();
+        let initiator_public = valid_public(31);
+        let initiator_private = valid_private(32);
+        let prepare = exchange_request(
+            &attestation,
+            "bob",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &initiator_public,
+            &initiator_private,
+        );
+        let offer = prepare_exchange(&initiator, SCOPE, &prepare).expect("prepare");
+        let responder_public = valid_public(33);
+        let responder_private = valid_private(34);
+        let initiator_fingerprint =
+            PublicFingerprint::from_encoded_public_key(&initiator_public).expect("fingerprint");
+        let request = RespondExchange {
+            contact_name: "alice",
+            offer_id: "cccccccccccccccccccccccccccccccc",
+            contact_id: "dddddddddddddddddddddddddddddddd",
+            local_public: &responder_public,
+            local_private: &responder_private,
+            initiator_offer_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            expected_initiator_fingerprint: &initiator_fingerprint,
+            label: None,
+            created_at: EXCHANGE_NOW + DEFAULT_OFFER_TTL_SECONDS - 1,
+            expires_at: EXCHANGE_NOW + DEFAULT_OFFER_TTL_SECONDS,
+            now: EXCHANGE_NOW + DEFAULT_OFFER_TTL_SECONDS,
+            attestation: &attestation,
+        };
+
+        assert!(matches!(
+            respond_exchange(
+                &responder,
+                SCOPE,
+                offer.public_artifact.as_bytes(),
+                &request,
+            ),
+            Err(KeyManagerError::InvalidExchangeArtifact)
+        ));
+    }
+
+    #[test]
     fn stage_a_wrong_response_binding_mutates_nothing() {
         let pair = prepared_pair();
         let mut response: ResponderExchange =
@@ -5532,7 +6273,7 @@ my_dm_chacha_secret = "{bob_private}"
             )
             .expect("fingerprint"),
             defer_apply: true,
-            now: EXCHANGE_NOW,
+            now: EXCHANGE_NOW + 1,
             attestation: &pair.attestation,
         };
         assert!(
@@ -5572,7 +6313,7 @@ my_dm_chacha_secret = "{bob_private}"
             contact_name: "bob",
             expected_peer_fingerprint: &responder_fingerprint,
             defer_apply: true,
-            now: EXCHANGE_NOW,
+            now: EXCHANGE_NOW + 1,
             attestation: &pair.attestation,
         };
         let first = complete_exchange(
@@ -5583,9 +6324,12 @@ my_dm_chacha_secret = "{bob_private}"
         )
         .expect("complete initiator");
         let initiator_workspace = Workspace::open(pair.initiator.clone()).expect("workspace");
-        let mut stale_pending =
-            read_pending_secret(&initiator_workspace, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-                .expect("pending exchange");
+        let mut stale_pending = read_pending_secret(
+            &initiator_workspace,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            SCOPE,
+        )
+        .expect("pending exchange");
         stale_pending.state = ExchangeState::Prepared.as_str().to_owned();
         stale_pending.peer_public = None;
         stale_pending.peer_fingerprint = None;
@@ -5611,7 +6355,7 @@ my_dm_chacha_secret = "{bob_private}"
             contact_name: "alice",
             expected_peer_fingerprint: &initiator_fingerprint,
             defer_apply: true,
-            now: EXCHANGE_NOW,
+            now: EXCHANGE_NOW + 1,
             attestation: &pair.attestation,
         };
         complete_exchange(
@@ -5683,8 +6427,10 @@ my_dm_chacha_secret = "{bob_private}"
             &private,
         );
         prepare_exchange(&paths, SCOPE, &request).expect("prepare");
-        let first = cancel_exchange(&paths, SCOPE, request.offer_id).expect("cancel");
-        let retry = cancel_exchange(&paths, SCOPE, request.offer_id).expect("cancel retry");
+        let first =
+            cancel_exchange_at(&paths, SCOPE, request.offer_id, EXCHANGE_NOW).expect("cancel");
+        let retry = cancel_exchange_at(&paths, SCOPE, request.offer_id, EXCHANGE_NOW)
+            .expect("cancel retry");
         assert_eq!(first, retry);
         assert!(matches!(
             prepare_exchange(&paths, SCOPE, &request),
@@ -5698,10 +6444,54 @@ my_dm_chacha_secret = "{bob_private}"
     }
 
     #[test]
+    fn pending_exchange_count_and_bytes_are_bounded() {
+        let (_temp, paths) = fixture();
+        let attestation = exchange_attestation();
+        let public = valid_public(35);
+        let private = valid_private(36);
+        let request = exchange_request(
+            &attestation,
+            "bob",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &public,
+            &private,
+        );
+        prepare_exchange(&paths, SCOPE, &request).expect("prepare");
+        let workspace = Workspace::open(paths).expect("workspace");
+        let secret = read_pending_secret(&workspace, request.offer_id, SCOPE).expect("pending");
+        let count_limited = PendingInventory {
+            entries: (0..MAX_PENDING_EXCHANGES)
+                .map(|_| PendingEntry {
+                    secret: secret.clone(),
+                })
+                .collect(),
+            total_bytes: 0,
+        };
+        assert!(matches!(
+            write_new_pending_secret(&workspace, &secret, &count_limited),
+            Err(KeyManagerError::PendingLimit)
+        ));
+        let bytes_limited = PendingInventory {
+            entries: Vec::new(),
+            total_bytes: MAX_PENDING_TOTAL_BYTES,
+        };
+        assert!(matches!(
+            write_new_pending_secret(&workspace, &secret, &bytes_limited),
+            Err(KeyManagerError::PendingLimit)
+        ));
+    }
+
+    #[test]
     fn stage_a_responder_cancel_tombstones_peer_offer() {
         let pair = prepared_pair();
-        cancel_exchange(&pair.responder, SCOPE, "cccccccccccccccccccccccccccccccc")
-            .expect("cancel response");
+        cancel_exchange_at(
+            &pair.responder,
+            SCOPE,
+            "cccccccccccccccccccccccccccccccc",
+            EXCHANGE_NOW + 1,
+        )
+        .expect("cancel response");
         let ledger = read_ledger(&pair.responder, SCOPE).expect("ledger");
         assert_eq!(
             ledger.consumed_exchange_ids["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"].state,
