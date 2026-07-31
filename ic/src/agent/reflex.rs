@@ -128,6 +128,12 @@ pub struct ReflexRouter {
     /// Fuzzy hit counter: normalized pattern → hit count.
     /// Promotes to exact cache when threshold is reached.
     fuzzy_hits: Arc<RwLock<HashMap<String, u32>>>,
+    /// Promoted input variants → canonical stored pattern.
+    ///
+    /// When a fuzzy variant is promoted into the exact cache, this map
+    /// remembers which stored pattern it came from so match bookkeeping
+    /// (e.g. `bump_reflex_pattern_match`) can target the canonical row.
+    promoted_variants: Arc<RwLock<HashMap<String, String>>>,
     /// Similarity threshold for fuzzy matching.
     fuzzy_threshold: f64,
     /// How many fuzzy matches before a pattern is promoted to exact cache.
@@ -149,6 +155,7 @@ impl ReflexRouter {
         Self {
             patterns: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_hits: Arc::new(RwLock::new(HashMap::new())),
+            promoted_variants: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_threshold: fuzzy.threshold,
             promotion_threshold: fuzzy.promotion_threshold,
             max_candidates: fuzzy.max_candidates,
@@ -163,6 +170,7 @@ impl ReflexRouter {
         Self {
             patterns: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_hits: Arc::new(RwLock::new(HashMap::new())),
+            promoted_variants: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_threshold: threshold.clamp(0.0, 1.0),
             promotion_threshold: PROMOTION_THRESHOLD,
             max_candidates: MAX_FUZZY_CANDIDATES,
@@ -197,12 +205,28 @@ impl ReflexRouter {
     /// First tries exact match (O(1)), then falls back to fuzzy
     /// matching against all known patterns.
     pub async fn try_route(&self, input: &str) -> Option<String> {
+        self.try_route_match(input).await.map(|m| m.tool_name)
+    }
+
+    /// Like [`try_route`](Self::try_route), but also reports which stored
+    /// pattern matched (`matched_pattern`), so callers can attribute the hit
+    /// to the canonical database row even for fuzzy/semantic/promoted hits.
+    pub async fn try_route_match(&self, input: &str) -> Option<FuzzyMatch> {
         let normalized = normalize_pattern(input);
         let patterns = self.patterns.read().await;
 
         // 1. Exact match — fast path
         if let Some(tool) = patterns.get(&normalized) {
-            return Some(tool.clone());
+            // A promoted fuzzy variant resolves to its canonical pattern.
+            let canonical = {
+                let promoted = self.promoted_variants.read().await;
+                promoted.get(&normalized).cloned().unwrap_or(normalized)
+            };
+            return Some(FuzzyMatch {
+                tool_name: tool.clone(),
+                matched_pattern: canonical,
+                score: 1.0,
+            });
         }
 
         // 2. Fuzzy fallback — only if we have patterns to check
@@ -213,22 +237,22 @@ impl ReflexRouter {
         // Drop the read lock so we can use fuzzy_hits
         drop(patterns);
 
-        if let Some(tool) = self.fuzzy_route(&normalized).await {
-            return Some(tool);
+        if let Some(m) = self.fuzzy_route(&normalized).await {
+            return Some(m);
         }
 
         // 3. Semantic fallback — only if embedding provider is set
         if self.embedding_provider.is_some()
-            && let Some(tool) = self.semantic_route(&normalized).await
+            && let Some(m) = self.semantic_route(&normalized).await
         {
-            return Some(tool);
+            return Some(m);
         }
 
         None
     }
 
     /// Fuzzy fallback: scan all patterns for similarity.
-    async fn fuzzy_route(&self, normalized: &str) -> Option<String> {
+    async fn fuzzy_route(&self, normalized: &str) -> Option<FuzzyMatch> {
         let patterns = self.patterns.read().await;
 
         // Pre-filter: only consider patterns that share at least
@@ -293,7 +317,8 @@ impl ReflexRouter {
                 // Track fuzzy hit for auto-promotion.
                 // We pass the user's normalized input so that specific variant
                 // can be promoted to the exact-match fast path.
-                self.bump_fuzzy_hit(normalized, tool_name).await;
+                self.bump_fuzzy_hit(normalized, tool_name, &best_pattern)
+                    .await;
 
                 tracing::debug!(
                     "Reflex fuzzy match: '{}' ≈ '{}' (score: {:.3})",
@@ -303,7 +328,11 @@ impl ReflexRouter {
                 );
             }
 
-            return tool;
+            return tool.map(|tool_name| FuzzyMatch {
+                tool_name,
+                matched_pattern: best_pattern,
+                score,
+            });
         }
 
         drop(patterns);
@@ -311,7 +340,7 @@ impl ReflexRouter {
     }
 
     /// Semantic fallback: embed the query and compare against cached pattern embeddings.
-    async fn semantic_route(&self, normalized: &str) -> Option<String> {
+    async fn semantic_route(&self, normalized: &str) -> Option<FuzzyMatch> {
         let provider = self.embedding_provider.as_ref()?;
         let query_embedding = match provider.embed(normalized).await {
             Ok(emb) => emb,
@@ -346,7 +375,11 @@ impl ReflexRouter {
                     best_pattern.unwrap_or("?"),
                     best_score
                 );
-                return Some(tool);
+                return Some(FuzzyMatch {
+                    tool_name: tool,
+                    matched_pattern: best_pattern.unwrap_or_default().to_string(),
+                    score: best_score,
+                });
             }
         }
 
@@ -355,7 +388,7 @@ impl ReflexRouter {
 
     /// Bump the fuzzy hit counter for a specific input variant and promote
     /// to the exact-match cache if the promotion threshold is reached.
-    async fn bump_fuzzy_hit(&self, normalized_input: &str, tool_name: &str) {
+    async fn bump_fuzzy_hit(&self, normalized_input: &str, tool_name: &str, canonical: &str) {
         let mut hits = self.fuzzy_hits.write().await;
         let count = hits.entry(normalized_input.to_string()).or_insert(0);
         *count += 1;
@@ -366,6 +399,12 @@ impl ReflexRouter {
             let mut patterns = self.patterns.write().await;
             patterns.insert(normalized_input.to_string(), tool_name.to_string());
             drop(patterns);
+
+            // Remember the canonical pattern so match bookkeeping targets the
+            // stored database row, not the promoted input variant.
+            let mut promoted = self.promoted_variants.write().await;
+            promoted.insert(normalized_input.to_string(), canonical.to_string());
+            drop(promoted);
 
             tracing::info!(
                 "Reflex variant '{}' promoted to fast path for tool '{}' ({} fuzzy hits)",
@@ -473,8 +512,11 @@ impl ReflexRouter {
             Ok(records) => {
                 let mut patterns = self.patterns.write().await;
                 let mut embeddings = self.pattern_embeddings.write().await;
+                let mut promoted = self.promoted_variants.write().await;
                 patterns.clear();
                 embeddings.clear();
+                promoted.clear();
+                drop(promoted);
                 for record in &records {
                     if record.status == "active" {
                         patterns
@@ -697,13 +739,13 @@ impl ReflexCompiler {
         // patterns stay disabled (user-deleted via CLI or auto-disabled after
         // repeated build failures); 'failed' and 'evicted' rows fall through
         // so they are retried.
-        match self.store.get_reflex_pattern(&self.user_id, &normalized).await {
+        match self
+            .store
+            .get_reflex_pattern(&self.user_id, &normalized)
+            .await
+        {
             Ok(Some((_, status))) if status == "active" || status == "disabled" => {
-                tracing::debug!(
-                    "Reflex pattern skipped (status {}): {}",
-                    status,
-                    normalized
-                );
+                tracing::debug!("Reflex pattern skipped (status {}): {}", status, normalized);
                 return;
             }
             _ => {}
@@ -1213,6 +1255,42 @@ mod tests {
             hits.get(variant_b).copied(),
             Some(PROMOTION_THRESHOLD - 1),
             "variant_b should not be promoted yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_route_match_reports_canonical_pattern() {
+        // Fuzzy hits must report the canonical stored pattern (for DB
+        // bookkeeping), and promotion must not lose that mapping.
+        let router = ReflexRouter::new();
+        router.register("summarize logs", "tool_summarize").await;
+
+        // Exact hit reports the pattern itself.
+        let m = router
+            .try_route_match("summarize logs")
+            .await
+            .expect("exact hit");
+        assert_eq!(m.matched_pattern, "summarize logs");
+
+        let variant = "summarize the logs please";
+
+        // Fuzzy hit (before promotion) reports the canonical pattern.
+        let m = router.try_route_match(variant).await.expect("fuzzy hit");
+        assert_eq!(m.tool_name, "tool_summarize");
+        assert_eq!(m.matched_pattern, "summarize logs");
+
+        // Drive the variant to promotion.
+        for _ in 1..PROMOTION_THRESHOLD {
+            router.try_route(variant).await;
+        }
+
+        // Promoted variant now hits the exact cache, but must still resolve
+        // to the canonical pattern.
+        let m = router.try_route_match(variant).await.expect("promoted hit");
+        assert_eq!(m.tool_name, "tool_summarize");
+        assert_eq!(
+            m.matched_pattern, "summarize logs",
+            "promoted variant should resolve to the canonical pattern"
         );
     }
 

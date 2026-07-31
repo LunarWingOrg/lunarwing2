@@ -190,10 +190,7 @@ impl AgentConfig {
                     86400u64,
                 )?),
                 eviction_stale_days: parse_optional_env("REFLEX_EVICTION_STALE_DAYS", 30i32)?,
-                max_patterns_per_user: parse_optional_env(
-                    "REFLEX_MAX_PATTERNS_PER_USER",
-                    50usize,
-                )?,
+                max_patterns_per_user: parse_optional_env("REFLEX_MAX_PATTERNS_PER_USER", 50usize)?,
             },
         })
     }
