@@ -20,6 +20,16 @@ else
   UNITS_ARR=("${UNITS_DEFAULT[@]}")
 fi
 
+# Old health.env files may still list retired Nanocode units explicitly. Apply
+# retirement filtering after override resolution so configured and discovered
+# paths agree.
+FILTERED_UNITS=()
+for unit in "${UNITS_ARR[@]}"; do
+  case "$unit" in lunarwing-nanocode-*) continue ;; esac
+  FILTERED_UNITS+=("$unit")
+done
+UNITS_ARR=("${FILTERED_UNITS[@]}")
+
 # Multi-tenant host? (a tenant registry exists). On MT hosts the base system-
 # level units (lunarwing.service, …) are not expected — tenants run per-user
 # units — so a missing base unit is skipped instead of flagged critical.

@@ -6,8 +6,8 @@
 > full TOML rewrite (for example `/model`) still omits `auth_token` and can make
 > the worker return 401 after reload. Provisioning is fixed; persistence is open.
 
-This consolidates `MISSING-CONFIG-FOR-NANOCODE.md` and the current config
-round-trip finding.
+This consolidates historical `history/MISSING-CONFIG-FOR-NANOCODE.md` and the
+current supported-worker config round-trip finding.
 
 ## 1. Provisioning-time generation
 

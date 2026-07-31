@@ -238,5 +238,11 @@ assert_eq "$(jq '[.metrics.services[] | select(.name | startswith("lunarwing-nan
 assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S12: retired Nanocode failures do not affect overall health"
 assert_eq "$RC" 0 "S12: retired Nanocode failures keep exit 0"
 
+run_hc "$s" SERVICES='lunarwing-nanocode-acme lunarwing-nanocode-acme-sup'
+assert_eq "$(jq '[.metrics.services[] | select(.name | startswith("lunarwing-nanocode-"))] | length' <<<"$OUT")" 0 \
+  "S13: explicit retired Nanocode units absent from report"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S13: explicit retired Nanocode failures do not affect overall health"
+assert_eq "$RC" 0 "S13: explicit retired Nanocode failures keep exit 0"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

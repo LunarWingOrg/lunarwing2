@@ -1,7 +1,6 @@
-# Consolidated: external-worker config generation and persistence
+# Retired Nanocode Config Report
 
-> **Status: PARTIALLY-FIXED.** See
-> [`BUG-external-worker-config-persistence.md`](BUG-external-worker-config-persistence.md).
-
-Provisioning now writes all worker blocks, but a settings save can omit their
-bearer tokens.
+Nanocode support is retired. Historical pointer moved to
+[`history/MISSING-CONFIG-FOR-NANOCODE.md`](history/MISSING-CONFIG-FOR-NANOCODE.md).
+Supported-worker persistence remains tracked in
+[`BUG-external-worker-config-persistence.md`](BUG-external-worker-config-persistence.md).

@@ -6,9 +6,10 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from hermes_kawarimi.config import ImportPlan
-from hermes_kawarimi.cli import _plan_from_args, build_parser
+from hermes_kawarimi.cli import _plan_from_args, build_parser, main
 
 
 class ImportPlanSerializationTest(unittest.TestCase):
@@ -89,6 +90,20 @@ class ImportPlanCliTest(unittest.TestCase):
             ["import", "--tenant", "testimport", "--with-kimi"]
         )
         self.assertTrue(_plan_from_args(args).with_kimi)
+
+    def test_legacy_nanocode_resume_fails_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "plan.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"with_nanocode": True}, handle)
+            with patch("hermes_kawarimi.cli.out") as mock_out:
+                result = main(["import", "--resume", path])
+
+        self.assertEqual(result, 2)
+        mock_out.assert_called_once_with(
+            "[red]error:[/red] invalid import plan: "
+            "nanocode worker is no longer supported"
+        )
 
 
 if __name__ == "__main__":

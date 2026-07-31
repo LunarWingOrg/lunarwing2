@@ -12,10 +12,11 @@ tenant and writes to it, so it needs root on a LunarWing host.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 
 from hermes_kawarimi import __version__
-from hermes_kawarimi.config import ImportPlan
+from hermes_kawarimi.config import ImportPlan, ImportPlanFormatError
 from hermes_kawarimi.extract import extract
 from hermes_kawarimi.mapper import map_agent
 from hermes_kawarimi.model import MappedAgent
@@ -97,7 +98,11 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
 
 
 def _cmd_import(args: argparse.Namespace) -> int:
-    plan = _plan_from_args(args)
+    try:
+        plan = _plan_from_args(args)
+    except (ImportPlanFormatError, json.JSONDecodeError, OSError) as exc:
+        out(f"[red]error:[/red] invalid import plan: {exc}")
+        return 2
     err = plan.validate()
     if err:
         out(f"[red]error:[/red] {err}")

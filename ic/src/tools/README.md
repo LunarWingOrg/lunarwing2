@@ -256,6 +256,6 @@ The LLM-facing interface is identical for both (tool name, schema, execute), so 
 Local and Docker `create_job` workers default to 200 agent-loop iterations.
 Callers may set `max_iterations` from 1 through 500; large multi-fix write jobs
 should usually request 300 or more. Named external workers such as OpenCode,
-NanoCode, and Pebble control their own iteration policy and reject this option.
+Kimi Code, and Pebble control their own iteration policy and reject this option.
 
 This budget is separate from interactive chat's `AGENT_MAX_TOOL_ITERATIONS`.

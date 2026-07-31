@@ -1,7 +1,7 @@
 # Bug tracker
 
 Reconciled against current source on **2026-07-28** (prior pass against revision
-`51ae5a8` on 2026-07-20). All 38 Markdown documents in this tracker (36
+`51ae5a8` on 2026-07-20). All 39 Markdown documents in this tracker (37
 report/pointer files plus two README files) were checked against current source,
 scripts, tests, and reachable Git history. Closely related reports remain
 grouped; their original filenames and technical evidence are named in the
@@ -25,7 +25,7 @@ Some superseded files remain as compatibility pointers, including pointers in
 | [BUG-kawarimi-import-flag-parity.md](BUG-kawarimi-import-flag-parity.md) | OPEN | Import rejects an explicit `--with-wasm` although it adds the flag internally | `ic/scripts/import-tenant.sh:51-69,283-289`; fresh related flag harness |
 | [BUG-ssh-git-ref-and-remote-head.md](BUG-ssh-git-ref-and-remote-head.md) | PARTIAL | Null-like refs fixed; bare remote HEAD mismatch still reports success for an empty checkout, with only raw Git stderr | `ssh_git.rs`, null-ref tests, local bare-Git reproduction |
 | [BUG-weechat-relay-rand-check.md](BUG-weechat-relay-rand-check.md) | PARTIAL | Unused import fixed; `rand_check` still always returns false | `lunarwing_weechat_wss/weechat_relay/src/lib.rs:46-50,2164-2172` |
-| [BUG-worker-workspace-path-expansion.md](BUG-worker-workspace-path-expansion.md) | PARTIAL | Structured OpenCode/Nanocode project paths expand `~`; prompt-generated paths and Pebble remain open | worker TypeScript/Rust files; Bun unavailable for a fresh self-check run |
+| [BUG-worker-workspace-path-expansion.md](BUG-worker-workspace-path-expansion.md) | PARTIAL | Structured OpenCode project paths expand `~`; prompt-generated paths and Pebble remain open | worker TypeScript/Rust files; Bun unavailable for a fresh self-check run |
 | [BUG-xmpp-polling-and-backpressure.md](BUG-xmpp-polling-and-backpressure.md) | PARTIAL | Poll-loop supervision/health is implemented; an unbounded send await on a full downstream queue remains a residual risk | WASM wrapper, active-turn dispatcher, channel manager, watchdog, XMPP bridge source |
 | [BUG-xmpp-omemo-warmup-and-processing.md](BUG-xmpp-omemo-warmup-and-processing.md) | UNVERIFIED | Historical MUC fallback-spam has no current live verification; generic stuck-`Processing` recovery is fixed | XMPP config/tests, release v1.0.7, agent timeout path; source-only |
 
@@ -84,7 +84,7 @@ unverified historical symptoms alongside their fixed primary changes.
 | [BUG-ssh-git-null-ref-serialization.md](BUG-ssh-git-null-ref-serialization.md) | FIXED | [SSH Git](BUG-ssh-git-ref-and-remote-head.md#1-null-like-ref-values) |
 | [BUG-subagent-worker-hang.md](BUG-subagent-worker-hang.md) | FIXED/RETIRED | [worker lifecycle](BUG-agent-worker-lifecycle.md#2-fire-and-forget-worker-completion-race) |
 | [BUG-unbounded-mpsc-recv-in-spawned-tasks.md](BUG-unbounded-mpsc-recv-in-spawned-tasks.md) | FIXED/INVALIDATED | [worker lifecycle](BUG-agent-worker-lifecycle.md#3-notification-receiver-report) |
-| [MISSING-CONFIG-FOR-NANOCODE.md](MISSING-CONFIG-FOR-NANOCODE.md) | PARTIAL | [external-worker config](BUG-external-worker-config-persistence.md) |
+| [history/MISSING-CONFIG-FOR-NANOCODE.md](history/MISSING-CONFIG-FOR-NANOCODE.md) | FIXED/RETIRED | [external-worker config](BUG-external-worker-config-persistence.md) |
 | [history/BUG-FIXED-LAPSE.md](history/BUG-FIXED-LAPSE.md) | FIXED | [LAPSE history](history/BUG-FIXED-LAPSE.md) |
 | [history/BUG-FIXED-WEECHAT-WARNINGS.md](history/BUG-FIXED-WEECHAT-WARNINGS.md) | PARTIAL | [WeeChat rand check](BUG-weechat-relay-rand-check.md) |
 | [history/BUG-FIXED-wasm-tools-not-found-on-build.md](history/BUG-FIXED-wasm-tools-not-found-on-build.md) | FIXED | [wasm-tools history](history/BUG-FIXED-wasm-tools-not-found-on-build.md) |
@@ -112,7 +112,7 @@ reports as follows:
 - `BUG-engine-crate-test-failures.md` and
   `BUG-rust-integration-test-harness-failures.md` -> archived engine/harness
 - `BUG-kawarimi-import-no-opencode.md` -> archived Kawarimi import
-- `MISSING-CONFIG-FOR-NANOCODE.md` -> external-worker config persistence
+- `history/MISSING-CONFIG-FOR-NANOCODE.md` -> external-worker config persistence
 - `history/BUG-FIXED-WEECHAT-WARNINGS.md` -> active WeeChat `rand_check` report
 - `history/XMPP-OMEMO-BUG-TO-DO.md` -> active OMEMO fallback/processing report
 

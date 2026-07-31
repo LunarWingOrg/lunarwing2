@@ -655,25 +655,27 @@ podman_supports_quadlet() {
   [[ "$QUADLET_OK" == "yes" ]]
 }
 
-# Run the container runtime for a TENANT's containers. When rootless (podman),
-# execute as the tenant user against their rootless store + runtime dir; when
-# rootful (docker), run as root unchanged. Every per-tenant pg/worker container
-# operation MUST go through this so inspect/start/stop/exec/rm hit the SAME store
-# that owns the container — root and rootless podman are separate universes.
+# Run the container runtime directly against a tenant's rootless store.
+_ctr_rootless() {
+  local name="$1"; shift
+  ensure_container_runtime
+  local uid home
+  uid="$(id -u "$name")" || die "cannot resolve uid for tenant '$name'"
+  home="$(getent passwd "$name" | cut -d: -f6)"
+  # Run from a tenant-traversable CWD (F10): `sudo -u` keeps the caller's cwd, so
+  # when mt-admin runs from an admin dir the tenant can't enter (e.g. ~dame, 0700)
+  # `sudo -u` aborts before the runtime runs. `/` is always traversable.
+  ( cd / && exec sudo -u "$name" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" "$CONTAINER_RT" "$@" )
+}
+
+# Run the container runtime for a TENANT's current container store. Every normal
+# per-tenant operation goes through this; retirement code separately checks both
+# Podman stores because pre-rootless containers may still live in root's store.
 _ctr() {
   local name="$1"; shift
   ensure_container_runtime
   if [[ "$MT_ROOTLESS" == "true" ]]; then
-    local uid home
-    uid="$(id -u "$name")" || die "cannot resolve uid for tenant '$name'"
-    home="$(getent passwd "$name" | cut -d: -f6)"
-    # Run from a tenant-traversable CWD (F10): `sudo -u` keeps the caller's cwd, so
-    # when mt-admin runs from an admin dir the tenant can't enter (e.g. ~dame, 0700)
-    # `sudo -u` aborts with "cannot chdir ... Permission denied" BEFORE the runtime
-    # runs — which silently broke the rootless pg readiness gate (it always timed
-    # out). `/` is always traversable; no _ctr call passes a cwd-relative path. exec
-    # preserves the exit code and the stdin/stdout redirects used by exec/pg_dump.
-    ( cd / && exec sudo -u "$name" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" "$CONTAINER_RT" "$@" )
+    _ctr_rootless "$name" "$@"
   else
     "$CONTAINER_RT" "$@"
   fi
@@ -3335,7 +3337,16 @@ remove_external_worker_config() {
         block[++block_len] = $0
         next
       }
-      in_worker && /^\[/ {
+      in_worker && /^[[:space:]]*# External worker:/ {
+        flush_block()
+        print
+        next
+      }
+      in_worker && /^[[:space:]]*\[/ {
+        if ($0 ~ "^[[:space:]]*\\[\\[?sandbox\\.external_workers\\.") {
+          block[++block_len] = $0
+          next
+        }
         flush_block()
         print
         next
@@ -3357,7 +3368,7 @@ remove_external_worker_config() {
 }
 
 remove_retired_nanocode_config() {
-  local name="$1" env_path retired_env
+  local name="$1" env_path legacy_env_path retired_env
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   if [[ -f "$env_path" ]] \
       && grep -qE '^NANOCODE_[A-Z0-9_]*=' "$env_path" 2>/dev/null; then
@@ -3367,6 +3378,11 @@ remove_retired_nanocode_config() {
     chmod 600 "$retired_env"
     mv -f -- "$retired_env" "$env_path"
     say "removed retired Nanocode settings from $env_path"
+  fi
+  legacy_env_path="$(tenant_env_dir "$name")/nanocode.env"
+  if [[ -e "$legacy_env_path" || -L "$legacy_env_path" ]]; then
+    rm -f -- "$legacy_env_path"
+    say "removed retired Nanocode env file $legacy_env_path"
   fi
   remove_external_worker_config "$name" "nanocode"
 }
@@ -4135,42 +4151,102 @@ configure_pebble() {
   fi
 }
 
-# Legacy Nanocode cleanup. Keep stop/retire paths so upgrades disable old units
-# without deleting containers, images, or workspaces.
-stop_tenant_nanocode() {
-  local name="$1"
+# Run a legacy container command against an explicit store. Podman retirement
+# checks both stores because old tenants may be rootful while current defaults
+# select the tenant's rootless store.
+_legacy_nanocode_ctr() {
+  local store="$1" name="$2"
+  shift 2
   ensure_container_runtime
+  case "$store" in
+    rootful) "$CONTAINER_RT" "$@" ;;
+    rootless) _ctr_rootless "$name" "$@" ;;
+    *) die "unknown legacy container store '$store'" ;;
+  esac
+}
 
-  local container_name="lunarwing-nanocode-$name"
-  ensure_init_system
-  if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
-    _deregister_babysitter "$container_name"
-    rc-service "$container_name" stop >/dev/null 2>&1 || true
-    say "nanocode worker stopped ($container_name)"
-  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
-    _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
-    say "nanocode worker stopped ($container_name)"
+_stop_nanocode_container_store() {
+  local store="$1" name="$2" container_name="lunarwing-nanocode-$2" running
+  _legacy_nanocode_ctr "$store" "$name" inspect "$container_name" &>/dev/null || return 0
+  if ! _legacy_nanocode_ctr "$store" "$name" stop "$container_name" >/dev/null 2>&1; then
+    say "ERROR: failed to stop retired Nanocode container $container_name in $store store" >&2
+    return 1
   fi
+  running="$(_legacy_nanocode_ctr "$store" "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || true)"
+  if [[ "$running" == "true" ]]; then
+    say "ERROR: retired Nanocode container still running in $store store: $container_name" >&2
+    return 1
+  fi
+  say "nanocode worker stopped ($container_name, $store store)"
+}
+
+_stop_legacy_nanocode_containers() {
+  local name="$1" failed=0
+  ensure_container_runtime
+  _stop_nanocode_container_store rootful "$name" || failed=1
+  if [[ "$CONTAINER_RT" == "podman" ]] && id -u "$name" >/dev/null 2>&1; then
+    _stop_nanocode_container_store rootless "$name" || failed=1
+  fi
+  return "$failed"
+}
+
+_stop_nanocode_supervision() {
+  local name="$1" container_name="lunarwing-nanocode-$1" failed=0
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    local quadlet unit load_state
+    quadlet="$(tenant_quadlet_dir "$name")/${container_name}.container"
+    unit="${container_name}.service"
+    load_state="$(_systemctl_user "$name" show -p LoadState --value "$unit" 2>/dev/null || true)"
+    if [[ -f "$quadlet" || "$load_state" == "loaded" ]]; then
+      if ! _systemctl_user "$name" stop "$unit" >/dev/null 2>&1; then
+        say "ERROR: failed to stop retired Nanocode service $unit" >&2
+        failed=1
+      fi
+    fi
+  else
+    local service
+    for service in "${container_name}-sup" "$container_name"; do
+      if rc-service --exists "$service" >/dev/null 2>&1 \
+          && ! rc-service "$service" stop >/dev/null 2>&1; then
+        say "ERROR: failed to stop retired Nanocode service $service" >&2
+        failed=1
+      fi
+    done
+  fi
+  return "$failed"
+}
+
+# Legacy Nanocode cleanup. Keep stop/retire paths so upgrades disable old units
+# without deleting images or workspaces. Stop failures are fatal: continuing would
+# leave an unsupported worker running while status and health no longer show it.
+stop_tenant_nanocode() {
+  local name="$1" failed=0
+  ensure_container_runtime
+  _stop_nanocode_supervision "$name" || failed=1
+  _stop_legacy_nanocode_containers "$name" || failed=1
+  return "$failed"
 }
 
 retire_tenant_nanocode() {
   local name="$1" container_name="lunarwing-nanocode-$1"
-  ensure_container_runtime
   ensure_init_system
+  if ! stop_tenant_nanocode "$name"; then
+    say "ERROR: Nanocode retirement incomplete for tenant '$name'; refusing to continue" >&2
+    return 1
+  fi
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    _systemctl_user "$name" stop "${container_name}.service" >/dev/null 2>&1 || true
     rm -f "$(tenant_quadlet_dir "$name")/${container_name}.container"
-    _systemctl_user "$name" daemon-reload >/dev/null 2>&1 || true
+    if ! _systemctl_user "$name" daemon-reload >/dev/null 2>&1; then
+      say "WARNING: tenant systemd reload failed after Nanocode retirement; next start will reload it" >&2
+    fi
   else
-    rc-service "${container_name}-sup" stop >/dev/null 2>&1 || true
-    rc-service "$container_name" stop >/dev/null 2>&1 || true
-    rc-update del "${container_name}-sup" default >/dev/null 2>&1 || true
-    rc-update del "$container_name" default >/dev/null 2>&1 || true
+    rc-update del "${container_name}-sup" default >/dev/null 2>&1 \
+      || say "note: retired Nanocode supervisor was not enabled"
+    rc-update del "$container_name" default >/dev/null 2>&1 \
+      || say "note: retired Nanocode service was not enabled"
     rm -f "/etc/init.d/${container_name}-sup" "/etc/conf.d/${container_name}-sup" \
           "/etc/init.d/${container_name}" "/etc/conf.d/${container_name}"
-  fi
-  if _ctr "$name" inspect "$container_name" &>/dev/null; then
-    _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
   fi
   remove_retired_nanocode_config "$name"
 }
@@ -7193,6 +7269,10 @@ remove_tenant() {
   say "=== Removing tenant: $name ==="
   say ""
 
+  # Stop and unregister retired supervision before deleting tenant units, ports,
+  # or the user. Failure must leave teardown state intact for operator recovery.
+  retire_tenant_nanocode "$name" || return 1
+
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     stop_tenant_systemd "$name"
@@ -7310,7 +7390,7 @@ start_tenant() {
   say "=== Starting tenant: $name ==="
 
   # Retire old Nanocode supervision while preserving container/workspace data.
-  retire_tenant_nanocode "$name"
+  retire_tenant_nanocode "$name" || return 1
 
   # Safety net: if the tenant has LUNARWING_OWNER_ID set but the DB still has
   # orphaned 'default'-scoped rows (e.g. an upgrade that didn't run patch-env),
@@ -7416,7 +7496,7 @@ stop_tenant() {
   stop_tenant_vision "$name"
   stop_tenant_pebble "$name"
   # Stop retired Nanocode containers if an upgraded tenant still has one.
-  stop_tenant_nanocode "$name"
+  stop_tenant_nanocode "$name" || return 1
   stop_tenant_opencode "$name"
   stop_tenant_kimi "$name"
   stop_tenant_postgres "$name"

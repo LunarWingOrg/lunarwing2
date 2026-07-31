@@ -121,9 +121,10 @@ Internal planning issue. Closed as completed.
 
 ### #211 — refactor nanocode container to be like opencode's
 **Closed**: 2026-07-08
-**Status**: ✅ Resolved
+**Status**: Superseded by Nanocode retirement
 
-`lunarcode4lunarwing/` exists with a Dockerfile (187 lines). The source was refactored. `docs/internal/vendored/nanocode-config/` no longer exists (removed per #180).
+Historical refactor completed, then Nanocode support and its source/build tree
+were removed in v2.0.4. Legacy images and tenant workspace data remain untouched.
 
 ---
 
@@ -218,4 +219,3 @@ Based on codebase verification:
 | #223 | DarkIRC key exchange | Low | DarkIRC is opt-in; key exchange automation missing |
 | #201 | memory de-duping routines | Low | Stub issue, no work started |
 | #5 | Reflex Compiler Integration | Medium | Full 8-phase validation largely uncompleted |
-

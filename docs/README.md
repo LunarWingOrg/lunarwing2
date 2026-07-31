@@ -225,7 +225,7 @@ here while they are still present in `proposals/`.
 | [`ENGINE_V2_POLISH_v2.0.3.0.md`](proposals/ENGINE_V2_POLISH_v2.0.3.0.md) | Implemented | v2.0.3.0 Engine V2 fixes for provenance, mission controls, gates, and memory; P1/P2 landed, P3 partially deferred |
 | [`EXTERNAL-WORKER-AUDIT-2026-06-23.md`](proposals/EXTERNAL-WORKER-AUDIT-2026-06-23.md) | Implemented / historical | External-worker security findings and landed fixes |
 | [`EXTERNAL-WORKER-PLAN-UPGRADES.md`](proposals/EXTERNAL-WORKER-PLAN-UPGRADES.md) | Implemented | Context, pooling, load balancing, and surviving worker updates landed |
-| [`EXTERNAL-WORKER-PROMPT-CONTEXT.md`](proposals/EXTERNAL-WORKER-PROMPT-CONTEXT.md) | Implemented | Typed, bounded, opt-in conversation context propagation for OpenCode, Nanocode, and Pebble workers |
+| [`EXTERNAL-WORKER-PROMPT-CONTEXT.md`](proposals/EXTERNAL-WORKER-PROMPT-CONTEXT.md) | Implemented / historical | Typed, bounded conversation-context implementation record predating Nanocode retirement |
 | [`EXTERNAL-WORKER-UPGRADES-PROGRESS.md`](proposals/EXTERNAL-WORKER-UPGRADES-PROGRESS.md) | Implemented / historical | Completed external-worker progress record |
 | [`GITLAB_CI_CD_PLAN.md`](proposals/GITLAB_CI_CD_PLAN.md) | Partial / activation pending | Four-layer GitLab CI/CD rollout plan; Phase 1 is implemented and later phases remain gated |
 | [`GITWASM/README.md`](proposals/GITWASM/README.md) | Open | Gitoxide-based Git/Markdown WASM tool proposal |
@@ -249,7 +249,7 @@ here while they are still present in `proposals/`.
 | [`MT-LEGACY-UPGRADE-CHERRYPICK-PLAN.md`](proposals/MT-LEGACY-UPGRADE-CHERRYPICK-PLAN.md) | Implemented / historical | Executed legacy-upgrade fix plan; production run remained operator-gated |
 | [`MT-LEGACY-UPGRADE-QA-PLAN.md`](proposals/MT-LEGACY-UPGRADE-QA-PLAN.md) | Verification pending | Live legacy-upgrade operator checklist |
 | [`MT-LEGACY-UPGRADE-VERIFICATION.md`](proposals/MT-LEGACY-UPGRADE-VERIFICATION.md) | Verification pending | Legacy harness canary, rollback, soak, and sign-off plan |
-| [`MT-ONBOARDING-CLI.md`](proposals/MT-ONBOARDING-CLI.md) | Implemented | Shipped onboarding CLI, upgrade mode, and Kawarimi import/export extensions |
+| [`MT-ONBOARDING-CLI.md`](proposals/MT-ONBOARDING-CLI.md) | Historical pointer | Original design moved to history; current commands live in `lunarwing_mt_onboard/README.md` |
 | [`MT-WEECHAT-CONSISTENCY-AND-CHANNEL-PRUNING.md`](proposals/MT-WEECHAT-CONSISTENCY-AND-CHANNEL-PRUNING.md) | Superseded | Historical deployment snapshot; allowlist and log rotation ideas remain |
 | [`MULTIAGENTTEAMORCHESTRATION_INTEGRATION_PLAN_v2.0.4.0.md`](proposals/MULTIAGENTTEAMORCHESTRATION_INTEGRATION_PLAN_v2.0.4.0.md) | Open | Release-scoped plan for structured multi-agent coordination hooks, policies, and enforcement |
 | [`MULTIAGENTTEAMORCHESTRATION/coordination-phase1-hooks.md`](proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-hooks.md) | Open | Declarative-hook capabilities, enforcement scope, and limitations for coordination Phase 1 |
@@ -410,8 +410,6 @@ Internal notes, drafts, and working documents — incomplete or in-progress by n
 | [`FORK_CONTEXT.md`](internal/FORK_CONTEXT.md) | Fork history and context (authoritative; linked from `CLAUDE.md`) |
 | [`CHANGELOG-AGENTS.md`](internal/CHANGELOG-AGENTS.md) | Internal changelog of `AGENTS.md` updates |
 | [`ic-infrastructure-health-check/draft-ic-infrastructure-health-check-analysis-report.md`](internal/ic-infrastructure-health-check/draft-ic-infrastructure-health-check-analysis-report.md) | Health-check analysis draft |
-| [`nanocode-config/KAGEHO_QUESTIONS.md`](internal/nanocode-config/KAGEHO_QUESTIONS.md) | Agnostic coding-worker container design notes |
-| [`nanocode-config/NextSteps.md`](internal/nanocode-config/NextSteps.md) | Nanocode + TensorZero setup next steps |
 | [`COMPONENT_SOURCES.md`](internal/COMPONENT_SOURCES.md) | Where each custom component's upstream source repo lives |
 
 **Archives** (kept for provenance, not active docs):
@@ -435,7 +433,7 @@ The following are **not** in this directory and should remain where they are:
 - **`CLAUDE.md` / `AGENTS.md` / `CODEX.md`** — AI agent context files (kept at their respective locations)
 - **`ic/`** — all documentation within the `ic/` tree stays in place (workspace templates, crate docs, skill definitions, etc.)
 - **`projects/`** — satellite service documentation stays with its source (e.g., `projects/ocr-sidecar/README.md`)
-- **`lunarcode4lunarwing/` / `pebble4lunarwing/` / `opencode4lunarwing/`** — worker-container docs stay with their container source
+- **`pebble4lunarwing/` / `opencode4lunarwing/` / `kimicode4lunarwing/`** — worker-container docs stay with their container source
 - **`.claude/`** — Claude command and rule files
 
 ---

@@ -30,7 +30,7 @@ Add
 | Kawarimi owner-scope continuity — remaining phases | v2.0.4 | `docs/proposals/KAWARIMI-OWNER-SCOPE-CONTINUITY.md` |
 | Per-tenant WeeChat health-glob gate (fix the flap /`render-units` footgun) | v2.0.5 | `docs/proposals/RENDER_UNITS_SMALL_BUG.md` |
 | Security hardening | v2.0.5 | |
-| Deprecate Nanocode external Worker | v2.0.5 | |
+| Retire Nanocode external worker | Done v2.0.4 | `docs/ops/NANOCODE-REMOVAL.md` |
 | Lunartica UI reskin continuation | v2.0.5 | `docs/proposals/MULTICA_LUNARTICA_RESKIN.md` |
 | Upgrade old testing harness | v2.0.5 | |
 | Further external worker polishing | v2.0.5 | `docs/proposals/EXTERNAL-WORKER-PLAN-UPGRADES.md` |

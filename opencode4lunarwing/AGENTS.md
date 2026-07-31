@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Persistent container worker for upstream opencode, following the same pattern as `lunarcode4lunarwing`. The WebSocket bridge is TypeScript/Bun and uses `@opencode-ai/sdk/v2` to communicate with the internal opencode headless server.
+Persistent container worker for upstream opencode. The WebSocket bridge is TypeScript/Bun and uses `@opencode-ai/sdk/v2` to communicate with the internal opencode headless server.
 
 ## Key Files
 

@@ -182,4 +182,8 @@ oG="$(run_hs "$g" acme acme)"
 assert_eq "$(ustat "$oG" lunarwing-nanocode-acme.service)" "ABSENT" "G1: retired Nanocode unit absent from report"
 assert_eq "$(oall "$oG")" "healthy" "G2: retired Nanocode failure does not affect overall health"
 
+oG2="$(UNITS='lunarwing-nanocode-acme.service' run_hs "$g" acme acme)"
+assert_eq "$(ustat "$oG2" lunarwing-nanocode-acme.service)" "ABSENT" "G3: explicit retired Nanocode unit absent from report"
+assert_eq "$(oall "$oG2")" "healthy" "G4: explicit retired Nanocode failure does not affect overall health"
+
 finish

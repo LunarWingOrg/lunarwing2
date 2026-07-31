@@ -56,6 +56,15 @@ else
   mapfile -t SERVICES_ARR < <(discover_services)
 fi
 
+# Old health.env files may still list retired Nanocode services explicitly.
+# Filter after override resolution so configured and discovered paths agree.
+FILTERED_SERVICES=()
+for service in "${SERVICES_ARR[@]}"; do
+  case "$service" in lunarwing-nanocode-*) continue ;; esac
+  FILTERED_SERVICES+=("$service")
+done
+SERVICES_ARR=("${FILTERED_SERVICES[@]}")
+
 issues=()
 svc_results=()
 overall_status="healthy"
