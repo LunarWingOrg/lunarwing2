@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 
 from hermes_kawarimi import loader
-from hermes_kawarimi.config import ImportPlan
+from hermes_kawarimi.config import ImportPlan, ImportPlanFormatError
 from hermes_kawarimi.loader import _build_flags, _worker_flags, _schema_wait_seconds
 from hermes_kawarimi.model import MappedAgent
 from lunarwing_mt_onboard.provisioner import PhaseResult
@@ -20,9 +20,9 @@ class WorkerFlagsTest(unittest.TestCase):
     def test_empty_plan_yields_no_flags(self) -> None:
         self.assertEqual(_worker_flags(ImportPlan()), [])
 
-    def test_nanocode_flag(self) -> None:
-        plan = ImportPlan(with_nanocode=True)
-        self.assertIn("--with-nanocode", _worker_flags(plan))
+    def test_nanocode_plan_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ImportPlanFormatError, "no longer supported"):
+            ImportPlan.from_dict({"with_nanocode": True})
 
     def test_pebble_flag(self) -> None:
         plan = ImportPlan(with_pebble=True)
