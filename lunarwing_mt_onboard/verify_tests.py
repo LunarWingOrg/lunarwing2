@@ -19,7 +19,7 @@ Ports:
   http:             10001
 
 PostgreSQL: running (lunarwing-pg-lunarium)
-Nanocode worker: not created
+Pebble worker: not created
 
 Services (systemd):
   lunarwing-lunarium.service: active
@@ -28,7 +28,7 @@ Services (systemd):
   lunarwing-weechat-lunarium.service: active
   lunarwing-weechat-adapter-lunarium.service: active
   lunarwing-pg-lunarium.service: active
-  lunarwing-nanocode-lunarium.service: inactive
+  lunarwing-pebble-lunarium.service: inactive
 """
 
 OPENRC_STATUS = """\
@@ -71,8 +71,8 @@ class ParseDaemonStateTests(unittest.TestCase):
         self.assertIn("not found", detail)
 
     def test_does_not_match_worker_prefix(self) -> None:
-        # Only the primary daemon line, not lunarwing-nanocode-<t>
-        text = "  lunarwing-nanocode-lunarium.service: active\n"
+        # Only the primary daemon line, not lunarwing-pebble-<t>
+        text = "  lunarwing-pebble-lunarium.service: active\n"
         ok, _ = parse_daemon_state(text, "lunarium")
         self.assertIsNone(ok)
 

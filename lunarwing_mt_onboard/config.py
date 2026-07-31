@@ -31,7 +31,6 @@ RESERVED_PREFIXES = (
 class WorkerType(str, Enum):
     """Selectable external worker container types."""
 
-    NANOCODE = "nanocode"
     PEBBLE = "pebble"
     OPENCODE = "opencode"
     KIMI = "kimi"
@@ -57,8 +56,6 @@ class TenantConfig:
     toolchains: bool = False
     llm_base_url: str = ""
     llm_model: str = "tensorzero::function_name::lunarwing"
-    nanocode_model: str = ""
-    nanocode_base_url: str = ""
     opencode_model: str = ""
     opencode_base_url: str = ""
     kimi_model: str = ""
@@ -109,6 +106,8 @@ class TenantConfig:
     def from_dict(cls, data: dict[str, Any]) -> "TenantConfig":
         """Reconstruct a config from a deserialized dict."""
         workers_raw = data.get("workers", [])
+        if "nanocode" in workers_raw:
+            raise ValueError("nanocode worker is no longer supported")
         workers = [WorkerType(w) for w in workers_raw]
         return cls(
             name=data.get("name", ""),
@@ -129,8 +128,6 @@ class TenantConfig:
             llm_model=data.get(
                 "llm_model", "tensorzero::function_name::lunarwing"
             ),
-            nanocode_model=data.get("nanocode_model", ""),
-            nanocode_base_url=data.get("nanocode_base_url", ""),
             opencode_model=data.get("opencode_model", ""),
             opencode_base_url=data.get("opencode_base_url", ""),
             kimi_model=data.get("kimi_model", ""),
