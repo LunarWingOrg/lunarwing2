@@ -40,7 +40,7 @@ Security invariants: private keys never enter argv, environment variables, stdou
 24. [ ] self healing capability expansion
 25. [x] (S) Refactor mt admin. The existing document plans have SERIOUS issues. Therefore, I'm going with a COMPLETELY different plan for this. Please see the following branch:`mtadminrefactor/meta4/v2.0.3.0`
 26. [ ] Suggest additional UI fixes a new document in docs/ops — update`docs/ops/UI_FIX_SUGGESTIONS.md` with any additional findings
-27. [ ] improve Lunarvision AND XMPP file sharing integration, see documents about this if unsure. see`XMPP_FT_REVIEW_A.md` and other docs
+27. [ ] improve Lunarvision AND XMPP file sharing integration, see documents about this if unsure. see`XMPP_FT_REVIEW_A.md` and other docs - failed salvaged run here (technicall issues) : rarity/kimi-27-20260731-0904
 28. [ ] review/improve recently added netbird support
 29. [ ] create dependency list for debian, ubuntu, fedora. be sure to include python packages not listed in these dep lists currently
 30. [ ] review darkirc key exchange implementation (only if completed). if not done, check this off
