@@ -242,7 +242,7 @@ here while they are still present in `proposals/`.
 | [`IRONCLAW_TOP3_EASIEST_PLAN.md`](proposals/IRONCLAW_TOP3_EASIEST_PLAN.md) | Open | Implementation plan for three small, independent IronClaw-derived correctness fixes |
 | [`JINGLE_IBB_FEASIBILITY.md`](proposals/JINGLE_IBB_FEASIBILITY.md) | Historical | Deferred Jingle/IBB feasibility decision |
 | [`KAWARIMI-OWNER-SCOPE-CONTINUITY.md`](proposals/KAWARIMI-OWNER-SCOPE-CONTINUITY.md) | Partial | Core import reconciliation landed; Phase 2 export/FK work remains |
-| [`LOREBOOKS.md`](proposals/LOREBOOKS.md) | Open | Unscoped character-lorebook idea |
+| [`LOREBOOKS.md`](proposals/LOREBOOKS.md) | Implemented (v1) | Bounded SillyTavern World Info import subset with deterministic activation and prompt-write hardening |
 | [`LUNARVISION_POLISHING.md`](proposals/LUNARVISION_POLISHING.md) | Superseded | Health wiring and `vision_health` allocation landed elsewhere |
 | [`MEMORY_MAINTENANCE_ROUTINES.md`](proposals/MEMORY_MAINTENANCE_ROUTINES.md) | Open | Routine-pack and reviewed memory-maintenance proposal/apply design |
 | [`MT-1.1.0-TO-1.1.4-UPGRADE.md`](proposals/MT-1.1.0-TO-1.1.4-UPGRADE.md) | Implemented / verification pending | Rootless-flip tooling shipped; exact production flip remains unvalidated |

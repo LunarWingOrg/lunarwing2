@@ -794,6 +794,8 @@ impl SignalChannel {
                 .unwrap_or(u64::MAX)
             });
 
+        let is_group_chat = data_msg.group_info.is_some();
+
         // Build metadata with signal-specific routing info.
         let sender_uuid = envelope.source_uuid.as_deref();
         let metadata = serde_json::json!({
@@ -801,6 +803,7 @@ impl SignalChannel {
             "signal_sender_uuid": sender_uuid,
             "signal_target": &target,
             "signal_timestamp": timestamp,
+            "chat_type": if is_group_chat { "group" } else { "private" },
         });
 
         let mut msg = IncomingMessage::new("signal", &sender, text).with_metadata(metadata);
@@ -816,7 +819,7 @@ impl SignalChannel {
         // This ensures DMs and groups continue the same thread AND work with
         // maybe_hydrate_thread, enabling conversation history persistence.
         // Priority: source_uuid > generated UUID from phone/group
-        if data_msg.group_info.is_some() {
+        if is_group_chat {
             // For groups, use the group ID to generate a deterministic UUID
             msg = msg.with_thread(Self::thread_id_from_identifier(&target));
         } else if let Some(ref uuid) = envelope.source_uuid {
@@ -2201,6 +2204,7 @@ mod tests {
         assert_eq!(msg.metadata["signal_sender"], "+1111111111");
         assert_eq!(msg.metadata["signal_target"], "+1111111111");
         assert_eq!(msg.metadata["signal_timestamp"], 1_700_000_000_000_u64);
+        assert_eq!(msg.metadata["chat_type"], "private");
         Ok(())
     }
 
@@ -2231,6 +2235,7 @@ mod tests {
         let (msg, _) = ch.process_envelope(&env).unwrap();
         assert_eq!(msg.metadata["signal_target"], "group:mygroup");
         assert_eq!(msg.metadata["signal_sender"], "+2222222222");
+        assert_eq!(msg.metadata["chat_type"], "group");
         Ok(())
     }
 

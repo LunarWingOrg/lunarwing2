@@ -742,6 +742,19 @@ impl WorkspaceStore for PgBackend {
         self.repo.list_directory(user_id, agent_id, directory).await
     }
 
+    async fn list_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
+        self.repo
+            .list_files_limited(user_id, agent_id, directory, suffix, limit)
+            .await
+    }
+
     async fn list_all_paths(
         &self,
         user_id: &str,
