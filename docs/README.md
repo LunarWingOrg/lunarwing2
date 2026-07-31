@@ -82,6 +82,7 @@ Deployment, operations, multitenancy, and production guides.
 | [`HARNESS-SINGLE-TENANT.md`](ops/HARNESS-SINGLE-TENANT.md) | Single-tenant test harness guide |
 | [`SSH-HARNESS-SETUP.md`](ops/SSH-HARNESS-SETUP.md) | SSH harness setup & ops: config, key provisioning (mt-admin + manual), verifying in a worker, troubleshooting |
 | [`WORKER-CONTAINERS.md`](ops/WORKER-CONTAINERS.md) | Supported worker container images (Pebble, OpenCode, Kimi Code) |
+| [`NANOCODE-REMOVAL.md`](ops/NANOCODE-REMOVAL.md) | Nanocode external worker retirement: upgrade behavior and operator check |
 | [`PEBBLE-WORKER.md`](ops/PEBBLE-WORKER.md) | Pebble external worker operational guide |
 | [`WEECHAT-SERVICES.md`](ops/WEECHAT-SERVICES.md) | WeeChat services, ports, env vars, day-to-day ops |
 | [`XMPP_KNOWN_ISSUES.md`](ops/XMPP_KNOWN_ISSUES.md) | XMPP/OMEMO known issues |
