@@ -1,11 +1,18 @@
 # DarkIRC Secure Key Exchange: Next Stages
 
-**Status:** Stage A implemented on 2026-07-27 and merged into the release tree
-on 2026-07-30 (branch `aj/kimi-20-20260730-2101`; ports-registry scope-ID
-migration renumbered v12 -> v13 on merge to coexist with the kimi worker port
-migration, no semantic change). Stage B/C sections remain an
-implementation plan and do not claim those APIs or commands exist. Authoritative
-security design remains `docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md`.
+**Status (2026-07-31, branch `rarity/kimi-21-20260731-1800`):** Phase 0/1 and
+Stage A are implemented on this branch. The earlier `dik/v2.0.4.0` merge
+request was rejected after security/correctness review; this branch
+re-landed the implementation as reviewed cherry-picks onto current master
+(scope-ID registry migration renumbered v13 -> v14 to coexist with the
+`coord_admin` v13 migration) and fixed the review defects: responder expiry
+may now outlive initiator offer expiry (delayed transport), stranded
+`pending/*.json.next` candidates from a pre-rename crash are recovered by
+scope-checked discard instead of wedging the tenant, and
+`generate_darkirc_config` holds the ports-registry lock through the helper
+commit. Stage B/C sections remain an implementation plan and do not claim
+those APIs or commands exist. Authoritative security design remains
+`docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md`.
 
 **Scope:** Managed-key stages for multi-tenant DarkIRC. Phase 0/1 and Stage A
 are implemented; activation/rollback, rotation/revocation, same-host pairing,

@@ -1,22 +1,21 @@
 # Secure Automated DarkIRC Key Exchange
 
-> **Current status (2026-07-29): OPEN / PLANNED in the release tree.** No
-> proposed key-exchange commands, ledger, journal, or web surfaces exist in the
-> merged codebase (verified: `ic/scripts/lunarwing-mt-admin.sh` has no exchange
-> verbs). The Phase 0 prerequisite is also open: DarkIRC config regeneration
-> can still replace the whole TOML instead of preserving manually managed
-> contacts.
->
-> **Unmerged partial work exists** — goals item #20 landed Phase 1 + Stage A
-> exchange verbs (commit `49736ad`) and Stage C apply/confirm-roundtrip verbs
-> (`506eb7b`) on branch `rarity/item-20-20260722-1501`; see also
-> `darkirckeyex/aragents/v2.0.3.0` and `feat/darkirc-key-exchange-v1`. Item #29
-> records that item #20 was **not** completed/merged. Any future implementation
-> should start by salvaging those branches rather than starting greenfield.
+> **Current status (2026-07-31): Phase 0/1 and Stage A IMPLEMENTED on branch
+> `rarity/kimi-21-20260731-1800`.** Contact-preserving config ownership,
+> binary attestation, scope IDs, read-only inspection/adoption, structured
+> migration safeguards, the strict `darkirc-health` gate, and the Public
+> Exchange V1 verbs (`prepare`, `respond`, `complete` with deferred
+> activation, `cancel`, `exchanges`) exist in
+> `ic/scripts/lunarwing-mt-admin.sh` plus the typed helper
+> `ic/src/darkirc_key_manager.rs` / `lunarwing-darkirc-key-helper`.
+> Activation/rollback (Stage C), rotation, revocation, same-host pairing,
+> and web/QR/trusted-channel delivery remain unimplemented; see
+> [Next Stages](DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md) for stage boundaries.
+> The earlier `dik/v2.0.4.0` MR was rejected on review; this branch
+> re-landed the work as reviewed cherry-picks with the review defects fixed.
 
-**Status:** Proposal only. None of the commands, state files, APIs, or web
-surfaces described here exist yet (in the merged tree — see unmerged branches
-above).
+**Status:** Proposal partially implemented (Phase 0/1 + Stage A); later
+stages remain proposal only.
 
 **Scope:** LunarWing multi-tenant DarkIRC deployments managed through
 `ic/scripts/lunarwing-mt-admin.sh`.
