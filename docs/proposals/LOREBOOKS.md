@@ -1,6 +1,6 @@
 # Idea
 
-> **Current status (2026-07-30, branch `aj/kimi-8-20260730-1803`): IMPLEMENTED (v1).**
+> **Current status (2026-07-31): IMPLEMENTED (v1).**
 > Lorebook data model, keyword activation engine, and chat-prompt integration
 > exist in `ic/src/lorebook/`. See "Implemented shape" below.
 
@@ -22,12 +22,14 @@ export shape and a simpler native shape are accepted:
       "content": "Dragons are extinct in this setting.",
       "constant": false,
       "selective": true,
+      "selectiveLogic": 0,
       "order": 100,
       "disable": false,
       "probability": 80,
       "useProbability": true,
       "scanDepth": 4,
-      "caseSensitive": false
+      "caseSensitive": false,
+      "matchWholeWords": true
     }
   }
 }
@@ -39,19 +41,35 @@ entries are appended to the system prompt as a `## Lorebook` block of
 `<lore_entry>` elements.
 
 - Parsing/model: `ic/src/lorebook/model.rs` (SillyTavern field aliases,
-  `disable`→`enabled` inversion, probability gating, bare array/map forms).
+  `disable`→`enabled` inversion, probability gating, all four
+  `selectiveLogic` modes, per-entry case/whole-word matching, bare array/map
+  forms). Malformed individual entries are skipped without dropping valid
+  siblings; map IDs and file paths load deterministically.
 - Activation engine: `ic/src/lorebook/engine.rs` (constant entries, selective
-  secondary keys, probability rolls, per-entry scan depth, insertion ordering,
-  approximate token budget).
+  secondary keys, context-stable probability rolls, per-entry scan depth,
+  insertion ordering, approximate token budget). Budget selection prioritizes
+  constant entries, then descending order; selected entries render in ascending
+  order so larger values remain closer to the end of the prompt.
 - Workspace loading + prompt block: `ic/src/lorebook/mod.rs`
   (`lorebooks/` dir, primary-scope reads like other identity files).
 - Runtime knobs: `LOREBOOK_ENABLED` (default true), `LOREBOOK_SCAN_DEPTH`
   (10), `LOREBOOK_MAX_ENTRIES` (20), `LOREBOOK_TOKEN_BUDGET` (1200, 0 =
-  unlimited).
-- Security: writes under `lorebooks/` go through the same prompt-injection
-  scan as other system-prompt files (`ic/src/workspace/mod.rs`).
+  no configurable token cap). Hard maxima are 100 scanned messages, 100 active
+  entries, 256 KiB scanned text, 32,768 approximate configured tokens, and 256
+  KiB rendered prompt bytes.
+- Resource bounds: at most 64 files, 1 MiB per file, 4 MiB aggregate source,
+  1,024 entries per file, and 4,096 aggregate entries load per turn. Entry
+  names, keys, key counts, and content also have hard parser caps.
+- Security: default and named-layer writes under `lorebooks/` scan raw JSON and
+  decoded prompt-visible fields for prompt injection. Loading repeats the
+  decoded scan for legacy/direct-database documents. Wrapper-like
+  `<lore_entry>` tags are escaped. Lorebook appends are rejected; write the
+  complete JSON document with replace semantics instead.
 
 Deferred from full SillyTavern parity (v1 intentionally excludes): in-chat
-`@depth` insertion positions, recursive triggering, vectorized matching,
-entry groups/sticky/cooldown, and a dedicated lorebook management tool or
-web UI (files are managed as ordinary workspace documents for now).
+`@depth` and other insertion positions/roles, recursive triggering, JavaScript
+regex keys (currently treated as plaintext), vectorized matching, global
+case/whole-word fallback settings, entry groups/sticky/cooldown, macros,
+additional character/persona matching sources, and a dedicated lorebook
+management tool or web UI (files are managed as ordinary workspace documents
+for now).

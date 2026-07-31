@@ -131,6 +131,20 @@ When a workspace has additional read scopes (via `with_additional_read_scopes`),
 
 **Design rule:** If you want shared identity across users, seed the same content into each user's scope at setup time. Don't rely on multi-scope fallback for identity files.
 
+### Lorebooks
+
+`lorebooks/*.json` accepts SillyTavern World Info exports or the native array
+shape documented in `docs/proposals/LOREBOOKS.md`. Lorebooks are prompt-visible
+configuration: default and named-layer writes scan both raw JSON and decoded
+entry text for prompt injection, and loading scans decoded text again. Create or
+update a lorebook with a complete-document replacement (`append: false`);
+lorebook appends are rejected.
+
+Loading is bounded to 64 files, 1 MiB per file, 4 MiB aggregate source, and
+4,096 aggregate entries. Runtime selection also enforces scan-depth, active-entry,
+approximate-token, and rendered-byte caps. See the proposal for exact supported
+SillyTavern fields and deferred parity.
+
 ## Heartbeat System
 
 Proactive periodic execution (default: 30 minutes):
