@@ -1186,6 +1186,7 @@ impl Agent {
             channel: message.channel.clone(),
             content: response.clone(),
             thread_id: message.thread_id.clone(),
+            policy_scope: crate::channels::routing_target_from_metadata(&message.metadata),
         };
         match self.hooks().run(&event).await {
             Err(error) => {
@@ -1464,13 +1465,30 @@ impl Agent {
                 channel: message.channel.clone(),
                 content: content.clone(),
                 thread_id: message.thread_id.clone(),
+                policy_scope: crate::channels::routing_target_from_metadata(&message.metadata),
             };
             match self.hooks().run(&event).await {
                 Err(crate::hooks::HookError::Rejected { reason }) => {
-                    return Ok(Some(format!("[Message rejected: {}]", reason)));
+                    // Typed suppression (ISSUE-004): return the empty response,
+                    // which the delivery layer drops, instead of manufacturing
+                    // channel text that would re-enter outbound hooks and be
+                    // mis-scored as this agent's own policy violation.
+                    tracing::debug!(
+                        channel = %message.channel,
+                        user = %message.user_id,
+                        reason = %reason,
+                        "Inbound hook rejected message; suppressing response"
+                    );
+                    return Ok(Some(String::new()));
                 }
                 Err(err) => {
-                    return Ok(Some(format!("[Message blocked by hook policy: {}]", err)));
+                    tracing::warn!(
+                        channel = %message.channel,
+                        user = %message.user_id,
+                        error = %err,
+                        "Inbound hook blocked message; suppressing response"
+                    );
+                    return Ok(Some(String::new()));
                 }
                 Ok(crate::hooks::HookOutcome::Continue {
                     modified: Some(new_content),

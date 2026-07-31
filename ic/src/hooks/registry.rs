@@ -327,6 +327,7 @@ mod tests {
             channel: "test".into(),
             content: "hello".into(),
             thread_id: None,
+            policy_scope: None,
         }
     }
 

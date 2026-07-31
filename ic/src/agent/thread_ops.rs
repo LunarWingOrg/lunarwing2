@@ -529,6 +529,9 @@ impl Agent {
                         thread_id: thread_id.to_string(),
                         response: response.clone(),
                         channel: Some(message.channel.clone()),
+                        policy_scope: crate::channels::routing_target_from_metadata(
+                            &message.metadata,
+                        ),
                     };
                     match self.hooks().run(&event).await {
                         Err(crate::hooks::HookError::Rejected { reason }) => {

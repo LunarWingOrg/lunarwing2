@@ -3321,6 +3321,7 @@ async fn handle_mission_notification(
             channel: channel_name.clone(),
             content: full_text.clone(),
             thread_id: Some(notif.thread_id.to_string()),
+            policy_scope: None,
         };
         let outbound_text = match hooks.run(&event).await {
             Err(error) => {
