@@ -3527,7 +3527,6 @@ pub fn inspect_exchanges(paths: &TenantPaths, scope_id: &str) -> Result<Vec<Exch
 // Stage B/C prototypes remain excluded until their state transitions and
 // recovery contracts receive dedicated implementation and review.
 
-
 pub fn recover(paths: &TenantPaths, scope_id: &str) -> Result<()> {
     validate_scope_id(scope_id)?;
     let workspace = Workspace::open(paths.clone())?;
