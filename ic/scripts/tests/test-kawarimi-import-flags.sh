@@ -28,6 +28,16 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    fail "$label"
+    printf '        unexpectedly contains: %s\n' "$needle"
+  else
+    pass "$label"
+  fi
+}
+
 assert_file_contains() {
   local label="$1" file="$2" needle="$3"
   if grep -qF -- "$needle" "$file"; then
@@ -61,8 +71,10 @@ META
 SECRETS_MASTER_KEY="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 XMPP_JID=kawarimi@example.test
 GATEWAY_HOST=0.0.0.0
-NANOCODE_MODEL=test-nanocode-model
-NANOCODE_BASE_URL=https://nanocode.example.test/openai/v1
+NANOCODE_MODEL=retired-nanocode-model
+NANOCODE_BASE_URL=https://retired-nanocode.example.test/openai/v1
+OPENCODE_MODEL=test-opencode-model
+OPENCODE_BASE_URL=https://opencode.example.test/openai/v1
 KIMI_API_KEY=kimi-manifest-secret
 ENV
   cat >"$work/bundle-src/manifest-bridge.env" <<'ENV'
@@ -153,8 +165,10 @@ output="$(
 }
 
 assert_contains "passes --docker-group to add-tenant" "$output" "--docker-group"
-assert_contains "preserves nanocode model override" "$output" "--nanocode-model test-nanocode-model"
-assert_contains "preserves nanocode base URL override" "$output" "--nanocode-base-url https://nanocode.example.test/openai/v1"
+assert_contains "preserves opencode model override" "$output" "--opencode-model test-opencode-model"
+assert_contains "preserves opencode base URL override" "$output" "--opencode-base-url https://opencode.example.test/openai/v1"
+assert_not_contains "does not forward retired Nanocode model" "$output" "retired-nanocode-model"
+assert_not_contains "does not forward retired Nanocode base URL" "$output" "retired-nanocode.example.test"
 assert_contains "builds vision sidecar when requested" "$output" "build-vision-sidecar"
 assert_contains "injects vision manifest" "$output" "manifest-vision.env ->"
 assert_contains "runs WeeChat preflight before start" "$output" "lunarwing-weechat-preflight.sh kawarimi"
@@ -170,7 +184,7 @@ worker_output="$(
   KAWARIMI_TEST_WORK="$tmp" \
   bash "$tmp/scripts/import-tenant.sh" "$tmp/kawarimi.tar" \
     --dry-run --yes \
-    --with-nanocode --with-opencode \
+    --with-pebble --with-opencode \
     2>&1
 )" || {
   status=$?
@@ -183,20 +197,20 @@ worker_output="$(
 # planned invocations so a flag on one can't satisfy an assertion on the other.
 add_line="$(printf '%s\n' "$worker_output" | grep -m1 '\[dry-run\].* add-tenant ' || true)"
 build_line="$(printf '%s\n' "$worker_output" | grep -m1 '\[dry-run\].* build-tenant ' || true)"
-assert_contains "add-tenant carries --with-nanocode" "$add_line" "--with-nanocode"
+assert_contains "add-tenant carries --with-pebble" "$add_line" "--with-pebble"
 assert_contains "add-tenant carries --with-opencode" "$add_line" "--with-opencode"
-assert_contains "build-tenant carries --with-nanocode" "$build_line" "--with-nanocode"
+assert_contains "build-tenant carries --with-pebble" "$build_line" "--with-pebble"
 assert_contains "build-tenant carries --with-opencode" "$build_line" "--with-opencode"
-# Unselected worker must NOT appear on either planned call.
-if [[ "$add_line" == *"--with-pebble"* ]]; then
-  fail "add-tenant leaked --with-pebble (not selected)"
+# Retired worker must NOT appear on either planned call.
+if [[ "$add_line" == *"--with-nanocode"* ]]; then
+  fail "add-tenant leaked retired --with-nanocode"
 else
-  pass "add-tenant omits unselected --with-pebble"
+  pass "add-tenant omits retired --with-nanocode"
 fi
-if [[ "$build_line" == *"--with-pebble"* ]]; then
-  fail "build-tenant leaked --with-pebble (not selected)"
+if [[ "$build_line" == *"--with-nanocode"* ]]; then
+  fail "build-tenant leaked retired --with-nanocode"
 else
-  pass "build-tenant omits unselected --with-pebble"
+  pass "build-tenant omits retired --with-nanocode"
 fi
 
 echo "=== import-tenant explicit owner-scope dry-run ==="
@@ -245,6 +259,8 @@ assert_file_contains "import keeps target sidecar token" "$tmp/home/kawarimi/lun
 assert_file_contains "import keeps matching daemon token" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "VISION_AUTH_TOKEN=target-vision-token"
 assert_file_not_contains "import ignores carried sidecar token" "$tmp/home/kawarimi/lunarwing/env/vision.env" "LUNARWING_AUTH_TOKEN=vision-token"
 assert_file_contains "import injects Kimi key after provisioning" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "KIMI_API_KEY=kimi-manifest-secret"
+assert_file_not_contains "import drops retired Nanocode model" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "NANOCODE_MODEL="
+assert_file_not_contains "import drops retired Nanocode base URL" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "NANOCODE_BASE_URL="
 assert_file_not_contains "import keeps Kimi key out of mt-admin argv" "$tmp/mt-admin.log" "kimi-manifest-secret"
 if [[ "$auto_output" == *"kimi-manifest-secret"* ]]; then
   fail "import keeps Kimi key out of logs"
@@ -513,8 +529,6 @@ full_passphrase="full-roundtrip-passphrase"
 printf '%s' "$full_passphrase" >"$tmp/full-passphrase"
 cat >>"$tmp/export-home/alpha/lunarwing/env/lunarwing.env" <<'ENV'
 LLM_BASE_URL=https://localhost:7443/openai/v1
-NANOCODE_MODEL=roundtrip-nanocode
-NANOCODE_BASE_URL=https://127.0.0.2:7443/openai/v1
 OPENCODE_MODEL=roundtrip-opencode
 OPENCODE_BASE_URL=https://[::1]:7443/openai/v1
 KIMI_API_KEY=encrypted-roundtrip-kimi-secret
@@ -553,7 +567,6 @@ roundtrip_output="$(
   exit "$status"
 }
 assert_contains "production encrypted export can be imported" "$roundtrip_output" "DRY RUN"
-assert_contains "production export preserves Nanocode model" "$roundtrip_output" "--nanocode-model roundtrip-nanocode"
 assert_contains "production export preserves OpenCode model" "$roundtrip_output" "--opencode-model roundtrip-opencode"
 if [[ "$full_export_output$roundtrip_output" == *"encrypted-roundtrip-kimi-secret"* ]]; then
   fail "encrypted Kimi round-trip does not log plaintext key"
@@ -568,7 +581,6 @@ manifest_path="$(find "$tmp/roundtrip-extract" -name manifest-lunarwing.env -pri
 assert_file_contains "encrypted manifest preserves Kimi API key" "$manifest_path" "KIMI_API_KEY=encrypted-roundtrip-kimi-secret"
 for source_local_url in \
   'https://localhost:7443/openai/v1' \
-  'https://127.0.0.2:7443/openai/v1' \
   'https://[::1]:7443/openai/v1'; do
   if [[ "$roundtrip_output" == *"$source_local_url"* ]]; then
     fail "production export drops host-local endpoint $source_local_url"

@@ -85,7 +85,6 @@ ports_get() {  # <name> <service>
     proxy)           echo 10004 ;;
     weechat)         echo 10005 ;;
     orchestrator)    echo 10006 ;;
-    nanocode_wss)    echo 10007 ;;
     pebble_wss)      echo 10008 ;;
     weechat_adapter) echo 10009 ;;
     coord_admin)     echo 20009 ;;
@@ -123,7 +122,7 @@ assert_eq "coordination admin port allocated" "$(envval COORD_ADMIN_PORT)" "2000
 
 # Case 2: all three flags on first write
 out="$(run_writer fixture-tenant \
-  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" "" "" \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" \
   "glm-5-air" "0.0.0.0" "admin@xmpp.org,bob@xmpp.org")"
 assert_eq "flag LLM_MODEL" "$(envval LLM_MODEL)" "glm-5-air"
 assert_eq "flag GATEWAY_HOST" "$(envval GATEWAY_HOST)" "0.0.0.0"
@@ -134,7 +133,7 @@ assert_eq "flag XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmp
 #   once with flags, then a second time without — but keep the file between.)
 rm -f "$MT_FIXTURE/env/lunarwing.env"
 write_tenant_lunarwing_env fixture-tenant \
-  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" "" "" \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" \
   "glm-5-air" "0.0.0.0" "admin@xmpp.org"
 sed -i \
   -e 's/^COORD_ENABLED=.*/COORD_ENABLED=true/' \
@@ -147,9 +146,9 @@ LW2STUDYMCP_HOME=/srv/lunarwing/lw2studymcp
 LW2STUDYMCP_STATE_HOME=/srv/lunarwing/study-state
 LW2STUDYMCP_ALLOW_WRITE=1
 EOF
-# Now re-run WITHOUT the new flags (pass empty for slots 9-11) — file exists.
+# Now re-run WITHOUT the new flags (pass empty for slots 7-9) — file exists.
 write_tenant_lunarwing_env fixture-tenant \
-  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" "" "" \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" \
   "" "" ""
 assert_eq "rerun preserves LLM_MODEL" "$(envval LLM_MODEL)" "glm-5-air"
 assert_eq "rerun preserves GATEWAY_HOST" "$(envval GATEWAY_HOST)" "0.0.0.0"
@@ -292,7 +291,7 @@ PORTS_REGISTRY="$WORKERS_REG"
 cat > "$WORKERS_REG" <<JSON
 {"tenants":{
   "oldt":{"base_port":10020},
-  "sel":{"base_port":10030,"workers":{"nanocode":true,"pebble":false,"opencode":false}}
+  "sel":{"base_port":10030,"workers":{"pebble":true,"opencode":false,"kimi":false}}
 }}
 JSON
 
@@ -303,13 +302,13 @@ worker_state() {  # <tenant> <worker> -> prints "on" | "off"
 
 # Absent workers key => every worker OFF (the bug this fixes: previously a
 # tenant started every worker whose shared image existed).
-assert_eq "old tenant nanocode OFF" "$(worker_state oldt nanocode)" "off"
 assert_eq "old tenant pebble OFF"   "$(worker_state oldt pebble)"   "off"
 assert_eq "old tenant opencode OFF" "$(worker_state oldt opencode)" "off"
+assert_eq "old tenant kimi OFF"     "$(worker_state oldt kimi)"     "off"
 
 # Explicit selection honored.
-assert_eq "selected nanocode ON"  "$(worker_state sel nanocode)" "on"
-assert_eq "unselected pebble OFF" "$(worker_state sel pebble)"   "off"
+assert_eq "selected pebble ON"      "$(worker_state sel pebble)"     "on"
+assert_eq "unselected opencode OFF" "$(worker_state sel opencode)"   "off"
 
 # Resume flip is one-directional (false->true), idempotent, and creates the
 # workers map on a tenant that lacked one — without leaking other workers ON.
@@ -317,7 +316,7 @@ ports_enable_worker oldt opencode >/dev/null 2>&1
 assert_eq "resume enable opencode"   "$(worker_state oldt opencode)" "on"
 ports_enable_worker oldt opencode >/dev/null 2>&1   # idempotent
 assert_eq "resume enable idempotent" "$(worker_state oldt opencode)" "on"
-assert_eq "resume no leak nanocode"  "$(worker_state oldt nanocode)" "off"
+assert_eq "resume no leak pebble"    "$(worker_state oldt pebble)"   "off"
 if jq -e . "$WORKERS_REG" >/dev/null 2>&1; then
   echo "  PASS: registry remains valid JSON after enable"
 else
@@ -370,23 +369,68 @@ fi
 
 echo "=== CLI dispatch parsing smoke check ==="
 
-# Verify the dispatch block recognizes the new flags by invoking the script
-# directly with a deliberately-bad tenant name AFTER the flags; if the flags
-# parsed, the script reaches require_root (not "unknown flag"). As non-root,
-# require_root exits with a permission message; we assert it does NOT mention
-# "unknown flag".
-err="$(bash "$ADMIN_SCRIPT" add-tenant \
+# Bypass root and provisioning inside the sourced harness so this tests
+# dispatch only: supported worker flags must parse, and the retired nanocode
+# flags must be rejected with the explicit retirement message.
+require_root() { :; }
+add_tenant() { :; }
+err="$(main add-tenant fixture \
   --llm-model glm-5-air \
   --gateway-host 0.0.0.0 \
   --xmpp-allow-from admin@xmpp.org \
-  --with-nanocode --with-pebble --with-opencode \
+  --with-pebble --with-opencode --with-kimi \
   2>&1 || true)"
 if echo "$err" | grep -q 'unknown flag'; then
-  echo "  FAIL: a new flag was rejected as unknown"
+  echo "  FAIL: a supported flag was rejected as unknown"
   echo "        $err"
   failures=$((failures + 1))
 else
-  echo "  PASS: all new flags (incl. --with-nanocode/pebble/opencode) parsed"
+  echo "  PASS: supported worker flags parsed"
+fi
+
+retired_output="$(main add-tenant fixture --with-nanocode 2>&1)" || true
+if echo "$retired_output" | grep -q 'retired with the Nanocode worker'; then
+  echo "  PASS: retired --with-nanocode flag rejected with retirement message"
+else
+  echo "  FAIL: retired --with-nanocode flag accepted or misreported"
+  echo "        $retired_output"
+  failures=$((failures + 1))
+fi
+
+retired_output="$(main add-tenant fixture --nanocode-model foo 2>&1)" || true
+if echo "$retired_output" | grep -q 'retired with the Nanocode worker'; then
+  echo "  PASS: retired --nanocode-model flag rejected with retirement message"
+else
+  echo "  FAIL: retired --nanocode-model flag accepted or misreported"
+  echo "        $retired_output"
+  failures=$((failures + 1))
+fi
+
+retired_output="$(main build-nanocode-worker 2>&1)" || true
+if echo "$retired_output" | grep -q 'retired with the Nanocode worker'; then
+  echo "  PASS: retired build-nanocode-worker command rejected"
+else
+  echo "  FAIL: retired build-nanocode-worker command accepted or misreported"
+  echo "        $retired_output"
+  failures=$((failures + 1))
+fi
+
+retired_output="$(main configure-nanocode fixture --model foo 2>&1)" || true
+if echo "$retired_output" | grep -q 'retired with the Nanocode worker'; then
+  echo "  PASS: retired configure-nanocode command rejected"
+else
+  echo "  FAIL: retired configure-nanocode command accepted or misreported"
+  echo "        $retired_output"
+  failures=$((failures + 1))
+fi
+
+retired_output="$(main build-tenant fixture --with-nanocode 2>&1)" || true
+if echo "$retired_output" | grep -q 'retired with the Nanocode worker'; then
+  echo "  PASS: retired build-tenant --with-nanocode rejected"
+else
+  echo "  FAIL: build-tenant --with-nanocode accepted or misreported"
+  echo "        $retired_output"
+  failures=$((failures + 1))
 fi
 
 # Verify --no-weechat-bootstrap is accepted by add-tenant dispatch.
