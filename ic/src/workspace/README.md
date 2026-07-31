@@ -28,6 +28,8 @@ workspace/
 ├── daily/                 <- Daily logs
 │   ├── 2024-01-15.md
 │   └── 2024-01-16.md
+├── lorebooks/             <- SillyTavern-style world info, keyword-triggered into system prompt
+│   └── fantasy.json
 ├── projects/              <- Arbitrary structure
 │   └── alpha/
 │       ├── README.md
@@ -121,12 +123,27 @@ When a workspace has additional read scopes (via `with_additional_read_scopes`),
 | IDENTITY.md | `read_primary()` | Identity is per-user |
 | TOOLS.md | `read_primary()` | Tool config is per-user |
 | BOOTSTRAP.md | `read_primary()` | Onboarding is per-user |
+| lorebooks/*.json | `list_primary()`/`read_primary()` | World lore is agent configuration, per-user |
 | MEMORY.md | `read()` | Shared memory is a feature |
 | daily/*.md | `read()` | Shared daily logs are a feature |
 
 **Why:** Without this, a user with read access to another scope could silently inherit that scope's identity if their own copy is missing. The agent would present itself as the wrong user — a correctness and security issue.
 
 **Design rule:** If you want shared identity across users, seed the same content into each user's scope at setup time. Don't rely on multi-scope fallback for identity files.
+
+### Lorebooks
+
+`lorebooks/*.json` accepts SillyTavern World Info exports or the native array
+shape documented in `docs/proposals/LOREBOOKS.md`. Lorebooks are prompt-visible
+configuration: default and named-layer writes scan both raw JSON and decoded
+entry text for prompt injection, and loading scans decoded text again. Create or
+update a lorebook with a complete-document replacement (`write`); lorebook
+appends are rejected.
+
+Loading is bounded to 64 files, 1 MiB per file, 4 MiB aggregate source, and
+4,096 aggregate entries. Runtime selection also enforces scan-depth,
+active-entry, approximate-token, and rendered-byte caps. See the proposal for
+exact supported SillyTavern fields and deferred parity.
 
 ## Heartbeat System
 
