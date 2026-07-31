@@ -382,7 +382,8 @@ sudo rc-service lunarwing-proxy-<tenant> restart            # TensorZero proxy
 sudo rc-service lunarwing-pg-<tenant> restart               # Postgres container
 sudo rc-service lunarwing-weechat-<tenant> restart          # weechat backend
 sudo rc-service lunarwing-weechat-adapter-<tenant> restart  # weechat WS adapter
-# workers (if provisioned): lunarwing-nanocode-<tenant>, lunarwing-pebble-<tenant>, lunarwing-opencode-<tenant>
+# workers (if provisioned): lunarwing-pebble-<tenant>, lunarwing-opencode-<tenant>, lunarwing-kimi-<tenant>
+# (legacy lunarwing-nanocode-<tenant> units are retired on start/stop/remove)
 # each worker also has a <unit>-sup babysitter; stop it before stopping a container manually
 ```
 
@@ -438,7 +439,7 @@ Primary block:
 | +4 | TensorZero proxy |
 | +5 | WeeChat |
 | +6 | Orchestrator |
-| +7 | Nanocode WSS |
+| +7 | Nanocode WSS (reserved legacy slot; Nanocode retired) |
 | +8 | Pebble WSS |
 | +9 | WeeChat adapter |
 
@@ -446,7 +447,7 @@ Extended block (registry v6+; opencode_wss/health added in v11):
 
 | Offset | Service |
 |--------|---------|
-| ebase+3 | nanocode_health |
+| ebase+3 | nanocode_health (reserved legacy slot; Nanocode retired) |
 | ebase+4 | pebble_health |
 | ebase+7 | opencode_wss |
 | ebase+8 | opencode_health |
