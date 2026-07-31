@@ -485,6 +485,13 @@ impl Hook for EngagementPolicyHook {
 }
 
 /// Priority 16 — first responder wins; duplicates are rejected.
+///
+/// Scope note (ISSUE-013): claims live in this process's in-memory
+/// `CoordinationState`, so deduplication is **process-local** — it covers
+/// hooks sharing one daemon's state, NOT separate tenant daemons watching
+/// the same MUC. Two independent agents can both claim and both respond.
+/// A shared compare-and-insert backend (host-local store or broker op) is
+/// deferred; treat this as opportunistic self-deduplication only.
 pub struct FirstResponderHook {
     state: CoordinationState,
     agent_id: String,
