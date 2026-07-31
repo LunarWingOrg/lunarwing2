@@ -24,7 +24,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const ATTESTED_DARKIRC_PATH: &str = "/usr/local/bin/darkirc";
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Options {
     tenant: Option<String>,
     scope_id: Option<String>,
@@ -45,32 +45,6 @@ struct Options {
     defer_apply: bool,
     json: bool,
     exchange_id: Option<String>,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            tenant: None,
-            scope_id: None,
-            expected_uid: None,
-            expected_gid: None,
-            contact: None,
-            generator_profile: None,
-            binary_sha256: None,
-            binary_path: None,
-            key_format: None,
-            source_revision: None,
-            unbound_validation: false,
-            yes: false,
-            out_path: None,
-            in_path: None,
-            expect_peer_fingerprint: None,
-            expires_seconds: None,
-            defer_apply: false,
-            json: false,
-            exchange_id: None,
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
