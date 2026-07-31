@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -145,6 +146,10 @@ pub enum CoalesceDecision {
 pub struct CoalesceBuffer {
     config: CoalesceConfig,
     pending: Arc<Mutex<HashMap<ChannelKey, PendingMessage>>>,
+    /// Monotonic generation source for timer identity. Generations are never
+    /// reused, so a stale timer can never match a replacement entry that was
+    /// inserted after an early flush removed the original (ISSUE-005).
+    next_generation: Arc<AtomicU64>,
 }
 
 impl CoalesceBuffer {
@@ -153,6 +158,7 @@ impl CoalesceBuffer {
         Self {
             config,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            next_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -160,6 +166,10 @@ impl CoalesceBuffer {
     ///
     /// `flush` is invoked (on a spawned task) with the merged content when
     /// the window expires, on early flush, or from [`Self::flush_all`].
+    ///
+    /// Lookup, merge, overflow handling, and fresh insertion all happen
+    /// under one map lock so concurrent first submissions for a key merge
+    /// instead of replacing each other (ISSUE-005).
     pub async fn submit(
         &self,
         key: ChannelKey,
@@ -170,54 +180,70 @@ impl CoalesceBuffer {
             return CoalesceDecision::SendNow(content);
         }
 
-        let mut guard = self.pending.lock().await;
-        if let Some(existing) = guard.get_mut(&key) {
-            let merged = merge_contents(&existing.content, &content);
-            if merged.chars().count() > self.config.max_message_length {
-                // Overflow: flush pending now, start a fresh window.
-                let taken = guard.remove(&key);
-                if let Some(taken) = taken {
-                    spawn_flush(taken.flush, taken.content);
+        // Collected under the lock; flushed after it is released so delivery
+        // never serializes on (or re-enters) the pending map.
+        let mut early_flush: Option<(FlushFn, String)> = None;
+        let mut arm_timer: Option<u64> = None;
+        {
+            let mut guard = self.pending.lock().await;
+            match guard.get_mut(&key) {
+                Some(existing) => {
+                    let merged = merge_contents(&existing.content, &content);
+                    if merged.chars().count() > self.config.max_message_length {
+                        // Overflow: flush pending now, start a fresh window.
+                        if let Some(taken) = guard.remove(&key) {
+                            early_flush = Some((taken.flush, taken.content));
+                        }
+                        arm_timer = Some(self.insert_fresh(&mut guard, &key, content, flush));
+                    } else {
+                        existing.content = merged;
+                        existing.merge_count += 1;
+                        if existing.merge_count >= self.config.max_merges
+                            && let Some(taken) = guard.remove(&key)
+                        {
+                            early_flush = Some((taken.flush, taken.content));
+                        }
+                    }
                 }
-                drop(guard);
-                return self.submit_new(key, content, flush).await;
-            }
-            existing.content = merged;
-            existing.merge_count += 1;
-            if existing.merge_count >= self.config.max_merges {
-                let taken = guard.remove(&key);
-                if let Some(taken) = taken {
-                    spawn_flush(taken.flush, taken.content);
+                None => {
+                    arm_timer = Some(self.insert_fresh(&mut guard, &key, content, flush));
                 }
             }
-            return CoalesceDecision::Buffered;
         }
-        drop(guard);
-        self.submit_new(key, content, flush).await
+
+        if let Some((flush, content)) = early_flush {
+            spawn_flush(flush, content);
+        }
+        if let Some(generation) = arm_timer {
+            self.spawn_timer(key, generation);
+        }
+        CoalesceDecision::Buffered
     }
 
-    /// Insert a fresh pending entry and arm its expiry timer.
-    async fn submit_new(
+    /// Insert a fresh pending entry under the held map lock and return its
+    /// globally unique generation.
+    fn insert_fresh(
         &self,
-        key: ChannelKey,
+        guard: &mut HashMap<ChannelKey, PendingMessage>,
+        key: &ChannelKey,
         content: String,
         flush: FlushFn,
-    ) -> CoalesceDecision {
-        let generation = {
-            let mut guard = self.pending.lock().await;
-            let generation = guard.get(&key).map(|p| p.generation + 1).unwrap_or(0);
-            guard.insert(
-                key.clone(),
-                PendingMessage {
-                    content,
-                    merge_count: 0,
-                    flush,
-                    generation,
-                },
-            );
-            generation
-        };
+    ) -> u64 {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        guard.insert(
+            key.clone(),
+            PendingMessage {
+                content,
+                merge_count: 0,
+                flush,
+                generation,
+            },
+        );
+        generation
+    }
 
+    /// Arm the window-expiry timer for a freshly inserted entry.
+    fn spawn_timer(&self, key: ChannelKey, generation: u64) {
         let pending = Arc::clone(&self.pending);
         let window = self.config.window;
         tokio::spawn(async move {
@@ -233,7 +259,6 @@ impl CoalesceBuffer {
                 (taken.flush)(taken.content).await;
             }
         });
-        CoalesceDecision::Buffered
     }
 
     /// Flush every pending message (thread termination / engine shutdown).
@@ -479,5 +504,58 @@ mod tests {
         buffer.flush_all().await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_first_submissions_merge_not_lose() {
+        // ISSUE-005 regression: two concurrent first submissions for one key
+        // must merge atomically; neither message may be dropped.
+        let buffer = CoalesceBuffer::new(test_config());
+        let (flush, sent) = collector();
+        let (d1, d2) = tokio::join!(
+            buffer.submit(key(), "STATUS: one".into(), flush.clone()),
+            buffer.submit(key(), "STATUS: two".into(), flush.clone()),
+        );
+        assert_eq!(d1, CoalesceDecision::Buffered);
+        assert_eq!(d2, CoalesceDecision::Buffered);
+        // Exactly one pending entry holds both messages.
+        assert_eq!(buffer.pending_count().await, 1);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let delivered = sent.lock().await.clone();
+        assert_eq!(delivered.len(), 1, "exactly one merged delivery expected");
+        assert!(delivered[0].contains("one"));
+        assert!(delivered[0].contains("two"));
+    }
+
+    #[tokio::test]
+    async fn test_stale_timer_cannot_remove_reinserted_entry() {
+        // ISSUE-005 regression: after an early flush removes an entry, a
+        // reinserted entry must survive the old entry's window timer.
+        let mut config = test_config();
+        config.window = Duration::from_millis(100);
+        let buffer = CoalesceBuffer::new(config);
+        let (flush, sent) = collector();
+        buffer.submit(key(), "STATUS: old".into(), flush.clone()).await;
+        // Early flush: "old" is delivered now, but its window timer is armed.
+        buffer.flush_all().await;
+        // Reinsert halfway through the old window; the new entry gets a
+        // fresh generation, so the old timer (due at ~100ms from the first
+        // submit) must ignore it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        buffer.submit(key(), "STATUS: new".into(), flush.clone()).await;
+        // At ~120ms: old timer has fired, the new entry's timer has not.
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        assert_eq!(
+            buffer.pending_count().await,
+            1,
+            "stale timer must not remove the reinserted entry"
+        );
+        // The new entry's own timer delivers it exactly once.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let delivered = sent.lock().await.clone();
+        assert_eq!(
+            delivered,
+            vec!["STATUS: old".to_string(), "STATUS: new".to_string()]
+        );
     }
 }
