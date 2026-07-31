@@ -183,8 +183,12 @@ impl Agent {
                         // Bump the canonical stored pattern (not the raw
                         // input) so fuzzy/semantic/promoted hits also update
                         // match_count and last_matched_at on the right row.
+                        // The router cache is loaded for `owner_id`, so the
+                        // matched pattern is always an owner-scoped row —
+                        // bumping with `message.user_id` would silently hit
+                        // 0 rows for any non-owner sender.
                         if let Err(e) = store
-                            .bump_reflex_pattern_match(&message.user_id, &route.matched_pattern)
+                            .bump_reflex_pattern_match(self.owner_id(), &route.matched_pattern)
                             .await
                         {
                             tracing::debug!("Failed to bump reflex pattern match: {}", e);
