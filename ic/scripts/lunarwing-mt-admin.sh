@@ -234,6 +234,18 @@ tenant_proxy_enabled() {
   [[ "$val" == "true" ]]
 }
 
+# Whether WeeChat is enabled for this tenant. Default TRUE: the flag is
+# absent on tenants created before the health-gate existed, and a missing or
+# unreadable registry must fail safe to the old behavior (weechat managed).
+# Used to make disable-weechat authoritative for lifecycle, not just health
+# classification (ISSUE-006). Explicit ==false test: jq `//` misreads false.
+tenant_weechat_enabled() {
+  local name="$1"
+  local val
+  val="$(jq -r --arg name "$name" 'if .tenants[$name].enable_weechat == false then "false" else "true" end' "$PORTS_REGISTRY" 2>/dev/null)"
+  [[ "$val" != "false" ]]
+}
+
 # Whether a given external worker (nanocode|pebble|opencode) is selected for this
 # tenant. The selection is persisted at add-tenant into
 # .tenants[<name>].workers.<worker> and gates start_tenant_<worker> — otherwise a
@@ -444,12 +456,13 @@ Commands:
                                    Preserves existing config: fails on any
                                    non-empty ~/.config/weechat without modifying it.
 
-  disable-weechat <name>           Mark WeeChat disabled for a tenant: health checks
-  enable-weechat <name>            report its (optional) weechat units `skipped` when
-                                   down instead of critical, so self-heal will not
-                                   restart-storm an intentionally unused backend.
-                                   Does NOT stop/disable/un-render the units.
-                                   Default is enabled (enable-weechat restores it).
+  disable-weechat <name>           Disable WeeChat for a tenant: stops its (optional)
+  enable-weechat <name>            weechat units and removes their boot persistence
+                                   (systemd disable / OpenRC runlevel removal), and
+                                   health checks report them `skipped` when down so
+                                   self-heal will not restart-storm them. start-tenant
+                                   leaves them off. enable-weechat re-enables + starts
+                                   them. Default is enabled (absent flag == enabled).
 
   patch-env <name>                 Add missing env vars (e.g. ORCHESTRATOR_PORT)
   patch-env-all                    Patch env for all registered tenants
@@ -1558,28 +1571,45 @@ ports_enable_proxy() {
 # unused WeeChat backend no longer reads critical and self-heal does not
 # restart-storm (flap) a unit that cannot come up. Absent flag == enabled, so
 # tenants created before this field existed keep the old behavior.
-# This gates HEALTH/SELF-HEAL classification only — it does not stop, disable, or
-# un-render the units themselves.
+# The flag is authoritative for lifecycle too (ISSUE-006): the
+# disable-weechat / enable-weechat verbs stop/disable resp. enable/start the
+# units after flipping it, and start-tenant respects it on both init systems.
+# This function only mutates the registry (under the shared ports lock).
+# ISSUE-012: runs under the shared ports lock like every other registry
+# mutation, and revalidates tenant existence while holding it — two unlocked
+# read-modify-rename writers could drop each other's updates, and a concurrent
+# remove-tenant could be followed by recreation of a partial tenant object.
 ports_set_weechat() {
   local name="$1" enabled="$2"
   require_cmd jq
   case "$enabled" in true|false) ;; *) die "ports_set_weechat: enabled must be true or false" ;; esac
+  acquire_ports_lock
   local current
   # Explicit ==false test: jq's `//` treats false as empty, so
   # `.enable_weechat // true` would misread a disabled tenant as enabled and
   # `enable-weechat` could never flip it back.
   current="$(jq -r --arg name "$name" 'if .tenants[$name].enable_weechat == false then "false" else "true" end' "$PORTS_REGISTRY" 2>/dev/null || true)"
-  [[ "$current" == "$enabled" ]] && { say "weechat for tenant '$name': already $enabled" >&2; return 0; }
+  if [[ "$current" == "$enabled" ]]; then
+    say "weechat for tenant '$name': already $enabled" >&2
+    release_ports_lock
+    return 0
+  fi
+  if ! jq -e ".tenants[\"$name\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
 
   local tmp
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
   if ! jq --arg name "$name" --argjson enabled "$enabled" '.tenants[$name].enable_weechat = $enabled' \
       "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
     rm -f "$tmp"
+    release_ports_lock
     die "failed to set weechat flag for tenant '$name'"
   fi
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
+  release_ports_lock
   say "weechat for tenant '$name': $current -> $enabled" >&2
 }
 
@@ -6190,7 +6220,13 @@ start_tenant_systemd() {
   # started by its own start_tenant_* function (which renders the quadlet,
   # reloads the daemon, and starts the unit). The imperative `start` below
   # is belt-and-suspenders for the vision unit (harmless if already running).
-  local enable_list=("lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-weechat-adapter-${name}.service")
+  local enable_list=("lunarwing-${name}.service" "xmpp-bridge-${name}.service")
+  # WeeChat units join the enable list only when the tenant's registry flag
+  # allows them (ISSUE-006): a disabled tenant must not be re-enabled for
+  # future boots by start-tenant.
+  if tenant_weechat_enabled "$name"; then
+    enable_list+=("lunarwing-weechat-${name}.service" "lunarwing-weechat-adapter-${name}.service")
+  fi
   if tenant_proxy_enabled "$name"; then
     enable_list+=("lunarwing-proxy-${name}.service")
   fi
@@ -6903,9 +6939,15 @@ start_tenant_openrc() {
   # Start PG babysitter (supervises the container via podman wait)
   rc-service "lunarwing-pg-${name}-sup" start 2>/dev/null || true
   # Optional channels next, non-fatal: a missing weechat/aiohttp must not abort
-  # the core stack (the main daemon does not depend on them).
-  rc-service "lunarwing-weechat-${name}" start 2>/dev/null || say "  (lunarwing-weechat-${name} skipped — optional)"
-  rc-service "lunarwing-weechat-adapter-${name}" start 2>/dev/null || say "  (lunarwing-weechat-adapter-${name} skipped — optional)"
+  # the core stack (the main daemon does not depend on them). WeeChat units are
+  # skipped entirely when the tenant's registry flag disables them (ISSUE-006):
+  # start-tenant must not reactivate a service the operator turned off.
+  if tenant_weechat_enabled "$name"; then
+    rc-service "lunarwing-weechat-${name}" start 2>/dev/null || say "  (lunarwing-weechat-${name} skipped — optional)"
+    rc-service "lunarwing-weechat-adapter-${name}" start 2>/dev/null || say "  (lunarwing-weechat-adapter-${name} skipped — optional)"
+  else
+    say "  (weechat disabled for $name — not starting lunarwing-weechat{,-adapter}-${name})"
+  fi
   if tenant_darkirc_enabled "$name"; then
     rc-service "lunarwing-darkirc-${name}" start 2>/dev/null || say "  (lunarwing-darkirc-${name} skipped — optional)"
     rc-service "lunarwing-darkirc-adapter-${name}" start 2>/dev/null || say "  (lunarwing-darkirc-adapter-${name} skipped — optional)"
@@ -6923,7 +6965,10 @@ start_tenant_openrc() {
 
   # Auto-enable on boot whatever is actually running (idempotent, OpenRC only).
   local svc
-  local boot_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "xmpp-bridge-${name}" "lunarwing-${name}" "lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-vision-${name}")
+  local boot_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "xmpp-bridge-${name}" "lunarwing-${name}" "lunarwing-vision-${name}")
+  if tenant_weechat_enabled "$name"; then
+    boot_svcs+=("lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}")
+  fi
   if tenant_proxy_enabled "$name"; then
     boot_svcs+=("lunarwing-proxy-${name}")
   fi
@@ -6967,6 +7012,73 @@ stop_tenant_openrc() {
   rc-service "lunarwing-pg-${name}-sup" stop 2>/dev/null || true
   rc-service "lunarwing-pg-${name}" stop 2>/dev/null || true
   say "OpenRC services stopped for $name"
+}
+
+# ISSUE-006: enable_weechat is authoritative for lifecycle, not just health
+# classification. disable-weechat stops the optional weechat units and removes
+# their boot persistence (ending any systemd restart loop); enable-weechat
+# re-enables and starts them. Both are idempotent and tolerate never-rendered
+# or missing units on either init system.
+weechat_lifecycle_stop_disable() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)
+      if ! id -u "$name" >/dev/null 2>&1; then
+        say "tenant user '$name' absent; skipping weechat unit stop/disable"
+        return 0
+      fi
+      _systemctl_user "$name" stop "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" >/dev/null 2>&1 || true
+      _systemctl_user "$name" disable "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" >/dev/null 2>&1 || true
+      say "stopped + disabled lunarwing-weechat{,-adapter}-${name}.service (systemd)"
+      ;;
+    openrc)
+      rc-service "lunarwing-weechat-adapter-${name}" stop 2>/dev/null || true
+      rc-service "lunarwing-weechat-${name}" stop 2>/dev/null || true
+      rc-update del "lunarwing-weechat-adapter-${name}" default >/dev/null 2>&1 || true
+      rc-update del "lunarwing-weechat-${name}" default >/dev/null 2>&1 || true
+      say "stopped + removed from default runlevel: lunarwing-weechat{,-adapter}-${name} (OpenRC)"
+      ;;
+    *)
+      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM; registry flag set only"
+      ;;
+  esac
+}
+
+weechat_lifecycle_enable_start() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)
+      if ! id -u "$name" >/dev/null 2>&1; then
+        say "tenant user '$name' absent; skipping weechat unit enable/start"
+        return 0
+      fi
+      local user_unit_dir
+      user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
+      if [[ ! -f "$user_unit_dir/lunarwing-weechat-${name}.service" ]]; then
+        say "weechat units not rendered for '$name' — run: render-units $name && start-tenant $name"
+        return 0
+      fi
+      _systemctl_user "$name" daemon-reload >/dev/null 2>&1 || true
+      _systemctl_user "$name" enable "lunarwing-weechat-${name}.service" "lunarwing-weechat-adapter-${name}.service" >/dev/null 2>&1 || true
+      _systemctl_user "$name" start "lunarwing-weechat-${name}.service" >/dev/null 2>&1 || say "  (lunarwing-weechat-${name}.service did not start — optional)"
+      _systemctl_user "$name" start "lunarwing-weechat-adapter-${name}.service" >/dev/null 2>&1 || say "  (lunarwing-weechat-adapter-${name}.service did not start — optional)"
+      say "enabled + started lunarwing-weechat{,-adapter}-${name}.service (systemd)"
+      ;;
+    openrc)
+      if [[ ! -x "/etc/init.d/lunarwing-weechat-${name}" ]]; then
+        say "weechat units not rendered for '$name' — run: render-units $name && start-tenant $name"
+        return 0
+      fi
+      rc-update add "lunarwing-weechat-${name}" default >/dev/null 2>&1 || true
+      rc-update add "lunarwing-weechat-adapter-${name}" default >/dev/null 2>&1 || true
+      rc-service "lunarwing-weechat-${name}" start 2>/dev/null || say "  (lunarwing-weechat-${name} did not start — optional)"
+      rc-service "lunarwing-weechat-adapter-${name}" start 2>/dev/null || say "  (lunarwing-weechat-adapter-${name} did not start — optional)"
+      say "enabled + started lunarwing-weechat{,-adapter}-${name} (OpenRC)"
+      ;;
+    *)
+      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM; registry flag set only"
+      ;;
+  esac
 }
 
 uninstall_tenant_openrc() {
@@ -7156,6 +7268,23 @@ ENVEOF
       cat "$_tmp" > "$HEALTH_ENV_FILE"   # overwrite content, preserve mode/owner
       rm -f "$_tmp"
       say "reconciled LUNARWING_SERVICE_MANAGER=$INIT_SYSTEM in $HEALTH_ENV_FILE"
+    fi
+    # Reconcile the tenants-file line with the ACTIVE ports registry
+    # (ISSUE-012): the file is write-once, so if PORTS_REGISTRY moved after
+    # first install, health kept reading the old registry while admin
+    # commands updated the new one. Same targeted-line rewrite as above;
+    # operator edits and file mode/owner are preserved.
+    if ! grep -q "^SELF_HEAL_TENANTS_FILE=${PORTS_REGISTRY}$" "$HEALTH_ENV_FILE"; then
+      local _tmp2; _tmp2="$(mktemp)"
+      if grep -q '^SELF_HEAL_TENANTS_FILE=' "$HEALTH_ENV_FILE"; then
+        awk -v v="$PORTS_REGISTRY" '/^SELF_HEAL_TENANTS_FILE=/{print "SELF_HEAL_TENANTS_FILE=" v; next} {print}' "$HEALTH_ENV_FILE" > "$_tmp2"
+      else
+        cp "$HEALTH_ENV_FILE" "$_tmp2"
+        printf 'SELF_HEAL_TENANTS_FILE=%s\n' "$PORTS_REGISTRY" >> "$_tmp2"
+      fi
+      cat "$_tmp2" > "$HEALTH_ENV_FILE"   # overwrite content, preserve mode/owner
+      rm -f "$_tmp2"
+      say "reconciled SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY in $HEALTH_ENV_FILE"
     fi
   fi
 
@@ -8744,11 +8873,14 @@ main() {
       tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
       if [[ "$command_name" == "disable-weechat" ]]; then
         ports_set_weechat "$name" false
-        say "WeeChat health-gate disabled for tenant '$name': down weechat units now report skipped (never critical)"
-        say "NOTE: rendered units are untouched — stop them manually if running: stop-tenant leaves optional weechat units alone"
+        ensure_init_system
+        weechat_lifecycle_stop_disable "$name"
+        say "WeeChat disabled for tenant '$name': units stopped + boot persistence removed; health reports them skipped (never critical)"
       else
         ports_set_weechat "$name" true
-        say "WeeChat health-gate enabled for tenant '$name': down weechat units report critical again"
+        ensure_init_system
+        weechat_lifecycle_enable_start "$name"
+        say "WeeChat enabled for tenant '$name': units enabled + started; health reports critical when down"
       fi
       ;;
 
