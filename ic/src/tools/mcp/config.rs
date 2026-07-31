@@ -42,6 +42,10 @@ pub enum McpTransportConfig {
         args: Vec<String>,
         #[serde(default)]
         env: HashMap<String, String>,
+        /// Environment variable names mapped to owner-scoped secret names.
+        /// Secret values are resolved only when the process starts.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        env_secrets: HashMap<String, String>,
     },
     /// Unix domain socket transport.
     Unix { socket_path: String },
@@ -107,6 +111,17 @@ impl McpServerConfig {
         args: Vec<String>,
         env: HashMap<String, String>,
     ) -> Self {
+        Self::new_stdio_with_secrets(name, command, args, env, HashMap::new())
+    }
+
+    /// Create a stdio MCP configuration with owner-scoped secret references.
+    pub fn new_stdio_with_secrets(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        env_secrets: HashMap<String, String>,
+    ) -> Self {
         Self {
             name: name.into(),
             url: String::new(),
@@ -114,6 +129,7 @@ impl McpServerConfig {
                 command: command.into(),
                 args,
                 env,
+                env_secrets,
             }),
             headers: HashMap::new(),
             oauth: None,
@@ -170,9 +186,17 @@ impl McpServerConfig {
     pub fn effective_transport(&self) -> EffectiveTransport<'_> {
         match &self.transport {
             Some(McpTransportConfig::Http) | None => EffectiveTransport::Http,
-            Some(McpTransportConfig::Stdio { command, args, env }) => {
-                EffectiveTransport::Stdio { command, args, env }
-            }
+            Some(McpTransportConfig::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            }) => EffectiveTransport::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            },
             Some(McpTransportConfig::Unix { socket_path }) => {
                 EffectiveTransport::Unix { socket_path }
             }
@@ -203,7 +227,14 @@ impl McpServerConfig {
                     });
                 }
             }
-            EffectiveTransport::Stdio { command, args, env } => {
+            EffectiveTransport::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            } => {
+                let mut plain_env_names = std::collections::HashSet::new();
+                let mut secret_env_names = std::collections::HashSet::new();
                 if command.is_empty() {
                     return Err(ConfigError::InvalidConfig {
                         reason: "Stdio transport command cannot be empty".to_string(),
@@ -224,6 +255,40 @@ impl McpServerConfig {
                         return Err(ConfigError::InvalidConfig {
                             reason: format!(
                                 "Stdio environment variable '{name}' contains a NUL byte"
+                            ),
+                        });
+                    }
+                    if !plain_env_names.insert(canonical_env_name(name)) {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!("Duplicate stdio environment variable name '{name}'"),
+                        });
+                    }
+                }
+                for (name, secret_name) in env_secrets {
+                    if name.is_empty() || name.contains(['=', '\0']) {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!("Invalid stdio environment variable name '{name}'"),
+                        });
+                    }
+                    if secret_name.trim().is_empty() || secret_name.contains('\0') {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!(
+                                "Invalid secret name for stdio environment variable '{name}'"
+                            ),
+                        });
+                    }
+                    let canonical_name = canonical_env_name(name);
+                    if plain_env_names.contains(&canonical_name) {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!(
+                                "Stdio environment variable '{name}' cannot use both a plain value and a secret reference"
+                            ),
+                        });
+                    }
+                    if !secret_env_names.insert(canonical_name) {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!(
+                                "Duplicate stdio secret environment variable name '{name}'"
                             ),
                         });
                     }
@@ -336,6 +401,16 @@ impl McpServerConfig {
     pub fn client_id_secret_name(&self) -> String {
         format!("mcp_{}_client_id", self.name)
     }
+}
+
+#[cfg(windows)]
+fn canonical_env_name(name: &str) -> String {
+    name.to_ascii_uppercase()
+}
+
+#[cfg(not(windows))]
+fn canonical_env_name(name: &str) -> String {
+    name.to_string()
 }
 
 /// Parse the explicit Study Notes write opt-in.
@@ -1167,6 +1242,7 @@ pub enum EffectiveTransport<'a> {
         command: &'a str,
         args: &'a [String],
         env: &'a HashMap<String, String>,
+        env_secrets: &'a HashMap<String, String>,
     },
     Unix {
         socket_path: &'a str,
@@ -1267,7 +1343,9 @@ mod tests {
         assert!(config.enabled);
         assert!(config.always_require_approval.is_empty());
         match config.effective_transport() {
-            EffectiveTransport::Stdio { command, args, env } => {
+            EffectiveTransport::Stdio {
+                command, args, env, ..
+            } => {
                 assert_eq!(command, "python3");
                 assert!(args.iter().any(|arg| arg.ends_with("study_notes_mcp.py")));
                 assert!(args.iter().any(|arg| arg.ends_with("agent-notes.sqlite3")));
@@ -1567,6 +1645,7 @@ mod tests {
                 command,
                 args,
                 env: e,
+                env_secrets,
             }) => {
                 assert_eq!(command, "npx");
                 assert_eq!(
@@ -1574,6 +1653,7 @@ mod tests {
                     &["-y".to_string(), "@modelcontextprotocol/server".to_string()]
                 );
                 assert_eq!(e, &env);
+                assert!(env_secrets.is_empty());
             }
             other => panic!("Expected Stdio transport, got {:?}", other),
         }
@@ -1633,6 +1713,50 @@ mod tests {
             HashMap::from([("GOOD_NAME".to_string(), "bad\0value".to_string())]),
         );
         assert!(invalid_value.validate().is_err());
+    }
+
+    #[test]
+    fn test_stdio_secret_environment_validation() {
+        let valid = McpServerConfig::new_stdio_with_secrets(
+            "server",
+            "npx",
+            vec![],
+            HashMap::new(),
+            HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]),
+        );
+        assert!(valid.validate().is_ok());
+
+        let invalid_name = McpServerConfig::new_stdio_with_secrets(
+            "server",
+            "npx",
+            vec![],
+            HashMap::new(),
+            HashMap::from([("BAD=NAME".to_string(), "api_token".to_string())]),
+        );
+        assert!(invalid_name.validate().is_err());
+
+        let empty_secret = McpServerConfig::new_stdio_with_secrets(
+            "server",
+            "npx",
+            vec![],
+            HashMap::new(),
+            HashMap::from([("API_TOKEN".to_string(), "  ".to_string())]),
+        );
+        assert!(empty_secret.validate().is_err());
+
+        let overlap = McpServerConfig::new_stdio_with_secrets(
+            "server",
+            "npx",
+            vec![],
+            HashMap::from([("API_TOKEN".to_string(), "plain".to_string())]),
+            HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]),
+        );
+        let error = overlap.validate().expect_err("overlap must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("both a plain value and a secret")
+        );
     }
 
     #[test]
@@ -1815,6 +1939,7 @@ mod tests {
             command: "npx".to_string(),
             args: vec!["-y".to_string(), "server".to_string()],
             env: HashMap::from([("KEY".to_string(), "val".to_string())]),
+            env_secrets: HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]),
         };
         let json = serde_json::to_string(&transport).unwrap();
         assert!(json.contains("\"transport\":\"stdio\""));
@@ -1822,10 +1947,16 @@ mod tests {
 
         let parsed: McpTransportConfig = serde_json::from_str(&json).unwrap();
         match parsed {
-            McpTransportConfig::Stdio { command, args, env } => {
+            McpTransportConfig::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args, vec!["-y".to_string(), "server".to_string()]);
                 assert_eq!(env.get("KEY").unwrap(), "val");
+                assert_eq!(env_secrets.get("API_TOKEN").unwrap(), "api_token");
             }
             other => panic!("Expected Stdio, got {:?}", other),
         }
@@ -1888,10 +2019,16 @@ mod tests {
         assert_eq!(parsed.description.as_deref(), Some("A test server"));
 
         match &parsed.transport {
-            Some(McpTransportConfig::Stdio { command, args, env }) => {
+            Some(McpTransportConfig::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            }) => {
                 assert_eq!(command, "node");
                 assert_eq!(args, &["server.js".to_string()]);
                 assert_eq!(env.get("NODE_ENV").unwrap(), "production");
+                assert!(env_secrets.is_empty());
             }
             other => panic!("Expected Stdio transport, got {:?}", other),
         }

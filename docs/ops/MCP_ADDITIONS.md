@@ -26,3 +26,42 @@
        - This completes the lifecycle without involving WASM or workers.                                                                     
        Diagnostics and command preflight                                                                                                     
        - Extend doctor/status with transport, enabled state, and executable availability. 
+    </details>
+
+## v2.0.4 continuation (2026-07-31)
+
+Goal 20 remains open. `rarity/kimi-19-20260730-1801` was reviewed as untrusted
+reference and must not be cherry-picked wholesale:
+
+- Its crash supervisor restarts a child but leaves `McpClient` and registered tool
+  wrappers bound to the dead transport. Disable/shutdown races can also resurrect
+  the process.
+- Its automatic npm/pip path runs unverified package lifecycle code under the
+  LunarWing service account without provenance, pinning, sandboxing, or rollback.
+- Its resolved secret values are retained in process-manager restart config.
+
+Completed safe slice:
+
+- Stdio config supports `env_secrets` mappings from environment variable to
+  owner-scoped LunarWing secret name. Only names are persisted.
+- CLI uses `--secret-env KEY=SECRET_NAME`; web and conversational install/update
+  requests use `env_secrets` objects.
+- Activation resolves values for the activating owner and fails closed before
+  spawn when the store or secret is unavailable.
+- Temporary parent-side values use `SecretString`; no resolved values are retained
+  for restart. Secret-bearing installs and all conversational MCP updates always
+  require approval.
+- Plain and secret mappings for the same environment variable are rejected.
+- Stdio children receive an allowlisted compatibility environment plus explicit
+  config instead of inheriting daemon credentials. Raw child stderr is suppressed
+  when secret references are present.
+- MCP update paths preserve forced-approval policy. `mcp test --user` now resolves
+  secret references for that user and explicitly cleans up its runtime.
+- Removed unused process-only `try_restart`; correct recovery belongs at
+  `ExtensionManager` level and must recreate/initialize the client, rediscover
+  tools, replace wrappers atomically, publish accurate status, and honor lifecycle
+  cancellation generations.
+
+Still deferred: automatic package installation pending provenance/sandbox policy,
+safe automatic crash recovery, worker-local MCP, general runtime adapters, and MCP
+gateway integration.

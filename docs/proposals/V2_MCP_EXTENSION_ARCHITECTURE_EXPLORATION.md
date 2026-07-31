@@ -1,9 +1,10 @@
 # V2 MCP and Extension Runtime Architecture Exploration
 
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL / EXPLORATORY.** Phase 0
-> host-local stdio installation is implemented. The runtime-neutral package
-> model, adapter boundary, worker-local MCP, marketplace provenance, and
-> MCP-over-WASM phases remain unimplemented design work.
+> **Current status (2026-07-31): PARTIAL / EXPLORATORY.** Phase 0 host-local
+> stdio installation and owner-scoped secret environment references are
+> implemented. The runtime-neutral package model, adapter boundary, worker-local
+> MCP, marketplace provenance, crash recovery, and MCP-over-WASM phases remain
+> unimplemented design work.
 
 **Status:** Exploratory V2 architecture; host-local stdio installation surfaces
 implemented as the first near-term step on 2026-07-09  
@@ -78,7 +79,7 @@ The core MCP configuration and CLI support:
 - Unix domain sockets
 
 `ic/src/tools/mcp/factory.rs` dispatches these configurations to the appropriate
-transport. `McpProcessManager` owns stdio process startup, shutdown, and restart.
+transport. `McpProcessManager` owns stdio process startup, tracking, and shutdown.
 The application startup path loads enabled MCP configurations, discovers their
 tools, wraps them as LunarWing `Tool` implementations, and registers them in the
 main tool registry.
@@ -90,6 +91,12 @@ structured host-local stdio configuration. Installation persists the configurati
 without running it; activation starts the managed child and discovers its tools.
 A supergateway can still be operationally useful, but it is not required to
 connect a stdio server.
+
+Stdio configs can map child environment variable names to owner-scoped LunarWing
+secret names. Values are resolved only during activation and are not persisted in
+MCP config or retained as restart data. Child processes receive an allowlisted OS
+environment rather than inheriting daemon credentials. This is raw credential
+exposure to trusted, unsandboxed code, not host-bound credential injection.
 
 ### Worker containers do not currently load MCP extensions
 
@@ -538,7 +545,9 @@ The package lifecycle should remain consistent even when runtime behavior differ
 
 Runtime adapters would own their specific resources:
 
-- Process adapter: child lifecycle, stdio framing, restart, and shutdown.
+- Process adapter: child lifecycle, stdio framing, and shutdown. Correct crash
+  recovery must recreate and initialize the MCP client, rediscover tools, and
+  atomically replace registered wrappers; restarting only the child is invalid.
 - WASM adapter: compile cache, instances/actors, fuel, memory, and host functions.
 - Worker adapter: image/package availability, task routing, health, and cancellation.
 - Remote adapter: sessions, OAuth, HTTP policy, and retries.

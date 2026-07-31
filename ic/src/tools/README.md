@@ -132,7 +132,8 @@ lunarwing mcp add local-files \
   --transport stdio \
   --command local-files-mcp \
   --arg /srv/data \
-  --env LOG_LEVEL=warn
+  --env LOG_LEVEL=warn \
+  --secret-env API_TOKEN=local_files_token
 ```
 
 The same structured fields are available in the web MCP settings form and the
@@ -145,14 +146,29 @@ conversational `tool_install` tool:
   "transport": "stdio",
   "command": "local-files-mcp",
   "args": ["/srv/data"],
-  "env": {"LOG_LEVEL": "warn"}
+  "env": {"LOG_LEVEL": "warn"},
+  "env_secrets": {"API_TOKEN": "local_files_token"}
 }
 ```
 
 Installation persists configuration only. Activation starts the child process,
 negotiates MCP, and registers its tools. Treat the executable as trusted installed
-code: stdio servers are not sandboxed. Values in `env` are plain configuration,
-not secret storage; use LunarWing's credential systems for secrets.
+code: stdio servers are not sandboxed. Values in `env` are plain configuration.
+`env_secrets` maps environment variable names to owner-scoped LunarWing secret
+names. Only names are persisted; values are decrypted at activation, zeroized from
+resolver-owned memory after spawn, and exposed to the child process. No resolved
+value is retained as restart configuration. Missing or wrong-owner secrets fail
+activation without starting the server. Conversational installs containing secret
+references and all conversational MCP updates require explicit approval.
+
+Managed stdio children do not inherit LunarWing's full service environment. They
+receive a small compatibility allowlist (`PATH`, home/user, locale, temporary and
+XDG paths, TLS certificate paths) plus explicitly configured `env` and
+`env_secrets`. Add other required non-secret variables explicitly. Raw secret
+values remain visible to the trusted child and potentially to other processes with
+the same OS privileges; use WASM tools when host-side credential injection is
+required. When `env_secrets` is non-empty, LunarWing suppresses raw MCP child
+stderr content to avoid copying an accidentally printed secret into daemon logs.
 
 MCP servers can be deactivated without uninstalling them. Deactivation unloads
 only that server's registered tools, closes its transport and session, stops a

@@ -848,11 +848,13 @@ pub struct InstallExtensionRequest {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub env_secrets: std::collections::HashMap<String, String>,
 }
 
 impl InstallExtensionRequest {
     pub fn mcp_config(&self) -> Result<Option<crate::tools::mcp::McpServerConfig>, String> {
-        if self.kind.as_deref() != Some("mcp_server") {
+        if self.kind.as_deref() != Some("mcp_server") && self.transport.is_none() {
             return Ok(None);
         }
         let config = match self.transport.as_deref() {
@@ -860,11 +862,12 @@ impl InstallExtensionRequest {
                 let command = self.command.as_deref().ok_or_else(|| {
                     "MCP server command is required for stdio transport".to_string()
                 })?;
-                crate::tools::mcp::McpServerConfig::new_stdio(
+                crate::tools::mcp::McpServerConfig::new_stdio_with_secrets(
                     &self.name,
                     command,
                     self.args.clone(),
                     self.env.clone(),
+                    self.env_secrets.clone(),
                 )
             }
             Some("http") => {
@@ -874,9 +877,13 @@ impl InstallExtensionRequest {
                 return Ok(None);
             }
             Some(other) => return Err(format!("Unsupported MCP transport '{other}'")),
-            None if self.command.is_some() || !self.args.is_empty() || !self.env.is_empty() => {
+            None if self.command.is_some()
+                || !self.args.is_empty()
+                || !self.env.is_empty()
+                || !self.env_secrets.is_empty() =>
+            {
                 return Err(
-                    "MCP transport must be 'stdio' when command, args, or env are provided"
+                    "MCP transport must be 'stdio' when command, args, env, or env_secrets are provided"
                         .to_string(),
                 );
             }
@@ -1669,7 +1676,8 @@ mod tests {
             "transport": "stdio",
             "command": "npx",
             "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
-            "env": {"NODE_ENV": "production"}
+            "env": {"NODE_ENV": "production"},
+            "env_secrets": {"API_TOKEN": "api_token"}
         }"#;
         let req: InstallExtensionRequest = serde_json::from_str(json).expect("request");
         let config: McpServerConfig = req
@@ -1679,10 +1687,16 @@ mod tests {
 
         assert!(matches!(
             config.effective_transport(),
-            EffectiveTransport::Stdio { command, args, env }
+            EffectiveTransport::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            }
                 if command == "npx"
                     && args == ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
                     && env.get("NODE_ENV").map(String::as_str) == Some("production")
+                    && env_secrets.get("API_TOKEN").map(String::as_str) == Some("api_token")
         ));
     }
 

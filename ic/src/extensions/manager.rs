@@ -2036,9 +2036,9 @@ impl ExtensionManager {
 
     /// Update an installed MCP server's configuration in-place.
     ///
-    /// Preserves enabled state, OAuth credentials, and headers from the existing
-    /// config. If the server is currently active, it is stopped and restarted
-    /// with the new configuration.
+    /// Preserves enabled state, credentials, headers, description, and approval
+    /// policy from the existing config. If the server is currently active, it is
+    /// stopped and restarted with the new configuration.
     pub async fn update_mcp(
         &self,
         name: &str,
@@ -2070,6 +2070,7 @@ impl ExtensionManager {
         if new_config.description.is_none() {
             new_config.description = existing.description.clone();
         }
+        new_config.always_require_approval = existing.always_require_approval.clone();
 
         new_config
             .validate()
@@ -5688,7 +5689,8 @@ done
                 "filesystem",
                 "cat",
                 Vec::<String>::new(),
-                std::collections::HashMap::new(),
+                std::collections::HashMap::<String, String>::new(),
+                false,
             )
             .await
             .expect("spawn managed test process");
@@ -5712,6 +5714,61 @@ done
             .await
             .expect("reload MCP config");
         assert!(stored.get("filesystem").is_none());
+    }
+
+    #[tokio::test]
+    async fn update_mcp_preserves_approval_policy_and_secret_references() {
+        use crate::tools::mcp::config::{EffectiveTransport, McpServerConfig};
+
+        let (store, dir) = make_test_store().await;
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(Arc::clone(&store)),
+        );
+        let original = McpServerConfig::new_stdio_with_secrets(
+            "secure-server",
+            "old-command",
+            vec![],
+            std::collections::HashMap::new(),
+            std::collections::HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]),
+        )
+        .with_always_require_approval(["write_data"]);
+        manager
+            .install_mcp_config(original, "test")
+            .await
+            .expect("install MCP config");
+
+        let replacement = McpServerConfig::new_stdio_with_secrets(
+            "secure-server",
+            "new-command",
+            vec![],
+            std::collections::HashMap::new(),
+            std::collections::HashMap::from([("NEW_TOKEN".to_string(), "new_token".to_string())]),
+        );
+        manager
+            .update_mcp("secure-server", replacement, "test")
+            .await
+            .expect("update MCP config");
+
+        let stored = crate::tools::mcp::config::load_mcp_servers_from_db(store.as_ref(), "test")
+            .await
+            .expect("load MCP config");
+        let updated = stored.get("secure-server").expect("updated server");
+        assert_eq!(
+            updated.always_require_approval,
+            vec!["write_data".to_string()]
+        );
+        assert!(matches!(
+            updated.effective_transport(),
+            EffectiveTransport::Stdio {
+                command,
+                env_secrets,
+                ..
+            } if command == "new-command"
+                && env_secrets.get("NEW_TOKEN").map(String::as_str) == Some("new_token")
+        ));
     }
 
     #[tokio::test]
