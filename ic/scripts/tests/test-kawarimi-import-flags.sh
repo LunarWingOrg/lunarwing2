@@ -63,6 +63,7 @@ XMPP_JID=kawarimi@example.test
 GATEWAY_HOST=0.0.0.0
 NANOCODE_MODEL=test-nanocode-model
 NANOCODE_BASE_URL=https://nanocode.example.test/openai/v1
+KIMI_API_KEY=kimi-manifest-secret
 ENV
   cat >"$work/bundle-src/manifest-bridge.env" <<'ENV'
 XMPP_JID=kawarimi@example.test
@@ -243,6 +244,13 @@ assert_file_contains "auto-migrates default owner scope" "$tmp/mt-admin.log" "mi
 assert_file_contains "import keeps target sidecar token" "$tmp/home/kawarimi/lunarwing/env/vision.env" "LUNARWING_AUTH_TOKEN=target-vision-token"
 assert_file_contains "import keeps matching daemon token" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "VISION_AUTH_TOKEN=target-vision-token"
 assert_file_not_contains "import ignores carried sidecar token" "$tmp/home/kawarimi/lunarwing/env/vision.env" "LUNARWING_AUTH_TOKEN=vision-token"
+assert_file_contains "import injects Kimi key after provisioning" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "KIMI_API_KEY=kimi-manifest-secret"
+assert_file_not_contains "import keeps Kimi key out of mt-admin argv" "$tmp/mt-admin.log" "kimi-manifest-secret"
+if [[ "$auto_output" == *"kimi-manifest-secret"* ]]; then
+  fail "import keeps Kimi key out of logs"
+else
+  pass "import keeps Kimi key out of logs"
+fi
 
 echo "=== export-tenant vision manifest coverage ==="
 assert_file_contains "export writes a vision manifest" "$EXPORT_SRC" "manifest-vision.env"
@@ -509,6 +517,7 @@ NANOCODE_MODEL=roundtrip-nanocode
 NANOCODE_BASE_URL=https://127.0.0.2:7443/openai/v1
 OPENCODE_MODEL=roundtrip-opencode
 OPENCODE_BASE_URL=https://[::1]:7443/openai/v1
+KIMI_API_KEY=encrypted-roundtrip-kimi-secret
 ENV
 full_export_output="$(
   exec 8<"$tmp/full-passphrase"
@@ -546,6 +555,17 @@ roundtrip_output="$(
 assert_contains "production encrypted export can be imported" "$roundtrip_output" "DRY RUN"
 assert_contains "production export preserves Nanocode model" "$roundtrip_output" "--nanocode-model roundtrip-nanocode"
 assert_contains "production export preserves OpenCode model" "$roundtrip_output" "--opencode-model roundtrip-opencode"
+if [[ "$full_export_output$roundtrip_output" == *"encrypted-roundtrip-kimi-secret"* ]]; then
+  fail "encrypted Kimi round-trip does not log plaintext key"
+else
+  pass "encrypted Kimi round-trip does not log plaintext key"
+fi
+mkdir -p "$tmp/roundtrip-extract"
+{
+  printf '%s\n' "$full_passphrase"
+} | 7z x -o"$tmp/roundtrip-extract" "$exported_bundle" -y >/dev/null 2>&1
+manifest_path="$(find "$tmp/roundtrip-extract" -name manifest-lunarwing.env -print -quit)"
+assert_file_contains "encrypted manifest preserves Kimi API key" "$manifest_path" "KIMI_API_KEY=encrypted-roundtrip-kimi-secret"
 for source_local_url in \
   'https://localhost:7443/openai/v1' \
   'https://127.0.0.2:7443/openai/v1' \

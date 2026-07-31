@@ -7,6 +7,8 @@
 //! [`ExecutionGate`]: lunarwing_engine::ExecutionGate
 
 pub mod approval;
+pub mod coordination;
 pub mod pending;
 pub mod persistence;
 pub mod store;
+pub mod violation_store;

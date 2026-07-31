@@ -46,6 +46,12 @@ pub enum HookEvent {
         channel: String,
         content: String,
         thread_id: Option<String>,
+        /// Canonical policy scope derived from routing metadata (e.g. the
+        /// XMPP room JID), when known. `channel` stays the transport/adapter
+        /// name for dispatch; policy hooks should match on this instead
+        /// (ISSUE-001). Falls back to `channel` semantics when absent.
+        #[serde(default)]
+        policy_scope: Option<String>,
     },
     /// A tool call about to be executed.
     ToolCall {
@@ -61,6 +67,9 @@ pub enum HookEvent {
         channel: String,
         content: String,
         thread_id: Option<String>,
+        /// Canonical policy scope (see `Inbound::policy_scope`).
+        #[serde(default)]
+        policy_scope: Option<String>,
     },
     /// A new session was created.
     SessionStart { user_id: String, session_id: String },
@@ -71,10 +80,43 @@ pub enum HookEvent {
         user_id: String,
         thread_id: String,
         response: String,
+        /// Destination channel, when known. `None` for non-channel-scoped
+        /// transforms. Added for coordination tag-schema enforcement.
+        #[serde(default)]
+        channel: Option<String>,
+        /// Canonical policy scope (see `Inbound::policy_scope`).
+        #[serde(default)]
+        policy_scope: Option<String>,
     },
 }
 
 impl HookEvent {
+    /// Policy scope for channel-scoped events: the canonical destination
+    /// from routing metadata when present, else the transport channel name.
+    /// Returns `None` for non-channel events (sessions, tool calls).
+    pub fn policy_scope(&self) -> Option<&str> {
+        match self {
+            HookEvent::Inbound {
+                channel,
+                policy_scope,
+                ..
+            }
+            | HookEvent::Outbound {
+                channel,
+                policy_scope,
+                ..
+            } => Some(policy_scope.as_deref().unwrap_or(channel)),
+            HookEvent::ResponseTransform {
+                channel,
+                policy_scope,
+                ..
+            } => policy_scope.as_deref().or(channel.as_deref()),
+            HookEvent::ToolCall { .. }
+            | HookEvent::SessionStart { .. }
+            | HookEvent::SessionEnd { .. } => None,
+        }
+    }
+
     /// Returns the [`HookPoint`] this event corresponds to.
     pub fn hook_point(&self) -> HookPoint {
         match self {

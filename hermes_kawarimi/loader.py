@@ -5,9 +5,12 @@ PostgreSQL stays up):
 
     1. add-tenant --no-health  + build-tenant + install-wasm   (empty tenant)
     2. start-tenant            -> daemon runs migrations + onboard = SCHEMA
-    3. stop-tenant             -> daemon down, PostgreSQL container stays up
+    3. stop-tenant             -> daemon down (mt-admin stop-tenant also stops
+       start-pg                PostgreSQL, so bring PG back up PG-only; the
+                                  daemon stays down)
     4. populate                -> INSERT rows + encrypt secrets, no daemon racing
-    5. start-tenant (if --start) else leave STAGED (stopped, data in place)
+    5. start-tenant (if --start) else leave STAGED (daemon stopped, data in
+       place; PG left running, mirroring import-tenant.sh's staged state)
 
 Why start-then-stop for the schema: LunarWing creates its schema via the
 daemon's refinery runner at first boot (``ic/src/app.rs`` run_migrations +
@@ -165,15 +168,20 @@ def run_import(
     if not phase([mt, "stop-tenant", plan.tenant]):
         result.error = "stop-tenant failed (before populate)"
         return result
+    # mt-admin's stop-tenant also stops PostgreSQL. Bring PG back up PG-only
+    # (daemon stays down) so populate can connect with nothing racing.
+    if not phase([mt, "start-pg", plan.tenant]):
+        result.error = "start-pg failed (populate needs PostgreSQL up, daemon down)"
+        return result
 
     # 4. populate (daemon down, PostgreSQL still up)
     try:
         counts = _populate(db_url, owner_id, mapped)
+        result.counts = counts  # set before _insert_secrets adds counts["secrets"]
         _insert_secrets(db_url, master_key, owner_id, mapped, result)
     except Exception as exc:  # psycopg2 / crypto errors
         result.error = f"populate failed: {exc}"
         return result
-    result.counts = counts
 
     # 5. cut over or stage
     if plan.start:

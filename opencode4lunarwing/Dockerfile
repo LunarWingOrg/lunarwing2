@@ -63,10 +63,6 @@ RUN set -e; \
 # ──────────────────────
 FROM docker.io/oven/bun:debian AS runtime
 
-LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
-      org.opencontainers.image.description="Persistent opencode worker with WebSocket agent communication" \
-      org.opencontainers.image.version="1.0.0"
-
 # WITH_TOOLCHAINS=false (default): slim runtime — no Rust/Go/C++ toolchains.
 # The opencode binary is already built in the builder stage; these are only
 # needed if coding tasks inside the container must compile native code.
@@ -74,6 +70,11 @@ LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
 # Also gates the heavy -dev packages and build tools (cmake, clang, llvm, etc.)
 # which are only needed to compile native dependencies at runtime.
 ARG WITH_TOOLCHAINS=false
+
+LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
+      org.opencontainers.image.description="Persistent opencode worker with WebSocket agent communication" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
 # Runtime packages: always installed (needed by the worker itself).
 RUN set -e; \
@@ -117,6 +118,7 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         clang \
         lld \
         llvm \
+        libclang-dev \
         pkg-config \
         libssl-dev \
         zlib1g-dev \
@@ -131,6 +133,10 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         musl-tools \
         libcurl4-openssl-dev \
         libxml2-dev \
+        autoconf \
+        automake \
+        libtool \
+        meson \
         nodejs \
         npm \
       && rm -rf /var/lib/apt/lists/*; \
@@ -146,14 +152,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Rust toolchain (only with WITH_TOOLCHAINS=true) ───────────────────
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
+ENV RUSTUP_HOME=/usr/local/rustup
 
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain 1.96.1 \
-      && chmod -R a+r /usr/local/rustup /usr/local/cargo; \
+        | CARGO_HOME=/usr/local/cargo sh -s -- -y --default-toolchain 1.96.1 \
+      && chmod -R a+rX /usr/local/rustup /usr/local/cargo; \
     fi
 
 # ── Go toolchain (only with WITH_TOOLCHAINS=true) ──────────────────────
@@ -164,7 +168,8 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
     fi
 ENV GOROOT=/usr/local/go \
     GOPATH=/home/opencode/go \
-    PATH=/usr/local/go/bin:/home/opencode/go/bin:$PATH
+    CARGO_HOME=/home/opencode/.cargo \
+    PATH=/home/opencode/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/opencode/go/bin:$PATH
 
 # ── non-root user ──────────────────────
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh. Rootless Podman

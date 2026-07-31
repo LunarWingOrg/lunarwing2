@@ -182,7 +182,7 @@ pub struct XmppChannel {
     encrypted_room_states: Arc<RwLock<HashMap<String, EncryptedRoomState>>>,
     /// Sender half for outbound stanzas.
     outbound_tx: mpsc::Sender<OutboundMessage>,
-    outbound_rate_limiter: tokio::sync::Mutex<OutboundRateLimiter>,
+    outbound_rate_limiter: Arc<tokio::sync::Mutex<OutboundRateLimiter>>,
     /// Receiver half taken by `start()` on the first call.
     outbound_rx: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<OutboundMessage>>>>,
     /// Cached JID of the discovered XEP-0363 HTTP upload service (per-server,
@@ -205,8 +205,9 @@ impl XmppChannel {
                 reason: "reply target cache capacity must be non-zero".into(),
             })?;
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(64);
-        let outbound_rate_limiter =
-            tokio::sync::Mutex::new(OutboundRateLimiter::new(config.max_messages_per_hour));
+        let outbound_rate_limiter = Arc::new(tokio::sync::Mutex::new(OutboundRateLimiter::new(
+            config.max_messages_per_hour,
+        )));
 
         Ok(Self {
             config,
@@ -1106,11 +1107,17 @@ impl Channel for XmppChannel {
             reason: format!("no routing target for message {}", msg.id),
         })?;
 
+        let groupchat = metadata_is_groupchat(&msg.metadata);
+        let preferred_device_id = xmpp_sender_device_id_from_metadata(&msg.metadata);
+
+        // Coalescing for coordination channels happens at the agent's
+        // outbound boundary (crate::agent deliver path, ISSUE-002) — the
+        // channel itself always sends immediately.
         self.queue_outbound(
             target_jid,
             response.content.clone(),
-            metadata_is_groupchat(&msg.metadata),
-            xmpp_sender_device_id_from_metadata(&msg.metadata),
+            groupchat,
+            preferred_device_id,
         )
         .await
     }
@@ -1244,6 +1251,12 @@ impl Channel for XmppChannel {
     }
 
     async fn health_check(&self) -> Result<(), ChannelError> {
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), ChannelError> {
+        // Coalesced flushes are owned by the agent-level shared buffer,
+        // which the agent run loop flushes before channel shutdown.
         Ok(())
     }
 

@@ -445,16 +445,13 @@ fn is_valid_tool_permission_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-'))
 }
 
-async fn persist_always_allow(
-    state: &EngineState,
-    pending: &PendingGate,
-) -> Option<serde_json::Value> {
+async fn persist_always_allow(state: &EngineState, pending: &PendingGate) {
     if !is_valid_tool_permission_name(&pending.action_name) {
         debug!(
             tool = %pending.action_name,
             "Skipping persisted AlwaysAllow for invalid tool name"
         );
-        return None;
+        return;
     }
 
     let is_locked = state
@@ -474,24 +471,14 @@ async fn persist_always_allow(
             tool = %pending.action_name,
             "Skipping persisted AlwaysAllow for ApprovalRequirement::Always tool"
         );
-        return None;
+        return;
     }
 
-    let store = state.effect_adapter.settings_store().await?;
-
-    let key = format!("tool_permissions.{}", pending.action_name);
-    let prior = match store.get_setting(&pending.user_id, &key).await {
-        Ok(value) => value,
-        Err(error) => {
-            debug!(
-                tool = %pending.action_name,
-                %error,
-                "resolve_gate: failed to load prior tool permission"
-            );
-            return None;
-        }
+    let Some(store) = state.effect_adapter.settings_store().await else {
+        return;
     };
 
+    let key = format!("tool_permissions.{}", pending.action_name);
     let value = serde_json::to_value(crate::tools::permissions::PermissionState::AlwaysAllow)
         .unwrap_or_else(|_| serde_json::json!("always_allow"));
     match store.set_setting(&pending.user_id, &key, &value).await {
@@ -505,39 +492,20 @@ async fn persist_always_allow(
             );
         }
     }
-
-    prior
 }
 
-async fn revert_always_allow(
-    state: &EngineState,
-    pending: &PendingGate,
-    prior: Option<serde_json::Value>,
-) {
-    let Some(store) = state.effect_adapter.settings_store().await else {
-        return;
-    };
-
-    let key = format!("tool_permissions.{}", pending.action_name);
-    let result = match prior {
-        Some(ref value) => store
-            .set_setting(&pending.user_id, &key, value)
-            .await
-            .map(|_| ()),
-        None => store
-            .delete_setting(&pending.user_id, &key)
-            .await
-            .map(|_| ()),
-    };
-
-    if let Err(error) = result {
-        tracing::warn!(
-            tool = %pending.action_name,
-            user_id = %pending.user_id,
-            %error,
-            "resolve_gate: failed to revert persisted AlwaysAllow"
-        );
+async fn enable_always_allow(state: &EngineState, pending: &PendingGate) {
+    state
+        .effect_adapter
+        .auto_approve_tool(&pending.user_id, &pending.action_name)
+        .await;
+    if let Some(registry_name) = legacy_extension_alias(&pending.action_name) {
+        state
+            .effect_adapter
+            .auto_approve_tool(&pending.user_id, &registry_name)
+            .await;
     }
+    persist_always_allow(state, pending).await;
 }
 
 fn resolved_action_event(
@@ -558,14 +526,66 @@ fn resolved_action_event(
     }
 }
 
+enum PendingActionOutcome {
+    Response(Option<String>),
+    GatePaused(Option<String>),
+    ExecutionStopped,
+}
+
+impl PendingActionOutcome {
+    fn into_response(self) -> Option<String> {
+        match self {
+            Self::Response(response) => response,
+            Self::GatePaused(response) => response,
+            Self::ExecutionStopped => Some(String::new()),
+        }
+    }
+}
+
+struct PendingActionApproval {
+    already_granted: bool,
+    event: Option<(String, bool)>,
+    enable_always_after_success: bool,
+}
+
+async fn finalize_silently_stopped_thread(
+    state: &EngineState,
+    conversation_id: lunarwing_engine::ConversationId,
+    thread_id: lunarwing_engine::ThreadId,
+    user_id: &str,
+) -> Result<(), Error> {
+    state
+        .thread_manager
+        .finalize_waiting_thread_as_stopped(thread_id, user_id)
+        .await
+        .map_err(|error| engine_err("finalize stopped thread", error))?;
+    state
+        .conversation_manager
+        .record_thread_outcome(conversation_id, thread_id, &ThreadOutcome::Stopped)
+        .await
+        .map_err(|error| engine_err("untrack stopped thread", error))
+}
+
+async fn finalize_silently_stopped_pending_thread(
+    state: &EngineState,
+    pending: &PendingGate,
+) -> Result<(), Error> {
+    finalize_silently_stopped_thread(
+        state,
+        pending.conversation_id,
+        pending.thread_id,
+        &pending.user_id,
+    )
+    .await
+}
+
 async fn execute_pending_gate_action(
     agent: &Agent,
     state: &EngineState,
     message: &IncomingMessage,
     pending: &PendingGate,
-    approval_already_granted: bool,
-    approval_event: Option<(String, bool)>,
-) -> Result<Option<String>, Error> {
+    approval: PendingActionApproval,
+) -> Result<PendingActionOutcome, Error> {
     let thread = state
         .store
         .load_thread(pending.thread_id)
@@ -600,18 +620,48 @@ async fn execute_pending_gate_action(
 
     state.effect_adapter.reset_call_count();
     let event_rx = state.thread_manager.subscribe_events();
-    match state
+    // Register the resolving window so /interrupt can see and cancel the
+    // inline action — otherwise the interrupt either reports "nothing to
+    // interrupt" while the side effect runs, or finalizes the waiting state
+    // invisibly mid-execution.
+    let resolve_token = state
+        .thread_manager
+        .begin_resolving(pending.thread_id)
+        .await;
+    let exec_result = state
         .effect_adapter
         .execute_resolved_pending_action(
             &pending.action_name,
             pending.parameters.clone(),
             &lease,
             &exec_ctx,
-            approval_already_granted,
+            approval.already_granted,
         )
-        .await
-    {
+        .await;
+    state.thread_manager.end_resolving(pending.thread_id).await;
+    match exec_result {
         Ok(result) => {
+            if resolve_token.is_cancelled() {
+                // Interrupted mid-action: the side effect already happened, so
+                // persist its result directly for audit (the waiting thread
+                // may already be finalized), then stop without resuming.
+                let event = resolved_action_event(pending, exec_ctx.step_id, &result);
+                if let Err(error) = state
+                    .store
+                    .append_events(&[lunarwing_engine::ThreadEvent::new(pending.thread_id, event)])
+                    .await
+                {
+                    debug!(thread_id = %pending.thread_id, %error, "failed to persist interrupted action result");
+                }
+                let _ = finalize_silently_stopped_pending_thread(state, pending).await;
+                return Ok(PendingActionOutcome::ExecutionStopped);
+            }
+            // Only a genuinely successful action earns AlwaysAllow: tool-level
+            // failures arrive as Ok(ActionResult { is_error: true }) and must
+            // not permanently auto-approve the tool.
+            if approval.enable_always_after_success && !result.is_error {
+                enable_always_allow(state, pending).await;
+            }
             state
                 .thread_manager
                 .record_waiting_event(
@@ -630,9 +680,9 @@ async fn execute_pending_gate_action(
                         &pending.call_id,
                         &pending.action_name,
                         &result.output,
-                        approval_already_granted,
+                        approval.already_granted,
                     )),
-                    approval_event,
+                    approval.event,
                     Some(pending.call_id.clone()),
                 )
                 .await
@@ -646,6 +696,7 @@ async fn execute_pending_gate_action(
                 event_rx,
             )
             .await
+            .map(PendingActionOutcome::Response)
         }
         Err(lunarwing_engine::EngineError::GatePaused {
             gate_name,
@@ -683,7 +734,13 @@ async fn execute_pending_gate_action(
                 original_message: None,
                 resume_output: resume_output.map(|value| *value),
             };
-            insert_and_notify_pending_gate(&agent.channels, state, message, pending_gate).await
+            insert_and_notify_pending_gate(&agent.channels, state, message, pending_gate)
+                .await
+                .map(PendingActionOutcome::GatePaused)
+        }
+        Err(lunarwing_engine::EngineError::ExecutionStopped) => {
+            finalize_silently_stopped_pending_thread(state, pending).await?;
+            Ok(PendingActionOutcome::ExecutionStopped)
         }
         Err(e) => Err(engine_err("execute pending gate action", e)),
     }
@@ -867,14 +924,14 @@ async fn reconcile_pending_gate_state(
     Ok(())
 }
 
-async fn fail_threads_for_expired_gates(
-    store: &Arc<dyn Store>,
-    pending_gates: &crate::gate::store::PendingGateStore,
-    expired_gates: &[PendingGate],
-) {
+async fn fail_threads_for_expired_gates(state: &EngineState, expired_gates: &[PendingGate]) {
     for gate in expired_gates {
         let key = gate.key();
-        let Some(mut thread) = store.load_thread(gate.thread_id).await.ok().flatten() else {
+        // Load + state checks happen BEFORE taking the gate-store lock: a
+        // replacement gate inserted while the load was in flight must win,
+        // so the presence check runs last (run_if_absent holds the lock
+        // across the finalization).
+        let Some(thread) = state.store.load_thread(gate.thread_id).await.ok().flatten() else {
             continue;
         };
         if thread.state != lunarwing_engine::ThreadState::Waiting
@@ -882,17 +939,31 @@ async fn fail_threads_for_expired_gates(
         {
             continue;
         }
-        pending_gates
+        state
+            .pending_gates
             .run_if_absent(&key, || async {
-                if let Err(error) = thread.transition_to(
-                    lunarwing_engine::ThreadState::Failed,
-                    Some("pending gate expired".into()),
-                ) {
-                    debug!(thread_id = %thread.id, %error, "failed to expire waiting thread");
-                    return;
-                }
-                if let Err(error) = store.save_thread(&thread).await {
-                    tracing::warn!(thread_id = %thread.id, %error, "failed to save expired waiting thread");
+                // Route through the ThreadManager so expiry finalizes like any
+                // other terminal path: terminal transition, lease revocation,
+                // events — then untrack from conversation state.
+                match state
+                    .thread_manager
+                    .finalize_waiting_thread_as_failed(
+                        gate.thread_id,
+                        &gate.user_id,
+                        "pending gate expired",
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        state
+                            .conversation_manager
+                            .untrack_thread_everywhere(gate.thread_id)
+                            .await;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        debug!(thread_id = %gate.thread_id, %error, "failed to expire waiting thread");
+                    }
                 }
             })
             .await;
@@ -916,31 +987,18 @@ async fn fail_orphaned_waiting_thread_if_needed(
         return Ok(false);
     }
 
-    let Some(mut thread) = state
-        .store
-        .load_thread(thread_id)
+    let finalized = state
+        .thread_manager
+        .finalize_waiting_thread_as_failed(thread_id, user_id, "pending gate missing before resume")
         .await
-        .map_err(|e| engine_err("load thread", e))?
-    else {
-        return Ok(false);
-    };
-
-    if !thread.is_owned_by(user_id) || thread.state != lunarwing_engine::ThreadState::Waiting {
-        return Ok(false);
-    }
-
-    thread
-        .transition_to(
-            lunarwing_engine::ThreadState::Failed,
-            Some("pending gate missing before resume".into()),
-        )
         .map_err(|e| engine_err("reconcile waiting thread", e))?;
-    state
-        .store
-        .save_thread(&thread)
-        .await
-        .map_err(|e| engine_err("save reconciled thread", e))?;
-    Ok(true)
+    if finalized {
+        state
+            .conversation_manager
+            .untrack_thread_everywhere(thread_id)
+            .await;
+    }
+    Ok(finalized)
 }
 
 async fn fail_scoped_orphaned_waiting_threads_if_needed(
@@ -995,6 +1053,10 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     ));
     if let Some(store) = agent.deps.store.clone() {
         effect_adapter.set_settings_store_from_db(store).await;
+    }
+    if let Some(gate) = agent.deps.coordination_gate.clone() {
+        effect_adapter.set_coordination_gate(gate).await;
+        debug!("engine v2: coordination gate set on effect adapter");
     }
 
     // Build centralized auth manager for pre-flight credential checks.
@@ -1390,7 +1452,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         start_skill_update_sweep(owner_id.clone());
     }
 
-    start_pending_gate_sweep(sweep_gates, store_dyn);
+    start_pending_gate_sweep(sweep_gates);
 
     Ok(())
 }
@@ -1775,7 +1837,9 @@ pub async fn has_interruptible_engine_state(message: &IncomingMessage) -> bool {
         return false;
     };
     for tid in &conversation.active_threads {
-        if state.thread_manager.is_running(*tid).await {
+        if state.thread_manager.is_running(*tid).await
+            || state.thread_manager.is_resolving(*tid).await
+        {
             return true;
         }
     }
@@ -1970,45 +2034,20 @@ pub async fn resolve_gate(
                     },
                 );
             }
-            let prior_permission = if always {
-                state
-                    .effect_adapter
-                    .auto_approve_tool(&pending.user_id, &pending.action_name)
-                    .await;
-                if let Some(registry_name) = legacy_extension_alias(&pending.action_name) {
-                    state
-                        .effect_adapter
-                        .auto_approve_tool(&pending.user_id, &registry_name)
-                        .await;
-                }
-                persist_always_allow(state, &pending).await
-            } else {
-                None
-            };
             let result = execute_pending_gate_action(
                 agent,
                 state,
                 message,
                 &pending,
-                true,
-                Some((pending.call_id.clone(), true)),
+                PendingActionApproval {
+                    already_granted: true,
+                    event: Some((pending.call_id.clone(), true)),
+                    enable_always_after_success: always,
+                },
             )
             .await;
 
-            if always && result.is_err() {
-                state
-                    .effect_adapter
-                    .revoke_auto_approve(&pending.user_id, &pending.action_name)
-                    .await;
-                if let Some(registry_name) = legacy_extension_alias(&pending.action_name) {
-                    state
-                        .effect_adapter
-                        .revoke_auto_approve(&pending.user_id, &registry_name)
-                        .await;
-                }
-                revert_always_allow(state, &pending, prior_permission).await;
-            }
-            return result;
+            return result.map(PendingActionOutcome::into_response);
         }
 
         lunarwing_engine::GateResolution::Denied { reason } => {
@@ -2073,15 +2112,9 @@ pub async fn resolve_gate(
                     },
                 );
             }
-            // Stop the thread entirely (fix: 49b4c398 — cancel during auth
-            // was misrouted to approval handler)
-            if let Err(e) = state
-                .thread_manager
-                .stop_thread(pending.thread_id, &message.user_id)
-                .await
-            {
-                tracing::debug!(error = %e, "Failed to stop thread on cancel");
-            }
+            // Gate-paused threads are persisted as Waiting and are absent from
+            // the running map, so finalize them directly instead of signalling.
+            finalize_silently_stopped_pending_thread(state, &pending).await?;
             return Ok(Some("Cancelled.".into()));
         }
 
@@ -2177,9 +2210,18 @@ pub async fn resolve_gate(
                     event_rx
                 } else {
                     return execute_pending_gate_action(
-                        agent, state, message, &pending, false, None,
+                        agent,
+                        state,
+                        message,
+                        &pending,
+                        PendingActionApproval {
+                            already_granted: false,
+                            event: None,
+                            enable_always_after_success: false,
+                        },
                     )
-                    .await;
+                    .await
+                    .map(PendingActionOutcome::into_response);
                 }
             } else {
                 return Err(engine_err(
@@ -2223,8 +2265,19 @@ pub async fn resolve_gate(
                     .map_err(|e| engine_err("resume error", e))?;
                 event_rx
             } else {
-                return execute_pending_gate_action(agent, state, message, &pending, false, None)
-                    .await;
+                return execute_pending_gate_action(
+                    agent,
+                    state,
+                    message,
+                    &pending,
+                    PendingActionApproval {
+                        already_granted: false,
+                        event: None,
+                        enable_always_after_success: false,
+                    },
+                )
+                .await
+                .map(PendingActionOutcome::into_response);
             }
         }
     };
@@ -2281,7 +2334,18 @@ async fn interrupt_engine_conversation(
 
     let mut stopped = 0u32;
     for tid in &active_threads {
-        if state.thread_manager.is_running(*tid).await {
+        if state.thread_manager.is_resolving(*tid).await {
+            // A gate action is executing inline: cancel the resolving window
+            // (the approval task finalizes the thread once the action returns)
+            // and stop the visible waiting state now.
+            state.thread_manager.cancel_resolving(*tid).await;
+            match finalize_silently_stopped_thread(state, conv_id, *tid, &message.user_id).await {
+                Ok(()) => stopped += 1,
+                Err(error) => {
+                    debug!(thread_id = %tid, %error, "engine v2: failed to finalize resolving thread");
+                }
+            }
+        } else if state.thread_manager.is_running(*tid).await {
             if let Err(e) = state
                 .thread_manager
                 .stop_thread(*tid, &message.user_id)
@@ -2290,6 +2354,18 @@ async fn interrupt_engine_conversation(
                 debug!(thread_id = %tid, error = %e, "engine v2: failed to stop thread");
             } else {
                 stopped += 1;
+            }
+        } else if let Ok(Some(thread)) = state.store.load_thread(*tid).await
+            && matches!(
+                thread.state,
+                lunarwing_engine::ThreadState::Waiting | lunarwing_engine::ThreadState::Suspended
+            )
+        {
+            match finalize_silently_stopped_thread(state, conv_id, *tid, &message.user_id).await {
+                Ok(()) => stopped += 1,
+                Err(error) => {
+                    debug!(thread_id = %tid, %error, "engine v2: failed to finalize waiting thread");
+                }
             }
         }
     }
@@ -2675,7 +2751,7 @@ async fn handle_with_engine_inner(
             expired_gates = expired_gates.len(),
             "engine v2: removed expired pending gates"
         );
-        fail_threads_for_expired_gates(&state.store, &state.pending_gates, &expired_gates).await;
+        fail_threads_for_expired_gates(state, &expired_gates).await;
     }
 
     debug!(
@@ -2948,11 +3024,31 @@ async fn await_thread_outcome(
         }
     }
 
-    let outcome = state
+    let mut outcome = state
         .thread_manager
         .join_thread(thread_id)
         .await
         .map_err(|e| engine_err("join error", e))?;
+
+    let is_auth_fallback = matches!(
+        &outcome,
+        ThreadOutcome::Completed {
+            response: Some(text),
+        } if text.contains("authentication_required")
+    );
+    if !is_auth_fallback
+        && let ThreadOutcome::Completed {
+            response: Some(text),
+        } = &mut outcome
+    {
+        match agent
+            .transform_response(message, &tid_str, std::mem::take(text))
+            .await
+        {
+            Some(transformed) => *text = transformed,
+            None => text.clear(),
+        }
+    }
 
     state
         .conversation_manager
@@ -3297,6 +3393,24 @@ fn interpret_message_event(role: &str, content_preview: &str) -> Option<&'static
     }
 }
 
+fn format_mission_notification(mission_name: &str, text: &str) -> String {
+    let trimmed = text.trim_start();
+    if let Some((tag, body)) = trimmed.split_once(':')
+        && crate::hooks::coordination::DEFAULT_ALLOWED_TAGS
+            .iter()
+            .any(|allowed| tag.eq_ignore_ascii_case(allowed))
+    {
+        let body = body.trim_start();
+        if body.is_empty() {
+            format!("{tag}: **[{mission_name}]**")
+        } else {
+            format!("{tag}: **[{mission_name}]** {body}")
+        }
+    } else {
+        format!("**[{mission_name}]** {text}")
+    }
+}
+
 /// Deliver a mission thread outcome to the mission's notify_channels.
 async fn handle_mission_notification(
     notif: &lunarwing_engine::MissionNotification,
@@ -3309,14 +3423,37 @@ async fn handle_mission_notification(
         return;
     };
 
-    let full_text = format!("**[{}]** {text}", notif.mission_name);
+    let full_text = format_mission_notification(&notif.mission_name, text);
+    let mut seen_channels = HashSet::new();
+    let mut first_accepted: Option<(String, String)> = None;
 
     for channel_name in &notif.notify_channels {
+        if !seen_channels.insert(channel_name.as_str()) {
+            continue;
+        }
+        let transform_event = crate::hooks::HookEvent::ResponseTransform {
+            user_id: notif.user_id.clone(),
+            thread_id: notif.thread_id.to_string(),
+            response: full_text.clone(),
+            channel: Some(channel_name.clone()),
+            policy_scope: Some(notif.user_id.clone()),
+        };
+        let transformed_text = match hooks.run(&transform_event).await {
+            Err(error) => {
+                tracing::warn!(channel = %channel_name, %error, "TransformResponse hook blocked mission notification");
+                continue;
+            }
+            Ok(crate::hooks::HookOutcome::Continue {
+                modified: Some(content),
+            }) => content,
+            _ => full_text.clone(),
+        };
         let event = crate::hooks::HookEvent::Outbound {
             user_id: notif.user_id.clone(),
             channel: channel_name.clone(),
-            content: full_text.clone(),
+            content: transformed_text.clone(),
             thread_id: Some(notif.thread_id.to_string()),
+            policy_scope: Some(notif.user_id.clone()),
         };
         let outbound_text = match hooks.run(&event).await {
             Err(error) => {
@@ -3326,8 +3463,11 @@ async fn handle_mission_notification(
             Ok(crate::hooks::HookOutcome::Continue {
                 modified: Some(content),
             }) => content,
-            _ => full_text.clone(),
+            _ => transformed_text,
         };
+        if first_accepted.is_none() {
+            first_accepted = Some((channel_name.clone(), outbound_text.clone()));
+        }
         if let Err(e) = channels
             .broadcast(
                 channel_name,
@@ -3344,12 +3484,16 @@ async fn handle_mission_notification(
         }
     }
 
+    let Some((history_channel, accepted_text)) = first_accepted else {
+        return;
+    };
+
     // Also write to SSE for the web gateway
     if let Some(sse) = sse {
         sse.broadcast_for_user(
             &notif.user_id,
             AppEvent::Response {
-                content: full_text.clone(),
+                content: accepted_text.clone(),
                 thread_id: notif.thread_id.to_string(),
             },
         );
@@ -3358,13 +3502,12 @@ async fn handle_mission_notification(
     // Write to v1 DB so the history API shows the mission result.
     // Use the "assistant" conversation for the user on the first notify channel.
     if let Some(db) = db
-        && let Some(channel_name) = notif.notify_channels.first()
         && let Ok(conv_id) = db
-            .get_or_create_assistant_conversation(&notif.user_id, channel_name)
+            .get_or_create_assistant_conversation(&notif.user_id, &history_channel)
             .await
     {
         let _ = db
-            .add_conversation_message(conv_id, "assistant", &full_text)
+            .add_conversation_message(conv_id, "assistant", &accepted_text)
             .await;
     }
 }
@@ -4759,10 +4902,7 @@ fn start_skill_update_sweep(user_id: String) {
 ///
 /// Without this, a thread waiting on an expired gate blocks until
 /// the next ingress triggers cleanup via `drain_expired()`.
-fn start_pending_gate_sweep(
-    pending_gates: Arc<crate::gate::store::PendingGateStore>,
-    store: Arc<dyn Store>,
-) {
+fn start_pending_gate_sweep(pending_gates: Arc<crate::gate::store::PendingGateStore>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(PENDING_GATE_SWEEP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -4774,7 +4914,14 @@ fn start_pending_gate_sweep(
                     removed = expired.len(),
                     "background sweep removed expired pending gates"
                 );
-                fail_threads_for_expired_gates(&store, &pending_gates, &expired).await;
+                let Some(lock) = ENGINE_STATE.get() else {
+                    continue;
+                };
+                let guard = lock.read().await;
+                let Some(state) = guard.as_ref() else {
+                    continue;
+                };
+                fail_threads_for_expired_gates(state, &expired).await;
             }
         }
     });
@@ -5347,7 +5494,7 @@ mod tests {
     #[tokio::test]
     async fn expired_gate_sweep_fails_waiting_thread_without_ingress() {
         let store = Arc::new(TestStore::new());
-        let store_dyn: Arc<dyn Store> = store.clone();
+        let state = make_expected_test_state(store.clone());
         let gates = crate::gate::store::PendingGateStore::in_memory();
         let project_id = lunarwing_engine::ProjectId::new();
         let mut thread = lunarwing_engine::Thread::new(
@@ -5376,7 +5523,7 @@ mod tests {
         gates.insert(gate).await.unwrap();
         let expired = gates.drain_expired().await;
         assert_eq!(expired.len(), 1);
-        fail_threads_for_expired_gates(&store_dyn, &gates, &expired).await;
+        fail_threads_for_expired_gates(&state, &expired).await;
 
         let saved = store.load_thread(thread.id).await.unwrap().unwrap();
         assert_eq!(saved.state, lunarwing_engine::ThreadState::Failed);
@@ -5385,7 +5532,7 @@ mod tests {
     #[tokio::test]
     async fn expired_gate_sweep_does_not_fail_unrelated_waiting_thread() {
         let store = Arc::new(TestStore::new());
-        let store_dyn: Arc<dyn Store> = store.clone();
+        let state = make_expected_test_state(store.clone());
         let gates = crate::gate::store::PendingGateStore::in_memory();
         let project_id = lunarwing_engine::ProjectId::new();
         let mut expired_thread = lunarwing_engine::Thread::new(
@@ -5432,7 +5579,7 @@ mod tests {
             .unwrap();
 
         let expired = gates.drain_expired().await;
-        fail_threads_for_expired_gates(&store_dyn, &gates, &expired).await;
+        fail_threads_for_expired_gates(&state, &expired).await;
 
         assert_eq!(
             store
@@ -5457,7 +5604,6 @@ mod tests {
     #[tokio::test]
     async fn expired_gate_sweep_does_not_fail_thread_with_replacement_gate() {
         let store = Arc::new(TestStore::new());
-        let store_dyn: Arc<dyn Store> = store.clone();
         let gates = Arc::new(crate::gate::store::PendingGateStore::in_memory());
         let mut thread = lunarwing_engine::Thread::new(
             "replaced",
@@ -5486,10 +5632,10 @@ mod tests {
         let expired = gates.drain_expired().await;
 
         store.block_next_thread_load.store(true, Ordering::SeqCst);
-        let sweep_store = Arc::clone(&store_dyn);
-        let sweep_gates = Arc::clone(&gates);
+        let mut state = make_expected_test_state(store.clone());
+        state.pending_gates = Arc::clone(&gates);
         let sweep = tokio::spawn(async move {
-            fail_threads_for_expired_gates(&sweep_store, &sweep_gates, &expired).await;
+            fail_threads_for_expired_gates(&state, &expired).await;
         });
         store.thread_load_started.notified().await;
         let replacement = sample_pending_gate(
@@ -6170,6 +6316,54 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].0, "owner-scope");
         assert_eq!(captured[0].1.content, "**[daily-review]** mission complete");
+    }
+
+    #[tokio::test]
+    async fn mission_notification_obeys_coordination_transform_schema() {
+        use crate::hooks::coordination::{
+            CoordinationState, DEFAULT_ALLOWED_TAGS, DEFAULT_MAX_MESSAGE_LENGTH, TagSchemaHook,
+        };
+        use crate::testing::RecordingBroadcastChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (channel, captures) = RecordingBroadcastChannel::new("weechat");
+        manager.add(Box::new(channel)).await;
+        let hooks = Arc::new(crate::hooks::HookRegistry::new());
+        let state =
+            CoordinationState::new(vec!["coord@conference.example".into()], Vec::new(), None);
+        hooks
+            .register(Arc::new(TagSchemaHook::new(
+                state,
+                "agent-1".into(),
+                DEFAULT_ALLOWED_TAGS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                DEFAULT_MAX_MESSAGE_LENGTH,
+            )))
+            .await;
+
+        let mut notification = lunarwing_engine::MissionNotification {
+            mission_id: lunarwing_engine::MissionId::new(),
+            mission_name: "daily-review".to_string(),
+            thread_id: lunarwing_engine::ThreadId::new(),
+            user_id: "coord@conference.example".to_string(),
+            notify_channels: vec!["weechat".to_string(), "weechat".to_string()],
+            response: Some("mission complete".to_string()),
+            is_error: false,
+        };
+        handle_mission_notification(&notification, &manager, &hooks, None, None).await;
+        assert!(captures.lock().await.is_empty());
+
+        notification.response = Some("STATUS: mission complete".to_string());
+        handle_mission_notification(&notification, &manager, &hooks, None, None).await;
+        let captured = captures.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, "coord@conference.example");
+        assert_eq!(
+            captured[0].1.content,
+            "STATUS: **[daily-review]** mission complete"
+        );
     }
 
     #[tokio::test]
@@ -7096,6 +7290,87 @@ mod tests {
             state.thread_manager.join_thread(tid_b),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_resolving_window_and_finalizes_waiting_thread() {
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let project_id = state.default_project_id;
+
+        let conv = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:resolving", "alice")
+            .await
+            .unwrap();
+
+        // Track a thread in the conversation, then retire it so its record can
+        // be re-saved as Waiting under the same id — production resolving
+        // threads are Waiting and absent from the running map.
+        let tid = state
+            .conversation_manager
+            .handle_user_message(
+                conv,
+                "hi",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = state.thread_manager.stop_thread(tid, "alice").await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.thread_manager.join_thread(tid),
+        )
+        .await;
+
+        let mut waiting = lunarwing_engine::Thread::new(
+            "waiting",
+            lunarwing_engine::ThreadType::Foreground,
+            project_id,
+            "alice",
+            ThreadConfig::default(),
+        );
+        waiting.id = tid;
+        waiting
+            .transition_to(lunarwing_engine::ThreadState::Running, None)
+            .unwrap();
+        waiting
+            .transition_to(lunarwing_engine::ThreadState::Waiting, None)
+            .unwrap();
+        state.store.save_thread(&waiting).await.unwrap();
+
+        // Mark the resolving window (approved action executing inline).
+        let token = state.thread_manager.begin_resolving(tid).await;
+
+        let msg = IncomingMessage::new("gateway", "alice", "/interrupt")
+            .with_conversation_scope("resolving");
+        let result = interrupt_engine_conversation(&state, &msg)
+            .await
+            .expect("interrupt should succeed");
+
+        assert_eq!(result, Some("Interrupted.".to_string()));
+        assert!(
+            token.is_cancelled(),
+            "interrupt must cancel the resolving token"
+        );
+        let saved = state.store.load_thread(tid).await.unwrap().unwrap();
+        assert!(
+            saved.state.is_terminal(),
+            "waiting thread must be finalized, got {:?}",
+            saved.state
+        );
+        let conv_after = state
+            .conversation_manager
+            .get_conversation(conv)
+            .await
+            .unwrap();
+        assert!(
+            conv_after.active_threads.is_empty(),
+            "finalized thread must be untracked"
+        );
     }
 
     #[tokio::test]
