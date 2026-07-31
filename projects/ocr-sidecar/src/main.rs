@@ -591,6 +591,21 @@ fn rate_limit_filter(state: AppState) -> impl Filter<Extract = (), Error = Rejec
         .untuple_one()
 }
 
+/// Constant-time string equality for Bearer token comparison. Early-exit
+/// `==` would let an attacker measure how many leading bytes matched.
+/// Length is checked first (acceptable: token length is not secret in
+/// practice), then every byte is compared without short-circuiting.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 fn auth_filter(config: Config) -> impl Filter<Extract = (), Error = Rejection> + Clone {
     warp::header::optional("authorization")
         .and_then(move |auth: Option<String>| {
@@ -601,7 +616,7 @@ fn auth_filter(config: Config) -> impl Filter<Extract = (), Error = Rejection> +
                     Some(token) => match auth {
                         Some(header) if header.starts_with("Bearer ") => {
                             let provided = header.trim_start_matches("Bearer ");
-                            if provided == token {
+                            if constant_time_eq(provided, &token) {
                                 Ok(())
                             } else {
                                 Err(warp::reject::custom(AppError::Unauthorized))
@@ -2011,6 +2026,15 @@ mod tests {
             image_mime_type(b"II\x2a\x00").expect("detect TIFF"),
             "image/tiff"
         );
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_tokens() {
+        assert!(constant_time_eq("s3cret-token", "s3cret-token"));
+        assert!(!constant_time_eq("s3cret-token", "s3cret-tokem"));
+        assert!(!constant_time_eq("s3cret-token", "s3cret"));
+        assert!(!constant_time_eq("", "x"));
+        assert!(constant_time_eq("", ""));
     }
 
     #[test]
