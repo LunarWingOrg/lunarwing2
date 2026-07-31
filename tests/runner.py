@@ -6,7 +6,7 @@ Matrix-driven test suite for LunarWing worker types.
 Usage:
     python runner.py                # smoke (happy paths)
     python runner.py --mode full    # all scenarios + chaos
-    python runner.py --worker nanocode # single worker
+    python runner.py --worker opencode # single worker
 """
 from __future__ import annotations
 
