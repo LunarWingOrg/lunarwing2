@@ -217,6 +217,30 @@ class ModelMappingTests(unittest.TestCase):
 
 
 class RedactionTests(unittest.TestCase):
+    def test_provision_kimi_key_never_enters_argv_or_audit_command(self) -> None:
+        from lunarwing_mt_onboard import provisioner
+        from lunarwing_mt_onboard.config import TenantConfig
+
+        secret = "kimi-secret-never-log"
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "lunarwing-mt-admin.sh"
+            script.write_text("#!/bin/sh\n")
+            script.chmod(0o700)
+            with patch.object(provisioner, "MT_ADMIN_SCRIPT", str(script)):
+                argv = provisioner.build_add_tenant_args(
+                    TenantConfig(name="alpha", kimi_api_key=secret)
+                )
+            logger = audit.AuditLogger("provision", "alpha", "kimi", log_dir=tmp)
+            logger.command(argv)
+            path = logger.path
+            logger.close()
+
+            logged = path.read_text()
+
+        self.assertNotIn(secret, argv)
+        self.assertNotIn("--kimi-api-key", argv)
+        self.assertNotIn(secret, logged)
+
     def test_redact_kv_and_hex(self) -> None:
         key = "a" * 64
         red = audit.redact_text(f"SECRETS_MASTER_KEY='{key}'")

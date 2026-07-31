@@ -180,6 +180,7 @@ base64 = "0.22"
 mime_guess = "2.0.5"
 clap_complete = "4.5.0"
 lru = "0.16.3"
+tempfile = "3"
 
 # XMPP channel
 tokio-xmpp = { version = "6", features = ["starttls"] }
@@ -217,7 +218,6 @@ tokio-test = "0.4"
 tracing-test = "0.2"
 tokio-tungstenite = "0.26"
 pretty_assertions = "1"
-tempfile = "3"
 insta = "1.46.3"
 criterion = "0.5"
 

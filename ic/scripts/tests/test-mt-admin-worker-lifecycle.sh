@@ -50,6 +50,7 @@ _ctr() {
   return 0
 }
 start_tenant_opencode() { CALLS+=("start-opencode:$1"); }
+start_tenant_kimi() { CALLS+=("start-kimi:$1"); }
 
 INIT_SYSTEM="systemd"
 CALLS=()
@@ -86,6 +87,15 @@ assert_before \
 CALLS=()
 start_worker alice opencode
 assert_call "start-opencode:alice"
+
+CALLS=()
+start_worker alice kimi
+assert_call "start-kimi:alice"
+
+CALLS=()
+stop_worker alice kimi
+assert_call "rc:lunarwing-kimi-alice-sup stop"
+assert_call "ctr:alice stop lunarwing-kimi-alice"
 
 INIT_SYSTEM="systemd"
 MT_ROOTLESS="false"

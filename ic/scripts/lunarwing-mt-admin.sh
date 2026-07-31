@@ -323,7 +323,7 @@ Commands:
                                    (written to lunarwing.env as KIMI_MODEL)
     --kimi-base-url <url>          Override the kimi worker's API base URL
                                    (written to lunarwing.env as KIMI_BASE_URL)
-    --kimi-api-key <key>           API key for the kimi worker
+    --kimi-api-key-file <path>     Read kimi API key from a file, never argv
                                    (written to lunarwing.env as KIMI_API_KEY)
     --llm-model <model>            Override LLM_MODEL (default:
                                    tensorzero::function_name::lunarwing)
@@ -336,7 +336,7 @@ Commands:
    add-tenants <names> [options]    Comma-separated list (e.g. "Ruffles,Miyuki")
      (same options as add-tenant apply to all, including --enable-darkirc,
        --nanocode-model/--nanocode-base-url, --opencode-model/--opencode-base-url,
-       --kimi-model/--kimi-base-url/--kimi-api-key,
+       --kimi-model/--kimi-base-url/--kimi-api-key-file,
       --llm-model, --gateway-host, --xmpp-allow-from, and --no-weechat-bootstrap)
 
   remove-tenant <name>             Stop services, deallocate ports
@@ -349,6 +349,8 @@ Commands:
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
     --with-kimi                    Also build the kimi worker Docker image
+    --with-toolchains              Include toolchains in selected nanocode,
+                                   opencode, and kimi worker images (default: slim)
 
   build-all                        Build each tenant sequentially
     --with-wasm                    Also build WASM extensions
@@ -356,6 +358,8 @@ Commands:
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
     --with-kimi                    Also build the kimi worker Docker image
+    --with-toolchains              Include toolchains in selected nanocode,
+                                   opencode, and kimi worker images (default: slim)
 
   build-nanocode-worker            Build the nanocode worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
@@ -426,7 +430,7 @@ Commands:
   configure-kimi <name>            Set kimi worker LLM overrides for a tenant
     --model <model>                Kimi model (KIMI_MODEL; any string)
     --base-url <url>               Kimi API base URL (KIMI_BASE_URL; full URL)
-    --api-key <key>                Kimi API key (KIMI_API_KEY)
+    --api-key-file <path>          Read Kimi API key from a file, never argv
                                    (restart the worker after: stop-tenant && start-tenant)
 
   configure-study-mcp <name>       Configure lw2studymcp for LunarWing and
@@ -2043,13 +2047,13 @@ build_tenant() {
   if [[ "$with_opencode" == "true" ]]; then
     say ""
     say "=== Building opencode worker image ==="
-    build_opencode_worker "false" "$with_toolchains"
+    build_opencode_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"
   fi
 
   if [[ "$with_kimi" == "true" ]]; then
     say ""
     say "=== Building kimi worker image ==="
-    build_kimi_worker "false" "$with_toolchains"
+    build_kimi_worker "false" "$with_toolchains" "" "$(tenant_lw_root "$name")"
   fi
 
   # After a rebuild, the tenant will be restarted with the new binary. If the
@@ -2075,7 +2079,7 @@ build_darkirc() {
     local envf
     envf="$(tenant_env_dir "$tenant_name")/lunarwing.env"
     if [[ -f "$envf" ]]; then
-      darkirc_src="$(grep -s '^DARKIRC_SOURCE=' "$envf" | cut -d= -f2-)" || true
+      darkirc_src="$(_read_env_value "$envf" DARKIRC_SOURCE)"
     fi
     [[ -n "$darkirc_src" ]] || darkirc_src="$DARKIRC_SOURCE"
     [[ -n "$darkirc_src" ]] || darkirc_src="$(tenant_home "$tenant_name")/darkfi"
@@ -2129,6 +2133,32 @@ build_darkirc() {
   ) 200>"$BUILD_LOCK"
 }
 
+shared_worker_source_root() {  # <names> <with-opencode> <with-kimi>
+  local names="$1" with_opencode="$2" with_kimi="$3"
+  local name root commit dirty expected_commit="" selected_root=""
+  local -a worker_paths=()
+  [[ "$with_opencode" != "true" ]] || worker_paths+=(opencode4lunarwing)
+  [[ "$with_kimi" != "true" ]] || worker_paths+=(kimicode4lunarwing)
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    root="$(tenant_lw_root "$name")"
+    commit="$(sudo -u "$name" git -C "$root" rev-parse HEAD 2>/dev/null)" \
+      || die "cannot resolve tenant checkout for worker build: $name"
+    dirty="$(sudo -u "$name" git -C "$root" status --porcelain --untracked-files=all -- "${worker_paths[@]}")" \
+      || die "cannot inspect tenant worker source: $name"
+    [[ -z "$dirty" ]] \
+      || die "build-all refuses dirty worker source in tenant checkout: $name"
+    if [[ -z "$expected_commit" ]]; then
+      expected_commit="$commit"
+      selected_root="$root"
+    elif [[ "$commit" != "$expected_commit" ]]; then
+      die "build-all cannot publish one shared worker image from mixed tenant revisions"
+    fi
+  done <<<"$names"
+  [[ -n "$selected_root" ]] || die "no tenant checkout available for worker build"
+  printf '%s\n' "$selected_root"
+}
+
 build_all() {
   local with_wasm="${1:-false}"
   local with_nanocode="${2:-false}"
@@ -2142,6 +2172,11 @@ build_all() {
   if [[ -z "$names" ]]; then
     say "no tenants registered"
     return 0
+  fi
+
+  local worker_source_root=""
+  if [[ "$with_opencode" == "true" || "$with_kimi" == "true" ]]; then
+    worker_source_root="$(shared_worker_source_root "$names" "$with_opencode" "$with_kimi")"
   fi
 
   if [[ "$with_nanocode" == "true" ]]; then
@@ -2159,13 +2194,13 @@ build_all() {
   if [[ "$with_opencode" == "true" ]]; then
     say ""
     say "=== Building opencode worker image ==="
-    build_opencode_worker "false" "$with_toolchains"
+    build_opencode_worker "false" "$with_toolchains" "$worker_source_root"
   fi
 
   if [[ "$with_kimi" == "true" ]]; then
     say ""
     say "=== Building kimi worker image ==="
-    build_kimi_worker "false" "$with_toolchains"
+    build_kimi_worker "false" "$with_toolchains" "" "$worker_source_root"
   fi
 
   while IFS= read -r name; do
@@ -2241,7 +2276,8 @@ build_pebble_worker() {
 build_opencode_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
-  local opencode_dir="${LUNARWING_ROOT}/opencode4lunarwing"
+  local source_root="${3:-$LUNARWING_ROOT}"
+  local opencode_dir="${source_root}/opencode4lunarwing"
 
   [[ -d "$opencode_dir" ]] || die "opencode worker dir not found at $opencode_dir"
 
@@ -2282,8 +2318,9 @@ build_opencode_worker() {
 build_kimi_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
-  local kimi_code_version="${3:-0.30.0}"
-  local kimi_dir="${LUNARWING_ROOT}/kimicode4lunarwing"
+  local kimi_code_version="${3:-}"
+  local source_root="${4:-$LUNARWING_ROOT}"
+  local kimi_dir="${source_root}/kimicode4lunarwing"
 
   [[ -d "$kimi_dir" ]] || die "kimi worker dir not found at $kimi_dir"
 
@@ -2291,7 +2328,9 @@ build_kimi_worker() {
 
   local toolchain_desc="slim (no toolchains)"
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
-  say "building kimi worker Docker image [$toolchain_desc] (kimi-code version: ${kimi_code_version}) ..."
+  local version_desc="Dockerfile default"
+  [[ -z "$kimi_code_version" ]] || version_desc="$kimi_code_version"
+  say "building kimi worker Docker image [$toolchain_desc] (kimi-code version: ${version_desc}) ..."
 
   local -a cache_args=()
   [[ "$no_cache" == "true" ]] && cache_args=(--no-cache)
@@ -2299,7 +2338,8 @@ build_kimi_worker() {
   local -a toolchain_args=()
   [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
 
-  local -a version_args=(--build-arg KIMI_CODE_VERSION="${kimi_code_version}")
+  local -a version_args=()
+  [[ -z "$kimi_code_version" ]] || version_args=(--build-arg KIMI_CODE_VERSION="${kimi_code_version}")
 
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     local -a layer_args=()
@@ -2469,8 +2509,7 @@ install_wasm_all() {
 # Echo the existing VALUE of KEY from a tenant env file (empty if file/key absent).
 # Used to PRESERVE secrets across re-runs so re-provisioning never rotates them.
 _env_existing() {  # <env_file> <KEY>
-  [[ -f "$1" ]] || return 0
-  sed -n "s/^$2=//p" "$1" | head -1
+  _read_env_value "$1" "$2"
 }
 
 validate_study_notes_path() {  # <absolute path> <label>
@@ -2619,7 +2658,39 @@ tenant_weechat_home() {  # <tenant>
 # Returns empty if file or key is absent. Never prints the file's other content.
 _read_env_value() {  # <file> <KEY>
   [[ -f "$1" ]] || return 0
-  sed -n "s/^$2=//p" "$1" | tail -1
+  local value
+  value="$(sed -n "s/^$2=//p" "$1" | tail -1)"
+  # Current writers use systemd-compatible double quotes. Keep decoding the
+  # older onboarding client's single-quoted representation during migration.
+  if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\"/\"}"
+    value="${value//\\\\/\\}"
+  elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\'/\'}"
+    value="${value//\\\\/\\}"
+  fi
+  printf '%s\n' "$value"
+}
+
+_quote_env_value() {  # <one-line value>
+  local value="$1"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+    || die "environment values cannot contain newlines"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+_read_secret_file() {  # <path> <description>
+  local path="$1" description="$2" value
+  [[ -f "$path" && -r "$path" ]] || die "$description file is not readable: $path"
+  value="$(<"$path")"
+  [[ -n "$value" ]] || die "$description file is empty: $path"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+    || die "$description file must contain exactly one line"
+  printf '%s\n' "$value"
 }
 
 # Success when <dir> contains any entry (normal or dotfile).
@@ -3049,7 +3120,8 @@ ENVEOF
   [[ -n "$opencode_base_url" ]] && printf 'OPENCODE_BASE_URL=%s\n' "$opencode_base_url" >> "$path"
   [[ -n "$kimi_model" ]]        && printf '\nKIMI_MODEL=%s\n'        "$kimi_model"        >> "$path"
   [[ -n "$kimi_base_url" ]]     && printf 'KIMI_BASE_URL=%s\n'     "$kimi_base_url"     >> "$path"
-  [[ -n "$kimi_api_key" ]]      && printf 'KIMI_API_KEY=%s\n'      "$kimi_api_key"      >> "$path"
+  [[ -n "$kimi_api_key" ]] \
+    && printf 'KIMI_API_KEY=%s\n' "$(_quote_env_value "$kimi_api_key")" >> "$path"
   if [[ -n "$study_notes_home" ]]; then
     printf '\n# Shared LunarWing Study Notes MCP\nLW2STUDYMCP_HOME=%s\n' \
       "$study_notes_home" >> "$path"
@@ -3077,11 +3149,11 @@ write_tenant_bridge_env() {
 
   local state_dir bridge_token
   state_dir="$(tenant_state_dir "$name")"
-  bridge_token="$(grep -s '^XMPP_BRIDGE_TOKEN=' "$(tenant_env_dir "$name")/lunarwing.env" | cut -d= -f2- || true)"
+  bridge_token="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_BRIDGE_TOKEN)"
   [[ -n "$bridge_token" ]] || bridge_token="$(generate_token | cut -c1-32)"
 
   local xmpp_pass_val
-  xmpp_pass_val="$(grep -s '^XMPP_PASSWORD=' "$(tenant_env_dir "$name")/lunarwing.env" | cut -d= -f2- || true)"
+  xmpp_pass_val="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_PASSWORD)"
   [[ -n "$xmpp_pass_val" ]] || xmpp_pass_val="${xmpp_password:-$(generate_token | cut -c1-32)}"
 
   # Idempotent XMPP allow-from JSON: an explicit flag wins; else re-derive from
@@ -3092,7 +3164,7 @@ write_tenant_bridge_env() {
     xmpp_allow_from_json_effective="$(build_xmpp_allow_from_json "$xmpp_jid" "$xmpp_allow_from")"
   else
     local daemon_csv
-    daemon_csv="$(grep -s '^XMPP_ALLOW_FROM=' "$(tenant_env_dir "$name")/lunarwing.env" | cut -d= -f2- || true)"
+    daemon_csv="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_ALLOW_FROM)"
     if [[ -n "$daemon_csv" && "$daemon_csv" != "$xmpp_jid" ]]; then
       # Daemon has extras: rebuild JSON from owner + the extras (everything
       # after the leading owner entry, which build_xmpp_allow_from re-prepends).
@@ -3161,7 +3233,7 @@ write_tenant_darkirc_adapter_env() {
   darkirc_irc_port="$(ports_get "$name" darkirc_irc)" || true
 
   local adapter_secret
-  adapter_secret="$(grep -s '^DARKIRC_ADAPTER_SECRET=' "$lunarwing_env" | cut -d= -f2- || true)"
+  adapter_secret="$(_read_env_value "$lunarwing_env" DARKIRC_ADAPTER_SECRET)"
   [[ -n "$adapter_secret" ]] || adapter_secret="$(generate_token | cut -c1-32)"
 
   if [[ -f "$TEMPLATES_DIR/darkirc-adapter.env.template" ]]; then
@@ -3321,6 +3393,11 @@ ensure_external_worker_config() {
   local port_key="$3"  # ports-registry key for its WSS port (e.g. "nanocode_wss")
 
   local state_dir env_path config_path wss_port auth_token
+
+  if [[ "$worker" == "kimi" ]] && ! tenant_worker_enabled "$name" kimi; then
+    say "kimi worker not selected for $name (skipping external-worker config)"
+    return 0
+  fi
   state_dir="$(tenant_state_dir "$name")"
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   config_path="$state_dir/config.toml"
@@ -3350,7 +3427,7 @@ ensure_external_worker_config() {
     return 0
   fi
 
-  auth_token="$(grep -s '^GATEWAY_AUTH_TOKEN=' "$env_path" | cut -d= -f2- || true)"
+  auth_token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
 
   # add-tenant runs before the daemon ever starts, so config.toml usually does
   # not exist yet — create it with a header. Appending a fresh
@@ -3634,11 +3711,11 @@ upload_tenant_darkirc_secret() {
 
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
 
-  darkirc_adapter_secret="$(grep -s '^DARKIRC_ADAPTER_SECRET=' "$env_path" | cut -d= -f2- || true)"
+  darkirc_adapter_secret="$(_read_env_value "$env_path" DARKIRC_ADAPTER_SECRET)"
   # The secret is optional — nothing to upload if it is not set.
   [[ -n "$darkirc_adapter_secret" ]] || return 0
 
-  gateway_token="$(grep -s '^GATEWAY_AUTH_TOKEN=' "$env_path" | cut -d= -f2- || true)"
+  gateway_token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
   if [[ -z "$gateway_token" ]]; then
     say "WARNING: GATEWAY_AUTH_TOKEN not found in $env_path; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2
     return 1
@@ -4187,14 +4264,13 @@ configure_nanocode() {
 
   # Upsert: drop any existing override lines, then append the provided values.
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp "${env_path}.tmp.XXXXXX")"
   grep -v -e '^NANOCODE_MODEL=' -e '^NANOCODE_BASE_URL=' "$env_path" >"$tmp" || true
   [[ -n "$model" ]]    && printf 'NANOCODE_MODEL=%s\n'    "$model"    >>"$tmp"
   [[ -n "$base_url" ]] && printf 'NANOCODE_BASE_URL=%s\n' "$base_url" >>"$tmp"
-  cat "$tmp" >"$env_path"
-  rm -f "$tmp"
-  chown "$name:$name" "$env_path"
-  chmod 600 "$env_path"
+  chown "$name:$name" "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$env_path"
   say "nanocode LLM overrides written to $env_path for tenant '$name'"
 
   local container_name="lunarwing-nanocode-$name"
@@ -4704,11 +4780,7 @@ start_tenant_opencode() {
     fi
 
     local workspace_dir
-    workspace_dir="$(tenant_lw_root "$name")/opencode-workspace"
-    mkdir -p "$workspace_dir"
-    # Migrate files created under an older rootless UID mapping before keep-id.
-    chown -R "$name:$name" "$workspace_dir"
-    chmod 777 "$workspace_dir"
+    workspace_dir="$(prepare_worker_workspace "$name" opencode)"
 
     local -a restart_arg=()
     [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
@@ -4764,6 +4836,58 @@ stop_tenant_opencode() {
 
 # ── Kimi Code worker container ────────────────────────────────────────────────
 
+prepare_worker_workspace() {
+  local name="$1" worker="$2" workspace_dir container_uid container_gid
+  workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
+  mkdir -p "$workspace_dir"
+
+  case "$worker" in
+    opencode)
+      container_uid="$OPENCODE_CONTAINER_UID"
+      container_gid="$OPENCODE_CONTAINER_GID"
+      ;;
+    kimi)
+      container_uid="$KIMI_CONTAINER_UID"
+      container_gid="$KIMI_CONTAINER_GID"
+      ;;
+    *) die "unsupported private worker workspace: $worker" ;;
+  esac
+
+  if [[ "$MT_ROOTLESS" != "true" ]]; then
+    # Rootful runtimes do not apply keep-id, so bind mounts must use image IDs.
+    chown -R "$container_uid:$container_gid" "$workspace_dir"
+  else
+    chown -R "$name:$name" "$workspace_dir"
+  fi
+  chmod 2770 "$workspace_dir"
+  printf '%s\n' "$workspace_dir"
+}
+
+write_kimi_runtime_env() {
+  local name="$1" source_path target_path temporary key value
+  source_path="$(tenant_env_dir "$name")/lunarwing.env"
+  target_path="$(tenant_env_dir "$name")/kimi-runtime.env"
+  temporary="$(mktemp "${target_path}.tmp.XXXXXX")"
+  chmod 600 "$temporary"
+
+  for key in KIMI_MODEL KIMI_BASE_URL KIMI_API_KEY; do
+    value="$(_read_env_value "$source_path" "$key")"
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+      || { rm -f "$temporary"; die "$key cannot contain a newline"; }
+    [[ -z "$value" ]] || printf '%s=%s\n' "$key" "$value" >>"$temporary"
+  done
+
+  value="$(_read_env_value "$source_path" GATEWAY_AUTH_TOKEN)"
+  [[ -n "$value" ]] \
+    || { rm -f "$temporary"; die "Kimi worker requires GATEWAY_AUTH_TOKEN"; }
+  # Worker bridge expects AGENT_AUTH_TOKEN, not daemon's gateway variable name.
+  printf 'AGENT_AUTH_TOKEN=%s\n' "$value" >>"$temporary"
+  chown "$name:$name" "$temporary"
+  chmod 600 "$temporary"
+  mv -f "$temporary" "$target_path"
+  printf '%s\n' "$target_path"
+}
+
 configure_kimi() {
   local name="$1"
   local model="${2:-}"
@@ -4773,18 +4897,25 @@ configure_kimi() {
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
   [[ -n "$model" || -n "$base_url" || -n "$api_key" ]] \
-    || die "configure-kimi: pass --model <model> and/or --base-url <url> and/or --api-key <key>"
+    || die "configure-kimi: pass --model <model>, --base-url <url>, or --api-key-file <path>"
 
   local env_path
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
 
-  local tmp
+  local tmp existing_model existing_base_url existing_api_key
+  existing_model="$(_read_env_value "$env_path" KIMI_MODEL)"
+  existing_base_url="$(_read_env_value "$env_path" KIMI_BASE_URL)"
+  existing_api_key="$(_read_env_value "$env_path" KIMI_API_KEY)"
+  [[ -n "$model" ]] || model="$existing_model"
+  [[ -n "$base_url" ]] || base_url="$existing_base_url"
+  [[ -n "$api_key" ]] || api_key="$existing_api_key"
   tmp="$(mktemp)"
   grep -v -e '^KIMI_MODEL=' -e '^KIMI_BASE_URL=' -e '^KIMI_API_KEY=' "$env_path" >"$tmp" || true
   [[ -n "$model" ]]    && printf 'KIMI_MODEL=%s\n'    "$model"    >>"$tmp"
   [[ -n "$base_url" ]] && printf 'KIMI_BASE_URL=%s\n' "$base_url" >>"$tmp"
-  [[ -n "$api_key" ]]  && printf 'KIMI_API_KEY=%s\n'  "$api_key"  >>"$tmp"
+  [[ -n "$api_key" ]] \
+    && printf 'KIMI_API_KEY=%s\n' "$(_quote_env_value "$api_key")" >>"$tmp"
   cat "$tmp" >"$env_path"
   rm -f "$tmp"
   chown "$name:$name" "$env_path"
@@ -4882,36 +5013,19 @@ start_tenant_kimi() {
   if ! _ctr "$name" inspect "$container_name" &>/dev/null; then
     say "creating kimi worker container $container_name on WSS port $wss_port"
 
-    local tenant_env_path
-    tenant_env_path="$(tenant_env_dir "$name")/lunarwing.env"
-
     local kimi_env_path
     kimi_env_path="$(tenant_env_dir "$name")/kimi.env"
 
-    local env_flags=()
-    if [[ -f "$tenant_env_path" ]]; then
-      local gateway_token
-      gateway_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
-      [[ -n "$gateway_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$gateway_token")
-
-      local kimi_model kimi_base_url kimi_api_key
-      kimi_model="$(_read_env_value "$tenant_env_path" KIMI_MODEL)"
-      [[ -n "$kimi_model" ]] && env_flags+=(-e "KIMI_MODEL=$kimi_model")
-      kimi_base_url="$(_read_env_value "$tenant_env_path" KIMI_BASE_URL)"
-      [[ -n "$kimi_base_url" ]] && env_flags+=(-e "KIMI_BASE_URL=$kimi_base_url")
-      kimi_api_key="$(_read_env_value "$tenant_env_path" KIMI_API_KEY)"
-      [[ -n "$kimi_api_key" ]] && env_flags+=(-e "KIMI_API_KEY=$kimi_api_key")
-    fi
+    local runtime_env_path
+    runtime_env_path="$(write_kimi_runtime_env "$name")"
+    local env_flags=(--env-file "$runtime_env_path")
 
     if [[ -f "$kimi_env_path" ]]; then
       env_flags+=(--env-file "$kimi_env_path")
     fi
 
     local workspace_dir
-    workspace_dir="$(tenant_lw_root "$name")/kimi-workspace"
-    mkdir -p "$workspace_dir"
-    chown -R "$name:$name" "$workspace_dir"
-    chmod 777 "$workspace_dir"
+    workspace_dir="$(prepare_worker_workspace "$name" kimi)"
 
     local -a restart_arg=()
     [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
@@ -5345,7 +5459,7 @@ render_vision_quadlet() {
   vision_health_port="$(ports_get "$name" vision_health)" || true
   env_path="$(tenant_env_dir "$name")/vision.env"
   [[ -f "$env_path" ]] || write_tenant_vision_env "$name" >/dev/null
-  token="$(grep '^LUNARWING_AUTH_TOKEN=' "$env_path" 2>/dev/null | cut -d= -f2- || true)"
+  token="$(_read_env_value "$env_path" LUNARWING_AUTH_TOKEN)"
   token="${token//%/%%}"
   mkdir -p "$qdir"
 
@@ -5773,14 +5887,16 @@ EOF
   chown -R "$name:$name" "$(tenant_home "$name")/.config/containers"
 }
 
-# Render a per-tenant Quadlet .container for an external worker (nanocode/pebble).
+# Render a per-tenant Quadlet .container for an external worker.
 # Mirrors the imperative env from start_tenant_<worker>: the GATEWAY_AUTH_TOKEN ->
 # AGENT_AUTH_TOKEN and LLM_API_KEY -> TENSORZERO_API_KEY remap is resolved here and
-# inlined as Environment= in a 0600 tenant-owned unit (no secret leaves the file).
+# inlined as Environment= in a 0600 tenant-owned unit. Kimi uses a separate
+# mode-0600 runtime env file so its API key never enters generated unit commands.
 # Returns early (no unit) when the worker has no allocated wss port.
 render_worker_quadlet() {
   local name="$1" worker="$2" health_port="${3:-8443}"
   local qdir wss_port workspace_dir env_dir tenant_env_path worker_env_path host_health_port
+  local runtime_env_path="" runtime_env_hash="" health_path="health"
   qdir="$(tenant_quadlet_dir "$name")"
   wss_port="$(ports_get "$name" "${worker}_wss")"
   host_health_port="$(ports_get "$name" "${worker}_health")"
@@ -5790,13 +5906,16 @@ render_worker_quadlet() {
   worker_env_path="$env_dir/${worker}.env"
   workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
   mkdir -p "$workspace_dir"
-  if [[ "$worker" == "opencode" || "$worker" == "kimi" ]]; then
-    # Migrate files created under older rootless UID mappings.
-    chown -R "$name:$name" "$workspace_dir"
+  if [[ "$worker" == "kimi" || "$worker" == "opencode" ]]; then
+    workspace_dir="$(prepare_worker_workspace "$name" "$worker")"
   else
     chown "$name:$name" "$workspace_dir"
   fi
-  chmod 777 "$workspace_dir"
+  [[ "$worker" == "kimi" || "$worker" == "opencode" ]] || chmod 777 "$workspace_dir"
+  [[ "$worker" != "kimi" ]] || runtime_env_path="$(write_kimi_runtime_env "$name")"
+  [[ -z "$runtime_env_path" ]] \
+    || runtime_env_hash="$(sha256sum "$runtime_env_path" | cut -d' ' -f1)"
+  [[ "$worker" != "kimi" ]] || health_path="ready"
   mkdir -p "$qdir"
 
   local agent_token tz_key
@@ -5877,8 +5996,8 @@ EOF
     printf 'Volume=%s:/tmp/ssh-agent.sock:z\n' "$ssh_agent_socket"
     printf 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent.sock\n'
     # Publish the per-tenant dedicated health port (v8) -> container's 8443, so
-    # the host self-heal pipeline can probe /health directly. The container still
-    # listens on HEALTH_PORT=8443 internally (matches the image's baked HEALTHCHECK).
+    # the host self-heal pipeline can probe the worker directly. Container still
+    # listens on HEALTH_PORT=8443 internally (matches image healthcheck).
     [[ -n "$host_health_port" ]] && printf 'PublishPort=127.0.0.1:%s:8443\n' "$host_health_port"
     if [[ "$worker" == "nanocode" ]]; then
       printf 'Environment=NANOCODE_MODE=websocket\n'
@@ -5892,7 +6011,8 @@ EOF
       printf 'Environment=KIMI_MODE=websocket\n'
       printf 'Environment=WS_ROLE=server\n'
     fi
-    [[ -n "$agent_token" ]] && printf 'Environment=AGENT_AUTH_TOKEN=%s\n' "$agent_token"
+    [[ "$worker" == "kimi" || -z "$agent_token" ]] \
+      || printf 'Environment=AGENT_AUTH_TOKEN=%s\n' "$agent_token"
     [[ "$worker" == "nanocode" && -n "$tz_key" ]] && printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key"
     [[ "$worker" == "nanocode" && -n "$nanocode_model" ]] && printf 'Environment=NANOCODE_MODEL=%s\n' "$nanocode_model"
     [[ "$worker" == "nanocode" && -n "$nanocode_base_url" ]] && printf 'Environment=NANOCODE_BASE_URL=%s\n' "$nanocode_base_url"
@@ -5902,19 +6022,16 @@ EOF
     oc_base_url="$(_read_env_value "$tenant_env_path" OPENCODE_BASE_URL)"
     [[ "$worker" == "opencode" && -n "$oc_model" ]] && printf 'Environment=OPENCODE_MODEL=%s\n' "$oc_model"
     [[ "$worker" == "opencode" && -n "$oc_base_url" ]] && printf 'Environment=OPENCODE_BASE_URL=%s\n' "$oc_base_url"
-    local kimi_model kimi_base_url kimi_api_key
-    kimi_model="$(_read_env_value "$tenant_env_path" KIMI_MODEL)"
-    kimi_base_url="$(_read_env_value "$tenant_env_path" KIMI_BASE_URL)"
-    kimi_api_key="$(_read_env_value "$tenant_env_path" KIMI_API_KEY)"
-    [[ "$worker" == "kimi" && -n "$kimi_model" ]] && printf 'Environment=KIMI_MODEL=%s\n' "$kimi_model"
-    [[ "$worker" == "kimi" && -n "$kimi_base_url" ]] && printf 'Environment=KIMI_BASE_URL=%s\n' "$kimi_base_url"
-    [[ "$worker" == "kimi" && -n "$kimi_api_key" ]] && printf 'Environment=KIMI_API_KEY=%s\n' "$kimi_api_key"
+    if [[ -n "$runtime_env_path" ]]; then
+      printf '# RuntimeEnvHash=%s\n' "$runtime_env_hash"
+      printf 'EnvironmentFile=%s\n' "$runtime_env_path"
+    fi
     # Operator override file (optional). EnvironmentFile= has existed since the
     # Quadlet 4.4 debut, so it is safe at our >= 4.6 floor.
     [[ -f "$worker_env_path" ]] && printf 'EnvironmentFile=%s\n' "$worker_env_path"
     [[ "$worker" == "nanocode" || "$worker" == "opencode" || "$worker" == "kimi" ]] && printf 'Exec=--mode websocket\n'
     cat <<EOF
-HealthCmd=curl -sf http://127.0.0.1:${health_port}/health || exit 1
+HealthCmd=curl -sf http://127.0.0.1:${health_port}/${health_path} || exit 1
 HealthInterval=15s
 HealthTimeout=5s
 HealthRetries=3
@@ -7483,7 +7600,7 @@ _wait_tenant_gateway() {
   local name="$1" env_path gateway_port gateway_token auth_header i=0
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   gateway_port="$(ports_get "$name" gateway)"
-  gateway_token="$(grep -s '^GATEWAY_AUTH_TOKEN=' "$env_path" | cut -d= -f2- || true)"
+  gateway_token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
   [[ -n "$gateway_token" ]] || return 1
   auth_header="Authorization: Bearer ${gateway_token}"
   while ! curl -sf --max-time 2 \
@@ -8079,7 +8196,7 @@ show_tokens() {
     local env_path gateway_port token
     env_path="$(tenant_env_dir "$name")/lunarwing.env"
     gateway_port="$(ports_get "$name" gateway)"
-    token="$(grep -s '^GATEWAY_AUTH_TOKEN=' "$env_path" | cut -d= -f2- || true)"
+    token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
     say "$name (port $gateway_port): ${token:-<not set>}"
   done <<< "$names"
 }
@@ -8258,7 +8375,8 @@ main() {
           --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
           --kimi-model)        kimi_model="$2"; shift 2 ;;
           --kimi-base-url)     kimi_base_url="$2"; shift 2 ;;
-          --kimi-api-key)      kimi_api_key="$2"; shift 2 ;;
+          --kimi-api-key-file) kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
+          --kimi-api-key)      die "--kimi-api-key was removed; use --kimi-api-key-file" ;;
           --llm-model)         llm_model="$2"; shift 2 ;;
           --gateway-host)      gateway_host="$2"; shift 2 ;;
           --xmpp-allow-from)   xmpp_allow_from="$2"; shift 2 ;;
@@ -8303,7 +8421,8 @@ main() {
           --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
           --kimi-model)        kimi_model="$2"; shift 2 ;;
           --kimi-base-url)     kimi_base_url="$2"; shift 2 ;;
-          --kimi-api-key)      kimi_api_key="$2"; shift 2 ;;
+          --kimi-api-key-file) kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
+          --kimi-api-key)      die "--kimi-api-key was removed; use --kimi-api-key-file" ;;
           --llm-model)         llm_model="$2"; shift 2 ;;
           --gateway-host)      gateway_host="$2"; shift 2 ;;
           --xmpp-allow-from)   xmpp_allow_from="$2"; shift 2 ;;
@@ -8455,7 +8574,7 @@ main() {
       require_root
       local no_cache="false"
       local with_toolchains="false"
-      local kimi_code_version="0.30.0"
+      local kimi_code_version=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --no-cache)          no_cache="true"; shift ;;
@@ -8660,7 +8779,8 @@ main() {
         case "$1" in
           --model)    kimi_model="$2"; shift 2 ;;
           --base-url) kimi_base_url="$2"; shift 2 ;;
-          --api-key)  kimi_api_key="$2"; shift 2 ;;
+          --api-key-file) kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
+          --api-key)  die "--api-key was removed; use --api-key-file" ;;
           -*)         die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
@@ -8669,7 +8789,7 @@ main() {
             ;;
         esac
       done
-      [[ -n "$name" ]] || die "usage: configure-kimi <name> [--model <model>] [--base-url <url>] [--api-key <key>]"
+      [[ -n "$name" ]] || die "usage: configure-kimi <name> [--model <model>] [--base-url <url>] [--api-key-file <path>]"
       configure_kimi "$name" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
       ;;
 
