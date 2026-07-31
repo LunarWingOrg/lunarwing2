@@ -1014,7 +1014,7 @@ Serious automated remediation system (~1,000 lines):
 
 **Service manager support:** systemd (incl. per-tenant user units), OpenRC, launchd.
 
-### Worker Runtime Packaging (`codex4lunarwing/` *(removed v1.1.9)*, `lunarcode4lunarwing/`, `pebble4lunarwing/`)
+### Worker Runtime Packaging (`pebble4lunarwing/`, `opencode4lunarwing/`, `kimicode4lunarwing/`)
 
 Each external worker runtime has its own miniature execution harness:
 - `entrypoint.sh` — container entrypoint.
@@ -1053,9 +1053,10 @@ Confirms external worker ecosystems are becoming **platformized** — each runti
 
 ---
 
-## 12g. `nanocode-config/` — TensorZero + NanoCode Configuration Hub
+## 12g. Removed `nanocode-config/` Snapshot
 
-> **⚠️ NOTE: This directory appears stale.** It is unclear whether any current code references it. It has not been removed or archived yet pending confirmation. The analysis below documents what exists for reference.
+> **Historical:** This directory was removed with Nanocode retirement in v2.0.4.
+> Analysis below records its former contents and is not current guidance.
 
 ### Overview
 

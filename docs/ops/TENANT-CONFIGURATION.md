@@ -339,7 +339,7 @@ sudo lunarwing-mt-admin.sh restart-worker <tenant> opencode
 sudo lunarwing-mt-admin.sh kill-worker <tenant> opencode
 ```
 
-The same commands accept `nanocode` and `pebble`. Running `podman stop` as root
+The same commands accept `pebble`, `opencode`, and `kimi`. Running `podman stop` as root
 targets root's unrelated store and runtime directory (`/run/user/0/libpod`), not
 the tenant container. Do not use raw root Podman for tenant workers.
 
@@ -363,9 +363,9 @@ lunarwing-proxy-<tenant>.service            # TensorZero proxy
 lunarwing-weechat-<tenant>.service          # weechat backend
 lunarwing-weechat-adapter-<tenant>.service  # weechat WS adapter
 lunarwing-pg-<tenant>.service               # Postgres (rootless Quadlet)
-lunarwing-nanocode-<tenant>.service         # nanocode worker (rootless Quadlet)
 lunarwing-pebble-<tenant>.service           # pebble worker (rootless Quadlet)
 lunarwing-opencode-<tenant>.service         # opencode worker (rootless Quadlet)
+lunarwing-kimi-<tenant>.service             # Kimi Code worker (rootless Quadlet)
 ```
 
 There is no per-tenant `.target`; restart units individually, or use

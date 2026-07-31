@@ -15,24 +15,10 @@ docker build -f Dockerfile.worker -t lunarwing-worker:latest .
 
 Runs as non-root user `sandbox` (UID 1000) in `/workspace`. Entrypoint is the `lunarwing` binary — the orchestrator passes the full command via Docker cmd.
 
-## Nanocode Worker
-
-Bun-based Nanocode agent. Runs nanocode headless server internally (port 4096) with a TypeScript bridge to the WebSocket protocol. Health on 8443, WebSocket on 9090.
-
-**Dockerfile:** `lunarcode4lunarwing/Dockerfile`
-
-```bash
-# Copy nanocode source (required, not checked in)
-cp -R nanocode-config/nanocode lunarcode4lunarwing/nanocode
-
-cd lunarcode4lunarwing
-docker build -t lunarwing-nanocode-worker:latest .
-
-# Or via docker-compose
-docker compose up --build
-```
-
-Modes: `--mode websocket` (default, persistent), `--mode cli` (one-shot), `--mode acp`. Requires `AGENT_AUTH_TOKEN` for WebSocket auth. See `lunarcode4lunarwing/CLAUDE.md` for full env var reference.
+Nanocode is retired and no longer built, configured, started, monitored, or
+published by LunarWing (removed in v2.0.4.0). See
+[Nanocode External Worker Removal](NANOCODE-REMOVAL.md) for upgrade and
+legacy-data handling.
 
 ## Pebble Worker
 

@@ -1,4 +1,8 @@
-# Nanocode Worker: Multi-Tenant Setup
+# Nanocode Worker: Multi-Tenant Setup (HISTORICAL)
+
+> **Retired in v2.0.4.0.** Nanocode is no longer a supported external worker;
+> this guide is archived for historical reference. See
+> `docs/ops/NANOCODE-REMOVAL.md` for the removal and legacy-data handling.
 
 Guide for deploying the nanocode external worker in a multi-tenant LunarWing environment.
 
