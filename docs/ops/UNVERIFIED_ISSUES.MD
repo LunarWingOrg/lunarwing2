@@ -254,7 +254,8 @@ by each pending entry. A stale timer must never match a replacement entry.
 ### ISSUE-006: `disable-weechat` changes health classification but not service lifecycle
 
 **Severity:** High
-**Status:** Confirmed real — FIXED in `346c9f1`
+**Status:** Confirmed real — initial lifecycle gating in `346c9f1`; completed by
+the ISSUE-006 follow-up on `aj/kimi-2-20260731-0001` after independent review
 **Affected code:** `ic/scripts/lunarwing-mt-admin.sh:1554-1583`,
 `ic/scripts/lunarwing-mt-admin.sh:5941-5965`,
 `ic/scripts/lunarwing-mt-admin.sh:6012-6026`,

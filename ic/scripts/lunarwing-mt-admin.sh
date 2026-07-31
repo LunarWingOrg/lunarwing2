@@ -18,6 +18,7 @@ PORT_RANGE_START=10000
 PORT_RANGE_END=19999
 PORT_BLOCK_SIZE=10
 BUILD_LOCK="/var/lock/lunarwing-build.lock"
+TENANT_LIFECYCLE_LOCK_DIR="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/var/lock/lunarwing-tenants}"
 PORTS_LOCK_HELD="false"
 PROFILE="${LUNARWING_MT_PROFILE:-release}"
 SOURCE_REPO="${LUNARWING_MT_SOURCE_REPO:-$LUNARWING_ROOT}"
@@ -30,6 +31,9 @@ DARKIRC_REPO="${LUNARWING_MT_DARKIRC_REPO:-https://github.com/darkrenaissance/da
 DARKIRC_REV="${LUNARWING_MT_DARKIRC_REV:-a05956d412a091e8b54c1cd4f4264c33b941203d}"
 OPENRC_ENV_EXEC_SRC="$SCRIPT_DIR/lunarwing-openrc-env-exec.sh"
 OPENRC_ENV_EXEC="/usr/local/libexec/lunarwing-openrc-env-exec"
+OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}"
+OPENRC_CONFD_DIR="${LUNARWING_MT_OPENRC_CONFD_DIR:-/etc/conf.d}"
+OPENRC_RUNLEVELS_DIR="${LUNARWING_MT_OPENRC_RUNLEVELS_DIR:-/etc/runlevels}"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 DEFAULT_TENSORZERO_URL="${LUNARWING_MT_TENSORZERO_URL:-http://192.168.1.157:3000/openai/v1}"
 # Fleet-wide default VL (vision-language) backend URL the OCR sidecar proxies to.
@@ -121,6 +125,24 @@ release_ports_lock() {
   flock -u 199
   exec 199>&-
   PORTS_LOCK_HELD="false"
+}
+
+with_tenant_lifecycle_lock() {
+  local name="$1"
+  shift
+  require_cmd flock
+  mkdir -p "$TENANT_LIFECYCLE_LOCK_DIR"
+  local lock_fd result
+  exec {lock_fd}>"$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" || return 1
+  if ! flock -x "$lock_fd"; then
+    exec {lock_fd}>&-
+    return 1
+  fi
+  "$@" || result=$?
+  result="${result:-0}"
+  flock -u "$lock_fd" || result=1
+  exec {lock_fd}>&-
+  return "$result"
 }
 
 generate_token() {
@@ -1585,6 +1607,10 @@ ports_set_weechat() {
   case "$enabled" in true|false) ;; *) die "ports_set_weechat: enabled must be true or false" ;; esac
   acquire_ports_lock
   local current
+  if ! jq -e ".tenants[\"$name\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
   # Explicit ==false test: jq's `//` treats false as empty, so
   # `.enable_weechat // true` would misread a disabled tenant as enabled and
   # `enable-weechat` could never flip it back.
@@ -1594,11 +1620,6 @@ ports_set_weechat() {
     release_ports_lock
     return 0
   fi
-  if ! jq -e ".tenants[\"$name\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
-    release_ports_lock
-    die "tenant '$name' not in port registry"
-  fi
-
   local tmp
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
   if ! jq --arg name "$name" --argjson enabled "$enabled" '.tenants[$name].enable_weechat = $enabled' \
@@ -6018,6 +6039,8 @@ render_tenant_systemd_units() {
 
   local ws_adapter_path
   ws_adapter_path="$(tenant_lw_root "$name")/lunarwing_weechat_wss/weechat_relay/ws_adapter.py"
+  local weechat_enabled=false
+  tenant_weechat_enabled "$name" && weechat_enabled=true
 
   # Proxy unit (only when enabled)
   if tenant_proxy_enabled "$name"; then
@@ -6039,16 +6062,17 @@ WantedBy=default.target
 EOF
   fi
 
-  # WeeChat unit (runs in tmux so you can attach: tmux -L weechat-${name} attach)
-  local weechat_home
-  weechat_home="$(tenant_home "$name")/.config/weechat"
-  mkdir -p "$weechat_home"
-  chown "$name:$name" "$weechat_home"
+  if [[ "$weechat_enabled" == "true" ]]; then
+    # WeeChat unit (runs in tmux so you can attach: tmux -L weechat-${name} attach)
+    local weechat_home
+    weechat_home="$(tenant_home "$name")/.config/weechat"
+    mkdir -p "$weechat_home"
+    chown "$name:$name" "$weechat_home"
 
-  _render_weechat_systemd_unit "$name" "$user_unit_dir"
+    _render_weechat_systemd_unit "$name" "$user_unit_dir"
 
-  # WeeChat WS adapter unit
-  cat >"$user_unit_dir/lunarwing-weechat-adapter-${name}.service" <<EOF
+    # WeeChat WS adapter unit
+    cat >"$user_unit_dir/lunarwing-weechat-adapter-${name}.service" <<EOF
 [Unit]
 Description=LunarWing WeeChat WS adapter ($name)
 After=network.target lunarwing-weechat-${name}.service
@@ -6067,6 +6091,15 @@ NoNewPrivileges=true
 [Install]
 WantedBy=default.target
 EOF
+  else
+    # Remove stale files and enablement links so render-units also reconciles a
+    # tenant whose registry flag was changed outside the lifecycle command.
+    rm -f \
+      "$user_unit_dir/lunarwing-weechat-${name}.service" \
+      "$user_unit_dir/lunarwing-weechat-adapter-${name}.service" \
+      "$user_unit_dir/default.target.wants/lunarwing-weechat-${name}.service" \
+      "$user_unit_dir/default.target.wants/lunarwing-weechat-adapter-${name}.service"
+  fi
 
   if tenant_darkirc_enabled "$name"; then
     local darkirc_adapter_path
@@ -6151,12 +6184,18 @@ EOF
     proxy_sd_wants=" lunarwing-proxy-${name}.service"
   fi
 
+  local weechat_sd_after="" weechat_sd_wants=""
+  if [[ "$weechat_enabled" == "true" ]]; then
+    weechat_sd_after=" lunarwing-weechat-${name}.service lunarwing-weechat-adapter-${name}.service"
+    weechat_sd_wants=" lunarwing-weechat-${name}.service lunarwing-weechat-adapter-${name}.service"
+  fi
+
   # Main daemon unit
   cat >"$user_unit_dir/lunarwing-${name}.service" <<EOF
 [Unit]
 Description=LunarWing AI assistant ($name)
-After=network.target ${pg_dep_after}xmpp-bridge-${name}.service${proxy_sd_after} lunarwing-weechat-${name}.service lunarwing-weechat-adapter-${name}.service${darkirc_sd_after}
-  Wants=xmpp-bridge-${name}.service${proxy_sd_wants} lunarwing-weechat-${name}.service lunarwing-weechat-adapter-${name}.service${darkirc_sd_wants}
+After=network.target ${pg_dep_after}xmpp-bridge-${name}.service${proxy_sd_after}${weechat_sd_after}${darkirc_sd_after}
+Wants=xmpp-bridge-${name}.service${proxy_sd_wants}${weechat_sd_wants}${darkirc_sd_wants}
 ${pg_dep_requires}
 
 [Service]
@@ -6425,6 +6464,7 @@ render_tenant_openrc_units() {
   log_dir="$(tenant_log_dir "$name")"
   run_dir="$(tenant_run_dir "$name")"
   install_openrc_env_exec
+  mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR"
 
   local proxy_port bridge_port weechat_port
   proxy_port="$(ports_get "$name" proxy)"
@@ -6440,6 +6480,8 @@ render_tenant_openrc_units() {
   ws_adapter_path="$(tenant_lw_root "$name")/lunarwing_weechat_wss/weechat_relay/ws_adapter.py"
   local ws_adapter_dir
   ws_adapter_dir="$(dirname "$ws_adapter_path")"
+  local weechat_enabled=false
+  tenant_weechat_enabled "$name" && weechat_enabled=true
 
   local darkirc_rc_after=""
   if tenant_darkirc_enabled "$name"; then
@@ -6449,6 +6491,11 @@ render_tenant_openrc_units() {
   local proxy_rc_after=""
   if tenant_proxy_enabled "$name"; then
     proxy_rc_after=" lunarwing-proxy-${name}"
+  fi
+
+  local weechat_rc_after=""
+  if [[ "$weechat_enabled" == "true" ]]; then
+    weechat_rc_after=" lunarwing-weechat-${name} lunarwing-weechat-adapter-${name}"
   fi
 
   local weechat_home
@@ -6468,7 +6515,7 @@ render_tenant_openrc_units() {
   # A first-class unit (not a daemon start_pre side-effect) so the host self-heal
   # pipeline — which auto-discovers /etc/init.d units — can remediate a crashed
   # Postgres independently.
-  cat >"/etc/init.d/lunarwing-pg-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-pg-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing Postgres container ($name)"
@@ -6535,11 +6582,11 @@ status() {
     einfo "\${pg_container}: stopped"; return 3
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-pg-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-pg-${name}"
   render_container_babysitter_unit "$name" pg "$pg_container" "$pg_uid" "$pg_home"
 
   # ── Main daemon init script ──
-  cat >"/etc/init.d/lunarwing-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing AI assistant ($name)"
@@ -6579,8 +6626,9 @@ required_files="\${lunarwing_openrc_env_exec} \${lunarwing_command} \${lunarwing
 
 depend() {
     need net localmount lunarwing-pg-${name}
+    want \${lunarwing_rc_need}
     use dns logger
-    after firewall lunarwing-pg-${name} xmpp-bridge-${name}${proxy_rc_after} weechat-${name} lunarwing-weechat-adapter-${name}${darkirc_rc_after}
+    after firewall lunarwing-pg-${name} xmpp-bridge-${name}${proxy_rc_after}${weechat_rc_after}${darkirc_rc_after}
 }
 
 start_pre() {
@@ -6594,10 +6642,10 @@ start_pre() {
     umask "\${lunarwing_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-${name}"
 
   # ── XMPP bridge init script ──
-  cat >"/etc/init.d/xmpp-bridge-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/xmpp-bridge-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing XMPP bridge ($name)"
@@ -6650,11 +6698,11 @@ start_pre() {
     umask "\${xmpp_bridge_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/xmpp-bridge-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/xmpp-bridge-${name}"
 
   # ── DarkIRC daemon init script (only when enabled) ──
   if tenant_darkirc_enabled "$name"; then
-  cat >"/etc/init.d/lunarwing-darkirc-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-darkirc-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing DarkIRC daemon ($name)"
@@ -6706,12 +6754,12 @@ start_pre() {
     umask "\${darkirc_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-darkirc-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-darkirc-${name}"
   fi
 
   # ── TensorZero proxy init script (only when enabled) ──
   if tenant_proxy_enabled "$name"; then
-  cat >"/etc/init.d/lunarwing-proxy-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-proxy-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing TensorZero proxy ($name)"
@@ -6761,14 +6809,15 @@ start_pre() {
     umask "\${proxy_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-proxy-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-proxy-${name}"
   fi
 
-  # ── WeeChat init script (tmux-based) ──
-  _render_weechat_openrc_unit "$name" "/etc/init.d/lunarwing-weechat-${name}"
+  if [[ "$weechat_enabled" == "true" ]]; then
+    # ── WeeChat init script (tmux-based) ──
+    _render_weechat_openrc_unit "$name" "$OPENRC_INITD_DIR/lunarwing-weechat-${name}"
 
-  # WeeChat WS adapter init script
-  cat >"/etc/init.d/lunarwing-weechat-adapter-${name}" <<INITEOF
+    # WeeChat WS adapter init script
+    cat >"$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing WeeChat WS adapter ($name)"
@@ -6819,7 +6868,16 @@ start_pre() {
     umask "\${adapter_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-weechat-adapter-${name}"
+    chmod 0755 "$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}"
+  else
+    rm -f \
+      "$OPENRC_INITD_DIR/lunarwing-weechat-${name}" \
+      "$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}" \
+      "$OPENRC_CONFD_DIR/lunarwing-weechat-${name}" \
+      "$OPENRC_CONFD_DIR/lunarwing-weechat-adapter-${name}" \
+      "$OPENRC_RUNLEVELS_DIR"/*/"lunarwing-weechat-${name}" \
+      "$OPENRC_RUNLEVELS_DIR"/*/"lunarwing-weechat-adapter-${name}"
+  fi
 
   # DarkIRC adapter init script (only when enabled)
   if tenant_darkirc_enabled "$name"; then
@@ -6827,7 +6885,7 @@ INITEOF
   darkirc_adapter_path="$(tenant_lw_root "$name")/darkirc_channel_for_lunarwing/darkirc/adapter/darkirc_adapter.py"
   darkirc_adapter_dir="$(dirname "$darkirc_adapter_path")"
 
-  cat >"/etc/init.d/lunarwing-darkirc-adapter-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-darkirc-adapter-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing DarkIRC adapter ($name)"
@@ -6878,7 +6936,7 @@ start_pre() {
     umask "\${darkirc_adapter_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-darkirc-adapter-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-darkirc-adapter-${name}"
   fi
 
   # ── Conf.d files ──
@@ -6890,32 +6948,38 @@ INITEOF
   if tenant_proxy_enabled "$name"; then
     proxy_rc_need=" lunarwing-proxy-${name}"
   fi
-  cat >"/etc/conf.d/lunarwing-${name}" <<CONFD
+  local weechat_rc_need=""
+  if [[ "$weechat_enabled" == "true" ]]; then
+    weechat_rc_need=" lunarwing-weechat-${name} lunarwing-weechat-adapter-${name}"
+  fi
+  cat >"$OPENRC_CONFD_DIR/lunarwing-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
-lunarwing_rc_need="xmpp-bridge-${name}${proxy_rc_need} lunarwing-weechat-${name} lunarwing-weechat-adapter-${name}${darkirc_rc_need}"
+lunarwing_rc_need="xmpp-bridge-${name}${proxy_rc_need}${weechat_rc_need}${darkirc_rc_need}"
 CONFD
 
-  cat >"/etc/conf.d/xmpp-bridge-${name}" <<CONFD
+  cat >"$OPENRC_CONFD_DIR/xmpp-bridge-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 xmpp_bridge_rc_before="lunarwing-${name}"
 CONFD
 
   if tenant_proxy_enabled "$name"; then
-    cat >"/etc/conf.d/lunarwing-proxy-${name}" <<CONFD
+    cat >"$OPENRC_CONFD_DIR/lunarwing-proxy-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 CONFD
   fi
 
-  cat >"/etc/conf.d/lunarwing-weechat-${name}" <<CONFD
+  if [[ "$weechat_enabled" == "true" ]]; then
+    cat >"$OPENRC_CONFD_DIR/lunarwing-weechat-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 CONFD
 
-  cat >"/etc/conf.d/lunarwing-weechat-adapter-${name}" <<CONFD
+    cat >"$OPENRC_CONFD_DIR/lunarwing-weechat-adapter-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 CONFD
+  fi
 
   if tenant_darkirc_enabled "$name"; then
-    cat >"/etc/conf.d/lunarwing-darkirc-adapter-${name}" <<CONFD
+    cat >"$OPENRC_CONFD_DIR/lunarwing-darkirc-adapter-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 CONFD
   fi
@@ -7024,22 +7088,44 @@ weechat_lifecycle_stop_disable() {
   case "$INIT_SYSTEM" in
     systemd)
       if ! id -u "$name" >/dev/null 2>&1; then
-        say "tenant user '$name' absent; skipping weechat unit stop/disable"
-        return 0
+        say "tenant user '$name' absent; cannot stop/disable WeeChat" >&2
+        return 1
       fi
-      _systemctl_user "$name" stop "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" >/dev/null 2>&1 || true
-      _systemctl_user "$name" disable "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" >/dev/null 2>&1 || true
+      local user_unit_dir
+      user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
+      _systemctl_user "$name" show-environment >/dev/null || return 1
+      local units=() unit load_state
+      for unit in "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service"; do
+        if ! load_state="$(_systemctl_user "$name" show --value -p LoadState "$unit" 2>/dev/null)"; then
+          return 1
+        fi
+        if [[ -f "$user_unit_dir/$unit" || ( -n "$load_state" && "$load_state" != "not-found" ) ]]; then
+          units+=("$unit")
+        fi
+      done
+      if ((${#units[@]} > 0)); then
+        _systemctl_user "$name" stop "${units[@]}" || return 1
+        _systemctl_user "$name" disable "${units[@]}" || return 1
+      fi
       say "stopped + disabled lunarwing-weechat{,-adapter}-${name}.service (systemd)"
       ;;
     openrc)
-      rc-service "lunarwing-weechat-adapter-${name}" stop 2>/dev/null || true
-      rc-service "lunarwing-weechat-${name}" stop 2>/dev/null || true
-      rc-update del "lunarwing-weechat-adapter-${name}" default >/dev/null 2>&1 || true
-      rc-update del "lunarwing-weechat-${name}" default >/dev/null 2>&1 || true
-      say "stopped + removed from default runlevel: lunarwing-weechat{,-adapter}-${name} (OpenRC)"
+      local svc link runlevel
+      for svc in "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}"; do
+        if [[ -x "$OPENRC_INITD_DIR/$svc" ]]; then
+          rc-service "$svc" stop || return 1
+        fi
+        for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
+          [[ -e "$link" || -L "$link" ]] || continue
+          runlevel="$(basename "$(dirname "$link")")"
+          rc-update del "$svc" "$runlevel" || return 1
+        done
+      done
+      say "stopped + removed from runlevels: lunarwing-weechat{,-adapter}-${name} (OpenRC)"
       ;;
     *)
-      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM; registry flag set only"
+      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM" >&2
+      return 1
       ;;
   esac
 }
@@ -7049,43 +7135,97 @@ weechat_lifecycle_enable_start() {
   case "$INIT_SYSTEM" in
     systemd)
       if ! id -u "$name" >/dev/null 2>&1; then
-        say "tenant user '$name' absent; skipping weechat unit enable/start"
-        return 0
+        say "tenant user '$name' absent; cannot enable/start WeeChat" >&2
+        return 1
       fi
       local user_unit_dir
       user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
-      if [[ ! -f "$user_unit_dir/lunarwing-weechat-${name}.service" ]]; then
-        say "weechat units not rendered for '$name' — run: render-units $name && start-tenant $name"
-        return 0
+      if [[ ! -f "$user_unit_dir/lunarwing-weechat-${name}.service" \
+        || ! -f "$user_unit_dir/lunarwing-weechat-adapter-${name}.service" ]]; then
+        say "weechat units not rendered for '$name'" >&2
+        return 1
       fi
-      _systemctl_user "$name" daemon-reload >/dev/null 2>&1 || true
-      _systemctl_user "$name" enable "lunarwing-weechat-${name}.service" "lunarwing-weechat-adapter-${name}.service" >/dev/null 2>&1 || true
-      _systemctl_user "$name" start "lunarwing-weechat-${name}.service" >/dev/null 2>&1 || say "  (lunarwing-weechat-${name}.service did not start — optional)"
-      _systemctl_user "$name" start "lunarwing-weechat-adapter-${name}.service" >/dev/null 2>&1 || say "  (lunarwing-weechat-adapter-${name}.service did not start — optional)"
+      _systemctl_user "$name" daemon-reload || return 1
+      _systemctl_user "$name" enable "lunarwing-weechat-${name}.service" "lunarwing-weechat-adapter-${name}.service" || return 1
+      _systemctl_user "$name" start "lunarwing-weechat-${name}.service" || return 1
+      _systemctl_user "$name" start "lunarwing-weechat-adapter-${name}.service" || return 1
       say "enabled + started lunarwing-weechat{,-adapter}-${name}.service (systemd)"
       ;;
     openrc)
-      if [[ ! -x "/etc/init.d/lunarwing-weechat-${name}" ]]; then
-        say "weechat units not rendered for '$name' — run: render-units $name && start-tenant $name"
-        return 0
+      if [[ ! -x "$OPENRC_INITD_DIR/lunarwing-weechat-${name}" \
+        || ! -x "$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}" ]]; then
+        say "weechat units not rendered for '$name'" >&2
+        return 1
       fi
-      rc-update add "lunarwing-weechat-${name}" default >/dev/null 2>&1 || true
-      rc-update add "lunarwing-weechat-adapter-${name}" default >/dev/null 2>&1 || true
-      rc-service "lunarwing-weechat-${name}" start 2>/dev/null || say "  (lunarwing-weechat-${name} did not start — optional)"
-      rc-service "lunarwing-weechat-adapter-${name}" start 2>/dev/null || say "  (lunarwing-weechat-adapter-${name} did not start — optional)"
+      rc-update add "lunarwing-weechat-${name}" default || return 1
+      rc-update add "lunarwing-weechat-adapter-${name}" default || return 1
+      rc-service "lunarwing-weechat-${name}" start || return 1
+      rc-service "lunarwing-weechat-adapter-${name}" start || return 1
       say "enabled + started lunarwing-weechat{,-adapter}-${name} (OpenRC)"
       ;;
     *)
-      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM; registry flag set only"
+      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM" >&2
+      return 1
       ;;
   esac
+}
+
+weechat_reconcile_units() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)
+      (render_tenant_systemd_units "$name") || return 1
+      _systemctl_user "$name" daemon-reload || return 1
+      ;;
+    openrc)
+      (render_tenant_openrc_units "$name") || return 1
+      ;;
+    *)
+      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM" >&2
+      return 1
+      ;;
+  esac
+}
+
+set_tenant_weechat_enabled() {
+  local name="$1" enabled="$2"
+  with_tenant_lifecycle_lock "$name" _set_tenant_weechat_enabled_locked "$name" "$enabled"
+}
+
+_set_tenant_weechat_enabled_locked() {
+  local name="$1" enabled="$2"
+  case "$enabled" in true|false) ;; *) return 2 ;; esac
+
+  ensure_init_system || return 1
+  if [[ "$enabled" == "false" ]]; then
+    # Stop first: health must not mask a unit until init confirms that its
+    # process and boot persistence are gone.
+    weechat_lifecycle_stop_disable "$name" || return 1
+    ports_set_weechat "$name" false || return 1
+    if ! weechat_reconcile_units "$name"; then
+      # Reconciliation failed after the flag changed. Restore fail-loud health
+      # semantics and make a best effort to restore the prior unit graph.
+      say "disabled WeeChat unit reconciliation failed; restoring enabled flag" >&2
+      ports_set_weechat "$name" true \
+        || say "WARNING: failed to restore enable_weechat=true for '$name'" >&2
+      weechat_reconcile_units "$name" \
+        || say "WARNING: failed to restore enabled WeeChat units for '$name'" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  # Enabled is fail-loud: health remains critical if rendering or startup fails.
+  ports_set_weechat "$name" true || return 1
+  weechat_reconcile_units "$name" || return 1
+  weechat_lifecycle_enable_start "$name" || return 1
 }
 
 uninstall_tenant_openrc() {
   local name="$1"
   for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-kimi-${name}-sup"; do
     rc-update del "$svc" default 2>/dev/null || true
-    rm -f "/etc/init.d/$svc" "/etc/conf.d/$svc"
+    rm -f "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc"
   done
   say "uninstalled OpenRC services for $name"
 }
@@ -7571,6 +7711,12 @@ render_tenant_units() {
   local name="$1"
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  with_tenant_lifecycle_lock "$name" _render_tenant_units_locked "$name" \
+    || die "failed to re-render units for tenant '$name'"
+}
+
+_render_tenant_units_locked() {
+  local name="$1"
   ensure_init_system
   say "--- Re-rendering $INIT_SYSTEM units for $name ---"
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
@@ -7625,6 +7771,16 @@ _wait_tenant_gateway() {
   return 0
 }
 
+_start_tenant_init_services() {
+  local name="$1"
+  ensure_init_system || return 1
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    start_tenant_systemd "$name"
+  else
+    start_tenant_openrc "$name"
+  fi
+}
+
 # Restart ONLY the lunarwing daemon unit for a tenant (not the full stack).
 # Used by start_tenant to make a freshly-uploaded SSH key signable: the agent
 # loads keys from the secrets store at startup only ("runtime key add is
@@ -7676,12 +7832,8 @@ start_tenant() {
   start_tenant_postgres "$name"
   start_tenant_vision "$name"
 
-  ensure_init_system
-  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    start_tenant_systemd "$name"
-  else
-    start_tenant_openrc "$name"
-  fi
+  with_tenant_lifecycle_lock "$name" _start_tenant_init_services "$name" \
+    || die "failed to start init services for tenant '$name'"
 
   # Upload the staged SSH key to the secrets store (if one was provisioned by
   # add-tenant but not yet uploaded), BEFORE the workers start. If a key was
@@ -8872,14 +9024,12 @@ main() {
       ports_registry_init
       tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
       if [[ "$command_name" == "disable-weechat" ]]; then
-        ports_set_weechat "$name" false
-        ensure_init_system
-        weechat_lifecycle_stop_disable "$name"
+        set_tenant_weechat_enabled "$name" false \
+          || die "failed to stop/disable WeeChat for tenant '$name'"
         say "WeeChat disabled for tenant '$name': units stopped + boot persistence removed; health reports them skipped (never critical)"
       else
-        ports_set_weechat "$name" true
-        ensure_init_system
-        weechat_lifecycle_enable_start "$name"
+        set_tenant_weechat_enabled "$name" true \
+          || die "failed to enable/start WeeChat for tenant '$name'"
         say "WeeChat enabled for tenant '$name': units enabled + started; health reports critical when down"
       fi
       ;;
