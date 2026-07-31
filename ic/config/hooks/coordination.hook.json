@@ -10,7 +10,7 @@
         "failure_mode": "fail_closed",
         "when_regex": "(?i)(api[_-]?key|secret|token|password|bearer|authorization)\\s*[:=]\\s*['\"]?[A-Za-z0-9+/=_-]{16,}",
         "reject_reason": "coord: secret pattern detected in inbound message",
-        "when_channel_regex": "conference\\."
+        "when_channel_regex": "^__CONFIGURED_COORDINATION_CHANNELS__$"
       },
       {
         "name": "secret-detect-api-keys-outbound",
@@ -22,7 +22,7 @@
         "failure_mode": "fail_closed",
         "when_regex": "(?i)(api[_-]?key|secret|token|password|bearer|authorization)\\s*[:=]\\s*['\"]?[A-Za-z0-9+/=_-]{16,}",
         "reject_reason": "coord: secret pattern detected in outbound message",
-        "when_channel_regex": "conference\\."
+        "when_channel_regex": "^__CONFIGURED_COORDINATION_CHANNELS__$"
       },
       {
         "name": "secret-detect-private-keys",
@@ -35,7 +35,7 @@
         "failure_mode": "fail_closed",
         "when_regex": "-----BEGIN\\s+(RSA\\s+|EC\\s+|OPENSSH\\s+|PGP\\s+)?PRIVATE KEY-----",
         "reject_reason": "coord: private key material detected",
-        "when_channel_regex": "conference\\."
+        "when_channel_regex": "^__CONFIGURED_COORDINATION_CHANNELS__$"
       },
       {
         "name": "secret-detect-jwt-tokens",
@@ -48,7 +48,7 @@
         "failure_mode": "fail_closed",
         "when_regex": "eyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}",
         "reject_reason": "coord: JWT token detected",
-        "when_channel_regex": "conference\\."
+        "when_channel_regex": "^__CONFIGURED_COORDINATION_CHANNELS__$"
       },
       {
         "name": "secret-detect-high-entropy-strings",
@@ -61,7 +61,7 @@
         "failure_mode": "fail_closed",
         "when_regex": "[A-Za-z0-9+/]{40,}={0,2}",
         "reject_reason": "coord: high-entropy string detected (possible secret)",
-        "when_channel_regex": "conference\\."
+        "when_channel_regex": "^__CONFIGURED_COORDINATION_CHANNELS__$"
       },
       {
         "name": "coord-newline-strip-inbound",
@@ -76,7 +76,7 @@
             "replacement": " "
           }
         ],
-        "when_channel_regex": "conference\\."
+        "when_channel_regex": "^__CONFIGURED_COORDINATION_CHANNELS__$"
       },
       {
         "name": "coord-newline-reject-outbound",
@@ -88,7 +88,7 @@
         "failure_mode": "fail_closed",
         "when_regex": "\\n|\\r",
         "reject_reason": "coord: outbound messages must be single-line",
-        "when_channel_regex": "conference\\."
+        "when_channel_regex": "^__CONFIGURED_COORDINATION_CHANNELS__$"
       },
       {
         "name": "coord-max-length-reject-outbound",
@@ -100,7 +100,7 @@
         "failure_mode": "fail_closed",
         "when_regex": "[\\s\\S]{421,}",
         "reject_reason": "coord: outbound messages must not exceed 420 characters",
-        "when_channel_regex": "conference\\."
+        "when_channel_regex": "^__CONFIGURED_COORDINATION_CHANNELS__$"
       }
     ]
   }

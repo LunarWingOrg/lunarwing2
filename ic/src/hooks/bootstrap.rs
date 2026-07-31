@@ -8,6 +8,7 @@ use crate::channels::wasm::discover_channels;
 use crate::hooks::bundled::{
     HookBundleConfig, HookRegistrationSummary, register_bundle, register_bundled_hooks,
 };
+use crate::hooks::coordination::{CoordinationHookConfig, coordination_channel_guard};
 use crate::hooks::registry::HookRegistry;
 use crate::tools::wasm::{discover_dev_tools, discover_tools};
 use crate::workspace::Workspace;
@@ -38,6 +39,7 @@ impl HookBootstrapSummary {
 pub async fn bootstrap_hooks(
     registry: &Arc<HookRegistry>,
     workspace: Option<&Arc<Workspace>>,
+    coordination_config: &CoordinationHookConfig,
     wasm_tools_dir: &Path,
     wasm_channels_dir: &Path,
     active_tool_names: &[String],
@@ -65,7 +67,8 @@ pub async fn bootstrap_hooks(
     summary.errors += plugin.errors;
 
     if let Some(workspace) = workspace {
-        let workspace_loaded = register_workspace_bundles(registry, workspace).await;
+        let workspace_loaded =
+            register_workspace_bundles(registry, workspace, coordination_config).await;
         summary.workspace_hooks += workspace_loaded.hooks;
         summary.outbound_webhooks += workspace_loaded.outbound_webhooks;
         summary.errors += workspace_loaded.errors;
@@ -254,6 +257,7 @@ fn extract_hooks_section(root: &serde_json::Value) -> Option<&serde_json::Value>
 async fn register_workspace_bundles(
     registry: &Arc<HookRegistry>,
     workspace: &Arc<Workspace>,
+    coordination_config: &CoordinationHookConfig,
 ) -> HookRegistrationSummary {
     let mut summary = HookRegistrationSummary::default();
 
@@ -273,6 +277,10 @@ async fn register_workspace_bundles(
     hook_paths.sort();
 
     for path in hook_paths {
+        if path == "hooks/coordination.hook.json" && !coordination_config.is_actionable() {
+            tracing::debug!(path = %path, "Skipping disabled coordination hook bundle");
+            continue;
+        }
         let doc = match workspace.read(&path).await {
             Ok(doc) => doc,
             Err(err) => {
@@ -291,7 +299,7 @@ async fn register_workspace_bundles(
             }
         };
 
-        let bundle = match parse_workspace_bundle(&parsed) {
+        let mut bundle = match parse_workspace_bundle(&parsed) {
             Ok(bundle) => bundle,
             Err(err) => {
                 summary.errors += 1;
@@ -300,12 +308,23 @@ async fn register_workspace_bundles(
             }
         };
 
+        if path == "hooks/coordination.hook.json" {
+            scope_coordination_bundle(&mut bundle, coordination_config);
+        }
+
         let source = format!("workspace:{}", path);
         let registered = register_bundle(registry, &source, bundle).await;
         summary.merge(registered);
     }
 
     summary
+}
+
+fn scope_coordination_bundle(bundle: &mut HookBundleConfig, config: &CoordinationHookConfig) {
+    let guard = coordination_channel_guard(&config.coordination_channels);
+    for rule in &mut bundle.rules {
+        rule.when_channel_regex = Some(guard.clone());
+    }
 }
 
 fn parse_workspace_bundle(value: &serde_json::Value) -> Result<HookBundleConfig, String> {
@@ -356,6 +375,45 @@ mod tests {
         assert!(is_workspace_hook_file("hooks/redact.hook.json"));
         assert!(!is_workspace_hook_file("hooks/readme.md"));
         assert!(!is_workspace_hook_file("MEMORY.md"));
+    }
+
+    #[test]
+    fn coordination_bundle_scope_is_exact_and_escaped() {
+        let mut bundle = HookBundleConfig {
+            rules: vec![crate::hooks::bundled::HookRuleConfig {
+                name: "coord-test".into(),
+                points: vec![crate::hooks::HookPoint::BeforeOutbound],
+                priority: None,
+                failure_mode: None,
+                timeout_ms: None,
+                when_regex: None,
+                when_channel_regex: Some("conference\\.".into()),
+                reject_reason: Some("blocked".into()),
+                replacements: Vec::new(),
+                prepend: None,
+                append: None,
+            }],
+            outbound_webhooks: Vec::new(),
+        };
+        let config = CoordinationHookConfig {
+            enabled: true,
+            agent_id: "agent-1".into(),
+            coordination_channels: vec![
+                "ops+one@conference.example".into(),
+                "room.two@conference.example".into(),
+                "Ä-team@conference.example".into(),
+            ],
+            ..CoordinationHookConfig::default()
+        };
+
+        scope_coordination_bundle(&mut bundle, &config);
+        let guard = regex::Regex::new(bundle.rules[0].when_channel_regex.as_deref().unwrap())
+            .expect("generated scope must compile");
+        assert!(guard.is_match("OPS+ONE@CONFERENCE.EXAMPLE"));
+        assert!(guard.is_match("room.two@conference.example"));
+        assert!(guard.is_match("ä-team@conference.example"));
+        assert!(!guard.is_match("other@conference.example"));
+        assert!(!guard.is_match("xops+one@conference.example"));
     }
 
     #[test]

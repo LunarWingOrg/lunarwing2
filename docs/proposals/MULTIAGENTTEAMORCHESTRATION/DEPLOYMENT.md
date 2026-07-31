@@ -25,7 +25,7 @@ Hook events carry two channel identities (ISSUE-001):
 All coordination hooks match `COORD_CHANNELS` against the **policy scope**, so
 populate it with room JIDs (e.g. `coord@conference.example`). Native and
 installable (WASM) XMPP paths produce the same scope; XMPP DMs and unrelated
-rooms are unaffected. Matching is case-insensitive equality or containment.
+rooms are unaffected. Matching is case-insensitive exact equality.
 
 ## Phase 1 — Declarative hook bundle (no Rust needed)
 
@@ -38,11 +38,11 @@ restart the daemon. `register_workspace_bundles()` auto-loads
 Enforces: API-key/PEM/JWT/high-entropy secret rejection (inbound + outbound),
 inbound newline stripping, outbound single-line and 420-char caps.
 
-Every rule carries `when_channel_regex` (ISSUE-010), evaluated against the
-policy scope before content actions — the bundle no longer fires on unrelated
-channels (CLI, web, DMs). The shipped value `conference\.` matches standard
-MUC JIDs; **adjust it to your conference domain / room naming** when they
-differ. Omitting `when_channel_regex` keeps a rule global (old behavior).
+The managed workspace path follows `COORD_ENABLED` (ISSUE-010). When enabled,
+startup replaces every rule's inert shipped guard with one exact,
+case-insensitive regex generated from escaped `COORD_CHANNELS` values. Other
+MUCs, CLI, web, and DMs remain unaffected; no hand-editing is required.
+Generic workspace hook files keep their configured guards unchanged.
 
 ## Phase 2 — Stateful Rust hooks
 
@@ -64,11 +64,10 @@ Notes:
   Inbound hook rejections now produce **typed suppression** (empty response,
   logged at debug) instead of synthetic `[Message rejected: …]` channel text
   that re-entered outbound hooks and mis-scored the local agent (ISSUE-004).
-- `TagSchemaHook` enforces at `transformResponse` **only** (ISSUE-004): every
-  model response passes that point exactly once per turn — including drain-loop
-  intermediate responses that bypass BeforeOutbound — so one malformed response
-  costs exactly one strike. BeforeOutbound registration was dropped because the
-  `[Response filtered: …]` replacement text was struck a second time there.
+- `TagSchemaHook` enforces at `transformResponse` **only** (ISSUE-004): legacy,
+  approval-resume, Engine V2 final responses, and mission notifications pass it exactly once,
+  so one malformed response costs one strike. Rejection is typed suppression:
+  no synthetic policy text is persisted, re-hooked, rate-limited, or delivered.
 - `SecretEntropyHook` attributes violations by direction (ISSUE-004): inbound
   secrets strike the remote sender; outbound secrets strike the configured
   local agent (`COORD_AGENT_ID`). The event's `user_id` is the conversation
@@ -92,16 +91,18 @@ Notes:
   priority 5) is **registered in production** (ISSUE-003): `main.rs` builds it
   from the same `Arc<ViolationStore>` as the hooks, `AgentDeps` carries it,
   and the Engine V2 effect adapter checks it first in
-  `execute_action_internal` — before any tool side effect. Denials carry the
-  `"[SILENT] "` prefix and are logged at debug; disabled agents get no tool
-  execution and no channel policy text. `COORD_PERMISSIVE=true` disables it
-  for testing.
+  `execute_action_internal` — before any tool side effect. Denials become typed
+  `ExecutionStopped` control flow: executors refund pre-execution lease use,
+  emit no action failure, stop the thread, and expose no reason to model or
+  channel. `COORD_PERMISSIVE=true` disables it for testing.
 - Admin endpoints (`ic/src/channels/web/handlers/coord.rs`): dedicated axum
   server bound to `127.0.0.1` only — **not** routed through the authenticated
   web gateway. All routes require `Authorization: Bearer $COORD_ADMIN_TOKEN`
   (constant-time compare; ISSUE-009); the server does not start when the token
   is unset (fail closed). Agent path values are validated (1–128 chars,
-  JID/agent-name character set).
+  JID/agent-name character set) by the same validator used for hook activation.
+  `lunarwing-mt-admin.sh` generates and preserves a per-tenant token; `patch-env`
+  backfills existing tenants without printing or rotating it.
 
   | Endpoint | Action |
   |----------|--------|
@@ -129,7 +130,10 @@ channel, native and installable WASM XMPP channels coalesce identically.
 - Lookup/merge/insert happen atomically under one lock and timer identity is a
   monotonic generation, so concurrent first submissions merge (never replace)
   and stale timers can't remove reinserted entries (ISSUE-005).
-- Agent shutdown flushes all pending messages before channels close.
+- Buffer keys include agent, transport, destination, and conversation, so two
+  adapters targeting the same destination cannot merge or misroute output.
+- Agent shutdown flushes all pending messages before channels close and waits
+  for timer/early-flush callbacks already in flight.
 - Coalesced flushes pass through the existing XMPP hourly rate limiter
   (`OutboundRateLimiter`, see also `scripts/xmpp-rate-limit.sh` for the
   bridge-level control) — coalescing reduces volume, it doesn't bypass limits.
@@ -139,7 +143,7 @@ channel, native and installable WASM XMPP channels coalesce identically.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `COORD_ENABLED` | `false` | Master switch for coordination hooks + admin server |
-| `COORD_AGENT_ID` | (required) | This agent's unique identifier |
+| `COORD_AGENT_ID` | (required) | Unique 1–128-byte ASCII ID using letters, digits, `@.-_/:+~` |
 | `COORD_AGENT_ALIASES` | (required for engagement) | Comma-separated @mentions targeting this agent |
 | `COORD_CHANNELS` | (required) | Comma-separated coordination destinations (policy scope: room JIDs/names) |
 | `COORD_MAX_MESSAGES` | `2` | Max messages per rate window per agent |
@@ -152,8 +156,8 @@ channel, native and installable WASM XMPP channels coalesce identically.
 | `COORD_VIOLATION_DISABLE_DURATION` | `86400` | Auto-disable seconds (24h) |
 | `COORD_VIOLATION_DECAY` | `604800` | Violation decay seconds (7d) |
 | `COORD_PERMISSIVE` | `false` | Disable CoordinationGate (testing) |
-| `COORD_ADMIN_PORT` | `18777` | Admin server port (always 127.0.0.1) |
-| `COORD_ADMIN_TOKEN` | (required for admin API) | Bearer token for the admin server; server stays down when unset |
+| `COORD_ADMIN_PORT` | `18777` | Admin server port (always 127.0.0.1); MT provisioning assigns `extended_base+9` |
+| `COORD_ADMIN_TOKEN` | (required for admin API) | Bearer token; MT provisioning generates/preserves it, otherwise server stays down when unset |
 | `COALESCE_ENABLED` | `true` | Coalesce window switch |
 | `COALESCE_WINDOW_SEC` | `2.0` | Coalesce window seconds |
 | `COALESCE_MAX_MERGES` | `3` | Flush after this many merges |

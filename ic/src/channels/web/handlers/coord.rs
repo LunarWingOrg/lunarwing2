@@ -31,15 +31,15 @@ use serde::Serialize;
 use subtle::ConstantTimeEq;
 
 use crate::gate::violation_store::{ViolationStatus, ViolationStore};
+#[cfg(test)]
+use crate::hooks::MAX_COORD_AGENT_ID_LEN;
+use crate::hooks::valid_coordination_agent_id;
 
 /// Default port for the coordination admin server (`COORD_ADMIN_PORT`).
 pub const DEFAULT_COORD_ADMIN_PORT: u16 = 18777;
 
 /// Environment variable carrying the admin bearer token.
 pub const COORD_ADMIN_TOKEN_ENV: &str = "COORD_ADMIN_TOKEN";
-
-/// Maximum accepted length for an agent identifier in path parameters.
-const MAX_AGENT_ID_LEN: usize = 128;
 
 #[derive(Clone)]
 struct CoordAdminState {
@@ -83,16 +83,6 @@ fn status_label(status: &ViolationStatus) -> String {
 /// Conservative agent-ID policy: non-empty, bounded length, and only
 /// characters seen in JIDs and local agent names. Rejects control bytes,
 /// whitespace, percent-encoding tricks, and store-flooding identifiers.
-fn valid_agent_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_AGENT_ID_LEN
-        && id.bytes().all(|b| {
-            matches!(b,
-                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'
-                | b'@' | b'.' | b'-' | b'_' | b'/' | b':' | b'+' | b'~')
-        })
-}
-
 /// Bearer-token gate for every coordination admin route.
 async fn require_auth(
     State(state): State<CoordAdminState>,
@@ -136,7 +126,7 @@ async fn get_agent_status(
     State(state): State<CoordAdminState>,
     Path(agent): Path<String>,
 ) -> Result<Json<AgentStatusView>, StatusCode> {
-    if !valid_agent_id(&agent) {
+    if !valid_coordination_agent_id(&agent) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok(Json(AgentStatusView {
@@ -149,7 +139,7 @@ async fn clear_agent(
     State(state): State<CoordAdminState>,
     Path(agent): Path<String>,
 ) -> Result<Json<ActionView>, StatusCode> {
-    if !valid_agent_id(&agent) {
+    if !valid_coordination_agent_id(&agent) {
         return Err(StatusCode::BAD_REQUEST);
     }
     state.store.clear(&agent);
@@ -165,7 +155,7 @@ async fn disable_agent(
     State(state): State<CoordAdminState>,
     Path(agent): Path<String>,
 ) -> Result<Json<ActionView>, StatusCode> {
-    if !valid_agent_id(&agent) {
+    if !valid_coordination_agent_id(&agent) {
         return Err(StatusCode::BAD_REQUEST);
     }
     state.store.manual_disable(&agent);
@@ -181,7 +171,7 @@ async fn enable_agent(
     State(state): State<CoordAdminState>,
     Path(agent): Path<String>,
 ) -> Result<Json<ActionView>, StatusCode> {
-    if !valid_agent_id(&agent) {
+    if !valid_coordination_agent_id(&agent) {
         return Err(StatusCode::BAD_REQUEST);
     }
     state.store.manual_enable(&agent);
@@ -302,15 +292,19 @@ mod tests {
 
     #[test]
     fn test_valid_agent_id() {
-        assert!(valid_agent_id("agent-1"));
-        assert!(valid_agent_id("luna@conference.example/resource"));
-        assert!(valid_agent_id("a"));
-        assert!(!valid_agent_id(""));
-        assert!(!valid_agent_id(&"x".repeat(MAX_AGENT_ID_LEN + 1)));
-        assert!(!valid_agent_id("bad id"));
-        assert!(!valid_agent_id("bad%20id"));
-        assert!(!valid_agent_id("bad\nid"));
-        assert!(!valid_agent_id("bad?id"));
+        assert!(valid_coordination_agent_id("agent-1"));
+        assert!(valid_coordination_agent_id(
+            "luna@conference.example/resource"
+        ));
+        assert!(valid_coordination_agent_id("a"));
+        assert!(!valid_coordination_agent_id(""));
+        assert!(!valid_coordination_agent_id(
+            &"x".repeat(MAX_COORD_AGENT_ID_LEN + 1)
+        ));
+        assert!(!valid_coordination_agent_id("bad id"));
+        assert!(!valid_coordination_agent_id("bad%20id"));
+        assert!(!valid_coordination_agent_id("bad\nid"));
+        assert!(!valid_coordination_agent_id("bad?id"));
     }
 
     #[tokio::test]
@@ -394,7 +388,7 @@ mod tests {
         let client = reqwest::Client::new();
 
         // Overlong identifier.
-        let long = "x".repeat(MAX_AGENT_ID_LEN + 1);
+        let long = "x".repeat(MAX_COORD_AGENT_ID_LEN + 1);
         let resp = match authed(&client, client.post(format!("{base}/coord/disable/{long}")))
             .send()
             .await

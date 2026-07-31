@@ -39,7 +39,15 @@ if [ "$IS_MT" = "true" ]; then
     MT_DISCOVERY_OK=false; MT_DISCOVERY_NOTE="timeout(1) not installed; tenant bus probes would be unbounded"
   elif ! command -v sudo >/dev/null 2>&1; then
     MT_DISCOVERY_OK=false; MT_DISCOVERY_NOTE="sudo not installed; cannot reach tenant user buses"
-  elif ! jq -e 'type == "object"' "$TENANTS_FILE" >/dev/null 2>&1; then
+  elif ! jq -e '
+    type == "object"
+    and (.tenants | type == "object")
+    and ([.tenants | to_entries[] |
+      (.value | type == "object")
+      and (.value.user | type == "string")
+      and (.value.user | length > 0)
+    ] | all)
+  ' "$TENANTS_FILE" >/dev/null 2>&1; then
     MT_DISCOVERY_OK=false; MT_DISCOVERY_NOTE="tenant registry is not valid JSON: $TENANTS_FILE"
   fi
 fi
@@ -136,11 +144,12 @@ done
 _tenants_seen=0
 _tenant_units_loaded=0
 _tenant_probe_failures=0
+_tenant_discovery_failures=0
 _sweep_incomplete=false
 if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
-  _tenant_uctl() {  # <user> <uid> <args...> -> systemctl --user output (failure-safe, bounded)
+  _tenant_uctl() {  # <user> <uid> <args...> -> bounded systemctl --user output
     local u="$1" uid="$2"; shift 2
-    timeout -k 2 5 sudo -n -u "$u" env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@" 2>/dev/null || true
+    timeout -k 2 5 sudo -n -u "$u" env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@" 2>/dev/null
   }
   _tenant_ctr_health() {  # <user> <uid> <container> -> health status (healthy/unhealthy/starting/"")
     local u="$1" uid="$2" ctr="$3"
@@ -151,40 +160,68 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
   # outer `timeout 30` in infrastructure-health-check.sh: a few dead tenant buses
   # (each bounded per-probe) must not consume the whole window and blank the
   # component. Past the deadline we stop probing and emit a partial report.
-  _deadline=24
+  # A probe can consume up to seven seconds (`timeout -k 2 5`). Stop starting
+  # new probes at 19s so final JSON still lands before the outer 30s timeout.
+  _deadline=19
   while IFS=$'\t' read -r tname tuser tweechat; do
     [ "$SECONDS" -lt "$_deadline" ] || { _sweep_incomplete=true; break; }
     [ -n "$tname" ] && [ -n "$tuser" ] || continue
     _tenants_seen=$((_tenants_seen+1))
     tuid=$(id -u "$tuser" 2>/dev/null || echo "")
-    [ -n "$tuid" ] || continue
+    if [ -z "$tuid" ]; then
+      _tenant_discovery_failures=$((_tenant_discovery_failures+1))
+      issues+=("tenant $tname: OS user $tuser not found")
+      continue
+    fi
+    _tenant_loaded_before=$_tenant_units_loaded
+    _tenant_sweep_cut_short=false
     # Is this tenant "started"? Its primary daemon being active means every other
     # unit should be up too — so a down unit is a real outage (incl. a stopped
     # `generated` Quadlet pg/worker), not a tenant that was add-ed but not yet
     # start-ed (F3-A). One bounded show per tenant.
-    tdaemon_active=false
-    [ "$(_tenant_uctl "$tuser" "$tuid" show --value -p ActiveState "lunarwing-$tname.service")" = "active" ] && tdaemon_active=true
+    tdaemon_active=unknown
+    if tdaemon_state=$(_tenant_uctl "$tuser" "$tuid" show --value -p ActiveState "lunarwing-$tname.service"); then
+      if [ "$tdaemon_state" = "active" ]; then
+        tdaemon_active=true
+      else
+        tdaemon_active=false
+      fi
+    else
+      _tenant_discovery_failures=$((_tenant_discovery_failures+1))
+      issues+=("tenant $tname ($tuser): user-manager daemon probe failed")
+    fi
+    [ "$SECONDS" -lt "$_deadline" ] || { _sweep_incomplete=true; break; }
     # Enumerate ALL of this tenant's lunarwing-*/xmpp-bridge-*/weechat-* user
     # units — the systemd analog of health-openrc.sh's /etc/init.d/lunarwing-*
     # glob — instead of a hardcoded pair. Covers pg, the workers, proxy,
     # weechat(-adapter), and the daemon. Generated Quadlet units (pg/workers)
     # appear after daemon-reload. (weechat-* also catches the pre-Fold-in-A bare
     # `weechat-<t>` name; post-rename `lunarwing-*` covers it.)
-    tunits=$(_tenant_uctl "$tuser" "$tuid" list-unit-files --no-legend 'lunarwing-*' 'xmpp-bridge-*' 'weechat-*' \
-             | awk '$1 ~ /\.service$/ {print $1}' | sort -u)
+    # Do not pass glob patterns to systemctl: it exits 1 when they match zero
+    # units, which is not a bus/enumeration failure. List services, then filter.
+    if ! tunits=$(_tenant_uctl "$tuser" "$tuid" list-unit-files --no-legend --type=service \
+             | awk '$1 ~ /^(lunarwing-|xmpp-bridge-|weechat-).*\.service$/ {print $1}' | sort -u); then
+      _tenant_discovery_failures=$((_tenant_discovery_failures+1))
+      issues+=("tenant $tname ($tuser): user-manager unit enumeration failed; using fallback unit names")
+      tunits=""
+    fi
     [ -n "$tunits" ] || tunits="lunarwing-$tname.service xmpp-bridge-$tname.service"
     for tunit in $tunits; do
-      [ "$SECONDS" -lt "$_deadline" ] || { _sweep_incomplete=true; break; }
+      [ "$SECONDS" -lt "$_deadline" ] || { _sweep_incomplete=true; _tenant_sweep_cut_short=true; break; }
       # One show call per unit (LoadState/ActiveState/SubState/NRestarts, in
       # systemd's canonical order for a .service) instead of four round-trips —
       # leaner and bounds hang exposure on a slow tenant bus.
-      mapfile -t _uf < <(_tenant_uctl "$tuser" "$tuid" show --value \
-        -p LoadState -p ActiveState -p SubState -p NRestarts "$tunit")
+      if ! unit_fields=$(_tenant_uctl "$tuser" "$tuid" show --value \
+        -p LoadState -p ActiveState -p SubState -p NRestarts "$tunit"); then
+        _tenant_probe_failures=$((_tenant_probe_failures+1))
+        continue
+      fi
+      mapfile -t _uf <<<"$unit_fields"
       if [ "${_uf[0]:-}" != "loaded" ]; then
         # Distinguish a genuinely absent unit (LoadState not-found etc.) from
         # a FAILED probe: zero output means sudo/bus/timeout broke, which must
         # surface at the end instead of silently dropping the unit (ISSUE-007).
-        [ "${#_uf[@]}" -eq 0 ] && _tenant_probe_failures=$((_tenant_probe_failures+1))
+        [ -z "$unit_fields" ] && _tenant_probe_failures=$((_tenant_probe_failures+1))
         continue
       fi
       _tenant_units_loaded=$((_tenant_units_loaded+1))
@@ -230,8 +267,14 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
           # disabled/static/generated unit is the expected `skipped` case.
           if [ "$tdaemon_active" = "true" ]; then
             ustatus="critical"; uexit=2; issues+=("$tunit ($tuser) down while tenant running: $uactive/$usub")
+          elif [ "$tdaemon_active" = "unknown" ]; then
+            ustatus="degraded"; uexit=1
           else
-            case "$(_tenant_uctl "$tuser" "$tuid" show --value -p UnitFileState "$tunit")" in
+            if ! unit_file_state=$(_tenant_uctl "$tuser" "$tuid" show --value -p UnitFileState "$tunit"); then
+              _tenant_probe_failures=$((_tenant_probe_failures+1))
+              unit_file_state=unknown
+            fi
+            case "$unit_file_state" in
               disabled|static|masked|linked|linked-runtime|generated|transient|indirect)
                 ustatus="skipped"; uexit=0 ;;
               *)
@@ -259,6 +302,10 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
       unit_results+=("$(unit_json "$tunit" "$uactive" "$usub" "$urestarts" \
         "$(jq -n --arg u "$tuser" --arg h "$uhealth" '{tenant_user:$u} + (if $h=="" then {} else {container_health:$h} end)')" "$ustatus")")
     done
+    if [ "$_tenant_sweep_cut_short" != "true" ] && [ "$_tenant_units_loaded" -eq "$_tenant_loaded_before" ]; then
+      _tenant_discovery_failures=$((_tenant_discovery_failures+1))
+      issues+=("tenant $tname ($tuser): no user units observable")
+    fi
   # enable_weechat: explicit ==false test (jq `//` treats false as empty).
   done < <(jq -r '.tenants // {} | to_entries[] | "\(.key)\t\(.value.user)\t\(if .value.enable_weechat == false then "false" else "true" end)"' "$TENANTS_FILE" 2>/dev/null || true)
 fi
@@ -279,6 +326,8 @@ if [ "$IS_MT" = "true" ]; then
     fi
     [ "$_tenant_probe_failures" -gt 0 ] && \
       mt_degrade "$_tenant_probe_failures tenant unit probe(s) failed (sudo/bus/timeout); results partial"
+    [ "$_tenant_discovery_failures" -gt 0 ] && \
+      mt_degrade "$_tenant_discovery_failures tenant discovery failure(s); results partial"
   fi
 fi
 

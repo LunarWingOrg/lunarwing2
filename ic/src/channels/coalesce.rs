@@ -22,16 +22,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 
 /// Async flush callback invoked with the final merged content.
 pub type FlushFn = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-/// Buffering key: one pending message per agent/channel/conversation.
+/// Buffering key: one pending message per agent/transport/channel/conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChannelKey {
     /// Sending agent identifier (e.g. own JID).
     pub agent_id: String,
+    /// Transport/adapter identifier (e.g. `xmpp`, `darkirc`).
+    pub transport_id: String,
     /// Destination channel/conversation (e.g. MUC JID).
     pub channel_id: String,
     /// Conversation/thread scope (may be empty).
@@ -42,11 +44,13 @@ impl ChannelKey {
     /// Build a key from its parts.
     pub fn new(
         agent_id: impl Into<String>,
+        transport_id: impl Into<String>,
         channel_id: impl Into<String>,
         conversation_id: impl Into<String>,
     ) -> Self {
         Self {
             agent_id: agent_id.into(),
+            transport_id: transport_id.into(),
             channel_id: channel_id.into(),
             conversation_id: conversation_id.into(),
         }
@@ -109,17 +113,16 @@ impl CoalesceConfig {
         config
     }
 
-    /// Whether coalescing applies to this channel (case-insensitive
-    /// equality or containment, matching the coordination hooks).
+    /// Whether coalescing applies to this exact channel (case-insensitive),
+    /// matching coordination hook scope.
     pub fn applies_to(&self, channel: &str) -> bool {
         if !self.enabled {
             return false;
         }
         let channel = channel.to_lowercase();
-        self.coordination_channels.iter().any(|c| {
-            let c = c.to_lowercase();
-            channel == c || channel.contains(&c)
-        })
+        self.coordination_channels
+            .iter()
+            .any(|configured| channel == configured.to_lowercase())
     }
 }
 
@@ -150,6 +153,9 @@ pub struct CoalesceBuffer {
     /// reused, so a stale timer can never match a replacement entry that was
     /// inserted after an early flush removed the original (ISSUE-005).
     next_generation: Arc<AtomicU64>,
+    /// Readers own active submissions/deliveries. `flush_all` takes the writer
+    /// so it cannot return while a detached callback is still running.
+    delivery_barrier: Arc<RwLock<()>>,
 }
 
 impl CoalesceBuffer {
@@ -159,6 +165,7 @@ impl CoalesceBuffer {
             config,
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(0)),
+            delivery_barrier: Arc::new(RwLock::new(())),
         }
     }
 
@@ -179,6 +186,10 @@ impl CoalesceBuffer {
         if !self.config.applies_to(&key.channel_id) || is_alert(&content) {
             return CoalesceDecision::SendNow(content);
         }
+
+        // Establish submission ownership before touching the map. Shutdown's
+        // write guard then waits for every submission that started before it.
+        let delivery_guard = Arc::clone(&self.delivery_barrier).read_owned().await;
 
         // Collected under the lock; flushed after it is released so delivery
         // never serializes on (or re-enters) the pending map.
@@ -212,7 +223,9 @@ impl CoalesceBuffer {
         }
 
         if let Some((flush, content)) = early_flush {
-            spawn_flush(flush, content);
+            spawn_flush(flush, content, delivery_guard);
+        } else {
+            drop(delivery_guard);
         }
         if let Some(generation) = arm_timer {
             self.spawn_timer(key, generation);
@@ -245,9 +258,11 @@ impl CoalesceBuffer {
     /// Arm the window-expiry timer for a freshly inserted entry.
     fn spawn_timer(&self, key: ChannelKey, generation: u64) {
         let pending = Arc::clone(&self.pending);
+        let delivery_barrier = Arc::clone(&self.delivery_barrier);
         let window = self.config.window;
         tokio::spawn(async move {
             tokio::time::sleep(window).await;
+            let _delivery_guard = delivery_barrier.read_owned().await;
             let taken = {
                 let mut guard = pending.lock().await;
                 match guard.get(&key) {
@@ -263,6 +278,7 @@ impl CoalesceBuffer {
 
     /// Flush every pending message (thread termination / engine shutdown).
     pub async fn flush_all(&self) {
+        let _delivery_guard = Arc::clone(&self.delivery_barrier).write_owned().await;
         let taken: Vec<PendingMessage> = {
             let mut guard = self.pending.lock().await;
             guard.drain().map(|(_, p)| p).collect()
@@ -286,7 +302,7 @@ fn is_alert(content: &str) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case("alert:"))
 }
 
-fn spawn_flush(flush: FlushFn, content: String) {
+fn spawn_flush(flush: FlushFn, content: String, _guard: OwnedRwLockReadGuard<()>) {
     tokio::spawn(async move {
         flush(content).await;
     });
@@ -343,7 +359,7 @@ mod tests {
     }
 
     fn key() -> ChannelKey {
-        ChannelKey::new("agent-1", "coord@conference.example", "thread-1")
+        ChannelKey::new("agent-1", "xmpp", "coord@conference.example", "thread-1")
     }
 
     fn collector() -> (FlushFn, Arc<Mutex<Vec<String>>>) {
@@ -393,6 +409,14 @@ mod tests {
         assert!(!is_alert("STATUS: all good"));
     }
 
+    #[test]
+    fn test_scope_match_is_exact_and_case_insensitive() {
+        let config = test_config();
+        assert!(config.applies_to("COORD@CONFERENCE.EXAMPLE"));
+        assert!(!config.applies_to("other-coord@conference.example"));
+        assert!(!config.applies_to("xmpp:coord@conference.example/group"));
+    }
+
     #[tokio::test]
     async fn test_rapid_fire_messages_are_merged() {
         let buffer = CoalesceBuffer::new(test_config());
@@ -431,7 +455,7 @@ mod tests {
     async fn test_non_coordination_channel_unaffected() {
         let buffer = CoalesceBuffer::new(test_config());
         let (flush, _sent) = collector();
-        let key = ChannelKey::new("agent-1", "general", "thread-1");
+        let key = ChannelKey::new("agent-1", "xmpp", "general", "thread-1");
         let decision = buffer.submit(key, "STATUS: hi".into(), flush).await;
         assert!(matches!(decision, CoalesceDecision::SendNow(_)));
         assert_eq!(buffer.pending_count().await, 0);
@@ -476,6 +500,102 @@ mod tests {
         let delivered = sent.lock().await.clone();
         assert_eq!(delivered, vec!["STATUS: pending".to_string()]);
         assert_eq!(buffer.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_identical_destination_on_different_transports_stays_isolated() {
+        let buffer = CoalesceBuffer::new(test_config());
+        let (xmpp_flush, xmpp_sent) = collector();
+        let (wasm_flush, wasm_sent) = collector();
+        let destination = "coord@conference.example";
+        buffer
+            .submit(
+                ChannelKey::new("agent-1", "xmpp", destination, "thread-1"),
+                "STATUS: xmpp".into(),
+                xmpp_flush,
+            )
+            .await;
+        buffer
+            .submit(
+                ChannelKey::new("agent-1", "wasm-xmpp", destination, "thread-1"),
+                "STATUS: wasm".into(),
+                wasm_flush,
+            )
+            .await;
+
+        assert_eq!(buffer.pending_count().await, 2);
+        buffer.flush_all().await;
+        assert_eq!(*xmpp_sent.lock().await, vec!["STATUS: xmpp"]);
+        assert_eq!(*wasm_sent.lock().await, vec!["STATUS: wasm"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_flush_all_waits_for_timer_callback() {
+        let mut config = test_config();
+        config.window = Duration::from_secs(1);
+        let buffer = CoalesceBuffer::new(config);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let flush: FlushFn = {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            Arc::new(move |_| {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                })
+            })
+        };
+        buffer.submit(key(), "STATUS: timer".into(), flush).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        started.notified().await;
+
+        let shutdown = {
+            let buffer = buffer.clone();
+            tokio::spawn(async move { buffer.flush_all().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        release.notify_one();
+        shutdown.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_flush_all_waits_for_early_flush_callback() {
+        let mut config = test_config();
+        config.max_merges = 1;
+        config.window = Duration::from_secs(60);
+        let buffer = CoalesceBuffer::new(config);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let flush: FlushFn = {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            Arc::new(move |_| {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                })
+            })
+        };
+        buffer
+            .submit(key(), "STATUS: first".into(), flush.clone())
+            .await;
+        buffer.submit(key(), "STATUS: second".into(), flush).await;
+        started.notified().await;
+
+        let shutdown = {
+            let buffer = buffer.clone();
+            tokio::spawn(async move { buffer.flush_all().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        release.notify_one();
+        shutdown.await.unwrap();
     }
 
     #[tokio::test]

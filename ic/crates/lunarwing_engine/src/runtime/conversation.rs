@@ -283,7 +283,9 @@ impl ConversationManager {
         if let Some(conv) = convs.get_mut(&conversation_id) {
             match outcome {
                 ThreadOutcome::Completed { response } => {
-                    if let Some(text) = response {
+                    if let Some(text) = response
+                        && !text.is_empty()
+                    {
                         conv.add_entry(ConversationEntry::agent(thread_id, text));
                     }
                     conv.untrack_thread(thread_id);
@@ -883,6 +885,33 @@ mod tests {
             conv.entries[0].sender,
             EntrySender::Agent { thread_id } if thread_id == tid
         ));
+    }
+
+    #[tokio::test]
+    async fn record_outcome_skips_empty_response() {
+        let (_, cm) = make_conv_manager();
+        let conv_id = cm.get_or_create_conversation("cli", "user1").await.unwrap();
+        let tid = ThreadId::new();
+
+        cm.conversations
+            .write()
+            .await
+            .get_mut(&conv_id)
+            .unwrap()
+            .track_thread(tid);
+        cm.record_thread_outcome(
+            conv_id,
+            tid,
+            &ThreadOutcome::Completed {
+                response: Some(String::new()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let conv = cm.get_conversation(conv_id).await.unwrap();
+        assert!(conv.active_threads.is_empty());
+        assert!(conv.entries.is_empty());
     }
 
     #[tokio::test]

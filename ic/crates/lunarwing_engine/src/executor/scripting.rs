@@ -690,6 +690,14 @@ pub async fn execute_code_with_skills(
                                         }
                                         None
                                     }
+                                    ToolFutureResolution::Stopped => {
+                                        if first_gate.is_none() {
+                                            first_gate = Some(
+                                                crate::runtime::messaging::ThreadOutcome::Stopped,
+                                            );
+                                        }
+                                        None
+                                    }
                                 }
                             }
                             PendingFuture::Llm { handle } => {
@@ -849,6 +857,7 @@ enum PendingFuture {
 enum ToolFutureResolution {
     Monty(ExtFunctionResult),
     GatePaused(crate::runtime::messaging::ThreadOutcome),
+    Stopped,
 }
 
 /// Result of preflight checks (lease + policy) for a tool call.
@@ -1364,6 +1373,10 @@ async fn resolve_tool_future(
                 resume_kind,
                 resume_output,
             })
+        }
+        Ok(Err(EngineError::ExecutionStopped)) => {
+            let _ = leases.refund_use(lease_id).await;
+            ToolFutureResolution::Stopped
         }
         Ok(Err(e)) => {
             events.push(EventKind::ActionFailed {
@@ -2104,6 +2117,42 @@ except Exception as error:
             after.uses_remaining,
             Some(2),
             "pre-execution gate must refund its consumed lease use"
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_stopped_returns_silent_thread_stop() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("http")],
+            vec![Err(EngineError::ExecutionStopped)],
+        ));
+        let leases = LeaseManager::new();
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(1))
+            .await
+            .unwrap();
+
+        let result = run_code_with_leases(
+            r#"await http(url="https://example.com")
+FINAL("must not reach")"#,
+            effects,
+            &thread,
+            &leases,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            result.need_approval,
+            Some(crate::runtime::messaging::ThreadOutcome::Stopped)
+        ));
+        assert!(result.action_results.is_empty());
+        assert!(result.events.is_empty());
+        assert!(result.final_answer.is_none());
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(1)
         );
     }
 

@@ -356,6 +356,15 @@ impl Thread {
         self.updated_at = Utc::now();
     }
 
+    /// Complete the current turn without retaining an assistant response.
+    pub fn suppress_turn(&mut self) {
+        if let Some(turn) = self.turns.last_mut() {
+            turn.suppress();
+        }
+        self.state = ThreadState::Idle;
+        self.updated_at = Utc::now();
+    }
+
     /// Fail the current turn with an error.
     pub fn fail_turn(&mut self, error: impl Into<String>) {
         if let Some(turn) = self.turns.last_mut() {
@@ -644,6 +653,14 @@ impl Turn {
         self.state = TurnState::Completed;
         self.completed_at = Some(Utc::now());
         // Free image data — only needed for the initial LLM call, not subsequent turns
+        self.image_content_parts.clear();
+    }
+
+    /// Complete this turn while suppressing its assistant response.
+    pub fn suppress(&mut self) {
+        self.response = None;
+        self.state = TurnState::Completed;
+        self.completed_at = Some(Utc::now());
         self.image_content_parts.clear();
     }
 

@@ -759,6 +759,70 @@ impl ThreadManager {
         self.request_stop(thread_id).await
     }
 
+    /// Finalize a persisted waiting/suspended thread when external policy stops it.
+    pub async fn finalize_waiting_thread_as_stopped(
+        &self,
+        thread_id: ThreadId,
+        user_id: &str,
+    ) -> Result<(), EngineError> {
+        let resume_lock = self.resume_lock(thread_id).await;
+        let _resume_guard = resume_lock.lock().await;
+        if self.is_running(thread_id).await {
+            return Err(EngineError::Thread(
+                crate::types::error::ThreadError::AlreadyRunning(thread_id),
+            ));
+        }
+
+        let mut thread = self
+            .store
+            .load_thread(thread_id)
+            .await?
+            .ok_or(EngineError::ThreadNotFound(thread_id))?;
+        if !thread.is_owned_by(user_id) {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("thread {thread_id}"),
+            });
+        }
+        if thread.state.is_terminal() {
+            return Ok(());
+        }
+        if !matches!(thread.state, ThreadState::Waiting | ThreadState::Suspended) {
+            return Err(EngineError::Store {
+                reason: format!(
+                    "thread {thread_id} cannot be externally stopped from {:?}",
+                    thread.state
+                ),
+            });
+        }
+
+        let new_event_start = thread.events.len();
+        thread.transition_to(ThreadState::Completed, Some("execution stopped".into()))?;
+        thread.transition_to(ThreadState::Done, None)?;
+        if let Some(metadata) = thread.metadata.as_object_mut() {
+            metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
+            metadata.remove(INITIAL_PERSISTED_STATE_METADATA_KEY);
+        }
+        self.store.save_thread(&thread).await?;
+        if let Err(error) = self
+            .store
+            .append_events(&thread.events[new_event_start..])
+            .await
+        {
+            debug!(thread_id = %thread_id, %error, "failed to append external-stop events");
+        }
+        self.revoke_lease_ids(
+            &thread.capability_leases,
+            "owning thread externally stopped",
+        )
+        .await;
+        self.completed.write().await.remove(&thread_id);
+        if let Some(event) = thread.events.last().cloned() {
+            let _ = self.event_tx.send(event);
+        }
+        Ok(())
+    }
+
     /// Stop a running thread without ownership check (system operations).
     pub async fn stop_thread_system(&self, thread_id: ThreadId) -> Result<(), EngineError> {
         self.request_stop(thread_id).await
@@ -1348,6 +1412,39 @@ mod tests {
     }
 
     // ── Tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn finalize_waiting_thread_as_stopped_persists_terminal_state() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "waiting",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.transition_to(ThreadState::Waiting, None).unwrap();
+        thread.metadata[RUNTIME_CHECKPOINT_METADATA_KEY] = serde_json::json!({"step": 1});
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        mgr.finalize_waiting_thread_as_stopped(thread_id, "user")
+            .await
+            .unwrap();
+
+        let saved = store.load_thread(thread_id).await.unwrap().unwrap();
+        assert_eq!(saved.state, ThreadState::Done);
+        assert!(saved.completed_at.is_some());
+        assert!(
+            saved
+                .metadata
+                .get(RUNTIME_CHECKPOINT_METADATA_KEY)
+                .is_none()
+        );
+        assert!(!mgr.is_running(thread_id).await);
+    }
 
     #[tokio::test]
     async fn spawn_and_join() {

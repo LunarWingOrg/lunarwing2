@@ -1223,6 +1223,7 @@ impl Agent {
                 .unwrap_or_else(|| message.channel.clone());
             let key = crate::channels::coalesce::ChannelKey::new(
                 self.deps.owner_id.clone(),
+                message.channel.clone(),
                 destination,
                 message
                     .conversation_scope_id
@@ -1969,6 +1970,7 @@ impl Agent {
                     Ok(Some(content))
                 }
             }
+            SubmissionResult::Suppressed => Ok(Some(String::new())),
             SubmissionResult::Ok { message } => Ok(message),
             SubmissionResult::Error { message } => Ok(Some(format!("Error: {}", message))),
             SubmissionResult::Interrupted => Ok(Some("Interrupted.".into())),

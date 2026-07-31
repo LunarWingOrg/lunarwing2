@@ -148,6 +148,23 @@ XMPP_ALLOW_PLAINTEXT_FALLBACK=true      # Set to false to require encryption
 
 The XMPP bridge has its own env file (`xmpp-bridge.env`) that mirrors the JID, password, and bridge token. Both files must agree on `XMPP_BRIDGE_TOKEN`.
 
+## Multi-Agent Coordination
+
+Tenant provisioning writes coordination defaults to `env/lunarwing.env`:
+
+```bash
+COORD_ENABLED=false
+COORD_AGENT_ID=<tenant-name>
+COORD_CHANNELS=
+COORD_ADMIN_TOKEN=<generated-secret>
+COORD_ADMIN_PORT=<allocated-port>
+```
+
+Set `COORD_CHANNELS` to exact room JIDs, then set `COORD_ENABLED=true` and
+restart tenant. `add-tenant` preserves existing coordination values and token;
+`patch-env <tenant>` backfills missing keys without rotating or printing token.
+Agent IDs must be 1–128 ASCII characters using letters, digits, `@.-_/:+~`.
+
 ## Gateway (Web UI)
 
 ```bash

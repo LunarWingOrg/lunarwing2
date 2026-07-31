@@ -91,7 +91,9 @@ the canonical destination.
 ### ISSUE-002: XMPP coalescing is not present in the deployed channel path
 
 **Severity:** High
-**Status:** Confirmed real — FIXED in `c995575`
+**Status:** Confirmed real — initial transport-boundary fix in `c995575`;
+completed by the 2026-07-31 follow-up with transport-key isolation and a
+shutdown callback barrier
 **Affected code:** `ic/src/main.rs:379-384`, `ic/src/main.rs:523-554`,
 `ic/src/channels/xmpp/mod.rs:1145-1192`,
 `docs/proposals/MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md:74-87`,
@@ -135,7 +137,8 @@ Until that lands, mark Phase 4 partial rather than implemented.
 ### ISSUE-003: Three-strike disable gate is not registered in production
 
 **Severity:** High
-**Status:** Confirmed real — FIXED in `32cb470`
+**Status:** Confirmed real — initial gate wiring in `32cb470`; completed by the
+2026-07-31 follow-up with typed terminal denial across Engine V2 executors
 **Affected code:** `ic/src/gate/coordination.rs:17-83`,
 `ic/src/main.rs:656-689`
 
@@ -176,7 +179,9 @@ effect.
 ### ISSUE-004: Violation accounting can strike the wrong agent or count one event twice
 
 **Severity:** High
-**Status:** Confirmed real — FIXED in `52ce1bd`
+**Status:** Confirmed real — initial accounting fix in `52ce1bd`; completed by
+the 2026-07-31 follow-up with Engine V2 transform parity and typed transform
+suppression
 **Affected code:** `ic/src/agent/agent_loop.rs:1179-1185`,
 `ic/src/agent/agent_loop.rs:1456-1478`,
 `ic/src/agent/thread_ops.rs:525-545`,
@@ -300,7 +305,9 @@ both init systems.
 ### ISSUE-007: Multi-tenant systemd health can report healthy when discovery fails
 
 **Severity:** High
-**Status:** Confirmed real — FIXED in `9d372f5`
+**Status:** Confirmed real — initial discovery checks in `9d372f5`; completed by
+the 2026-07-31 follow-up with per-tenant user, bus, enumeration, and loaded-unit
+invariants
 **Affected code:** `ic-infrastructure-health-check/health-systemd.sh:23-27`,
 `ic-infrastructure-health-check/health-systemd.sh:48-55`,
 `ic-infrastructure-health-check/health-systemd.sh:93-104`,
@@ -389,7 +396,9 @@ a new violation, and encode that policy explicitly.
 ### ISSUE-009: Coordination admin mutation endpoints have no authentication
 
 **Severity:** Medium
-**Status:** Confirmed real (security weakness) — FIXED in `82b81be`
+**Status:** Confirmed real (security weakness) — initial route auth in `82b81be`;
+completed by the 2026-07-31 follow-up with tenant token provisioning, per-tenant
+admin ports, and shared agent-ID validation
 **Affected code:** `ic/src/channels/web/handlers/coord.rs:1-12`,
 `ic/src/channels/web/handlers/coord.rs:79-136`,
 `ic/src/channels/web/handlers/coord.rs:139-159`
@@ -428,7 +437,9 @@ server loopback-only as defense in depth.
 ### ISSUE-010: Declarative coordination rules apply to every channel
 
 **Severity:** Medium
-**Status:** Confirmed real — FIXED in `90405e0`
+**Status:** Confirmed real — initial channel guard in `90405e0`; completed by the
+2026-07-31 follow-up with `COORD_ENABLED` gating and exact escaped
+`COORD_CHANNELS` scope generation
 **Affected code:** `ic/config/hooks/coordination.hook.json:3-68`,
 `ic/src/hooks/bundled.rs:439-477`
 

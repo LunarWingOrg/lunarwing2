@@ -73,7 +73,9 @@ tenant_state_dir()  { echo "$MT_FIXTURE/state"; }
 tenant_run_dir()    { echo "$MT_FIXTURE/run"; }
 mkdir -p "$MT_FIXTURE/env" "$MT_FIXTURE/state" "$MT_FIXTURE/run"
 
-# Stub ports_get to return deterministic ports.
+# Stub ports_get to return deterministic ports. Restore the real implementation
+# for registry migration/lookup tests below.
+REAL_PORTS_GET_DEF="$(declare -f ports_get)"
 ports_get() {  # <name> <service>
   case "$2" in
     gateway)         echo 10000 ;;
@@ -86,6 +88,7 @@ ports_get() {  # <name> <service>
     nanocode_wss)    echo 10007 ;;
     pebble_wss)      echo 10008 ;;
     weechat_adapter) echo 10009 ;;
+    coord_admin)     echo 20009 ;;
     *)               echo 0 ;;
   esac
 }
@@ -112,6 +115,11 @@ out="$(run_writer fixture-tenant)"
 assert_eq "default LLM_MODEL" "$(envval LLM_MODEL)" "tensorzero::function_name::lunarwing"
 assert_eq "default GATEWAY_HOST" "$(envval GATEWAY_HOST)" "127.0.0.1"
 assert_eq "default XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmpp.localhost"
+assert_eq "default coordination disabled" "$(envval COORD_ENABLED)" "false"
+assert_eq "default coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-tenant"
+assert_eq "coordination admin token generated" \
+  "$(envval COORD_ADMIN_TOKEN)" "token-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+assert_eq "coordination admin port allocated" "$(envval COORD_ADMIN_PORT)" "20009"
 
 # Case 2: all three flags on first write
 out="$(run_writer fixture-tenant \
@@ -128,6 +136,12 @@ rm -f "$MT_FIXTURE/env/lunarwing.env"
 write_tenant_lunarwing_env fixture-tenant \
   "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" "" "" \
   "glm-5-air" "0.0.0.0" "admin@xmpp.org"
+sed -i \
+  -e 's/^COORD_ENABLED=.*/COORD_ENABLED=true/' \
+  -e 's/^COORD_AGENT_ID=.*/COORD_AGENT_ID=custom-agent/' \
+  -e 's/^COORD_CHANNELS=.*/COORD_CHANNELS=ops@conference.example/' \
+  -e 's/^COORD_ADMIN_TOKEN=.*/COORD_ADMIN_TOKEN=preserved-coord-token/' \
+  "$MT_FIXTURE/env/lunarwing.env"
 cat >>"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LW2STUDYMCP_HOME=/srv/lunarwing/lw2studymcp
 LW2STUDYMCP_STATE_HOME=/srv/lunarwing/study-state
@@ -140,6 +154,10 @@ write_tenant_lunarwing_env fixture-tenant \
 assert_eq "rerun preserves LLM_MODEL" "$(envval LLM_MODEL)" "glm-5-air"
 assert_eq "rerun preserves GATEWAY_HOST" "$(envval GATEWAY_HOST)" "0.0.0.0"
 assert_eq "rerun preserves XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmpp.localhost,admin@xmpp.org"
+assert_eq "rerun preserves COORD_ENABLED" "$(envval COORD_ENABLED)" "true"
+assert_eq "rerun preserves COORD_AGENT_ID" "$(envval COORD_AGENT_ID)" "custom-agent"
+assert_eq "rerun preserves COORD_CHANNELS" "$(envval COORD_CHANNELS)" "ops@conference.example"
+assert_eq "rerun preserves COORD_ADMIN_TOKEN" "$(envval COORD_ADMIN_TOKEN)" "preserved-coord-token"
 assert_eq "rerun preserves LW2STUDYMCP_HOME" \
   "$(envval LW2STUDYMCP_HOME)" "/srv/lunarwing/lw2studymcp"
 assert_eq "rerun preserves LW2STUDYMCP_STATE_HOME" \
@@ -154,6 +172,38 @@ write_tenant_lunarwing_env fixture-tenant
 assert_eq "rerun preserves DARKIRC_ADAPTER_SECRET" \
   "$(envval DARKIRC_ADAPTER_SECRET)" "preserved-darkirc-fixture"
 DARKIRC_FIXTURE_ENABLED=false
+
+echo "=== coordination env backfill tests ==="
+cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
+LUNARWING_OWNER_ID=fixture-tenant
+EOF
+patch_tenant_coordination_env fixture-tenant "$MT_FIXTURE/env/lunarwing.env"
+assert_eq "backfill coordination disabled" "$(envval COORD_ENABLED)" "false"
+assert_eq "backfill coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-tenant"
+assert_eq "backfill coordination channels" "$(envval COORD_CHANNELS)" ""
+assert_eq "backfill coordination aliases" "$(envval COORD_AGENT_ALIASES)" ""
+assert_eq "backfill coordination admin users" "$(envval COORD_ADMIN_USERS)" ""
+assert_eq "backfill coordination token" \
+  "$(envval COORD_ADMIN_TOKEN)" "token-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+assert_eq "backfill coordination admin port" "$(envval COORD_ADMIN_PORT)" "20009"
+sed -i 's/^COORD_ADMIN_TOKEN=.*/COORD_ADMIN_TOKEN=backfill-preserved/' \
+  "$MT_FIXTURE/env/lunarwing.env"
+patch_tenant_coordination_env fixture-tenant "$MT_FIXTURE/env/lunarwing.env"
+assert_eq "backfill token remains stable" "$(envval COORD_ADMIN_TOKEN)" "backfill-preserved"
+assert_eq "backfill env mode" \
+  "$(stat -c '%a' "$MT_FIXTURE/env/lunarwing.env")" "600"
+sed -i \
+  -e 's/^COORD_ADMIN_TOKEN=.*/COORD_ADMIN_TOKEN=/' \
+  -e 's/^COORD_ADMIN_PORT=.*/COORD_ADMIN_PORT=/' \
+  "$MT_FIXTURE/env/lunarwing.env"
+patch_tenant_coordination_env fixture-tenant "$MT_FIXTURE/env/lunarwing.env"
+assert_eq "backfill repairs empty token" \
+  "$(envval COORD_ADMIN_TOKEN)" "token-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+assert_eq "backfill repairs empty admin port" "$(envval COORD_ADMIN_PORT)" "20009"
+assert_eq "backfill keeps one token key" \
+  "$(grep -c '^COORD_ADMIN_TOKEN=' "$MT_FIXTURE/env/lunarwing.env")" "1"
+assert_eq "backfill keeps one port key" \
+  "$(grep -c '^COORD_ADMIN_PORT=' "$MT_FIXTURE/env/lunarwing.env")" "1"
 
 echo "=== XMPP_JID preservation tests ==="
 
@@ -272,6 +322,43 @@ if jq -e . "$WORKERS_REG" >/dev/null 2>&1; then
   echo "  PASS: registry remains valid JSON after enable"
 else
   echo "  FAIL: registry corrupted"; failures=$((failures + 1))
+fi
+
+echo "=== coordination admin port migration tests ==="
+eval "$REAL_PORTS_GET_DEF"
+PORTS_REGISTRY="$MT_FIXTURE/ports-v12.json"
+cat >"$PORTS_REGISTRY" <<'JSON'
+{"version":12,"tenants":{"legacy":{"extended_base":20000,"extended_ports":{"reserved_9":20009}},"missing":{"extended_base":20010}}}
+JSON
+ports_migrate_v13
+assert_eq "v13 registry version" "$(jq -r '.version' "$PORTS_REGISTRY")" "13"
+assert_eq "v13 coord_admin rename" \
+  "$(jq -r '.tenants.legacy.extended_ports.coord_admin' "$PORTS_REGISTRY")" "20009"
+assert_eq "v13 removes reserved_9" \
+  "$(jq -r '.tenants.legacy.extended_ports | has("reserved_9")' "$PORTS_REGISTRY")" "false"
+assert_eq "ports_get resolves coord_admin" "$(ports_get legacy coord_admin)" "20009"
+assert_eq "v13 repairs missing extended_ports" \
+  "$(jq -r '.tenants.missing.extended_ports.coord_admin' "$PORTS_REGISTRY")" "20019"
+jq '.tenants.unmigrated = {"extended_base":20020}' "$PORTS_REGISTRY" >"$PORTS_REGISTRY.tmp"
+mv "$PORTS_REGISTRY.tmp" "$PORTS_REGISTRY"
+assert_eq "ports_get derives coord_admin from extended_base" \
+  "$(ports_get unmigrated coord_admin)" "20029"
+
+BAD_ENV="$MT_FIXTURE/env/bad.env"
+printf 'LUNARWING_OWNER_ID=broken\n' >"$BAD_ENV"
+chmod 0644 "$BAD_ENV"
+jq '.tenants.broken = {}' "$PORTS_REGISTRY" >"$PORTS_REGISTRY.tmp"
+mv "$PORTS_REGISTRY.tmp" "$PORTS_REGISTRY"
+if (patch_tenant_coordination_env broken "$BAD_ENV" >/dev/null 2>&1); then
+  echo "  FAIL: missing coord_admin port accepted"; failures=$((failures + 1))
+else
+  echo "  PASS: missing coord_admin port rejected"
+fi
+assert_eq "failed backfill hardens env mode" "$(stat -c '%a' "$BAD_ENV")" "600"
+if grep -q '^COORD_ADMIN_TOKEN=' "$BAD_ENV"; then
+  echo "  FAIL: failed backfill appended coordination token"; failures=$((failures + 1))
+else
+  echo "  PASS: failed backfill leaves token absent"
 fi
 
 # Unknown worker name is rejected.

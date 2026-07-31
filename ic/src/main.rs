@@ -633,10 +633,12 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Register lifecycle hooks.
     let active_tool_names = components.tools.list().await;
+    let coordination_config = CoordinationHookConfig::from_env();
 
     let hook_bootstrap = bootstrap_hooks(
         &components.hooks,
         components.workspace.as_ref(),
+        &coordination_config,
         &config.wasm.tools_dir,
         &config.channels.wasm_channels_dir,
         &active_tool_names,
@@ -655,7 +657,6 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Multi-agent coordination hooks (Phase 2/3 of the coordination pipeline).
     // Only active when COORD_ENABLED=true with COORD_AGENT_ID/COORD_CHANNELS set.
-    let coordination_config = CoordinationHookConfig::from_env();
     let coordination_store: Option<Arc<ViolationStore>> =
         coordination_config.is_actionable().then(|| {
             Arc::new(ViolationStore::with_default_path(

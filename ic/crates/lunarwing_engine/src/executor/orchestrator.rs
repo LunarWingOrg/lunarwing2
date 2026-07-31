@@ -70,6 +70,19 @@ pub struct OrchestratorResult {
     pub tokens_used: TokenUsage,
 }
 
+fn stopped_orchestrator_result(
+    thread: &mut Thread,
+    tokens_used: TokenUsage,
+) -> Result<OrchestratorResult, EngineError> {
+    if thread.state == ThreadState::Running {
+        thread.transition_to(ThreadState::Completed, Some("execution stopped".into()))?;
+    }
+    Ok(OrchestratorResult {
+        outcome: ThreadOutcome::Stopped,
+        tokens_used,
+    })
+}
+
 /// Extract source_channel from thread metadata (set by ConversationManager).
 fn thread_source_channel(thread: &Thread) -> Option<String> {
     thread
@@ -455,26 +468,47 @@ pub async fn execute_orchestrator(
 
                     // __execute_code_step__(code, state)
                     "__execute_code_step__" => {
-                        handle_execute_code_step(
+                        match handle_execute_code_step(
                             args, kwargs, thread, llm, effects, leases, policy, event_tx, store,
                         )
                         .await
+                        {
+                            Ok(result) => result,
+                            Err(EngineError::ExecutionStopped) => {
+                                return stopped_orchestrator_result(thread, total_tokens);
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
 
                     // __execute_action__(name, params, call_id=...)
                     "__execute_action__" => {
-                        handle_execute_action(
+                        match handle_execute_action(
                             args, kwargs, thread, effects, leases, policy, event_tx,
                         )
                         .await
+                        {
+                            Ok(result) => result,
+                            Err(EngineError::ExecutionStopped) => {
+                                return stopped_orchestrator_result(thread, total_tokens);
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
 
                     // __execute_actions_parallel__(calls)
                     "__execute_actions_parallel__" => {
-                        handle_execute_actions_parallel(
+                        match handle_execute_actions_parallel(
                             args, thread, effects, leases, policy, event_tx,
                         )
                         .await
+                        {
+                            Ok(result) => result,
+                            Err(EngineError::ExecutionStopped) => {
+                                return stopped_orchestrator_result(thread, total_tokens);
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
 
                     // __check_signals__()
@@ -762,14 +796,14 @@ async fn handle_execute_code_step(
     policy: &Arc<PolicyEngine>,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
     store: Option<&Arc<dyn Store>>,
-) -> ExtFunctionResult {
+) -> Result<ExtFunctionResult, EngineError> {
     let code = match args.first() {
         Some(obj) => monty_to_string(obj),
         None => {
-            return ExtFunctionResult::Error(monty::MontyException::new(
+            return Ok(ExtFunctionResult::Error(monty::MontyException::new(
                 monty::ExcType::TypeError,
                 Some("__execute_code_step__ requires a code string".into()),
-            ));
+            )));
         }
     };
 
@@ -807,6 +841,9 @@ async fn handle_execute_code_step(
     .await
     {
         Ok(result) => {
+            if matches!(&result.need_approval, Some(ThreadOutcome::Stopped)) {
+                return Err(EngineError::ExecutionStopped);
+            }
             // Broadcast events from code execution to the thread and event channel.
             // Without this, ActionExecuted events from CodeAct tool calls are lost
             // and never appear in traces.
@@ -854,12 +891,12 @@ async fn handle_execute_code_step(
                 }),
             });
 
-            ExtFunctionResult::Return(json_to_monty(&result_json))
+            Ok(ExtFunctionResult::Return(json_to_monty(&result_json)))
         }
-        Err(e) => ExtFunctionResult::Error(monty::MontyException::new(
+        Err(e) => Ok(ExtFunctionResult::Error(monty::MontyException::new(
             monty::ExcType::RuntimeError,
             Some(format!("Code execution failed: {e}")),
-        )),
+        ))),
     }
 }
 
@@ -882,14 +919,14 @@ async fn handle_execute_action(
     leases: &Arc<LeaseManager>,
     policy: &Arc<PolicyEngine>,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
-) -> ExtFunctionResult {
+) -> Result<ExtFunctionResult, EngineError> {
     let name = match extract_string_arg(args, kwargs, "name", 0) {
         Some(n) => n,
         None => {
-            return ExtFunctionResult::Error(monty::MontyException::new(
+            return Ok(ExtFunctionResult::Error(monty::MontyException::new(
                 monty::ExcType::TypeError,
                 Some("__execute_action__ requires a name argument".into()),
-            ));
+            )));
         }
     };
 
@@ -952,7 +989,7 @@ async fn handle_execute_action(
                 "output": output,
                 "is_error": true,
             });
-            return ExtFunctionResult::Return(json_to_monty(&result));
+            return Ok(ExtFunctionResult::Return(json_to_monty(&result)));
         }
     };
 
@@ -985,7 +1022,7 @@ async fn handle_execute_action(
                     "output": output,
                     "is_error": true,
                 });
-                return ExtFunctionResult::Return(json_to_monty(&result));
+                return Ok(ExtFunctionResult::Return(json_to_monty(&result)));
             }
             crate::capability::policy::PolicyDecision::RequireApproval { .. } => {
                 let output = serde_json::json!({"status": "gate_paused", "gate_name": "approval"});
@@ -1016,7 +1053,7 @@ async fn handle_execute_action(
                     })
                     .unwrap_or_default(),
                 });
-                return ExtFunctionResult::Return(json_to_monty(&result));
+                return Ok(ExtFunctionResult::Return(json_to_monty(&result)));
             }
             crate::capability::policy::PolicyDecision::Allow => {}
         }
@@ -1055,7 +1092,7 @@ async fn handle_execute_action(
                 "is_error": r.is_error,
                 "duration_ms": r.duration.as_millis(),
             });
-            ExtFunctionResult::Return(json_to_monty(&result))
+            Ok(ExtFunctionResult::Return(json_to_monty(&result)))
         }
         Err(EngineError::GatePaused {
             gate_name,
@@ -1100,7 +1137,11 @@ async fn handle_execute_action(
                 "resume_kind": serde_json::to_value(&*resume_kind).unwrap_or_default(),
                 "resume_output": resume_output,
             });
-            ExtFunctionResult::Return(json_to_monty(&result))
+            Ok(ExtFunctionResult::Return(json_to_monty(&result)))
+        }
+        Err(EngineError::ExecutionStopped) => {
+            let _ = leases.refund_use(lease.id).await;
+            Err(EngineError::ExecutionStopped)
         }
         Err(e) => {
             let output = serde_json::json!({"error": e.to_string()});
@@ -1122,7 +1163,7 @@ async fn handle_execute_action(
                 "output": output,
                 "is_error": true,
             });
-            ExtFunctionResult::Return(json_to_monty(&result))
+            Ok(ExtFunctionResult::Return(json_to_monty(&result)))
         }
     }
 }
@@ -1143,7 +1184,7 @@ async fn handle_execute_actions_parallel(
     leases: &Arc<LeaseManager>,
     policy: &Arc<PolicyEngine>,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
-) -> ExtFunctionResult {
+) -> Result<ExtFunctionResult, EngineError> {
     // Parse the calls list from the first argument (list of dicts)
     let calls_json = args
         .first()
@@ -1152,15 +1193,17 @@ async fn handle_execute_actions_parallel(
     let calls_array = match calls_json.as_array() {
         Some(arr) => arr.clone(),
         None => {
-            return ExtFunctionResult::Error(monty::MontyException::new(
+            return Ok(ExtFunctionResult::Error(monty::MontyException::new(
                 monty::ExcType::TypeError,
                 Some("__execute_actions_parallel__ requires a list of call dicts".into()),
-            ));
+            )));
         }
     };
 
     if calls_array.is_empty() {
-        return ExtFunctionResult::Return(json_to_monty(&serde_json::json!([])));
+        return Ok(ExtFunctionResult::Return(json_to_monty(
+            &serde_json::json!([]),
+        )));
     }
 
     // Parse each call dict into (name, params, call_id)
@@ -1316,8 +1359,8 @@ async fn handle_execute_actions_parallel(
                         })
                         .unwrap_or_default(),
                     }));
-                    return ExtFunctionResult::Return(json_to_monty(&serde_json::json!(
-                        results_json
+                    return Ok(ExtFunctionResult::Return(json_to_monty(
+                        &serde_json::json!(results_json),
                     )));
                 }
                 crate::capability::policy::PolicyDecision::Allow => {}
@@ -1377,7 +1420,7 @@ async fn handle_execute_actions_parallel(
             prompt_context: Arc::clone(&prompt_context),
         };
         let ps = summarize_params(&pc.name, &pc.params);
-        let (result_json, event, output) = execute_single_action(
+        let execution = execute_single_action(
             effects,
             &pc.name,
             pc.params.clone(),
@@ -1387,6 +1430,14 @@ async fn handle_execute_actions_parallel(
             ps,
         )
         .await;
+        let (result_json, event, output) = match execution {
+            Ok(result) => result,
+            Err(EngineError::ExecutionStopped) => {
+                let _ = leases.refund_use(lease.id).await;
+                return Err(EngineError::ExecutionStopped);
+            }
+            Err(error) => return Err(error),
+        };
         if interrupted_result_needs_refund(&result_json) {
             let _ = leases.refund_use(lease.id).await;
         }
@@ -1419,7 +1470,7 @@ async fn handle_execute_actions_parallel(
             let ps = summarize_params(&pc_name, &pc_params);
 
             join_set.spawn(async move {
-                let (result_json, event, output) = execute_single_action(
+                let result = execute_single_action(
                     &effects,
                     &pc_name,
                     pc_params,
@@ -1429,24 +1480,35 @@ async fn handle_execute_actions_parallel(
                     ps,
                 )
                 .await;
-                (idx, lease.id, result_json, event, output)
+                (idx, lease.id, result)
             });
         }
 
+        let mut execution_stopped = false;
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
-                Ok((idx, lease_id, result_json, event, output)) => {
-                    if interrupted_result_needs_refund(&result_json) {
-                        let _ = leases.refund_use(lease_id).await;
+                Ok((idx, lease_id, result)) => match result {
+                    Ok((result_json, event, output)) => {
+                        if interrupted_result_needs_refund(&result_json) {
+                            let _ = leases.refund_use(lease_id).await;
+                        }
+                        slot_results[idx] = Some(result_json);
+                        slot_events[idx] = Some(event);
+                        slot_outputs[idx] = Some(output);
                     }
-                    slot_results[idx] = Some(result_json);
-                    slot_events[idx] = Some(event);
-                    slot_outputs[idx] = Some(output);
-                }
+                    Err(EngineError::ExecutionStopped) => {
+                        let _ = leases.refund_use(lease_id).await;
+                        execution_stopped = true;
+                    }
+                    Err(error) => return Err(error),
+                },
                 Err(e) => {
                     debug!("parallel action execution task panicked: {e}");
                 }
             }
+        }
+        if execution_stopped {
+            return Err(EngineError::ExecutionStopped);
         }
     }
 
@@ -1473,7 +1535,9 @@ async fn handle_execute_actions_parallel(
     }
 
     thread.updated_at = chrono::Utc::now();
-    ExtFunctionResult::Return(json_to_monty(&serde_json::json!(results_json)))
+    Ok(ExtFunctionResult::Return(json_to_monty(
+        &serde_json::json!(results_json),
+    )))
 }
 
 /// Execute a single action and return (result_json, event, output) for the
@@ -1486,7 +1550,7 @@ async fn execute_single_action(
     lease: &crate::types::capability::CapabilityLease,
     exec_ctx: &ThreadExecutionContext,
     params_summary: Option<String>,
-) -> (serde_json::Value, EventKind, serde_json::Value) {
+) -> Result<(serde_json::Value, EventKind, serde_json::Value), EngineError> {
     match effects.execute_action(name, params, lease, exec_ctx).await {
         Ok(r) => {
             let event = EventKind::ActionExecuted {
@@ -1503,7 +1567,7 @@ async fn execute_single_action(
                 "is_error": r.is_error,
                 "duration_ms": r.duration.as_millis(),
             });
-            (result_json, event, r.output)
+            Ok((result_json, event, r.output))
         }
         Err(EngineError::GatePaused {
             gate_name,
@@ -1535,8 +1599,9 @@ async fn execute_single_action(
                 "resume_kind": serde_json::to_value(&*resume_kind).unwrap_or_default(),
                 "resume_output": resume_output,
             });
-            (result_json, event, output)
+            Ok((result_json, event, output))
         }
+        Err(EngineError::ExecutionStopped) => Err(EngineError::ExecutionStopped),
         Err(e) => {
             let output = serde_json::json!({"error": e.to_string()});
             let event = EventKind::ActionFailed {
@@ -1550,7 +1615,7 @@ async fn execute_single_action(
                 "output": &output,
                 "is_error": true,
             });
-            (result_json, event, output)
+            Ok((result_json, event, output))
         }
     }
 }
@@ -2382,7 +2447,7 @@ mod tests {
     use super::*;
     use crate::runtime::messaging::{ThreadSignal, signal_channel};
     use crate::traits::llm::{LlmStream, LlmStreamChunk};
-    use crate::types::capability::CapabilityLease;
+    use crate::types::capability::{ActionDef, CapabilityLease, EffectType, GrantedActions};
     use crate::types::memory::{DocType, MemoryDoc};
     use crate::types::message::{MessageRole, TransientContentPart};
     use crate::types::project::ProjectId;
@@ -3101,6 +3166,8 @@ mod tests {
 
     struct EmptyEffects;
 
+    struct StoppedEffects;
+
     #[async_trait::async_trait]
     impl EffectExecutor for EmptyEffects {
         async fn execute_action(
@@ -3124,6 +3191,32 @@ mod tests {
             _: &[CapabilityLease],
         ) -> Result<Vec<crate::types::capability::ActionDef>, EngineError> {
             Ok(vec![])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for StoppedEffects {
+        async fn execute_action(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            Err(EngineError::ExecutionStopped)
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![ActionDef {
+                name: "blocked_tool".into(),
+                description: "blocked tool".into(),
+                parameters_schema: serde_json::json!({"type": "object"}),
+                effects: vec![EffectType::ReadLocal],
+                requires_approval: false,
+            }])
         }
     }
 
@@ -3194,6 +3287,61 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.role == MessageRole::Assistant)
+        );
+    }
+
+    #[tokio::test]
+    async fn host_policy_stop_terminates_without_error_event() {
+        let code = "__execute_action__('blocked_tool', {}, call_id='blocked')\nFINAL('unreached')";
+        let project = ProjectId::new();
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            project,
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(PendingStreamLlm);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(StoppedEffects);
+        let leases = Arc::new(LeaseManager::new());
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(1))
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let (_signal_tx, mut signal_rx) = signal_channel(16);
+        let token = CancellationToken::new();
+
+        let result = execute_orchestrator(
+            code,
+            &mut thread,
+            &llm,
+            &effects,
+            &leases,
+            &policy,
+            &mut signal_rx,
+            &token,
+            None,
+            None,
+            None,
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result.outcome, ThreadOutcome::Stopped));
+        assert_eq!(thread.state, ThreadState::Completed);
+        assert!(
+            thread
+                .events
+                .iter()
+                .all(|event| !matches!(event.kind, EventKind::ActionFailed { .. }))
+        );
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(1)
         );
     }
 

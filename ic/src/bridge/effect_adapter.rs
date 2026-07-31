@@ -519,18 +519,18 @@ impl EffectBridgeAdapter {
         let start = Instant::now();
 
         // ── Coordination gate (priority 5 — first check, before any side
-        // effect). A disabled agent must not execute tools at all; the deny
-        // reason is SILENT-prefixed: log at debug, never surface policy text
-        // to the channel (ISSUE-003).
+        // effect). A disabled agent must not execute tools at all. Return typed
+        // control flow so executors stop without putting policy text in model
+        // context or channel status (ISSUE-003).
         if let Some(gate) = self.coordination_gate.read().await.as_ref()
-            && let Some(reason) = gate.deny_reason(&context.user_id)
+            && gate.deny_reason(&context.user_id).is_some()
         {
             tracing::debug!(
                 user = %context.user_id,
                 tool = %action_name,
                 "coordination gate: tool execution silently denied"
             );
-            return Err(EngineError::Effect { reason });
+            return Err(EngineError::ExecutionStopped);
         }
 
         let resolved_name = self.tools.resolve_name(action_name).await;
@@ -1565,12 +1565,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
                 &bad_ctx,
             )
             .await;
-        match result {
-            Err(EngineError::Effect { reason }) => {
-                assert!(crate::gate::coordination::is_silent_deny(&reason));
-            }
-            other => panic!("expected silent Effect deny, got {other:?}"),
-        }
+        assert!(matches!(result, Err(EngineError::ExecutionStopped)));
 
         // Clean user still executes (auto-approved to skip the approval pause).
         adapter

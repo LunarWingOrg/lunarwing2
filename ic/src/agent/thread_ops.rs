@@ -33,6 +33,47 @@ fn requires_preexisting_uuid_thread(channel: &str) -> bool {
 }
 
 impl Agent {
+    /// Run final-response transforms once. Rejections suppress output instead
+    /// of manufacturing policy text that could re-enter outbound hooks.
+    pub(crate) async fn transform_response(
+        &self,
+        message: &IncomingMessage,
+        thread_id: &str,
+        response: String,
+    ) -> Option<String> {
+        let event = crate::hooks::HookEvent::ResponseTransform {
+            user_id: message.user_id.clone(),
+            thread_id: thread_id.to_string(),
+            response: response.clone(),
+            channel: Some(message.channel.clone()),
+            policy_scope: crate::channels::routing_target_from_metadata(&message.metadata),
+        };
+        match self.hooks().run(&event).await {
+            Err(crate::hooks::HookError::Rejected { reason }) => {
+                tracing::debug!(
+                    channel = %message.channel,
+                    user = %message.user_id,
+                    reason = %reason,
+                    "Response transform rejected output; suppressing response"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    channel = %message.channel,
+                    user = %message.user_id,
+                    %error,
+                    "Response transform failed closed; suppressing response"
+                );
+                None
+            }
+            Ok(crate::hooks::HookOutcome::Continue {
+                modified: Some(new_response),
+            }) => Some(new_response),
+            _ => Some(response),
+        }
+    }
+
     /// Hydrate a historical thread from DB into memory if not already present.
     ///
     /// Called before `resolve_thread` so that the session manager finds the
@@ -522,29 +563,26 @@ impl Agent {
                 let (response, suggestions) =
                     crate::agent::dispatcher::extract_suggestions(&response);
 
-                // Hook: TransformResponse — allow hooks to modify or reject the final response
-                let response = {
-                    let event = crate::hooks::HookEvent::ResponseTransform {
-                        user_id: message.user_id.clone(),
-                        thread_id: thread_id.to_string(),
-                        response: response.clone(),
-                        channel: Some(message.channel.clone()),
-                        policy_scope: crate::channels::routing_target_from_metadata(
-                            &message.metadata,
-                        ),
-                    };
-                    match self.hooks().run(&event).await {
-                        Err(crate::hooks::HookError::Rejected { reason }) => {
-                            format!("[Response filtered: {}]", reason)
-                        }
-                        Err(err) => {
-                            format!("[Response blocked by hook policy: {}]", err)
-                        }
-                        Ok(crate::hooks::HookOutcome::Continue {
-                            modified: Some(new_response),
-                        }) => new_response,
-                        _ => response, // fail-open: use original
-                    }
+                let response = self
+                    .transform_response(message, &thread_id.to_string(), response)
+                    .await;
+
+                let Some(response) = response else {
+                    thread.suppress_turn();
+                    let (turn_number, tool_calls) = thread
+                        .turns
+                        .last()
+                        .map(|t| (t.turn_number, t.tool_calls.clone()))
+                        .unwrap_or_default();
+                    self.persist_tool_calls(
+                        thread_id,
+                        &message.channel,
+                        &message.user_id,
+                        turn_number,
+                        &tool_calls,
+                    )
+                    .await;
+                    return Ok(SubmissionResult::Suppressed);
                 };
 
                 // State transitions and DB persistence always happen,
@@ -1512,6 +1550,26 @@ impl Agent {
                 Ok(AgenticLoopResult::Response(response)) => {
                     let (response, suggestions) =
                         crate::agent::dispatcher::extract_suggestions(&response);
+                    let response = self
+                        .transform_response(message, &thread_id.to_string(), response)
+                        .await;
+                    let Some(response) = response else {
+                        thread.suppress_turn();
+                        let (turn_number, tool_calls) = thread
+                            .turns
+                            .last()
+                            .map(|t| (t.turn_number, t.tool_calls.clone()))
+                            .unwrap_or_default();
+                        self.persist_tool_calls(
+                            thread_id,
+                            &message.channel,
+                            &message.user_id,
+                            turn_number,
+                            &tool_calls,
+                        )
+                        .await;
+                        return Ok(SubmissionResult::Suppressed);
+                    };
                     thread.complete_turn(&response);
                     let (turn_number, tool_calls) = thread
                         .turns

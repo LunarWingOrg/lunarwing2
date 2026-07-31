@@ -34,6 +34,7 @@ const APPROVAL_CALL_ID: &str = "callgate1";
 const APPROVAL_REPLAY_CALL_ID: &str = "callgate2";
 const APPROVAL_CONTEXT_MARKER: &str = "The user explicitly approved this action";
 const OUTBOUND_POINTS: [HookPoint; 1] = [HookPoint::BeforeOutbound];
+const TRANSFORM_POINTS: [HookPoint; 1] = [HookPoint::TransformResponse];
 
 struct DeterministicStreamingLlm;
 
@@ -630,6 +631,12 @@ struct OutboundHook {
     behavior: HookBehavior,
 }
 
+struct TransformHook {
+    behavior: HookBehavior,
+    calls: Arc<AtomicUsize>,
+    scopes: Arc<Mutex<Vec<Option<String>>>>,
+}
+
 #[async_trait]
 impl Hook for OutboundHook {
     fn name(&self) -> &str {
@@ -651,6 +658,33 @@ impl Hook for OutboundHook {
         Ok(match self.behavior {
             HookBehavior::Modify => HookOutcome::modify("modified-by-hook".to_string()),
             HookBehavior::Reject => HookOutcome::reject("blocked"),
+        })
+    }
+}
+
+#[async_trait]
+impl Hook for TransformHook {
+    fn name(&self) -> &str {
+        "phase5-transform"
+    }
+
+    fn hook_points(&self) -> &[HookPoint] {
+        &TRANSFORM_POINTS
+    }
+
+    async fn execute(
+        &self,
+        event: &HookEvent,
+        _ctx: &HookContext,
+    ) -> Result<HookOutcome, HookError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(event.policy_scope().map(str::to_string));
+        Ok(match self.behavior {
+            HookBehavior::Modify => HookOutcome::modify("transformed-by-hook".to_string()),
+            HookBehavior::Reject => HookOutcome::reject("blocked transform"),
         })
     }
 }
@@ -1129,6 +1163,144 @@ async fn assert_hook_case(behavior: HookBehavior, expected_response: Option<&str
     lunarwing::bridge::reset_engine_state().await;
 }
 
+async fn assert_transform_hook_case(behavior: HookBehavior, expected_response: Option<&str>) {
+    lunarwing::bridge::reset_engine_state().await;
+
+    let rejects = matches!(behavior, HookBehavior::Reject);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let scopes = Arc::new(Mutex::new(Vec::new()));
+    let llm: Arc<dyn LlmProvider> = Arc::new(DeterministicStreamingLlm);
+    let rig = TestRigBuilder::new()
+        .with_channel_name("xmpp")
+        .with_llm(llm)
+        .with_hook(Arc::new(TransformHook {
+            behavior,
+            calls: Arc::clone(&calls),
+            scopes: Arc::clone(&scopes),
+        }))
+        .build()
+        .await;
+    let scope = Uuid::new_v4().to_string();
+    let message = IncomingMessage::new("xmpp", "test-user", "apply transform hook")
+        .with_conversation_scope(scope.clone())
+        .with_metadata(serde_json::json!({"xmpp_target": "room@conference.example.org"}));
+
+    rig.send_incoming(message).await;
+    match expected_response {
+        Some(expected) => {
+            let responses = rig.wait_for_responses(1, Duration::from_secs(10)).await;
+            assert_eq!(responses.len(), 1);
+            assert_eq!(responses[0].content, expected);
+        }
+        None => {
+            wait_for_engine_completion().await;
+            assert!(rig.captured_responses().is_empty());
+        }
+    }
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec![Some("room@conference.example.org".to_string())]
+    );
+    let conversation_id = rig
+        .database()
+        .get_or_create_scoped_conversation("xmpp", "test-user", &scope)
+        .await
+        .expect("scoped conversation should resolve");
+    let history = rig
+        .database()
+        .list_conversation_messages(conversation_id)
+        .await
+        .expect("history should load");
+    let assistant_messages: Vec<_> = history
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .collect();
+    match expected_response {
+        Some(expected) => {
+            assert_eq!(assistant_messages.len(), 1);
+            assert_eq!(assistant_messages[0].content, expected);
+        }
+        None => assert!(assistant_messages.is_empty()),
+    }
+    assert!(history.iter().all(|message| {
+        !message.content.contains("Response filtered")
+            && !message.content.contains("blocked transform")
+    }));
+    if rejects {
+        let follow_up = IncomingMessage::new("xmpp", "test-user", "still running")
+            .with_conversation_scope(Uuid::new_v4().to_string())
+            .with_metadata(serde_json::json!({"xmpp_target": "room@conference.example.org"}));
+        rig.send_incoming(follow_up).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transform rejection must not shut down the agent loop");
+        assert!(rig.captured_responses().is_empty());
+    }
+
+    rig.shutdown_and_wait().await;
+    lunarwing::bridge::reset_engine_state().await;
+}
+
+async fn assert_legacy_transform_rejection() {
+    lunarwing::bridge::reset_engine_state().await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let scopes = Arc::new(Mutex::new(Vec::new()));
+    let llm: Arc<dyn LlmProvider> = Arc::new(DeterministicStreamingLlm);
+    let rig = TestRigBuilder::new()
+        .with_channel_name("xmpp")
+        .with_llm(llm)
+        .with_hook(Arc::new(TransformHook {
+            behavior: HookBehavior::Reject,
+            calls: Arc::clone(&calls),
+            scopes,
+        }))
+        .build()
+        .await;
+    let scope = Uuid::new_v4().to_string();
+    let message = IncomingMessage::new("xmpp", "test-user", "reject legacy transform")
+        .with_conversation_scope(scope.clone())
+        .with_metadata(serde_json::json!({"xmpp_target": "legacy@example.org"}));
+
+    rig.send_incoming(message).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("legacy transform hook should run");
+    tokio::task::yield_now().await;
+    assert!(rig.captured_responses().is_empty());
+
+    let conversation_id = rig
+        .database()
+        .get_or_create_scoped_conversation("xmpp", "test-user", &scope)
+        .await
+        .expect("scoped conversation should resolve");
+    let history = rig
+        .database()
+        .list_conversation_messages(conversation_id)
+        .await
+        .expect("history should load");
+    assert!(history.iter().all(|message| message.role != "assistant"));
+    assert!(history.iter().all(|message| {
+        !message.content.contains("Response filtered")
+            && !message.content.contains("blocked transform")
+    }));
+
+    rig.shutdown_and_wait().await;
+    lunarwing::bridge::reset_engine_state().await;
+}
+
 async fn assert_error_case() {
     lunarwing::bridge::reset_engine_state().await;
 
@@ -1592,6 +1764,11 @@ async fn engine_v2_channel_delivery_matrix() {
     assert_attachment_secret_scan_case().await;
     assert_hook_case(HookBehavior::Modify, Some("modified-by-hook")).await;
     assert_hook_case(HookBehavior::Reject, None).await;
+    assert_transform_hook_case(HookBehavior::Modify, Some("transformed-by-hook")).await;
+    assert_transform_hook_case(HookBehavior::Reject, None).await;
+    env.set_channels(None);
+    assert_legacy_transform_rejection().await;
+    env.set_channels(Some("xmpp"));
     assert_error_case().await;
     assert_stopped_case().await;
     assert_approval_case().await;

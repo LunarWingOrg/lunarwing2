@@ -34,6 +34,30 @@ pub const DEFAULT_MAX_MESSAGE_LENGTH: usize = 420;
 /// Default allowed coordination message tags.
 pub const DEFAULT_ALLOWED_TAGS: [&str; 5] = ["STATUS", "ALERT", "COORD", "ANNOUNCE", "QUERY"];
 
+/// Maximum accepted coordination agent identifier length.
+pub const MAX_COORD_AGENT_ID_LEN: usize = 128;
+
+/// Shared coordination agent-ID contract used by hooks and admin routes.
+pub fn valid_coordination_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_COORD_AGENT_ID_LEN
+        && id.bytes().all(|byte| {
+            matches!(byte,
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'
+                | b'@' | b'.' | b'-' | b'_' | b'/' | b':' | b'+' | b'~')
+        })
+}
+
+/// Build shared case-insensitive exact matcher for configured coordination channels.
+pub(crate) fn coordination_channel_guard(channels: &[String]) -> String {
+    let alternatives = channels
+        .iter()
+        .map(|channel| regex::escape(channel))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("(?i)^(?:{alternatives})$")
+}
+
 /// Configuration for the coordination hooks, loaded from environment.
 #[derive(Debug, Clone)]
 pub struct CoordinationHookConfig {
@@ -118,7 +142,9 @@ impl CoordinationHookConfig {
 
     /// Whether the config is usable (enabled and minimally configured).
     pub fn is_actionable(&self) -> bool {
-        self.enabled && !self.agent_id.is_empty() && !self.coordination_channels.is_empty()
+        self.enabled
+            && valid_coordination_agent_id(&self.agent_id)
+            && !self.coordination_channels.is_empty()
     }
 }
 
@@ -164,7 +190,7 @@ struct CoordinationStateInner {
 #[derive(Debug, Clone)]
 pub struct CoordinationState {
     inner: Arc<Mutex<CoordinationStateInner>>,
-    channels: Arc<Vec<String>>,
+    channel_matcher: Arc<Option<regex::Regex>>,
     admins: Arc<Vec<String>>,
     violations: Option<Arc<ViolationStore>>,
 }
@@ -176,26 +202,32 @@ impl CoordinationState {
         admin_users: Vec<String>,
         violations: Option<Arc<ViolationStore>>,
     ) -> Self {
+        let channel_matcher = if coordination_channels.is_empty() {
+            None
+        } else {
+            let guard = coordination_channel_guard(&coordination_channels);
+            match regex::Regex::new(&guard) {
+                Ok(matcher) => Some(matcher),
+                Err(error) => {
+                    tracing::warn!(%error, "Invalid coordination channel matcher; hooks disabled");
+                    None
+                }
+            }
+        };
         Self {
             inner: Arc::new(Mutex::new(CoordinationStateInner::default())),
-            channels: Arc::new(
-                coordination_channels
-                    .into_iter()
-                    .map(|c| c.to_lowercase())
-                    .collect(),
-            ),
+            channel_matcher: Arc::new(channel_matcher),
             admins: Arc::new(admin_users),
             violations,
         }
     }
 
-    /// Case-insensitive match: the event channel equals or contains a
-    /// configured coordination channel JID/name.
+    /// Case-insensitive exact match against a configured channel JID/name.
     pub async fn is_coordination_channel(&self, channel: &str) -> bool {
-        let channel = channel.to_lowercase();
-        self.channels
-            .iter()
-            .any(|c| channel == *c || channel.contains(c.as_str()))
+        self.channel_matcher
+            .as_ref()
+            .as_ref()
+            .is_some_and(|matcher| matcher.is_match(channel))
     }
 
     /// Whether a user id is a configured admin.
@@ -775,10 +807,17 @@ pub async fn register_coordination_hooks(
     let mut summary = HookRegistrationSummary::default();
     if !config.is_actionable() {
         if config.enabled {
-            tracing::warn!(
-                "COORD_ENABLED=true but COORD_AGENT_ID/COORD_CHANNELS missing; \
-                 coordination hooks not registered"
-            );
+            if !valid_coordination_agent_id(&config.agent_id) {
+                tracing::warn!(
+                    "COORD_ENABLED=true but COORD_AGENT_ID is missing or invalid; \
+                     coordination hooks not registered"
+                );
+            } else {
+                tracing::warn!(
+                    "COORD_ENABLED=true but COORD_CHANNELS is missing; \
+                     coordination hooks not registered"
+                );
+            }
             summary.errors += 1;
         }
         return summary;
@@ -851,6 +890,24 @@ pub async fn register_coordination_hooks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordination_agent_id_contract_matches_admin_paths() {
+        assert!(valid_coordination_agent_id("agent-1"));
+        assert!(valid_coordination_agent_id(
+            "luna@conference.example/resource"
+        ));
+        assert!(valid_coordination_agent_id(
+            &"x".repeat(MAX_COORD_AGENT_ID_LEN)
+        ));
+        assert!(!valid_coordination_agent_id(""));
+        assert!(!valid_coordination_agent_id(
+            &"x".repeat(MAX_COORD_AGENT_ID_LEN + 1)
+        ));
+        for invalid in ["bad id", "bad%20id", "bad\nid", "bad?id", "üni"] {
+            assert!(!valid_coordination_agent_id(invalid));
+        }
+    }
 
     fn test_config() -> CoordinationHookConfig {
         CoordinationHookConfig {
@@ -928,11 +985,23 @@ mod tests {
                 .await
         );
         assert!(
-            state
+            !state
                 .is_coordination_channel("xmpp:coord@conference.example/group")
                 .await
         );
+        assert!(
+            !state
+                .is_coordination_channel("other-coord@conference.example")
+                .await
+        );
         assert!(!state.is_coordination_channel("random-channel").await);
+        let unicode_state =
+            CoordinationState::new(vec!["Ä-team@conference.example".into()], Vec::new(), None);
+        assert!(
+            unicode_state
+                .is_coordination_channel("ä-team@conference.example")
+                .await
+        );
         assert!(state.is_admin("sun"));
         assert!(!state.is_admin("agent-2"));
     }
