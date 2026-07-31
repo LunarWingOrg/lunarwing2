@@ -25,7 +25,7 @@ source "$MT_ADMIN"
 
 # Redirect the isolated registry AWAY from /etc/lunarwing/ports.json.
 PORTS_REGISTRY="$(mktemp -t mt-darkirc-flag.XXXXXX.json)"
-trap 'rm -f "$PORTS_REGISTRY"' EXIT
+trap 'rm -f "$PORTS_REGISTRY" "$PORTS_REGISTRY.lock"' EXIT
 
 # Seed an empty v7 registry (what ports_registry_init would write) so this test
 # never calls ports_registry_init (which mkdir's /etc/lunarwing).
@@ -60,6 +60,10 @@ darkirc_flag() {
   jq -r ".tenants[\"$1\"].enable_darkirc | if . == null then \"<missing>\" else tostring end" "$PORTS_REGISTRY"
 }
 
+darkirc_scope() {
+  jq -r ".tenants[\"$1\"].darkirc_scope_id // empty" "$PORTS_REGISTRY"
+}
+
 echo "== H2: --enable-darkirc flag flip on existing tenant =="
 
 # 1. Fresh tenant, darkirc disabled.
@@ -71,24 +75,53 @@ assert_eq "alpha enable_darkirc initially false"  "$(darkirc_flag alpha)" "false
 base1b="$(ports_allocate alpha true 2>/dev/null)"
 assert_eq "resume reuses base_port (alpha)"       "$base1b"               "10000"
 assert_eq "alpha enable_darkirc flips to true"    "$(darkirc_flag alpha)" "true"
+alpha_scope="$(darkirc_scope alpha)"
+[[ "$alpha_scope" =~ ^[0-9a-f]{32}$ && ! "$alpha_scope" =~ ^0+$ ]] \
+  && assert_eq "alpha receives a nonzero 128-bit scope ID" valid valid \
+  || assert_eq "alpha receives a nonzero 128-bit scope ID" invalid valid
 
 # 3. Resume WITHOUT the flag must NOT silently downgrade an enabled tenant
 #    (reconciliation is one-directional; disabling is a manual teardown).
 base1c="$(ports_allocate alpha false 2>/dev/null)"
 assert_eq "resume w/o flag keeps base_port (alpha)" "$base1c"               "10000"
 assert_eq "alpha stays enabled (no silent downgrade)" "$(darkirc_flag alpha)" "true"
+assert_eq "alpha scope ID is stable across resume" "$(darkirc_scope alpha)" "$alpha_scope"
 
 # 4. A second fresh tenant with darkirc enabled from the start.
 base2="$(ports_allocate beta true 2>/dev/null)"
 assert_eq "second tenant base_port (beta)"        "$base2"               "10010"
 assert_eq "beta enable_darkirc true on create"    "$(darkirc_flag beta)" "true"
+beta_scope="$(darkirc_scope beta)"
+[[ "$beta_scope" =~ ^[0-9a-f]{32}$ && "$beta_scope" != "$alpha_scope" ]] \
+  && assert_eq "beta receives a distinct scope ID" distinct distinct \
+  || assert_eq "beta receives a distinct scope ID" collision distinct
 
-# 5. ports_enable_darkirc is idempotent on an already-enabled tenant (no rewrite).
+# 5. Re-enabling a manually disabled tenant preserves its existing scope ID.
+tmp_disabled="$(mktemp "$PORTS_REGISTRY.disabled.XXXXXX")"
+jq '.tenants.beta.enable_darkirc = false' "$PORTS_REGISTRY" >"$tmp_disabled"
+mv "$tmp_disabled" "$PORTS_REGISTRY"
+ports_enable_darkirc beta 2>/dev/null || true
+assert_eq "re-enable preserves beta scope" "$(darkirc_scope beta)" "$beta_scope"
+
+# 6. ports_enable_darkirc is idempotent on an already-enabled tenant (no rewrite).
 before_mtime="$(stat -c %Y "$PORTS_REGISTRY" 2>/dev/null || stat -f %m "$PORTS_REGISTRY")"
 ports_enable_darkirc beta 2>/dev/null || true
 after_mtime="$(stat -c %Y "$PORTS_REGISTRY" 2>/dev/null || stat -f %m "$PORTS_REGISTRY")"
 assert_eq "idempotent: registry not rewritten"     "$after_mtime"          "$before_mtime"
 assert_eq "beta still enabled after idempotent call" "$(darkirc_flag beta)" "true"
+assert_eq "beta scope ID is stable" "$(darkirc_scope beta)" "$beta_scope"
+
+echo "== H3: explicit migration scope is preserved on fresh allocation =="
+migration_scope="11223344556677889900aabbccddeeff"
+base3="$(ports_allocate gamma true false '{}' "$migration_scope" 2>/dev/null)"
+assert_eq "gamma base_port (explicit migration scope)" "$base3" "10020"
+assert_eq "gamma keeps explicit migration scope" "$(darkirc_scope gamma)" "$migration_scope"
+
+if (ports_allocate delta true false '{}' "$migration_scope") >/dev/null 2>&1; then
+  assert_eq "duplicate migration scope rejected" accepted rejected
+else
+  assert_eq "duplicate migration scope rejected" rejected rejected
+fi
 
 # 6. Separate mt-admin processes must serialize allocation against the same
 #    registry instead of selecting the same free block from stale snapshots.

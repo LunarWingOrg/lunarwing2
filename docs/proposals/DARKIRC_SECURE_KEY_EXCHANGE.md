@@ -1,22 +1,25 @@
 # Secure Automated DarkIRC Key Exchange
 
-> **Current status (2026-07-29): OPEN / PLANNED in the release tree.** No
-> proposed key-exchange commands, ledger, journal, or web surfaces exist in the
-> merged codebase (verified: `ic/scripts/lunarwing-mt-admin.sh` has no exchange
-> verbs). The Phase 0 prerequisite is also open: DarkIRC config regeneration
-> can still replace the whole TOML instead of preserving manually managed
-> contacts.
+> **Current status (2026-07-30): PHASE 0/1 AND STAGE A MERGED into the release
+> tree** (branch `aj/kimi-20-20260730-2101`, salvaged from
+> `darkirckeyex/aragents/v2.0.3.0` implemented 2026-07-27). Config regeneration
+> is contact-preserving and journaled. Typed public-offer exchange commands
+> (`darkirc-contact prepare/respond/complete/cancel/exchanges`), protected
+> pending records, replay tombstones, compatibility attestation, structured
+> migration, recovery, and `darkirc-health --strict` now exist in
+> `ic/scripts/lunarwing-mt-admin.sh`, backed by `ic/src/darkirc_key_manager.rs`
+> and the `lunarwing-darkirc-key-helper` binary. Activation/rollback, rotation,
+> revocation, same-host pairing, and web delivery remain planned (see
+> `docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md`).
 >
-> **Unmerged partial work exists** — goals item #20 landed Phase 1 + Stage A
-> exchange verbs (commit `49736ad`) and Stage C apply/confirm-roundtrip verbs
-> (`506eb7b`) on branch `rarity/item-20-20260722-1501`; see also
-> `darkirckeyex/aragents/v2.0.3.0` and `feat/darkirc-key-exchange-v1`. Item #29
-> records that item #20 was **not** completed/merged. Any future implementation
-> should start by salvaging those branches rather than starting greenfield.
+> **Merge note:** the salvaged branch's ports-registry scope-ID migration was
+> renumbered v12 -> v13 because the kimi worker port-range migration already
+> owns registry v12 on this tree. `ports_migrate_v13` remains unconditional and
+> repair-style; the scope-ID semantics are unchanged.
 
-**Status:** Proposal only. None of the commands, state files, APIs, or web
-surfaces described here exist yet (in the merged tree — see unmerged branches
-above).
+**Status:** Authoritative design plus implementation boundary. Stage A installs
+contacts with deferred activation; later lifecycle surfaces described below do
+not exist unless explicitly marked implemented.
 
 **Scope:** LunarWing multi-tenant DarkIRC deployments managed through
 `ic/scripts/lunarwing-mt-admin.sh`.
@@ -40,12 +43,12 @@ DarkIRC TOML during `patch-env`. Current rendering can erase manually managed
 `[contact]` sections. Key automation must not ship until all writers share a
 locked, semantic, journaled config-update path that preserves contacts.
 
-The recommended migration sequence is:
+Implementation sequence is:
 
-1. Make DarkIRC config regeneration contact-preserving and crash-recoverable.
-2. Add read-only inspection and adoption of existing manual contacts.
-3. Add staged public-offer exchange with mandatory fingerprint confirmation.
-4. Add rotation, revocation, same-host pairing, and a targeted DarkIRC restart.
+1. Make DarkIRC config regeneration contact-preserving and crash-recoverable. **Implemented.**
+2. Add read-only inspection and adoption of existing manual contacts. **Implemented.**
+3. Add staged public-offer exchange with mandatory fingerprint confirmation. **Implemented with deferred activation.**
+4. Add rotation, revocation, same-host pairing, and a targeted DarkIRC restart. **Planned.**
 5. Consider web delivery or a mutual protocol over an already trusted channel
    only after a separate security review.
 
