@@ -676,14 +676,24 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // Phase 3: localhost-only admin endpoints for coordination violations.
+    // Requires COORD_ADMIN_TOKEN; without it the server stays down (fail
+    // closed) rather than exposing unauthenticated mutations (ISSUE-009).
     if let Some(store) = coordination_store.clone() {
-        let port = lunarwing::channels::web::coord_admin_port_from_env();
-        match lunarwing::channels::web::start_coord_admin_server(store, port).await {
-            Ok(addr) => tracing::info!(%addr, "Coordination admin endpoints listening"),
-            Err(err) => tracing::warn!(
-                error = %err,
-                port = port,
-                "Coordination admin server failed to bind; continuing without it"
+        match lunarwing::channels::web::coord_admin_token_from_env() {
+            Some(token) => {
+                let port = lunarwing::channels::web::coord_admin_port_from_env();
+                match lunarwing::channels::web::start_coord_admin_server(store, token, port).await
+                {
+                    Ok(addr) => tracing::info!(%addr, "Coordination admin endpoints listening"),
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        port = port,
+                        "Coordination admin server failed to bind; continuing without it"
+                    ),
+                }
+            }
+            None => tracing::warn!(
+                "COORD_ADMIN_TOKEN is not set; coordination admin server disabled"
             ),
         }
     }
