@@ -16,8 +16,10 @@ Current-source cross-checks were refreshed against current source on 2026-07-28.
 | [BUG-FIXED-WEECHAT-WARNINGS.md](BUG-FIXED-WEECHAT-WARNINGS.md) | COMPATIBILITY POINTER: PARTIAL; `rand_check` is active in `../BUG-weechat-relay-rand-check.md` |
 | [BUG-FIXED-wasm-tools-not-found-on-build.md](BUG-FIXED-wasm-tools-not-found-on-build.md) | FIXED: tenant-local `wasm-tools` lookup and raw-component fallback wording |
 | [BUG-FIXED-workspace-concurrency-fixes-v1.1.0.md](BUG-FIXED-workspace-concurrency-fixes-v1.1.0.md) | FIXED: atomic workspace writes and indexing; expected pool lag retained as not-a-bug |
+| [BUG-mt-nanocode-image-size.md](BUG-mt-nanocode-image-size.md) | CLOSED BY RETIREMENT: Nanocode image builds and distribution removed |
+| [MISSING-CONFIG-FOR-NANOCODE.md](MISSING-CONFIG-FOR-NANOCODE.md) | CLOSED BY RETIREMENT: Nanocode routes no longer generated |
 | [OPENRC-MT-1.1.4-ISSUES.md](OPENRC-MT-1.1.4-ISSUES.md) | Historical OpenRC pass; O1/O2/O4/O5 fixed and O3 documented |
-| [SYSTEMD-MT-1.1.4-ISSUES.md](SYSTEMD-MT-1.1.4-ISSUES.md) | Historical systemd pass; F11 was promoted to active `BUG-mt-nanocode-image-size.md` |
+| [SYSTEMD-MT-1.1.4-ISSUES.md](SYSTEMD-MT-1.1.4-ISSUES.md) | Historical systemd pass; former F11 closed by Nanocode retirement |
 | [WEECHAT-NO-SECRET-ACCESS.md](WEECHAT-NO-SECRET-ACCESS.md) | FIXED: owner credential scope for WASM channel messages |
 | [XMPP-OMEMO-BUG-TO-DO.md](XMPP-OMEMO-BUG-TO-DO.md) | COMPATIBILITY POINTER: UNVERIFIED fallback-spam; active report is `../BUG-xmpp-omemo-warmup-and-processing.md` |
 

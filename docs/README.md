@@ -63,7 +63,6 @@ How-to guides, build instructions, and setup walkthroughs.
 | [`gotify-wasm/README.md`](guides/gotify-wasm/README.md) | Gotify WASM tool |
 | [`ic_sm/README.md`](guides/ic_sm/README.md) | Secret manager (`ic_sm`) |
 | [`git-lunarwing-unix-socket-repl-server-repo/README.md`](guides/git-lunarwing-unix-socket-repl-server-repo/README.md) | REPLv2 Unix-socket REPL server |
-| [`nanocode-config/README.md`](guides/nanocode-config/README.md) | Nanocode custom-config overview |
 
 ---
 
@@ -82,9 +81,9 @@ Deployment, operations, multitenancy, and production guides.
 | [`MULTITENANCY-HARNESS.md`](ops/MULTITENANCY-HARNESS.md) | Multi-tenant test harness guide |
 | [`HARNESS-SINGLE-TENANT.md`](ops/HARNESS-SINGLE-TENANT.md) | Single-tenant test harness guide |
 | [`SSH-HARNESS-SETUP.md`](ops/SSH-HARNESS-SETUP.md) | SSH harness setup & ops: config, key provisioning (mt-admin + manual), verifying in a worker, troubleshooting |
-| [`WORKER-CONTAINERS.md`](ops/WORKER-CONTAINERS.md) | Worker container images (LunarWing, Nanocode, Pebble, Opencode) |
+| [`WORKER-CONTAINERS.md`](ops/WORKER-CONTAINERS.md) | Worker container images (LunarWing, Pebble, OpenCode, Kimi Code) |
 | [`PEBBLE-WORKER.md`](ops/PEBBLE-WORKER.md) | Pebble external worker operational guide |
-| [`NANOCODE-MULTITENANT.md`](ops/NANOCODE-MULTITENANT.md) | Nanocode external worker, multi-tenant setup |
+| [`NANOCODE-REMOVAL.md`](ops/NANOCODE-REMOVAL.md) | Nanocode retirement behavior, verification, preserved data, and rollback |
 | [`WEECHAT-SERVICES.md`](ops/WEECHAT-SERVICES.md) | WeeChat services, ports, env vars, day-to-day ops |
 | [`XMPP_KNOWN_ISSUES.md`](ops/XMPP_KNOWN_ISSUES.md) | XMPP/OMEMO known issues |
 | [`XMPP_TRANSFERS.md`](ops/XMPP_TRANSFERS.md) | XMPP file-transfer methods quick-reference |
@@ -411,8 +410,6 @@ Internal notes, drafts, and working documents — incomplete or in-progress by n
 | [`FORK_CONTEXT.md`](internal/FORK_CONTEXT.md) | Fork history and context (authoritative; linked from `CLAUDE.md`) |
 | [`CHANGELOG-AGENTS.md`](internal/CHANGELOG-AGENTS.md) | Internal changelog of `AGENTS.md` updates |
 | [`ic-infrastructure-health-check/draft-ic-infrastructure-health-check-analysis-report.md`](internal/ic-infrastructure-health-check/draft-ic-infrastructure-health-check-analysis-report.md) | Health-check analysis draft |
-| [`nanocode-config/KAGEHO_QUESTIONS.md`](internal/nanocode-config/KAGEHO_QUESTIONS.md) | Agnostic coding-worker container design notes |
-| [`nanocode-config/NextSteps.md`](internal/nanocode-config/NextSteps.md) | Nanocode + TensorZero setup next steps |
 | [`COMPONENT_SOURCES.md`](internal/COMPONENT_SOURCES.md) | Where each custom component's upstream source repo lives |
 
 **Archives** (kept for provenance, not active docs):
@@ -436,7 +433,7 @@ The following are **not** in this directory and should remain where they are:
 - **`CLAUDE.md` / `AGENTS.md` / `CODEX.md`** — AI agent context files (kept at their respective locations)
 - **`ic/`** — all documentation within the `ic/` tree stays in place (workspace templates, crate docs, skill definitions, etc.)
 - **`projects/`** — satellite service documentation stays with its source (e.g., `projects/ocr-sidecar/README.md`)
-- **`lunarcode4lunarwing/` / `pebble4lunarwing/` / `opencode4lunarwing/`** — worker-container docs stay with their container source
+- **`pebble4lunarwing/` / `opencode4lunarwing/` / `kimicode4lunarwing/`** — worker-container docs stay with their container source
 - **`.claude/`** — Claude command and rule files
 
 ---

@@ -131,5 +131,5 @@ The test harness documented here is for development/testing only. See the compar
 ## Future Work
 
 - Weechat relay port integration (currently reserved, no harness plumbing yet)
-- Per-instance worker container ports (lunarcode4lunarwing, pebble4lunarwing, opencode4lunarwing)
+- Per-instance worker container ports (Pebble, OpenCode, Kimi Code)
 - Automatic port conflict detection in `doctor` command

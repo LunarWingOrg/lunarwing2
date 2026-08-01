@@ -136,7 +136,7 @@ require_root() { :; }
 BUILD_CALL=''
 build_tenant() { BUILD_CALL="tenant:$*"; }
 main build-tenant root --with-kimi --with-toolchains
-if [[ "$BUILD_CALL" == 'tenant:root false false false false true true false' ]]; then
+if [[ "$BUILD_CALL" == 'tenant:root false false false true true false' ]]; then
   pass 'build-tenant forwards Kimi toolchain flag'
 else
   fail "build-tenant forwarding wrong: $BUILD_CALL"
@@ -144,7 +144,7 @@ fi
 
 build_all() { BUILD_CALL="all:$*"; }
 main build-all --with-kimi --with-toolchains
-if [[ "$BUILD_CALL" == 'all:false false false false true true' ]]; then
+if [[ "$BUILD_CALL" == 'all:false false false true true' ]]; then
   pass 'build-all forwards Kimi toolchain flag'
 else
   fail "build-all forwarding wrong: $BUILD_CALL"

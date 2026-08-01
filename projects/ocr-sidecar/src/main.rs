@@ -1936,7 +1936,7 @@ async fn main() {
     // The health route runs on a SEPARATE port (OCR_HEALTH_PORT, default 8089)
     // so that a saturated or panicked OCR/vision handler cannot prevent the
     // host self-heal pipeline from probing /health. This mirrors the
-    // nanocode/pebble worker pattern (WSS + dedicated 8443 health port).
+    // external-worker pattern (WSS + dedicated 8443 health port).
     let health_state = state.clone();
     let health_port = config.health_port;
     tokio::spawn(async move {

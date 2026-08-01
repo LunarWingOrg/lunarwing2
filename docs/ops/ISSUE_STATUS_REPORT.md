@@ -123,7 +123,8 @@ Internal planning issue. Closed as completed.
 **Closed**: 2026-07-08
 **Status**: ✅ Resolved
 
-`lunarcode4lunarwing/` exists with a Dockerfile (187 lines). The source was refactored. `docs/internal/vendored/nanocode-config/` no longer exists (removed per #180).
+Historical resolution. Nanocode was subsequently retired; active source and
+image-build definitions no longer exist. See `NANOCODE-REMOVAL.md`.
 
 ---
 
@@ -218,4 +219,3 @@ Based on codebase verification:
 | #223 | DarkIRC key exchange | Low | DarkIRC is opt-in; key exchange automation missing |
 | #201 | memory de-duping routines | Low | Stub issue, no work started |
 | #5 | Reflex Compiler Integration | Medium | Full 8-phase validation largely uncompleted |
-

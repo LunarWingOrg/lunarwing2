@@ -123,7 +123,7 @@ assert_eq "coordination admin port allocated" "$(envval COORD_ADMIN_PORT)" "2000
 
 # Case 2: all three flags on first write
 out="$(run_writer fixture-tenant \
-  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" "" "" \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" \
   "glm-5-air" "0.0.0.0" "admin@xmpp.org,bob@xmpp.org")"
 assert_eq "flag LLM_MODEL" "$(envval LLM_MODEL)" "glm-5-air"
 assert_eq "flag GATEWAY_HOST" "$(envval GATEWAY_HOST)" "0.0.0.0"
@@ -134,7 +134,7 @@ assert_eq "flag XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmp
 #   once with flags, then a second time without — but keep the file between.)
 rm -f "$MT_FIXTURE/env/lunarwing.env"
 write_tenant_lunarwing_env fixture-tenant \
-  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" "" "" \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" \
   "glm-5-air" "0.0.0.0" "admin@xmpp.org"
 sed -i \
   -e 's/^COORD_ENABLED=.*/COORD_ENABLED=true/' \
@@ -149,7 +149,7 @@ LW2STUDYMCP_ALLOW_WRITE=1
 EOF
 # Now re-run WITHOUT the new flags (pass empty for slots 9-11) — file exists.
 write_tenant_lunarwing_env fixture-tenant \
-  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" "" "" \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" \
   "" "" ""
 assert_eq "rerun preserves LLM_MODEL" "$(envval LLM_MODEL)" "glm-5-air"
 assert_eq "rerun preserves GATEWAY_HOST" "$(envval GATEWAY_HOST)" "0.0.0.0"
@@ -292,7 +292,7 @@ PORTS_REGISTRY="$WORKERS_REG"
 cat > "$WORKERS_REG" <<JSON
 {"tenants":{
   "oldt":{"base_port":10020},
-  "sel":{"base_port":10030,"workers":{"nanocode":true,"pebble":false,"opencode":false}}
+  "sel":{"base_port":10030,"workers":{"nanocode":false,"pebble":true,"opencode":false}}
 }}
 JSON
 
@@ -308,8 +308,8 @@ assert_eq "old tenant pebble OFF"   "$(worker_state oldt pebble)"   "off"
 assert_eq "old tenant opencode OFF" "$(worker_state oldt opencode)" "off"
 
 # Explicit selection honored.
-assert_eq "selected nanocode ON"  "$(worker_state sel nanocode)" "on"
-assert_eq "unselected pebble OFF" "$(worker_state sel pebble)"   "off"
+assert_eq "retired nanocode remains OFF" "$(worker_state sel nanocode)" "off"
+assert_eq "selected pebble ON"           "$(worker_state sel pebble)"   "on"
 
 # Resume flip is one-directional (false->true), idempotent, and creates the
 # workers map on a tenant that lacked one — without leaking other workers ON.
@@ -379,14 +379,25 @@ err="$(bash "$ADMIN_SCRIPT" add-tenant \
   --llm-model glm-5-air \
   --gateway-host 0.0.0.0 \
   --xmpp-allow-from admin@xmpp.org \
-  --with-nanocode --with-pebble --with-opencode \
+  --with-pebble --with-opencode \
   2>&1 || true)"
 if echo "$err" | grep -q 'unknown flag'; then
   echo "  FAIL: a new flag was rejected as unknown"
   echo "        $err"
   failures=$((failures + 1))
 else
-  echo "  PASS: all new flags (incl. --with-nanocode/pebble/opencode) parsed"
+  echo "  PASS: all supported worker flags parsed"
+fi
+
+retired_err="$(
+  ( require_root() { :; }; main add-tenant --with-nanocode fixture ) 2>&1 || true
+)"
+if echo "$retired_err" | grep -q 'Nanocode worker is retired'; then
+  echo "  PASS: retired Nanocode flag rejected explicitly"
+else
+  echo "  FAIL: retired Nanocode flag was not rejected explicitly"
+  echo "        $retired_err"
+  failures=$((failures + 1))
 fi
 
 # Verify --no-weechat-bootstrap is accepted by add-tenant dispatch.

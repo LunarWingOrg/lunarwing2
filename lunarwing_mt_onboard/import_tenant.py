@@ -65,6 +65,8 @@ class ImportConfig:
     def validate(self) -> str | None:
         if not self.bundle.strip():
             return "bundle path is required"
+        if self.with_nanocode:
+            return "Nanocode worker is retired; remove it from the saved import config"
         if self.name:
             error = TenantConfig.validate_name(self.name)
             if error:
@@ -79,7 +81,6 @@ class ImportConfig:
             "name": self.name,
             "start": self.start,
             "old_stopped": self.old_stopped,
-            "with_nanocode": self.with_nanocode,
             "with_pebble": self.with_pebble,
             "with_opencode": self.with_opencode,
             "with_kimi": self.with_kimi,
@@ -158,8 +159,6 @@ def build_import_args(cfg: ImportConfig) -> list[str]:
         args.append("--start")
     if cfg.old_stopped:
         args.append("--old-stopped")
-    if cfg.with_nanocode:
-        args.append("--with-nanocode")
     if cfg.with_pebble:
         args.append("--with-pebble")
     if cfg.with_opencode:

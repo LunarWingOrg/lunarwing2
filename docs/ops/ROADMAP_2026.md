@@ -21,7 +21,7 @@ Add
 | Multi-agent agent team orchestration via XMPP | v2.0.4 |
 | Per-tenant WeeChat health-glob gate (fix the flap /`render-units` footgun) | v2.0.5 |
 | Security hardening | v2.0.5 |
-| Deprecate Nanocode external Worker | v2.0.5 |
+| Retire Nanocode external worker | DONE v2.0.4 |
 | Lunartica UI reskin continuation | v2.0.5 |
 | Upgrade old testing harness | v2.0.5 |
 | Further external worker polishing | v2.0.5 |

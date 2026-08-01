@@ -28,6 +28,16 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    fail "$label"
+    printf '        unexpectedly contains: %s\n' "$needle"
+  else
+    pass "$label"
+  fi
+}
+
 assert_file_contains() {
   local label="$1" file="$2" needle="$3"
   if grep -qF -- "$needle" "$file"; then
@@ -153,8 +163,8 @@ output="$(
 }
 
 assert_contains "passes --docker-group to add-tenant" "$output" "--docker-group"
-assert_contains "preserves nanocode model override" "$output" "--nanocode-model test-nanocode-model"
-assert_contains "preserves nanocode base URL override" "$output" "--nanocode-base-url https://nanocode.example.test/openai/v1"
+assert_not_contains "drops retired nanocode model override" "$output" "--nanocode-model"
+assert_not_contains "drops retired nanocode base URL override" "$output" "--nanocode-base-url"
 assert_contains "builds vision sidecar when requested" "$output" "build-vision-sidecar"
 assert_contains "injects vision manifest" "$output" "manifest-vision.env ->"
 assert_contains "runs WeeChat preflight before start" "$output" "lunarwing-weechat-preflight.sh kawarimi"
@@ -170,7 +180,7 @@ worker_output="$(
   KAWARIMI_TEST_WORK="$tmp" \
   bash "$tmp/scripts/import-tenant.sh" "$tmp/kawarimi.tar" \
     --dry-run --yes \
-    --with-nanocode --with-opencode \
+    --with-opencode \
     2>&1
 )" || {
   status=$?
@@ -183,9 +193,9 @@ worker_output="$(
 # planned invocations so a flag on one can't satisfy an assertion on the other.
 add_line="$(printf '%s\n' "$worker_output" | grep -m1 '\[dry-run\].* add-tenant ' || true)"
 build_line="$(printf '%s\n' "$worker_output" | grep -m1 '\[dry-run\].* build-tenant ' || true)"
-assert_contains "add-tenant carries --with-nanocode" "$add_line" "--with-nanocode"
+assert_not_contains "add-tenant omits retired --with-nanocode" "$add_line" "--with-nanocode"
 assert_contains "add-tenant carries --with-opencode" "$add_line" "--with-opencode"
-assert_contains "build-tenant carries --with-nanocode" "$build_line" "--with-nanocode"
+assert_not_contains "build-tenant omits retired --with-nanocode" "$build_line" "--with-nanocode"
 assert_contains "build-tenant carries --with-opencode" "$build_line" "--with-opencode"
 # Unselected worker must NOT appear on either planned call.
 if [[ "$add_line" == *"--with-pebble"* ]]; then
@@ -197,6 +207,16 @@ if [[ "$build_line" == *"--with-pebble"* ]]; then
   fail "build-tenant leaked --with-pebble (not selected)"
 else
   pass "build-tenant omits unselected --with-pebble"
+fi
+
+set +e
+retired_output="$(bash "$tmp/scripts/import-tenant.sh" "$tmp/kawarimi.tar" --with-nanocode 2>&1)"
+retired_status=$?
+set -e
+if [[ "$retired_status" -eq 2 && "$retired_output" == *"Nanocode worker is retired"* ]]; then
+  pass "import rejects retired --with-nanocode explicitly"
+else
+  fail "import rejects retired --with-nanocode explicitly"
 fi
 
 echo "=== import-tenant explicit owner-scope dry-run ==="
@@ -553,7 +573,7 @@ roundtrip_output="$(
   exit "$status"
 }
 assert_contains "production encrypted export can be imported" "$roundtrip_output" "DRY RUN"
-assert_contains "production export preserves Nanocode model" "$roundtrip_output" "--nanocode-model roundtrip-nanocode"
+assert_not_contains "production export omits retired Nanocode model" "$roundtrip_output" "--nanocode-model"
 assert_contains "production export preserves OpenCode model" "$roundtrip_output" "--opencode-model roundtrip-opencode"
 if [[ "$full_export_output$roundtrip_output" == *"encrypted-roundtrip-kimi-secret"* ]]; then
   fail "encrypted Kimi round-trip does not log plaintext key"
@@ -566,6 +586,8 @@ mkdir -p "$tmp/roundtrip-extract"
 } | 7z x -o"$tmp/roundtrip-extract" "$exported_bundle" -y >/dev/null 2>&1
 manifest_path="$(find "$tmp/roundtrip-extract" -name manifest-lunarwing.env -print -quit)"
 assert_file_contains "encrypted manifest preserves Kimi API key" "$manifest_path" "KIMI_API_KEY=encrypted-roundtrip-kimi-secret"
+assert_file_not_contains "encrypted manifest omits retired Nanocode model" "$manifest_path" "NANOCODE_MODEL="
+assert_file_not_contains "encrypted manifest omits retired Nanocode base URL" "$manifest_path" "NANOCODE_BASE_URL="
 for source_local_url in \
   'https://localhost:7443/openai/v1' \
   'https://127.0.0.2:7443/openai/v1' \

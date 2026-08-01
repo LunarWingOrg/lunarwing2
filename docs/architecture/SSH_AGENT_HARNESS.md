@@ -16,8 +16,8 @@ verification, see the operator guide linked above.
 
 ## 1. What it is
 
-The SSH Agent harness gives LunarWing worker containers (nanocode, pebble,
-opencode; codex removed in v1.1.9), routines, and git operations the ability to authenticate to remote SSH
+The SSH Agent harness gives LunarWing worker containers (Pebble, OpenCode, and
+Kimi Code), routines, and git operations the ability to authenticate to remote SSH
 hosts **without ever exposing raw private-key bytes to those consumers**.
 
 It does this by splitting SSH state into two halves:
@@ -50,7 +50,7 @@ bytes never touch disk and never cross the container boundary.
                                          ▼
                         ┌──────────── worker container ────────────┐
                         │  git / ssh  ──►  SSH_AUTH_SOCK  ──►  sign │
-                        │  (nanocode, pebble, opencode)            │
+                        │  (pebble, opencode, kimi)                │
                         └──────────────────────────────────────────┘
 ```
 
@@ -170,8 +170,8 @@ does **not** check that a key secret exists (keys may be uploaded later).
    logged and skipped; the agent still starts for the remaining hosts.
 3. `SshAgentServer::start(socket_path, keys)`:
    - removes any stale socket, `UnixListener::bind`, then **chmods the socket
-     `0o666`** so the worker's OS user (e.g. `nanocode`,
-     a different UID than the daemon) can read/write it;
+      `0o666`** so the worker's OS user (different from the daemon UID) can
+      read/write it;
    - parses each key with `russh::keys::decode_secret_key`;
    - spawns `russh::keys::agent::server::serve` over the `UnixListenerStream`;
    - **sleeps 100 ms**, then self-connects as an `AgentClient` and calls
@@ -318,8 +318,7 @@ Built and working:
   encrypted secrets store.
 - `config/ssh.rs` — `[ssh]` / `[[ssh.hosts]]` parsing + `to_host_map()`.
 - `ssh_api.rs` — full CRUD HTTP surface, mounted in the webhook server.
-- `mt-admin` provisioning + bind-mount wiring (verified working inside a
-  nanocode worker).
+- `mt-admin` provisioning + bind-mount wiring for supported workers.
 
 Now wired into live paths (via the delivery mechanisms — see
 [`SSH_DELIVERY_MECHANISMS.md`](SSH_DELIVERY_MECHANISMS.md)):
