@@ -48,7 +48,8 @@ Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 - WASM channels for XMPP, WeeChat, DarkIRC, and Multica
 - XMPP file attachments via XEP-0363 HTTP File Upload
 - WeeChat buffer restoration across service restarts and clean reboots
-- Host-local stdio MCP servers with install, activate, and deactivate lifecycle controls
+- HTTP/HTTPS plus host-local stdio and Unix MCP with validated install, lifecycle
+  controls, in-place updates, live removal, diagnostics, and owner-scoped secrets
 - Optional Gotify notifications, SSH tooling, NetBird tunnels, and LunarVision OCR integration
 
 DarkIRC is opt-in. It is neither rendered nor built for a new tenant unless the operator enables it during tenant creation and builds its supporting service.

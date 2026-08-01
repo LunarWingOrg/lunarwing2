@@ -243,13 +243,13 @@ implementation effort.
 ## Priority 4 — Defer to later releases
 
 These items from the v2.0.2.0 known issues are explicitly out of scope for a
-v2.0.3.0 polish cycle:
+v2.0.3.0 polish cycle. Status below includes later source-verified work:
 
-| Item | Reason for deferral |
+| Item | Current disposition |
 |---|---|
 | Worker-local MCP execution | Large security surface; track separately |
 | Automatic npm/pip MCP install | Security-sensitive; track separately |
-| Secret injection through stdio env | Security-sensitive; track separately |
+| Secret injection through stdio env | **Implemented in v2.0.4 continuation.** Config persists owner-scoped secret-name references; activation resolves values just before spawn and restricts inherited child environment. Host-local stdio remains unsandboxed and sees injected raw values. |
 | Broad dependency modernization | Separate crate-audit track (item #8) |
 | PostgreSQL vector search indexing (pgvector/ANN) | Infrastructure-scale work |
 | DarkIRC secure key exchange | Separate track (item #10) |

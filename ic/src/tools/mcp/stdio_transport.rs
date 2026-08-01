@@ -4,6 +4,7 @@
 //! newline-delimited JSON-RPC.
 
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,11 +18,81 @@ use crate::tools::mcp::protocol::{McpRequest, McpResponse};
 use crate::tools::mcp::transport::{McpTransport, spawn_jsonrpc_reader, stream_transport_send};
 use crate::tools::tool::ToolError;
 
+const SAFE_INHERITED_ENV: &[&str] = &[
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "TZ",
+    "USER",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+];
+
+#[cfg(windows)]
+const SAFE_INHERITED_ENV_WINDOWS: &[&str] = &[
+    "APPDATA",
+    "COMSPEC",
+    "LOCALAPPDATA",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "USERPROFILE",
+    "WINDIR",
+];
+
+fn is_safe_inherited_env(name: &OsStr) -> bool {
+    if SAFE_INHERITED_ENV
+        .iter()
+        .any(|allowed| env_name_matches(name, allowed))
+    {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        SAFE_INHERITED_ENV_WINDOWS
+            .iter()
+            .any(|allowed| env_name_matches(name, allowed))
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn env_name_matches(name: &OsStr, allowed: &str) -> bool {
+    name.to_string_lossy().eq_ignore_ascii_case(allowed)
+}
+
+#[cfg(not(windows))]
+fn env_name_matches(name: &OsStr, allowed: &str) -> bool {
+    name == OsStr::new(allowed)
+}
+
+fn safe_process_environment() -> Vec<(OsString, OsString)> {
+    std::env::vars_os()
+        .filter(|(name, _)| is_safe_inherited_env(name))
+        .collect()
+}
+
 /// MCP transport that communicates with a child process over stdin/stdout.
 ///
 /// The child process is spawned with piped stdin/stdout/stderr. Requests are
 /// written as newline-delimited JSON to stdin, and responses are read from
-/// stdout by a background reader task. Stderr is drained to tracing logs.
+/// stdout by a background reader task. Stderr is drained in bounded chunks;
+/// content is suppressed when credentials were injected.
 pub struct StdioMcpTransport {
     server_name: String,
     stdin: Arc<Mutex<tokio::process::ChildStdin>>,
@@ -40,17 +111,22 @@ impl StdioMcpTransport {
     /// * `command` - The command to execute.
     /// * `args` - Command-line arguments.
     /// * `env` - Additional environment variables to set.
+    /// * `suppress_stderr` - Hide raw stderr when credentials were injected.
     pub async fn spawn(
         name: impl Into<String>,
         command: &str,
         args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
         env: impl IntoIterator<Item = (impl AsRef<std::ffi::OsStr>, impl AsRef<std::ffi::OsStr>)>,
+        suppress_stderr: bool,
     ) -> Result<Self, ToolError> {
         let server_name = name.into();
 
         let mut cmd = Command::new(command);
         cmd.args(args)
+            .env_clear()
+            .envs(safe_process_environment())
             .envs(env)
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -91,12 +167,29 @@ impl StdioMcpTransport {
 
         let stderr_name = server_name.clone();
         let stderr_handle = tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
+            use tokio::io::AsyncReadExt;
 
-            let reader = TokioBufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!("[{}] stderr: {}", stderr_name, line);
+            let mut stderr = stderr;
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match stderr.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(bytes) => {
+                        if suppress_stderr {
+                            tracing::debug!(
+                                server = %stderr_name,
+                                bytes,
+                                "MCP server emitted stderr output; content suppressed"
+                            );
+                        } else {
+                            tracing::debug!(
+                                server = %stderr_name,
+                                stderr = %String::from_utf8_lossy(&buffer[..bytes]),
+                                "MCP server stderr"
+                            );
+                        }
+                    }
+                }
             }
         });
 
@@ -171,6 +264,7 @@ mod tests {
             "this-command-does-not-exist-lunarwing-test",
             std::iter::empty::<&str>(),
             &env,
+            false,
         )
         .await;
 
@@ -182,15 +276,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inherited_environment_allowlist_excludes_daemon_secrets() {
+        assert!(is_safe_inherited_env(OsStr::new("PATH")));
+        assert!(is_safe_inherited_env(OsStr::new("HOME")));
+        assert!(!is_safe_inherited_env(OsStr::new("DATABASE_URL")));
+        assert!(!is_safe_inherited_env(OsStr::new("SECRETS_MASTER_KEY")));
+        assert!(!is_safe_inherited_env(OsStr::new("GATEWAY_AUTH_TOKEN")));
+    }
+
     #[tokio::test]
     async fn test_spawn_and_shutdown() {
         let env: HashMap<String, String> = HashMap::new();
         let transport =
-            StdioMcpTransport::spawn("test-cat", "cat", std::iter::empty::<&str>(), &env)
+            StdioMcpTransport::spawn("test-cat", "cat", std::iter::empty::<&str>(), &env, false)
                 .await
                 .expect("cat should be available");
 
         // Verify shutdown completes without error.
+        transport.shutdown().await.expect("shutdown should succeed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawn_receives_explicit_environment() {
+        let env = HashMap::from([("MCP_TEST_TOKEN".to_string(), "expected".to_string())]);
+        let transport = StdioMcpTransport::spawn(
+            "test-env",
+            "sh",
+            ["-c", "test \"$MCP_TEST_TOKEN\" = expected"],
+            &env,
+            true,
+        )
+        .await
+        .expect("spawn shell");
+        let status = transport
+            .child
+            .lock()
+            .await
+            .wait()
+            .await
+            .expect("wait for shell");
+
+        assert!(status.success());
         transport.shutdown().await.expect("shutdown should succeed");
     }
 
@@ -202,7 +330,7 @@ mod tests {
         // we override the 30s timeout expectation by just checking the error type.
         let env: HashMap<String, String> = HashMap::new();
         let transport =
-            StdioMcpTransport::spawn("test-echo", "cat", std::iter::empty::<&str>(), &env)
+            StdioMcpTransport::spawn("test-echo", "cat", std::iter::empty::<&str>(), &env, false)
                 .await
                 .expect("cat should be available");
 

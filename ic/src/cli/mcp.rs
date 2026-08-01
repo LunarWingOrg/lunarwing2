@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::secrets::SecretsStore;
 use crate::tools::mcp::{
-    McpClient, McpProcessManager, McpServerConfig, McpSessionManager, OAuthConfig,
+    McpProcessManager, McpServerConfig, McpSessionManager, OAuthConfig,
     auth::{authorize_mcp_server, is_authenticated},
     config::{self, EffectiveTransport, McpServersFile},
     factory::create_client_from_config,
@@ -43,6 +43,10 @@ pub struct McpAddArgs {
     /// Environment variables (stdio transport, KEY=VALUE format, can be repeated)
     #[arg(long = "env", value_parser = parse_env_var)]
     pub env: Vec<(String, String)>,
+
+    /// Secret environment references (KEY=SECRET_NAME, can be repeated)
+    #[arg(long = "secret-env", value_parser = parse_secret_env_ref)]
+    pub secret_env: Vec<(String, String)>,
 
     /// Unix socket path (unix transport)
     #[arg(long)]
@@ -97,6 +101,10 @@ pub struct McpUpdateArgs {
     /// New environment variables (stdio transport, KEY=VALUE format, can be repeated)
     #[arg(long = "env", value_parser = parse_env_var, num_args = 0..)]
     pub env: Option<Vec<(String, String)>>,
+
+    /// New secret environment references (KEY=SECRET_NAME, can be repeated)
+    #[arg(long = "secret-env", value_parser = parse_secret_env_ref, num_args = 0..)]
+    pub secret_env: Option<Vec<(String, String)>>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -108,6 +116,18 @@ pub enum McpCommand {
     Remove {
         /// Server name to remove
         name: String,
+
+        /// Gateway URL for stopping a running MCP server before removal
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Gateway auth token (required with --url; otherwise reads configuration or env)
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Remove persisted configuration without contacting the running gateway
+        #[arg(long)]
+        offline: bool,
     },
 
     /// List configured MCP servers
@@ -181,6 +201,17 @@ fn parse_env_var(s: &str) -> Result<(String, String), String> {
     Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
 }
 
+fn parse_secret_env_ref(s: &str) -> Result<(String, String), String> {
+    let (name, secret_name) = parse_env_var(s)
+        .map_err(|_| format!("invalid secret env format '{s}', expected KEY=SECRET_NAME"))?;
+    if secret_name.trim().is_empty() {
+        return Err(format!(
+            "invalid secret env format '{s}', SECRET_NAME cannot be empty"
+        ));
+    }
+    Ok((name, secret_name))
+}
+
 /// Run an MCP command.
 pub async fn run_mcp_command(
     cmd: McpCommand,
@@ -189,7 +220,12 @@ pub async fn run_mcp_command(
 ) -> anyhow::Result<()> {
     match cmd {
         McpCommand::Add(args) => add_server(*args, config_path, no_db).await,
-        McpCommand::Remove { name } => remove_server(name, config_path, no_db).await,
+        McpCommand::Remove {
+            name,
+            url,
+            token,
+            offline,
+        } => remove_server(name, url, token, offline, config_path, no_db).await,
         McpCommand::List { verbose } => list_servers(verbose, config_path, no_db).await,
         McpCommand::Auth { name, user } => auth_server(name, user, config_path, no_db).await,
         McpCommand::Test { name, user } => test_server(name, user, config_path, no_db).await,
@@ -230,6 +266,7 @@ async fn add_server(
         command,
         cmd_args,
         env,
+        secret_env,
         socket,
         headers,
         client_id,
@@ -240,6 +277,9 @@ async fn add_server(
     } = args;
 
     let transport_lower = transport.to_lowercase();
+    if transport_lower != "stdio" && !secret_env.is_empty() {
+        anyhow::bail!("--secret-env is only supported with stdio transport");
+    }
 
     let mut config = match transport_lower.as_str() {
         "stdio" => {
@@ -247,7 +287,14 @@ async fn add_server(
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("--command is required for stdio transport"))?;
             let env_map: HashMap<String, String> = env.into_iter().collect();
-            McpServerConfig::new_stdio(&name, &cmd, cmd_args.clone(), env_map)
+            let secret_env_map: HashMap<String, String> = secret_env.into_iter().collect();
+            McpServerConfig::new_stdio_with_secrets(
+                &name,
+                &cmd,
+                cmd_args.clone(),
+                env_map,
+                secret_env_map,
+            )
         }
         "unix" => {
             let socket_path = socket
@@ -341,19 +388,55 @@ async fn add_server(
 /// Remove an MCP server.
 async fn remove_server(
     name: String,
+    gateway_url: Option<String>,
+    gateway_token: Option<String>,
+    offline: bool,
     config_path: Option<&Path>,
     no_db: bool,
 ) -> anyhow::Result<()> {
     let db = connect_db(config_path, no_db).await?;
+    let servers = load_servers(db.as_ref()).await?;
+    if servers.get(&name).is_none() {
+        anyhow::bail!("Server '{name}' not found");
+    }
+
+    if !offline {
+        match apply_live_remove(
+            &name,
+            gateway_url.as_deref(),
+            gateway_token.as_deref(),
+            config_path,
+            db.as_ref(),
+        )
+        .await?
+        {
+            LiveMcpResult::Applied(message) => {
+                println!();
+                println!("  ✓ {message}");
+                println!();
+                return Ok(());
+            }
+            LiveMcpResult::Unavailable(reason) => {
+                anyhow::bail!(
+                    "Live MCP removal unavailable ({reason}). No offline configuration deletion was attempted; if the request reached the gateway, its outcome may be unknown. Check status, or stop LunarWing and rerun with --offline for persisted-only removal."
+                );
+            }
+        }
+    }
+
+    eprintln!(
+        "  Warning: --offline removes configuration only; it does not stop a running MCP process or unregister its tools."
+    );
+
     if let Some(db) = db.as_ref() {
-        config::load_mcp_servers_from_db_or_migrate(db.store.as_ref(), &db.owner_id).await?;
         config::remove_mcp_server_db(db.store.as_ref(), &db.owner_id, &name).await?;
     } else {
         config::remove_mcp_server(&name).await?;
     }
 
     println!();
-    println!("  ✓ Removed MCP server '{}'", name);
+    println!("  ✓ Removed MCP server '{name}' from persisted configuration.");
+    println!("    Offline removal did not contact or stop a running LunarWing process.");
     println!();
 
     Ok(())
@@ -409,7 +492,12 @@ async fn list_servers(
                 EffectiveTransport::Http => {
                     println!("      URL: {}", server.url);
                 }
-                EffectiveTransport::Stdio { command, args, env } => {
+                EffectiveTransport::Stdio {
+                    command,
+                    args,
+                    env,
+                    env_secrets,
+                } => {
                     println!("      Command: {}", command);
                     if !args.is_empty() {
                         println!("      Args: {}", args.join(", "));
@@ -418,6 +506,14 @@ async fn list_servers(
                         // Only print env var names, not values (may contain secrets).
                         let env_keys: Vec<&str> = env.keys().map(|k| k.as_str()).collect();
                         println!("      Env: {}", env_keys.join(", "));
+                    }
+                    if !env_secrets.is_empty() {
+                        let mut mappings = env_secrets
+                            .iter()
+                            .map(|(name, secret)| format!("{name} <- {secret}"))
+                            .collect::<Vec<_>>();
+                        mappings.sort();
+                        println!("      Secret env: {}", mappings.join(", "));
                     }
                 }
                 EffectiveTransport::Unix { socket_path } => {
@@ -566,15 +662,13 @@ async fn test_server(
 
     // Create client
     let session_manager = Arc::new(McpSessionManager::new());
+    let process_manager = Arc::new(McpProcessManager::new());
 
     // Always check for stored tokens (from either pre-configured OAuth or DCR)
     let secrets = get_secrets_store().await?;
     let has_tokens = is_authenticated(&server, &secrets, &user_id).await;
 
-    let client = if has_tokens {
-        // We have stored tokens, use authenticated client
-        McpClient::new_authenticated(server.clone(), session_manager.clone(), secrets, user_id)
-    } else if server.requires_auth() {
+    if !has_tokens && server.requires_auth() {
         // OAuth configured but no tokens - need to authenticate
         println!();
         println!(
@@ -583,19 +677,17 @@ async fn test_server(
         );
         println!();
         return Ok(());
-    } else {
-        // Use the factory to dispatch on transport type (HTTP, stdio, unix)
-        let process_manager = Arc::new(McpProcessManager::new());
-        create_client_from_config(
-            server.clone(),
-            &session_manager,
-            &process_manager,
-            None,
-            "default",
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e))?
-    };
+    }
+
+    let client = create_client_from_config(
+        server.clone(),
+        &session_manager,
+        &process_manager,
+        Some(secrets),
+        &user_id,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     // Test connection
     match client.test_connection().await {
@@ -650,6 +742,17 @@ async fn test_server(
                 println!("  ✗ Connection failed: {}", e);
             }
         }
+    }
+
+    if let Err(error) = crate::tools::mcp::factory::shutdown_client_runtime(
+        &name,
+        Some(&client),
+        &session_manager,
+        &process_manager,
+    )
+    .await
+    {
+        println!("  Cleanup warning: {error}");
     }
 
     println!();
@@ -712,7 +815,11 @@ fn build_update_config(
             EffectiveTransport::Unix { .. } => Some("unix".to_string()),
         });
 
-    match transport.as_deref() {
+    if transport.as_deref() != Some("stdio") && args.secret_env.is_some() {
+        anyhow::bail!("--secret-env is only supported with stdio transport");
+    }
+
+    let mut config = match transport.as_deref() {
         Some("stdio") => {
             let cmd = args
                 .command
@@ -739,9 +846,22 @@ fn build_update_config(
                     _ => None,
                 })
                 .unwrap_or_default();
-            let mut config = McpServerConfig::new_stdio(&existing.name, cmd, new_args, new_env);
-            config.enabled = existing.enabled;
-            Ok(config)
+            let new_secret_env = args
+                .secret_env
+                .clone()
+                .map(|values| values.into_iter().collect())
+                .or_else(|| match existing.effective_transport() {
+                    EffectiveTransport::Stdio { env_secrets, .. } => Some(env_secrets.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            McpServerConfig::new_stdio_with_secrets(
+                &existing.name,
+                cmd,
+                new_args,
+                new_env,
+                new_secret_env,
+            )
         }
         Some("http") => {
             let url = args
@@ -749,12 +869,7 @@ fn build_update_config(
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&existing.url);
-            let mut config = McpServerConfig::new(&existing.name, url);
-            config.enabled = existing.enabled;
-            config.oauth = existing.oauth.clone();
-            config.headers = existing.headers.clone();
-            config.description = existing.description.clone();
-            Ok(config)
+            McpServerConfig::new(&existing.name, url)
         }
         Some("unix") => {
             let socket_path = match existing.effective_transport() {
@@ -765,15 +880,22 @@ fn build_update_config(
                     ));
                 }
             };
-            let mut config = McpServerConfig::new_unix(&existing.name, &socket_path);
-            config.enabled = existing.enabled;
-            Ok(config)
+            McpServerConfig::new_unix(&existing.name, &socket_path)
         }
-        Some(other) => Err(anyhow::anyhow!(
-            "Unknown transport type '{other}'. Supported: http, stdio, unix"
-        )),
-        None => Err(anyhow::anyhow!("Could not determine transport type")),
-    }
+        Some(other) => {
+            return Err(anyhow::anyhow!(
+                "Unknown transport type '{other}'. Supported: http, stdio, unix"
+            ));
+        }
+        None => return Err(anyhow::anyhow!("Could not determine transport type")),
+    };
+
+    config.enabled = existing.enabled;
+    config.oauth = existing.oauth.clone();
+    config.headers = existing.headers.clone();
+    config.description = existing.description.clone();
+    config.always_require_approval = existing.always_require_approval.clone();
+    Ok(config)
 }
 
 /// Toggle server enabled/disabled state.
@@ -812,13 +934,13 @@ async fn toggle_server(
         )
         .await?
         {
-            LiveToggleResult::Applied(message) => {
+            LiveMcpResult::Applied(message) => {
                 println!();
                 println!("  ✓ {message}");
                 println!();
                 return Ok(());
             }
-            LiveToggleResult::Unavailable(reason) => {
+            LiveMcpResult::Unavailable(reason) => {
                 eprintln!("  Gateway unavailable ({reason}); saving for next startup.");
             }
         }
@@ -853,9 +975,37 @@ async fn toggle_server(
     Ok(())
 }
 
-enum LiveToggleResult {
+enum LiveMcpResult {
     Applied(String),
     Unavailable(String),
+}
+
+#[derive(Clone, Copy)]
+enum LiveMcpAction {
+    Activate,
+    Deactivate,
+    Toggle,
+    Remove,
+}
+
+impl LiveMcpAction {
+    fn endpoint(self) -> &'static str {
+        match self {
+            Self::Activate => "activate",
+            Self::Deactivate => "deactivate",
+            Self::Toggle => "toggle",
+            Self::Remove => "remove",
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Activate => "activation",
+            Self::Deactivate => "deactivation",
+            Self::Toggle => "toggle",
+            Self::Remove => "removal",
+        }
+    }
 }
 
 async fn apply_live_toggle(
@@ -865,7 +1015,41 @@ async fn apply_live_toggle(
     token_override: Option<&str>,
     config_path: Option<&Path>,
     db: Option<&McpDbContext>,
-) -> anyhow::Result<LiveToggleResult> {
+) -> anyhow::Result<LiveMcpResult> {
+    let action = match enabled {
+        Some(true) => LiveMcpAction::Activate,
+        Some(false) => LiveMcpAction::Deactivate,
+        None => LiveMcpAction::Toggle,
+    };
+    apply_live_lifecycle(name, action, url_override, token_override, config_path, db).await
+}
+
+async fn apply_live_remove(
+    name: &str,
+    url_override: Option<&str>,
+    token_override: Option<&str>,
+    config_path: Option<&Path>,
+    db: Option<&McpDbContext>,
+) -> anyhow::Result<LiveMcpResult> {
+    apply_live_lifecycle(
+        name,
+        LiveMcpAction::Remove,
+        url_override,
+        token_override,
+        config_path,
+        db,
+    )
+    .await
+}
+
+async fn apply_live_lifecycle(
+    name: &str,
+    action: LiveMcpAction,
+    url_override: Option<&str>,
+    token_override: Option<&str>,
+    config_path: Option<&Path>,
+    db: Option<&McpDbContext>,
+) -> anyhow::Result<LiveMcpResult> {
     let config = match Config::from_env_with_toml(config_path).await {
         Ok(config) => Some(config),
         Err(error) if config_path.is_some() => return Err(anyhow::anyhow!("{error:#}")),
@@ -902,23 +1086,19 @@ async fn apply_live_toggle(
             .or(persisted_token)
     };
     let Some(token) = token.filter(|token| !token.trim().is_empty()) else {
-        return Ok(LiveToggleResult::Unavailable(
+        return Ok(LiveMcpResult::Unavailable(
             "no gateway auth token was provided".to_string(),
         ));
     };
 
-    let action = match enabled {
-        Some(true) => "activate",
-        Some(false) => "deactivate",
-        None => "toggle",
-    };
+    let action_endpoint = action.endpoint();
     let mut endpoint = url::Url::parse(base_url.trim_end_matches('/'))
         .map_err(|error| anyhow::anyhow!("Invalid gateway URL '{base_url}': {error}"))?;
     endpoint
         .path_segments_mut()
         .map_err(|_| anyhow::anyhow!("Gateway URL cannot be used as a base URL"))?
         .pop_if_empty()
-        .extend(["api", "extensions", name, action]);
+        .extend(["api", "extensions", name, action_endpoint]);
     let response = match reqwest::Client::new()
         .post(endpoint.clone())
         .bearer_auth(token.trim())
@@ -928,7 +1108,7 @@ async fn apply_live_toggle(
     {
         Ok(response) => response,
         Err(error) => {
-            return Ok(LiveToggleResult::Unavailable(format!(
+            return Ok(LiveMcpResult::Unavailable(format!(
                 "could not connect to {endpoint}: {error}"
             )));
         }
@@ -936,8 +1116,9 @@ async fn apply_live_toggle(
     if response.status() == reqwest::StatusCode::NOT_FOUND
         || response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
     {
-        return Ok(LiveToggleResult::Unavailable(format!(
-            "gateway does not support live MCP {action}"
+        return Ok(LiveMcpResult::Unavailable(format!(
+            "gateway does not support live MCP {}",
+            action.noun()
         )));
     }
     if !response.status().is_success() {
@@ -956,7 +1137,7 @@ async fn apply_live_toggle(
     if payload.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
         anyhow::bail!("Gateway rejected MCP lifecycle change: {message}");
     }
-    Ok(LiveToggleResult::Applied(message))
+    Ok(LiveMcpResult::Applied(message))
 }
 
 struct McpDbContext {
@@ -1073,6 +1254,116 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_mcp_remove_live_control_flags_parse() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "remove",
+            "local-files",
+            "--url",
+            "http://127.0.0.1:3000",
+            "--token",
+            "test-token",
+        ])
+        .expect("parse live remove flags");
+        match parsed.cmd {
+            McpCommand::Remove {
+                name,
+                url,
+                token,
+                offline,
+            } => {
+                assert_eq!(name, "local-files");
+                assert_eq!(url.as_deref(), Some("http://127.0.0.1:3000"));
+                assert_eq!(token.as_deref(), Some("test-token"));
+                assert!(!offline);
+            }
+            other => panic!("expected remove command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_secret_environment_flags_parse() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "add",
+            "local-files",
+            "--transport",
+            "stdio",
+            "--command",
+            "local-files-mcp",
+            "--secret-env",
+            "API_TOKEN=api_token",
+        ])
+        .expect("parse secret environment reference");
+        match parsed.cmd {
+            McpCommand::Add(args) => {
+                assert_eq!(
+                    args.secret_env,
+                    vec![("API_TOKEN".to_string(), "api_token".to_string())]
+                );
+            }
+            other => panic!("expected add command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_update_preserves_secret_refs_and_approval_policy() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let existing = McpServerConfig::new_stdio_with_secrets(
+            "local-files",
+            "old-command",
+            vec![],
+            HashMap::new(),
+            HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]),
+        )
+        .with_always_require_approval(["write_file"]);
+        let parsed =
+            TestCli::try_parse_from(["test", "update", "local-files", "--command", "new-command"])
+                .expect("parse update");
+        let McpCommand::Update(args) = parsed.cmd else {
+            panic!("expected update command");
+        };
+
+        let updated = build_update_config(&args, &existing).expect("build update config");
+        assert_eq!(
+            updated.always_require_approval,
+            vec!["write_file".to_string()]
+        );
+        assert!(matches!(
+            updated.effective_transport(),
+            EffectiveTransport::Stdio {
+                command,
+                env_secrets,
+                ..
+            } if command == "new-command"
+                && env_secrets.get("API_TOKEN").map(String::as_str) == Some("api_token")
+        ));
+    }
+
     #[tokio::test]
     async fn test_apply_live_mcp_toggle_calls_authenticated_gateway() {
         use axum::extract::Path as AxumPath;
@@ -1120,8 +1411,8 @@ mod tests {
         .await
         .expect("live toggle");
         match result {
-            LiveToggleResult::Applied(message) => assert_eq!(message, "deactivated live"),
-            LiveToggleResult::Unavailable(reason) => {
+            LiveMcpResult::Applied(message) => assert_eq!(message, "deactivated live"),
+            LiveMcpResult::Unavailable(reason) => {
                 panic!("test gateway unexpectedly unavailable: {reason}")
             }
         }
@@ -1162,8 +1453,8 @@ mod tests {
         .await
         .expect("live implicit toggle");
         match result {
-            LiveToggleResult::Applied(message) => assert_eq!(message, "toggled live"),
-            LiveToggleResult::Unavailable(reason) => {
+            LiveMcpResult::Applied(message) => assert_eq!(message, "toggled live"),
+            LiveMcpResult::Unavailable(reason) => {
                 panic!("test gateway unexpectedly unavailable: {reason}")
             }
         }
@@ -1183,10 +1474,10 @@ mod tests {
         .await
         .expect("missing explicit token is an offline fallback");
         match result {
-            LiveToggleResult::Unavailable(reason) => {
+            LiveMcpResult::Unavailable(reason) => {
                 assert!(reason.contains("no gateway auth token"));
             }
-            LiveToggleResult::Applied(message) => {
+            LiveMcpResult::Applied(message) => {
                 panic!("unexpected live transition: {message}")
             }
         }
@@ -1211,14 +1502,83 @@ mod tests {
         .await
         .expect("404 is an offline fallback");
         match result {
-            LiveToggleResult::Unavailable(reason) => {
+            LiveMcpResult::Unavailable(reason) => {
                 assert!(reason.contains("does not support"));
             }
-            LiveToggleResult::Applied(message) => {
+            LiveMcpResult::Applied(message) => {
                 panic!("unexpected live transition: {message}")
             }
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_apply_live_mcp_remove_calls_authenticated_gateway() {
+        use axum::extract::Path as AxumPath;
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        async fn remove(
+            AxumPath(name): AxumPath<String>,
+            headers: HeaderMap,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(name, "local-files");
+            assert_eq!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer test-token")
+            );
+            Json(serde_json::json!({
+                "success": true,
+                "message": "removed live"
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test gateway");
+        let address = listener.local_addr().expect("gateway address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/api/extensions/{name}/remove", post(remove)),
+            )
+            .await
+        });
+
+        let result = apply_live_remove(
+            "local-files",
+            Some(&format!("http://{address}")),
+            Some("test-token"),
+            None,
+            None,
+        )
+        .await
+        .expect("live remove");
+        match result {
+            LiveMcpResult::Applied(message) => assert_eq!(message, "removed live"),
+            LiveMcpResult::Unavailable(reason) => {
+                panic!("test gateway unexpectedly unavailable: {reason}")
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_custom_remove_url_requires_explicit_token() {
+        let result = apply_live_remove("local-files", Some("http://127.0.0.1:9"), None, None, None)
+            .await
+            .expect("missing token is reported as unavailable");
+        match result {
+            LiveMcpResult::Unavailable(reason) => {
+                assert!(reason.contains("no gateway auth token"));
+            }
+            LiveMcpResult::Applied(message) => {
+                panic!("unexpected live removal: {message}")
+            }
+        }
     }
 
     #[test]
@@ -1261,5 +1621,15 @@ mod tests {
         let result = parse_env_var("no-equals-here");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid env var format"));
+    }
+
+    #[test]
+    fn test_parse_secret_env_ref() {
+        assert_eq!(
+            parse_secret_env_ref("API_TOKEN=api_token").unwrap(),
+            ("API_TOKEN".to_string(), "api_token".to_string())
+        );
+        assert!(parse_secret_env_ref("API_TOKEN=").is_err());
+        assert!(parse_secret_env_ref("api_token").is_err());
     }
 }

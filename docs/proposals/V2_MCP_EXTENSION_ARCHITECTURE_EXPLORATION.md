@@ -1,12 +1,14 @@
 # V2 MCP and Extension Runtime Architecture Exploration
 
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL / EXPLORATORY.** Phase 0
-> host-local stdio installation is implemented. The runtime-neutral package
-> model, adapter boundary, worker-local MCP, marketplace provenance, and
-> MCP-over-WASM phases remain unimplemented design work.
+> **Current status (2026-08-01): PARTIAL / EXPLORATORY.** Host-local stdio
+> installation, owner-scoped secret environment references, diagnostics, and
+> explicit activate/deactivate/update/remove lifecycle are implemented. The
+> runtime-neutral package model, adapter boundary, generic worker-local MCP,
+> marketplace provenance, automatic package installation, safe crash recovery,
+> dedicated MCP gateway, and MCP-over-WASM phases remain unimplemented design work.
 
-**Status:** Exploratory V2 architecture; host-local stdio installation surfaces
-implemented as the first near-term step on 2026-07-09  
+**Status:** Exploratory V2 architecture; host-local stdio installation landed on
+2026-07-09 and later lifecycle/secret hardening is reflected through 2026-08-01.
 **Date:** 2026-07-09  
 **Scope:** Possible V2 extension packaging, MCP compatibility, execution placement,
 and tenant policy
@@ -78,7 +80,7 @@ The core MCP configuration and CLI support:
 - Unix domain sockets
 
 `ic/src/tools/mcp/factory.rs` dispatches these configurations to the appropriate
-transport. `McpProcessManager` owns stdio process startup, shutdown, and restart.
+transport. `McpProcessManager` owns stdio process startup, tracking, and shutdown.
 The application startup path loads enabled MCP configurations, discovers their
 tools, wraps them as LunarWing `Tool` implementations, and registers them in the
 main tool registry.
@@ -91,7 +93,23 @@ without running it; activation starts the managed child and discovers its tools.
 A supergateway can still be operationally useful, but it is not required to
 connect a stdio server.
 
-### Worker containers do not currently load MCP extensions
+The shipped lifecycle now tracks exact tool ownership and supports explicit
+activate/deactivate, in-place update, and remove. Deactivation closes transport,
+session, client, and managed process resources while preserving config. Active
+conversational or authenticated web API updates attempt restart through
+`ExtensionManager`; config remains updated if reactivation fails. CLI `mcp update`
+remains persisted-config-only. CLI toggle and remove can use the authenticated
+LunarWing gateway, but this is not the dedicated shared MCP gateway described later
+in this proposal. CLI removal refuses an implicit config-only fallback; `--offline`
+is explicit.
+
+Stdio configs can map child environment variable names to owner-scoped LunarWing
+secret names. Values are resolved only during activation and are not persisted in
+MCP config or retained as restart data. Child processes receive an allowlisted OS
+environment rather than inheriting daemon credentials. This is raw credential
+exposure to trusted, unsandboxed code, not host-bound credential injection.
+
+### Core per-job workers do not load LunarWing MCP configs
 
 The standard container worker creates a fresh `ToolRegistry` and calls
 `register_container_tools()`. That path currently registers shell and file-editing
@@ -104,6 +122,11 @@ the worker runtime has no supported manifest/configuration path for them today.
 
 Adding worker-local MCP therefore requires lifecycle and policy plumbing, not only
 installing a package in the image.
+
+Some persistent external workers can independently configure their own MCP clients
+or servers. That is not generic LunarWing worker-local placement: the orchestrator
+does not send an installed MCP package descriptor and evaluated grants to the core
+job worker, and worker-local MCP tools are not registered from LunarWing MCP config.
 
 ### The current WASM tool ABI is intentionally invocation-scoped
 
@@ -133,6 +156,36 @@ It does not by itself establish who published the extension, whether that
 publisher remains trusted, or whether a compromised registry entry should be
 revoked. A V2 marketplace needs package signatures and publisher trust metadata in
 addition to checksums.
+
+### Automatic npm/pip MCP installation is not implemented
+
+Current stdio manifests describe a command, arguments, and environment. The MCP
+path does not download or manage npm/PyPI packages, and WASM artifact checksums do
+not verify the executable or dependency tree behind a stdio command. Operators are
+responsible for installing and pinning that command.
+
+Automatic installation could provide one-command setup, exact version selection,
+reproducible tenant provisioning, and managed upgrade/rollback. It would also run
+package lifecycle hooks and dependency code. Typosquatting, compromised publisher
+accounts, mutable registry entries, dependency substitution, and unpinned drift
+would become direct code-execution risks.
+
+Package provenance must establish canonical identity, source, immutable version,
+artifact digest, publisher signature/key, locked dependencies, trust/revocation
+state, capability and placement requests, upgrade diffs, and rollback history.
+Provenance answers **what code is this and who supplied it**. It does not prove that
+code is safe.
+
+Installation and runtime also need containment: non-root execution, isolated
+writable paths, controlled egress, process and resource limits, no implicit daemon
+credentials/devices, and reliable teardown. Sandboxing answers **what can this code
+damage if it is malicious or compromised**. Sandboxing does not establish package
+identity, and signatures do not replace containment.
+
+Automatic installation is not required for MCP. Manually installed pinned commands,
+verified bundles, and prebuilt worker images remain valid. Worker-local prototypes
+should start only preinstalled or verified packages; arbitrary package-manager
+downloads during a job should not be the default.
 
 ### The WASM security model is promising but not fully unified
 
@@ -538,7 +591,9 @@ The package lifecycle should remain consistent even when runtime behavior differ
 
 Runtime adapters would own their specific resources:
 
-- Process adapter: child lifecycle, stdio framing, restart, and shutdown.
+- Process adapter: child lifecycle, stdio framing, and shutdown. Correct crash
+  recovery must recreate and initialize the MCP client, rediscover tools, and
+  atomically replace registered wrappers; restarting only the child is invalid.
 - WASM adapter: compile cache, instances/actors, fuel, memory, and host functions.
 - Worker adapter: image/package availability, task routing, health, and cancellation.
 - Remote adapter: sessions, OAuth, HTTP policy, and retries.
@@ -549,7 +604,7 @@ Runtime adapters would own their specific resources:
 The host-local installation work below was selected as an immediate improvement.
 If broader V2 work proceeds, the least-regret order is:
 
-### Phase 0: Host-local stdio installation surfaces (completed)
+### Phase 0: Host-local stdio installation and lifecycle (completed)
 
 - Add typed stdio MCP registry manifests.
 - Route registry, chat, API, and web installation through validated
@@ -557,6 +612,9 @@ If broader V2 work proceeds, the least-regret order is:
 - Keep activation explicit and use the existing `McpProcessManager` lifecycle.
 - Expose transport and command metadata in installed-extension responses.
 - Do not add runtime package downloads or worker placement in this phase.
+- Subsequent hardening added diagnostics, exact tool ownership,
+  activate/deactivate/update/remove, owner-scoped `env_secrets`, restricted child
+  environment inheritance, and explicit runtime cleanup.
 
 ### Phase 1: Package and policy vocabulary
 
@@ -661,9 +719,11 @@ Use native WASM tools for small integrations, worker placement for workspace-loc
 or native servers, dedicated workers for stateful/heavy services, and gateways for
 shared remote control-plane concerns.
 
-The immediate host-local stdio installation work is complete. Worker-local MCP is
-the next placement option to evaluate when a concrete workspace-coupled server
-justifies the additional lifecycle and credential-policy plumbing.
+The host-local stdio installation and explicit lifecycle work is complete.
+Worker-local MCP is the next placement option to evaluate when a concrete
+workspace-coupled server justifies additional lifecycle and credential-policy
+plumbing. Start with preinstalled or verified packages; do not combine the first
+placement prototype with arbitrary npm/pip installation.
 
 Defer MCP-over-WASM until a concrete server or required MCP primitive justifies the
 new actor/session ABI. Defer general embedded extensions indefinitely; reserve them
@@ -674,6 +734,11 @@ for first-party capabilities whose coupling to the daemon is intentional.
 - `ic/src/tools/mcp/config.rs`
 - `ic/src/tools/mcp/factory.rs`
 - `ic/src/tools/mcp/process.rs`
+- `ic/src/tools/mcp/stdio_transport.rs`
+- `ic/src/extensions/manager.rs`
+- `ic/src/cli/mcp.rs`
+- `ic/src/tools/builtin/extension_tools.rs`
+- `ic/src/channels/web/server.rs`
 - `ic/src/app.rs`
 - `ic/src/worker/container.rs`
 - `ic/src/tools/registry.rs`

@@ -79,15 +79,24 @@ lifecycle/status commands go through `lunarwing-mt-admin.sh` — never bare
 
 ### 1.5 MCP management
 
-- In-place config updates: `lunarwing mcp update` (CLI),
-  `tool_update` (conversational), `POST /api/extensions/{name}/update` (web).
-  Active servers require explicit restart confirmation.
+- In-place config updates exist on three surfaces with different runtime behavior.
+  `lunarwing mcp update` changes persisted config only. Conversational
+  `tool_update` always requires approval and attempts to restart an active server.
+  Authenticated `POST /api/extensions/{name}/update` attempts that restart
+  immediately without a separate confirmation field. Config remains updated if
+  reactivation fails, so inspect returned message and active status. Browser MCP
+  panel currently has no update editor.
 - `lunarwing doctor` MCP diagnostics: config validation, transport/enabled
   reporting, stdio command resolution through PATH.
 - Stricter HTTP header validation: case-insensitive duplicates and custom
   `Mcp-Session-Id` / `Content-Type` / `Accept` headers are now rejected.
 - Owner-scoped DB setting is authoritative for MCP state when DB is enabled;
   disk config migrates once into the configured owner.
+- `lunarwing mcp remove` now uses the authenticated gateway to stop active
+  transports, unregister tools, and delete config through `ExtensionManager`.
+  Gateway failure never triggers fallback config deletion; because delivery can
+  be ambiguous, inspect status before retrying. `--offline` explicitly removes
+  persisted config only after the tenant is stopped.
 
 ### 1.6 Self-improving skills repair (machinery was inert; now functional)
 
@@ -259,18 +268,26 @@ For each worker type the tenant selected (`--with-opencode`, `--with-pebble`,
 1. `lunarwing doctor` (as the tenant user, in the tenant checkout): MCP section
    reports each server's transport + enabled state; enabled stdio servers with
    missing commands are flagged.
-2. `lunarwing mcp update` on an inactive stdio server (change an arg) →
-   persisted; reactivate → new argv in effect.
-3. Update an **active** server via the web route or conversational `tool_update`
-   → explicit restart confirmation is required; after confirming, the server
-   reactivates with the new config.
-4. Deactivate → tools disappear from the active set and the managed child is
+2. Run `lunarwing mcp update` on an active stdio server and change an argument.
+   Config changes, but the current child keeps its old argv until deactivate/activate
+   or tenant restart; then the new argv takes effect.
+3. Update an active server through conversational `tool_update` → approval is
+   required; after approval, the server stops and attempts reactivation with new
+   config. Force a failed reactivation and confirm config remains updated while
+   returned message and active status expose failure.
+4. Update an active server through authenticated
+   `POST /api/extensions/{name}/update` → it attempts restart immediately. There is
+   no separate restart-confirmation parameter. Re-query active status; browser MCP
+   panel has no update editor.
+5. Deactivate → tools disappear from the active set and the managed child is
    gone; Activate → fresh handshake, tools rediscovered.
-5. Header validation: attempt to save an HTTP MCP config with duplicate or
+6. Header validation: attempt to save an HTTP MCP config with duplicate or
    reserved headers (`Mcp-Session-Id`, `Content-Type`, `Accept`) → rejected.
-6. Reminder for testers: CLI `mcp update`/`mcp remove` are persistence-only —
-   restart the tenant (or use web/conversational surfaces) for runtime effect.
-7. Owner scope: if the tenant uses a non-default owner, confirm MCP state
+7. CLI remove: while the tenant runs, `lunarwing mcp remove <name>` stops the
+   transport, unregisters its tools, and removes config. With the gateway stopped,
+   default removal must fail without deleting config; `--offline` then performs
+   persisted-only removal.
+8. Owner scope: if the tenant uses a non-default owner, confirm MCP state
    migrated into that owner's scope and did not strand under `default`.
 
 ### T6 — Self-improving skills (newly functional — test on ONE testing tenant)

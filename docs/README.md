@@ -113,7 +113,7 @@ Deployment, operations, multitenancy, and production guides.
 | [`ISSUE_STATUS_REPORT.md`](ops/ISSUE_STATUS_REPORT.md) | GitHub issue status review with closure and follow-up recommendations |
 | [`UI_FIX_SUGGESTIONS.md`](ops/UI_FIX_SUGGESTIONS.md) | Web gateway UI fix suggestions: source-verified findings with priorities and implementation order |
 | [`KUMOGAKURE_RECENT_REV_T.md`](ops/KUMOGAKURE_RECENT_REV_T.md) | v2 branch sentinel with Hermes adapter and mt-admin decomposition review notes |
-| [`MCP_ADDITIONS.md`](ops/MCP_ADDITIONS.md) | Host-local stdio MCP installation record and follow-up lifecycle and diagnostics ideas |
+| [`MCP_ADDITIONS.md`](ops/MCP_ADDITIONS.md) | Current MCP implementation matrix, host-local lifecycle and secret handling, deferred package/worker/runtime work, and security rationale |
 | [`MEMORY_IMPL.md`](ops/MEMORY_IMPL.md) | Planning stub for importing or integrating memory cleanup, de-duplication, and correction routines |
 | [`meta5.md`](ops/meta5.md) | `sun/meta5/v2.0.0.0` branch pointer |
 | [`NEAR_REMOVAL_COMPLETION_AUDIT.md`](ops/NEAR_REMOVAL_COMPLETION_AUDIT.md) | Completion audit of the Near/IronClaw naming migration and its unresolved compatibility work |
@@ -296,7 +296,7 @@ here while they are still present in `proposals/`.
 | [`TEST_IN_PLACE_UPGRADE_IN_NEW_WEB_GUI.md`](proposals/TEST_IN_PLACE_UPGRADE_IN_NEW_WEB_GUI.md) | Open stub | Placeholder without a test plan |
 | [`TEST_KAWARIMI_IMPORT_AND_EXPORT_IN_NEW_WEB_GUI.md`](proposals/TEST_KAWARIMI_IMPORT_AND_EXPORT_IN_NEW_WEB_GUI.md) | Open stub | Placeholder without web-GUI acceptance criteria |
 | [`UPGRADE_AND_MIGRATION_ISSUES_TO_FIX.md`](proposals/UPGRADE_AND_MIGRATION_ISSUES_TO_FIX.md) | Partial / mostly superseded | Owner-scope risk closed; remaining operational cautions retained |
-| [`V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md`](proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md) | Partial / exploratory | Phase 0 stdio install landed; broader V2 package/runtime work remains |
+| [`V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md`](proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md) | Partial / exploratory | Host-local install/lifecycle and owner-scoped secret references landed; package provenance, worker placement, adapters, crash recovery, and MCP-over-WASM remain design work |
 | [`WEECHAT_CLIENT_RELAY_API_AUTOMATION.md`](proposals/WEECHAT_CLIENT_RELAY_API_AUTOMATION.md) | Partial | Relay bootstrap shipped; full client provisioning remains open |
 | [`WEECHAT_WS_ADAPTER_MISSING_DEPENDENCY_AND_AUTOMATION.md`](proposals/WEECHAT_WS_ADAPTER_MISSING_DEPENDENCY_AND_AUTOMATION.md) | Partial | Service and port automation landed; dependency install remains warn-only |
 | [`WEECHAT_WS_ADAPTER_SYNC_PROTOCOL.md`](proposals/WEECHAT_WS_ADAPTER_SYNC_PROTOCOL.md) | Superseded | `ironclaw-sync` was renamed to `lunarwing-sync` |
