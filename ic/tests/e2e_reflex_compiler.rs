@@ -144,6 +144,37 @@ impl SoftwareBuilder for FailingSoftwareBuilder {
     }
 }
 
+/// A `SoftwareBuilder` whose `build()` returns `Err(ToolError)`, simulating a
+/// transient infrastructure failure (LLM timeout, network, provider outage)
+/// rather than a genuine build failure.
+struct ErrorSoftwareBuilder;
+
+#[async_trait]
+impl SoftwareBuilder for ErrorSoftwareBuilder {
+    async fn analyze(&self, description: &str) -> Result<BuildRequirement, ToolError> {
+        Ok(BuildRequirement {
+            name: format!("err_{}", description.replace(' ', "_")),
+            description: description.to_string(),
+            software_type: SoftwareType::WasmTool,
+            language: Language::Rust,
+            input_spec: None,
+            output_spec: None,
+            dependencies: vec![],
+            capabilities: vec![],
+        })
+    }
+
+    async fn build(&self, _requirement: &BuildRequirement) -> Result<BuildResult, ToolError> {
+        Err(ToolError::BuilderFailed(
+            "mock infrastructure failure: provider unreachable".into(),
+        ))
+    }
+
+    async fn repair(&self, result: &BuildResult, _error: &str) -> Result<BuildResult, ToolError> {
+        Ok(result.clone())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -532,5 +563,56 @@ async fn e2e_max_patterns_per_run_respected() {
         all.len(),
         2,
         "only 2 patterns should be compiled when max_patterns_per_run = 2"
+    );
+}
+
+/// Infrastructure errors (`build()` returning `Err(ToolError)`, e.g. LLM
+/// timeout or provider outage) are transient: they must NOT record a
+/// compilation failure, must NOT increment attempts, and must NOT prevent
+/// the pattern from compiling successfully once the provider recovers.
+#[tokio::test]
+async fn e2e_infra_error_not_recorded_and_pattern_recovers() {
+    let (backend, store) = fresh_backend().await;
+    seed_completed_jobs(&backend, "transient provider task", 5).await;
+
+    // Provider is down: build() returns Err(ToolError).
+    let error_compiler = make_compiler(Arc::new(ErrorSoftwareBuilder), Arc::clone(&store), 3, 10);
+    error_compiler.compile_patterns().await;
+
+    // No 'failed' row, no attempts — the pattern must remain untracked so it
+    // is retried on the next sweep without accruing failure state.
+    let pattern = store
+        .get_reflex_pattern("default", "transient provider task")
+        .await
+        .expect("get_reflex_pattern");
+    assert!(
+        pattern.is_none(),
+        "infra error must not record a reflex pattern row"
+    );
+
+    // A second failing sweep still records nothing.
+    error_compiler.compile_patterns().await;
+    let all = store
+        .list_reflex_patterns("default")
+        .await
+        .expect("list_reflex_patterns");
+    assert!(
+        all.is_empty(),
+        "repeated infra errors must not accrue failure state"
+    );
+
+    // Provider recovers: the same pattern compiles to active immediately,
+    // proving the earlier infra errors did not poison it.
+    let compiler = make_compiler(Arc::new(MockSoftwareBuilder), Arc::clone(&store), 3, 10);
+    compiler.compile_patterns().await;
+
+    let (_, status) = store
+        .get_reflex_pattern("default", "transient provider task")
+        .await
+        .expect("get_reflex_pattern")
+        .expect("pattern should compile after provider recovery");
+    assert_eq!(
+        status, "active",
+        "pattern should compile cleanly once infra errors stop"
     );
 }
