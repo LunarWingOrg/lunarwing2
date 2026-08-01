@@ -57,7 +57,7 @@ class TestConfigSerialization(unittest.TestCase):
             gateway_host="0.0.0.0",
             xmpp_enabled=True,
             xmpp_jid="alpha@xmpp.localhost",
-            workers=[WorkerType.NANOCODE, WorkerType.OPENCODE, WorkerType.KIMI],
+            workers=[WorkerType.PEBBLE, WorkerType.OPENCODE, WorkerType.KIMI],
             secrets_master_key="ab" * 32,
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -69,7 +69,7 @@ class TestConfigSerialization(unittest.TestCase):
         self.assertTrue(loaded.xmpp_enabled)
         self.assertEqual(
             loaded.workers,
-            [WorkerType.NANOCODE, WorkerType.OPENCODE, WorkerType.KIMI],
+            [WorkerType.PEBBLE, WorkerType.OPENCODE, WorkerType.KIMI],
         )
         self.assertEqual(loaded.secrets_master_key, "ab" * 32)
 
@@ -77,8 +77,6 @@ class TestConfigSerialization(unittest.TestCase):
         config = TenantConfig(
             name="alpha",
             llm_base_url="http://127.0.0.1:4000/openai/v1",
-            nanocode_model="nano-model",
-            nanocode_base_url="http://nano.test/v1",
             opencode_model="open-model",
             opencode_base_url="http://open.test/v1",
             kimi_model="kimi-model",
@@ -94,16 +92,20 @@ class TestConfigSerialization(unittest.TestCase):
         data = config.to_dict()
         self.assertEqual(data["workers"], ["pebble"])
 
-    def test_from_dict_accepts_string_workers(self):
+    def test_from_dict_accepts_supported_string_workers(self):
         data = {
             "name": "gamma",
-            "workers": ["nanocode", "opencode", "kimi"],
+            "workers": ["pebble", "opencode", "kimi"],
         }
         config = TenantConfig.from_dict(data)
         self.assertEqual(
             config.workers,
-            [WorkerType.NANOCODE, WorkerType.OPENCODE, WorkerType.KIMI],
+            [WorkerType.PEBBLE, WorkerType.OPENCODE, WorkerType.KIMI],
         )
+
+    def test_from_dict_rejects_retired_nanocode_worker(self):
+        with self.assertRaisesRegex(ValueError, "Nanocode worker is retired"):
+            TenantConfig.from_dict({"name": "legacy", "workers": ["nanocode"]})
 
     def test_json_file_permissions(self):
         config = TenantConfig(name="perms")
@@ -251,8 +253,6 @@ class TestProvisionerArgs(unittest.TestCase):
                     TenantConfig(
                         name="alpha",
                         llm_base_url="http://llm.test/v1",
-                        nanocode_model="nano-model",
-                        nanocode_base_url="http://nano.test/v1",
                         opencode_model="open-model",
                         opencode_base_url="http://open.test/v1",
                         kimi_model="kimi-model",
@@ -264,8 +264,6 @@ class TestProvisionerArgs(unittest.TestCase):
 
         for flag, value in (
             ("--llm-base-url", "http://llm.test/v1"),
-            ("--nanocode-model", "nano-model"),
-            ("--nanocode-base-url", "http://nano.test/v1"),
             ("--opencode-model", "open-model"),
             ("--opencode-base-url", "http://open.test/v1"),
             ("--kimi-model", "kimi-model"),
@@ -315,7 +313,7 @@ class TestProvisionerArgs(unittest.TestCase):
             try:
                 config = TenantConfig(
                     name="alpha",
-                    workers=[WorkerType.NANOCODE, WorkerType.OPENCODE, WorkerType.KIMI],
+                    workers=[WorkerType.OPENCODE, WorkerType.KIMI],
                 )
                 add_args = provisioner.build_add_tenant_args(config)
                 build_args = provisioner.build_build_tenant_args(config)
@@ -323,13 +321,11 @@ class TestProvisionerArgs(unittest.TestCase):
                 provisioner.MT_ADMIN_SCRIPT = previous
 
         # Selected workers appear on add-tenant (the persisted selection).
-        self.assertIn("--with-nanocode", add_args)
         self.assertIn("--with-opencode", add_args)
         self.assertIn("--with-kimi", add_args)
         # Unselected worker is omitted from add-tenant.
         self.assertNotIn("--with-pebble", add_args)
         # build-tenant still gets the same selection (to build the images).
-        self.assertIn("--with-nanocode", build_args)
         self.assertIn("--with-opencode", build_args)
         self.assertIn("--with-kimi", build_args)
         self.assertNotIn("--with-pebble", build_args)

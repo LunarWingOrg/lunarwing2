@@ -35,7 +35,6 @@ LLM_API_KEY="${LLM_API_KEY:-}"                 # blank -> defaults to token-fidg
 GOTIFY_URL="${GOTIFY_URL:-}"                    # optional, e.g. https://gotify.example.com
 DOCKER_GROUP="${DOCKER_GROUP:-false}"          # set true ONLY if fidget runs Docker sandbox/workers
                                                #   (docker group is ~root-equivalent — opt in deliberately)
-WITH_NANOCODE="${WITH_NANOCODE:-false}"        # also build the nanocode worker image
 # ----------------------------------------------------------------------------
 
 AUTO_YES=false
@@ -69,7 +68,6 @@ say "  XMPP password:  $([[ -n "$XMPP_PASSWORD" ]] && echo '(provided)' || echo 
 say "  LLM API key:    $([[ -n "$LLM_API_KEY" ]] && echo '(provided)' || echo 'token-fidget default')"
 say "  Gotify URL:     ${GOTIFY_URL:-(none)}"
 say "  docker group:   $DOCKER_GROUP"
-say "  build nanocode: $WITH_NANOCODE"
 say "  source repo:    $(git -C "$SCRIPT_DIR/../.." rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')@$(git -C "$SCRIPT_DIR/../.." rev-parse --short HEAD 2>/dev/null || echo '?')"
 confirm "Proceed?" || { say "aborted."; exit 0; }
 
@@ -83,7 +81,6 @@ add_args=( add-tenant "$TENANT" --xmpp-jid "$XMPP_JID" )
 
 banner "2/4  build-tenant --with-wasm"
 build_args=( build-tenant "$TENANT" --with-wasm )
-[[ "$WITH_NANOCODE" == true ]] && build_args+=( --with-nanocode )
 "$MT" "${build_args[@]}"
 
 banner "3/4  start-tenant"

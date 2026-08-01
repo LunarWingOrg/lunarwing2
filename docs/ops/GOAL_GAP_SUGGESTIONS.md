@@ -295,7 +295,7 @@ These were considered and rejected so a future reviewer doesn't re-raise them:
 - **Reflex compiler** — already items #23 + #25-reference; roadmap v2.0.4/0.7.
 - **Lunartica reskin** — roadmap v2.0.5+, not a 2.0.3.0 concern.
 - **LunarVoice** — roadmap v2.0.6+; no 2.0.3.0 dependency.
-- **Nanocode deprecation** — roadmap v2.0.5; explicitly not this cycle.
+- **Nanocode retirement** — completed in v2.0.4; no longer future scope.
 - **DarkIRC key exchange** — already items #10/#18.
 - **Human delay mode phase 2** — proposal exists but phase 1 already landed in
   a prior release; phase 2 is not on the v2.0.3.0 critical path.

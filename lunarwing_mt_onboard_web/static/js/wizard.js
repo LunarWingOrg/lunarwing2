@@ -77,11 +77,10 @@
       enable_darkirc: false,
       xmpp_enabled: false, xmpp_jid: '', xmpp_password: '', xmpp_allow_from: '',
       gotify_enabled: false, gotify_url: '', gotify_title: '',
-      w_nanocode: false, w_pebble: false, w_opencode: false,
+      w_pebble: false, w_opencode: false,
       w_kimi: false, kimi_model: '', kimi_base_url: '', kimi_api_key: '', toolchains: false,
       llm_base_url: '',
       model_choice: 'lunarwing', model_custom: '',
-      nanocode_model: '', nanocode_base_url: '',
       opencode_model: '', opencode_base_url: '',
       llm_api_key: '', secrets_master_key: '',
       ssh_harness: true, health_pipeline: true, weechat_bootstrap: true,
@@ -172,16 +171,6 @@
     }
 
     function stepWorkers(b) {
-      b.appendChild(checkField(data, 'w_nanocode', 'nanocode (NanoGPT)', (checked) => {
-        if (!checked) { data.nanocode_model = ''; data.nanocode_base_url = ''; }
-        render();
-      }));
-      if (data.w_nanocode) {
-        const nanocode = h('div', { class: 'subgroup' });
-        nanocode.appendChild(textField(data, 'nanocode_model', 'Nanocode model override (optional)', {}));
-        nanocode.appendChild(textField(data, 'nanocode_base_url', 'Nanocode base URL override (optional)', {}));
-        b.appendChild(nanocode);
-      }
       b.appendChild(checkField(data, 'w_pebble', 'pebble (Rust harness)'));
       b.appendChild(checkField(data, 'w_opencode', 'opencode (sst/opencode)', (checked) => {
         if (!checked) { data.opencode_model = ''; data.opencode_base_url = ''; }
@@ -232,7 +221,7 @@
     }
 
     function stepReview(b) {
-      const workers = [data.w_nanocode && 'nanocode', data.w_pebble && 'pebble', data.w_opencode && 'opencode', data.w_kimi && 'kimi'].filter(Boolean);
+      const workers = [data.w_pebble && 'pebble', data.w_opencode && 'opencode', data.w_kimi && 'kimi'].filter(Boolean);
       const rows = [
         ['Tenant', data.name || '(unset)'],
         ['Gateway host', data.gateway_host],
@@ -260,7 +249,6 @@
 
     function buildPayload() {
       const workers = [];
-      if (data.w_nanocode) workers.push('nanocode');
       if (data.w_pebble) workers.push('pebble');
       if (data.w_opencode) workers.push('opencode');
       if (data.w_kimi) workers.push('kimi');
@@ -283,8 +271,6 @@
         toolchains: data.toolchains,
         llm_base_url: data.llm_base_url.trim(),
         llm_model: model,
-        nanocode_model: data.nanocode_model.trim(),
-        nanocode_base_url: data.nanocode_base_url.trim(),
         opencode_model: data.opencode_model.trim(),
         opencode_base_url: data.opencode_base_url.trim(),
         kimi_model: data.kimi_model.trim(),
@@ -373,7 +359,7 @@
     simpleForm(host, 'Import a tenant', 'stage-only by default; start requires old host stopped', (b, data) => {
       Object.assign(data, {
         bundle: '', name: '', apply: false, start: false, old_stopped: false, force: false,
-        with_opencode: false, with_kimi: false, with_toolchains: false, with_nanocode: false,
+        with_opencode: false, with_kimi: false, with_toolchains: false,
         with_pebble: false, with_vision: false, docker_group: false,
         owner_scope: '', passphrase: '',
       });
@@ -388,7 +374,6 @@
       workers.appendChild(checkField(data, 'with_opencode', 'Build opencode worker'));
       workers.appendChild(checkField(data, 'with_kimi', 'Build kimi worker'));
       workers.appendChild(checkField(data, 'with_toolchains', 'Include worker toolchains'));
-      workers.appendChild(checkField(data, 'with_nanocode', 'Build nanocode worker'));
       workers.appendChild(checkField(data, 'with_pebble', 'Build pebble worker'));
       workers.appendChild(checkField(data, 'with_vision', 'Restore LunarVision'));
       workers.appendChild(checkField(data, 'docker_group', 'Add tenant user to docker/podman group'));

@@ -7,6 +7,7 @@ mod config;
 pub mod omemo;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1548,8 +1549,11 @@ async fn handle_message_stanza(
             .or_insert_with(HashSet::new);
     }
 
-    let attachments = extract_inbound_attachments(&msg.payloads, &content).await;
-    let content = strip_attachment_urls(content, &attachments);
+    let extraction = extract_inbound_attachments(&msg.payloads, &content).await;
+    // Strip every recognized attachment URL (successful download or not) so
+    // key-bearing `aesgcm://` URLs never survive into content.
+    let content = strip_attachment_urls(content, &extraction.recognized_urls);
+    let attachments = extraction.attachments;
 
     let mut incoming = IncomingMessage::new("xmpp", target_jid.clone(), content)
         .with_owner_id(&config.jid)
@@ -2871,12 +2875,28 @@ fn extract_body_from_message(msg: &xmpp_parsers::message::Message) -> Option<Str
     msg.bodies.values().find(|b| !b.is_empty()).cloned()
 }
 
+/// Result of inbound attachment extraction.
+struct InboundAttachmentExtraction {
+    /// Attachments that downloaded (and decrypted) successfully.
+    attachments: Vec<IncomingAttachment>,
+    /// Every attachment URL recognized in the stanza, including ones whose
+    /// download failed. A failed `aesgcm://` URL still carries the XEP-0454
+    /// key fragment and a failed OOB URL can carry signed query credentials,
+    /// so callers must strip these from message content — not just the URLs
+    /// of successful downloads — before the text reaches the model or
+    /// persisted history.
+    recognized_urls: Vec<String>,
+}
+
 /// Extract downloadable attachments referenced by an incoming message: OOB URLs
 /// from the stanza payloads (XEP-0066) plus any `aesgcm://` (XEP-0454) URLs that
 /// appear only in the decrypted body — some clients omit the cleartext OOB
 /// element for encrypted files. Downloads (and decrypts) them and returns the
-/// resulting attachments.
-async fn extract_inbound_attachments(payloads: &[Element], body: &str) -> Vec<IncomingAttachment> {
+/// resulting attachments plus every recognized URL for content stripping.
+async fn extract_inbound_attachments(
+    payloads: &[Element],
+    body: &str,
+) -> InboundAttachmentExtraction {
     let mut urls = collect_oob_urls(payloads, MAX_OOB_ATTACHMENTS);
     let oob_total = payloads.iter().filter(|p| p.is("x", ns::OOB)).count();
     if oob_total > MAX_OOB_ATTACHMENTS {
@@ -2900,31 +2920,32 @@ async fn extract_inbound_attachments(payloads: &[Element], body: &str) -> Vec<In
     }
 
     if urls.is_empty() {
-        return Vec::new();
+        return InboundAttachmentExtraction {
+            attachments: Vec::new(),
+            recognized_urls: Vec::new(),
+        };
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(OOB_DOWNLOAD_TIMEOUT_SECS))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("Failed to build HTTP client for OOB download: {}", e);
-            return Vec::new();
-        }
-    };
+    let recognized_urls: Vec<String> = urls.iter().map(|(u, _)| u.clone()).collect();
 
     // Download up to MAX_CONCURRENT_OOB_DOWNLOADS files at once so a single slow
     // URL can't serialize the whole batch (and stall the client event loop) for
-    // N * timeout. `buffered` keeps the results in stanza order.
-    futures::stream::iter(urls)
+    // N * timeout. `buffered` keeps the results in stanza order. Each download
+    // builds its own egress-policy-checked client (see
+    // `policy_checked_download_client`).
+    let attachments = futures::stream::iter(urls)
         .map(|(url, _desc)| {
-            let client = &client;
             async move {
-                match download_oob_file(client, &url).await {
+                match download_oob_file(&url).await {
                     Ok(attachment) => Some(attachment),
                     Err(e) => {
-                        tracing::warn!(url = %url, "OOB file download failed: {}", e);
+                        // The raw URL can carry an XEP-0454 key fragment or
+                        // signed query credentials — log only a redacted form.
+                        tracing::warn!(
+                            url = %redact_url_for_log(&url),
+                            "OOB file download failed: {}",
+                            e
+                        );
                         None
                     }
                 }
@@ -2933,7 +2954,145 @@ async fn extract_inbound_attachments(payloads: &[Element], body: &str) -> Vec<In
         .buffered(MAX_CONCURRENT_OOB_DOWNLOADS)
         .filter_map(|opt| async move { opt })
         .collect()
+        .await;
+
+    InboundAttachmentExtraction {
+        attachments,
+        recognized_urls,
+    }
+}
+
+/// Format a reqwest error with its embedded URL removed — reqwest's Display
+/// includes the request URL, which can carry signed query credentials that
+/// must not reach logs or message content.
+fn sanitize_reqwest_error(e: &reqwest::Error) -> String {
+    let msg = e.to_string();
+    match e.url() {
+        Some(url) => msg.replace(url.as_str(), "<redacted-url>"),
+        None => msg,
+    }
+}
+
+/// Render a URL safe for logging: scheme and host only. Userinfo, path, query,
+/// and — critically for `aesgcm://` (XEP-0454) — the key-bearing fragment are
+/// all dropped.
+fn redact_url_for_log(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) => {
+            let mut out = format!("{}://", url.scheme());
+            match url.host_str() {
+                Some(host) => out.push_str(host),
+                None => out.push_str("<no-host>"),
+            }
+            if let Some(port) = url.port() {
+                out.push_str(&format!(":{port}"));
+            }
+            out.push_str("/<redacted>");
+            out
+        }
+        Err(_) => "<invalid-url>".to_string(),
+    }
+}
+
+/// `ALLOW_PRIVATE_IPS=1` opts out of the public-IP requirement and permits
+/// plain `http` for local-dev / private-network harness setups, matching the
+/// existing WASM host-function guard in `tools/wasm/wrapper.rs`.
+fn allow_private_attachment_ips() -> bool {
+    std::env::var("ALLOW_PRIVATE_IPS").ok().as_deref() == Some("1")
+}
+
+/// Validate a sender-supplied attachment URL against the egress policy and
+/// build an HTTP client for the fetch. Guards against SSRF from admitted but
+/// untrusted XMPP peers:
+///
+/// - only `https` URLs without embedded credentials are accepted
+///   (`aesgcm://` callers pass their derived `https://` fetch URL); plain
+///   `http` requires `allow_private` (local-dev opt-in)
+/// - the hostname is resolved up front and every candidate address must be a
+///   globally routable unicast IP; the client is pinned to those validated
+///   addresses so a DNS rebind between validation and connect can't swap in
+///   an internal address
+/// - redirects are disabled and environment proxies ignored, so an initially
+///   innocent URL can't be retargeted at internal services and ambient proxy
+///   config can't reroute the fetch
+async fn policy_checked_download_client(
+    url: &str,
+    allow_private: bool,
+) -> Result<reqwest::Client, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid attachment URL: {e}"))?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" if allow_private => {}
+        scheme => {
+            return Err(format!(
+                "attachment URL scheme {scheme:?} rejected (https required)"
+            ));
+        }
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("attachment URLs with embedded credentials are rejected".to_string());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "attachment URL has no host".to_string())?
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "attachment URL has no usable port".to_string())?;
+
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
         .await
+        .map_err(|e| format!("failed to resolve attachment host: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err("attachment host resolved to no addresses".to_string());
+    }
+    if !allow_private && addrs.iter().any(|a| !is_public_attachment_ip(a.ip())) {
+        return Err("attachment host resolves to a non-public address".to_string());
+    }
+
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(OOB_DOWNLOAD_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .resolve_to_addrs(&host, &addrs)
+        .build()
+        .map_err(|e| format!("failed to build attachment HTTP client: {e}"))
+}
+
+/// True only for globally routable unicast addresses. Loopback, private,
+/// link-local, carrier-grade NAT, unique-local, unspecified, broadcast, and
+/// multicast addresses (including IPv4-mapped IPv6 forms) are not acceptable
+/// attachment destinations.
+fn is_public_attachment_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 100.64.0.0/10 carrier-grade NAT (RFC 6598) is not covered by
+            // Ipv4Addr::is_private.
+            let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || is_cgnat)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_public_attachment_ip(IpAddr::V4(mapped));
+            }
+            let seg0 = v6.segments()[0];
+            let is_unique_local = (seg0 & 0xfe00) == 0xfc00; // fc00::/7
+            let is_link_local = (seg0 & 0xffc0) == 0xfe80; // fe80::/10
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || is_unique_local
+                || is_link_local)
+        }
+    }
 }
 
 /// Collect OOB URLs (with optional descriptions) from message payloads, capped
@@ -2959,33 +3118,20 @@ fn collect_aesgcm_urls(text: &str, max: usize) -> Vec<String> {
         .collect()
 }
 
-fn strip_attachment_urls(mut content: String, attachments: &[IncomingAttachment]) -> String {
-    for attachment in attachments {
-        if let Some(url) = attachment.source_url.as_deref() {
-            content = content.replace(url, "");
-        }
+/// Remove every recognized attachment URL from `content`. Must be called with
+/// all URLs recognized in the stanza — not only successfully downloaded ones —
+/// so a failed `aesgcm://` download can't leave the key-bearing URL (or a
+/// signed OOB query) in text that flows into model context and persisted
+/// history.
+fn strip_attachment_urls(mut content: String, urls: &[String]) -> String {
+    for url in urls {
+        content = content.replace(url.as_str(), "");
     }
 
     if content.trim().is_empty() {
         String::new()
     } else {
         content
-    }
-}
-
-#[cfg(test)]
-fn incoming_attachment_for_url(url: &str) -> IncomingAttachment {
-    IncomingAttachment {
-        id: Uuid::new_v4().to_string(),
-        kind: AttachmentKind::Document,
-        mime_type: "application/octet-stream".to_string(),
-        filename: None,
-        size_bytes: None,
-        source_url: Some(url.to_string()),
-        storage_key: None,
-        extracted_text: None,
-        data: vec![1],
-        duration_secs: None,
     }
 }
 
@@ -3027,20 +3173,19 @@ where
 /// Download a single file from an OOB URL and return as an IncomingAttachment.
 ///
 /// `aesgcm://` (XEP-0454) URLs are fetched over https and AES-256-GCM-decrypted;
-/// every other http(s) URL is downloaded as-is.
-async fn download_oob_file(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<IncomingAttachment, String> {
+/// every other URL is downloaded as-is. All fetches go through
+/// `policy_checked_download_client` (SSRF/egress policy).
+async fn download_oob_file(url: &str) -> Result<IncomingAttachment, String> {
     if url.starts_with("aesgcm://") {
-        return download_aesgcm_file(client, url).await;
+        return download_aesgcm_file(url).await;
     }
 
+    let client = policy_checked_download_client(url, allow_private_attachment_ips()).await?;
     let response = client
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("HTTP GET failed: {e}"))?;
+        .map_err(|e| format!("HTTP GET failed: {}", sanitize_reqwest_error(&e)))?;
 
     if !response.status().is_success() {
         return Err(format!("HTTP {} from OOB URL", response.status()));
@@ -3093,17 +3238,17 @@ async fn download_oob_file(
 }
 
 /// Download and AES-256-GCM-decrypt an `aesgcm://` (XEP-0454) media URL.
-async fn download_aesgcm_file(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<IncomingAttachment, String> {
+async fn download_aesgcm_file(url: &str) -> Result<IncomingAttachment, String> {
     let (https_url, iv, key) = parse_aesgcm_url(url)?;
+    // Encryption of the payload does not remove the SSRF capability of the
+    // sender-chosen fetch URL — the same egress policy applies.
+    let client = policy_checked_download_client(&https_url, allow_private_attachment_ips()).await?;
 
     let response = client
         .get(&https_url)
         .send()
         .await
-        .map_err(|e| format!("HTTP GET failed: {e}"))?;
+        .map_err(|e| format!("HTTP GET failed: {}", sanitize_reqwest_error(&e)))?;
     if !response.status().is_success() {
         return Err(format!("HTTP {} from aesgcm URL", response.status()));
     }
@@ -3625,15 +3770,141 @@ mod tests {
     fn strip_attachment_urls_removes_embedded_aesgcm_urls() {
         let url = "aesgcm://h/a.jpg#aa";
         let content = format!("check this out {url} thanks");
-        let stripped = strip_attachment_urls(content, &[incoming_attachment_for_url(url)]);
+        let stripped = strip_attachment_urls(content, &[url.to_string()]);
         assert_eq!(stripped, "check this out  thanks");
     }
 
     #[test]
     fn strip_attachment_urls_clears_url_only_body() {
         let url = "aesgcm://h/a.jpg#aa";
-        let stripped = strip_attachment_urls(url.to_string(), &[incoming_attachment_for_url(url)]);
+        let stripped = strip_attachment_urls(url.to_string(), &[url.to_string()]);
         assert!(stripped.is_empty());
+    }
+
+    #[test]
+    fn redact_url_for_log_drops_query_and_key_fragment() {
+        let fragment = hex::encode([7u8; 44]);
+        let aesgcm = format!("aesgcm://up.example.com/x/file.bin#{fragment}");
+        let redacted = redact_url_for_log(&aesgcm);
+        assert_eq!(redacted, "aesgcm://up.example.com/<redacted>");
+        assert!(!redacted.contains(&fragment));
+
+        let signed = "https://files.example.com/get?sig=secret-token&x=1";
+        let redacted = redact_url_for_log(signed);
+        assert!(!redacted.contains("secret-token"));
+        assert!(!redacted.contains('?'));
+
+        assert_eq!(redact_url_for_log("not a url"), "<invalid-url>");
+    }
+
+    /// Regression for the credential-leak finding: when an `aesgcm://`
+    /// download fails, the key-bearing URL must still be recognized (so the
+    /// caller strips it from content) while no attachment is produced.
+    #[tokio::test]
+    async fn failed_aesgcm_download_still_recognized_for_stripping() {
+        let fragment = hex::encode([9u8; 44]);
+        // Port 1 refuses fast regardless of DNS/egress policy, so the
+        // download fails deterministically without network access.
+        let url = format!("aesgcm://127.0.0.1:1/x/file.bin#{fragment}");
+        let content = format!("here you go {url} enjoy");
+        let extraction = extract_inbound_attachments(&[], &content).await;
+
+        assert!(extraction.attachments.is_empty());
+        assert_eq!(extraction.recognized_urls, vec![url.clone()]);
+
+        let stripped = strip_attachment_urls(content, &extraction.recognized_urls);
+        assert!(!stripped.contains(&url));
+        assert!(!stripped.contains(&fragment));
+        assert_eq!(stripped, "here you go  enjoy");
+    }
+
+    #[test]
+    fn public_attachment_ip_classification() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let rejected = [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), // cloud metadata
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),      // CGNAT
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            "fe80::1".parse().unwrap(),
+            "fc00::1".parse().unwrap(),
+            "ff02::1".parse().unwrap(),
+            "::ffff:127.0.0.1".parse().unwrap(),
+            "::ffff:10.1.2.3".parse().unwrap(),
+        ];
+        for ip in rejected {
+            assert!(!is_public_attachment_ip(ip), "{ip} must be rejected");
+        }
+        let accepted = [
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            "2606:4700:4700::1111".parse().unwrap(),
+        ];
+        for ip in accepted {
+            assert!(is_public_attachment_ip(ip), "{ip} must be accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn download_policy_rejects_unsafe_destinations() {
+        // Plain http requires the local-dev opt-in.
+        assert!(
+            policy_checked_download_client("https://8.8.8.8/file.bin", false)
+                .await
+                .is_ok()
+        );
+        assert!(
+            policy_checked_download_client("http://8.8.8.8/file.bin", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            policy_checked_download_client("http://8.8.8.8/file.bin", true)
+                .await
+                .is_ok()
+        );
+
+        // Non-http(s) schemes and embedded credentials are always rejected.
+        for bad in [
+            "ftp://8.8.8.8/file.bin",
+            "file:///etc/passwd",
+            "https://user:pass@8.8.8.8/file.bin",
+            "https://user@8.8.8.8/file.bin",
+        ] {
+            assert!(
+                policy_checked_download_client(bad, true).await.is_err(),
+                "{bad} must be rejected"
+            );
+        }
+
+        // Loopback / private / link-local destinations are rejected without
+        // the opt-in (literal IPs need no DNS) and allowed with it.
+        for internal in [
+            "https://127.0.0.1:8443/file.bin",
+            "https://10.0.0.5/file.bin",
+            "https://192.168.0.1/file.bin",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/file.bin",
+        ] {
+            assert!(
+                policy_checked_download_client(internal, false)
+                    .await
+                    .is_err(),
+                "{internal} must be rejected"
+            );
+        }
+        assert!(
+            policy_checked_download_client("http://127.0.0.1:8088/file.bin", true)
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

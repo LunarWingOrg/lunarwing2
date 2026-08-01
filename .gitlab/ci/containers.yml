@@ -29,20 +29,6 @@
         "$CI_REGISTRY" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" \
         > /kaniko/.docker/config.json
 
-worker-nanocode-image:
-  extends: .container-job
-  variables:
-    NANOCODE_REF: "v1.2.28"
-  script:
-    - /kaniko/executor
-      --context "$CI_PROJECT_DIR/lunarcode4lunarwing"
-      --dockerfile "$CI_PROJECT_DIR/lunarcode4lunarwing/Dockerfile"
-      --build-arg "NANOCODE_REF=$NANOCODE_REF"
-      --destination "$CI_REGISTRY_IMAGE/worker-nanocode:$CI_COMMIT_SHORT_SHA"
-      --destination "$CI_REGISTRY_IMAGE/worker-nanocode:latest"
-  rules:
-    - when: manual
-
 worker-pebble-image:
   extends: .container-job
   script:

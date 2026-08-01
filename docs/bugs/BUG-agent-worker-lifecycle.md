@@ -18,7 +18,7 @@ with their distinct reproducers and current evidence.
 ### Symptoms and reproduction
 
 1. Call the `create_job` tool with the built-in Docker sandbox (`mode: worker`)
-   or an external worker (`opencode`, `nanocode`, or `pebble`) and `wait=true`.
+   or an external worker (`opencode`, `kimi`, or `pebble`) and `wait=true`.
 2. Use a task that takes several minutes, such as a repository analysis.
 3. The originating turn does not return until the worker result is available.
    Exact `/interrupt` and `/stop` submissions are handled while it is active;

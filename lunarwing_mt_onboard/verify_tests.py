@@ -19,7 +19,7 @@ Ports:
   http:             10001
 
 PostgreSQL: running (lunarwing-pg-lunarium)
-Nanocode worker: not created
+Nanocode (retired): no container in active runtime store
 
 Services (systemd):
   lunarwing-lunarium.service: active
@@ -28,7 +28,6 @@ Services (systemd):
   lunarwing-weechat-lunarium.service: active
   lunarwing-weechat-adapter-lunarium.service: active
   lunarwing-pg-lunarium.service: active
-  lunarwing-nanocode-lunarium.service: inactive
 """
 
 OPENRC_STATUS = """\

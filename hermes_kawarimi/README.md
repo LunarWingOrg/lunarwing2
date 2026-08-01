@@ -68,7 +68,8 @@ sudo python3 -m hermes_kawarimi import --source /path/to/hermes/home \
 
 `--source` defaults to `$HERMES_HOME`, then `~/.hermes` (matching Hermes' own
 resolution). Import flags: `--apply`, `--start`, `--force` (reuse an existing
-tenant name), `--with-nanocode/--with-pebble/--with-opencode`, `--docker-group`,
+tenant name), `--with-pebble/--with-opencode/--with-kimi`, `--with-toolchains`
+(build-tenant only), `--docker-group`,
 `--tensorzero-url`, `--llm-model`, `--save FILE` / `--resume FILE`.
 
 ## Module layout
@@ -83,17 +84,18 @@ hermes_kawarimi/
 ├── cli.py          # `inspect` + `import`
 ├── model_tests.py / extract_tests.py / mapper_tests.py
 ├── config_tests.py / loader_tests.py / loader_populate_tests.py
+├── cli_tests.py
 └── requirements.txt
 ```
 
 ## Testing
 
 ```bash
-# Unit tests (no root, no DB) — all six modules
+# Unit tests (no root, no DB) — all seven modules
 python3 -m unittest hermes_kawarimi.model_tests \
   hermes_kawarimi.extract_tests hermes_kawarimi.mapper_tests \
   hermes_kawarimi.config_tests hermes_kawarimi.loader_tests \
-  hermes_kawarimi.loader_populate_tests
+  hermes_kawarimi.loader_populate_tests hermes_kawarimi.cli_tests
 ```
 
 `loader_tests` / `loader_populate_tests` cover preflight, plan->argv wiring,

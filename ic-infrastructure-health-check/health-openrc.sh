@@ -71,6 +71,13 @@ svc_json() {
 EOF
 }
 
+retired_nanocode_service() {
+  case "$1" in
+    lunarwing-nanocode-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Probe one unit, bounded by STATUS_TIMEOUT when `timeout` is available.
 # Sets globals STATUS_OUT (text) and STATUS_RC (the REAL exit code; 124/137 mean
 # the probe was killed for exceeding the timeout).
@@ -172,6 +179,10 @@ weechat_unit_disabled() {
 for svc in "${SERVICES_ARR[@]}"; do
   # Init script must exist.
   if ! rc-service --exists "$svc" >/dev/null 2>&1; then
+    if retired_nanocode_service "$svc"; then
+      svc_results+=("$(svc_json "$svc" "missing" "skipped")")
+      continue
+    fi
     issues+=("service not found: $svc")
     svc_results+=("$(svc_json "$svc" "missing" "critical")")
     overall_status="critical"; overall_exit=2
@@ -203,6 +214,9 @@ for svc in "${SERVICES_ARR[@]}"; do
     state="stopped"   # non-keyword output AND non-zero exit → down/ambiguous
   fi
 
+  if retired_nanocode_service "$svc"; then
+    local_status="skipped"; local_exit=0
+  else
   case "$state" in
     stopped|crashed)
       if weechat_unit_disabled "$svc"; then
@@ -234,6 +248,7 @@ for svc in "${SERVICES_ARR[@]}"; do
       issues+=("$svc in unexpected state: $state")
       ;;
   esac
+  fi
 
   if [ "$local_exit" -gt "$overall_exit" ]; then
     overall_exit=$local_exit

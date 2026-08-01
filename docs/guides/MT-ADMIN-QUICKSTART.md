@@ -44,6 +44,13 @@ sudo dnf install jq git python3-aiohttp weechat
 sudo emerge app-misc/jq app-containers/podman dev-python/aiohttp net-irc/weechat
 ```
 
+These are minimal hints — for complete per-distro dependency lists (including the Python
+ops-tooling packages the hints above omit) see
+[`DEBIAN_PACKAGE_LIST.md`](DEBIAN_PACKAGE_LIST.md),
+[`UBUNTU_PACKAGE_LIST.md`](UBUNTU_PACKAGE_LIST.md),
+[`FEDORA_PACKAGE_LIST.md`](FEDORA_PACKAGE_LIST.md), and
+[`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md).
+
 All commands below run from the repository root (e.g., `/home/you/lunarwing`).
 
 ---
@@ -68,7 +75,7 @@ These `[FAIL]`s are benign and can be ignored:
 - `rustup installed` — a per-tenant toolchain is installed by `add-tenant`
   (see Prerequisites).
 - `port registry exists` — created automatically on your first `add-tenant`.
-- `nanocode/pebble/opencode worker image exists` — only relevant if you use the worker
+- `pebble/opencode/kimi worker image exists` — only relevant if you use the worker
   containers.
 
 ---
@@ -261,7 +268,7 @@ Verify the relay is running inside WeeChat:
 From the host machine, confirm WeeChat's relay is reachable:
 
 ```bash
-curl -u "plain:your-relay-password" http://127.0.0.1:10005/api/version
+curl -u "plain:your-relay-password" http://127.0.0.1:10005/api/version # gitleaks:allow
 ```
 
 You should see WeeChat version info in JSON. If you get a connection refused
@@ -469,7 +476,7 @@ Primary block:
 | +4 | proxy | TensorZero LLM proxy |
 | +5 | weechat | WeeChat relay (configure WeeChat to bind here) |
 | +6 | orchestrator | Job orchestrator API |
-| +7 | nanocode_wss | Nanocode worker WebSocket |
+| +7 | nanocode_wss | Reserved legacy Nanocode slot |
 | +8 | pebble_wss | Pebble worker WebSocket |
 | +9 | weechat_adapter | WeeChat WS adapter HTTP API |
 
@@ -477,7 +484,7 @@ Extended block (e.g. tenant `ruffles` base `10000` → extended base `20000`):
 
 | Offset | Name | Service |
 |--------|------|---------|
-| ebase+3 | nanocode_health | Nanocode worker `/health` |
+| ebase+3 | nanocode_health | Reserved legacy Nanocode slot |
 | ebase+4 | pebble_health | Pebble worker `/health` |
 | ebase+7 | opencode_wss | Opencode worker WebSocket |
 | ebase+8 | opencode_health | Opencode worker `/health` |

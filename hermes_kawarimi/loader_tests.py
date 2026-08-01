@@ -20,9 +20,10 @@ class WorkerFlagsTest(unittest.TestCase):
     def test_empty_plan_yields_no_flags(self) -> None:
         self.assertEqual(_worker_flags(ImportPlan()), [])
 
-    def test_nanocode_flag(self) -> None:
-        plan = ImportPlan(with_nanocode=True)
-        self.assertIn("--with-nanocode", _worker_flags(plan))
+    def test_retired_nanocode_is_not_forwarded(self) -> None:
+        plan = ImportPlan(tenant="legacy", with_nanocode=True)
+        self.assertNotIn("--with-nanocode", _worker_flags(plan))
+        self.assertIn("Nanocode worker is retired", plan.validate())
 
     def test_pebble_flag(self) -> None:
         plan = ImportPlan(with_pebble=True)
@@ -121,6 +122,28 @@ class RunImportSequenceTest(unittest.TestCase):
     def test_start_after_populate_when_requested(self) -> None:
         verbs = self._run_phases(ImportPlan(tenant="t1", apply=True, start=True))
         self.assertEqual(verbs[-2:], ["start-pg", "start-tenant"])
+
+    def test_install_wasm_failure_fails_clearly(self) -> None:
+        """install-wasm is required (import-tenant.sh aborts on it via set -e).
+
+        Regression: the phase used to be 'best-effort' in name only — its
+        failed PhaseResult still gated result.ok while result.error stayed
+        None, so the CLI reported an unexplained failure after populate.
+        """
+
+        def fake_run_command(args, **_kw):  # noqa: ANN001, ANN202
+            rc = 1 if args[1] == "install-wasm" else 0
+            return PhaseResult(name=args[1], returncode=rc)
+
+        with (
+            mock.patch("hermes_kawarimi.loader.ensure_mt_admin", return_value="mt"),
+            mock.patch(
+                "hermes_kawarimi.loader.run_command", side_effect=fake_run_command
+            ),
+        ):
+            result = loader.run_import(ImportPlan(tenant="t1", apply=True), MappedAgent())
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "install-wasm failed")
 
     def test_secret_count_survives_in_result(self) -> None:
         """_insert_secrets writes counts["secrets"]; a later counts assignment

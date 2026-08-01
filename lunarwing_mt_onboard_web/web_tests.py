@@ -49,6 +49,14 @@ class ModelMappingTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             ProvisionRequest(name="alpha", workers=["opencdoe"])
 
+    def test_provision_rejects_retired_nanocode_worker(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "Nanocode worker is retired"):
+            ProvisionRequest(name="alpha", workers=["nanocode"])
+
+    def test_import_rejects_retired_nanocode_worker(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "Nanocode worker is retired"):
+            ImportRequest(with_nanocode=True)
+
     def test_obsolete_tensorzero_url_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             ProvisionRequest(
@@ -59,7 +67,7 @@ class ModelMappingTests(unittest.TestCase):
     def test_provision_maps_fields_and_workers(self) -> None:
         req = ProvisionRequest(
             name="  sphinx  ",
-            workers=["nanocode", "opencode", "kimi"],
+            workers=["pebble", "opencode", "kimi"],
             no_ssh=True,
             no_weechat_bootstrap=True,
             xmpp_allow_from=["a@x", "  ", "b@y"],
@@ -68,7 +76,7 @@ class ModelMappingTests(unittest.TestCase):
         self.assertEqual(cfg.name, "sphinx")
         self.assertEqual(
             cfg.workers,
-            [WorkerType.NANOCODE, WorkerType.OPENCODE, WorkerType.KIMI],
+            [WorkerType.PEBBLE, WorkerType.OPENCODE, WorkerType.KIMI],
         )
         self.assertTrue(cfg.no_ssh)
         self.assertTrue(cfg.no_weechat_bootstrap)
@@ -108,7 +116,6 @@ class ModelMappingTests(unittest.TestCase):
             with_opencode=True,
             with_kimi=True,
             with_toolchains=True,
-            with_nanocode=True,
             with_pebble=True,
             with_vision=True,
             docker_group=True,
@@ -125,7 +132,7 @@ class ModelMappingTests(unittest.TestCase):
         self.assertTrue(cfg.with_opencode)
         self.assertTrue(cfg.with_kimi)
         self.assertTrue(cfg.with_toolchains)
-        self.assertTrue(cfg.with_nanocode)
+        self.assertFalse(cfg.with_nanocode)
         self.assertTrue(cfg.with_pebble)
         self.assertTrue(cfg.with_vision)
         self.assertTrue(cfg.docker_group)
@@ -136,10 +143,8 @@ class ModelMappingTests(unittest.TestCase):
     def test_current_provision_fields_map_to_tenant_config(self) -> None:
         cfg = ProvisionRequest(
             name="sphinx",
-            workers=["nanocode", "opencode", "kimi"],
+            workers=["opencode", "kimi"],
             llm_base_url=" http://llm.test/v1 ",
-            nanocode_model=" nano ",
-            nanocode_base_url=" http://nano.test/v1 ",
             opencode_model=" open ",
             opencode_base_url=" http://open.test/v1 ",
             kimi_model=" kimi ",
@@ -147,8 +152,6 @@ class ModelMappingTests(unittest.TestCase):
         ).to_tenant_config()
 
         self.assertEqual(cfg.llm_base_url, "http://llm.test/v1")
-        self.assertEqual(cfg.nanocode_model, "nano")
-        self.assertEqual(cfg.nanocode_base_url, "http://nano.test/v1")
         self.assertEqual(cfg.opencode_model, "open")
         self.assertEqual(cfg.opencode_base_url, "http://open.test/v1")
         self.assertEqual(cfg.kimi_model, "kimi")
@@ -157,13 +160,11 @@ class ModelMappingTests(unittest.TestCase):
     def test_worker_overrides_are_dropped_when_worker_is_not_selected(self) -> None:
         cfg = ProvisionRequest(
             name="sphinx",
-            nanocode_model="stale-nano",
             opencode_model="stale-open",
             kimi_model="stale-kimi",
             kimi_base_url="http://stale-kimi.test/v1",
             kimi_api_key="stale-secret",
         ).to_tenant_config()
-        self.assertEqual(cfg.nanocode_model, "")
         self.assertEqual(cfg.opencode_model, "")
         self.assertEqual(cfg.kimi_model, "")
         self.assertEqual(cfg.kimi_base_url, "")
@@ -393,7 +394,7 @@ class DemoProvisionIntegrationTests(unittest.TestCase):
 
     def test_provision_demo_emits_phases_and_succeeds(self) -> None:
         job = Job(id="test1", mode="provision", demo=True)
-        req = ProvisionRequest(name="sphinx", workers=["nanocode"], skip_start=True)
+        req = ProvisionRequest(name="sphinx", workers=["opencode"], skip_start=True)
         self.runner.run_provision_job(job, req, log_dir=self.tmp)
         events = _drain(job.queue)
         phases = [e["name"] for e in events if e.get("type") == "phase"]
@@ -422,7 +423,7 @@ class DemoProvisionIntegrationTests(unittest.TestCase):
         from .models import SecretRequest
 
         job = Job(id="test3", mode="secrets", demo=True)
-        secret_value = "sup3r-s3cret-v4lue-xyz"
+        secret_value = "sup3r-s3cret-v4lue-xyz"  # gitleaks:allow
         self.runner.run_secret_job(
             job, SecretRequest(tenant="sphinx", name="gotify_app_token", value=secret_value), log_dir=self.tmp
         )
@@ -596,7 +597,6 @@ class ImportUiTests(unittest.TestCase):
             "with_opencode",
             "with_kimi",
             "with_toolchains",
-            "with_nanocode",
             "with_pebble",
             "with_vision",
             "docker_group",

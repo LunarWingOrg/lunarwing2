@@ -165,8 +165,9 @@ impl Agent {
 
         // Reflex fast-path: check for compiled patterns before invoking LLM
         if !cavepony_skill_active
-            && let Some(tool_name) = self.reflex_router.try_route(&message.content).await
+            && let Some(route) = self.reflex_router.try_route_match(&message.content).await
         {
+            let tool_name = route.tool_name;
             tracing::info!("Reflex fast-path: routing to compiled tool '{}'", tool_name);
             let mut job_ctx =
                 JobContext::with_user(&message.user_id, "reflex", "Reflex fast-path execution")
@@ -178,6 +179,21 @@ impl Agent {
             let params = serde_json::json!({"input": message.content});
             match self.execute_chat_tool(&tool_name, &params, &job_ctx).await {
                 Ok(output) => {
+                    if let Some(store) = self.store() {
+                        // Bump the canonical stored pattern (not the raw
+                        // input) so fuzzy/semantic/promoted hits also update
+                        // match_count and last_matched_at on the right row.
+                        // The router cache is loaded for `owner_id`, so the
+                        // matched pattern is always an owner-scoped row —
+                        // bumping with `message.user_id` would silently hit
+                        // 0 rows for any non-owner sender.
+                        if let Err(e) = store
+                            .bump_reflex_pattern_match(self.owner_id(), &route.matched_pattern)
+                            .await
+                        {
+                            tracing::debug!("Failed to bump reflex pattern match: {}", e);
+                        }
+                    }
                     return Ok(AgenticLoopResult::Response(output));
                 }
                 Err(e) => {

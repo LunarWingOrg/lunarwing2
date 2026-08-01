@@ -190,6 +190,8 @@ I18n.register('en', {
   'mcp.argsPlaceholder': 'Arguments, one per line',
   'mcp.envPlaceholder': 'Non-secret environment, KEY=VALUE per line',
   'mcp.envNonSecret': 'Environment values are stored as plain configuration. Do not enter secrets.',
+  'mcp.secretEnvPlaceholder': 'Secret environment references, KEY=secret_name per line',
+  'mcp.secretEnvWarning': 'Secret values are decrypted only at activation, then exposed to the unsandboxed MCP process. Install trusted code only.',
 
 
   // Skills Tab

@@ -27,7 +27,7 @@
 #
 # Usage (run as root on the new host):
 #   sudo ic/scripts/import-tenant.sh <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped]
-#        [--with-nanocode] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]
+#        [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]
 #        [--with-vision] [--docker-group]
 #        [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]
 # Encrypted bundles read their passphrase from KAWARIMI_PASS_FD, KAWARIMI_PASS,
@@ -40,7 +40,6 @@ NAME_OVERRIDE=""
 DO_START=false
 OLD_STOPPED=false
 WITH_DOCKER_GROUP=false
-WITH_NANOCODE=false
 WITH_PEBBLE=false
 WITH_OPENCODE=false
 WITH_KIMI=false
@@ -60,7 +59,7 @@ while [[ $# -gt 0 ]]; do
     --start)         DO_START=true; shift ;;
     --old-stopped)   OLD_STOPPED=true; shift ;;
     --docker-group)  WITH_DOCKER_GROUP=true; shift ;;
-    --with-nanocode) WITH_NANOCODE=true; shift ;;
+    --with-nanocode) printf 'error: Nanocode worker is retired; remove --with-nanocode\n' >&2; exit 2 ;;
     --with-pebble)   WITH_PEBBLE=true; shift ;;
     --with-opencode)   WITH_OPENCODE=true; shift ;;
     --with-kimi)       WITH_KIMI=true; shift ;;
@@ -279,6 +278,11 @@ inject_keys() {  # <manifest> <live_env> [skip_key]
     [[ "$line" == *=* ]] || continue
     key="${line%%=*}"
     [[ -n "$skip_key" && "$key" == "$skip_key" ]] && continue
+    case "$key" in
+      NANOCODE_MODEL|NANOCODE_BASE_URL)
+        note "discarded retired $key from legacy manifest"
+        continue ;;
+    esac
     grep -qxF "$line" "$live" 2>/dev/null && continue
     tmp="$(mktemp)"
     if grep -q "^${key}=" "$live"; then
@@ -358,7 +362,7 @@ reconcile_owner_scope() {
   note "owner-scope continuity verified for '$TENANT'"
 }
 
-[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] [--with-vision] [--docker-group] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
+[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] [--with-vision] [--docker-group] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
 [[ -f "$BUNDLE" ]] || die "bundle not found: $BUNDLE"
 [[ "$MAX_BUNDLE_BYTES" =~ ^[1-9][0-9]*$ && "$MAX_STATE_BYTES" =~ ^[1-9][0-9]*$ && "$MAX_STATE_ENTRIES" =~ ^[1-9][0-9]*$ ]] \
   || die "Kawarimi archive limits must be positive integers"
@@ -465,8 +469,6 @@ GATEWAY_HOST="$(manifest_value GATEWAY_HOST)"
 [[ -n "$GATEWAY_HOST" ]] || GATEWAY_HOST="$(manifest_value HTTP_HOST)"
 LLM_MODEL="$(manifest_value LLM_MODEL)"
 LLM_BASE_URL="$(manifest_value LLM_BASE_URL)"
-NANOCODE_MODEL="$(manifest_value NANOCODE_MODEL)"
-NANOCODE_BASE_URL="$(manifest_value NANOCODE_BASE_URL)"
 OPENCODE_MODEL="$(manifest_value OPENCODE_MODEL)"
 OPENCODE_BASE_URL="$(manifest_value OPENCODE_BASE_URL)"
 KIMI_MODEL="$(manifest_value KIMI_MODEL)"
@@ -485,8 +487,6 @@ $WITH_DOCKER_GROUP && add_args+=(--docker-group)
 [[ -n "$GATEWAY_HOST" ]] && add_args+=(--gateway-host "$GATEWAY_HOST")
 [[ -n "$LLM_MODEL" ]] && add_args+=(--llm-model "$LLM_MODEL")
 [[ -n "$LLM_BASE_URL" ]] && add_args+=(--llm-base-url "$LLM_BASE_URL")
-[[ -n "$NANOCODE_MODEL" ]] && add_args+=(--nanocode-model "$NANOCODE_MODEL")
-[[ -n "$NANOCODE_BASE_URL" ]] && add_args+=(--nanocode-base-url "$NANOCODE_BASE_URL")
 [[ -n "$OPENCODE_MODEL" ]] && add_args+=(--opencode-model "$OPENCODE_MODEL")
 [[ -n "$OPENCODE_BASE_URL" ]] && add_args+=(--opencode-base-url "$OPENCODE_BASE_URL")
 [[ -n "$KIMI_MODEL" ]] && add_args+=(--kimi-model "$KIMI_MODEL")
@@ -499,7 +499,6 @@ $WITH_DOCKER_GROUP && add_args+=(--docker-group)
 # started with --start would build its workers but never start them unless the
 # selection is recorded here too. Mirrors the --with-* flags passed to
 # build-tenant below. See PER_TENANT_WORKER_GATING.md.
-$WITH_NANOCODE && add_args+=(--with-nanocode)
 $WITH_PEBBLE  && add_args+=(--with-pebble)
 $WITH_OPENCODE && add_args+=(--with-opencode)
 $WITH_KIMI && add_args+=(--with-kimi)
@@ -514,7 +513,6 @@ VISION_ENVF="$LWROOT/env/vision.env"
 # ---- 2. build daemon + workers -----------------------------------------------
 banner "2/7  Build"
 build_args=(build-tenant "$TENANT" --with-wasm)
-$WITH_NANOCODE && build_args+=(--with-nanocode)
 $WITH_PEBBLE  && build_args+=(--with-pebble)
 $WITH_OPENCODE && build_args+=(--with-opencode)
 $WITH_KIMI && build_args+=(--with-kimi)

@@ -385,6 +385,8 @@
                     <textarea id="mcp-install-args" rows="3" data-i18n-placeholder="mcp.argsPlaceholder" placeholder="Arguments, one per line"></textarea>
                     <textarea id="mcp-install-env" rows="3" data-i18n-placeholder="mcp.envPlaceholder" placeholder="Non-secret environment, KEY=VALUE per line"></textarea>
                     <div class="mcp-env-note" data-i18n="mcp.envNonSecret">Environment values are stored as plain configuration. Do not enter secrets.</div>
+                    <textarea id="mcp-install-env-secrets" rows="3" data-i18n-placeholder="mcp.secretEnvPlaceholder" placeholder="Secret environment references, KEY=secret_name per line"></textarea>
+                    <div class="mcp-env-note" data-i18n="mcp.secretEnvWarning">Secret values are decrypted only at activation, then exposed to the unsandboxed MCP process. Install trusted code only.</div>
                   </div>
                   <button id="mcp-add-btn" data-i18n="mcp.add">Add</button>
                 </div>

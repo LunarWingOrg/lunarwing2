@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Persistent container worker for upstream opencode, following the same pattern as `lunarcode4lunarwing`. The WebSocket bridge is TypeScript/Bun and uses `@opencode-ai/sdk/v2` to communicate with the internal opencode headless server.
+Persistent container worker for upstream opencode. The WebSocket bridge is TypeScript/Bun and uses `@opencode-ai/sdk/v2` to communicate with the internal opencode headless server.
 
 ## Key Files
 
@@ -14,7 +14,7 @@ Persistent container worker for upstream opencode, following the same pattern as
 
 ## Protocol Compatibility
 
-The `lunarwing-agent-v1` WebSocket subprotocol (legacy alias `ironclaw-agent-v1` still accepted for one deprecation cycle) is shared with nanocode and pebble workers. Changes to `agent_comm_protocol.json` or envelope format must stay backward-compatible or be coordinated across all workers.
+The `lunarwing-agent-v1` WebSocket subprotocol (legacy alias `ironclaw-agent-v1` still accepted for one deprecation cycle) is shared with Pebble and Kimi Code workers. Changes to `agent_comm_protocol.json` or envelope format must stay backward-compatible or be coordinated across all workers.
 
 ## Build Notes
 

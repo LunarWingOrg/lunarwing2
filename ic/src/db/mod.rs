@@ -733,15 +733,20 @@ pub trait SettingsStore: Send + Sync {
 
 #[async_trait]
 pub trait ReflexStore: Send + Sync {
-    /// Find job descriptions that appear at least `min_count` times.
+    /// Find job descriptions that appear at least `min_count` times for a given user.
     /// Returns up to `limit` recurring patterns.
     async fn find_recurring_job_patterns(
         &self,
+        user_id: &str,
         min_count: i32,
         limit: i32,
     ) -> Result<Vec<String>, DatabaseError>;
 
     /// Insert or update a reflex pattern mapping.
+    ///
+    /// On conflict (pattern already known), the row is (re)activated with the
+    /// new `tool_name` and `compilation_attempts` is reset, so a successful
+    /// build always supersedes earlier failed attempts.
     async fn upsert_reflex_pattern(
         &self,
         user_id: &str,
@@ -771,6 +776,22 @@ pub trait ReflexStore: Send + Sync {
         &self,
         user_id: &str,
         normalized_pattern: &str,
+    ) -> Result<(), DatabaseError>;
+
+    /// Record a failed compilation attempt for a reflex pattern.
+    ///
+    /// Inserts the pattern with status `'failed'` when it is not yet known,
+    /// otherwise increments `compilation_attempts`. If the count reaches
+    /// `max_attempts`, the pattern is disabled (status set to `'disabled'`)
+    /// so the compiler stops retrying it. A later successful build reactivates
+    /// the row via `upsert_reflex_pattern`.
+    async fn record_reflex_compilation_failure(
+        &self,
+        user_id: &str,
+        normalized_pattern: &str,
+        original_pattern: &str,
+        tool_name: &str,
+        max_attempts: i32,
     ) -> Result<(), DatabaseError>;
 
     /// Prune (auto-disable) reflex patterns that haven't been matched
