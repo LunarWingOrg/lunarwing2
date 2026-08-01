@@ -77,6 +77,22 @@ b_map B1 gateway    degraded lunarwing
 b_map B2 xmpp       critical xmpp-bridge
 b_map B3 tensorzero critical tensorzero-gateway
 b_map B4 clickhouse critical clickhouse-server
+b_map B10 netbird   critical netbird
+
+# B11 — NETBIRD_SERVICE override retargets the netbird component's service.
+b11="$(sb)"; report "$b11" '{components:[{component:"netbird",status:"critical",metrics:{}}]}'
+oB11="$(run_dry "$b11" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false NETBIRD_SERVICE=netbird-custom)"
+assert_contains "$oB11" "would run: systemctl restart netbird-custom" "B11: NETBIRD_SERVICE override honored"
+
+# B12 — MT mode (REMEDY_LOGICAL=false): per-tenant logical components are
+# skipped, but the host-global netbird daemon is still remediated.
+b12="$(sb)"; report "$b12" '{components:[
+  {component:"gateway",status:"degraded",metrics:{}},
+  {component:"netbird",status:"critical",metrics:{}}]}'
+oB12="$(run_dry "$b12" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false SELF_HEAL_REMEDY_LOGICAL=false)"
+assert_contains "$oB12" "MT mode: skipping logical component 'gateway'"  "B12: MT mode skips per-tenant logical component"
+assert_absent   "$oB12" "would run: systemctl restart lunarwing"         "B12: MT mode does not restart base lunarwing"
+assert_contains "$oB12" "would run: systemctl restart netbird"           "B12: MT mode still remediates host-global netbird"
 
 b_skip() {  # b_skip <id> <component> <expected-log-fragment>
     local id="$1" comp="$2" frag="$3" s o

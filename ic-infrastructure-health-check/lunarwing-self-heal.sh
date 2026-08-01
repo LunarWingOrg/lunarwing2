@@ -354,6 +354,7 @@ declare -A SERVICE_MAP=(
     [tensorzero]="tensorzero-gateway"
     [clickhouse]="clickhouse-server"
     [lunarvision]="${LUNARVISION_SERVICE:-ocr-sidecar}"
+    [netbird]="${NETBIRD_SERVICE:-netbird}"
 )
 
 # Component → health-check script, for post-restart verification.
@@ -363,6 +364,7 @@ declare -A COMPONENT_CHECK_MAP=(
     [tensorzero]="health-tensorzero.sh"
     [clickhouse]="health-clickhouse.sh"
     [lunarvision]="health-lunarvision.sh"
+    [netbird]="health-netbird.sh"
 )
 
 # Components that represent features of another service, not their own service.
@@ -803,9 +805,20 @@ main() {
     local comp services svc
 
     # 1) Standard logical components (skipped in MT mode — see SELF_HEAL_REMEDY_LOGICAL).
-    if [[ "$REMEDY_LOGICAL" == "true" ]]; then
+    #    Host-global components are exempt from the MT skip: the netbird daemon is
+    #    a single host-level service that carries EVERY tenant's tunnel, so it
+    #    exists (and is remediable) even on multi-tenant hosts where the
+    #    per-tenant logical base services (lunarwing, xmpp-bridge, …) do not.
+    HOST_GLOBAL_COMPONENTS=" netbird "
+    if [[ "$REMEDY_LOGICAL" != "true" ]]; then
+        log "MT mode: logical-component remediation disabled (SELF_HEAL_REMEDY_LOGICAL=false); host-global components (${HOST_GLOBAL_COMPONENTS}) and init sub-units will still be remediated"
+    fi
     while IFS=$'\t' read -r comp cstatus; do
         [[ -n "$comp" ]] || continue
+        if [[ "$REMEDY_LOGICAL" != "true" && "$HOST_GLOBAL_COMPONENTS" != *" $comp "* ]]; then
+            [[ "$cstatus" != healthy ]] && log "MT mode: skipping logical component '$comp'"
+            continue
+        fi
         [[ "${NO_REMEDY[$comp]:-}" == "1" ]] && { [[ "$cstatus" != healthy ]] && log "SKIP: component '$comp' has no standalone service (feature/external)"; continue; }
         services="${SERVICE_MAP[$comp]:-}"
         [[ -n "$services" ]] || { [[ "$cstatus" != healthy ]] && log "WARNING: no service mapping for component '$comp'; skipping"; continue; }
@@ -819,9 +832,6 @@ main() {
             fi
         done
     done < <(jq -r '.components[] | "\(.component)\t\(.status)"' "$report" 2>/dev/null || true)
-    else
-        log "MT mode: logical-component remediation disabled (SELF_HEAL_REMEDY_LOGICAL=false); only init sub-units will be remediated"
-    fi
 
     # 2) Init-system sub-units (systemd/openrc/launchd). Healthy ones populate
     #    `healthy`; unhealthy ones become targets.
