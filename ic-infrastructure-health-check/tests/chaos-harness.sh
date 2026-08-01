@@ -150,6 +150,92 @@ assert_contains "$o" "not stable after restart (substate=auto-restart)" "CH14: v
 assert_ne "$(restarts_of "$c" "lunarwing-acme.service")" "0"  "CH14: a restart was attempted"
 assert_ne "$(state_of "$c")" "{}"                            "CH14: crash-looping unit kept in retry state (not cleared)"
 
+# ── Escalation page cooldown (SELF_HEAL_ESCALATE_COOLDOWN) ──────────────────
+# A flap→recover→reflap loop must not re-page on every cycle. These scenarios
+# count real notifier invocations via a mock pager (SELF_HEAL_NOTIFY_SCRIPT)
+# so the page path is exercised end-to-end without touching Gotify.
+
+# mk_notifier <sb> [exit-code] — mock pager that appends one line per call to
+# <sb>/pages.log and exits with the given code (default 0). Echoes its path.
+mk_notifier() {
+    local sb="$1" rc="${2:-0}"
+    cat > "$sb/notifier.sh" <<EOF
+#!/usr/bin/env bash
+echo "page \$1" >> "$sb/pages.log"
+exit $rc
+EOF
+    chmod +x "$sb/notifier.sh"
+    printf '%s' "$sb/notifier.sh"
+}
+pages_of() { wc -l < "$1/pages.log" 2>/dev/null || printf '0'; }
+
+# Drive ticks until lunarwing escalates (stuck service, bounded retries).
+escalate_lunarwing() {  # <sb> [ENV=VAL ...]
+    local c="$1"; shift
+    svc_down "$c" lunarwing; svc_stuck "$c" lunarwing; report "$c" "$GW"
+    local last="" _
+    for _ in 1 2 3 4; do
+        last="$(run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_MAX_RETRIES=3 \
+            SELF_HEAL_BACKOFF_BASE=0 "$@")"
+    done
+    printf '%s' "$last"
+}
+recover_lunarwing() {   # <sb> [ENV=VAL ...]
+    local c="$1"; shift
+    svc_up "$c" lunarwing; report "$c" "$HEALTHY_GW"
+    run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1 "$@" >/dev/null
+}
+
+echo "=== CH15a: reflap inside cooldown → second page suppressed, state still escalates ==="
+c="$(sb)"; mk_mockbin "$c"; n="$(mk_notifier "$c")"
+o="$(escalate_lunarwing "$c" SELF_HEAL_NOTIFY_SCRIPT="$n")"
+assert_contains "$o" "ESCALATING: lunarwing"           "CH15a: first outage escalates"
+assert_eq "$(pages_of "$c")" "1"                       "CH15a: first outage pages once"
+recover_lunarwing "$c"
+o="$(escalate_lunarwing "$c" SELF_HEAL_NOTIFY_SCRIPT="$n")"
+assert_contains "$o" "ESCALATING: lunarwing"           "CH15a: reflap re-escalates"
+assert_contains "$o" "COOLDOWN: page for lunarwing suppressed" "CH15a: repeat page suppressed by cooldown"
+assert_eq "$(pages_of "$c")" "1"                       "CH15a: no second page inside the window"
+assert_eq "$(state_of "$c" '.lunarwing.escalated')" "true" "CH15a: escalated state retained despite suppression"
+# Cooldown expiry: backdate the sidecar beyond the window, reflap again.
+echo $(( $(now) - 7200 )) > "$c/self-heal/.last_escalation_page.lunarwing"
+recover_lunarwing "$c"
+escalate_lunarwing "$c" SELF_HEAL_NOTIFY_SCRIPT="$n" >/dev/null
+assert_eq "$(pages_of "$c")" "2"                       "CH15a: page resumes after cooldown expiry"
+
+echo "=== CH15b: cooldown disabled (0) → every escalation pages ==="
+c="$(sb)"; mk_mockbin "$c"; n="$(mk_notifier "$c")"
+escalate_lunarwing "$c" SELF_HEAL_NOTIFY_SCRIPT="$n" SELF_HEAL_ESCALATE_COOLDOWN=0 >/dev/null
+recover_lunarwing "$c"
+escalate_lunarwing "$c" SELF_HEAL_NOTIFY_SCRIPT="$n" SELF_HEAL_ESCALATE_COOLDOWN=0 >/dev/null
+assert_eq "$(pages_of "$c")" "2"                       "CH15b: disabled cooldown pages every escalation"
+
+echo "=== CH15c: cooldown is per-service — two services each page once ==="
+c="$(sb)"; mk_mockbin "$c"; n="$(mk_notifier "$c")"
+svc_down "$c" lunarwing;      svc_stuck "$c" lunarwing
+svc_down "$c" xmpp-bridge;    svc_stuck "$c" xmpp-bridge
+report "$c" '{components:[{component:"gateway",status:"degraded",metrics:{}},
+  {component:"xmpp",status:"critical",metrics:{}}]}'
+for _ in 1 2 3 4; do
+    run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_MAX_RETRIES=3 \
+        SELF_HEAL_BACKOFF_BASE=0 SELF_HEAL_NOTIFY_SCRIPT="$n" >/dev/null
+done
+assert_eq "$(state_of "$c" '.lunarwing.escalated')"   "true" "CH15c: lunarwing escalated"
+assert_eq "$(state_of "$c" '."xmpp-bridge".escalated')" "true" "CH15c: xmpp-bridge escalated"
+assert_eq "$(pages_of "$c")" "2"                       "CH15c: each service pages once (no cross-service suppression)"
+
+echo "=== CH15d: failed page does not arm the cooldown ==="
+c="$(sb)"; mk_mockbin "$c"; n="$(mk_notifier "$c" 1)"   # notifier always fails
+escalate_lunarwing "$c" SELF_HEAL_NOTIFY_SCRIPT="$n" >/dev/null
+assert_eq "$(pages_of "$c")" "1"                       "CH15d: failed page attempted once"
+[[ -f "$c/self-heal/.last_escalation_page.lunarwing" ]] \
+    && bad "CH15d: no cooldown sidecar after failed page" "sidecar exists: $(cat "$c/self-heal/.last_escalation_page.lunarwing")" \
+    || ok "CH15d: no cooldown sidecar after failed page"
+recover_lunarwing "$c"
+escalate_lunarwing "$c" SELF_HEAL_NOTIFY_SCRIPT="$n" >/dev/null
+assert_eq "$(pages_of "$c")" "2"                       "CH15d: next escalation retries the page (no suppression)"
+
+
 echo
 echo "Note: CH7 (DNS failure) is modeled by CH6's stuck-service escalation path."
 echo "Note: CH8 (disk full) requires real disk-fault injection and is out of scope"

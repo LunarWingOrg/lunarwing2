@@ -500,7 +500,6 @@ run_dry "$m2" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HE
 assert_eq "$(state_of "$m2" '.lunarwing.retries')" "1" "M2: dry-run still tracks retry state"
 
 echo "=== Section N: CLI argument validation ==="
-
 # N1 — unknown flag → die.
 n1="$(sb)"
 oN1="$(run_raw "$n1" LUNARWING_SERVICE_MANAGER=systemd -- --bogus)"; RC=$?
@@ -523,6 +522,29 @@ assert_contains "$oN3" "grace=4"         "N3: --grace-checks parsed"
 assert_contains "$oN3" "backoff=linear"  "N3: --backoff-strategy parsed"
 assert_contains "$oN3" "base=123s"       "N3: --backoff-base parsed"
 assert_contains "$oN3" "verify=false"    "N3: --verify-health parsed"
+
+echo "=== Section P: Escalation cooldown helpers ==="
+# The end-to-end page path is chaos-only (dry-run never pages, see CH15); these
+# cover the pure helper that keeps hostile unit names inside the state dir.
+
+# P1 — ordinary unit names map inside the state dir, dotfile-prefixed.
+p1="$(sb)"
+assert_eq "$(src_fn SELF_HEAL_STATE_DIR="$p1/self-heal" -- _cooldown_file "lunarwing-acme.service")" \
+    "$p1/self-heal/.last_escalation_page.lunarwing-acme.service" "P1: sidecar path for a normal unit"
+
+# P2 — path traversal in a report-supplied unit name cannot escape the state dir.
+p2="$(src_fn SELF_HEAL_STATE_DIR=/state -- _cooldown_file "evil/../../etc/cron.d/x")"
+assert_eq "$p2" "/state/.last_escalation_page.evil_.._.._etc_cron.d_x" "P2: traversal chars replaced with underscores"
+assert_absent "$p2" "/etc/" "P2: no traversal target survives sanitization"
+
+# P3 — config banner exposes the cooldown knob.
+p3="$(sb)"; report "$p3" "$GW"
+oP3="$(run_raw "$p3" LUNARWING_SERVICE_MANAGER=systemd GOTIFY_TOKEN='' SELF_HEAL_ESCALATE_COOLDOWN=900 -- \
+    --dry-run --report "$p3/report.json" --backoff 0)"
+assert_contains "$oP3" "escalate-cooldown=900s" "P3: SELF_HEAL_ESCALATE_COOLDOWN parsed into config banner"
+oP3b="$(run_raw "$p3" LUNARWING_SERVICE_MANAGER=systemd GOTIFY_TOKEN='' SELF_HEAL_ESCALATE_COOLDOWN=off -- \
+    --dry-run --report "$p3/report.json" --backoff 0)"
+assert_contains "$oP3b" "escalate-cooldown=0s" "P3: 'off' normalizes to 0 (disabled)"
 
 finish
 
