@@ -7,6 +7,7 @@ mod config;
 pub mod omemo;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2925,33 +2926,17 @@ async fn extract_inbound_attachments(
         };
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(OOB_DOWNLOAD_TIMEOUT_SECS))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("Failed to build HTTP client for OOB download: {}", e);
-            // Still return the recognized URLs so the caller strips key- and
-            // credential-bearing URLs from content even though nothing was
-            // downloaded.
-            return InboundAttachmentExtraction {
-                attachments: Vec::new(),
-                recognized_urls: urls.into_iter().map(|(u, _)| u).collect(),
-            };
-        }
-    };
-
     let recognized_urls: Vec<String> = urls.iter().map(|(u, _)| u.clone()).collect();
 
     // Download up to MAX_CONCURRENT_OOB_DOWNLOADS files at once so a single slow
     // URL can't serialize the whole batch (and stall the client event loop) for
-    // N * timeout. `buffered` keeps the results in stanza order.
+    // N * timeout. `buffered` keeps the results in stanza order. Each download
+    // builds its own egress-policy-checked client (see
+    // `policy_checked_download_client`).
     let attachments = futures::stream::iter(urls)
         .map(|(url, _desc)| {
-            let client = &client;
             async move {
-                match download_oob_file(client, &url).await {
+                match download_oob_file(&url).await {
                     Ok(attachment) => Some(attachment),
                     Err(e) => {
                         // The raw URL can carry an XEP-0454 key fragment or
@@ -3006,6 +2991,106 @@ fn redact_url_for_log(raw: &str) -> String {
             out
         }
         Err(_) => "<invalid-url>".to_string(),
+    }
+}
+
+/// `ALLOW_PRIVATE_IPS=1` opts out of the public-IP requirement and permits
+/// plain `http` for local-dev / private-network harness setups, matching the
+/// existing WASM host-function guard in `tools/wasm/wrapper.rs`.
+fn allow_private_attachment_ips() -> bool {
+    std::env::var("ALLOW_PRIVATE_IPS").ok().as_deref() == Some("1")
+}
+
+/// Validate a sender-supplied attachment URL against the egress policy and
+/// build an HTTP client for the fetch. Guards against SSRF from admitted but
+/// untrusted XMPP peers:
+///
+/// - only `https` URLs without embedded credentials are accepted
+///   (`aesgcm://` callers pass their derived `https://` fetch URL); plain
+///   `http` requires `allow_private` (local-dev opt-in)
+/// - the hostname is resolved up front and every candidate address must be a
+///   globally routable unicast IP; the client is pinned to those validated
+///   addresses so a DNS rebind between validation and connect can't swap in
+///   an internal address
+/// - redirects are disabled and environment proxies ignored, so an initially
+///   innocent URL can't be retargeted at internal services and ambient proxy
+///   config can't reroute the fetch
+async fn policy_checked_download_client(
+    url: &str,
+    allow_private: bool,
+) -> Result<reqwest::Client, String> {    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid attachment URL: {e}"))?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" if allow_private => {}
+        scheme => {
+            return Err(format!(
+                "attachment URL scheme {scheme:?} rejected (https required)"
+            ));
+        }
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("attachment URLs with embedded credentials are rejected".to_string());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "attachment URL has no host".to_string())?
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "attachment URL has no usable port".to_string())?;
+
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| format!("failed to resolve attachment host: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err("attachment host resolved to no addresses".to_string());
+    }
+    if !allow_private && addrs.iter().any(|a| !is_public_attachment_ip(a.ip())) {
+        return Err("attachment host resolves to a non-public address".to_string());
+    }
+
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(OOB_DOWNLOAD_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .resolve_to_addrs(&host, &addrs)
+        .build()
+        .map_err(|e| format!("failed to build attachment HTTP client: {e}"))
+}
+
+/// True only for globally routable unicast addresses. Loopback, private,
+/// link-local, carrier-grade NAT, unique-local, unspecified, broadcast, and
+/// multicast addresses (including IPv4-mapped IPv6 forms) are not acceptable
+/// attachment destinations.
+fn is_public_attachment_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 100.64.0.0/10 carrier-grade NAT (RFC 6598) is not covered by
+            // Ipv4Addr::is_private.
+            let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || is_cgnat)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_public_attachment_ip(IpAddr::V4(mapped));
+            }
+            let seg0 = v6.segments()[0];
+            let is_unique_local = (seg0 & 0xfe00) == 0xfc00; // fc00::/7
+            let is_link_local = (seg0 & 0xffc0) == 0xfe80; // fe80::/10
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || is_unique_local
+                || is_link_local)
+        }
     }
 }
 
@@ -3087,15 +3172,14 @@ where
 /// Download a single file from an OOB URL and return as an IncomingAttachment.
 ///
 /// `aesgcm://` (XEP-0454) URLs are fetched over https and AES-256-GCM-decrypted;
-/// every other http(s) URL is downloaded as-is.
-async fn download_oob_file(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<IncomingAttachment, String> {
+/// every other URL is downloaded as-is. All fetches go through
+/// `policy_checked_download_client` (SSRF/egress policy).
+async fn download_oob_file(url: &str) -> Result<IncomingAttachment, String> {
     if url.starts_with("aesgcm://") {
-        return download_aesgcm_file(client, url).await;
+        return download_aesgcm_file(url).await;
     }
 
+    let client = policy_checked_download_client(url, allow_private_attachment_ips()).await?;
     let response = client
         .get(url)
         .send()
@@ -3153,11 +3237,11 @@ async fn download_oob_file(
 }
 
 /// Download and AES-256-GCM-decrypt an `aesgcm://` (XEP-0454) media URL.
-async fn download_aesgcm_file(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<IncomingAttachment, String> {
+async fn download_aesgcm_file(url: &str) -> Result<IncomingAttachment, String> {
     let (https_url, iv, key) = parse_aesgcm_url(url)?;
+    // Encryption of the payload does not remove the SSRF capability of the
+    // sender-chosen fetch URL — the same egress policy applies.
+    let client = policy_checked_download_client(&https_url, allow_private_attachment_ips()).await?;
 
     let response = client
         .get(&https_url)
@@ -3731,6 +3815,95 @@ mod tests {
         assert!(!stripped.contains(&url));
         assert!(!stripped.contains(&fragment));
         assert_eq!(stripped, "here you go  enjoy");
+    }
+
+    #[test]
+    fn public_attachment_ip_classification() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let rejected = [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), // cloud metadata
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),     // CGNAT
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            "fe80::1".parse().unwrap(),
+            "fc00::1".parse().unwrap(),
+            "ff02::1".parse().unwrap(),
+            "::ffff:127.0.0.1".parse().unwrap(),
+            "::ffff:10.1.2.3".parse().unwrap(),
+        ];
+        for ip in rejected {
+            assert!(!is_public_attachment_ip(ip), "{ip} must be rejected");
+        }
+        let accepted = [
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            "2606:4700:4700::1111".parse().unwrap(),
+        ];
+        for ip in accepted {
+            assert!(is_public_attachment_ip(ip), "{ip} must be accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn download_policy_rejects_unsafe_destinations() {
+        // Plain http requires the local-dev opt-in.
+        assert!(
+            policy_checked_download_client("https://8.8.8.8/file.bin", false)
+                .await
+                .is_ok()
+        );
+        assert!(
+            policy_checked_download_client("http://8.8.8.8/file.bin", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            policy_checked_download_client("http://8.8.8.8/file.bin", true)
+                .await
+                .is_ok()
+        );
+
+        // Non-http(s) schemes and embedded credentials are always rejected.
+        for bad in [
+            "ftp://8.8.8.8/file.bin",
+            "file:///etc/passwd",
+            "https://user:pass@8.8.8.8/file.bin",
+            "https://user@8.8.8.8/file.bin",
+        ] {
+            assert!(
+                policy_checked_download_client(bad, true).await.is_err(),
+                "{bad} must be rejected"
+            );
+        }
+
+        // Loopback / private / link-local destinations are rejected without
+        // the opt-in (literal IPs need no DNS) and allowed with it.
+        for internal in [
+            "https://127.0.0.1:8443/file.bin",
+            "https://10.0.0.5/file.bin",
+            "https://192.168.0.1/file.bin",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/file.bin",
+        ] {
+            assert!(
+                policy_checked_download_client(internal, false)
+                    .await
+                    .is_err(),
+                "{internal} must be rejected"
+            );
+        }
+        assert!(
+            policy_checked_download_client("http://127.0.0.1:8088/file.bin", true)
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
