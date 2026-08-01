@@ -350,34 +350,40 @@ impl ReflexRouter {
             }
         };
 
-        let embeddings = self.pattern_embeddings.read().await;
-        if embeddings.is_empty() {
-            return None;
-        }
-
-        let mut best_pattern: Option<&str> = None;
-        let mut best_score: f64 = 0.0;
-
-        for (pattern, emb) in embeddings.iter() {
-            let score = cosine_similarity(&query_embedding, emb);
-            if score > best_score {
-                best_score = score;
-                best_pattern = Some(pattern);
+        // Scope the embeddings read guard: `refresh()` acquires
+        // patterns.write → embeddings.write, so holding embeddings while
+        // acquiring patterns would invert the lock order and could deadlock.
+        let (best_pattern, best_score) = {
+            let embeddings = self.pattern_embeddings.read().await;
+            if embeddings.is_empty() {
+                return None;
             }
-        }
+
+            let mut best_pattern: Option<String> = None;
+            let mut best_score: f64 = 0.0;
+
+            for (pattern, emb) in embeddings.iter() {
+                let score = cosine_similarity(&query_embedding, emb);
+                if score > best_score {
+                    best_score = score;
+                    best_pattern = Some(pattern.clone());
+                }
+            }
+            (best_pattern, best_score)
+        };
 
         if best_score >= self.semantic_threshold {
             let patterns = self.patterns.read().await;
-            if let Some(tool) = best_pattern.and_then(|p| patterns.get(p).cloned()) {
+            if let Some(tool) = best_pattern.as_ref().and_then(|p| patterns.get(p).cloned()) {
                 tracing::debug!(
                     "Reflex semantic match: '{}' ≈ '{}' (cosine: {:.3})",
                     normalized,
-                    best_pattern.unwrap_or("?"),
+                    best_pattern.as_deref().unwrap_or("?"),
                     best_score
                 );
                 return Some(FuzzyMatch {
                     tool_name: tool,
-                    matched_pattern: best_pattern.unwrap_or_default().to_string(),
+                    matched_pattern: best_pattern.unwrap_or_default(),
                     score: best_score,
                 });
             }
@@ -465,6 +471,11 @@ impl ReflexRouter {
             return Some(best);
         }
 
+        // Release the fuzzy-scan read guard before the semantic fallback —
+        // re-acquiring patterns below while this guard is alive could
+        // self-deadlock if a writer (refresh) queues in between.
+        drop(patterns);
+
         // 3. Semantic fallback
         if let Some(provider) = self.embedding_provider.as_ref() {
             let query_embedding = match provider.embed(&normalized).await {
@@ -475,21 +486,27 @@ impl ReflexRouter {
                 }
             };
 
-            let embeddings = self.pattern_embeddings.read().await;
-            if embeddings.is_empty() {
-                return None;
-            }
-
-            let mut best_pattern: Option<String> = None;
-            let mut best_score: f64 = 0.0;
-
-            for (pattern, emb) in embeddings.iter() {
-                let score = cosine_similarity(&query_embedding, emb);
-                if score > best_score {
-                    best_score = score;
-                    best_pattern = Some(pattern.clone());
+            // Scope the embeddings read guard (see semantic_route: refresh()
+            // takes patterns.write → embeddings.write, so the inverse order
+            // here would risk an ABBA deadlock).
+            let (best_pattern, best_score) = {
+                let embeddings = self.pattern_embeddings.read().await;
+                if embeddings.is_empty() {
+                    return None;
                 }
-            }
+
+                let mut best_pattern: Option<String> = None;
+                let mut best_score: f64 = 0.0;
+
+                for (pattern, emb) in embeddings.iter() {
+                    let score = cosine_similarity(&query_embedding, emb);
+                    if score > best_score {
+                        best_score = score;
+                        best_pattern = Some(pattern.clone());
+                    }
+                }
+                (best_pattern, best_score)
+            };
 
             if best_score >= self.semantic_threshold {
                 let patterns = self.patterns.read().await;
