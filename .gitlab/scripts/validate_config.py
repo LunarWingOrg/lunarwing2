@@ -30,6 +30,7 @@ IMAGE_PATTERN = re.compile(r"@sha256:[0-9a-f]{64}$")
 DIGEST_PATTERN = re.compile(r"sha256:([0-9a-f]{64})")
 DIRECT_CARGO_PATTERN = re.compile(r"(?:^|[;&|]\s*|\s)cargo(?:\s|$)")
 RUST_IMAGE_RE = re.compile(r"rust:([^@]+)@sha256:([0-9a-f]{64})")
+VARIABLE_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def load_yaml(path: pathlib.Path) -> dict:
@@ -48,14 +49,41 @@ def image_name(image: object) -> str | None:
     return None
 
 
-def extract_rust_image(defaults: dict, job_name: str) -> tuple[str, str] | None:
+def collect_variables(configs: list[tuple[pathlib.Path, dict]]) -> dict[str, str]:
+    variables: dict[str, str] = {}
+    for _path, config in configs:
+        declared = config.get("variables")
+        if not isinstance(declared, dict):
+            continue
+        for key, value in declared.items():
+            if isinstance(value, str):
+                variables[key] = value
+    return variables
+
+
+def resolve_variables(value: str, variables: dict[str, str], depth: int = 5) -> str:
+    result = value
+    for _ in range(depth):
+        replaced = VARIABLE_REF_PATTERN.sub(
+            lambda match: variables.get(match.group(1) or match.group(2), match.group(0)),
+            result,
+        )
+        if replaced == result:
+            break
+        result = replaced
+    return result
+
+
+def extract_rust_image(
+    defaults: dict, job_name: str, variables: dict[str, str]
+) -> tuple[str, str] | None:
     rust_job = defaults.get(job_name, {})
     if not isinstance(rust_job, dict):
         return None
     image = image_name(rust_job.get("image"))
     if not image:
         return None
-    match = RUST_IMAGE_RE.search(image)
+    match = RUST_IMAGE_RE.search(resolve_variables(image, variables))
     if not match:
         return None
     return match.group(1), match.group(2)
@@ -77,6 +105,7 @@ def main() -> int:
             configs.append(path)
 
     loaded_configs = [(path, load_yaml(path)) for path in configs]
+    merged_variables = collect_variables(loaded_configs)
     workflow = dict(loaded_configs[1][1].get("workflow", {}))
     workflow_rules = workflow.get("rules", [])
     conditions = "\n".join(str(rule.get("if", "")) for rule in workflow_rules)
@@ -88,8 +117,13 @@ def main() -> int:
             if not isinstance(value, dict):
                 continue
             image = image_name(value.get("image"))
-            if image and not IMAGE_PATTERN.search(image):
-                errors.append(f"{path.relative_to(ROOT)}:{name} uses unpinned image {image}")
+            if image:
+                resolved_image = resolve_variables(image, merged_variables)
+                if not IMAGE_PATTERN.search(resolved_image):
+                    errors.append(
+                        f"{path.relative_to(ROOT)}:{name} uses unpinned image "
+                        f"{image} (resolved: {resolved_image})"
+                    )
 
             script = value.get("script", [])
             if isinstance(script, str):
@@ -106,8 +140,8 @@ def main() -> int:
 
     defaults_path = ROOT / ".gitlab" / "ci" / "defaults.yml"
     defaults = load_yaml(defaults_path)
-    rust_image = extract_rust_image(defaults, ".rust-job")
-    msrv_image = extract_rust_image(defaults, ".rust-msrv-job")
+    rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
+    msrv_image = extract_rust_image(defaults, ".rust-msrv-job", merged_variables)
     if rust_image is None:
         errors.append("could not extract Rust image tag/digest from defaults.yml .rust-job")
     if msrv_image is None:
