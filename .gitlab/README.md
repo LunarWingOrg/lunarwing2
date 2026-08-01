@@ -45,6 +45,73 @@ Pinned images:
 `ci-config` enforces Rust 1.96.1 across `ic/Cargo.toml` `rust-version`,
 `ic/rust-toolchain.toml`, and both primary/MSRV image tags. It also requires
 both Rust jobs to use same digest-pinned image and keeps README digest in sync.
+Job images are declared through the `CI_LINT_IMAGE`, `CI_RUST_IMAGE`, and
+`CI_GITLEAKS_IMAGE` variables in `defaults.yml`; `ci-config` expands those
+variables before checking pins, so overrides must stay digest-pinned too.
+
+## Docker Hub pull rate limits
+
+Symptom — a job fails before any test runs, with a log like:
+
+```
+ERROR: Job failed: failed to pull image "docker.io/library/python:3.12-slim-bookworm@sha256:..."
+  with specified policies [always]: Error response from daemon: toomanyrequests:
+  You have reached your unauthenticated pull rate limit.
+```
+
+This is a **runner/infrastructure failure, not a test defect**. Docker Hub
+caps anonymous pulls at 100 per 6 hours per public egress IPv4. Our runners
+pull without Docker Hub credentials, so every container on the runner host
+(and anything else behind the same NAT IP) shares that quota. Once it is
+exhausted, the Docker executor cannot fetch the job image and GitLab Runner
+(`manager.go` in its source) aborts the job before the checkout or any
+script executes. Because jobs share base images, the failures cluster: the
+lint/validate jobs (`ci-config`, `shell-syntax`, `python-syntax`,
+`registry-json`, `version-policy`, `panic-policy`, `release-version`) all
+use the `.lint-job` Python image, and the Rust jobs (`rust-check-*`,
+`wasm-channel-test-artifacts`, `rust-test-*`, `cargo-deny`) all use the
+`.rust-job` image — one exhausted quota takes down both groups at once.
+
+Immediate action: retrying inside the 6-hour window does not help (the
+built-in `runner_system_failure` retry already fired and failed the same
+way). Wait for the quota window to reset, then retry the pipeline.
+
+Permanent mitigations, in order of preference:
+
+1. **Authenticate runner pulls to Docker Hub.** A free Docker Hub account
+   gets its own per-account quota instead of the shared per-IP anonymous
+   one. Add `DOCKER_AUTH_CONFIG` to the runner host's `config.toml`
+   (`environment = ["DOCKER_AUTH_CONFIG=..."]` under `[[runners]]`), never
+   as a CI variable — credentials stay on the runner host per the
+   secret-handling rules above.
+2. **Mirror the pinned images into the project container registry** and
+   override the image variables. The registry from
+   `docs/ops/GITLAB_CONTAINER_REGISTRY.md` is already live. From any host
+   with podman/docker and a `read_registry`+`write_registry` PAT, for each
+   of the three pinned images:
+
+   ```bash
+   podman pull  docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
+   podman tag   docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b \
+                registry.git.lunarwing.org/lunarwing/lunarwing2/ci/python:3.12-slim-bookworm
+   podman push  registry.git.lunarwing.org/lunarwing/lunarwing2/ci/python:3.12-slim-bookworm
+   ```
+
+   Digests are content-addressed, so the mirrored copy keeps the same
+   `@sha256` pin. Then set project/group CI variables (unprotected,
+   unmasked — image names are not secrets), e.g.
+   `CI_LINT_IMAGE=registry.git.lunarwing.org/lunarwing/lunarwing2/ci/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b`
+   and likewise for `CI_RUST_IMAGE` / `CI_GITLEAKS_IMAGE`. Runners
+   authenticate to the GitLab registry automatically with the job token, so
+   pulls stop counting against Docker Hub entirely. When bumping an image,
+   update the pinned default in `defaults.yml` and re-mirror.
+3. **GitLab Dependency Proxy** (requires an admin to enable it instance-
+   wide): prefix image names with
+   `${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}` instead of option 2's manual
+   mirror. Equivalent effect; not currently enabled on this instance.
+
+If runner image allowlists are enabled (see above), add the mirrored
+registry paths to the allowlist when adopting option 2.
 
 ## Required jobs
 
