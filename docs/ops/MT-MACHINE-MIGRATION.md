@@ -141,7 +141,10 @@ sudo ic/scripts/export-tenant.sh <tenant>            # prompts before stopping s
 ```
 The tenant is now stopped on the old host (PostgreSQL left up for the dump; you may
 stop it too). Use `--no-quiesce` only if you've already stopped the daemon+bridge
-yourself.
+yourself. Export fails closed if systemd-user/OpenRC state cannot prove both
+writers stopped. Export holds tenant lifecycle lock through final bundle seal.
+Custom `--out-dir` must be under root-owned directories with no group/world write;
+shared directories such as `/tmp` are rejected.
 
 ### 2. Transfer the bundle securely
 ```bash
@@ -159,8 +162,11 @@ sudo ic/scripts/import-tenant.sh /var/lib/lunarwing-migrate/<tenant>-migrate-<st
 ```
 Runs `add-tenant --no-health` → `build-tenant` → injects the carried secrets (incl.
 `SECRETS_MASTER_KEY`, verified verbatim) → `restore-tenant` (DB) → restores `state/`
-(OMEMO) → `install-wasm` → runs the read-only WeeChat migration preflight → starts the
-daemon. `--with-opencode` and `--with-toolchains` are passed through to
+(OMEMO) → restores structured DarkIRC contacts when present → `install-wasm` →
+runs the read-only WeeChat migration preflight → starts the daemon. Import holds
+same per-tenant lifecycle lock across provision, restore, and optional start, and
+performs tenant-owned atomic env/state destination writes. `--with-opencode` and
+`--with-toolchains` are passed through to
 `build-tenant`. `--with-vision` builds the LunarVision sidecar image before start; if
 the bundle contains `manifest-vision.env`, import injects the carried `VL_URL`,
 `VL_MODEL` into the target `vision.env`. Import deliberately ignores auth tokens

@@ -1,22 +1,19 @@
 # Secure Automated DarkIRC Key Exchange
 
-> **Current status (2026-07-29): OPEN / PLANNED in the release tree.** No
-> proposed key-exchange commands, ledger, journal, or web surfaces exist in the
-> merged codebase (verified: `ic/scripts/lunarwing-mt-admin.sh` has no exchange
-> verbs). The Phase 0 prerequisite is also open: DarkIRC config regeneration
-> can still replace the whole TOML instead of preserving manually managed
-> contacts.
+> **Current status (2026-08-01): PARTIAL IMPLEMENTATION.** Current release
+> branch implements Phase 0/1 and Stage A: contact-preserving baseline updates,
+> typed helper, compatibility attestation, stable tenant scopes, bounded pending
+> state, public offer/respond/complete/cancel flow, durable replay tombstones,
+> crash recovery, writer locks, and structured machine migration. Activation is
+> deliberately deferred.
 >
-> **Unmerged partial work exists** — goals item #20 landed Phase 1 + Stage A
-> exchange verbs (commit `49736ad`) and Stage C apply/confirm-roundtrip verbs
-> (`506eb7b`) on branch `rarity/item-20-20260722-1501`; see also
-> `darkirckeyex/aragents/v2.0.3.0` and `feat/darkirc-key-exchange-v1`. Item #29
-> records that item #20 was **not** completed/merged. Any future implementation
-> should start by salvaging those branches rather than starting greenfield.
+> Stage B and later work remains open: local activation health gates, peer
+> verification, rollback, rotation, revocation, same-host pairing, web/QR
+> delivery, and trusted-channel automation. No web surface exists. See
+> `DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md` for stage boundaries.
 
-**Status:** Proposal only. None of the commands, state files, APIs, or web
-surfaces described here exist yet (in the merged tree — see unmerged branches
-above).
+**Status:** Phase 0/1 + Stage A implemented and locally verified; later stages
+open and must not be inferred from existing state enums.
 
 **Scope:** LunarWing multi-tenant DarkIRC deployments managed through
 `ic/scripts/lunarwing-mt-admin.sh`.
@@ -476,12 +473,14 @@ implicit update. The caller must use the rotation flow.
 
 ### CLI Flow
 
-The following syntax is a proposed contract, not an existing implementation:
+Stage A subset below is implemented for `prepare`, `respond`, deferred
+`complete`, `list`, `status`, `cancel`, and `doctor`. `apply`, strict health,
+round-trip confirmation, and later lifecycle commands remain proposed:
 
 ```text
 lunarwing-mt-admin.sh darkirc-contact prepare <tenant> <contact> --out <offer.json> [--expires <duration>] [--json]
 lunarwing-mt-admin.sh darkirc-contact respond <tenant> <contact> --in <offer.json> --out <response.json> --expect-peer-fingerprint <sha256> [--json]
-lunarwing-mt-admin.sh darkirc-contact complete <tenant> <contact> (--in <response.json> | --exchange-id <id>) --expect-peer-fingerprint <sha256> [--defer-apply] [--json]
+lunarwing-mt-admin.sh darkirc-contact complete <tenant> <contact> --exchange-id <id> --in <response.json> --expect-peer-fingerprint <sha256> [--json]
 lunarwing-mt-admin.sh darkirc-contact apply <tenant> <contact> [--json]
 lunarwing-mt-admin.sh darkirc-contact confirm-roundtrip <tenant> <contact> --exchange-id <id> --expect-peer-fingerprint <sha256> [--json]
 lunarwing-mt-admin.sh darkirc-contact list <tenant> [--json]
@@ -491,9 +490,9 @@ lunarwing-mt-admin.sh darkirc-contact doctor (<tenant> | --all) [--json]
 lunarwing-mt-admin.sh darkirc-health <tenant> --strict [--json]
 ```
 
-`prepare`, `respond`, `complete`, `list`, `status`, `cancel`, `doctor`, `apply`,
-`confirm-roundtrip`, and strict health verification are the first-release
-surface. Proposed later names are `darkirc-contact rotate`,
+Implemented Stage A surface is `prepare`, `respond`, deferred `complete`, `list`,
+`status`, `cancel`, and `doctor`. Stage B/C adds `apply`, `confirm-roundtrip`,
+and strict health verification. Proposed later names are `darkirc-contact rotate`,
 `darkirc-contact revoke`, `darkirc-contact pair-local`,
 `darkirc-contact resolve-overdue`, and `restart-darkirc`.
 
@@ -524,10 +523,11 @@ An operator flow is:
    and `--yes` are not accepted. Unattended mode requires
    `--expect-peer-fingerprint` from a separate trust source. Transcript binding
    is recomputed and checked internally from the two artifacts.
-5. The helper installs the contact transactionally. `apply` activates it
+5. The helper installs contact transactionally in `Installed` state. Future
+   Stage B `apply` activates it
    through mt-admin and reports `LocallyActivated` after service health. Only a
    successful bidirectional encrypted DM check can mark it `PeerVerified`.
-6. After both operators observe a bidirectional encrypted DM round trip, each
+6. Future Stage C: after both operators observe a bidirectional encrypted DM round trip, each
    records that fact with `confirm-roundtrip`. This is an explicit operator
    attestation, not a claim inferred from service health. It advances
    `PeerVerified` and triggers the applicable rollback cleanup.

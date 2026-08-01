@@ -126,12 +126,38 @@ else
   exit 2
 fi
 GETENT
-  chmod +x "$work/bin/getent"
+  cat >"$work/bin/install" <<'INSTALL'
+#!/usr/bin/env bash
+target="${!#}"
+if [[ "${1:-}" == "-d" && "$target" == "${LUNARWING_MT_LIFECYCLE_LOCK_DIR:?}" ]]; then
+  mkdir -p -- "$target"
+  chmod 0700 -- "$target"
+else
+  exec /usr/bin/install "$@"
+fi
+INSTALL
+  cat >"$work/bin/stat" <<'STAT'
+#!/usr/bin/env bash
+target="${!#}"
+if [[ "${1:-}" == "-c" && "${2:-}" == "%u:%a" \
+  && "$target" == "${LUNARWING_MT_LIFECYCLE_LOCK_DIR:?}" ]]; then
+  printf '0:700\n'
+else
+  exec /usr/bin/stat "$@"
+fi
+STAT
+  cat >"$work/bin/sudo" <<'SUDO'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+exec "$@"
+SUDO
+  chmod +x "$work/bin/getent" "$work/bin/install" "$work/bin/stat" "$work/bin/sudo"
 }
 
 echo "=== import-tenant dry-run flag passthrough ==="
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+export LUNARWING_MT_LIFECYCLE_LOCK_DIR="$tmp/lifecycle-locks"
 make_bundle "$tmp"
 make_test_scripts "$tmp"
 printf '{"tenants":{}}\n' >"$tmp/ports.json"
@@ -158,6 +184,33 @@ assert_contains "preserves nanocode base URL override" "$output" "--nanocode-bas
 assert_contains "builds vision sidecar when requested" "$output" "build-vision-sidecar"
 assert_contains "injects vision manifest" "$output" "manifest-vision.env ->"
 assert_contains "runs WeeChat preflight before start" "$output" "lunarwing-weechat-preflight.sh kawarimi"
+
+echo "=== structured DarkIRC migration wiring ==="
+darkirc_tmp="$(mktemp -d)"
+make_bundle "$darkirc_tmp"
+printf 'darkirc_scope_id=fedcba9876543210fedcba9876543210\n' >>"$darkirc_tmp/bundle-src/meta.txt"
+printf '{}\n' >"$darkirc_tmp/bundle-src/darkirc-contacts-v1.json"
+tar cf "$darkirc_tmp/kawarimi.tar" -C "$darkirc_tmp/bundle-src" .
+make_test_scripts "$darkirc_tmp"
+printf '{"tenants":{}}\n' >"$darkirc_tmp/ports.json"
+darkirc_output="$(
+  PATH="$darkirc_tmp/bin:$PATH" \
+  LUNARWING_PORTS_REGISTRY="$darkirc_tmp/ports.json" \
+  KAWARIMI_TEST_WORK="$darkirc_tmp" \
+  bash "$darkirc_tmp/scripts/import-tenant.sh" "$darkirc_tmp/kawarimi.tar" \
+    --dry-run --yes 2>&1
+)" || {
+  status=$?
+  printf '%s\n' "$darkirc_output"
+  fail "structured DarkIRC import dry-run exited successfully"
+  exit "$status"
+}
+assert_contains "DarkIRC import enables target service" "$darkirc_output" "--enable-darkirc"
+assert_contains "DarkIRC import preserves stable scope" "$darkirc_output" \
+  "LUNARWING_MT_IMPORT_DARKIRC_SCOPE_ID=fedcba9876543210fedcba9876543210"
+assert_contains "DarkIRC import stages structured manifest" "$darkirc_output" \
+  "would stage and import structured DarkIRC contacts"
+rm -rf "$darkirc_tmp"
 
 echo "=== import-tenant worker selection reaches BOTH add-tenant and build-tenant ==="
 # Regression guard for per-tenant worker gating: start-tenant now gates workers on
@@ -371,6 +424,50 @@ else
   fail "import rejects links and special files in nested state"
 fi
 
+mkdir -p "$tmp/managed-darkirc/state/darkirc/key-exchange"
+printf '{}\n' >"$tmp/managed-darkirc/state/darkirc/key-exchange/ledger.json"
+tar czf "$tmp/managed-darkirc-state.tar.gz" -C "$tmp/managed-darkirc" state
+mkdir -p "$tmp/managed-darkirc-bundle"
+cp "$tmp/bundle-src/meta.txt" "$tmp/bundle-src/db.dump" \
+  "$tmp/bundle-src/manifest-lunarwing.env" "$tmp/managed-darkirc-bundle/"
+cp "$tmp/managed-darkirc-state.tar.gz" "$tmp/managed-darkirc-bundle/state.tar.gz"
+tar cf "$tmp/managed-darkirc-bundle.tar" -C "$tmp/managed-darkirc-bundle" .
+set +e
+managed_darkirc_output="$(
+  PATH="$tmp/bin:$PATH" \
+  LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
+  KAWARIMI_TEST_WORK="$tmp" \
+  bash "$tmp/scripts/import-tenant.sh" "$tmp/managed-darkirc-bundle.tar" --dry-run --yes \
+    2>&1
+)"
+managed_darkirc_status=$?
+set -e
+if [[ "$managed_darkirc_status" -ne 0 && "$managed_darkirc_output" == *"structured contact import"* ]]; then
+  pass "import rejects generic managed DarkIRC state"
+else
+  fail "import rejects generic managed DarkIRC state"
+fi
+
+tar czf "$tmp/managed-darkirc-alias-state.tar.gz" \
+  --transform='s#^state/darkirc#state/./darkirc#' -C "$tmp/managed-darkirc" state
+cp "$tmp/managed-darkirc-alias-state.tar.gz" "$tmp/managed-darkirc-bundle/state.tar.gz"
+tar cf "$tmp/managed-darkirc-alias-bundle.tar" -C "$tmp/managed-darkirc-bundle" .
+set +e
+managed_alias_output="$(
+  PATH="$tmp/bin:$PATH" \
+  LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
+  KAWARIMI_TEST_WORK="$tmp" \
+  bash "$tmp/scripts/import-tenant.sh" "$tmp/managed-darkirc-alias-bundle.tar" --dry-run --yes \
+    2>&1
+)"
+managed_alias_status=$?
+set -e
+if [[ "$managed_alias_status" -ne 0 && "$managed_alias_output" == *"structured contact import"* ]]; then
+  pass "import normalizes managed DarkIRC path aliases"
+else
+  fail "import normalizes managed DarkIRC path aliases"
+fi
+
 set +e
 limit_output="$(
   PATH="$tmp/bin:$PATH" \
@@ -455,8 +552,42 @@ GIT
 cat >"$tmp/export-bin/systemctl" <<'SYSTEMCTL'
 #!/usr/bin/env bash
 printf 'called\n' >>"${KAWARIMI_TEST_WORK:?}/systemctl-called"
+if [[ "${KAWARIMI_SYSTEMCTL_MODE:-}" == unavailable && " $* " == *" list-unit-files "* ]]; then
+  exit 1
+fi
+if [[ "${KAWARIMI_SYSTEMCTL_MODE:-}" == active && " $* " == *" is-active "* ]]; then
+  printf 'active\n'
+  exit 0
+fi
+if [[ "${KAWARIMI_SYSTEMCTL_MODE:-}" == inactive && " $* " == *" is-active "* ]]; then
+  printf 'inactive\n'
+  exit 3
+fi
 exit 0
 SYSTEMCTL
+cat >"$tmp/export-bin/stat" <<'STAT'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-c" && "${2:-}" == "%u" ]]; then
+  printf '0\n'
+elif [[ "${1:-}" == "-c" && "${2:-}" == "%u:%a" ]]; then
+  printf '0:%s\n' "$(/usr/bin/stat -c '%a' "${!#}")"
+elif [[ "${1:-}" == "-c" && "${2:-}" == "%a" && -d "${!#}" \
+  && ( "${!#}" == /tmp || "${!#}" == "${KAWARIMI_TEST_WORK:?}"* ) ]]; then
+  printf '700\n'
+else
+  exec /usr/bin/stat "$@"
+fi
+STAT
+cat >"$tmp/export-bin/install" <<'INSTALL'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-d" ]]; then
+  target="${!#}"
+  mkdir -p -- "$target"
+  chmod 0700 -- "$target"
+else
+  exec /usr/bin/install "$@"
+fi
+INSTALL
 chmod +x "$tmp/export-bin/"*
 
 set +e
@@ -506,6 +637,58 @@ else
 fi
 sed -i '/^XMPP_PASSWORD=/d' "$tmp/export-home/alpha/lunarwing/env/lunarwing.env"
 rm -f "$tmp/export-home/alpha/lunarwing/env/xmpp-bridge.env"
+
+echo "=== export requires structured DarkIRC tooling before quiescence ==="
+mkdir -p "$tmp/export-home/alpha/lunarwing/state/darkirc/key-exchange"
+printf '{}\n' >"$tmp/export-home/alpha/lunarwing/state/darkirc/key-exchange/ledger.json"
+rm -f "$tmp/systemctl-called"
+set +e
+managed_export_output="$(
+  PATH="$tmp/export-bin:$PATH" \
+  KAWARIMI_TEST_WORK="$tmp" \
+  LUNARWING_MT_ADMIN="$tmp/missing-mt-admin" \
+  KAWARIMI_PASS='valid-export-passphrase' \
+  bash "$EXPORT_SRC" alpha --out-dir "$tmp/export-out" </dev/null 2>&1
+)"
+managed_export_status=$?
+set -e
+if [[ "$managed_export_status" -ne 0 && "$managed_export_output" == *"requires trusted mt-admin"* ]]; then
+  pass "export requires structured DarkIRC tooling"
+else
+  fail "export requires structured DarkIRC tooling"
+fi
+if [[ -e "$tmp/systemctl-called" ]]; then
+  fail "missing DarkIRC tooling does not stop tenant services"
+else
+  pass "missing DarkIRC tooling does not stop tenant services"
+fi
+rm -rf "$tmp/export-home/alpha/lunarwing/state/darkirc/key-exchange"
+
+echo "=== export --no-quiesce fails closed ==="
+for writer_mode in active unavailable; do
+  rm -f "$tmp/systemctl-called"
+  set +e
+  no_quiesce_output="$(
+    PATH="$tmp/export-bin:$PATH" \
+    KAWARIMI_TEST_WORK="$tmp" \
+    KAWARIMI_SYSTEMCTL_MODE="$writer_mode" \
+    bash "$EXPORT_SRC" alpha --out-dir "$tmp/export-out" --no-quiesce --no-encrypt \
+      </dev/null 2>&1
+  )"
+  no_quiesce_status=$?
+  set -e
+  if [[ "$writer_mode" == active ]]; then
+    expected_no_quiesce="still running"
+  else
+    expected_no_quiesce="could not verify"
+  fi
+  if [[ "$no_quiesce_status" -ne 0 && "$no_quiesce_output" == *"$expected_no_quiesce"* \
+    && "$no_quiesce_output" != *"Database (pg_dump"* ]]; then
+    pass "--no-quiesce rejects $writer_mode writer state before snapshot"
+  else
+    fail "--no-quiesce rejects $writer_mode writer state before snapshot"
+  fi
+done
 
 echo "=== production export -> encrypted import dry-run ==="
 rm -f "$tmp/systemctl-called"

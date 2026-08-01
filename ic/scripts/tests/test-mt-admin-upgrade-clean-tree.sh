@@ -7,11 +7,31 @@ source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+TENANT_LIFECYCLE_LOCK_DIR="$fixture/lifecycle-locks"
 repo="$fixture/repo"
 lockfile="$repo/ic/channels-src/xmpp/Cargo.lock"
 tracked_file="$repo/README.md"
 failures=0
 fail_checkout=false
+
+install() {
+  local target="${!#}"
+  if [[ "${1:-}" == -d && "$target" == "$TENANT_LIFECYCLE_LOCK_DIR" ]]; then
+    mkdir -p -- "$target"
+    chmod 0700 -- "$target"
+  else
+    command install "$@"
+  fi
+}
+
+stat() {
+  local target="${!#}"
+  if [[ "${1:-}" == -c && "${2:-}" == %u:%a && "$target" == "$TENANT_LIFECYCLE_LOCK_DIR" ]]; then
+    printf '0:700\n'
+  else
+    command stat "$@"
+  fi
+}
 
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1"; failures=$((failures + 1)); }

@@ -46,11 +46,16 @@
 # any tenant service is stopped. The passphrase is fed to 7z over stdin.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+MT_ADMIN="${LUNARWING_MT_ADMIN:-$SCRIPT_DIR/lunarwing-mt-admin.sh}"
 OUT_DIR="${LUNARWING_MIGRATE_DIR:-/var/lib/lunarwing-migrate}"
 NO_QUIESCE=false
 DRY_RUN=false
 NO_ENCRYPT=false
 TENANT=""
+PORTS_REGISTRY="${LUNARWING_PORTS_REGISTRY:-/etc/lunarwing/ports.json}"
+DARKIRC_WRITER_LOCK_DIR="${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-/run/lock/lunarwing-darkirc}"
+TENANT_LIFECYCLE_LOCK_DIR="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -68,6 +73,20 @@ die()    { printf 'error: %s\n' "$*" >&2; exit 1; }
 banner() { printf '\n========== %s ==========\n' "$*"; }
 note()   { printf '  · %s\n' "$*"; }
 run()    { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; return 0; fi; printf '  + %s\n' "$*"; "$@"; }
+
+validate_secure_output_directory() {
+  local path="$1" current="" component owner mode
+  [[ "$path" == /* && -d "$path" && ! -L "$path" ]] || return 1
+  while IFS= read -r component; do
+    [[ -n "$component" ]] || continue
+    current="$current/$component"
+    [[ -d "$current" && ! -L "$current" ]] || return 1
+    owner="$(stat -c '%u' "$current" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$current" 2>/dev/null || true)"
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+  done < <(tr '/' '\n' <<<"${path#/}")
+}
 
 validate_passphrase() {
   [[ -n "$1" ]] || die "encryption passphrase must not be empty"
@@ -133,9 +152,11 @@ is_loopback_url() {
 }
 
 [[ -n "$TENANT" ]] || die "usage: $0 <tenant> [--out-dir DIR] [--no-quiesce] [--dry-run] [--no-encrypt]"
+[[ "$TENANT" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "invalid tenant name"
 [[ "$(id -u)" -eq 0 ]] || die "run as root (sudo): stops the tenant services, reads its home/state, execs its DB container"
 command -v jq  >/dev/null 2>&1 || die "jq required"
 command -v tar >/dev/null 2>&1 || die "tar required"
+command -v flock >/dev/null 2>&1 || die "flock required"
 if ! $NO_ENCRYPT; then
   command -v 7z >/dev/null 2>&1 || die "7z (p7zip) required for encrypted bundles"
 fi
@@ -143,12 +164,62 @@ fi
 id "$TENANT" >/dev/null 2>&1 || die "OS user '$TENANT' not found"
 UID_T="$(id -u "$TENANT")"
 HOME_T="$(getent passwd "$TENANT" | cut -d: -f6)"
+if ! $DRY_RUN; then
+  [[ ! -L "$TENANT_LIFECYCLE_LOCK_DIR" ]]
+  install -d -o root -g root -m 0700 "$TENANT_LIFECYCLE_LOCK_DIR"
+  [[ "$(stat -c '%u:%a' "$TENANT_LIFECYCLE_LOCK_DIR" 2>/dev/null)" == "0:700" ]] \
+    || die "unsafe tenant lifecycle lock directory"
+  lifecycle_lock_file="$TENANT_LIFECYCLE_LOCK_DIR/$TENANT.lock"
+  [[ ! -L "$lifecycle_lock_file" && ( ! -e "$lifecycle_lock_file" || -f "$lifecycle_lock_file" ) ]] \
+    || die "unsafe tenant lifecycle lock file"
+  if [[ ! -e "$lifecycle_lock_file" ]]; then (umask 077; : >"$lifecycle_lock_file"); fi
+  chmod 0600 "$lifecycle_lock_file"
+  exec {EXPORT_LIFECYCLE_LOCK_FD}>"$lifecycle_lock_file"
+  flock -x "$EXPORT_LIFECYCLE_LOCK_FD"
+  export LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD="$EXPORT_LIFECYCLE_LOCK_FD"
+  export LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT="$TENANT"
+fi
 LWROOT="$HOME_T/lunarwing"
 ENVF="$LWROOT/env/lunarwing.env"
 BRIDGE_ENVF="$LWROOT/env/xmpp-bridge.env"
 VISION_ENVF="$LWROOT/env/vision.env"
 STATE_DIR="$LWROOT/state"
 [[ -f "$ENVF" ]] || die "tenant env not found: $ENVF (is '$TENANT' a LunarWing tenant on this host?)"
+MANAGED_DARKIRC=false
+if [[ -e "$STATE_DIR/darkirc/key-exchange" || -L "$STATE_DIR/darkirc/key-exchange" ]]; then
+  MANAGED_DARKIRC=true
+fi
+
+# Read scope under registry lock, release it, then acquire locks in mt-admin's
+# writer-before-registry order. Revalidation prevents scope replacement races.
+if ! $MANAGED_DARKIRC && [[ -f "$PORTS_REGISTRY" && ! -L "$PORTS_REGISTRY" ]]; then
+  registry_dir="$(dirname "$PORTS_REGISTRY")"
+  exec {DARKIRC_PORTS_LOCK_FD}<"$registry_dir"
+  flock -x "$DARKIRC_PORTS_LOCK_FD"
+  darkirc_scope="$(jq -r --arg tenant "$TENANT" '.tenants[$tenant].darkirc_scope_id // empty' "$PORTS_REGISTRY" 2>/dev/null || true)"
+  flock -u "$DARKIRC_PORTS_LOCK_FD"
+  exec {DARKIRC_PORTS_LOCK_FD}>&-
+  if [[ "$darkirc_scope" =~ ^[0-9a-f]{32}$ && "$darkirc_scope" != "00000000000000000000000000000000" ]]; then
+    [[ ! -L "$DARKIRC_WRITER_LOCK_DIR" ]]
+    install -d -o root -g root -m 0700 "$DARKIRC_WRITER_LOCK_DIR"
+    [[ "$(stat -c '%u:%a' "$DARKIRC_WRITER_LOCK_DIR" 2>/dev/null)" == "0:700" ]] \
+      || die "unsafe DarkIRC writer lock directory"
+    darkirc_lock_file="$DARKIRC_WRITER_LOCK_DIR/$darkirc_scope.lock"
+    [[ ! -L "$darkirc_lock_file" && ( ! -e "$darkirc_lock_file" || -f "$darkirc_lock_file" ) ]] \
+      || die "unsafe DarkIRC writer lock file"
+    if [[ ! -e "$darkirc_lock_file" ]]; then (umask 077; : >"$darkirc_lock_file"); fi
+    chmod 0600 "$darkirc_lock_file"
+    exec {DARKIRC_WRITER_LOCK_FD}>"$darkirc_lock_file"
+    flock -x "$DARKIRC_WRITER_LOCK_FD"
+    exec {DARKIRC_PORTS_LOCK_FD}<"$registry_dir"
+    flock -x "$DARKIRC_PORTS_LOCK_FD"
+    verified_darkirc_scope="$(jq -r --arg tenant "$TENANT" '.tenants[$tenant].darkirc_scope_id // empty' "$PORTS_REGISTRY" 2>/dev/null || true)"
+    [[ "$verified_darkirc_scope" == "$darkirc_scope" ]] \
+      || die "DarkIRC scope changed while export lock was acquired"
+    flock -u "$DARKIRC_PORTS_LOCK_FD"
+    exec {DARKIRC_PORTS_LOCK_FD}>&-
+  fi
+fi
 
 # Validate critical source secrets before prompting or stopping tenant services.
 SOURCE_MASTER_KEY="$(read_env_value "$ENVF" SECRETS_MASTER_KEY)"
@@ -209,6 +280,57 @@ RUNTIME="$(pick_runtime || true)"
 if ! $DRY_RUN && ! $NO_ENCRYPT; then
   acquire_export_passphrase
 fi
+if $MANAGED_DARKIRC; then
+  [[ -x "$MT_ADMIN" && ! -L "$MT_ADMIN" ]] \
+    || die "managed DarkIRC state requires trusted mt-admin: $MT_ADMIN"
+  if $DRY_RUN; then
+    run "$MT_ADMIN" darkirc-contact export-migration "$TENANT"
+  else
+    DARKIRC_SCOPE_ID="$(jq -r --arg tenant "$TENANT" '.tenants[$tenant].darkirc_scope_id // empty' "$PORTS_REGISTRY" 2>/dev/null || true)"
+    [[ "$DARKIRC_SCOPE_ID" =~ ^[0-9a-f]{32}$ && "$DARKIRC_SCOPE_ID" != "00000000000000000000000000000000" ]] \
+      || die "managed DarkIRC tenant has no valid stable scope ID"
+    [[ ! -L "$DARKIRC_WRITER_LOCK_DIR" ]]
+    install -d -o root -g root -m 0700 "$DARKIRC_WRITER_LOCK_DIR"
+    [[ "$(stat -c '%u:%a' "$DARKIRC_WRITER_LOCK_DIR" 2>/dev/null)" == "0:700" ]] \
+      || die "unsafe DarkIRC writer lock directory"
+    darkirc_lock_file="$DARKIRC_WRITER_LOCK_DIR/$DARKIRC_SCOPE_ID.lock"
+    [[ ! -L "$darkirc_lock_file" && ( ! -e "$darkirc_lock_file" || -f "$darkirc_lock_file" ) ]] \
+      || die "unsafe DarkIRC writer lock file"
+    if [[ ! -e "$darkirc_lock_file" ]]; then (umask 077; : >"$darkirc_lock_file"); fi
+    chmod 0600 "$darkirc_lock_file"
+    exec {DARKIRC_WRITER_LOCK_FD}>"$darkirc_lock_file"
+    flock -x -w 10 "$DARKIRC_WRITER_LOCK_FD" \
+      || die "DarkIRC config update is busy for tenant '$TENANT'"
+    registry_dir="$(dirname "$PORTS_REGISTRY")"
+    exec {DARKIRC_PORTS_LOCK_FD}<"$registry_dir"
+    flock -x "$DARKIRC_PORTS_LOCK_FD"
+    verified_darkirc_scope="$(jq -r --arg tenant "$TENANT" '.tenants[$tenant].darkirc_scope_id // empty' "$PORTS_REGISTRY" 2>/dev/null || true)"
+    [[ "$verified_darkirc_scope" == "$DARKIRC_SCOPE_ID" ]] \
+      || die "DarkIRC scope changed while export lock was acquired"
+    flock -u "$DARKIRC_PORTS_LOCK_FD"
+    exec {DARKIRC_PORTS_LOCK_FD}>&-
+    LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD="$DARKIRC_WRITER_LOCK_FD" \
+    LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE="$DARKIRC_SCOPE_ID" \
+      "$MT_ADMIN" darkirc-contact export-migration "$TENANT"
+    DARKIRC_MIGRATION_FILE="$STATE_DIR/darkirc/key-exchange/darkirc-contacts-v1.json"
+    [[ -f "$DARKIRC_MIGRATION_FILE" && ! -L "$DARKIRC_MIGRATION_FILE" ]] \
+      || die "DarkIRC structured migration manifest was not produced"
+    DARKIRC_INNER_LOCK="$STATE_DIR/darkirc/key-exchange/update.lock"
+    [[ -f "$DARKIRC_INNER_LOCK" && ! -L "$DARKIRC_INNER_LOCK" ]] \
+      || die "unsafe DarkIRC helper lock path"
+    exec {DARKIRC_INNER_LOCK_FD}<>"$DARKIRC_INNER_LOCK"
+    inner_owner="$(stat -c '%u' "/proc/self/fd/$DARKIRC_INNER_LOCK_FD")"
+    inner_mode="$(stat -c '%a' "/proc/self/fd/$DARKIRC_INNER_LOCK_FD")"
+    inner_links="$(stat -c '%h' "/proc/self/fd/$DARKIRC_INNER_LOCK_FD")"
+    inner_identity="$(stat -c '%d:%i' "/proc/self/fd/$DARKIRC_INNER_LOCK_FD")"
+    path_identity="$(stat -c '%d:%i' "$DARKIRC_INNER_LOCK" 2>/dev/null || true)"
+    [[ "$inner_owner" == "$UID_T" && "$inner_mode" == 600 && "$inner_links" == 1 \
+      && "$inner_identity" == "$path_identity" ]] \
+      || die "unsafe DarkIRC helper lock file"
+    flock -x -w 10 "$DARKIRC_INNER_LOCK_FD" \
+      || die "DarkIRC helper state is busy for tenant '$TENANT'"
+  fi
+fi
 
 # Determine if the tenant's containers are rootless (need _ctr wrapper).
 _is_rootless() {
@@ -221,19 +343,52 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 banner "Export tenant '$TENANT' (source $SRC_VER, runtime $RUNTIME, db $PG_DB/$PG_ROLE) — CUTOVER"
 $DRY_RUN && say "*** DRY RUN — no changes will be made ***"
 
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+WORK="$(mktemp -d)"; SEAL_DIR=""
+trap 'rm -rf "$WORK"; [[ -z "${SEAL_DIR:-}" ]] || rm -rf "$SEAL_DIR"' EXIT
 chmod 0700 "$WORK"
 
 # ---- 1. quiesce the writers (consistent + final snapshot) --------------------
 banner "1/5  Quiesce daemon + bridge"
-daemon_running() {
+tenant_writers_running() {
+  local unit state status service found=false
   if command -v systemctl >/dev/null 2>&1 \
-     && sudo -u "$TENANT" XDG_RUNTIME_DIR="/run/user/$UID_T" systemctl --user is-active --quiet "lunarwing-$TENANT.service" 2>/dev/null; then return 0; fi
-  if command -v rc-service >/dev/null 2>&1 && rc-service "lunarwing-$TENANT" status >/dev/null 2>&1; then return 0; fi
-  return 1
+    && sudo -u "$TENANT" XDG_RUNTIME_DIR="/run/user/$UID_T" \
+      systemctl --user list-unit-files >/dev/null 2>&1; then
+    for unit in "lunarwing-$TENANT.service" "xmpp-bridge-$TENANT.service"; do
+      status=0
+      state="$(sudo -u "$TENANT" XDG_RUNTIME_DIR="/run/user/$UID_T" \
+        systemctl --user is-active "$unit" 2>/dev/null)" || status=$?
+      case "$state" in
+        active|activating|reloading|deactivating) return 0 ;;
+        inactive|failed|unknown) ;;
+        *) [[ "$status" -eq 3 || "$status" -eq 4 ]] || return 2 ;;
+      esac
+    done
+    return 1
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    for service in "lunarwing-$TENANT" "xmpp-bridge-$TENANT"; do
+      [[ -x "/etc/init.d/$service" ]] || continue
+      found=true
+      status=0
+      rc-service "$service" status >/dev/null 2>&1 || status=$?
+      [[ "$status" -ne 0 ]] || return 0
+      [[ "$status" -eq 3 ]] || return 2
+    done
+    [[ "$found" == true ]] && return 1
+  fi
+  return 2
 }
 if $NO_QUIESCE; then
-  if ! $DRY_RUN && daemon_running; then die "--no-quiesce given but the '$TENANT' daemon is still running — stop it (and the bridge) first for a consistent snapshot"; fi
+  if ! $DRY_RUN; then
+    writer_status=0
+    tenant_writers_running || writer_status=$?
+    case "$writer_status" in
+      0) die "--no-quiesce given but the '$TENANT' daemon or bridge is still running — stop both first for a consistent snapshot" ;;
+      1) ;;
+      *) die "could not verify that the '$TENANT' daemon and bridge are stopped" ;;
+    esac
+  fi
   note "--no-quiesce: assuming daemon + bridge are already stopped"
 else
   if command -v systemctl >/dev/null 2>&1 \
@@ -303,40 +458,40 @@ else
   for k in "${LW_KEYS[@]}"; do copy_key "$ENVF" "$WORK/manifest-lunarwing.env" "$k"; done
   # LLM_BASE_URL: carry ONLY a non-local custom endpoint; a local proxy URL is
   # host-specific (its port differs on the new host, which sets its own).
-  llm_url="$(sed -n 's/^LLM_BASE_URL=//p' "$ENVF" | head -1)"; llm_url="${llm_url%$'\r'}"
+  llm_url="$(read_env_value "$ENVF" LLM_BASE_URL)"
   if [[ -n "$llm_url" ]] && ! is_loopback_url "$llm_url"; then
     printf 'LLM_BASE_URL=%s\n' "$llm_url" >> "$WORK/manifest-lunarwing.env"
     note "carrying custom LLM_BASE_URL"
   else
-    note "LLM_BASE_URL is host-local ($llm_url) — NOT carried"
+    note "LLM_BASE_URL is host-local — NOT carried"
   fi
-  opencode_url="$(sed -n 's/^OPENCODE_BASE_URL=//p' "$ENVF" | head -1)"; opencode_url="${opencode_url%$'\r'}"
+  opencode_url="$(read_env_value "$ENVF" OPENCODE_BASE_URL)"
   if [[ -n "$opencode_url" ]] && ! is_loopback_url "$opencode_url"; then
     printf 'OPENCODE_BASE_URL=%s\n' "$opencode_url" >> "$WORK/manifest-lunarwing.env"
     note "carrying custom OPENCODE_BASE_URL"
   elif [[ -n "$opencode_url" ]]; then
-    note "OPENCODE_BASE_URL is host-local ($opencode_url) — NOT carried"
+    note "OPENCODE_BASE_URL is host-local — NOT carried"
   fi
-  kimi_url="$(sed -n 's/^KIMI_BASE_URL=//p' "$ENVF" | head -1)"; kimi_url="${kimi_url%$'\r'}"
+  kimi_url="$(read_env_value "$ENVF" KIMI_BASE_URL)"
   if [[ -n "$kimi_url" ]] && ! is_loopback_url "$kimi_url"; then
     printf 'KIMI_BASE_URL=%s\n' "$kimi_url" >> "$WORK/manifest-lunarwing.env"
     note "carrying custom KIMI_BASE_URL"
   elif [[ -n "$kimi_url" ]]; then
-    note "KIMI_BASE_URL is host-local ($kimi_url) — NOT carried"
+    note "KIMI_BASE_URL is host-local — NOT carried"
   fi
-  nanocode_url="$(sed -n 's/^NANOCODE_BASE_URL=//p' "$ENVF" | head -1)"; nanocode_url="${nanocode_url%$'\r'}"
+  nanocode_url="$(read_env_value "$ENVF" NANOCODE_BASE_URL)"
   if [[ -n "$nanocode_url" ]] && ! is_loopback_url "$nanocode_url"; then
     printf 'NANOCODE_BASE_URL=%s\n' "$nanocode_url" >> "$WORK/manifest-lunarwing.env"
     note "carrying custom NANOCODE_BASE_URL"
   elif [[ -n "$nanocode_url" ]]; then
-    note "NANOCODE_BASE_URL is host-local ($nanocode_url) — NOT carried"
+    note "NANOCODE_BASE_URL is host-local — NOT carried"
   fi
   for k in "${BRIDGE_KEYS[@]}"; do copy_key "$BRIDGE_ENVF" "$WORK/manifest-bridge.env" "$k"; done
   if [[ -f "$VISION_ENVF" ]]; then
     ( umask 077; : > "$WORK/manifest-vision.env" )
     for k in "${VISION_KEYS[@]}"; do copy_key "$VISION_ENVF" "$WORK/manifest-vision.env" "$k"; done
     if [[ -s "$WORK/manifest-vision.env" ]]; then
-      say "  manifest-vision.env:    $(grep -c '=' "$WORK/manifest-vision.env" 2>/dev/null || echo 0) keys"
+      say "  manifest-vision.env:    $(grep -c '=' "$WORK/manifest-vision.env" 2>/dev/null || true) keys"
     else
       rm -f "$WORK/manifest-vision.env"
       note "vision.env had no carried keys — no vision manifest written"
@@ -347,7 +502,7 @@ else
   grep -q '^SECRETS_MASTER_KEY=' "$WORK/manifest-lunarwing.env" \
     || die "SECRETS_MASTER_KEY not found in $ENVF — refusing to export a bundle that can't decrypt the DB. Locate the key first."
   say "  manifest-lunarwing.env: $(grep -c '=' "$WORK/manifest-lunarwing.env") keys (incl. SECRETS_MASTER_KEY)"
-  say "  manifest-bridge.env:    $(grep -c '=' "$WORK/manifest-bridge.env" 2>/dev/null || echo 0) keys"
+  say "  manifest-bridge.env:    $(grep -c '=' "$WORK/manifest-bridge.env" 2>/dev/null || true) keys"
 fi
 
 # ---- 4. on-disk state (OMEMO store + workspace) ------------------------------
@@ -361,12 +516,30 @@ if [[ -d "$STATE_DIR" ]]; then
       note "  (no OMEMO store present yet)"
     fi
   else
+    state_excludes=(
+      --exclude='*.sock' --exclude='state/config.toml'
+      --exclude='state/tools/*.wasm' --exclude='state/channels/*.wasm'
+      --exclude='state/darkirc/key-exchange'
+    )
+    if $MANAGED_DARKIRC; then
+      state_excludes+=(--exclude='state/darkirc')
+      exec {DARKIRC_MANIFEST_FD}<"$DARKIRC_MIGRATION_FILE"
+      manifest_owner="$(stat -c '%u' "/proc/self/fd/$DARKIRC_MANIFEST_FD")"
+      manifest_mode="$(stat -c '%a' "/proc/self/fd/$DARKIRC_MANIFEST_FD")"
+      manifest_links="$(stat -c '%h' "/proc/self/fd/$DARKIRC_MANIFEST_FD")"
+      [[ "$manifest_owner" == "$UID_T" && "$manifest_mode" == 600 && "$manifest_links" == 1 ]] \
+        || die "unsafe DarkIRC structured migration manifest"
+      (umask 077; dd status=none <&"$DARKIRC_MANIFEST_FD" >"$WORK/darkirc-contacts-v1.json")
+      exec {DARKIRC_MANIFEST_FD}>&-
+    fi
     # Exclude: sockets; the host-specific config.toml (the new host's add-tenant
     # writes the correct external-worker ports); and *.wasm (rebuilt by install-wasm
     # — carrying stale v1.1.0 artifacts would linger past the never-cleaning overlay).
-    tar czf "$WORK/state.tar.gz" -C "$LWROOT" \
-      --exclude='*.sock' --exclude='state/config.toml' \
-      --exclude='state/tools/*.wasm' --exclude='state/channels/*.wasm' state
+    tar czf "$WORK/state.tar.gz" -C "$LWROOT" "${state_excludes[@]}" state
+    if ! $MANAGED_DARKIRC; then
+      [[ ! -e "$STATE_DIR/darkirc/key-exchange" && ! -L "$STATE_DIR/darkirc/key-exchange" ]] \
+        || die "managed DarkIRC state appeared during export; retry structured export"
+    fi
     say "  state.tar.gz: $(du -h "$WORK/state.tar.gz" | cut -f1)$( [[ -d "$STATE_DIR/xmpp" ]] && echo ' (incl. OMEMO store)' )"
   fi
 else
@@ -385,9 +558,20 @@ if $DRY_RUN; then
   say ""; say "DRY RUN complete — no bundle written, services NOT stopped."
   exit 0
 fi
-mkdir -p "$OUT_DIR"; chmod 0700 "$OUT_DIR"
+[[ "$OUT_DIR" == /* ]] || die "output directory must be absolute"
+output_parent="$(dirname "$OUT_DIR")"
+validate_secure_output_directory "$output_parent" \
+  || die "output directory parent is unsafe"
+[[ ! -L "$OUT_DIR" && ( ! -e "$OUT_DIR" || -d "$OUT_DIR" ) ]] \
+  || die "output directory is unsafe"
+install -d -o root -g root -m 0700 "$OUT_DIR"
+validate_secure_output_directory "$OUT_DIR" \
+  || die "output directory must be root-owned and non-symlinked"
+SEAL_DIR="$(mktemp -d "$OUT_DIR/.seal.XXXXXX")"
+chmod 0700 "$SEAL_DIR"
 {
   printf 'tenant=%s\n' "$TENANT"
+  if $MANAGED_DARKIRC; then printf 'darkirc_scope_id=%s\n' "$DARKIRC_SCOPE_ID"; fi
   printf 'source_version=%s\n' "$SRC_VER"
   printf 'source_runtime=%s\n' "$RUNTIME"
   printf 'pg_role=%s\n' "$PG_ROLE"
@@ -399,22 +583,28 @@ mkdir -p "$OUT_DIR"; chmod 0700 "$OUT_DIR"
 if $NO_ENCRYPT; then
   # Legacy plaintext tar — for testing only
   BUNDLE="$OUT_DIR/${TENANT}-migrate-${STAMP}.tar"
-  ( umask 077; tar cf "$BUNDLE" -C "$WORK" . )
-  chmod 0600 "$BUNDLE"
+  BUNDLE_CANDIDATE="$SEAL_DIR/bundle.tar"
+  ( umask 077; tar cf "$BUNDLE_CANDIDATE" -C "$WORK" . )
   say "  WARNING: bundle is UNENCRYPTED (--no-encrypt)" >&2
 else
   # Encrypted 7z with header encryption
   BUNDLE="$OUT_DIR/${TENANT}-migrate-${STAMP}.7z"
+  BUNDLE_CANDIDATE="$SEAL_DIR/bundle.7z"
 
   # Bare -p reads the password twice from stdin and keeps it out of process argv.
   { printf '%s\n%s\n' "$KAWARIMI_ARCHIVE_PASS" "$KAWARIMI_ARCHIVE_PASS"; } | 7z a -t7z \
     -mhe=on -p \
     -mx=5 \
-    "$BUNDLE" "$WORK"/* \
+    "$BUNDLE_CANDIDATE" "$WORK"/* \
     >/dev/null 2>&1 || die "7z encryption failed"
-  chmod 0600 "$BUNDLE"
   unset KAWARIMI_ARCHIVE_PASS
 fi
+chmod 0600 "$BUNDLE_CANDIDATE"
+[[ ! -e "$BUNDLE" && ! -L "$BUNDLE" ]] || die "output bundle already exists"
+ln "$BUNDLE_CANDIDATE" "$BUNDLE" || die "failed to publish output bundle"
+rm -f "$BUNDLE_CANDIDATE"
+rmdir "$SEAL_DIR"
+SEAL_DIR=""
 
 banner "Done — bundle written (tenant is STOPPED — cutover in progress)"
 say "  $BUNDLE ($(du -h "$BUNDLE" | cut -f1))"
