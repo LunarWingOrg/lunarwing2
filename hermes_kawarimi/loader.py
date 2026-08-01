@@ -133,7 +133,11 @@ def run_import(
     if not phase([mt, "build-tenant", plan.tenant, "--with-wasm", *_worker_flags(plan), *_build_flags(plan)]):
         result.error = "build-tenant failed"
         return result
-    phase([mt, "install-wasm", plan.tenant])  # best-effort, mirrors import-tenant.sh
+    # Required, mirroring import-tenant.sh (set -e aborts there on failure):
+    # a tenant missing its WASM artifacts boots with silently absent channels.
+    if not phase([mt, "install-wasm", plan.tenant]):
+        result.error = "install-wasm failed"
+        return result
 
     # Env (DATABASE_URL / SECRETS_MASTER_KEY / LUNARWING_OWNER_ID) exists now.
     try:
