@@ -3,6 +3,10 @@
 **Generated**: 2026-07-08 (v1.1.9 `Kiyome きよめ` pre-release, item #3)
 **Author**: Rarity
 
+> **Note (2026-08-01):** historical snapshot. Since this report, the worker
+> matrix in `tests/tests.yaml` gained a sixth worker (`kimi`); the inventory
+> below otherwise still matches the scripts on disk.
+
 This report catalogs every automated testing script in the LunarWing repo, its
 current status, what was fixed, and what remains untested or broken.
 
