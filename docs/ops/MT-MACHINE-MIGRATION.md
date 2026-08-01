@@ -154,13 +154,13 @@ keep mode `0600`, and delete it from both hosts once the import is verified.
 ```bash
 sudo ic/scripts/import-tenant.sh /var/lib/lunarwing-migrate/<tenant>-migrate-<stamp>.7z \
      --start --old-stopped \
-     [--with-nanocode] [--with-pebble] [--with-opencode] [--with-toolchains] \
+     [--with-nanocode] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] \
      [--with-vision] [--docker-group]   # --dry-run first
 ```
 Runs `add-tenant --no-health` → `build-tenant` → injects the carried secrets (incl.
 `SECRETS_MASTER_KEY`, verified verbatim) → `restore-tenant` (DB) → restores `state/`
 (OMEMO) → `install-wasm` → runs the read-only WeeChat migration preflight → starts the
-daemon. `--with-opencode` and `--with-toolchains` are passed through to
+daemon. `--with-opencode`, `--with-kimi`, and `--with-toolchains` are passed through to
 `build-tenant`. `--with-vision` builds the LunarVision sidecar image before start; if
 the bundle contains `manifest-vision.env`, import injects the carried `VL_URL`,
 `VL_MODEL` into the target `vision.env`. Import deliberately ignores auth tokens
