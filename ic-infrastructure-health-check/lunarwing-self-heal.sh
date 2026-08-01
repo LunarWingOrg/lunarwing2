@@ -5,7 +5,8 @@
 # by restarting unhealthy services. Applies a grace period before the first
 # restart, exponential backoff with jitter (linear toggle available), a
 # flapping guard, post-restart verification via the component health checks,
-# multi-tenant remediation, state auto-prune, and escalation via notification.
+# multi-tenant remediation, state auto-prune, per-service escalation page
+# cooldown, and escalation via notification.
 #
 # Usage:
 #   lunarwing-self-heal.sh [--report <path>] [--dry-run] [--max-retries N]
@@ -19,7 +20,7 @@
 
 set -euo pipefail
 
-VERSION="2.0.1"
+VERSION="2.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -56,6 +57,20 @@ HISTORY_MAX="${SELF_HEAL_HISTORY_MAX:-20}"
 # from stalling the entire self-heal tick. Falls back to no timeout if GNU
 # coreutils `timeout` is unavailable (macOS/launchd hosts).
 ESCALATE_TIMEOUT="${SELF_HEAL_ESCALATE_TIMEOUT:-30}"
+
+# Escalation page cooldown (seconds, PER SERVICE). A flap→recover→reflap loop
+# would otherwise re-page on every cycle: recover clears the state entry, the
+# next flap re-escalates and pages again. Suppress repeat pages for the same
+# service within the window; the escalated state + escalation report are still
+# written. 0 (or false/no/off) disables. Per-service (not global) so one noisy
+# service can't suppress a different service's first page in the same outage.
+ESCALATE_COOLDOWN="${SELF_HEAL_ESCALATE_COOLDOWN:-3600}"
+case "$ESCALATE_COOLDOWN" in
+    0|false|no|off) ESCALATE_COOLDOWN=0 ;;
+esac
+
+# Notifier script override (tests / non-Gotify paging integrations).
+NOTIFY_SCRIPT="${SELF_HEAL_NOTIFY_SCRIPT:-$SCRIPT_DIR/send-notification.sh}"
 
 # Post-restart verification: re-run the component's health-*.sh and parse
 # .status (deeper than is-active). Set false to use is-active only.
@@ -531,9 +546,39 @@ prune_state() {
 
 # ── Notification escalation ─────────────────────────────────────────────────
 
+# Cooldown sidecar path for a service. The epoch lives OUTSIDE state.json on
+# purpose: a per-service field in state.json would be erased by
+# clear_service_state/prune_state — which is exactly the flap→recover→reflap
+# cycle this guard targets. The service name is sanitized so a hostile or odd
+# unit name from a report can never escape the state dir.
+_cooldown_file() {
+    local svc="$1" safe
+    safe="$(printf '%s' "$svc" | tr -c 'A-Za-z0-9_.-' '_')"
+    printf '%s/.last_escalation_page.%s' "$SELF_HEAL_STATE_DIR" "$safe"
+}
+
+# _send_notification <status> <report_path> [svc]
+# When svc is given and ESCALATE_COOLDOWN > 0, suppress repeat pages for that
+# service inside the cooldown window. The sidecar epoch is written only after
+# the notifier exits 0, so a failed page never arms the cooldown.
 _send_notification() {
-    local status="$1" report_path="$2"
-    local notify_script="$SCRIPT_DIR/send-notification.sh"
+    local status="$1" report_path="$2" svc="${3:-}"
+    local notify_script="$NOTIFY_SCRIPT"
+
+    if [[ -n "$svc" && "$ESCALATE_COOLDOWN" -gt 0 ]] 2>/dev/null; then
+        local cd_file last now
+        cd_file="$(_cooldown_file "$svc")"
+        last="$(cat "$cd_file" 2>/dev/null || printf '0')"
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
+        now="$(date +%s)"
+        if [[ "$last" -gt 0 && $((now - last)) -lt "$ESCALATE_COOLDOWN" ]]; then
+            log "COOLDOWN: page for $svc suppressed (last page $((now - last))s ago < ${ESCALATE_COOLDOWN}s cooldown); escalated state retained"
+            log_action "ESCALATE_PAGE_SUPPRESSED target=$svc last_page_age=$((now - last))s cooldown=${ESCALATE_COOLDOWN}s"
+            return 0
+        fi
+    fi
+
+    local sent=1
     if [[ -x "$notify_script" ]]; then
         # CRITICAL: redirect the notifier's stdout to stderr. escalate_service runs
         # inside remediate_component, whose STDOUT is captured as the returned state
@@ -544,13 +589,19 @@ _send_notification() {
         #
         # Guard with timeout so a hung Gotify endpoint can't stall the self-heal tick.
         if command -v timeout >/dev/null 2>&1; then
-            timeout "${ESCALATE_TIMEOUT}" "$notify_script" "$status" "$report_path" >&2 || log "WARNING: escalation notification failed (page may not have been delivered)"
+            timeout "${ESCALATE_TIMEOUT}" "$notify_script" "$status" "$report_path" >&2 && sent=0 || log "WARNING: escalation notification failed (page may not have been delivered)"
         else
             # Fallback for macOS/launchd hosts without GNU coreutils timeout.
-            "$notify_script" "$status" "$report_path" >&2 || log "WARNING: escalation notification failed (page may not have been delivered)"
+            "$notify_script" "$status" "$report_path" >&2 && sent=0 || log "WARNING: escalation notification failed (page may not have been delivered)"
         fi
     else
         log "WARNING: send-notification.sh not found at $notify_script; cannot escalate"
+    fi
+
+    # Arm the cooldown only on a delivered page (sent=0); a failed/missing
+    # notifier leaves the window open so the next escalation event can retry.
+    if [[ -n "$svc" && "$ESCALATE_COOLDOWN" -gt 0 && "$sent" -eq 0 ]] 2>/dev/null; then
+        date +%s > "$(_cooldown_file "$svc")" 2>/dev/null || true
     fi
 }
 
@@ -570,7 +621,7 @@ escalate_service() {
         '{escalated: true, service: $svc, timestamp: $now, retries: $retries, reason: $reason, action: "manual_intervention_required"}' \
         > "$esc_report"
 
-    _send_notification "critical" "$esc_report"
+    _send_notification "critical" "$esc_report" "$svc"
     rm -f "$esc_report"
 }
 
@@ -738,7 +789,7 @@ main() {
     log "=== Self-Healing Watchdog v$VERSION ==="
     log "report: $report"
     log "service manager: $SERVICE_MANAGER"
-    log "config: max-retries=$MAX_RETRIES settle=${BACKOFF_SECONDS}s backoff=$BACKOFF_STRATEGY base=${BACKOFF_BASE}s max=${BACKOFF_MAX}s grace=$GRACE_CHECKS flap=$FLAP_MAX_RESTARTS/${FLAP_WINDOW_SECS}s prune-ttl=${STATE_PRUNE_TTL}s verify=$VERIFY_HEALTH dry-run=$DRY_RUN"
+    log "config: max-retries=$MAX_RETRIES settle=${BACKOFF_SECONDS}s backoff=$BACKOFF_STRATEGY base=${BACKOFF_BASE}s max=${BACKOFF_MAX}s grace=$GRACE_CHECKS flap=$FLAP_MAX_RESTARTS/${FLAP_WINDOW_SECS}s prune-ttl=${STATE_PRUNE_TTL}s verify=$VERIFY_HEALTH escalate-cooldown=${ESCALATE_COOLDOWN}s dry-run=$DRY_RUN"
 
     jq . "$report" >/dev/null 2>&1 || die "report is not valid JSON: $report"
 
