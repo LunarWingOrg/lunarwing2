@@ -17,7 +17,7 @@ cd ic
 # 1. Create isolated env, state, run, and log dirs
 scripts/lunarwing-xmpp-test-env.sh init
 
-# 2. Build daemon + bridge + all 20 WASM channels/tools
+# 2. Build daemon + bridge + all WASM channels/tools (ic/channels-src/* + ic/tools-src/*)
 scripts/lunarwing-xmpp-test-env.sh build --with-wasm
 
 # 3. Install WASM artifacts into the test state dir
