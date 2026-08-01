@@ -2006,10 +2006,7 @@ mod tests {
         let token = "0123456789abcdef0123456789abcdef";
         assert!(bearer_token_eq(token, token));
         // Same length, one byte different.
-        assert!(!bearer_token_eq(
-            "0123456789abcdef0123456789abcdee",
-            token
-        ));
+        assert!(!bearer_token_eq("0123456789abcdef0123456789abcdee", token));
         // Prefix of the expected token (early-exit compare would accept
         // sooner, which is exactly the timing signal we avoid relying on).
         assert!(!bearer_token_eq("0123456789abcdef", token));
