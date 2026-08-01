@@ -8,9 +8,9 @@ rollback. This is the recommended cross-host path for important tenants.
 **Tools:** `ic/scripts/export-tenant.sh` (old host) and `ic/scripts/import-tenant.sh`
 (new host).
 
-**Cross-init:** both scripts work for **systemd and OpenRC**. Export only needs to
-stop two per-tenant units (auto-detecting the init); import delegates all
-init/runtime-specific work to `lunarwing-mt-admin.sh`, which auto-detects systemd vs
+**Cross-init:** both scripts work for **systemd and OpenRC**. Export delegates the
+complete writer set to `lunarwing-mt-admin.sh` rather than probing init directly;
+import delegates all init/runtime-specific work to same command, which auto-detects systemd vs
 OpenRC and rootless-podman vs rootful-docker. The new host's init system need not
 match the old host's.
 
@@ -19,8 +19,9 @@ match the old host's.
 > file by hand if needed).
 
 > **Export is the start of cutover, not a read-only snapshot.** To capture a
-> consistent *and final* picture, `export-tenant.sh` **stops the tenant's daemon +
-> xmpp-bridge** before dumping (PostgreSQL stays up just for `pg_dump`). The agent is
+> consistent *and final* picture, `export-tenant.sh` **stops every known tenant
+> writer** before dumping: daemon, bridges/adapters, proxy, DarkIRC, vision, and
+> selected external workers. PostgreSQL stays up just for `pg_dump`. The agent is
 > down from export until you start it on the new host — plan a per-tenant maintenance
 > window. This is deliberate: it prevents a torn OMEMO store and prevents losing
 > anything written between snapshot and cutover.
@@ -136,13 +137,14 @@ current `lunarwing-mt-admin.sh` with `restore-tenant` and owner-scope inspection
 ```bash
 sudo ic/scripts/export-tenant.sh <tenant> --dry-run  # preview; no passphrase needed
 sudo ic/scripts/export-tenant.sh <tenant>            # prompts before stopping services
-# stops the tenant's daemon + bridge, dumps the DB, snapshots state, writes
+# stops all tenant writers through mt-admin, dumps DB, snapshots state, writes
 # /var/lib/lunarwing-migrate/<tenant>-migrate-<stamp>.7z  (AES-256, 0600, root)
 ```
 The tenant is now stopped on the old host (PostgreSQL left up for the dump; you may
-stop it too). Use `--no-quiesce` only if you've already stopped the daemon+bridge
-yourself. Export fails closed if systemd-user/OpenRC state cannot prove both
-writers stopped. Export holds tenant lifecycle lock through final bundle seal.
+stop it too). Use `--no-quiesce` only if you've already stopped every writer.
+Export fails closed if mt-admin cannot prove all systemd-user/OpenRC services and
+direct worker/vision containers are stopped. Export holds tenant lifecycle lock
+through final bundle seal.
 Custom `--out-dir` must be under root-owned directories with no group/world write;
 shared directories such as `/tmp` are rejected.
 
@@ -176,6 +178,12 @@ group membership is a target-host choice and is not exported from the source hos
 `--old-stopped` confirms the old side is down (export already stopped it);
 omit `--start` to **stage** without starting, or omit `--old-stopped` to be prompted
 interactively. The double-login confirmation is **not** satisfied by `--yes` alone.
+
+When structured DarkIRC manifest is present, import first streams it to installed
+typed helper and validates against target binary compatibility attestation before provisioning. Validated stable scope is
+then passed explicitly as `--darkirc-scope-id`; environment overrides cannot alter
+scope selection. Unsupported manifest state, malformed scope, or missing trusted
+helper fails before target creation.
 
 The WeeChat preflight checks the restored tenant env against the target port
 registry and installed capabilities before cutover. A preflight FAIL blocks import

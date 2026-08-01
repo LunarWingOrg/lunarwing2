@@ -3,8 +3,8 @@
 # export-tenant.sh — package one multi-tenant tenant into a portable bundle for
 # MACHINE MIGRATION to a fresh LunarWing host (see docs/ops/MT-MACHINE-MIGRATION.md).
 #
-# Runs on the OLD (source) host. Self-contained: it does NOT need a v1.1.4-class
-# mt-admin (the source may be v1.1.0). It only needs the container runtime, jq, tar.
+# Runs on the OLD (source) host. Init-specific lifecycle operations delegate to
+# current mt-admin so systemd user units and OpenRC follow one contract.
 #
 # IMPORTANT — this is the START OF CUTOVER, not a read-only snapshot. To capture a
 # CONSISTENT and FINAL picture (so nothing is written after the snapshot and the
@@ -88,6 +88,30 @@ validate_secure_output_directory() {
   done < <(tr '/' '\n' <<<"${path#/}")
 }
 
+validate_mt_admin_override() {
+  [[ "$MT_ADMIN" == /* && -f "$MT_ADMIN" && ! -L "$MT_ADMIN" ]] || return 1
+  local owner mode links dir rest component current=""
+  owner="$(/usr/bin/stat -c '%u' "$MT_ADMIN" 2>/dev/null || true)"
+  mode="$(/usr/bin/stat -c '%a' "$MT_ADMIN" 2>/dev/null || true)"
+  links="$(/usr/bin/stat -c '%h' "$MT_ADMIN" 2>/dev/null || true)"
+  [[ "$owner" == 0 && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$mode & 022) == 0 )) || return 1
+  dir="${MT_ADMIN%/*}"
+  [[ -n "$dir" ]] || dir=/
+  rest="${dir#/}"
+  while [[ -n "$rest" ]]; do
+    component="${rest%%/*}"
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+    current="$current/$component"
+    [[ -d "$current" && ! -L "$current" ]] || return 1
+    owner="$(/usr/bin/stat -c '%u' "$current" 2>/dev/null || true)"
+    mode="$(/usr/bin/stat -c '%a' "$current" 2>/dev/null || true)"
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 022) == 0 )) || return 1
+    if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+  done
+}
+
 validate_passphrase() {
   [[ -n "$1" ]] || die "encryption passphrase must not be empty"
   [[ "${#1}" -ge 12 ]] || die "encryption passphrase must be at least 12 characters"
@@ -160,6 +184,15 @@ command -v flock >/dev/null 2>&1 || die "flock required"
 if ! $NO_ENCRYPT; then
   command -v 7z >/dev/null 2>&1 || die "7z (p7zip) required for encrypted bundles"
 fi
+[[ -x "$MT_ADMIN" && ! -L "$MT_ADMIN" ]] || die "trusted mt-admin not found/executable at $MT_ADMIN"
+if [[ -n "${LUNARWING_MT_ADMIN:-}" ]]; then
+  validate_mt_admin_override \
+    || die "LUNARWING_MT_ADMIN must be an absolute root-owned, single-link, non-writable executable"
+fi
+grep -qE '^\s*stop-writers\)' "$MT_ADMIN" \
+  || die "mt-admin at $MT_ADMIN lacks stop-writers"
+grep -qE '^\s*writers-active\)' "$MT_ADMIN" \
+  || die "mt-admin at $MT_ADMIN lacks writers-active"
 
 id "$TENANT" >/dev/null 2>&1 || die "OS user '$TENANT' not found"
 UID_T="$(id -u "$TENANT")"
@@ -348,59 +381,36 @@ trap 'rm -rf "$WORK"; [[ -z "${SEAL_DIR:-}" ]] || rm -rf "$SEAL_DIR"' EXIT
 chmod 0700 "$WORK"
 
 # ---- 1. quiesce the writers (consistent + final snapshot) --------------------
-banner "1/5  Quiesce daemon + bridge"
+banner "1/5  Quiesce tenant writers"
 tenant_writers_running() {
-  local unit state status service found=false
-  if command -v systemctl >/dev/null 2>&1 \
-    && sudo -u "$TENANT" XDG_RUNTIME_DIR="/run/user/$UID_T" \
-      systemctl --user list-unit-files >/dev/null 2>&1; then
-    for unit in "lunarwing-$TENANT.service" "xmpp-bridge-$TENANT.service"; do
-      status=0
-      state="$(sudo -u "$TENANT" XDG_RUNTIME_DIR="/run/user/$UID_T" \
-        systemctl --user is-active "$unit" 2>/dev/null)" || status=$?
-      case "$state" in
-        active|activating|reloading|deactivating) return 0 ;;
-        inactive|failed|unknown) ;;
-        *) [[ "$status" -eq 3 || "$status" -eq 4 ]] || return 2 ;;
-      esac
-    done
-    return 1
-  fi
-  if command -v rc-service >/dev/null 2>&1; then
-    for service in "lunarwing-$TENANT" "xmpp-bridge-$TENANT"; do
-      [[ -x "/etc/init.d/$service" ]] || continue
-      found=true
-      status=0
-      rc-service "$service" status >/dev/null 2>&1 || status=$?
-      [[ "$status" -ne 0 ]] || return 0
-      [[ "$status" -eq 3 ]] || return 2
-    done
-    [[ "$found" == true ]] && return 1
-  fi
-  return 2
+  local status=0
+  "$MT_ADMIN" writers-active "$TENANT" >/dev/null 2>&1 || status=$?
+  case "$status" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 if $NO_QUIESCE; then
   if ! $DRY_RUN; then
     writer_status=0
     tenant_writers_running || writer_status=$?
     case "$writer_status" in
-      0) die "--no-quiesce given but the '$TENANT' daemon or bridge is still running — stop both first for a consistent snapshot" ;;
+      0) die "--no-quiesce given but '$TENANT' still has active writers — stop them first for a consistent snapshot" ;;
       1) ;;
-      *) die "could not verify that the '$TENANT' daemon and bridge are stopped" ;;
+      *) die "could not verify that all '$TENANT' writers are stopped" ;;
     esac
   fi
-  note "--no-quiesce: assuming daemon + bridge are already stopped"
+  note "--no-quiesce: verified tenant writers are already stopped"
 else
-  if command -v systemctl >/dev/null 2>&1 \
-     && sudo -u "$TENANT" XDG_RUNTIME_DIR="/run/user/$UID_T" systemctl --user list-unit-files "lunarwing-$TENANT.service" >/dev/null 2>&1; then
-    run sudo -u "$TENANT" env XDG_RUNTIME_DIR="/run/user/$UID_T" systemctl --user stop "lunarwing-$TENANT.service" "xmpp-bridge-$TENANT.service"
-  elif command -v rc-service >/dev/null 2>&1; then
-    run rc-service "lunarwing-$TENANT" stop
-    run rc-service "xmpp-bridge-$TENANT" stop
-  else
-    die "could not detect the init system to stop the writers; stop the '$TENANT' daemon + xmpp-bridge manually and re-run with --no-quiesce"
+  run "$MT_ADMIN" stop-writers "$TENANT"
+  if ! $DRY_RUN; then
+    writer_status=0
+    tenant_writers_running || writer_status=$?
+    [[ "$writer_status" -eq 1 ]] \
+      || die "mt-admin stop-writers returned without verified quiescence"
   fi
-  note "daemon + bridge stopped (PostgreSQL left running for the dump)"
+  note "tenant writers stopped (PostgreSQL left running for the dump)"
 fi
 
 # ---- 2. database (PG container must still be up) -----------------------------

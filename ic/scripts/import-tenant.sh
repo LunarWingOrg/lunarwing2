@@ -35,6 +35,21 @@
 # fed to 7z over stdin and never placed in command argv.
 set -euo pipefail
 
+IMPORT_LUNARWING_KEYS=(
+  SECRETS_MASTER_KEY XMPP_JID XMPP_PASSWORD XMPP_DM_POLICY XMPP_ALLOW_FROM
+  XMPP_ALLOW_ROOMS XMPP_ENCRYPTED_ROOMS XMPP_ALLOW_PLAINTEXT_FALLBACK
+  XMPP_OMEMO_DEVICE_ID LLM_API_KEY LLM_MODEL LLM_BASE_URL NANOCODE_MODEL
+  NANOCODE_BASE_URL OPENCODE_MODEL OPENCODE_BASE_URL KIMI_MODEL KIMI_BASE_URL
+  KIMI_API_KEY GOTIFY_URL GATEWAY_HOST HTTP_HOST
+)
+IMPORT_BRIDGE_KEYS=(
+  XMPP_JID XMPP_PASSWORD XMPP_DM_POLICY XMPP_ALLOW_FROM_JSON
+  XMPP_ALLOW_ROOMS_JSON XMPP_ENCRYPTED_ROOMS_JSON XMPP_DEVICE_ID
+  XMPP_ALLOW_PLAINTEXT_FALLBACK
+)
+IMPORT_VISION_KEYS=(VL_URL VL_MODEL LUNARWING_AUTH_TOKEN)
+INJECTED_MASTER_KEY_VERIFIED=false
+
 BUNDLE=""
 NAME_OVERRIDE=""
 DO_START=false
@@ -166,7 +181,14 @@ validate_tar_archive() {
 }
 
 validate_manifest() {
-  local file="$1" kind="$2" line key
+  local file="$1" kind="$2" line key allowed_name allowed
+  case "$kind" in
+    lunarwing) allowed_name=IMPORT_LUNARWING_KEYS ;;
+    bridge) allowed_name=IMPORT_BRIDGE_KEYS ;;
+    vision) allowed_name=IMPORT_VISION_KEYS ;;
+    *) die "unknown manifest kind '$kind'" ;;
+  esac
+  local -n allowed_keys="$allowed_name"
   declare -A seen=()
   [[ -f "$file" && ! -L "$file" ]] || die "bundle contains an unsafe $kind manifest"
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -177,13 +199,81 @@ validate_manifest() {
     [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "$kind manifest contains an invalid key name"
     [[ -z "${seen[$key]+x}" ]] || die "$kind manifest contains duplicate key '$key'"
     seen["$key"]=1
-    case "$kind:$key" in
-      lunarwing:SECRETS_MASTER_KEY|lunarwing:XMPP_JID|lunarwing:XMPP_PASSWORD|lunarwing:XMPP_DM_POLICY|lunarwing:XMPP_ALLOW_FROM|lunarwing:XMPP_ALLOW_ROOMS|lunarwing:XMPP_ENCRYPTED_ROOMS|lunarwing:XMPP_ALLOW_PLAINTEXT_FALLBACK|lunarwing:XMPP_OMEMO_DEVICE_ID|lunarwing:LLM_API_KEY|lunarwing:LLM_MODEL|lunarwing:LLM_BASE_URL|lunarwing:NANOCODE_MODEL|lunarwing:NANOCODE_BASE_URL|lunarwing:OPENCODE_MODEL|lunarwing:OPENCODE_BASE_URL|lunarwing:KIMI_MODEL|lunarwing:KIMI_BASE_URL|lunarwing:KIMI_API_KEY|lunarwing:GOTIFY_URL|lunarwing:GATEWAY_HOST|lunarwing:HTTP_HOST) ;;
-      bridge:XMPP_JID|bridge:XMPP_PASSWORD|bridge:XMPP_DM_POLICY|bridge:XMPP_ALLOW_FROM_JSON|bridge:XMPP_ALLOW_ROOMS_JSON|bridge:XMPP_ENCRYPTED_ROOMS_JSON|bridge:XMPP_DEVICE_ID|bridge:XMPP_ALLOW_PLAINTEXT_FALLBACK) ;;
-      vision:VL_URL|vision:VL_MODEL|vision:LUNARWING_AUTH_TOKEN) ;;
-      *) die "$kind manifest contains unsupported key '$key'" ;;
-    esac
+    for allowed in "${allowed_keys[@]}"; do
+      [[ "$key" == "$allowed" ]] && continue 2
+    done
+    die "$kind manifest contains unsupported key '$key'"
   done <"$file"
+}
+
+path_components_no_symlink() {
+  local path="$1" rest component current="/"
+  [[ "$path" == /* ]] || return 1
+  rest="${path#/}"
+  while [[ -n "$rest" ]]; do
+    component="${rest%%/*}"
+    if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+    current="${current%/}/$component"
+    [[ ! -L "$current" ]] || return 1
+    [[ -z "$rest" || -d "$current" ]] || return 1
+  done
+}
+
+validate_mt_admin_override() {
+  local path="$1" dir rest component current="" owner mode links
+  [[ "$path" == /* && -f "$path" && ! -L "$path" && -x "$path" ]] || return 1
+  owner="$(/usr/bin/stat -c '%u' "$path" 2>/dev/null || true)"
+  mode="$(/usr/bin/stat -c '%a' "$path" 2>/dev/null || true)"
+  links="$(/usr/bin/stat -c '%h' "$path" 2>/dev/null || true)"
+  [[ "$owner" == 0 && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$mode & 022) == 0 )) || return 1
+  dir="${path%/*}"
+  [[ -n "$dir" ]] || dir=/
+  path_components_no_symlink "$dir" || return 1
+  rest="${dir#/}"
+  while [[ -n "$rest" ]]; do
+    component="${rest%%/*}"
+    current="$current/$component"
+    owner="$(/usr/bin/stat -c '%u' "$current" 2>/dev/null || true)"
+    mode="$(/usr/bin/stat -c '%a' "$current" 2>/dev/null || true)"
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 022) == 0 )) || return 1
+    if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+  done
+}
+
+validate_import_target_roots() {
+  local uid path owner mode links
+  uid="$(id -u "$TENANT" 2>/dev/null || true)"
+  [[ "$uid" =~ ^[0-9]+$ ]] || die "could not resolve target tenant UID"
+  for path in "$HOME_T" "$LWROOT" "$LWROOT/env" "$LWROOT/state"; do
+    path_components_no_symlink "$path" \
+      || die "unsafe target path component (symlink or missing directory): $path"
+    [[ -d "$path" && ! -L "$path" ]] || die "target path is not a regular directory: $path"
+    owner="$(stat -c '%u' "$path" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+    [[ "$owner" == "$uid" && "$mode" =~ ^[0-7]+$ ]] \
+      || die "target directory has unexpected ownership: $path"
+    (( (8#$mode & 022) == 0 )) || die "target directory is group/world writable: $path"
+  done
+  for path in "$ENVF" "$BRIDGE_ENVF"; do
+    [[ -f "$path" && ! -L "$path" ]] || die "target environment file is missing or unsafe: $path"
+    path_components_no_symlink "$path" || die "unsafe target environment path: $path"
+    owner="$(stat -c '%u' "$path" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+    links="$(stat -c '%h' "$path" 2>/dev/null || true)"
+    [[ "$owner" == "$uid" && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] \
+      || die "target environment file has unexpected ownership or link count: $path"
+    (( (8#$mode & 077) == 0 && (8#$mode & 0400) != 0 )) \
+      || die "target environment file has unsafe permissions: $path"
+  done
+  if [[ -e "$VISION_ENVF" ]]; then
+    [[ -f "$VISION_ENVF" && ! -L "$VISION_ENVF" ]] \
+      || die "target vision environment file is unsafe: $VISION_ENVF"
+    path_components_no_symlink "$VISION_ENVF" \
+      || die "unsafe target vision environment path: $VISION_ENVF"
+  fi
 }
 
 validate_bundle_layout() {
@@ -285,41 +375,93 @@ acquire_import_passphrase() {
   validate_passphrase "$KAWARIMI_ARCHIVE_PASS"
 }
 
-# Inject through tenant-owned atomic replacements. Root feeds secret lines over
-# stdin but never opens a tenant-controlled destination for writing.
-inject_keys() {  # <manifest> <live_env> [skip_key]
-  local man="$1" live="$2" skip_key="${3:-}" line key
-  [[ -f "$man" && ! -L "$man" ]] || return 0
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%$'\r'}"
-    [[ "$line" == *=* ]] || continue
-    key="${line%%=*}"
-    [[ -n "$skip_key" && "$key" == "$skip_key" ]] && continue
-    printf '%s\n' "$line" | sudo -u "$TENANT" env -i PATH="/usr/bin:/bin" \
-      bash -c '
-        set -euo pipefail
-        live="$1"; key="$2"; IFS= read -r replacement
-        [[ "$replacement" == "$key="* && -f "$live" && ! -L "$live" ]]
-        dir="${live%/*}"; base="${live##*/}"
-        [[ -d "$dir" && ! -L "$dir" ]]
-        tmp="$(mktemp "$dir/.${base}.import.XXXXXX")"
-        trap '\''rm -f -- "$tmp"'\'' EXIT
-        found=false
-        while IFS= read -r current || [[ -n "$current" ]]; do
-          if [[ "$current" == "$key="* ]]; then
-            printf "%s\n" "$replacement"
-            found=true
-          else
-            printf "%s\n" "$current"
-          fi
-        done <"$live" >"$tmp"
-        $found || printf "%s\n" "$replacement" >>"$tmp"
-        chmod 0600 "$tmp"
-        mv -T -- "$tmp" "$live"
-        trap - EXIT
-      ' bash "$live" "$key" || die "failed to inject $key into tenant env"
-    note "injected $key"
-  done < "$man"
+# Merge one allowlisted manifest through one tenant-side atomic replacement.
+# Secret values stay on stdin and same-directory temporary files, never argv or
+# environment. Master-key equality is verified before the rename commits.
+inject_keys() {  # <manifest> <live_env> <kind> [skip_key]
+  local man="$1" live="$2" kind="$3" skip_key="${4:-}" verify_key=""
+  validate_manifest "$man" "$kind"
+  path_components_no_symlink "$live" || die "unsafe target environment path: $live"
+  [[ -f "$live" && ! -L "$live" ]] || die "target environment file is missing or unsafe: $live"
+  [[ "$kind" == lunarwing ]] && verify_key="SECRETS_MASTER_KEY"
+
+  cat "$man" | sudo -u "$TENANT" env -i PATH="/usr/bin:/bin" \
+    TARGET_PATH="$live" TARGET_VERIFY_KEY="$verify_key" TARGET_SKIP_KEY="$skip_key" bash -c '
+      set -euo pipefail
+      target="$TARGET_PATH"
+      parent="${target%/*}"
+      base="${target##*/}"
+      uid="$(id -u)"
+      [[ -d "$parent" && ! -L "$parent" ]] || exit 73
+      parent_owner="$(stat -c %u "$parent" 2>/dev/null || printf -- -1)"
+      parent_mode="$(stat -c %a "$parent" 2>/dev/null || true)"
+      [[ "$parent_owner" == "$uid" && "$parent_mode" =~ ^[0-7]+$ ]] || exit 73
+      (( (8#$parent_mode & 077) == 0 )) || exit 73
+      [[ -f "$target" && ! -L "$target" ]] || exit 73
+      owner="$(stat -c %u "$target" 2>/dev/null || printf -- -1)"
+      mode="$(stat -c %a "$target" 2>/dev/null || true)"
+      links="$(stat -c %h "$target" 2>/dev/null || printf 0)"
+      [[ "$owner" == "$uid" && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] || exit 73
+      (( (8#$mode & 077) == 0 && (8#$mode & 0400) != 0 )) || exit 73
+
+      umask 077
+      patch="$(mktemp "$parent/.${base}.import.XXXXXX")"
+      tmp="$(mktemp "$parent/.${base}.next.XXXXXX")"
+      trap '\''rm -f -- "$patch" "$tmp"'\'' EXIT
+      cat >"$patch"
+      if ! awk -v patch="$patch" '\''
+        BEGIN {
+          while ((getline line < patch) > 0) {
+            sub(/\r$/, "", line)
+            if (line == "" || line ~ /^#/) continue
+            if (line !~ /^[A-Za-z_][A-Za-z0-9_]*=.*$/) exit 74
+            key = line
+            sub(/=.*/, "", key)
+            if (key == ENVIRON["TARGET_SKIP_KEY"]) continue
+            if (key in replacement) exit 74
+            replacement[key] = line
+            order[++count] = key
+          }
+          close(patch)
+        }
+        {
+          key = $0
+          if (key ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+            sub(/=.*/, "", key)
+            if (key in replacement) {
+              if (seen[key]++) exit 74
+              print replacement[key]
+              next
+            }
+          }
+          print
+        }
+        END {
+          for (i = 1; i <= count; i++) {
+            key = order[i]
+            if (!(key in seen)) print replacement[key]
+          }
+        }
+      '\'' "$target" >"$tmp"; then
+        exit 74
+      fi
+      chmod "$mode" "$tmp"
+      if [[ -n "${TARGET_VERIFY_KEY:-}" ]]; then
+        awk -v key="${TARGET_VERIFY_KEY}=" '\''
+          FNR == NR {
+            if (index($0, key) == 1) expected = $0
+            next
+          }
+          { if (index($0, key) == 1) actual = $0 }
+          END { if (expected == "" || actual != expected) exit 74 }
+        '\'' "$patch" "$tmp" || exit 74
+      fi
+      mv -T -f -- "$tmp" "$target"
+      rm -f -- "$patch"
+      trap - EXIT
+    ' >/dev/null || die "could not safely inject $kind manifest into $live"
+  [[ "$kind" == lunarwing ]] && INJECTED_MASTER_KEY_VERIFIED=true
+  note "validated and atomically injected $kind manifest into $live"
 }
 
 non_target_owner_scopes() {  # <scope-summary> <target-scope>
@@ -405,10 +547,14 @@ if [[ "$BUNDLE" == *.7z ]]; then
 fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-MT="$SCRIPT_DIR/lunarwing-mt-admin.sh"
+MT="${LUNARWING_MT_ADMIN:-$SCRIPT_DIR/lunarwing-mt-admin.sh}"
 WEECHAT_PREFLIGHT="$SCRIPT_DIR/lunarwing-weechat-preflight.sh"
 PORTS_REGISTRY="${LUNARWING_PORTS_REGISTRY:-/etc/lunarwing/ports.json}"
 [[ -x "$MT" ]] || die "mt-admin not found/executable at $MT"
+if [[ -n "${LUNARWING_MT_ADMIN:-}" ]]; then
+  validate_mt_admin_override "$MT" \
+    || die "LUNARWING_MT_ADMIN must be root-owned, single-link, non-writable, and below trusted directories"
+fi
 [[ -x "$WEECHAT_PREFLIGHT" ]] || die "WeeChat preflight not found/executable at $WEECHAT_PREFLIGHT"
 grep -qE '^\s*restore-tenant)' "$MT" || die "mt-admin at $MT predates restore-tenant (need a v1.1.4-class host)"
 grep -qE '^\s*owner-scopes)' "$MT" || die "mt-admin at $MT predates owner-scopes (need current Kawarimi owner-scope checks)"
@@ -489,6 +635,18 @@ if [[ -f "$WORK/darkirc-contacts-v1.json" ]]; then
   DARKIRC_SCOPE_ID="$(meta darkirc_scope_id)"
   [[ "$DARKIRC_SCOPE_ID" =~ ^[0-9a-f]{32}$ && "$DARKIRC_SCOPE_ID" != "00000000000000000000000000000000" ]] \
     || die "bundle has invalid or missing DarkIRC stable scope ID"
+  grep -qE 'validate-migration' "$MT" \
+    || die "target mt-admin lacks typed DarkIRC migration validation"
+  if $DRY_RUN; then
+    note "[dry-run] would typed-validate darkirc-contacts-v1.json before provisioning"
+  else
+    manifest_validation="$("$MT" darkirc-contact validate-migration --in - --json \
+      <"$WORK/darkirc-contacts-v1.json")" \
+      || die "DarkIRC structured migration manifest failed typed validation"
+    validated_scope="$(jq -r '.scope_id // empty' <<<"$manifest_validation")"
+    [[ "$validated_scope" == "$DARKIRC_SCOPE_ID" ]] \
+      || die "DarkIRC manifest scope does not match bundle metadata"
+  fi
 fi
 
 banner "Import tenant '$TENANT' (from source $SRC_VER, db $DB_BACKEND)"
@@ -569,11 +727,9 @@ $WITH_PEBBLE  && add_args+=(--with-pebble)
 $WITH_OPENCODE && add_args+=(--with-opencode)
 $WITH_KIMI && add_args+=(--with-kimi)
 if [[ -n "$DARKIRC_SCOPE_ID" ]]; then
-  add_args+=(--enable-darkirc)
-  run env LUNARWING_MT_IMPORT_DARKIRC_SCOPE_ID="$DARKIRC_SCOPE_ID" "$MT" "${add_args[@]}"
-else
-  run "$MT" "${add_args[@]}"
+  add_args+=(--enable-darkirc --darkirc-scope-id "$DARKIRC_SCOPE_ID")
 fi
+run "$MT" "${add_args[@]}"
 
 HOME_T="$(getent passwd "$TENANT" | cut -d: -f6 2>/dev/null || echo "/home/$TENANT")"
 LWROOT="$HOME_T/lunarwing"
@@ -598,23 +754,20 @@ if $DRY_RUN; then
   note "[dry-run] would inject manifest-lunarwing.env -> $ENVF and manifest-bridge.env -> $BRIDGE_ENVF (incl. SECRETS_MASTER_KEY, XMPP password, XMPP/LLM config)"
   [[ -s "$WORK/manifest-vision.env" ]] && note "[dry-run] would inject manifest-vision.env -> $VISION_ENVF (VL_URL and VL_MODEL; target-generated auth token retained)"
 else
-  inject_keys "$WORK/manifest-lunarwing.env" "$ENVF"
-  [[ -f "$WORK/manifest-bridge.env" ]] && inject_keys "$WORK/manifest-bridge.env" "$BRIDGE_ENVF"
+  validate_import_target_roots
+  inject_keys "$WORK/manifest-lunarwing.env" "$ENVF" lunarwing
+  [[ -f "$WORK/manifest-bridge.env" ]] \
+    && inject_keys "$WORK/manifest-bridge.env" "$BRIDGE_ENVF" bridge
   if [[ -s "$WORK/manifest-vision.env" ]]; then
     [[ -f "$VISION_ENVF" ]] || die "bundle carries vision config, but target mt-admin did not render $VISION_ENVF"
     # Vision auth is host-local. Old bundles may carry it, but add-tenant has
     # already generated a matching target-sidecar/daemon pair; never split it.
-    inject_keys "$WORK/manifest-vision.env" "$VISION_ENVF" LUNARWING_AUTH_TOKEN
+    inject_keys "$WORK/manifest-vision.env" "$VISION_ENVF" vision LUNARWING_AUTH_TOKEN
     note "vision.env carried config injected (target-generated auth retained)"
   fi
-  # Verify the master key landed VERBATIM — without putting the value on argv
-  # (command substitution keeps it out of /proc/<pid>/cmdline) and without the
-  # grep -F "" empty-pattern false-PASS.
-  man_key="$(grep -m1 '^SECRETS_MASTER_KEY=' "$WORK/manifest-lunarwing.env" || true)"
-  live_key="$(grep -m1 '^SECRETS_MASTER_KEY=' "$ENVF" || true)"
-  [[ -n "$man_key" && "$live_key" == "$man_key" ]] \
-    || die "SECRETS_MASTER_KEY did not land in $ENVF after injection — abort before restore (the DB's secrets would be undecryptable)"
-  note "SECRETS_MASTER_KEY confirmed in place (verbatim)"
+  [[ "$INJECTED_MASTER_KEY_VERIFIED" == true ]] \
+    || die "SECRETS_MASTER_KEY verification did not complete before restore"
+  note "SECRETS_MASTER_KEY confirmed before atomic env replacement"
 fi
 
 # ---- 4. restore the database (PG up from step 1, daemon not started) ---------

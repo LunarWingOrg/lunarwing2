@@ -156,8 +156,8 @@ source "$ADMIN_SCRIPT"
 render_body="$(declare -f render_tenant_openrc_units)"
 weechat_render_body="$(declare -f _render_weechat_openrc_unit)"
 writer_body="$(declare -f write_tenant_darkirc_adapter_env)"
-grep -Fq 'chmod 0600 "$path"' <<<"$writer_body" || {
-  printf 'DarkIRC adapter env writer does not enforce mode 0600\n' >&2
+grep -Fq 'write_tenant_file_atomic "$name" "$path" 600' <<<"$writer_body" || {
+  printf 'DarkIRC adapter env writer does not use atomic mode-0600 output\n' >&2
   exit 1
 }
 for launcher_var in \

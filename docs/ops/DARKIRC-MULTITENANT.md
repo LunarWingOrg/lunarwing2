@@ -214,9 +214,11 @@ Generic machine migration now handles managed DarkIRC through structured
 `darkirc-contacts-v1` manifest. Export holds tenant lifecycle and writer locks
 through bundle seal,
 excludes host-specific DarkIRC runtime/config state, and carries stable
-`darkirc_scope_id`. Import allocates same scope before baseline generation, then
-stages and imports manifest through typed helper while holding same tenant
-lifecycle lock. Never copy `key-exchange/`
+`darkirc_scope_id`. Import validates manifest through installed typed helper
+before provisioning, passes scope explicitly to `add-tenant`, then stages and
+imports manifest through typed helper while holding same tenant lifecycle lock.
+Manifest env merges run as tenant through same-directory atomic replacements;
+root does not open tenant env destinations for writing. Never copy `key-exchange/`
 directly or delete it to bypass migration checks.
 
 Manual structured commands remain available for diagnostics:
@@ -317,22 +319,22 @@ Do not print `ADAPTER_SECRET`.
 
 ### 3. Check Adapter Health
 
-`/health` requires the adapter's bearer secret (it returns `{"error": "unauthorized"}` without it):
+Use mt-admin's authenticated strict diagnostic. It verifies both init services,
+reads bearer under tenant identity, keeps bearer out of process argv, and requires
+adapter response `status=ok` plus `irc_connected=true`:
 
 ```bash
-adapter_port=$(jq -r '.tenants["<TENANT>"].extended_ports.darkirc_adapter' /etc/lunarwing/ports.json)
-secret=$(sudo grep -s '^ADAPTER_SECRET=' /home/<TENANT>/lunarwing/env/darkirc-adapter.env | cut -d= -f2-)
-curl -sf -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${adapter_port}/health" | jq .
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-health <TENANT> --strict --json
 ```
 
-Do not print the secret in shared logs. Expected shape:
+This command is diagnostic only. It does not activate contacts, restart services,
+or satisfy deferred Stage B activation/rollback requirements. Expected shape:
 
 ```json
 {
   "status": "ok",
-  "irc_connected": true,
-  "irc_nick": "<TENANT>-bridge",
-  "queue_size": 0
+  "tenant": "<TENANT>",
+  "irc_connected": true
 }
 ```
 
@@ -413,6 +415,10 @@ sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact recover <TENANT> --json
 sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact cancel <TENANT> \
   --exchange-id <32-lowercase-hex> --json
 ```
+
+`list`, `status`, `doctor`, `exchanges`, `writers-active`, and strict health
+inspection validate registry read-only; they do not create or migrate registry
+state. Mutation commands retain registry migration and lifecycle locking.
 
 ## Tor / Hidden Service Options
 

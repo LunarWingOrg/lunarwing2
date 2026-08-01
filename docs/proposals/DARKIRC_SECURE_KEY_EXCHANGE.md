@@ -4,10 +4,12 @@
 > branch implements Phase 0/1 and Stage A: contact-preserving baseline updates,
 > typed helper, compatibility attestation, stable tenant scopes, bounded pending
 > state, public offer/respond/complete/cancel flow, durable replay tombstones,
-> crash recovery, writer locks, and structured machine migration. Activation is
-> deliberately deferred.
+> crash recovery, writer locks, structured machine migration, and standalone
+> strict local-health diagnostics. Diagnostics are not activation state;
+> activation remains deliberately deferred.
 >
-> Stage B and later work remains open: local activation health gates, peer
+> Stage B and later work remains open: binding local health into durable
+> activation/rollback, peer
 > verification, rollback, rotation, revocation, same-host pairing, web/QR
 > delivery, and trusted-channel automation. No web surface exists. See
 > `DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md` for stage boundaries.

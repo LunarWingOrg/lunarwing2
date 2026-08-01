@@ -45,6 +45,8 @@ tenant_darkirc_enabled() { [[ "${DARKIRC_ENABLED:-false}" == "true" ]]; }
 
 tenant_env_dir() { printf '%s/env' "$stub_dir"; }
 
+read_tenant_env_value() { _read_env_value "$2" "$3"; }
+
 ports_get() { printf '%s' "$FIXTURE_PORT"; printf '%s' "$2" >"${stub_dir}/ports_get_last_key_called.txt"; }
 
 _wait_tenant_gateway() { return 0; }

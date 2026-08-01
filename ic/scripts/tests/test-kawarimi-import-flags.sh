@@ -77,14 +77,31 @@ ENV
 }
 
 make_test_scripts() {
-  local work="$1"
-  mkdir -p "$work/scripts" "$work/bin" "$work/home/kawarimi/lunarwing/env"
+  local work="$1" fixture_uid fixture_gid
+  fixture_uid="$(id -u)"
+  fixture_gid="$(id -g)"
+  mkdir -p "$work/scripts" "$work/bin" "$work/home/kawarimi/lunarwing/env" \
+    "$work/home/kawarimi/lunarwing/state"
+  chmod 0700 "$work/home/kawarimi/lunarwing/env"
   cp "$IMPORT_SRC" "$work/scripts/import-tenant.sh"
+  cp "$EXPORT_SRC" "$work/scripts/export-tenant.sh"
 
   cat >"$work/scripts/lunarwing-mt-admin.sh" <<'MT'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${KAWARIMI_TEST_WORK:?}/mt-admin.log"
+if [[ "${1:-}" == darkirc-contact && "${2:-}" == validate-migration ]]; then
+  jq -c '{status:"valid",scope_id:(.scope_id // empty)}'
+  exit 0
+fi
 case "${1:-}" in
+  stop-writers) exit 0 ;;
+  writers-active)
+    case "${KAWARIMI_WRITER_MODE:-inactive}" in
+      active) exit 0 ;;
+      inactive) exit 1 ;;
+      *) exit 2 ;;
+    esac
+    ;;
   owner-scopes)
     if [[ -f "$KAWARIMI_TEST_WORK/scope-migrated" ]]; then
       printf 'kawarimi\t12\n'
@@ -108,12 +125,18 @@ printf 'preflight %s\n' "${1:-}" >> "${KAWARIMI_TEST_WORK:?}/preflight.log"
 PREFLIGHT
   chmod +x "$work/scripts/import-tenant.sh" "$work/scripts/lunarwing-weechat-preflight.sh"
 
-  cat >"$work/bin/id" <<'ID'
+  cat >"$work/bin/id" <<ID
 #!/usr/bin/env bash
-if [[ "${1:-}" == "-u" ]]; then
-  printf '0\n'
+if [[ "\${1:-}" == "-u" && \$# -eq 1 ]]; then
+  if [[ "\${KAWARIMI_FAKE_TENANT:-}" == 1 ]]; then
+    printf '%s\n' "$fixture_uid"
+  else
+    printf '0\n'
+  fi
+elif [[ "\${1:-}" == "-u" && "\${2:-}" == "kawarimi" ]]; then
+  printf '%s\n' "$fixture_uid"
 else
-  exec /usr/bin/id "$@"
+  exec /usr/bin/id "\$@"
 fi
 ID
   chmod +x "$work/bin/id"
@@ -121,7 +144,7 @@ ID
   cat >"$work/bin/getent" <<GETENT
 #!/usr/bin/env bash
 if [[ "\${1:-}" == "passwd" && "\${2:-}" == "kawarimi" ]]; then
-  printf 'kawarimi:x:1000:1000::%s/home/kawarimi:/bin/bash\n' "$work"
+  printf 'kawarimi:x:$fixture_uid:$fixture_gid::%s/home/kawarimi:/bin/bash\n' "$work"
 else
   exit 2
 fi
@@ -149,6 +172,7 @@ STAT
   cat >"$work/bin/sudo" <<'SUDO'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+export KAWARIMI_FAKE_TENANT=1
 exec "$@"
 SUDO
   chmod +x "$work/bin/getent" "$work/bin/install" "$work/bin/stat" "$work/bin/sudo"
@@ -207,9 +231,13 @@ darkirc_output="$(
 }
 assert_contains "DarkIRC import enables target service" "$darkirc_output" "--enable-darkirc"
 assert_contains "DarkIRC import preserves stable scope" "$darkirc_output" \
-  "LUNARWING_MT_IMPORT_DARKIRC_SCOPE_ID=fedcba9876543210fedcba9876543210"
+  "--darkirc-scope-id fedcba9876543210fedcba9876543210"
 assert_contains "DarkIRC import stages structured manifest" "$darkirc_output" \
   "would stage and import structured DarkIRC contacts"
+assert_contains "DarkIRC import plans typed preflight" "$darkirc_output" \
+  "would typed-validate darkirc-contacts-v1.json before provisioning"
+assert_file_not_contains "DarkIRC preflight binds target compatibility" "$IMPORT_SRC" \
+  "validate-migration --in - --json --unbound"
 rm -rf "$darkirc_tmp"
 
 echo "=== import-tenant worker selection reaches BOTH add-tenant and build-tenant ==="
@@ -281,6 +309,7 @@ cat >"$tmp/home/kawarimi/lunarwing/env/vision.env" <<'ENV'
 VL_MODEL=throwaway
 LUNARWING_AUTH_TOKEN=target-vision-token
 ENV
+chmod 0600 "$tmp/home/kawarimi/lunarwing/env/"*.env
 auto_output="$(
   PATH="$tmp/bin:$PATH" \
   LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
@@ -595,7 +624,7 @@ missing_output="$(
   PATH="$tmp/export-bin:$PATH" \
   KAWARIMI_TEST_WORK="$tmp" \
   KAWARIMI_PASS='' KAWARIMI_PASS_FILE='' KAWARIMI_PASS_FD='' \
-  bash "$EXPORT_SRC" alpha --out-dir "$tmp/export-out" </dev/null 2>&1
+  bash "$tmp/scripts/export-tenant.sh" alpha --out-dir "$tmp/export-out" </dev/null 2>&1
 )"
 missing_status=$?
 set -e
@@ -621,7 +650,7 @@ mismatch_output="$(
   PATH="$tmp/export-bin:$PATH" \
   KAWARIMI_TEST_WORK="$tmp" \
   KAWARIMI_PASS='valid-export-passphrase' \
-  bash "$EXPORT_SRC" alpha --out-dir "$tmp/export-out" </dev/null 2>&1
+  bash "$tmp/scripts/export-tenant.sh" alpha --out-dir "$tmp/export-out" </dev/null 2>&1
 )"
 mismatch_status=$?
 set -e
@@ -652,7 +681,7 @@ managed_export_output="$(
 )"
 managed_export_status=$?
 set -e
-if [[ "$managed_export_status" -ne 0 && "$managed_export_output" == *"requires trusted mt-admin"* ]]; then
+if [[ "$managed_export_status" -ne 0 && "$managed_export_output" == *"trusted mt-admin not found"* ]]; then
   pass "export requires structured DarkIRC tooling"
 else
   fail "export requires structured DarkIRC tooling"
@@ -671,14 +700,14 @@ for writer_mode in active unavailable; do
   no_quiesce_output="$(
     PATH="$tmp/export-bin:$PATH" \
     KAWARIMI_TEST_WORK="$tmp" \
-    KAWARIMI_SYSTEMCTL_MODE="$writer_mode" \
-    bash "$EXPORT_SRC" alpha --out-dir "$tmp/export-out" --no-quiesce --no-encrypt \
+    KAWARIMI_WRITER_MODE="$writer_mode" \
+    bash "$tmp/scripts/export-tenant.sh" alpha --out-dir "$tmp/export-out" --no-quiesce --no-encrypt \
       </dev/null 2>&1
   )"
   no_quiesce_status=$?
   set -e
   if [[ "$writer_mode" == active ]]; then
-    expected_no_quiesce="still running"
+    expected_no_quiesce="active writers"
   else
     expected_no_quiesce="could not verify"
   fi
@@ -707,7 +736,7 @@ full_export_output="$(
   PATH="$tmp/export-bin:$PATH" \
   KAWARIMI_TEST_WORK="$tmp" \
   KAWARIMI_PASS_FD=8 \
-  bash "$EXPORT_SRC" alpha --out-dir "$tmp/export-out" 2>&1
+  bash "$tmp/scripts/export-tenant.sh" alpha --out-dir "$tmp/export-out" 2>&1
 )" || {
   status=$?
   printf '%s\n' "$full_export_output"

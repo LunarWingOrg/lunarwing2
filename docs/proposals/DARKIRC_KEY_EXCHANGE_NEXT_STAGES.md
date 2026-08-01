@@ -15,6 +15,9 @@
   and crash-finalized completion journals.
 - Kawarimi export/import carries structured contacts and stable scope without
   copying host-specific DarkIRC runtime state.
+- Standalone `darkirc-health <tenant> --strict [--json]` checks both init
+  services and authenticated adapter connectivity without exposing bearer in
+  argv. It is diagnostic only, not activation state.
 - Named artifacts use capability-relative no-follow I/O. If delivery fails after
   pending state commits, helper reports committed `offer_id`; rerunning same
   prepare/respond operation reuses stored public artifact instead of generating
@@ -33,7 +36,8 @@ Implement only after dedicated design review:
 
 1. Durable activation intent and deadline.
 2. Daemon reload/restart through init-agnostic mt-admin lifecycle.
-3. Local health and config fingerprint verification.
+3. Bind existing strict local health diagnostic plus config fingerprint
+   verification into durable activation transaction.
 4. Crash recovery for every activation journal phase.
 5. Automatic rollback when local health gate fails.
 

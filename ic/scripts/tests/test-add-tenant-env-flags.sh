@@ -72,6 +72,7 @@ tenant_env_dir()    { echo "$MT_FIXTURE/env"; }
 tenant_state_dir()  { echo "$MT_FIXTURE/state"; }
 tenant_run_dir()    { echo "$MT_FIXTURE/run"; }
 mkdir -p "$MT_FIXTURE/env" "$MT_FIXTURE/state" "$MT_FIXTURE/run"
+chmod 0700 "$MT_FIXTURE/env" "$MT_FIXTURE/state" "$MT_FIXTURE/run"
 
 # Stub ports_get to return deterministic ports. Restore the real implementation
 # for registry migration/lookup tests below.
@@ -100,6 +101,15 @@ tenant_darkirc_enabled()  { [[ "$DARKIRC_FIXTURE_ENABLED" == "true" ]]; }
 generate_token()          { echo "token-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; }
 say()                     { :; }          # silence
 chown()                   { :; }          # no-op (running as non-root in tests)
+sudo() {
+  [[ "${1:-}" == -u ]] && shift 2
+  if [[ "${1:-}" == env ]]; then
+    shift
+    command env "$@"
+  else
+    "$@"
+  fi
+}
 
 run_writer() {  # <args...> — invokes write_tenant_lunarwing_env, prints the file
   rm -f "$MT_FIXTURE/env/lunarwing.env"
@@ -354,7 +364,7 @@ if (patch_tenant_coordination_env broken "$BAD_ENV" >/dev/null 2>&1); then
 else
   echo "  PASS: missing coord_admin port rejected"
 fi
-assert_eq "failed backfill hardens env mode" "$(stat -c '%a' "$BAD_ENV")" "600"
+assert_eq "failed backfill does not rewrite unsafe env" "$(stat -c '%a' "$BAD_ENV")" "644"
 if grep -q '^COORD_ADMIN_TOKEN=' "$BAD_ENV"; then
   echo "  FAIL: failed backfill appended coordination token"; failures=$((failures + 1))
 else
