@@ -1548,8 +1548,11 @@ async fn handle_message_stanza(
             .or_insert_with(HashSet::new);
     }
 
-    let attachments = extract_inbound_attachments(&msg.payloads, &content).await;
-    let content = strip_attachment_urls(content, &attachments);
+    let extraction = extract_inbound_attachments(&msg.payloads, &content).await;
+    // Strip every recognized attachment URL (successful download or not) so
+    // key-bearing `aesgcm://` URLs never survive into content.
+    let content = strip_attachment_urls(content, &extraction.recognized_urls);
+    let attachments = extraction.attachments;
 
     let mut incoming = IncomingMessage::new("xmpp", target_jid.clone(), content)
         .with_owner_id(&config.jid)
@@ -2871,12 +2874,28 @@ fn extract_body_from_message(msg: &xmpp_parsers::message::Message) -> Option<Str
     msg.bodies.values().find(|b| !b.is_empty()).cloned()
 }
 
+/// Result of inbound attachment extraction.
+struct InboundAttachmentExtraction {
+    /// Attachments that downloaded (and decrypted) successfully.
+    attachments: Vec<IncomingAttachment>,
+    /// Every attachment URL recognized in the stanza, including ones whose
+    /// download failed. A failed `aesgcm://` URL still carries the XEP-0454
+    /// key fragment and a failed OOB URL can carry signed query credentials,
+    /// so callers must strip these from message content — not just the URLs
+    /// of successful downloads — before the text reaches the model or
+    /// persisted history.
+    recognized_urls: Vec<String>,
+}
+
 /// Extract downloadable attachments referenced by an incoming message: OOB URLs
 /// from the stanza payloads (XEP-0066) plus any `aesgcm://` (XEP-0454) URLs that
 /// appear only in the decrypted body — some clients omit the cleartext OOB
 /// element for encrypted files. Downloads (and decrypts) them and returns the
-/// resulting attachments.
-async fn extract_inbound_attachments(payloads: &[Element], body: &str) -> Vec<IncomingAttachment> {
+/// resulting attachments plus every recognized URL for content stripping.
+async fn extract_inbound_attachments(
+    payloads: &[Element],
+    body: &str,
+) -> InboundAttachmentExtraction {
     let mut urls = collect_oob_urls(payloads, MAX_OOB_ATTACHMENTS);
     let oob_total = payloads.iter().filter(|p| p.is("x", ns::OOB)).count();
     if oob_total > MAX_OOB_ATTACHMENTS {
@@ -2900,7 +2919,10 @@ async fn extract_inbound_attachments(payloads: &[Element], body: &str) -> Vec<In
     }
 
     if urls.is_empty() {
-        return Vec::new();
+        return InboundAttachmentExtraction {
+            attachments: Vec::new(),
+            recognized_urls: Vec::new(),
+        };
     }
 
     let client = match reqwest::Client::builder()
@@ -2910,21 +2932,35 @@ async fn extract_inbound_attachments(payloads: &[Element], body: &str) -> Vec<In
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("Failed to build HTTP client for OOB download: {}", e);
-            return Vec::new();
+            // Still return the recognized URLs so the caller strips key- and
+            // credential-bearing URLs from content even though nothing was
+            // downloaded.
+            return InboundAttachmentExtraction {
+                attachments: Vec::new(),
+                recognized_urls: urls.into_iter().map(|(u, _)| u).collect(),
+            };
         }
     };
+
+    let recognized_urls: Vec<String> = urls.iter().map(|(u, _)| u.clone()).collect();
 
     // Download up to MAX_CONCURRENT_OOB_DOWNLOADS files at once so a single slow
     // URL can't serialize the whole batch (and stall the client event loop) for
     // N * timeout. `buffered` keeps the results in stanza order.
-    futures::stream::iter(urls)
+    let attachments = futures::stream::iter(urls)
         .map(|(url, _desc)| {
             let client = &client;
             async move {
                 match download_oob_file(client, &url).await {
                     Ok(attachment) => Some(attachment),
                     Err(e) => {
-                        tracing::warn!(url = %url, "OOB file download failed: {}", e);
+                        // The raw URL can carry an XEP-0454 key fragment or
+                        // signed query credentials — log only a redacted form.
+                        tracing::warn!(
+                            url = %redact_url_for_log(&url),
+                            "OOB file download failed: {}",
+                            e
+                        );
                         None
                     }
                 }
@@ -2933,7 +2969,44 @@ async fn extract_inbound_attachments(payloads: &[Element], body: &str) -> Vec<In
         .buffered(MAX_CONCURRENT_OOB_DOWNLOADS)
         .filter_map(|opt| async move { opt })
         .collect()
-        .await
+        .await;
+
+    InboundAttachmentExtraction {
+        attachments,
+        recognized_urls,
+    }
+}
+
+/// Format a reqwest error with its embedded URL removed — reqwest's Display
+/// includes the request URL, which can carry signed query credentials that
+/// must not reach logs or message content.
+fn sanitize_reqwest_error(e: &reqwest::Error) -> String {
+    let msg = e.to_string();
+    match e.url() {
+        Some(url) => msg.replace(url.as_str(), "<redacted-url>"),
+        None => msg,
+    }
+}
+
+/// Render a URL safe for logging: scheme and host only. Userinfo, path, query,
+/// and — critically for `aesgcm://` (XEP-0454) — the key-bearing fragment are
+/// all dropped.
+fn redact_url_for_log(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) => {
+            let mut out = format!("{}://", url.scheme());
+            match url.host_str() {
+                Some(host) => out.push_str(host),
+                None => out.push_str("<no-host>"),
+            }
+            if let Some(port) = url.port() {
+                out.push_str(&format!(":{port}"));
+            }
+            out.push_str("/<redacted>");
+            out
+        }
+        Err(_) => "<invalid-url>".to_string(),
+    }
 }
 
 /// Collect OOB URLs (with optional descriptions) from message payloads, capped
@@ -2959,33 +3032,20 @@ fn collect_aesgcm_urls(text: &str, max: usize) -> Vec<String> {
         .collect()
 }
 
-fn strip_attachment_urls(mut content: String, attachments: &[IncomingAttachment]) -> String {
-    for attachment in attachments {
-        if let Some(url) = attachment.source_url.as_deref() {
-            content = content.replace(url, "");
-        }
+/// Remove every recognized attachment URL from `content`. Must be called with
+/// all URLs recognized in the stanza — not only successfully downloaded ones —
+/// so a failed `aesgcm://` download can't leave the key-bearing URL (or a
+/// signed OOB query) in text that flows into model context and persisted
+/// history.
+fn strip_attachment_urls(mut content: String, urls: &[String]) -> String {
+    for url in urls {
+        content = content.replace(url.as_str(), "");
     }
 
     if content.trim().is_empty() {
         String::new()
     } else {
         content
-    }
-}
-
-#[cfg(test)]
-fn incoming_attachment_for_url(url: &str) -> IncomingAttachment {
-    IncomingAttachment {
-        id: Uuid::new_v4().to_string(),
-        kind: AttachmentKind::Document,
-        mime_type: "application/octet-stream".to_string(),
-        filename: None,
-        size_bytes: None,
-        source_url: Some(url.to_string()),
-        storage_key: None,
-        extracted_text: None,
-        data: vec![1],
-        duration_secs: None,
     }
 }
 
@@ -3040,7 +3100,7 @@ async fn download_oob_file(
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("HTTP GET failed: {e}"))?;
+        .map_err(|e| format!("HTTP GET failed: {}", sanitize_reqwest_error(&e)))?;
 
     if !response.status().is_success() {
         return Err(format!("HTTP {} from OOB URL", response.status()));
@@ -3103,7 +3163,7 @@ async fn download_aesgcm_file(
         .get(&https_url)
         .send()
         .await
-        .map_err(|e| format!("HTTP GET failed: {e}"))?;
+        .map_err(|e| format!("HTTP GET failed: {}", sanitize_reqwest_error(&e)))?;
     if !response.status().is_success() {
         return Err(format!("HTTP {} from aesgcm URL", response.status()));
     }
@@ -3625,15 +3685,52 @@ mod tests {
     fn strip_attachment_urls_removes_embedded_aesgcm_urls() {
         let url = "aesgcm://h/a.jpg#aa";
         let content = format!("check this out {url} thanks");
-        let stripped = strip_attachment_urls(content, &[incoming_attachment_for_url(url)]);
+        let stripped = strip_attachment_urls(content, &[url.to_string()]);
         assert_eq!(stripped, "check this out  thanks");
     }
 
     #[test]
     fn strip_attachment_urls_clears_url_only_body() {
         let url = "aesgcm://h/a.jpg#aa";
-        let stripped = strip_attachment_urls(url.to_string(), &[incoming_attachment_for_url(url)]);
+        let stripped = strip_attachment_urls(url.to_string(), &[url.to_string()]);
         assert!(stripped.is_empty());
+    }
+
+    #[test]
+    fn redact_url_for_log_drops_query_and_key_fragment() {
+        let fragment = hex::encode([7u8; 44]);
+        let aesgcm = format!("aesgcm://up.example.com/x/file.bin#{fragment}");
+        let redacted = redact_url_for_log(&aesgcm);
+        assert_eq!(redacted, "aesgcm://up.example.com/<redacted>");
+        assert!(!redacted.contains(&fragment));
+
+        let signed = "https://files.example.com/get?sig=secret-token&x=1";
+        let redacted = redact_url_for_log(signed);
+        assert!(!redacted.contains("secret-token"));
+        assert!(!redacted.contains('?'));
+
+        assert_eq!(redact_url_for_log("not a url"), "<invalid-url>");
+    }
+
+    /// Regression for the credential-leak finding: when an `aesgcm://`
+    /// download fails, the key-bearing URL must still be recognized (so the
+    /// caller strips it from content) while no attachment is produced.
+    #[tokio::test]
+    async fn failed_aesgcm_download_still_recognized_for_stripping() {
+        let fragment = hex::encode([9u8; 44]);
+        // Port 1 refuses fast regardless of DNS/egress policy, so the
+        // download fails deterministically without network access.
+        let url = format!("aesgcm://127.0.0.1:1/x/file.bin#{fragment}");
+        let content = format!("here you go {url} enjoy");
+        let extraction = extract_inbound_attachments(&[], &content).await;
+
+        assert!(extraction.attachments.is_empty());
+        assert_eq!(extraction.recognized_urls, vec![url.clone()]);
+
+        let stripped = strip_attachment_urls(content, &extraction.recognized_urls);
+        assert!(!stripped.contains(&url));
+        assert!(!stripped.contains(&fragment));
+        assert_eq!(stripped, "here you go  enjoy");
     }
 
     #[test]
