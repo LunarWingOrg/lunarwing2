@@ -11,9 +11,9 @@ Self-hosted GitLab CE (v19.2.0). Replace `<version>` (e.g. `1.1.9`) and
 (`master` → `release/v<version>`) is documented in the root `CLAUDE.md` where
 applicable.
 
-> **Sibling docs:**
-> - [`RELEASE-COMMANDS.md`](RELEASE-COMMANDS.md) — original GitHub / `gh` variant
-> - [`RELEASE-COMMANDS-CODEBERG.md`](RELEASE-COMMANDS-CODEBERG.md) — historical Codeberg/Forgejo variant, now archived
+> **Sibling docs:** the older GitHub/`gh` (`RELEASE-COMMANDS.md`) and
+> Codeberg/Forgejo (`RELEASE-COMMANDS-CODEBERG.md`) variants were deleted
+> (commits e975fa7 and e175fb9); they survive only in git history.
 >
 > Prefer **this** file for the GitLab origin used by `LunarWing_v2` going forward.
 
@@ -239,7 +239,7 @@ with others, or release notes.
 
 ## Related
 
-- [`RELEASE-COMMANDS.md`](RELEASE-COMMANDS.md) — original GitHub / `gh` variant
-- [`RELEASE-COMMANDS-CODEBERG.md`](RELEASE-COMMANDS-CODEBERG.md) — archived Codeberg/Forgejo variant
 - [`RELEASE_CADENCE.md`](RELEASE_CADENCE.md) — odd/even cadence notes
 - `docs/releases/` — archived release notes (where present)
+- Older GitHub/`gh` and Codeberg/Forgejo command variants were deleted;
+  recover them from git history if ever needed (commits e975fa7, e175fb9).
