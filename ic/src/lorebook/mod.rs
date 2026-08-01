@@ -5,6 +5,7 @@
 //! subset rather than claiming complete World Info parity; see
 //! `docs/proposals/LOREBOOKS.md` for supported and unsupported behavior.
 
+pub mod engine;
 pub mod model;
 
 pub use model::{LorebookEntry, LorebookError, SelectiveLogic, parse_lorebook};
