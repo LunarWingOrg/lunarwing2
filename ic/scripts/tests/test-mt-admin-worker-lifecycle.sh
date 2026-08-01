@@ -23,6 +23,14 @@ assert_call() {
   fail "missing call: $expected"
 }
 
+assert_no_call() {
+  local unexpected="$1" call
+  for call in "${CALLS[@]}"; do
+    [[ "$call" != "$unexpected" ]] || { fail "unexpected call: $unexpected"; return; }
+  done
+  printf 'PASS: no %s\n' "$unexpected"
+}
+
 assert_before() {
   local first="$1" second="$2" first_index=-1 second_index=-1 index
   for index in "${!CALLS[@]}"; do
@@ -108,6 +116,120 @@ if (stop_worker alice arbitrary >/dev/null 2>&1); then
 else
   printf 'PASS: unknown worker rejected\n'
 fi
+
+if (stop_worker alice nanocode >/dev/null 2>&1); then
+  fail "retired Nanocode worker accepted"
+else
+  printf 'PASS: retired Nanocode worker rejected\n'
+fi
+
+if (render_worker_quadlet alice nanocode 8443 >/dev/null 2>&1); then
+  fail "retired Nanocode Quadlet accepted"
+else
+  printf 'PASS: retired Nanocode Quadlet rejected\n'
+fi
+
+# ── Legacy Nanocode lifecycle ────────────────────────────────────────────────
+
+fixture="$(mktemp -d)"
+trap 'command rm -rf "$fixture"' EXIT
+tenant_home() { printf '%s/home/%s' "$fixture" "$1"; }
+tenant_quadlet_dir() { printf '%s/quadlets' "$fixture"; }
+id() {
+  if [[ "${1:-}" == "-u" ]]; then printf '1000\n'; return 0; fi
+  return 1
+}
+getent() {
+  [[ "${1:-}" == "passwd" ]] || return 1
+  printf 'alice:x:1000:1000::%s/home/alice:/bin/bash\n' "$fixture"
+}
+command() {
+  if [[ "${1:-}" == "-v" && ( "${2:-}" == "docker" || "${2:-}" == "podman" ) ]]; then
+    return 0
+  fi
+  builtin command "$@"
+}
+
+_stop_nanocode_container_store() {
+  local label="$1" container="$2"
+  shift 2
+  CALLS+=("store:$label:$container:$*")
+}
+
+CALLS=()
+_stop_nanocode_containers alice
+assert_call "store:root Docker store:lunarwing-nanocode-alice:docker"
+assert_call "store:root Podman store:lunarwing-nanocode-alice:podman"
+assert_call "store:tenant alice rootless Podman store:lunarwing-nanocode-alice:sudo -u alice env HOME=$fixture/home/alice XDG_RUNTIME_DIR=/run/user/1000 podman"
+
+mkdir -p "$fixture/quadlets" "$fixture/home/alice/.config/systemd/user"
+touch "$fixture/quadlets/lunarwing-nanocode-alice.container"
+_systemctl_user() {
+  CALLS+=("systemctl:$*")
+  case "${2:-}" in
+    show) printf 'loaded\n' ;;
+    is-active) return 1 ;;
+  esac
+}
+INIT_SYSTEM="systemd"
+CALLS=()
+_stop_nanocode_supervision alice
+assert_call "systemctl:alice stop lunarwing-nanocode-alice.service"
+
+OPENRC_INITD_DIR="$fixture/init.d"
+OPENRC_CONFD_DIR="$fixture/conf.d"
+OPENRC_RUNLEVELS_DIR="$fixture/runlevels"
+mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR" "$OPENRC_RUNLEVELS_DIR/default"
+touch "$OPENRC_INITD_DIR/lunarwing-nanocode-alice" \
+  "$OPENRC_INITD_DIR/lunarwing-nanocode-alice-sup"
+INIT_SYSTEM="openrc"
+CALLS=()
+_stop_nanocode_supervision alice
+assert_call "rc:lunarwing-nanocode-alice-sup stop"
+assert_call "rc:lunarwing-nanocode-alice stop"
+
+INIT_SYSTEM="systemd"
+CALLS=()
+uninstall_tenant_systemd alice
+assert_no_call "ctr:alice rm -f lunarwing-nanocode-alice"
+assert_call "ctr:alice rm -f lunarwing-pebble-alice"
+assert_call "ctr:alice rm -f lunarwing-opencode-alice"
+assert_call "ctr:alice rm -f lunarwing-kimi-alice"
+
+stop_tenant_systemd() { CALLS+=("stop-systemd:$1"); }
+stop_tenant_openrc() { CALLS+=("stop-openrc:$1"); }
+stop_tenant_vision() { CALLS+=("stop-vision:$1"); }
+stop_tenant_pebble() { CALLS+=("stop-pebble:$1"); }
+stop_tenant_opencode() { CALLS+=("stop-opencode:$1"); }
+stop_tenant_kimi() { CALLS+=("stop-kimi:$1"); }
+stop_tenant_postgres() { CALLS+=("stop-postgres:$1"); }
+RETIRE_FAILURE="false"
+retire_tenant_nanocode() {
+  CALLS+=("retire-nanocode:$1")
+  [[ "$RETIRE_FAILURE" != "true" ]]
+}
+die() { return 1; }
+
+INIT_SYSTEM="systemd"
+CALLS=()
+stop_tenant alice
+assert_before "stop-systemd:alice" "retire-nanocode:alice"
+assert_before "stop-vision:alice" "retire-nanocode:alice"
+assert_before "stop-pebble:alice" "retire-nanocode:alice"
+assert_before "stop-opencode:alice" "retire-nanocode:alice"
+assert_before "stop-kimi:alice" "retire-nanocode:alice"
+assert_before "stop-postgres:alice" "retire-nanocode:alice"
+
+INIT_SYSTEM="openrc"
+RETIRE_FAILURE="true"
+CALLS=()
+if stop_tenant alice >/dev/null 2>&1; then
+  fail "stop succeeded despite Nanocode retirement failure"
+else
+  printf 'PASS: retirement failure reported after shutdown\n'
+fi
+assert_before "stop-openrc:alice" "retire-nanocode:alice"
+assert_before "stop-postgres:alice" "retire-nanocode:alice"
 
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"

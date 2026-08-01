@@ -81,7 +81,7 @@ Deployment, operations, multitenancy, and production guides.
 | [`MULTITENANCY-HARNESS.md`](ops/MULTITENANCY-HARNESS.md) | Multi-tenant test harness guide |
 | [`HARNESS-SINGLE-TENANT.md`](ops/HARNESS-SINGLE-TENANT.md) | Single-tenant test harness guide |
 | [`SSH-HARNESS-SETUP.md`](ops/SSH-HARNESS-SETUP.md) | SSH harness setup & ops: config, key provisioning (mt-admin + manual), verifying in a worker, troubleshooting |
-| [`WORKER-CONTAINERS.md`](ops/WORKER-CONTAINERS.md) | Worker container images (LunarWing, Pebble, OpenCode, Kimi Code) |
+| [`WORKER-CONTAINERS.md`](ops/WORKER-CONTAINERS.md) | Supported worker container images (Pebble, OpenCode, Kimi Code) |
 | [`PEBBLE-WORKER.md`](ops/PEBBLE-WORKER.md) | Pebble external worker operational guide |
 | [`NANOCODE-REMOVAL.md`](ops/NANOCODE-REMOVAL.md) | Nanocode retirement behavior, verification, preserved data, and rollback |
 | [`WEECHAT-SERVICES.md`](ops/WEECHAT-SERVICES.md) | WeeChat services, ports, env vars, day-to-day ops |
@@ -249,7 +249,7 @@ here while they are still present in `proposals/`.
 | [`MT-LEGACY-UPGRADE-CHERRYPICK-PLAN.md`](proposals/MT-LEGACY-UPGRADE-CHERRYPICK-PLAN.md) | Implemented / historical | Executed legacy-upgrade fix plan; production run remained operator-gated |
 | [`MT-LEGACY-UPGRADE-QA-PLAN.md`](proposals/MT-LEGACY-UPGRADE-QA-PLAN.md) | Verification pending | Live legacy-upgrade operator checklist |
 | [`MT-LEGACY-UPGRADE-VERIFICATION.md`](proposals/MT-LEGACY-UPGRADE-VERIFICATION.md) | Verification pending | Legacy harness canary, rollback, soak, and sign-off plan |
-| [`MT-ONBOARDING-CLI.md`](proposals/MT-ONBOARDING-CLI.md) | Implemented | Shipped onboarding CLI, upgrade mode, and Kawarimi import/export extensions |
+| [`MT-ONBOARDING-CLI.md`](proposals/MT-ONBOARDING-CLI.md) | Historical pointer | Original design moved to `internal/history/proposals/`; current commands live in `lunarwing_mt_onboard/README.md` |
 | [`MT-WEECHAT-CONSISTENCY-AND-CHANNEL-PRUNING.md`](proposals/MT-WEECHAT-CONSISTENCY-AND-CHANNEL-PRUNING.md) | Superseded | Historical deployment snapshot; allowlist and log rotation ideas remain |
 | [`MULTIAGENTTEAMORCHESTRATION_INTEGRATION_PLAN_v2.0.4.0.md`](proposals/MULTIAGENTTEAMORCHESTRATION_INTEGRATION_PLAN_v2.0.4.0.md) | Open | Release-scoped plan for structured multi-agent coordination hooks, policies, and enforcement |
 | [`MULTIAGENTTEAMORCHESTRATION/coordination-phase1-hooks.md`](proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-hooks.md) | Open | Declarative-hook capabilities, enforcement scope, and limitations for coordination Phase 1 |

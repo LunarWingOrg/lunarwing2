@@ -3641,7 +3641,8 @@ _nanocode_openrc_service_known() {
 }
 
 _stop_nanocode_supervision() {
-  local name="$1" unit="lunarwing-nanocode-${name}.service"
+  local name="$1"
+  local unit="lunarwing-nanocode-${name}.service"
   local container="lunarwing-nanocode-${name}" load_state="" user_unit_dir
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
@@ -3690,7 +3691,8 @@ _stop_nanocode_container_store() {
 }
 
 _stop_nanocode_containers() {
-  local name="$1" container="lunarwing-nanocode-${name}" uid home
+  local name="$1"
+  local container="lunarwing-nanocode-${name}" uid home
   if command -v docker >/dev/null 2>&1; then
     _stop_nanocode_container_store "root Docker store" "$container" docker || return 1
   fi
@@ -3706,7 +3708,8 @@ _stop_nanocode_containers() {
 }
 
 _remove_nanocode_supervision() {
-  local name="$1" container="lunarwing-nanocode-${name}" svc link runlevel
+  local name="$1"
+  local container="lunarwing-nanocode-${name}" svc link runlevel
   rm -f -- \
     "$(tenant_quadlet_dir "$name")/${container}.container" \
     "$(tenant_home "$name")/.config/systemd/user/${container}.service" \
@@ -6095,6 +6098,10 @@ EOF
 # Returns early (no unit) when the worker has no allocated wss port.
 render_worker_quadlet() {
   local name="$1" worker="$2" health_port="${3:-8443}"
+  case "$worker" in
+    pebble|opencode|kimi) ;;
+    *) die "unsupported external worker '$worker'" ;;
+  esac
   local qdir wss_port workspace_dir env_dir tenant_env_path worker_env_path host_health_port
   local runtime_env_path="" runtime_env_hash="" health_path="health"
   qdir="$(tenant_quadlet_dir "$name")"
@@ -6580,7 +6587,10 @@ uninstall_tenant_systemd() {
         "$qdir/lunarwing-kimi-${name}.container" \
         "$qdir/lunarwing-vision-${name}.container"
   if id -u "$name" >/dev/null 2>&1; then
-    for w in nanocode pebble opencode kimi; do
+    # Retirement preserves stopped Nanocode containers for rollback and manual
+    # recovery. Supported workers remain disposable because their state lives
+    # in bind-mounted workspaces.
+    for w in pebble opencode kimi; do
       _ctr "$name" rm -f "lunarwing-${w}-${name}" >/dev/null 2>&1 || true
     done
     _ctr "$name" rm -f "lunarwing-vision-${name}" >/dev/null 2>&1 || true
@@ -8156,9 +8166,6 @@ stop_tenant() {
 
   say "=== Stopping tenant: $name ==="
 
-  retire_tenant_nanocode "$name" \
-    || die "failed to retire legacy Nanocode resources for tenant '$name'; refusing stop"
-
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     stop_tenant_systemd "$name"
@@ -8171,6 +8178,11 @@ stop_tenant() {
   stop_tenant_opencode "$name"
   stop_tenant_kimi "$name"
   stop_tenant_postgres "$name"
+
+  # Shutdown must not be blocked by malformed legacy config or an unsafe
+  # rollback path. Retire Nanocode only after every supported service is down.
+  retire_tenant_nanocode "$name" \
+    || die "tenant '$name' stopped, but legacy Nanocode retirement failed"
 }
 
 restart_tenant() {

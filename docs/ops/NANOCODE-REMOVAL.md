@@ -6,9 +6,10 @@ persistent worker containers are Pebble, OpenCode, and Kimi Code.
 ## Automatic Retirement
 
 Current `lunarwing-mt-admin.sh` lifecycle operations retire legacy Nanocode
-resources before continuing. This applies when resuming `add-tenant`, patching
-environment files, rendering units, starting, stopping, upgrading, or removing
-a tenant.
+resources as part of resuming `add-tenant`, patching environment files,
+rendering units, starting, stopping, upgrading, or removing a tenant. The stop
+path shuts down all supported services first, so malformed legacy config cannot
+block an operational shutdown; it then reports any retirement failure.
 
 Retirement runs under the tenant lifecycle lock and performs these steps in
 order:
@@ -38,6 +39,9 @@ Retirement is intentionally non-destructive. It preserves:
 - first rollback copies named `config.toml.pre-nanocode-retirement` and
   `lunarwing.env.pre-nanocode-retirement`
 - archived worker env files named `nanocode.env.retired[.<timestamp>.<pid>]`
+
+Non-purge tenant removal also preserves stopped Nanocode containers instead of
+removing their writable layers with supported-worker containers.
 
 New tenants retain the registry fields and port slots, but those slots are not
 reallocated or activated.
