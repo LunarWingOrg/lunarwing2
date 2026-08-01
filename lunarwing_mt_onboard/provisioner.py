@@ -162,10 +162,6 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
         args.extend(["--llm-base-url", config.llm_base_url])
     if config.llm_model:
         args.extend(["--llm-model", config.llm_model])
-    if config.nanocode_model:
-        args.extend(["--nanocode-model", config.nanocode_model])
-    if config.nanocode_base_url:
-        args.extend(["--nanocode-base-url", config.nanocode_base_url])
     if config.opencode_model:
         args.extend(["--opencode-model", config.opencode_model])
     if config.opencode_base_url:
@@ -181,8 +177,6 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
     # the per-tenant registry flag). build-tenant gets the same flags to build
     # the shared images; add-tenant records the per-tenant choice. See
     # build_build_tenant_args and docs/proposals/PER_TENANT_WORKER_GATING.md.
-    if WorkerType.NANOCODE in config.workers:
-        args.append("--with-nanocode")
     if WorkerType.PEBBLE in config.workers:
         args.append("--with-pebble")
     if WorkerType.OPENCODE in config.workers:
@@ -202,8 +196,6 @@ def build_build_tenant_args(config: "TenantConfig") -> list[str]:
     """Construct the argv list for ``mt-admin build-tenant``."""
     script = ensure_mt_admin()
     args: list[str] = [script, "build-tenant", config.name, "--with-wasm"]
-    if WorkerType.NANOCODE in config.workers:
-        args.append("--with-nanocode")
     if WorkerType.PEBBLE in config.workers:
         args.append("--with-pebble")
     if WorkerType.OPENCODE in config.workers:

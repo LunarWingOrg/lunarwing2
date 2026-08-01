@@ -22,14 +22,13 @@ class PlanFromArgsTest(unittest.TestCase):
                 "import",
                 "--tenant",
                 "kageho",
-                "--with-nanocode",
                 "--with-pebble",
                 "--with-opencode",
                 "--with-kimi",
                 "--with-toolchains",
             ]
         )
-        self.assertTrue(plan.with_nanocode)
+        self.assertFalse(plan.with_nanocode)
         self.assertTrue(plan.with_pebble)
         self.assertTrue(plan.with_opencode)
         self.assertTrue(plan.with_kimi)

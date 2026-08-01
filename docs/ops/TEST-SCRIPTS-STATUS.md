@@ -14,11 +14,11 @@ current status, what was fixed, and what remains untested or broken.
 |-----|------|--------|
 | **Bug fix** | `tests/mock_orchestrator/server.py:81` | f-string syntax error (`{args.host}:args.port}` → `{args.host}:{args.port}`) — the mock orchestrator could not start at all |
 | **Missing dependency** | `tests/requirements.txt` | Added `websockets==12.0` (used by `hub.py` but was absent from requirements); removed stale bare `docker` package (runner.py shells out to `docker compose`, doesn't use the Python SDK) |
-| **Missing workers** | `tests/docker-compose.test.yml` | Added `opencode_worker` and `pebble_worker` services (both have Dockerfiles and health endpoints at 8443/9090, same as nanocode) |
+| **Worker matrix** | `tests/docker-compose.test.yml` | Covers supported OpenCode, Kimi Code, and Pebble services plus built-in/sandbox workers |
 | **Missing test matrix entries** | `tests/tests.yaml` | Added `opencode` and `pebble` worker entries with health/ready/ws_handshake scenarios |
 | **Stale content** | `tests/a.txt` | Removed (placeholder file containing only `# A`) |
 | **Documentation** | `tests/README.md` | Updated worker table to include opencode and pebble; updated docker-compose service table; updated requirements list |
-| **Documentation** | `docs/guides/TESTING_GUIDE.md` | Updated worker matrix references from 3 workers to 5 (nanocode, opencode, pebble, builtin, sandbox) |
+| **Documentation** | `docs/guides/TESTING_GUIDE.md` | Worker matrix reflects supported external, built-in, and sandbox workers |
 
 ---
 
@@ -31,7 +31,7 @@ current status, what was fixed, and what remains untested or broken.
 | **Status** | ✅ Working (syntax valid, logic intact) |
 | **Language** | Python 3.10+ |
 | **Purpose** | Matrix-driven test suite for all worker types. Brings up Docker Compose services, runs health/WS/auth scenarios, reports pass/fail. |
-| **Tests** | nanocode (health, ready, ws_handshake), opencode (health, ready, ws_handshake), pebble (health, ws_handshake), builtin (orchestrator_health, worker_config), sandbox (orchestrator_health) |
+| **Tests** | opencode and kimi (health, ready, ws_handshake), pebble (health, ws_handshake), builtin (orchestrator_health, worker_config), sandbox (orchestrator_health) |
 | **Dependencies** | `requests`, `websocket-client`, `pyyaml` |
 | **Run** | `cd tests && python runner.py --mode smoke` |
 | **Notes** | No code changes needed. The runner correctly handles the new workers via `tests.yaml`. |

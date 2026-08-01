@@ -13,7 +13,7 @@
 #   2. wasm toolchain — ensure cargo-component + wasm32-wasip2 for the tenant so
 #                     build --with-wasm can actually compile every channel.
 #   3. build        — lunarwing + xmpp-bridge + (optionally) all WASM channels/tools
-#                     and the nanocode / pebble worker Docker images.
+#                     and the pebble worker Docker image.
 #   4. start-tenant — daemon, bridge, proxy, weechat, weechat-adapter.
 #   5. verify       — status, linger, service states, adapter/gateway health,
 #                     installed channel list.
@@ -28,7 +28,7 @@
 #   sudo ic/scripts/create-tenant.sh vex
 #   sudo ic/scripts/create-tenant.sh acme --xmpp-jid acme@xmpp.example.org --yes
 #   sudo ic/scripts/create-tenant.sh scratch --minimal           # core daemon only
-#   sudo ic/scripts/create-tenant.sh bot --no-pebble --no-nanocode
+#   sudo ic/scripts/create-tenant.sh bot --no-pebble
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,16 +56,15 @@ Options (all also settable via the matching ENV var):
   --llm-base-url <url>      LLM endpoint (LLM_BASE_URL)  (default: tenant's local proxy)
   --gotify-url <url>        custom Gotify URL            (default: none)
   --[no-]docker-group       add user to docker group     (default: on)
-  --[no-]nanocode           build nanocode worker image  (default: on)
   --[no-]pebble             build pebble worker image    (default: on)
   --[no-]wasm               build + install all WASM channels/tools (default: on)
   --[no-]ensure-toolchain   install cargo-component for the tenant if missing (default: on)
-  --minimal                 shorthand for --no-docker-group --no-nanocode --no-pebble
+  --minimal                 shorthand for --no-docker-group --no-pebble
   -y, --yes                 don't prompt for confirmation
   -h, --help                show this help
 
 Env overrides: XMPP_JID, XMPP_DOMAIN, XMPP_PASSWORD, LLM_API_KEY, LLM_BASE_URL, GOTIFY_URL,
-  DOCKER_GROUP, WITH_NANOCODE, WITH_PEBBLE, WITH_WASM, ENSURE_WASM_TOOLCHAIN (true/false).
+  DOCKER_GROUP, WITH_PEBBLE, WITH_WASM, ENSURE_WASM_TOOLCHAIN (true/false).
 EOF
 }
 
@@ -78,7 +77,6 @@ LLM_API_KEY="${LLM_API_KEY:-}"
 LLM_BASE_URL="${LLM_BASE_URL:-}"
 GOTIFY_URL="${GOTIFY_URL:-}"
 DOCKER_GROUP="${DOCKER_GROUP:-true}"
-WITH_NANOCODE="${WITH_NANOCODE:-true}"
 WITH_PEBBLE="${WITH_PEBBLE:-true}"
 WITH_WASM="${WITH_WASM:-true}"
 ENSURE_WASM_TOOLCHAIN="${ENSURE_WASM_TOOLCHAIN:-true}"
@@ -94,15 +92,14 @@ while [[ $# -gt 0 ]]; do
     --gotify-url)           GOTIFY_URL="$2"; shift 2 ;;
     --docker-group)         DOCKER_GROUP=true; shift ;;
     --no-docker-group)      DOCKER_GROUP=false; shift ;;
-    --nanocode|--with-nanocode)   WITH_NANOCODE=true; shift ;;
-    --no-nanocode)          WITH_NANOCODE=false; shift ;;
+    --nanocode|--with-nanocode|--no-nanocode) die "Nanocode worker is retired; remove $1" ;;
     --pebble|--with-pebble)       WITH_PEBBLE=true; shift ;;
     --no-pebble)            WITH_PEBBLE=false; shift ;;
     --wasm|--with-wasm)     WITH_WASM=true; shift ;;
     --no-wasm)              WITH_WASM=false; shift ;;
     --ensure-toolchain)     ENSURE_WASM_TOOLCHAIN=true; shift ;;
     --no-ensure-toolchain)  ENSURE_WASM_TOOLCHAIN=false; shift ;;
-    --minimal)              DOCKER_GROUP=false; WITH_NANOCODE=false; WITH_PEBBLE=false; shift ;;
+    --minimal)              DOCKER_GROUP=false; WITH_PEBBLE=false; shift ;;
     -y|--yes)               AUTO_YES=true; shift ;;
     -h|--help)              usage; exit 0 ;;
     --)                     shift; break ;;
@@ -160,7 +157,7 @@ if [[ "$WITH_WASM" == true ]]; then
     say "  note wasm-tools absent — channels install as raw components (fine; no strip)"
   fi
 fi
-if [[ "$WITH_NANOCODE" == true || "$WITH_PEBBLE" == true ]]; then
+if [[ "$WITH_PEBBLE" == true ]]; then
   if ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; then
     say "  MISS docker/podman (needed for worker images)"; miss=$((miss+1))
   fi
@@ -177,7 +174,6 @@ say "  docker group:     $DOCKER_GROUP"
 say "  linger:           auto-enabled by add-tenant (systemd)"
 say "  build wasm:       $WITH_WASM (all channels + tools)"
 say "  ensure toolchain: $([[ "$WITH_WASM" == true ]] && echo "$ENSURE_WASM_TOOLCHAIN" || echo 'n/a (wasm off)')"
-say "  build nanocode:   $WITH_NANOCODE"
 say "  build pebble:     $WITH_PEBBLE"
 say "  weechat service:  auto-rendered + started (lunarwing-weechat-$TENANT + adapter)"
 say "  source repo:      $(git -C "$SCRIPT_DIR/../.." rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')@$(git -C "$SCRIPT_DIR/../.." rev-parse --short HEAD 2>/dev/null || echo '?')"
@@ -223,7 +219,6 @@ fi
 
 build_args=( build-tenant "$TENANT" )
 [[ "$WITH_WASM" == true ]] && build_args+=( --with-wasm )
-[[ "$WITH_NANOCODE" == true ]] && build_args+=( --with-nanocode )
 [[ "$WITH_PEBBLE" == true ]] && build_args+=( --with-pebble )
 banner "3/5  ${build_args[*]}"
 "$MT" "${build_args[@]}"

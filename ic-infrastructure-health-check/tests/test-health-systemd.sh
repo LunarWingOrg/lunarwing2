@@ -197,6 +197,15 @@ unit_set "$f4" lunarwing-weechat-acme.service "loaded inactive dead 0 enabled"
 oF4="$(run_hs "$f4" acme acme)"   # absent flag = pre-gate tenant entry
 assert_eq "$(ustat "$oF4" lunarwing-weechat-acme.service)" "critical" "F5: flag absent -> down weechat still critical (backward compat)"
 
+# ── F6: retired Nanocode unit remains visible but cannot degrade health ──────
+f5="$(sb)"; mk_hs_mock "$f5"
+unit_set "$f5" lunarwing-acme.service          "loaded active running 0 enabled"
+unit_set "$f5" lunarwing-nanocode-acme.service "loaded failed failed 9 generated"
+oF5="$(run_hs "$f5" acme acme)"
+assert_eq "$(ustat "$oF5" lunarwing-nanocode-acme.service)" "skipped" "F6: retired Nanocode unit -> skipped"
+assert_eq "$(jq -r '.metrics.units[] | select(.name=="lunarwing-nanocode-acme.service") | .extra.retired' <<<"$oF5")" "true" "F7: retired Nanocode unit remains explicit"
+assert_eq "$(oall "$oF5")" "healthy" "F8: retired Nanocode unit cannot degrade host"
+
 # ── G: malformed tenant registry -> degraded, never healthy-blank (ISSUE-007) ─
 echo "=== Section G: malformed registry -> degraded (ISSUE-007) ==="
 g="$(sb)"; mk_hs_mock "$g"

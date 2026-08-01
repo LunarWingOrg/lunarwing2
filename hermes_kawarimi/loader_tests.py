@@ -20,9 +20,10 @@ class WorkerFlagsTest(unittest.TestCase):
     def test_empty_plan_yields_no_flags(self) -> None:
         self.assertEqual(_worker_flags(ImportPlan()), [])
 
-    def test_nanocode_flag(self) -> None:
-        plan = ImportPlan(with_nanocode=True)
-        self.assertIn("--with-nanocode", _worker_flags(plan))
+    def test_retired_nanocode_is_not_forwarded(self) -> None:
+        plan = ImportPlan(tenant="legacy", with_nanocode=True)
+        self.assertNotIn("--with-nanocode", _worker_flags(plan))
+        self.assertIn("Nanocode worker is retired", plan.validate())
 
     def test_pebble_flag(self) -> None:
         plan = ImportPlan(with_pebble=True)

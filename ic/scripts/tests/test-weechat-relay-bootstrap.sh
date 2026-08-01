@@ -807,6 +807,7 @@ write_tenant_lunarwing_env() { echo "env-created" >>"$call_order_log"; }
 write_tenant_bridge_env() { :; }
 write_tenant_gotify_config() { :; }
 ensure_external_worker_config() { :; }
+retire_tenant_nanocode() { :; }
 ensure_container_runtime() { :; }
 build_vision_sidecar_image() { :; }
 ensure_init_system() { :; }

@@ -9,9 +9,9 @@
 #                           units INCLUDING weechat-vex + lunarwing-weechat-adapter-vex.
 #   2. wasm toolchain     — ensure cargo-component + wasm32-wasip2 for the tenant so
 #                           build --with-wasm can actually compile every channel.
-#   3. build --with-wasm --with-nanocode --with-pebble
+#   3. build --with-wasm --with-pebble
 #                           — lunarwing + xmpp-bridge + ALL WASM channels/tools, plus
-#                           the nanocode and pebble worker Docker images.
+#                           the pebble worker Docker image.
 #   4. start-tenant       — starts daemon, bridge, proxy, weechat, weechat-adapter.
 #   5. verify             — status, linger, service states, adapter/gateway health,
 #                           installed channel list.
@@ -39,7 +39,6 @@ XMPP_PASSWORD="${XMPP_PASSWORD:-}"              # blank -> mt-admin generates on
 LLM_API_KEY="${LLM_API_KEY:-}"                 # blank -> defaults to token-vex (TensorZero proxy)
 GOTIFY_URL="${GOTIFY_URL:-}"                    # optional, e.g. https://gotify.example.com
 DOCKER_GROUP="${DOCKER_GROUP:-true}"           # add vex to the docker group (needed for sandbox + workers)
-WITH_NANOCODE="${WITH_NANOCODE:-true}"         # build the nanocode worker Docker image
 WITH_PEBBLE="${WITH_PEBBLE:-true}"             # build the pebble worker Docker image
 ENSURE_WASM_TOOLCHAIN="${ENSURE_WASM_TOOLCHAIN:-true}"  # install cargo-component for vex if missing
 # ----------------------------------------------------------------------------
@@ -92,7 +91,7 @@ if command -v wasm-tools >/dev/null 2>&1; then
 else
   say "  note wasm-tools absent — channels install as raw components (fine; no strip)"
 fi
-if [[ "$WITH_NANOCODE" == true || "$WITH_PEBBLE" == true ]]; then
+if [[ "$WITH_PEBBLE" == true ]]; then
   command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1 \
     || { say "  MISS docker/podman (needed for worker images)"; miss=$((miss+1)); }
 fi
@@ -107,7 +106,6 @@ say "  docker group:    $DOCKER_GROUP"
 say "  linger:          auto-enabled by add-tenant (systemd)"
 say "  build wasm:      yes (all channels + tools)"
 say "  ensure toolchain:$ENSURE_WASM_TOOLCHAIN (cargo-component for $TENANT)"
-say "  build nanocode:  $WITH_NANOCODE"
 say "  build pebble:    $WITH_PEBBLE"
 say "  weechat service: auto-rendered + started (lunarwing-weechat-$TENANT + adapter)"
 say "  source repo:     $(git -C "$SCRIPT_DIR/../.." rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')@$(git -C "$SCRIPT_DIR/../.." rev-parse --short HEAD 2>/dev/null || echo '?')"
@@ -151,7 +149,6 @@ else
 fi
 
 build_args=( build-tenant "$TENANT" --with-wasm )
-[[ "$WITH_NANOCODE" == true ]] && build_args+=( --with-nanocode )
 [[ "$WITH_PEBBLE" == true ]] && build_args+=( --with-pebble )
 banner "3/5  ${build_args[*]}"
 "$MT" "${build_args[@]}"

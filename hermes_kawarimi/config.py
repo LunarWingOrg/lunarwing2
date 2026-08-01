@@ -42,6 +42,8 @@ class ImportPlan:
     def validate(self) -> str | None:
         if not self.tenant.strip():
             return "tenant name is required"
+        if self.with_nanocode:
+            return "Nanocode worker is retired; remove it from the saved import plan"
         # Reuse the mt-admin-compatible name rules; imported lazily so this
         # module stays importable without the sibling package present.
         try:
@@ -60,7 +62,6 @@ class ImportPlan:
             "old_stopped": self.old_stopped,
             "force": self.force,
             "docker_group": self.docker_group,
-            "with_nanocode": self.with_nanocode,
             "with_pebble": self.with_pebble,
             "with_opencode": self.with_opencode,
             "with_kimi": self.with_kimi,

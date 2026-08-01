@@ -56,7 +56,7 @@ DarkIRC is opt-in. It is neither rendered nor built for a new tenant unless the 
 
 ### External workers
 
-LunarWing can attach persistent NanoCode, Pebble, OpenCode, or Kimi Code worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant.
+LunarWing can attach persistent Pebble, OpenCode, or Kimi Code worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant. Nanocode is retired; see [`docs/ops/NANOCODE-REMOVAL.md`](docs/ops/NANOCODE-REMOVAL.md).
 
 External `create_job` calls default to no conversation history. Set
 `context_scope: "recent"` to send bounded user/assistant messages from current

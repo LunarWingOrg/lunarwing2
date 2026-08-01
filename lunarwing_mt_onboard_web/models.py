@@ -44,8 +44,6 @@ class ProvisionRequest(RequestModel):
     toolchains: bool = False
     llm_base_url: str = ""
     llm_model: str = "tensorzero::function_name::lunarwing"
-    nanocode_model: str = ""
-    nanocode_base_url: str = ""
     opencode_model: str = ""
     opencode_base_url: str = ""
     kimi_model: str = ""
@@ -66,6 +64,8 @@ class ProvisionRequest(RequestModel):
             raise ValueError("secrets master key must be exactly 64 hexadecimal characters")
         if self.skip_build and not self.skip_start:
             raise ValueError("skip start-tenant when build-tenant is skipped")
+        if "nanocode" in self.workers:
+            raise ValueError("Nanocode worker is retired")
         unknown_workers = sorted(set(self.workers) - _VALID_WORKERS)
         if unknown_workers:
             raise ValueError(f"unknown workers: {', '.join(unknown_workers)}")
@@ -89,16 +89,6 @@ class ProvisionRequest(RequestModel):
             toolchains=self.toolchains,
             llm_base_url=self.llm_base_url.strip(),
             llm_model=self.llm_model.strip(),
-            nanocode_model=(
-                self.nanocode_model.strip()
-                if WorkerType.NANOCODE in workers
-                else ""
-            ),
-            nanocode_base_url=(
-                self.nanocode_base_url.strip()
-                if WorkerType.NANOCODE in workers
-                else ""
-            ),
             opencode_model=(
                 self.opencode_model.strip()
                 if WorkerType.OPENCODE in workers
@@ -214,6 +204,8 @@ class ImportRequest(RequestModel):
 
     @model_validator(mode="after")
     def validate_passphrase(self) -> "ImportRequest":
+        if self.with_nanocode:
+            raise ValueError("Nanocode worker is retired")
         if self.start and not self.old_stopped:
             raise ValueError(
                 "starting an imported tenant requires confirmation that the old host is stopped"

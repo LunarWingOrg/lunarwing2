@@ -25,7 +25,6 @@ class TestImportConfigSerialization(unittest.TestCase):
             name="alpha-new",
             start=True,
             old_stopped=True,
-            with_nanocode=True,
             with_pebble=True,
             with_opencode=True,
             with_kimi=True,
@@ -93,6 +92,12 @@ class TestImportConfigValidation(unittest.TestCase):
         ).validate()
         self.assertIn("line breaks", error or "")
 
+    def test_retired_nanocode_is_rejected(self) -> None:
+        error = ImportConfig(
+            bundle="/tmp/alpha.tar", with_nanocode=True
+        ).validate()
+        self.assertIn("Nanocode worker is retired", error or "")
+
 
 class TestEnsureImportScript(unittest.TestCase):
     def test_missing_script_raises(self) -> None:
@@ -154,7 +159,6 @@ class TestImportArgs(unittest.TestCase):
             ImportConfig(
                 bundle="/tmp/alpha.tar",
                 name="alpha-new",
-                with_nanocode=True,
                 with_pebble=True,
                 with_opencode=True,
                 with_kimi=True,
@@ -169,7 +173,7 @@ class TestImportArgs(unittest.TestCase):
 
         self.assertIn("--name", args)
         self.assertIn("alpha-new", args)
-        self.assertIn("--with-nanocode", args)
+        self.assertNotIn("--with-nanocode", args)
         self.assertIn("--with-pebble", args)
         self.assertIn("--with-opencode", args)
         self.assertIn("--with-kimi", args)

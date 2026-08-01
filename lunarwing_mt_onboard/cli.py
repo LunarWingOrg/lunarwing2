@@ -34,7 +34,6 @@ console = Console()
 
 
 WORKER_LABELS = {
-    WorkerType.NANOCODE: "nanocode (NanoGPT)",
     WorkerType.PEBBLE: "pebble (Rust harness)",
     WorkerType.OPENCODE: "opencode (sst/opencode)",
     WorkerType.KIMI: "kimi (MoonshotAI/kimi-code)",
@@ -362,7 +361,6 @@ def _configure_channels(config: TenantConfig) -> None:
 
 def _configure_workers(config: TenantConfig) -> None:
     labels = [
-        WORKER_LABELS[WorkerType.NANOCODE],
         WORKER_LABELS[WorkerType.PEBBLE],
         WORKER_LABELS[WorkerType.OPENCODE],
         WORKER_LABELS[WorkerType.KIMI],
@@ -378,14 +376,6 @@ def _configure_workers(config: TenantConfig) -> None:
         config.toolchains = _q_confirm(
             "Include Rust/Go/C++ toolchains in workers? (increases image size ~5GB)",
             default=config.toolchains,
-        )
-    if WorkerType.NANOCODE in config.workers:
-        config.nanocode_model = _q_text(
-            "Nanocode model override (optional)", default=config.nanocode_model
-        )
-        config.nanocode_base_url = _q_text(
-            "Nanocode base URL override (optional)",
-            default=config.nanocode_base_url,
         )
     if WorkerType.OPENCODE in config.workers:
         config.opencode_model = _q_text(

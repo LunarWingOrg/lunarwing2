@@ -68,8 +68,8 @@ sudo python3 -m hermes_kawarimi import --source /path/to/hermes/home \
 
 `--source` defaults to `$HERMES_HOME`, then `~/.hermes` (matching Hermes' own
 resolution). Import flags: `--apply`, `--start`, `--force` (reuse an existing
-tenant name), `--with-nanocode/--with-pebble/--with-opencode/--with-kimi`,
-`--with-toolchains` (build-tenant only), `--docker-group`,
+tenant name), `--with-pebble/--with-opencode/--with-kimi`, `--with-toolchains`
+(build-tenant only), `--docker-group`,
 `--tensorzero-url`, `--llm-model`, `--save FILE` / `--resume FILE`.
 
 ## Module layout

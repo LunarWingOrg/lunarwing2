@@ -268,7 +268,7 @@ tenant_weechat_enabled() {
   [[ "$val" != "false" ]]
 }
 
-# Whether a given external worker (nanocode|pebble|opencode) is selected for this
+# Whether a supported external worker (pebble|opencode|kimi) is selected for this
 # tenant. The selection is persisted at add-tenant into
 # .tenants[<name>].workers.<worker> and gates start_tenant_<worker> — otherwise a
 # tenant would start every worker whose SHARED host image happens to exist,
@@ -338,17 +338,9 @@ Commands:
                                    minimal weechat.env; services remain rendered)
     --enable-darkirc               Provision DarkIRC daemon + adapter for this tenant
                                    (disabled by default; darkirc services are NOT created)
-    --with-nanocode                Select the nanocode worker for this tenant (recorded
-                                   in the port registry; start-tenant only starts workers
-                                   the tenant selected — see --with-* on build-tenant to
-                                   also build the image). Off by default.
     --with-pebble                  Select the pebble worker for this tenant (as above)
     --with-opencode                Select the opencode worker for this tenant (as above)
     --with-kimi                    Select the kimi worker for this tenant (as above)
-    --nanocode-model <model>       Override the nanocode worker's LLM model
-                                   (written to lunarwing.env as NANOCODE_MODEL)
-    --nanocode-base-url <url>      Override the nanocode worker's TensorZero baseURL
-                                   (written to lunarwing.env as NANOCODE_BASE_URL)
     --opencode-model <model>       Override the opencode worker's LLM model
                                    (written to lunarwing.env as OPENCODE_MODEL)
     --opencode-base-url <url>      Override the opencode worker's TensorZero baseURL
@@ -369,8 +361,8 @@ Commands:
 
    add-tenants <names> [options]    Comma-separated list (e.g. "Ruffles,Miyuki")
      (same options as add-tenant apply to all, including --enable-darkirc,
-       --nanocode-model/--nanocode-base-url, --opencode-model/--opencode-base-url,
-       --kimi-model/--kimi-base-url/--kimi-api-key-file,
+       --opencode-model/--opencode-base-url, --kimi-model/--kimi-base-url/
+       --kimi-api-key-file,
       --llm-model, --gateway-host, --xmpp-allow-from, and --no-weechat-bootstrap)
 
   remove-tenant <name>             Stop services, deallocate ports
@@ -379,24 +371,19 @@ Commands:
   build-tenant <name>             Build binaries for one tenant (OOM-safe flock)
     --with-wasm                    Also build WASM extensions
     --require-wasm                 Fail instead of preserving stale WASM (requires --with-wasm)
-    --with-nanocode                Also build the nanocode worker Docker image
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
     --with-kimi                    Also build the kimi worker Docker image
-    --with-toolchains              Include toolchains in selected nanocode,
-                                   opencode, and kimi worker images (default: slim)
+    --with-toolchains              Include toolchains in selected opencode and kimi
+                                   worker images (default: slim)
 
   build-all                        Build each tenant sequentially
     --with-wasm                    Also build WASM extensions
-    --with-nanocode                Also build the nanocode worker Docker image
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
     --with-kimi                    Also build the kimi worker Docker image
-    --with-toolchains              Include toolchains in selected nanocode,
-                                   opencode, and kimi worker images (default: slim)
-
-  build-nanocode-worker            Build the nanocode worker Docker image
-    --no-cache                     Force a full rebuild without Docker cache
+    --with-toolchains              Include toolchains in selected opencode and kimi
+                                   worker images (default: slim)
 
   build-pebble-worker             Build the pebble worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
@@ -429,7 +416,7 @@ Commands:
   stop-worker <name> <worker>     Gracefully stop one external worker
   restart-worker <name> <worker>  Restart one external worker
   kill-worker <name> <worker>     Emergency zero-grace stop; leaves worker stopped
-                                   Workers: nanocode, pebble, opencode, kimi
+                                   Workers: pebble, opencode, kimi
   render-units <name>             Re-render a tenant's service units from the current
                                   generator (no restart; applies init-script changes)
   upgrade-tenant <name> --target <ref>
@@ -450,11 +437,6 @@ Commands:
   configure-pebble <name>          Configure pebble worker for a tenant
     --nanogpt-api-key <key>        NanoGPT API key
     --model <model>                Pebble model (default: openai/gpt-5.2)
-
-  configure-nanocode <name>        Set nanocode worker LLM overrides for a tenant
-    --model <model>                TensorZero model (NANOCODE_MODEL; any string)
-    --base-url <url>               TensorZero baseURL (NANOCODE_BASE_URL; full URL)
-                                   (restart the worker after: stop-tenant && start-tenant)
 
   configure-opencode <name>        Set opencode worker LLM overrides for a tenant
     --model <model>                TensorZero model (OPENCODE_MODEL; any string)
@@ -787,7 +769,7 @@ _ensure_tenant_image() {
   return 1
 }
 
-# Render a dedicated OpenRC unit for a tenant's external worker (nanocode/pebble),
+# Render a dedicated OpenRC unit for a tenant's supported external worker,
 # modeled on the lunarwing-pg-<t> unit. Health-aware status() checks the worker's
 # /health endpoint (curl is present in both worker images) so the host self-heal
 # pipeline — which auto-discovers /etc/init.d/lunarwing-* units — can detect and
@@ -1444,8 +1426,7 @@ ports_allocate() {
   local name="$1"
   local enable_darkirc="${2:-false}"
   local enable_proxy="${3:-false}"
-  # Selected external workers, as a JSON object literal
-  # (e.g. '{"nanocode":true,"pebble":false,"opencode":false}'). Persisted so
+  # Selected external workers, as a JSON object literal. Persisted so
   # start_tenant_<worker> can gate on the tenant's choice; see
   # tenant_worker_enabled. NOTE: assign in two steps — `${4:-{}}` mis-parses
   # (bash closes the ${...} at the first `}`, appending a stray `}` and
@@ -1476,7 +1457,7 @@ ports_allocate() {
     # as darkirc/proxy: re-running `add-tenant <existing> --with-<worker>` turns a
     # worker on; omitting the flag never turns one off (disabling is manual).
     local _w
-    for _w in nanocode pebble opencode kimi; do
+    for _w in pebble opencode kimi; do
       if [[ "$(jq -r --arg w "$_w" '.[$w] // false' <<<"$workers_json" 2>/dev/null)" == "true" ]]; then
         ports_enable_worker "$name" "$_w"
       fi
@@ -1503,11 +1484,11 @@ ports_allocate() {
   [[ "$enable_darkirc" == "true" ]] && darkirc_json="true"
   local proxy_json="false"
   [[ "$enable_proxy" == "true" ]] && proxy_json="true"
-  # Normalize the workers spec to a full {nanocode,pebble,opencode,kimi} bool map so
-  # every tenant object has a stable, explicit shape (missing/garbage -> all off).
+  # Keep the retired nanocode field false so existing registry consumers retain
+  # a stable shape and no historical port or worker slot gets reused.
   local workers_norm
   workers_norm="$(jq -c '{
-      nanocode: (.nanocode // false),
+      nanocode: false,
       pebble:   (.pebble   // false),
       opencode: (.opencode // false),
       kimi:     (.kimi     // false)
@@ -1690,7 +1671,7 @@ ports_set_weechat() {
   say "weechat for tenant '$name': $current -> $enabled" >&2
 }
 
-# Mark a single external worker (nanocode|pebble|opencode) enabled for a tenant
+# Mark a supported external worker (pebble|opencode|kimi) enabled for a tenant
 # (one-directional: false -> true). Idempotent. Used by ports_allocate()'s resume
 # path so `add-tenant <existing> --with-<worker>` flips the registry, mirroring
 # ports_enable_darkirc/proxy. Ensures a .workers object exists on older tenant
@@ -1699,7 +1680,7 @@ ports_enable_worker() {
   local name="$1" worker="$2"
   require_cmd jq
     case "$worker" in
-    nanocode|pebble|opencode|kimi) ;;
+    pebble|opencode|kimi) ;;
     *) die "ports_enable_worker: unknown worker '$worker'" ;;
   esac
   # ISSUE-012 (follow-up): same locked read-modify-rename pattern as
@@ -1730,6 +1711,29 @@ ports_enable_worker() {
   mv "$tmp" "$PORTS_REGISTRY"
   [[ "$had_lock" == "true" ]] || release_ports_lock
   say "worker '$worker' for tenant '$name': disabled -> enabled" >&2
+}
+
+# Preserve the legacy registry field while making retirement explicit. This runs
+# only after supervision and containers are confirmed stopped.
+ports_retire_nanocode() {
+  local name="$1" tmp
+  require_cmd jq
+  acquire_ports_lock
+  if ! jq -e --arg name "$name" '.tenants[$name]' "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    release_ports_lock
+    return 0
+  fi
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  if ! jq --arg name "$name" '
+      .tenants[$name].workers = ((.tenants[$name].workers // {}) + {nanocode: false})
+    ' "$PORTS_REGISTRY" >"$tmp"; then
+    rm -f "$tmp"
+    release_ports_lock
+    return 1
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  release_ports_lock
 }
 
 ports_deallocate() {
@@ -1806,7 +1810,7 @@ ports_list() {
     return 0
   fi
   jq -r '.tenants | to_entries[] | "\(.key)\t\(.value.ports.gateway)\t\(.value.ports.http)\t\(.value.ports.bridge)\t\(.value.ports.postgres)\t\(.value.ports.proxy)\t\(.value.ports.weechat)\t\(.value.ports.weechat_adapter // "-")\t\(.value.extended_ports.darkirc_adapter // "-")\t\(.value.extended_ports.darkirc_irc // "-")\t\(.value.extended_ports.darkirc_rpc // "-")\t\(.value.ports.orchestrator)\t\(.value.ports.nanocode_wss // "-")\t\(.value.ports.pebble_wss // "-")\t\(.value.extended_ports.vision_service // "-")\t\(.value.extended_ports.vision_health // "-")"' "$PORTS_REGISTRY" \
-    | column -t -N "TENANT,GATEWAY,HTTP,BRIDGE,PG,PROXY,WEECHAT,WS_ADPT,DARKIRC_ADPT,DARKIRC_IRC,DARKIRC_RPC,ORCH,NANOCODE,PEBBLE,VISION_SVC,VISION_HLTH"
+    | column -t -N "TENANT,GATEWAY,HTTP,BRIDGE,PG,PROXY,WEECHAT,WS_ADPT,DARKIRC_ADPT,DARKIRC_IRC,DARKIRC_RPC,ORCH,NC_RSVD,PEBBLE,VISION_SVC,VISION_HLTH"
 }
 
 tenant_exists_in_registry() {
@@ -2093,12 +2097,11 @@ clone_tenant_repo() {
 build_tenant() {
   local name="$1"
   local with_wasm="${2:-false}"
-  local with_nanocode="${3:-false}"
-  local with_pebble="${4:-false}"
-  local with_opencode="${5:-false}"
-  local with_kimi="${6:-false}"
-  local with_toolchains="${7:-false}"
-  local require_wasm="${8:-false}"
+  local with_pebble="${3:-false}"
+  local with_opencode="${4:-false}"
+  local with_kimi="${5:-false}"
+  local with_toolchains="${6:-false}"
+  local require_wasm="${7:-false}"
   local repo
   repo="$(tenant_repo "$name")"
 
@@ -2153,12 +2156,6 @@ build_tenant() {
     say "Reminder: set your LLM provider API key (if applicable to your backend) in $(tenant_env_dir "$name")/lunarwing.env"
     say "  e.g.  LLM_API_KEY=sk-..."
   ) 200>"$BUILD_LOCK" || return $?
-
-  if [[ "$with_nanocode" == "true" ]]; then
-    say ""
-    say "=== Building nanocode worker image ==="
-    build_nanocode_worker "false" "$with_toolchains"
-  fi
 
   if [[ "$with_pebble" == "true" ]]; then
     say ""
@@ -2283,11 +2280,10 @@ shared_worker_source_root() {  # <names> <with-opencode> <with-kimi>
 
 build_all() {
   local with_wasm="${1:-false}"
-  local with_nanocode="${2:-false}"
-  local with_pebble="${3:-false}"
-  local with_opencode="${4:-false}"
-  local with_kimi="${5:-false}"
-  local with_toolchains="${6:-false}"
+  local with_pebble="${2:-false}"
+  local with_opencode="${3:-false}"
+  local with_kimi="${4:-false}"
+  local with_toolchains="${5:-false}"
   local names
   names="$(all_tenant_names)"
 
@@ -2299,12 +2295,6 @@ build_all() {
   local worker_source_root=""
   if [[ "$with_opencode" == "true" || "$with_kimi" == "true" ]]; then
     worker_source_root="$(shared_worker_source_root "$names" "$with_opencode" "$with_kimi")"
-  fi
-
-  if [[ "$with_nanocode" == "true" ]]; then
-    say ""
-    say "=== Building nanocode worker image ==="
-    build_nanocode_worker "false" "$with_toolchains"
   fi
 
   if [[ "$with_pebble" == "true" ]]; then
@@ -2328,45 +2318,8 @@ build_all() {
   while IFS= read -r name; do
     say ""
     say "=== Building tenant: $name ==="
-    build_tenant "$name" "$with_wasm" "false" "false" "false" "false" "$with_toolchains" "false"
+    build_tenant "$name" "$with_wasm" "false" "false" "false" "$with_toolchains" "false"
   done <<< "$names"
-}
-
-# ── Nanocode worker Docker image build ────────────────────────────────────────
-
-build_nanocode_worker() {
-  local no_cache="${1:-false}"
-  local with_toolchains="${2:-false}"
-  local nanocode_ref="${3:-v1.2.28}"
-  local nanocode_dir="${LUNARWING_ROOT}/lunarcode4lunarwing"
-
-  [[ -d "$nanocode_dir" ]] || die "nanocode worker dir not found at $nanocode_dir"
-
-  ensure_container_runtime
-
-  say "building nanocode worker Docker image (nanocode ref: ${nanocode_ref}) ..."
-  local cache_flag=""
-  [[ "$no_cache" == "true" ]] && cache_flag="--no-cache"
-
-  local toolchain_arg=""
-  [[ "$with_toolchains" == "true" ]] && toolchain_arg="--build-arg WITH_TOOLCHAINS=true"
-
-  if [[ "$CONTAINER_RT" == "podman" ]]; then
-    # --network=host (F8): rootless/rootful podman's default build network can't
-    # reach the internet for RUN steps (apt) on hosts where the bridge/pasta path
-    # is broken or IPv6 is preferred-but-unrouted; the host netns has working IPv4.
-    # --format docker (O4): podman defaults to OCI, which drops the Dockerfile
-    # HEALTHCHECK ("not supported for OCI image format"); build docker-format so the
-    # baked healthcheck survives (harmless for the OpenRC init-unit probe, correct
-    # if the image is ever run directly / under a healthcheck-honouring runtime).
-    podman build $cache_flag $toolchain_arg --network=host --format docker --build-arg NANOCODE_REF="${nanocode_ref}" -t lunarwing-worker-nanocode:latest "$nanocode_dir" \
-      || die "nanocode worker image build failed"
-  else
-    docker build $cache_flag $toolchain_arg --build-arg NANOCODE_REF="${nanocode_ref}" -t lunarwing-worker-nanocode:latest "$nanocode_dir" \
-      || die "nanocode worker image build failed"
-  fi
-
-  say "nanocode worker image built: lunarwing-worker-nanocode:latest"
 }
 
 build_pebble_worker() {
@@ -2382,7 +2335,7 @@ build_pebble_worker() {
   [[ "$no_cache" == "true" ]] && cache_flag="--no-cache"
 
   if [[ "$CONTAINER_RT" == "podman" ]]; then
-    # --network=host (F8): see build_nanocode_worker — podman build's default network
+    # --network=host: podman's default build network
     # can't reach the internet for RUN steps on this host; the host netns has IPv4.
     # --format docker (O4): preserve the Dockerfile HEALTHCHECK (podman OCI drops it).
     podman build $cache_flag --network=host --format docker -t lunarwing-worker-pebble:latest -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
@@ -3013,18 +2966,16 @@ write_tenant_lunarwing_env() {
   local tensorzero_url="${4:-$DEFAULT_TENSORZERO_URL}"
   local llm_api_key="${5:-}"
   local llm_base_url="${6:-}"
-  local nanocode_model="${7:-}"
-  local nanocode_base_url="${8:-}"
-  local llm_model="${9:-}"
-  local gateway_host="${10:-}"
-  local xmpp_allow_from="${11:-}"
-  local opencode_model="${12:-}"
-  local opencode_base_url="${13:-}"
-  local kimi_model="${14:-}"
-  local kimi_base_url="${15:-}"
-  local kimi_api_key="${16:-}"
+  local llm_model="${7:-}"
+  local gateway_host="${8:-}"
+  local xmpp_allow_from="${9:-}"
+  local opencode_model="${10:-}"
+  local opencode_base_url="${11:-}"
+  local kimi_model="${12:-}"
+  local kimi_base_url="${13:-}"
+  local kimi_api_key="${14:-}"
 
-  local path gateway_port http_port bridge_port pg_port proxy_port weechat_port weechat_adapter_port orchestrator_port nanocode_wss_port pebble_wss_port opencode_wss_port kimi_wss_port
+  local path gateway_port http_port bridge_port pg_port proxy_port weechat_port weechat_adapter_port orchestrator_port pebble_wss_port opencode_wss_port kimi_wss_port
   path="$(tenant_env_dir "$name")/lunarwing.env"
   gateway_port="$(ports_get "$name" gateway)"
   http_port="$(ports_get "$name" http)"
@@ -3034,7 +2985,6 @@ write_tenant_lunarwing_env() {
   weechat_port="$(ports_get "$name" weechat)"
   weechat_adapter_port="$(ports_get "$name" weechat_adapter)"
   orchestrator_port="$(ports_get "$name" orchestrator)"
-  nanocode_wss_port="$(ports_get "$name" nanocode_wss)"
   pebble_wss_port="$(ports_get "$name" pebble_wss)"
   opencode_wss_port="$(ports_get "$name" opencode_wss)"
   kimi_wss_port="$(ports_get "$name" kimi_wss)"
@@ -3073,10 +3023,6 @@ write_tenant_lunarwing_env() {
   # XMPP password: an explicit --xmpp-password wins; else preserve an existing one;
   # else mint a fresh one (first-time provision).
   [[ -n "$xmpp_password" ]] || { xmpp_password="$(_env_existing "$path" XMPP_PASSWORD)"; xmpp_password="${xmpp_password:-$(generate_token | cut -c1-32)}"; }
-  # Nanocode model/base_url overrides: an explicit flag wins; else preserve an
-  # existing value so re-running add-tenant without the flags keeps prior settings.
-  [[ -n "$nanocode_model" ]]    || nanocode_model="$(_env_existing "$path" NANOCODE_MODEL)"
-  [[ -n "$nanocode_base_url" ]] || nanocode_base_url="$(_env_existing "$path" NANOCODE_BASE_URL)"
   [[ -n "$opencode_model" ]]    || opencode_model="$(_env_existing "$path" OPENCODE_MODEL)"
   [[ -n "$opencode_base_url" ]] || opencode_base_url="$(_env_existing "$path" OPENCODE_BASE_URL)"
   [[ -n "$kimi_model" ]]        || kimi_model="$(_env_existing "$path" KIMI_MODEL)"
@@ -3205,9 +3151,6 @@ HTTP_WEBHOOK_SECRET=$webhook_secret
 # Orchestrator (sandbox container callback)
 ORCHESTRATOR_PORT=$orchestrator_port
 
-# Nanocode worker (WebSocket port for agent communication)
-NANOCODE_WSS_PORT=$nanocode_wss_port
-
 # Opencode worker (WebSocket port for agent communication)
 OPENCODE_WSS_PORT=$opencode_wss_port
 
@@ -3254,11 +3197,6 @@ ENVEOF
     printf '\nVISION_SERVICE_URL=http://127.0.0.1:%s\nVISION_AUTH_TOKEN=%s\n' \
       "$vision_port" "$vision_token" >> "$path"
   fi
-  # Nanocode worker LLM overrides (consumed by the worker container via env;
-  # see start_tenant_nanocode / render_worker_quadlet). Written only when set so
-  # an unconfigured tenant gets the image's baked-in nanocode.json defaults.
-  [[ -n "$nanocode_model" ]]    && printf '\nNANOCODE_MODEL=%s\n'    "$nanocode_model"     >> "$path"
-  [[ -n "$nanocode_base_url" ]] && printf 'NANOCODE_BASE_URL=%s\n' "$nanocode_base_url" >> "$path"
   [[ -n "$opencode_model" ]]    && printf '\nOPENCODE_MODEL=%s\n'    "$opencode_model"     >> "$path"
   [[ -n "$opencode_base_url" ]] && printf 'OPENCODE_BASE_URL=%s\n' "$opencode_base_url" >> "$path"
   [[ -n "$kimi_model" ]]        && printf '\nKIMI_MODEL=%s\n'        "$kimi_model"        >> "$path"
@@ -3452,7 +3390,7 @@ generate_darkirc_config() {
 
 # ── External-worker config.toml generation ────────────────────────────────────
 #
-# External workers (nanocode, pebble, …) speak the lunarwing-agent-v1 WebSocket
+# External workers speak the lunarwing-agent-v1 WebSocket
 # protocol (legacy alias ironclaw-agent-v1 is still accepted for back-compat)
 # and are routed by the agent's `create_job(mode: "<worker>")` tool.
 # The daemon discovers them from `[[sandbox.external_workers]]` blocks in
@@ -3461,8 +3399,8 @@ generate_darkirc_config() {
 # and never logs `External workers configured: <worker>` on startup.
 #
 # The worker container binds 127.0.0.1:<wss_port> (path /ws/agent) and is
-# launched with AGENT_AUTH_TOKEN set to the tenant's GATEWAY_AUTH_TOKEN (see
-# start_tenant_nanocode), so the daemon side must present that same token as the
+# launched with AGENT_AUTH_TOKEN set to the tenant's GATEWAY_AUTH_TOKEN, so the
+# daemon side must present that same token as the
 # WebSocket bearer — hence auth_token mirrors GATEWAY_AUTH_TOKEN here.
 #
 # Idempotent: a tenant entry is written once and skipped on re-runs. Exact legacy
@@ -3532,8 +3470,8 @@ upgrade_external_worker_timeout() {
 
 ensure_external_worker_config() {
   local name="$1"      # tenant name
-  local worker="$2"    # logical worker name, matches create_job mode (e.g. "nanocode")
-  local port_key="$3"  # ports-registry key for its WSS port (e.g. "nanocode_wss")
+  local worker="$2"    # logical worker name, matches create_job mode
+  local port_key="$3"  # ports-registry key for its WSS port
 
   local state_dir env_path config_path wss_port auth_token
 
@@ -3609,6 +3547,337 @@ HDR
   chown "$name:$name" "$config_path"
   chmod 600 "$config_path"
   say "wrote $worker external-worker config to $config_path (ws://127.0.0.1:$wss_port/ws/agent)"
+}
+
+# Remove one external-worker array entry plus any nested child tables. Preserve
+# unrelated TOML text/comments, validate before and after, and retain one secure
+# rollback copy. Returns success when no Nanocode entry exists.
+remove_external_worker_config() {
+  local name="$1" worker="$2" config_path temp_path backup_path rc=0
+  config_path="$(tenant_state_dir "$name")/config.toml"
+  [[ -f "$config_path" ]] || return 0
+  [[ ! -L "$config_path" ]] || { say "refusing symlinked tenant config: $config_path" >&2; return 1; }
+  require_cmd python3
+  temp_path="$(mktemp "${config_path}.tmp.XXXXXX")"
+  backup_path="${config_path}.pre-${worker}-retirement"
+
+  python3 - "$config_path" "$temp_path" "$backup_path" "$worker" <<'PY' || rc=$?
+import os
+import re
+import stat
+import sys
+import tomllib
+from pathlib import Path
+
+source, target, backup = map(Path, sys.argv[1:4])
+worker = sys.argv[4]
+source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+source_stat = os.fstat(source_fd)
+if not stat.S_ISREG(source_stat.st_mode):
+    os.close(source_fd)
+    raise RuntimeError("tenant config is not a regular file")
+with os.fdopen(source_fd, encoding="utf-8") as handle:
+    text = handle.read()
+tomllib.loads(text)
+lines = text.splitlines(keepends=True)
+root = "sandbox.external_workers"
+header_re = re.compile(r"^\s*(\[\[?)([^\]]+)(\]\]?)\s*(?:#.*)?$")
+name_re = re.compile(rf"^\s*name\s*=\s*(['\"]){re.escape(worker)}\1\s*(?:#.*)?$")
+
+def header(line: str):
+    match = header_re.match(line.rstrip("\r\n"))
+    if not match or len(match.group(1)) != len(match.group(3)):
+        return None
+    return len(match.group(1)), "".join(match.group(2).split())
+
+ranges = []
+index = 0
+while index < len(lines):
+    info = header(lines[index])
+    if info != (2, root):
+        index += 1
+        continue
+    end = len(lines)
+    scalar_end = len(lines)
+    for cursor in range(index + 1, len(lines)):
+        child = header(lines[cursor])
+        if child is None:
+            continue
+        if scalar_end == len(lines):
+            scalar_end = cursor
+        if child[1] == root or not child[1].startswith(root + "."):
+            end = cursor
+            break
+    if any(name_re.match(line.rstrip("\r\n")) for line in lines[index + 1:scalar_end]):
+        start = index
+        cursor = index - 1
+        if cursor >= 0 and re.match(
+            rf"^\s*#\s*External worker:\s*{re.escape(worker)}\b",
+            lines[cursor],
+            re.IGNORECASE,
+        ):
+            start = cursor
+            if start > 0 and not lines[start - 1].strip():
+                start -= 1
+        ranges.append((start, end))
+    index = end
+
+if not ranges:
+    raise SystemExit(3)
+
+kept = []
+cursor = 0
+for start, end in ranges:
+    kept.extend(lines[cursor:start])
+    cursor = end
+kept.extend(lines[cursor:])
+result = "".join(kept)
+parsed = tomllib.loads(result)
+workers = parsed.get("sandbox", {}).get("external_workers", [])
+if any(isinstance(item, dict) and item.get("name") == worker for item in workers):
+    raise RuntimeError(f"failed to remove external worker {worker!r}")
+
+def write_secure(path: Path, content: str, flags: int) -> None:
+    fd = os.open(path, flags | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RuntimeError(f"unsafe retirement output: {path}")
+        os.fchmod(fd, 0o600)
+        os.fchown(fd, source_stat.st_uid, source_stat.st_gid)
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)
+
+if backup.exists() or backup.is_symlink():
+    backup_stat = os.lstat(backup)
+    if not stat.S_ISREG(backup_stat.st_mode):
+        raise RuntimeError(f"unsafe retirement backup: {backup}")
+else:
+    write_secure(backup, text, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+write_secure(target, result, os.O_WRONLY | os.O_TRUNC)
+os.replace(target, source)
+PY
+  if [[ "$rc" -eq 3 ]]; then
+    rm -f "$temp_path"
+    return 0
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    rm -f "$temp_path"
+    say "failed to remove external worker '$worker' from $config_path" >&2
+    return 1
+  fi
+  say "removed retired '$worker' route from $config_path"
+}
+
+_nanocode_openrc_service_known() {
+  local svc="$1" link
+  [[ -e "$OPENRC_INITD_DIR/$svc" || -e "$OPENRC_CONFD_DIR/$svc" ]] && return 0
+  for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
+    [[ -e "$link" || -L "$link" ]] && return 0
+  done
+  return 1
+}
+
+_stop_nanocode_supervision() {
+  local name="$1"
+  local unit="lunarwing-nanocode-${name}.service"
+  local container="lunarwing-nanocode-${name}" load_state="" user_unit_dir
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
+    if id -u "$name" >/dev/null 2>&1; then
+      load_state="$(_systemctl_user "$name" show --value -p LoadState "$unit" 2>/dev/null || true)"
+      if [[ -e "$(tenant_quadlet_dir "$name")/${container}.container" \
+          || -e "$user_unit_dir/$unit" || "$load_state" == "loaded" ]]; then
+        _systemctl_user "$name" stop "$unit" >/dev/null 2>&1 \
+          || { say "failed to stop legacy $unit" >&2; return 1; }
+        if _systemctl_user "$name" is-active --quiet "$unit" 2>/dev/null; then
+          say "legacy $unit remained active after stop" >&2
+          return 1
+        fi
+      fi
+    elif [[ -e "$(tenant_quadlet_dir "$name")/${container}.container" \
+        || -e "$user_unit_dir/$unit" ]]; then
+      say "tenant user '$name' absent; cannot stop legacy $unit" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  local svc
+  for svc in "${container}-sup" "$container"; do
+    _nanocode_openrc_service_known "$svc" || continue
+    rc-service "$svc" stop >/dev/null 2>&1 \
+      || { say "failed to stop legacy OpenRC service $svc" >&2; return 1; }
+  done
+}
+
+_stop_nanocode_container_store() {
+  local label="$1" container="$2"
+  shift 2
+  local -a runtime=("$@")
+  "${runtime[@]}" inspect "$container" >/dev/null 2>&1 || return 0
+  if ! "${runtime[@]}" stop --time 30 "$container" >/dev/null 2>&1; then
+    say "failed to stop legacy $container in $label" >&2
+    return 1
+  fi
+  if [[ "$("${runtime[@]}" inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" == "true" ]]; then
+    say "legacy $container still running in $label" >&2
+    return 1
+  fi
+  say "stopped legacy $container in $label"
+}
+
+_stop_nanocode_containers() {
+  local name="$1"
+  local container="lunarwing-nanocode-${name}" uid home
+  if command -v docker >/dev/null 2>&1; then
+    _stop_nanocode_container_store "root Docker store" "$container" docker || return 1
+  fi
+  if command -v podman >/dev/null 2>&1; then
+    _stop_nanocode_container_store "root Podman store" "$container" podman || return 1
+    if id -u "$name" >/dev/null 2>&1; then
+      uid="$(id -u "$name")"
+      home="$(getent passwd "$name" | cut -d: -f6)"
+      _stop_nanocode_container_store "tenant $name rootless Podman store" "$container" \
+        sudo -u "$name" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" podman || return 1
+    fi
+  fi
+}
+
+_remove_nanocode_supervision() {
+  local name="$1"
+  local container="lunarwing-nanocode-${name}" svc link runlevel
+  rm -f -- \
+    "$(tenant_quadlet_dir "$name")/${container}.container" \
+    "$(tenant_home "$name")/.config/systemd/user/${container}.service" \
+    "$(tenant_home "$name")/.config/systemd/user/default.target.wants/${container}.service" \
+    "$(_hash_dir "$name")/${container}.hash"
+  if [[ "$INIT_SYSTEM" == "systemd" ]] && id -u "$name" >/dev/null 2>&1; then
+    _systemctl_user "$name" daemon-reload >/dev/null 2>&1 \
+      || { say "failed to reload tenant user manager after Nanocode retirement" >&2; return 1; }
+  fi
+
+  for svc in "${container}-sup" "$container"; do
+    for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
+      [[ -e "$link" || -L "$link" ]] || continue
+      runlevel="$(basename "$(dirname "$link")")"
+      if command -v rc-update >/dev/null 2>&1; then
+        rc-update del "$svc" "$runlevel" >/dev/null 2>&1 \
+          || { say "failed to remove $svc from OpenRC runlevel $runlevel" >&2; return 1; }
+      else
+        rm -f -- "$link"
+      fi
+    done
+    rm -f -- "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc"
+  done
+}
+
+_archive_nanocode_env() {
+  local name="$1" env_dir env_path legacy archive backup temp rc=0
+  env_dir="$(tenant_env_dir "$name")"
+  env_path="$env_dir/lunarwing.env"
+  legacy="$env_dir/nanocode.env"
+  require_cmd python3
+  if [[ -e "$env_path" || -L "$env_path" ]]; then
+    backup="$env_path.pre-nanocode-retirement"
+    temp="$(mktemp "${env_path}.tmp.XXXXXX")"
+    python3 - "$env_path" "$temp" "$backup" <<'PY' || rc=$?
+import os
+import stat
+import sys
+from pathlib import Path
+
+source, target, backup = map(Path, sys.argv[1:4])
+source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+source_stat = os.fstat(source_fd)
+if not stat.S_ISREG(source_stat.st_mode):
+    os.close(source_fd)
+    raise RuntimeError("tenant env is not a regular file")
+with os.fdopen(source_fd, encoding="utf-8") as handle:
+    text = handle.read()
+lines = text.splitlines(keepends=True)
+if not any(line.startswith("NANOCODE_") for line in lines):
+    raise SystemExit(3)
+result = "".join(line for line in lines if not line.startswith("NANOCODE_"))
+
+def write_secure(path: Path, content: str, flags: int) -> None:
+    fd = os.open(path, flags | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RuntimeError(f"unsafe retirement output: {path}")
+        os.fchmod(fd, 0o600)
+        os.fchown(fd, source_stat.st_uid, source_stat.st_gid)
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)
+
+if backup.exists() or backup.is_symlink():
+    if not stat.S_ISREG(os.lstat(backup).st_mode):
+        raise RuntimeError(f"unsafe retirement backup: {backup}")
+else:
+    write_secure(backup, text, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+write_secure(target, result, os.O_WRONLY | os.O_TRUNC)
+os.replace(target, source)
+PY
+    if [[ "$rc" -eq 3 ]]; then
+      rm -f -- "$temp"
+    elif [[ "$rc" -ne 0 ]]; then
+      rm -f -- "$temp"
+      say "failed to remove retired NANOCODE_* settings from $env_path" >&2
+      return 1
+    else
+      say "removed retired NANOCODE_* settings from $env_path"
+    fi
+  fi
+  if [[ -e "$legacy" || -L "$legacy" ]]; then
+    archive="$legacy.retired"
+    [[ ! -e "$archive" ]] || archive="$archive.$(date -u +%Y%m%dT%H%M%SZ).$$"
+    python3 - "$legacy" "$archive" <<'PY' || return 1
+import os
+import stat
+import sys
+from pathlib import Path
+
+source, archive = map(Path, sys.argv[1:3])
+fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    source_stat = os.fstat(fd)
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise RuntimeError("legacy env is not a regular file")
+    os.fchmod(fd, 0o600)
+    current = os.lstat(source)
+    if (current.st_dev, current.st_ino) != (source_stat.st_dev, source_stat.st_ino):
+        raise RuntimeError("legacy env changed during retirement")
+    os.link(source, archive, follow_symlinks=False)
+    os.unlink(source)
+finally:
+    os.close(fd)
+PY
+    say "archived legacy Nanocode env as $archive"
+  fi
+}
+
+_retire_tenant_nanocode() {
+  local name="$1"
+  _stop_nanocode_supervision "$name" || return 1
+  _stop_nanocode_containers "$name" || return 1
+  _remove_nanocode_supervision "$name" || return 1
+  remove_external_worker_config "$name" nanocode || return 1
+  _archive_nanocode_env "$name" || return 1
+  ports_retire_nanocode "$name" || return 1
+  say "Nanocode retired for tenant '$name' (data, stopped containers, and images preserved)"
+}
+
+retire_tenant_nanocode() {
+  local name="$1"
+  with_tenant_lifecycle_lock "$name" _retire_tenant_nanocode "$name"
 }
 
 # ── SSH harness config.toml generation ────────────────────────────────────────
@@ -3946,6 +4215,8 @@ patch_tenant_env() {
   local name="$1"
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  retire_tenant_nanocode "$name" \
+    || die "failed to retire legacy Nanocode resources for tenant '$name'"
 
   local env_path
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
@@ -3975,17 +4246,6 @@ patch_tenant_env() {
   else
     printf '\n# Orchestrator (sandbox container callback)\nORCHESTRATOR_PORT=%s\n' "$orchestrator_port" >>"$env_path"
     say "added ORCHESTRATOR_PORT=$orchestrator_port to $env_path"
-  fi
-
-  local nanocode_wss_port
-  nanocode_wss_port="$(ports_get "$name" nanocode_wss)"
-  if [[ -n "$nanocode_wss_port" ]]; then
-    if grep -q '^NANOCODE_WSS_PORT=' "$env_path"; then
-      say "NANOCODE_WSS_PORT already set in $env_path (skipping)"
-    else
-      printf '\n# Nanocode worker (WebSocket port for agent communication)\nNANOCODE_WSS_PORT=%s\n' "$nanocode_wss_port" >>"$env_path"
-      say "added NANOCODE_WSS_PORT=$nanocode_wss_port to $env_path"
-    fi
   fi
 
   local pebble_wss_port
@@ -4079,10 +4339,9 @@ patch_tenant_env() {
     fi
   fi
 
-  # Wire the nanocode/pebble/opencode external workers into config.toml so
+  # Wire supported external workers into config.toml so
   # existing tenants get create_job(mode: ...) routing without a hand-edited
   # config file.
-  ensure_external_worker_config "$name" "nanocode" "nanocode_wss"
   ensure_external_worker_config "$name" "pebble" "pebble_wss"
   ensure_external_worker_config "$name" "opencode" "opencode_wss"
   ensure_external_worker_config "$name" "kimi" "kimi_wss"
@@ -4430,213 +4689,6 @@ configure_pebble() {
   if _ctr "$name" inspect "$container_name" &>/dev/null 2>&1; then
     say "note: restart the pebble worker to pick up new config:"
     say "  sudo $0 stop-tenant $name && sudo $0 start-tenant $name"
-  fi
-}
-
-# ── Nanocode worker LLM configuration ─────────────────────────────────────────
-#
-# Sets the nanocode worker's TensorZero model + baseURL overrides for a tenant by
-# upserting NANOCODE_MODEL / NANOCODE_BASE_URL into lunarwing.env (the same source
-# add-tenant writes, and that both init paths inject into the container). Mirrors
-# configure-pebble, but stored in lunarwing.env (not a separate nanocode.env).
-
-configure_nanocode() {
-  local name="$1"
-  local model="${2:-}"
-  local base_url="${3:-}"
-
-  name="$(sanitize_name "$name")"
-  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
-  [[ -n "$model" || -n "$base_url" ]] \
-    || die "configure-nanocode: pass --model <model> and/or --base-url <url>"
-
-  local env_path
-  env_path="$(tenant_env_dir "$name")/lunarwing.env"
-  [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
-
-  # Upsert: drop any existing override lines, then append the provided values.
-  local tmp
-  tmp="$(mktemp "${env_path}.tmp.XXXXXX")"
-  grep -v -e '^NANOCODE_MODEL=' -e '^NANOCODE_BASE_URL=' "$env_path" >"$tmp" || true
-  [[ -n "$model" ]]    && printf 'NANOCODE_MODEL=%s\n'    "$model"    >>"$tmp"
-  [[ -n "$base_url" ]] && printf 'NANOCODE_BASE_URL=%s\n' "$base_url" >>"$tmp"
-  chown "$name:$name" "$tmp"
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$env_path"
-  say "nanocode LLM overrides written to $env_path for tenant '$name'"
-
-  local container_name="lunarwing-nanocode-$name"
-  if _ctr "$name" inspect "$container_name" &>/dev/null 2>&1; then
-    say "note: restart the nanocode worker to pick up the new config:"
-    say "  sudo $0 stop-tenant $name && sudo $0 start-tenant $name"
-  fi
-}
-
-# ── Nanocode worker container ─────────────────────────────────────────────────
-
-start_tenant_nanocode() {
-  local name="$1"
-  ensure_container_runtime
-
-  local wss_port container_name nanocode_dir
-  wss_port="$(ports_get "$name" nanocode_wss)"
-  container_name="lunarwing-nanocode-$name"
-  nanocode_dir="${LUNARWING_ROOT}/lunarcode4lunarwing"
-
-  if [[ -z "$wss_port" ]]; then
-    say "no nanocode_wss port allocated for $name (skipping nanocode worker)"
-    return 0
-  fi
-
-  # Ensure the image is available to whoever runs the container (rootless: load it
-  # into the tenant's store via save|load; rootful: must already be built in root).
-  if ! _ensure_tenant_image "$name" lunarwing-worker-nanocode:latest; then
-    say "nanocode worker image not available; run 'build-nanocode-worker' first (skipping)"
-    return 0
-  fi
-
-  # systemd + rootless podman: Quadlet .container owns the lifecycle (the unit's
-  # [Container] spec creates+runs it), so skip the imperative `_ctr run` below.
-  ensure_init_system
-  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
-    _wait_user_manager "$name"
-    local quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-nanocode-${name}.container"
-    render_worker_quadlet "$name" nanocode 8443
-    _systemctl_user "$name" daemon-reload 2>/dev/null || true
-    # Force-recreate if the quadlet config changed since the container was
-    # last created (Quadlet restarts the existing container without picking
-    # up new env vars / volumes).
-    if _container_config_changed "$name" "lunarwing-nanocode-${name}" "$quadlet_file"; then
-      _recreate_quadlet_container "$name" "lunarwing-nanocode-${name}.service" "lunarwing-nanocode-${name}"
-    fi
-    if _systemctl_user "$name" start "lunarwing-nanocode-${name}.service" >/dev/null 2>&1; then
-      _store_container_hash "$name" "lunarwing-nanocode-${name}" "$quadlet_file"
-      say "nanocode worker ready via quadlet (lunarwing-nanocode-${name}.service, WSS port $wss_port)"
-    else
-      say "WARNING: lunarwing-nanocode-${name}.service failed to start" >&2
-      _systemctl_user "$name" status "lunarwing-nanocode-${name}.service" --no-pager >&2 || true
-    fi
-    return 0
-  fi
-
-  if _ctr "$name" inspect "$container_name" &>/dev/null; then
-    # Check if the container's config is stale (env vars / volumes changed
-    # since it was created). The imperative path hashes lunarwing.env since
-    # there's no quadlet file to compare against.
-    local env_file_for_hash
-    env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
-    if _container_config_changed "$name" "$container_name" "$env_file_for_hash"; then
-      say "config changed for $container_name; force-recreating"
-      _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
-      _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
-    elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
-      say "nanocode worker already running ($container_name, WSS port $wss_port)"
-      _store_container_hash "$name" "$container_name" "$env_file_for_hash"
-      _register_worker_unit "$name" nanocode
-      return 0
-    else
-      say "starting existing nanocode worker container $container_name"
-      _ctr "$name" start "$container_name" >/dev/null
-      _store_container_hash "$name" "$container_name" "$env_file_for_hash"
-      _register_worker_unit "$name" nanocode
-      say "nanocode worker ready ($container_name, WSS port $wss_port)"
-      return 0
-    fi
-  fi
-
-  # Container doesn't exist (or was force-removed above) — create it fresh.
-  if ! _ctr "$name" inspect "$container_name" &>/dev/null; then
-    say "creating nanocode worker container $container_name on WSS port $wss_port"
-
-    # Read tenant env for secrets to pass through
-    local tenant_env_path
-    tenant_env_path="$(tenant_env_dir "$name")/lunarwing.env"
-
-    # Read nanocode-specific env if it exists
-    local nanocode_env_path
-    nanocode_env_path="$(tenant_env_dir "$name")/nanocode.env"
-
-    local env_flags=()
-    # Core env vars from tenant lunarwing.env
-    if [[ -f "$tenant_env_path" ]]; then
-      local gateway_token
-      gateway_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
-      [[ -n "$gateway_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$gateway_token")
-
-      local llm_api_key
-      llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
-      [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORZERO_API_KEY=$llm_api_key")
-
-      # Nanocode LLM overrides (model / TensorZero baseURL), if set on the tenant.
-      local nanocode_model nanocode_base_url
-      nanocode_model="$(_read_env_value "$tenant_env_path" NANOCODE_MODEL)"
-      [[ -n "$nanocode_model" ]] && env_flags+=(-e "NANOCODE_MODEL=$nanocode_model")
-      nanocode_base_url="$(_read_env_value "$tenant_env_path" NANOCODE_BASE_URL)"
-      [[ -n "$nanocode_base_url" ]] && env_flags+=(-e "NANOCODE_BASE_URL=$nanocode_base_url")
-    fi
-
-    # Override with nanocode-specific env file if present
-    if [[ -f "$nanocode_env_path" ]]; then
-      env_flags+=(--env-file "$nanocode_env_path")
-    fi
-
-    local workspace_dir
-    workspace_dir="$(tenant_lw_root "$name")/nanocode-workspace"
-    mkdir -p "$workspace_dir"
-    chown "$name:$name" "$workspace_dir"
-    chmod 777 "$workspace_dir"
-
-    # HEALTH_PORT=8443 matches the image's baked HEALTHCHECK (in-container).
-    # v8: also publish the tenant's dedicated nanocode_health port -> container
-    # 8443, so the host self-heal pipeline can probe /health directly.
-    local -a restart_arg=()
-    [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
-    local -a health_publish=()
-    local host_health_port
-    host_health_port="$(ports_get "$name" nanocode_health)" || true
-    [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
-    # SSH agent socket (always included — daemon creates it at startup).
-    # :z label so SELinux (Enforcing on Fedora) permits container_t to access the
-    # tenant-home-labeled socket; without it SSH_AUTH_SOCK reads fail despite 0666 mode.
-    local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
-    local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
-    _ctr "$name" run -d \
-      --name "$container_name" \
-      -e LUNARWING_WORKER_ID="worker-nanocode-${name}" \
-      -e WS_PORT="$wss_port" \
-      -e HEALTH_PORT="8443" \
-      -e NANOCODE_MODE=websocket \
-      -e WS_ROLE=server \
-      -e WS_BIND_HOST=0.0.0.0 \
-      -e WS_PATH=/ws/agent \
-      "${env_flags[@]}" \
-      "${ssh_mount[@]}" \
-      -p "127.0.0.1:${wss_port}:${wss_port}" \
-      "${health_publish[@]}" \
-      -v "$workspace_dir:/workspace:z" \
-      "${restart_arg[@]}" \
-      lunarwing-worker-nanocode:latest \
-      --mode websocket >/dev/null
-    _store_container_hash "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env"
-  fi
-
-  _register_worker_unit "$name" nanocode
-  say "nanocode worker ready ($container_name, WSS port $wss_port)"
-}
-
-stop_tenant_nanocode() {
-  local name="$1"
-  ensure_container_runtime
-
-  local container_name="lunarwing-nanocode-$name"
-  ensure_init_system
-  if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
-    _deregister_babysitter "$container_name"
-    rc-service "$container_name" stop >/dev/null 2>&1 || true
-    say "nanocode worker stopped ($container_name)"
-  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
-    _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
-    say "nanocode worker stopped ($container_name)"
   fi
 }
 
@@ -5369,7 +5421,7 @@ start_tenant_pebble() {
     host_health_port="$(ports_get "$name" pebble_health)" || true
     [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
     # SSH agent socket (always included — daemon creates it at startup).
-    # :z label for SELinux (Enforcing on Fedora) — see start_tenant_nanocode.
+    # :z label for SELinux (Enforcing on Fedora).
     local -a ssh_mount=()
     local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
     ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
@@ -5521,7 +5573,7 @@ start_tenant_vision() {
 
     # v10: also publish the tenant's dedicated vision_health port -> container
     # 8089, so the host self-heal pipeline can probe /health directly (mirrors
-    # the nanocode/pebble health_publish pattern).
+    # the external-worker health_publish pattern).
     local -a health_publish=()
     local host_health_port
     host_health_port="$(ports_get "$name" vision_health)" || true
@@ -6087,6 +6139,10 @@ EOF
 # Returns early (no unit) when the worker has no allocated wss port.
 render_worker_quadlet() {
   local name="$1" worker="$2" health_port="${3:-8443}"
+  case "$worker" in
+    pebble|opencode|kimi) ;;
+    *) die "unsupported external worker '$worker'" ;;
+  esac
   local qdir wss_port workspace_dir env_dir tenant_env_path worker_env_path host_health_port
   local runtime_env_path="" runtime_env_hash="" health_path="health"
   qdir="$(tenant_quadlet_dir "$name")"
@@ -6113,9 +6169,6 @@ render_worker_quadlet() {
   local agent_token tz_key
   agent_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
   tz_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
-  local nanocode_model nanocode_base_url
-  nanocode_model="$(_read_env_value "$tenant_env_path" NANOCODE_MODEL)"
-  nanocode_base_url="$(_read_env_value "$tenant_env_path" NANOCODE_BASE_URL)"
   # systemd treats % as a unit specifier; escape so a token containing % survives.
   agent_token="${agent_token//%/%%}"
   tz_key="${tz_key//%/%%}"
@@ -6191,10 +6244,7 @@ EOF
     # the host self-heal pipeline can probe the worker directly. Container still
     # listens on HEALTH_PORT=8443 internally (matches image healthcheck).
     [[ -n "$host_health_port" ]] && printf 'PublishPort=127.0.0.1:%s:8443\n' "$host_health_port"
-    if [[ "$worker" == "nanocode" ]]; then
-      printf 'Environment=NANOCODE_MODE=websocket\n'
-      printf 'Environment=WS_ROLE=server\n'
-    elif [[ "$worker" == "pebble" ]]; then
+    if [[ "$worker" == "pebble" ]]; then
       printf 'Environment=PEBBLE_MODE=websocket\n'
     elif [[ "$worker" == "opencode" ]]; then
       printf 'Environment=OPENCODE_MODE=websocket\n'
@@ -6205,9 +6255,6 @@ EOF
     fi
     [[ "$worker" == "kimi" || -z "$agent_token" ]] \
       || printf 'Environment=AGENT_AUTH_TOKEN=%s\n' "$agent_token"
-    [[ "$worker" == "nanocode" && -n "$tz_key" ]] && printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key"
-    [[ "$worker" == "nanocode" && -n "$nanocode_model" ]] && printf 'Environment=NANOCODE_MODEL=%s\n' "$nanocode_model"
-    [[ "$worker" == "nanocode" && -n "$nanocode_base_url" ]] && printf 'Environment=NANOCODE_BASE_URL=%s\n' "$nanocode_base_url"
     [[ "$worker" == "opencode" && -n "$tz_key" ]] && printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key"
     local oc_model oc_base_url
     oc_model="$(_read_env_value "$tenant_env_path" OPENCODE_MODEL)"
@@ -6221,7 +6268,7 @@ EOF
     # Operator override file (optional). EnvironmentFile= has existed since the
     # Quadlet 4.4 debut, so it is safe at our >= 4.6 floor.
     [[ -f "$worker_env_path" ]] && printf 'EnvironmentFile=%s\n' "$worker_env_path"
-    [[ "$worker" == "nanocode" || "$worker" == "opencode" || "$worker" == "kimi" ]] && printf 'Exec=--mode websocket\n'
+    [[ "$worker" == "opencode" || "$worker" == "kimi" ]] && printf 'Exec=--mode websocket\n'
     cat <<EOF
 HealthCmd=curl -sf http://127.0.0.1:${health_port}/${health_path} || exit 1
 HealthInterval=15s
@@ -6509,7 +6556,7 @@ _wait_user_manager() {
 start_tenant_systemd() {
   local name="$1"
   _systemctl_user "$name" daemon-reload
-  # Quadlet-generated units (pg, nanocode, pebble, vision) are NOT in the
+  # Quadlet-generated units (pg, supported workers, vision) are NOT in the
   # enable_list: `systemctl enable` fails on generated/transient units with
   # "Failed to enable unit: ... is transient or generated", and under
   # `set -euo pipefail` that non-zero exit aborts the entire enable batch —
@@ -6581,7 +6628,10 @@ uninstall_tenant_systemd() {
         "$qdir/lunarwing-kimi-${name}.container" \
         "$qdir/lunarwing-vision-${name}.container"
   if id -u "$name" >/dev/null 2>&1; then
-    for w in nanocode pebble opencode kimi; do
+    # Retirement preserves stopped Nanocode containers for rollback and manual
+    # recovery. Supported workers remain disposable because their state lives
+    # in bind-mounted workspaces.
+    for w in pebble opencode kimi; do
       _ctr "$name" rm -f "lunarwing-${w}-${name}" >/dev/null 2>&1 || true
     done
     _ctr "$name" rm -f "lunarwing-vision-${name}" >/dev/null 2>&1 || true
@@ -7280,7 +7330,7 @@ start_tenant_openrc() {
   rc-service "xmpp-bridge-${name}" start
   rc-service "lunarwing-${name}" start
   # Start worker babysitters (if workers are configured)
-  for worker in nanocode pebble opencode kimi; do
+  for worker in pebble opencode kimi; do
     rc-service "lunarwing-${worker}-${name}-sup" start 2>/dev/null || true
   done
   say "OpenRC services started for $name"
@@ -7303,7 +7353,7 @@ start_tenant_openrc() {
     fi
   done
   # Auto-enable worker babysitters
-  for worker in nanocode pebble opencode kimi; do
+  for worker in pebble opencode kimi; do
     if rc-service "lunarwing-${worker}-${name}-sup" status >/dev/null 2>&1; then
       rc-update add "lunarwing-${worker}-${name}-sup" default >/dev/null 2>&1 || true
     fi
@@ -7741,23 +7791,20 @@ add_tenant() {
   local llm_base_url="${9:-$DEFAULT_LLM_BASE_URL}"
   local enable_darkirc="${10:-false}"
   local enable_proxy="${11:-false}"
-  local nanocode_model="${12:-}"
-  local nanocode_base_url="${13:-}"
-  local llm_model="${14:-}"
-  local gateway_host="${15:-}"
-  local xmpp_allow_from="${16:-}"
-  local opencode_model="${17:-}"
-  local opencode_base_url="${18:-}"
+  local llm_model="${12:-}"
+  local gateway_host="${13:-}"
+  local xmpp_allow_from="${14:-}"
+  local opencode_model="${15:-}"
+  local opencode_base_url="${16:-}"
   # External worker selection (default off). Persisted into the port registry so
   # start_tenant_<worker> starts only what this tenant chose, not every worker
   # whose shared host image happens to exist. See PER_TENANT_WORKER_GATING.md.
-  local with_nanocode="${19:-false}"
-  local with_pebble="${20:-false}"
-  local with_opencode="${21:-false}"
-  local with_kimi="${22:-false}"
-  local kimi_model="${23:-}"
-  local kimi_base_url="${24:-}"
-  local kimi_api_key="${25:-}"
+  local with_pebble="${17:-false}"
+  local with_opencode="${18:-false}"
+  local with_kimi="${19:-false}"
+  local kimi_model="${20:-}"
+  local kimi_base_url="${21:-}"
+  local kimi_api_key="${22:-}"
 
   name="$(sanitize_name "$name")"
   [[ -n "$name" ]] || die "invalid tenant name"
@@ -7788,8 +7835,8 @@ add_tenant() {
 
   ports_registry_init
   local base_port workers_json
-  workers_json="$(printf '{"nanocode":%s,"pebble":%s,"opencode":%s,"kimi":%s}' \
-    "$with_nanocode" "$with_pebble" "$with_opencode" "$with_kimi")"
+  workers_json="$(printf '{"nanocode":false,"pebble":%s,"opencode":%s,"kimi":%s}' \
+    "$with_pebble" "$with_opencode" "$with_kimi")"
   base_port="$(ports_allocate "$name" "$enable_darkirc" "$enable_proxy" "$workers_json")"
   say ""
 
@@ -7801,9 +7848,13 @@ add_tenant() {
   clone_tenant_repo "$name"
   say ""
 
+  retire_tenant_nanocode "$name" \
+    || die "failed to retire legacy Nanocode resources for tenant '$name'"
+  say ""
+
   say "--- Generating environment files ---"
   write_tenant_vision_env "$name" >/dev/null
-  write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensorzero_url" "$llm_api_key" "$llm_base_url" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
+  write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensorzero_url" "$llm_api_key" "$llm_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
   write_tenant_bridge_env "$name" "$xmpp_jid" "$xmpp_password" "$xmpp_allow_from"
   if [[ "$enable_proxy" == "true" ]]; then
     write_tenant_proxy_env "$name" "$tensorzero_url"
@@ -7813,7 +7864,6 @@ add_tenant() {
     generate_darkirc_config "$name"
   fi
   write_tenant_gotify_config "$name" "$gotify_url" "$gotify_title"
-  ensure_external_worker_config "$name" "nanocode" "nanocode_wss"
   ensure_external_worker_config "$name" "pebble" "pebble_wss"
   ensure_external_worker_config "$name" "opencode" "opencode_wss"
   ensure_external_worker_config "$name" "kimi" "kimi_wss"
@@ -7887,19 +7937,19 @@ add_tenant() {
   say "  proxy:            $(ports_get "$name" proxy)"
   say "  weechat:          $(ports_get "$name" weechat)"
   say "  orchestrator:     $(ports_get "$name" orchestrator)"
-  say "  nanocode_wss:     $(ports_get "$name" nanocode_wss)"
+  say "  nanocode_wss:     $(ports_get "$name" nanocode_wss) (reserved legacy slot)"
   say "  pebble_wss:       $(ports_get "$name" pebble_wss)"
   say "  opencode_wss:     $(ports_get "$name" opencode_wss)"
   say "  kimi_wss:         $(ports_get "$name" kimi_wss)"
   say "  weechat_adapter:  $(ports_get "$name" weechat_adapter)"
   say "  darkirc:          $( [[ "$enable_darkirc" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-darkirc to enable)" )"
   say "  proxy:            $( [[ "$enable_proxy" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-proxy to enable)" )"
-  say "  workers:          $( _selected="$( [[ "$with_nanocode" == "true" ]] && printf 'nanocode '; [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode '; [[ "$with_kimi" == "true" ]] && printf 'kimi ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-nanocode/--with-pebble/--with-opencode/--with-kimi to select)" )"
+  say "  workers:          $( _selected="$( [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode '; [[ "$with_kimi" == "true" ]] && printf 'kimi ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-pebble/--with-opencode/--with-kimi to select)" )"
   say "  ssh:              $( [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]] && echo "enabled (key upload + activation handled by start-tenant)" || echo "disabled (pass --no-ssh)" )"
   say "  weechat relay:    $weechat_bootstrap_ok"
   say ""
   say "Next steps:"
-  say "  sudo $0 build-tenant $name --with-wasm --with-nanocode"
+  say "  sudo $0 build-tenant $name --with-wasm"
   say "  sudo $0 start-tenant $name"
 }
 
@@ -7927,6 +7977,9 @@ remove_tenant() {
   name="$(sanitize_name "$name")"
   say "=== Removing tenant: $name ==="
   say ""
+
+  retire_tenant_nanocode "$name" \
+    || die "failed to retire legacy Nanocode resources for tenant '$name'; refusing removal"
 
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
@@ -7975,6 +8028,7 @@ render_tenant_units() {
 
 _render_tenant_units_locked() {
   local name="$1"
+  _retire_tenant_nanocode "$name" || return 1
   ensure_init_system
   say "--- Re-rendering $INIT_SYSTEM units for $name ---"
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
@@ -8060,6 +8114,9 @@ start_tenant() {
 
   say "=== Starting tenant: $name ==="
 
+  retire_tenant_nanocode "$name" \
+    || die "failed to retire legacy Nanocode resources for tenant '$name'; refusing start"
+
   # Safety net: if the tenant has LUNARWING_OWNER_ID set but the DB still has
   # orphaned 'default'-scoped rows (e.g. an upgrade that didn't run patch-env),
   # migrate them before starting the daemon so no data is orphaned.
@@ -8133,7 +8190,7 @@ start_tenant() {
   # its only guards are "port allocated" (always true) and "image present"
   # (host-wide). See tenant_worker_enabled / PER_TENANT_WORKER_GATING.md.
   local _w
-  for _w in nanocode pebble opencode kimi; do
+  for _w in pebble opencode kimi; do
     if tenant_worker_enabled "$name" "$_w"; then
       "start_tenant_${_w}" "$name"
     else
@@ -8159,10 +8216,14 @@ stop_tenant() {
 
   stop_tenant_vision "$name"
   stop_tenant_pebble "$name"
-  stop_tenant_nanocode "$name"
   stop_tenant_opencode "$name"
   stop_tenant_kimi "$name"
   stop_tenant_postgres "$name"
+
+  # Shutdown must not be blocked by malformed legacy config or an unsafe
+  # rollback path. Retire Nanocode only after every supported service is down.
+  retire_tenant_nanocode "$name" \
+    || die "tenant '$name' stopped, but legacy Nanocode retirement failed"
 }
 
 restart_tenant() {
@@ -8173,8 +8234,9 @@ restart_tenant() {
 
 require_worker_name() {
   case "${1:-}" in
-    nanocode|pebble|opencode|kimi) ;;
-    *) die "unknown worker '${1:-}'; expected nanocode, pebble, opencode, or kimi" ;;
+    nanocode) die "Nanocode worker is retired" ;;
+    pebble|opencode|kimi) ;;
+    *) die "unknown worker '${1:-}'; expected pebble, opencode, or kimi" ;;
   esac
 }
 
@@ -8427,7 +8489,7 @@ upgrade_tenant_locked() {
   if tenant_worker_enabled "$name" kimi; then
     with_kimi="true"
   fi
-  build_tenant "$name" "true" "false" "false" "$with_opencode" "$with_kimi" "false" "true"
+  build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true"
 
   if [[ "$do_render" == "true" ]]; then
     render_tenant_units "$name"
@@ -8473,7 +8535,7 @@ status_tenant() {
   say "  proxy:            $(ports_get "$name" proxy)"
   say "  weechat:          $(ports_get "$name" weechat)"
   say "  orchestrator:     $(ports_get "$name" orchestrator)"
-  say "  nanocode_wss:     $(ports_get "$name" nanocode_wss)"
+  say "  nanocode_wss:     $(ports_get "$name" nanocode_wss) (reserved legacy slot)"
   say "  pebble_wss:       $(ports_get "$name" pebble_wss)"
   say "  opencode_wss:     $(ports_get "$name" opencode_wss)"
   say "  kimi_wss:         $(ports_get "$name" kimi_wss)"
@@ -8490,11 +8552,11 @@ status_tenant() {
 
   local nanocode_container="lunarwing-nanocode-$name"
   if _ctr "$name" inspect -f '{{.State.Running}}' "$nanocode_container" 2>/dev/null | grep -q true; then
-    say "Nanocode worker: running ($nanocode_container, WSS port $(ports_get "$name" nanocode_wss))"
+    say "Nanocode (retired): WARNING still running ($nanocode_container)"
   elif _ctr "$name" inspect "$nanocode_container" &>/dev/null; then
-    say "Nanocode worker: stopped ($nanocode_container)"
+    say "Nanocode (retired): stopped container preserved ($nanocode_container)"
   else
-    say "Nanocode worker: not created"
+    say "Nanocode (retired): no container in active runtime store"
   fi
 
   local pebble_container="lunarwing-pebble-$name"
@@ -8536,7 +8598,7 @@ status_tenant() {
     # pg + workers are Quadlet units only on rootless podman; on rootful docker
     # they run as plain containers (shown above), not systemd units.
     if [[ "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
-      svcs+=("lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}")
+      svcs+=("lunarwing-pg-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}")
     fi
     local svc state
     for svc in "${svcs[@]}"; do
@@ -8549,8 +8611,7 @@ status_tenant() {
     if tenant_darkirc_enabled "$name"; then
       rc_svcs+=("lunarwing-darkirc-${name}" "lunarwing-darkirc-adapter-${name}")
     fi
-    rc_svcs+=("lunarwing-nanocode-${name}" "lunarwing-nanocode-${name}-sup" \
-              "lunarwing-pebble-${name}" "lunarwing-pebble-${name}-sup" \
+    rc_svcs+=("lunarwing-pebble-${name}" "lunarwing-pebble-${name}-sup" \
               "lunarwing-opencode-${name}" "lunarwing-opencode-${name}-sup" \
               "lunarwing-kimi-${name}" "lunarwing-kimi-${name}-sup")
     local svc state
@@ -8574,7 +8635,7 @@ list_tenants() {
   fi
 
   printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
-    "TENANT" "GATEWAY" "HTTP" "BRIDGE" "PG" "PROXY" "WEECHAT" "WS_ADPT" "ORCH" "NANOCODE" "PEBBLE" "OPENCODE" "KIMI"
+    "TENANT" "GATEWAY" "HTTP" "BRIDGE" "PG" "PROXY" "WEECHAT" "WS_ADPT" "ORCH" "NC_RSVD" "PEBBLE" "OPENCODE" "KIMI"
   printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
     "------" "-------" "----" "------" "--" "-----" "-------" "-------" "----" "--------" "------" "--------" "----"
 
@@ -8722,8 +8783,6 @@ doctor() {
   if [[ "$DEFAULT_HEALTH_ENABLED" == "true" ]]; then
     _check "health pipeline scheduled" bash -c 'systemctl is-enabled lunarwing-mt-health.timer >/dev/null 2>&1 || crontab -l 2>/dev/null | grep -q lunarwing-mt-health || { command -v fcrontab >/dev/null 2>&1 && fcrontab -l 2>/dev/null | grep -q lunarwing-mt-health; }'
   fi
-  _check "nanocode worker dir exists" test -d "$LUNARWING_ROOT/lunarcode4lunarwing"
-  _check "nanocode worker Dockerfile exists" test -f "$LUNARWING_ROOT/lunarcode4lunarwing/Dockerfile"
   _check "pebble worker dir exists" test -d "$LUNARWING_ROOT/pebble4lunarwing"
   _check "pebble worker Dockerfile exists" test -f "$LUNARWING_ROOT/pebble4lunarwing/Dockerfile"
   _check "opencode worker dir exists" test -d "$LUNARWING_ROOT/opencode4lunarwing"
@@ -8733,13 +8792,11 @@ doctor() {
 
   # Check if worker images are built
   if command -v docker >/dev/null 2>&1; then
-    _check "nanocode worker image exists" docker image inspect lunarwing-worker-nanocode:latest
     _check "pebble worker image exists" docker image inspect lunarwing-worker-pebble:latest
     _check "opencode worker image exists" docker image inspect lunarwing-worker-opencode:latest
     _check "kimi worker image exists" docker image inspect lunarwing-worker-kimi:latest
     _check "vision sidecar image exists" docker image inspect "$VISION_SIDECAR_IMAGE"
   elif command -v podman >/dev/null 2>&1; then
-    _check "nanocode worker image exists" podman image inspect lunarwing-worker-nanocode:latest
     _check "pebble worker image exists" podman image inspect lunarwing-worker-pebble:latest
     _check "opencode worker image exists" podman image inspect lunarwing-worker-opencode:latest
     _check "kimi worker image exists" podman image inspect lunarwing-worker-kimi:latest
@@ -8771,7 +8828,7 @@ main() {
   case "$command_name" in
     add-tenant)
       require_root
-      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_nanocode="false" with_pebble="false" with_opencode="false" with_kimi="false"
+      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -8781,7 +8838,7 @@ main() {
           --no-weechat-bootstrap) WEECHAT_BOOTSTRAP_OPT_OUT=true; shift ;;
           --enable-darkirc)  enable_darkirc="true"; shift ;;
           --enable-proxy)    enable_proxy="true"; shift ;;
-          --with-nanocode)   with_nanocode="true"; shift ;;
+          --with-nanocode|--nanocode-model|--nanocode-base-url) die "Nanocode worker is retired; remove $1" ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
           --with-kimi)       with_kimi="true"; shift ;;
@@ -8791,8 +8848,6 @@ main() {
           --tensorzero-url)  tz_url="$2"; shift 2 ;;
           --gotify-url)      gotify_url="$2"; shift 2 ;;
           --gotify-title)    gotify_title="$2"; shift 2 ;;
-          --nanocode-model)    nanocode_model="$2"; shift 2 ;;
-          --nanocode-base-url) nanocode_base_url="$2"; shift 2 ;;
           --opencode-model)    opencode_model="$2"; shift 2 ;;
           --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
           --kimi-model)        kimi_model="$2"; shift 2 ;;
@@ -8813,12 +8868,12 @@ main() {
       [[ -n "$name" ]] || die "usage: add-tenant <name> [--docker-group] [--xmpp-jid <jid>]"
       # Leave empty when --xmpp-jid is absent: add_tenant preserves the tenant's
       # existing JID and only defaults to <name>@xmpp.localhost on a first write.
-      add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
+      add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
       ;;
 
     add-tenants)
       require_root
-      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_nanocode="false" with_pebble="false" with_opencode="false" with_kimi="false"
+      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -8828,7 +8883,7 @@ main() {
           --no-weechat-bootstrap) WEECHAT_BOOTSTRAP_OPT_OUT=true; shift ;;
           --enable-darkirc)  enable_darkirc="true"; shift ;;
           --enable-proxy)    enable_proxy="true"; shift ;;
-          --with-nanocode)   with_nanocode="true"; shift ;;
+          --with-nanocode|--nanocode-model|--nanocode-base-url) die "Nanocode worker is retired; remove $1" ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
           --with-kimi)       with_kimi="true"; shift ;;
@@ -8837,8 +8892,6 @@ main() {
           --tensorzero-url)  tz_url="$2"; shift 2 ;;
           --gotify-url)      gotify_url="$2"; shift 2 ;;
           --gotify-title)    gotify_title="$2"; shift 2 ;;
-          --nanocode-model)    nanocode_model="$2"; shift 2 ;;
-          --nanocode-base-url) nanocode_base_url="$2"; shift 2 ;;
           --opencode-model)    opencode_model="$2"; shift 2 ;;
           --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
           --kimi-model)        kimi_model="$2"; shift 2 ;;
@@ -8869,7 +8922,7 @@ main() {
         # Empty --xmpp-domain -> empty JID, so add_tenant preserves an existing one.
         local sjid=""
         if [[ -n "$xmpp_domain" ]]; then sjid="${sname}@${xmpp_domain}"; fi
-        add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
+        add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
       done
       ;;
 
@@ -8893,12 +8946,12 @@ main() {
 
     build-tenant)
       require_root
-      local name="" with_wasm="false" require_wasm="false" with_nanocode="false" with_pebble="false" with_opencode="false" with_kimi="false" with_toolchains="false"
+      local name="" with_wasm="false" require_wasm="false" with_pebble="false" with_opencode="false" with_kimi="false" with_toolchains="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --with-wasm)       with_wasm="true"; shift ;;
           --require-wasm)    require_wasm="true"; shift ;;
-          --with-nanocode)   with_nanocode="true"; shift ;;
+          --with-nanocode)   die "Nanocode worker is retired; remove --with-nanocode" ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
           --with-kimi)       with_kimi="true"; shift ;;
@@ -8911,18 +8964,18 @@ main() {
             ;;
         esac
       done
-      [[ -n "$name" ]] || die "usage: build-tenant <name> [--with-wasm] [--require-wasm] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]"
+      [[ -n "$name" ]] || die "usage: build-tenant <name> [--with-wasm] [--require-wasm] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]"
       [[ "$require_wasm" != "true" || "$with_wasm" == "true" ]] || die "--require-wasm requires --with-wasm"
-      build_tenant "$(sanitize_name "$name")" "$with_wasm" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains" "$require_wasm"
+      build_tenant "$(sanitize_name "$name")" "$with_wasm" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains" "$require_wasm"
       ;;
 
     build-all)
       require_root
-      local with_wasm="false" with_nanocode="false" with_pebble="false" with_opencode="false" with_kimi="false" with_toolchains="false"
+      local with_wasm="false" with_pebble="false" with_opencode="false" with_kimi="false" with_toolchains="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --with-wasm)       with_wasm="true"; shift ;;
-          --with-nanocode)   with_nanocode="true"; shift ;;
+          --with-nanocode)   die "Nanocode worker is retired; remove --with-nanocode" ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
           --with-kimi)       with_kimi="true"; shift ;;
@@ -8931,7 +8984,7 @@ main() {
           *)                 die "unexpected argument: $1" ;;
         esac
       done
-      build_all "$with_wasm" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains"
+      build_all "$with_wasm" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains"
       ;;
 
     build-darkirc)
@@ -8948,20 +9001,7 @@ main() {
       ;;
 
     build-nanocode-worker)
-      require_root
-      local no_cache="false"
-      local with_toolchains="false"
-      local nanocode_ref="v1.2.28"
-      while [[ $# -gt 0 ]]; do
-        case "$1" in
-          --no-cache)        no_cache="true"; shift ;;
-          --with-toolchains) with_toolchains="true"; shift ;;
-          --nanocode-ref)    nanocode_ref="$2"; shift 2 ;;
-          -*)                die "unknown flag: $1" ;;
-          *)                 die "unexpected argument: $1" ;;
-        esac
-      done
-      build_nanocode_worker "$no_cache" "$with_toolchains" "$nanocode_ref"
+      die "Nanocode worker is retired; build-nanocode-worker is unavailable"
       ;;
 
     build-pebble-worker)
@@ -9063,7 +9103,7 @@ main() {
 
     start-worker|stop-worker|restart-worker|kill-worker)
       require_root
-      [[ $# -eq 2 ]] || die "usage: $command_name <name> <nanocode|pebble|opencode|kimi>"
+      [[ $# -eq 2 ]] || die "usage: $command_name <name> <pebble|opencode|kimi>"
       case "$command_name" in
         start-worker) start_worker "$1" "$2" ;;
         stop-worker) stop_worker "$1" "$2" ;;
@@ -9157,22 +9197,7 @@ main() {
       ;;
 
     configure-nanocode)
-      require_root
-      local name="" nc_model="" nc_base_url=""
-      while [[ $# -gt 0 ]]; do
-        case "$1" in
-          --model)    nc_model="$2"; shift 2 ;;
-          --base-url) nc_base_url="$2"; shift 2 ;;
-          -*)         die "unknown flag: $1" ;;
-          *)
-            if [[ -z "$name" ]]; then name="$1"; shift
-            else die "unexpected argument: $1"
-            fi
-            ;;
-        esac
-      done
-      [[ -n "$name" ]] || die "usage: configure-nanocode <name> [--model <model>] [--base-url <url>]"
-      configure_nanocode "$name" "$nc_model" "$nc_base_url"
+      die "Nanocode worker is retired; configure-nanocode is unavailable"
       ;;
 
     configure-opencode)
