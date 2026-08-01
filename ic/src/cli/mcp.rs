@@ -774,10 +774,8 @@ fn build_update_config(
                     auto_install,
                     ..
                 }),
-            ) = (
-                existing.effective_transport(),
-                &mut config.transport,
-            ) {
+            ) = (existing.effective_transport(), &mut config.transport)
+            {
                 *env_secrets = existing_secrets.clone();
                 *auto_install = existing_install.cloned();
             }
