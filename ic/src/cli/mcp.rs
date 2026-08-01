@@ -761,6 +761,26 @@ fn build_update_config(
                 })
                 .unwrap_or_default();
             let mut config = McpServerConfig::new_stdio(&existing.name, cmd, new_args, new_env);
+            // Preserve secret-env injection and auto-install settings across
+            // in-place updates (new_stdio starts them empty).
+            if let (
+                EffectiveTransport::Stdio {
+                    env_secrets: existing_secrets,
+                    auto_install: existing_install,
+                    ..
+                },
+                Some(config::McpTransportConfig::Stdio {
+                    env_secrets,
+                    auto_install,
+                    ..
+                }),
+            ) = (
+                existing.effective_transport(),
+                &mut config.transport,
+            ) {
+                *env_secrets = existing_secrets.clone();
+                *auto_install = existing_install.cloned();
+            }
             config.enabled = existing.enabled;
             Ok(config)
         }
@@ -1091,6 +1111,53 @@ mod tests {
                 assert!(!offline);
             }
             other => panic!("expected toggle command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_update_config_preserves_env_secrets_and_auto_install() {
+        let mut existing =
+            McpServerConfig::new_stdio("srv", "npx", vec!["-y".into()], HashMap::new());
+        if let Some(config::McpTransportConfig::Stdio {
+            env_secrets,
+            auto_install,
+            ..
+        }) = &mut existing.transport
+        {
+            env_secrets.insert("TOKEN".to_string(), "my_token".to_string());
+            *auto_install = Some(crate::tools::mcp::McpAutoInstall {
+                manager: crate::tools::mcp::McpPackageManager::Npm,
+                package: "@scope/server".to_string(),
+            });
+        }
+
+        let args = McpUpdateArgs {
+            name: "srv".to_string(),
+            url: None,
+            transport: None,
+            command: None,
+            cmd_args: None,
+            env: None,
+        };
+        let updated = build_update_config(&args, &existing).expect("update config");
+
+        match updated.effective_transport() {
+            EffectiveTransport::Stdio {
+                env_secrets,
+                auto_install,
+                ..
+            } => {
+                assert_eq!(
+                    env_secrets.get("TOKEN").map(String::as_str),
+                    Some("my_token"),
+                    "env_secrets must survive in-place updates"
+                );
+                assert!(
+                    auto_install.is_some(),
+                    "auto_install must survive in-place updates"
+                );
+            }
+            other => panic!("expected stdio transport, got {other:?}"),
         }
     }
 

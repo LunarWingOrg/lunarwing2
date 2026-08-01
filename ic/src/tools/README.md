@@ -167,6 +167,10 @@ The stdio transport accepts two additional optional fields:
   without a shell under a 300s timeout, and nothing is installed without this
   explicit opt-in.
 
+Both fields are accepted by the web extension install/update API and preserved
+across in-place updates (web gateway, `lunarwing mcp update`, and the agent's
+`tool_update` tool) when an update omits them.
+
 Managed stdio servers are supervised: a background task polls child processes
 and automatically restarts servers that exit unexpectedly (exponential backoff,
 1s→16s, 5 attempts per restart). A crash-loop guard stops restarting a server

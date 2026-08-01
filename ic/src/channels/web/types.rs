@@ -848,6 +848,14 @@ pub struct InstallExtensionRequest {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Environment variables injected from the secrets store at spawn time
+    /// (env var name -> secret name). Stdio MCP servers only; secret values
+    /// are never accepted over this API, only references to stored secrets.
+    #[serde(default)]
+    pub env_secrets: Option<std::collections::HashMap<String, String>>,
+    /// Opt-in automatic package installation for stdio MCP servers.
+    #[serde(default)]
+    pub auto_install: Option<crate::tools::mcp::McpAutoInstall>,
 }
 
 impl InstallExtensionRequest {
@@ -860,12 +868,22 @@ impl InstallExtensionRequest {
                 let command = self.command.as_deref().ok_or_else(|| {
                     "MCP server command is required for stdio transport".to_string()
                 })?;
-                crate::tools::mcp::McpServerConfig::new_stdio(
+                let mut config = crate::tools::mcp::McpServerConfig::new_stdio(
                     &self.name,
                     command,
                     self.args.clone(),
                     self.env.clone(),
-                )
+                );
+                if let Some(crate::tools::mcp::config::McpTransportConfig::Stdio {
+                    env_secrets,
+                    auto_install,
+                    ..
+                }) = &mut config.transport
+                {
+                    *env_secrets = self.env_secrets.clone().unwrap_or_default();
+                    *auto_install = self.auto_install.clone();
+                }
+                config
             }
             Some("http") => {
                 if self.url.is_none() {
@@ -1688,6 +1706,59 @@ mod tests {
     }
 
     #[test]
+    fn test_install_extension_request_stdio_env_secrets_and_auto_install() {
+        use crate::tools::mcp::config::{EffectiveTransport, McpPackageManager, McpServerConfig};
+
+        let json = r#"{
+            "name": "github",
+            "kind": "mcp_server",
+            "transport": "stdio",
+            "command": "github-mcp-server",
+            "env_secrets": {"GITHUB_TOKEN": "github_token"},
+            "auto_install": {"manager": "npm", "package": "@modelcontextprotocol/server-github"}
+        }"#;
+        let req: InstallExtensionRequest = serde_json::from_str(json).expect("request");
+        let config: McpServerConfig = req
+            .mcp_config()
+            .expect("valid stdio request")
+            .expect("explicit MCP config");
+
+        match config.effective_transport() {
+            EffectiveTransport::Stdio {
+                env_secrets,
+                auto_install,
+                ..
+            } => {
+                assert_eq!(
+                    env_secrets.get("GITHUB_TOKEN").map(String::as_str),
+                    Some("github_token")
+                );
+                let install = auto_install.expect("auto_install must be set");
+                assert_eq!(install.manager, McpPackageManager::Npm);
+                assert_eq!(install.package, "@modelcontextprotocol/server-github");
+            }
+            other => panic!("expected stdio transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_install_extension_request_stdio_rejects_invalid_auto_install() {
+        let json = r#"{
+            "name": "evil",
+            "kind": "mcp_server",
+            "transport": "stdio",
+            "command": "npx",
+            "auto_install": {"manager": "npm", "package": "--evil"}
+        }"#;
+        let req: InstallExtensionRequest = serde_json::from_str(json).expect("request");
+
+        assert!(
+            req.mcp_config().is_err(),
+            "option-injection package specs must fail validation"
+        );
+    }
+
+    #[test]
     fn test_install_extension_request_rejects_unknown_mcp_transport() {
         let json = r#"{
             "name": "bad",
@@ -1699,7 +1770,6 @@ mod tests {
 
         assert!(error.contains("Unsupported MCP transport"));
     }
-
     #[test]
     fn test_install_extension_request_defers_registry_mcp_install() {
         let json = r#"{

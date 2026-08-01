@@ -2389,12 +2389,43 @@ async fn extensions_update_handler(
                     "command is required for stdio transport".to_string(),
                 )
             })?;
-            crate::tools::mcp::McpServerConfig::new_stdio(
+            let mut config = crate::tools::mcp::McpServerConfig::new_stdio(
                 &name,
                 command,
                 req.args.clone(),
                 req.env.clone(),
-            )
+            );
+            // Secret-env injection and auto-install: take the request values
+            // when present, otherwise preserve the existing server's settings
+            // so updates do not silently drop them.
+            if let Some(crate::tools::mcp::config::McpTransportConfig::Stdio {
+                env_secrets,
+                auto_install,
+                ..
+            }) = &mut config.transport
+            {
+                match existing.effective_transport() {
+                    crate::tools::mcp::config::EffectiveTransport::Stdio {
+                        env_secrets: existing_secrets,
+                        auto_install: existing_install,
+                        ..
+                    } => {
+                        *env_secrets = req
+                            .env_secrets
+                            .clone()
+                            .unwrap_or_else(|| existing_secrets.clone());
+                        *auto_install = req
+                            .auto_install
+                            .clone()
+                            .or_else(|| existing_install.cloned());
+                    }
+                    _ => {
+                        *env_secrets = req.env_secrets.clone().unwrap_or_default();
+                        *auto_install = req.auto_install.clone();
+                    }
+                }
+            }
+            config
         }
         _ => {
             let url = req

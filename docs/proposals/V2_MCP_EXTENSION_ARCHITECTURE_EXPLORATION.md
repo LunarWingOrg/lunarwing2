@@ -125,7 +125,10 @@ Three lifecycle gaps called out by this exploration have since been closed
 
 Gateway install/toggle/update flows persist `McpServerConfig` through the
 existing extension handlers, so the new fields are available through the web
-gateway and CLI without additional endpoints.
+gateway and CLI without additional endpoints. The web install/update request
+(`InstallExtensionRequest`) also accepts `env_secrets` and `auto_install`
+directly, and both the gateway update handler and `lunarwing mcp update`
+preserve them when an update omits them (2026-08-01 hardening pass).
 
 ### Worker containers do not currently load MCP extensions
 
