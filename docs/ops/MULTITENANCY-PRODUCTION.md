@@ -276,7 +276,7 @@ Primary block (10000-19999):
 | +8 | pebble_wss | Pebble worker WebSocket |
 | +9 | weechat_adapter | WeeChat WS adapter HTTP API |
 
-Extended block (20000-29999, registry version ≥ 6; slots dedicated through v11):
+Extended block (20000-29999, registry version ≥ 6; slots dedicated through v13):
 
 | Offset | Service | Description |
 |--------|---------|-------------|
@@ -289,6 +289,12 @@ Extended block (20000-29999, registry version ≥ 6; slots dedicated through v11
 | ebase+6 | vision_health | LunarVision sidecar `/health` (port 8089) |
 | ebase+7 | opencode_wss | Opencode worker WebSocket (v11) |
 | ebase+8 | opencode_health | Opencode worker `/health` (host self-heal, v11) |
+| ebase+9 | coord_admin | Multi-agent coordination admin API (v13) |
+
+Kimi worker ports are separate (registry v12+): a dedicated `kimi_range`
+(30000-39999, block size 2) gives each tenant `kimi_base` with
+`kimi_wss = kimi_base + 0` and `kimi_health = kimi_base + 1`, so the extended
+block did not have to be re-spaced for existing tenants.
 
 ### Example allocation
 
@@ -301,11 +307,13 @@ Extended block (20000-29999, registry version ≥ 6; slots dedicated through v11
 
 ```json
 {
-  "version": 11,
+  "version": 13,
   "range": { "start": 10000, "end": 19999 },
   "block_size": 10,
   "extended_range": { "start": 20000, "end": 29999 },
   "extended_block_size": 10,
+  "kimi_range": { "start": 30000, "end": 39999 },
+  "kimi_block_size": 2,
   "tenants": {
     "ruffles": {
       "base_port": 10000,
@@ -333,7 +341,13 @@ Extended block (20000-29999, registry version ≥ 6; slots dedicated through v11
         "vision_service": 20005,
         "vision_health": 20006,
         "opencode_wss": 20007,
-        "opencode_health": 20008
+        "opencode_health": 20008,
+        "coord_admin": 20009
+      },
+      "kimi_base": 30000,
+      "kimi_ports": {
+        "kimi_wss": 30000,
+        "kimi_health": 30001
       }
     }
   }
@@ -361,6 +375,7 @@ Extended block (20000-29999, registry version ≥ 6; slots dedicated through v11
   nanocode-workspace/          # Nanocode worker task workspace (if enabled)
   pebble-workspace/            # Pebble worker task workspace (if enabled)
   opencode-workspace/          # Opencode worker task workspace (if enabled)
+  kimi-workspace/              # Kimi worker task workspace (if enabled)
   logs/                        # Log files (OpenRC) or symlink to journal
   run/                         # PID files, sockets
 ```
@@ -369,13 +384,21 @@ Extended block (20000-29999, registry version ≥ 6; slots dedicated through v11
 
 ### Systemd (user-level with linger)
 
-Currently: Each tenant gets 5 user-level systemd units installed to `~/.config/systemd/user/`:
+Each tenant gets user-level systemd units installed to `~/.config/systemd/user/`
+(core units always; the rest when the feature is enabled/provisioned):
 
 | Unit | Description |
 |------|-------------|
 | `lunarwing-<name>.service` | Main daemon (Wants bridge + proxy) |
 | `xmpp-bridge-<name>.service` | XMPP bridge (PartOf main) |
 | `lunarwing-proxy-<name>.service` | TensorZero proxy |
+| `lunarwing-weechat-<name>.service` | WeeChat backend (optional) |
+| `lunarwing-weechat-adapter-<name>.service` | WeeChat WS adapter (optional) |
+| `lunarwing-pg-<name>.service` | Postgres rootless Quadlet |
+| `lunarwing-nanocode-<name>.service` | Nanocode worker Quadlet (if enabled) |
+| `lunarwing-pebble-<name>.service` | Pebble worker Quadlet (if enabled) |
+| `lunarwing-opencode-<name>.service` | Opencode worker Quadlet (if enabled) |
+| `lunarwing-kimi-<name>.service` | Kimi worker Quadlet (if enabled) |
 
 The main unit has `Wants=` on the bridge and proxy, so starting it pulls in the sidecars. `loginctl enable-linger` keeps services running after the user logs out.
 
@@ -392,7 +415,11 @@ journalctl --user -u lunarwing-<name>.service -f
 
 ### OpenRC (system-level with User= directives)
 
-Each tenant gets 3 init scripts in `/etc/init.d/` with corresponding `/etc/conf.d/` files:
+Each tenant gets init scripts in `/etc/init.d/` with corresponding `/etc/conf.d/`
+files — the 3 core scripts plus (when enabled) `lunarwing-pg-<name>`,
+`lunarwing-weechat-<name>`, `lunarwing-weechat-adapter-<name>`, and per-worker
+`lunarwing-{nanocode,pebble,opencode,kimi}-<name>` (each worker also has a
+`<unit>-sup` babysitter):
 
 | Init script | Conf.d |
 |-------------|--------|
@@ -425,7 +452,7 @@ Each tenant gets its own Docker/Podman container named `lunarwing-pg-<name>`, bo
 
 The container is created with `--restart unless-stopped` so it survives host reboots when using Docker. Podman has no daemon to honor that policy, so each tenant's container gets a first-class **supervised unit** instead:
 
-- **OpenRC** — a dedicated `/etc/init.d/lunarwing-pg-<name>` service (which the main daemon `need`s) `podman start`s the container and waits for `pg_isready`; the workers get `/etc/init.d/lunarwing-{nanocode,pebble,opencode}-<name>` the same way. See [`MT-GENTOO-SETUP-AND-CHANGES-MADE.md`](MT-GENTOO-SETUP-AND-CHANGES-MADE.md).
+- **OpenRC** — a dedicated `/etc/init.d/lunarwing-pg-<name>` service (which the main daemon `need`s) `podman start`s the container and waits for `pg_isready`; the workers get `/etc/init.d/lunarwing-{nanocode,pebble,opencode,kimi}-<name>` the same way. See [`MT-GENTOO-SETUP-AND-CHANGES-MADE.md`](MT-GENTOO-SETUP-AND-CHANGES-MADE.md).
 - **Podman + systemd (rootless)** — a per-tenant **Quadlet** `.container` at `~/.config/containers/systemd/lunarwing-pg-<name>.container` (`Restart=on-failure`, `HealthCmd=pg_isready`), which the podman user-generator turns into `lunarwing-pg-<name>.service` at `daemon-reload`. This supersedes the older `podman generate systemd` approach. See [`../proposals/MT_SYSTEMD_PARITY.md`](../proposals/MT_SYSTEMD_PARITY.md).
 
 ## Container Runtime
