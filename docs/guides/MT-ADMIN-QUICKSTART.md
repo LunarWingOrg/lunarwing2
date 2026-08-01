@@ -44,6 +44,13 @@ sudo dnf install jq git python3-aiohttp weechat
 sudo emerge app-misc/jq app-containers/podman dev-python/aiohttp net-irc/weechat
 ```
 
+These are minimal hints — for complete per-distro dependency lists (including the Python
+ops-tooling packages the hints above omit) see
+[`DEBIAN_PACKAGE_LIST.md`](DEBIAN_PACKAGE_LIST.md),
+[`UBUNTU_PACKAGE_LIST.md`](UBUNTU_PACKAGE_LIST.md),
+[`FEDORA_PACKAGE_LIST.md`](FEDORA_PACKAGE_LIST.md), and
+[`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md).
+
 All commands below run from the repository root (e.g., `/home/you/lunarwing`).
 
 ---
