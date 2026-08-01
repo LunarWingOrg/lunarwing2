@@ -110,7 +110,7 @@ docker pull pgvector/pgvector:pg16
 ```bash
 cd ic
 scripts/lunarwing-xmpp-test-env.sh mt-init
-scripts/lunarwing-xmpp-test-env.sh build --with-wasm  # builds daemon, bridge, + all 20 WASM
+scripts/lunarwing-xmpp-test-env.sh build --with-wasm  # builds daemon, bridge, + all WASM channels/tools
 scripts/lunarwing-xmpp-test-env.sh mt-up              # auto-detects macOS, renders + loads plists
 scripts/lunarwing-xmpp-test-env.sh mt-verify
 scripts/lunarwing-xmpp-test-env.sh mt-down
