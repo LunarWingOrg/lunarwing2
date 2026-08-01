@@ -30,7 +30,7 @@
 Script	What It Tests
 ic/scripts/release-test.sh ✅	Gateway API, WebSocket, core subsystems
 ic/scripts/lunarwing-xmpp-test-env.sh	Full stack: Postgres, TensorZero proxy, XMPP bridge, daemon, WASM tools
-tests/runner.py	All 4 worker types (Codex, Nanocode, Built-in, Sandbox) in Docker isolation
+tests/runner.py	Worker matrix from tests/tests.yaml (currently 6: nanocode, opencode, kimi, pebble, builtin, sandbox) in Docker isolation
 ic/tests/e2e/	Playwright browser tests against live instance
 cargo test	Rust unit + integration tests
 ic/scripts/check-boundaries.sh	Architecture boundary violations (no direct DB driver usage outside src/db/, etc.)
@@ -39,7 +39,7 @@ If you want "60%+ of everything" in one shot:
 # 1. Full integration harness (XMPP + daemon + WASM)
 ic/scripts/lunarwing-xmpp-test-env.sh up
 
-# 2. Worker matrix (all 4 workers)
+# 2. Worker matrix (all workers in tests/tests.yaml)
 cd tests && python runner.py --mode smoke
 
 # 3. Rust core
