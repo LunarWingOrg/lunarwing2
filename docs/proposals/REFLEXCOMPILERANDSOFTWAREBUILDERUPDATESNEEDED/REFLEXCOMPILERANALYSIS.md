@@ -27,7 +27,9 @@ The wiring gaps in §5 were addressed (first pass adapted from branch `anattempt
 
 Additional second-pass fix (not in original gap list): `compile_pattern` only skipped `status='active'`, so user-disabled patterns (CLI `reflex delete`) and attempt-capped patterns were recompiled and resurrected on the next sweep. The compiler now skips `disabled` too; `failed`/`evicted` still fall through to retry.
 
-Verification: 49 reflex unit tests + 10 e2e integration tests pass on `aj/kimi-6-20260731-0902`; `cargo check --all-targets` clean.
+Third-pass fix (2026-08-01, branch `aj/kimi-6-20260801-0002`, adopts `aj/kimi-6-20260731-2101` incl. the owner-scoped bump fix): `semantic_route()` and `try_route_with_details()` held `pattern_embeddings.read` while acquiring `patterns.read`, the inverse of `refresh()`'s `patterns.write` → `embeddings.write` order — a latent ABBA deadlock that becomes reachable in production once gap 5.1 wires the embedding provider. The embeddings guard is now scoped to the best-match computation and dropped before touching `patterns`; `try_route_with_details` also drops its fuzzy-scan `patterns` guard before the semantic fallback re-acquires it.
+
+Verification: 50 reflex unit tests + 10 e2e integration tests pass on `aj/kimi-6-20260801-0002`; `cargo check --all-targets` clean.
 
 ---
 
