@@ -3,6 +3,10 @@
 **Date:** 2026-07-21
 **Scope:** LunarWing v2.0.2.0 — `ic/` workspace and satellite crates
 **Replaces:** `_OUTDATED_CRATE_AUDIT_STATUS.md` (2026-07-12, v2.0.0.0)
+**Superseded by:** `CRATE_AUDIT_v2.0.3.0.md` (2026-07-25) and
+`CRATE_AUDIT_v2.0.4.0.md` (2026-07-30 — workspace crates are now all 2.0.4;
+see that file for the current audit). This report is retained as a dated
+snapshot; do not treat its version table as current.
 
 ---
 
