@@ -59,9 +59,14 @@ fallback, loopback URL enforcement, XML escaping, decoded image limits, and VL
 data-URL construction. Host credential tests also cover exact-origin scoping for
 the explicit WASM vision tool.
 
-Live Conversations/Gajim/Dino transfer validation and inbound-download SSRF
-hardening remain tracked by XMPP file-transfer item 15; they are not part of
-this now-closed automatic enrichment gap.
+Live Conversations/Gajim/Dino transfer validation remains tracked by XMPP
+file-transfer item 15. Inbound-download SSRF hardening (formerly deferred to
+item 15) has since landed: inbound OOB/`aesgcm://` fetches go through an
+egress policy (https-only by default, no embedded credentials, redirects and
+environment proxies disabled, non-public resolved addresses rejected, client
+pinned to validated addresses, `ALLOW_PRIVATE_IPS=1` local-dev opt-in), and
+recognized attachment URLs are stripped from message content and logs even
+when a download fails (2026-08-01, branch `rarity/kimi-27-20260801-0000`).
 
 Kawarimi migration carries `VL_URL`/`VL_MODEL` but deliberately regenerates the
 host-local vision auth token. Imports of older bundles ignore their carried

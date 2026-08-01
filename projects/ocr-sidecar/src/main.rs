@@ -591,6 +591,22 @@ fn rate_limit_filter(state: AppState) -> impl Filter<Extract = (), Error = Rejec
         .untuple_one()
 }
 
+/// Constant-time Bearer token comparison. The expected token is a
+/// daemon-generated secret; an early-exit string compare would leak how many
+/// leading bytes matched through response timing. Length inequality returns
+/// immediately — token length is not secret (it is fixed at provisioning).
+fn bearer_token_eq(provided: &str, expected: &str) -> bool {
+    let (provided, expected) = (provided.as_bytes(), expected.as_bytes());
+    if provided.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in provided.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 fn auth_filter(config: Config) -> impl Filter<Extract = (), Error = Rejection> + Clone {
     warp::header::optional("authorization")
         .and_then(move |auth: Option<String>| {
@@ -601,7 +617,7 @@ fn auth_filter(config: Config) -> impl Filter<Extract = (), Error = Rejection> +
                     Some(token) => match auth {
                         Some(header) if header.starts_with("Bearer ") => {
                             let provided = header.trim_start_matches("Bearer ");
-                            if provided == token {
+                            if bearer_token_eq(provided, &token) {
                                 Ok(())
                             } else {
                                 Err(warp::reject::custom(AppError::Unauthorized))
@@ -1983,6 +1999,19 @@ mod tests {
             Err(AppError::PayloadTooLarge { .. })
         ));
         assert!(MAX_BODY_SIZE > MAX_IMAGE_SIZE as u64);
+    }
+
+    #[test]
+    fn bearer_token_eq_compares_exactly() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert!(bearer_token_eq(token, token));
+        // Same length, one byte different.
+        assert!(!bearer_token_eq("0123456789abcdef0123456789abcdee", token));
+        // Prefix of the expected token (early-exit compare would accept
+        // sooner, which is exactly the timing signal we avoid relying on).
+        assert!(!bearer_token_eq("0123456789abcdef", token));
+        assert!(!bearer_token_eq("", token));
+        assert!(bearer_token_eq("", ""));
     }
 
     #[test]

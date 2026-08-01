@@ -113,7 +113,13 @@ impl ScopedBearerCredential {
         {
             return None;
         }
-        let host = url.host_str()?.to_ascii_lowercase();
+        // Normalize exactly like extract_host_from_url (lowercased, IPv6
+        // brackets stripped) so the stored host pattern matches the request
+        // host at injection time. Url::host_str() keeps IPv6 brackets
+        // ("[::1]") while extract_host_from_url strips them ("::1") — without
+        // this, an IPv6 loopback credential would never inject (fail-closed
+        // but broken).
+        let host = extract_host_from_url(service_url)?;
         let allowed_host = match url.host()? {
             url::Host::Domain(domain) => {
                 domain.eq_ignore_ascii_case("localhost")
@@ -2640,6 +2646,47 @@ mod tests {
             store_data.inject_host_credentials("localhost", &mut denied_headers, &mut denied_url);
             assert!(!denied_headers.contains_key("Authorization"));
         }
+    }
+
+    /// IPv6 loopback scoped credentials must actually inject: the credential
+    /// stores the host via the same normalization as `extract_host_from_url`
+    /// (bracket-stripped, lowercased). Regression coverage for the two forms
+    /// ("[::1]" vs "::1") silently mismatching.
+    #[test]
+    fn test_scoped_vision_credential_ipv6_loopback_injects() {
+        use crate::tools::wasm::wrapper::{
+            ScopedBearerCredential, StoreData, extract_host_from_url,
+        };
+        use secrecy::SecretString;
+        use std::collections::HashMap;
+
+        let credential = ScopedBearerCredential::new(
+            "http://[::1]:8088",
+            SecretString::from(TEST_BEARER_TOKEN_123.to_string()),
+        )
+        .expect("valid IPv6 loopback vision credential")
+        .resolve();
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            HashMap::new(),
+            vec![credential],
+        );
+
+        let mut headers = HashMap::new();
+        let mut url = "http://[::1]:8088/v1/vision/analyze".to_string();
+        let host = extract_host_from_url(&url).expect("request host");
+        store_data.inject_host_credentials(&host, &mut headers, &mut url);
+        assert_eq!(
+            headers.get("Authorization"),
+            Some(&format!("Bearer {TEST_BEARER_TOKEN_123}"))
+        );
+
+        // A different origin still must not receive the token.
+        let mut denied_headers = HashMap::new();
+        let mut denied_url = "http://[::1]:8089/v1/vision/analyze".to_string();
+        store_data.inject_host_credentials(&host, &mut denied_headers, &mut denied_url);
+        assert!(!denied_headers.contains_key("Authorization"));
     }
 
     #[test]
