@@ -13,9 +13,11 @@ Reconciled 2026-06-07.
   against a live server (Conversations/Gajim → agent). See `docs/architecture/XMPP_FILE_TRANSFERS.md`.
   *(Earlier notes said inbound OOB "isn't implemented" / "needs e2e testing"; the implementation is
   now in place — only the live e2e run remains.)*
-- **Inbound downloads have no SSRF guard (deferred).** The bridge fetches sender-supplied OOB /
-  `aesgcm://` URLs without blocking private/loopback/metadata IPs. Deployments rely on the network
-  boundary and the `ALLOW_PRIVATE_IPS` model; a future phase can reuse
-  `config/helpers.rs::validate_base_url`.
+- **Inbound downloads have no SSRF guard (deferred).** The WASM channel
+  (`ic/src/channels/xmpp/mod.rs::download_oob_file` / `download_aesgcm_file`)
+  fetches sender-supplied OOB / `aesgcm://` URLs without blocking
+  private/loopback/metadata IPs. Deployments rely on the network boundary and
+  the `ALLOW_PRIVATE_IPS` model; a future phase can reuse
+  `ic/src/config/helpers.rs::validate_base_url`.
 - **OMEMO MUC fallback spam / rare stuck processing loop** — historically observed; appear resolved
-  (`docs/bugs/XMPP-OMEMO-BUG-TO-DO.md`). Reopen if they recur.
+  (`docs/bugs/BUG-xmpp-omemo-warmup-and-processing.md`). Reopen if they recur.
