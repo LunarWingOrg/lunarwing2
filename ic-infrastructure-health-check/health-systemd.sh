@@ -89,7 +89,28 @@ unit_json() {
 EOF
 }
 
+retired_nanocode_unit() {
+  case "$1" in
+    lunarwing-nanocode-*.service) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 for unit in "${UNITS_ARR[@]}"; do
+  if retired_nanocode_unit "$unit"; then
+    load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || echo "not-found")
+    if [ "$load" = "loaded" ]; then
+      active=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || echo "unknown")
+      sub=$(systemctl show -p SubState --value "$unit" 2>/dev/null || echo "unknown")
+      restarts=$(systemctl show -p NRestarts --value "$unit" 2>/dev/null || echo 0)
+      restarts=${restarts:-0}
+    else
+      active="missing"; sub="retired"; restarts=0
+    fi
+    unit_results+=("$(unit_json "$unit" "$active" "$sub" "$restarts" \
+      "$(jq -n '{retired:true,worker:"nanocode"}')" "skipped")")
+    continue
+  fi
   if ! systemctl list-unit-files "$unit" >/dev/null 2>&1 && ! systemctl status "$unit" >/dev/null 2>&1; then
     # On a multi-tenant host the base system-level units don't exist (tenants run
     # per-user units) — skip rather than emit a phantom critical.
@@ -228,6 +249,11 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
       uactive=${_uf[1]:-unknown}; usub=${_uf[2]:-unknown}; urestarts=${_uf[3]:-0}
       [[ "$urestarts" =~ ^[0-9]+$ ]] || urestarts=0
       ustatus="healthy"; uexit=0
+      if retired_nanocode_unit "$tunit"; then
+        unit_results+=("$(unit_json "$tunit" "$uactive" "$usub" "$urestarts" \
+          "$(jq -n --arg u "$tuser" '{tenant_user:$u,retired:true,worker:"nanocode"}')" "skipped")")
+        continue
+      fi
       # Per-tenant WeeChat health-gate (RENDER_UNITS_SMALL_BUG follow-up): on a
       # weechat-DISABLED tenant (enable_weechat=false in the registry) a
       # not-running optional weechat backend/adapter unit is the expected
@@ -288,7 +314,7 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
       # but not serving) is caught instead of reported healthy.
       uhealth=""
       case "$tunit" in
-        lunarwing-pg-*|lunarwing-nanocode-*|lunarwing-opencode-*|lunarwing-kimi-*|lunarwing-pebble-*)
+        lunarwing-pg-*|lunarwing-opencode-*|lunarwing-kimi-*|lunarwing-pebble-*)
           uhealth=$(_tenant_ctr_health "$tuser" "$tuid" "${tunit%.service}")
           if [ "$uhealth" = "unhealthy" ] && [ "$uexit" -lt 2 ]; then
             ustatus="critical"; uexit=2; issues+=("$tunit ($tuser) container unhealthy")

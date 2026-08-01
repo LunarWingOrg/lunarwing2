@@ -4913,9 +4913,32 @@ function addMcpServer() {
       }
       env[key] = line.slice(separator + 1);
     }
+    var envSecrets = {};
+    var secretEnvLines = document.getElementById('mcp-install-env-secrets').value.split(/\r?\n/);
+    for (var j = 0; j < secretEnvLines.length; j++) {
+      var secretLine = secretEnvLines[j].trim();
+      if (!secretLine) continue;
+      var secretSeparator = secretLine.indexOf('=');
+      var envName = secretSeparator >= 0 ? secretLine.slice(0, secretSeparator).trim() : '';
+      var secretName = secretSeparator >= 0 ? secretLine.slice(secretSeparator + 1).trim() : '';
+      if (!envName || !secretName) {
+        showToast('Secret environment line ' + (j + 1) + ' must use KEY=SECRET_NAME', 'error');
+        return;
+      }
+      if (Object.prototype.hasOwnProperty.call(envSecrets, envName)) {
+        showToast('Secret environment variable ' + envName + ' is duplicated', 'error');
+        return;
+      }
+      if (Object.prototype.hasOwnProperty.call(env, envName)) {
+        showToast('Environment variable ' + envName + ' cannot have both a plain value and a secret reference', 'error');
+        return;
+      }
+      envSecrets[envName] = secretName;
+    }
     body.command = command;
     body.args = args;
     body.env = env;
+    body.env_secrets = envSecrets;
   }
 
   apiFetch('/api/extensions/install', {
@@ -4945,7 +4968,7 @@ function setMcpInstallTransport(transport) {
 }
 
 function resetMcpInstallForm() {
-  ['mcp-install-name', 'mcp-install-url', 'mcp-install-command', 'mcp-install-args', 'mcp-install-env']
+  ['mcp-install-name', 'mcp-install-url', 'mcp-install-command', 'mcp-install-args', 'mcp-install-env', 'mcp-install-env-secrets']
     .forEach(function(id) { document.getElementById(id).value = ''; });
   setMcpInstallTransport('http');
 }

@@ -381,7 +381,7 @@ Verify before locking into a prompt:
 | Core daemon | `ic/src/agent/**`, `ic/src/tools/**`, `ic/src/channels/**` |
 | Engine crates | `ic/crates/**` |
 | WASM tools / channels | `ic/tools-src/**`, `ic/channels-src/**` |
-| Workers | `lunarcode4lunarwing/**`, `pebble4lunarwing/**`, `opencode4lunarwing/**` |
+| Workers | `pebble4lunarwing/**`, `opencode4lunarwing/**`, `kimicode4lunarwing/**` |
 | MT onboard / health | `lunarwing_mt_onboard/**`, `ic-infrastructure-health-check/**` |
 | Bridges | `xmpp_bridge/**`, `lunarwing_weechat_wss/**`, `lunarwing-gotify-tool/**` |
 

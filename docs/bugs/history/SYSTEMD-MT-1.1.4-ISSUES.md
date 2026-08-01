@@ -16,7 +16,7 @@ systemd units). New tenant `springfeather` provisioned with
 
 **Current-document note (`51ae5a8`, 2026-07-20):** F1-F10 and F12 are
 historical resolved findings. F11 remains an active capacity issue and is tracked in
-[`../BUG-mt-nanocode-image-size.md`](../BUG-mt-nanocode-image-size.md); the
+[`BUG-mt-nanocode-image-size.md`](BUG-mt-nanocode-image-size.md); the
 discovery detail stays here for provenance.
 
 **Fix status (2026-06-17):** all six fixed in code on `1.1.4-staging-goals`, then a
@@ -42,7 +42,7 @@ crash-loop chaos case + `SubState` mock, and a new `tests/test-health-systemd.sh
 | F8 | Medium | nanocode/pebble worker image build fails under podman — the build-RUN container's `apt` can't reach the internet (host has no IPv6 route; the default build network can't route IPv4 out) | 🟢 fixed — `--network=host` on the podman worker builds; both images now build (apt reaches the net via the host netns) |
 | F9 | — | ~~`build-tenant` exits 0 on a worker-build failure~~ — **NOT a bug**: `build-tenant` `die`s (exit 1) and propagates correctly. The observed "exit 0" was a test-harness artifact (a trailing `echo "...$?"` in the background wrapper masked the real exit). | 🟢 invalid |
 | F10 | Medium | `_ctr` runs `sudo -u <tenant>` without a tenant-traversable CWD → "cannot chdir" → the rootless pg readiness gate **always** times out (spurious 120s WARNING) | 🟢 fixed — `cd /` in `_ctr` (gate now ~3s, "ready via quadlet") |
-| F11 | Low | nanocode worker image is **~6 GB**; per-tenant `save\|load` distribution into the rootless store is slow + disk-heavy and can fail under disk pressure (succeeded on retry) | 🔴 open follow-up; see [`BUG-mt-nanocode-image-size.md`](../BUG-mt-nanocode-image-size.md) |
+| F11 | Low | nanocode worker image is **~6 GB**; per-tenant `save\|load` distribution into the rootless store is slow + disk-heavy and can fail under disk pressure (succeeded on retry) | Historical; closed by retirement. See [`BUG-mt-nanocode-image-size.md`](BUG-mt-nanocode-image-size.md) |
 | F12 | Medium | worker Quadlet emitted `KillMode=process` in `[Service]` → the Quadlet generator **rejected** the `.container` ("invalid KillMode") → no `.service` generated → workers never started (pg's quadlet has no `KillMode`, so it worked) | 🟢 fixed — removed `KillMode=process` from `render_worker_quadlet` |
 
 ---

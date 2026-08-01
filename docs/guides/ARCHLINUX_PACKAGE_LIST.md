@@ -180,5 +180,8 @@ network. These are in `base`/`base-devel` and assumed present.
 ## Cross-reference
 
 - Gentoo/OpenRC equivalent: [`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md)
+- Debian equivalent: [`DEBIAN_PACKAGE_LIST.md`](DEBIAN_PACKAGE_LIST.md)
+- Ubuntu equivalent: [`UBUNTU_PACKAGE_LIST.md`](UBUNTU_PACKAGE_LIST.md)
+- Fedora equivalent: [`FEDORA_PACKAGE_LIST.md`](FEDORA_PACKAGE_LIST.md)
 - Admin quickstart: [`MT-ADMIN-QUICKSTART.md`](MT-ADMIN-QUICKSTART.md)
 - Production reference: [`../ops/MULTITENANCY-PRODUCTION.md`](../ops/MULTITENANCY-PRODUCTION.md)

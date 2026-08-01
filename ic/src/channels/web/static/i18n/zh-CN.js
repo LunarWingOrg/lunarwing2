@@ -190,6 +190,8 @@ I18n.register('zh-CN', {
   'mcp.argsPlaceholder': '参数，每行一个',
   'mcp.envPlaceholder': '非机密环境变量，每行 KEY=VALUE',
   'mcp.envNonSecret': '环境变量值将以普通配置形式存储。请勿输入机密信息。',
+  'mcp.secretEnvPlaceholder': '机密环境变量引用，每行 KEY=secret_name',
+  'mcp.secretEnvWarning': '机密值仅在激活时解密，然后暴露给未沙箱化的 MCP 进程。仅安装可信代码。',
 
 
   // 技能标签页

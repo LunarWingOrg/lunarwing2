@@ -2389,11 +2389,12 @@ async fn extensions_update_handler(
                     "command is required for stdio transport".to_string(),
                 )
             })?;
-            crate::tools::mcp::McpServerConfig::new_stdio(
+            crate::tools::mcp::McpServerConfig::new_stdio_with_secrets(
                 &name,
                 command,
                 req.args.clone(),
                 req.env.clone(),
+                req.env_secrets.clone(),
             )
         }
         _ => {

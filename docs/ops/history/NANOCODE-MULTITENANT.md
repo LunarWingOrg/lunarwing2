@@ -1,4 +1,8 @@
-# Nanocode Worker: Multi-Tenant Setup
+# Nanocode Worker: Multi-Tenant Setup (Historical)
+
+> Nanocode is retired. This document records the former deployment model and
+> must not be used as an active runbook. See
+> [`../NANOCODE-REMOVAL.md`](../NANOCODE-REMOVAL.md).
 
 Guide for deploying the nanocode external worker in a multi-tenant LunarWing environment.
 

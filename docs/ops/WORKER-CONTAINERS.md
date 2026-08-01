@@ -2,6 +2,9 @@
 
 Several container images provide sandboxed and persistent job execution for LunarWing.
 
+Nanocode is retired and has no active source, build, or runtime image definition.
+See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
+
 ## LunarWing Worker
 
 The main sandbox worker. Includes dev tools (git, build-essential, Node.js, Python3, Rust, GitHub CLI) and Claude Code CLI. The orchestrator (`ic/src/orchestrator/`) manages container lifecycle, LLM proxying, and credential injection.
@@ -14,25 +17,6 @@ docker build -f Dockerfile.worker -t lunarwing-worker:latest .
 ```
 
 Runs as non-root user `sandbox` (UID 1000) in `/workspace`. Entrypoint is the `lunarwing` binary — the orchestrator passes the full command via Docker cmd.
-
-## Nanocode Worker
-
-Bun-based Nanocode agent. Runs nanocode headless server internally (port 4096) with a TypeScript bridge to the WebSocket protocol. Health on 8443, WebSocket on 9090.
-
-**Dockerfile:** `lunarcode4lunarwing/Dockerfile`
-
-```bash
-# Copy nanocode source (required, not checked in)
-cp -R nanocode-config/nanocode lunarcode4lunarwing/nanocode
-
-cd lunarcode4lunarwing
-docker build -t lunarwing-nanocode-worker:latest .
-
-# Or via docker-compose
-docker compose up --build
-```
-
-Modes: `--mode websocket` (default, persistent), `--mode cli` (one-shot), `--mode acp`. Requires `AGENT_AUTH_TOKEN` for WebSocket auth. See `lunarcode4lunarwing/CLAUDE.md` for full env var reference.
 
 ## Pebble Worker
 

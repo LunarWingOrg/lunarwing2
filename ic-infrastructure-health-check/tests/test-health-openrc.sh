@@ -227,5 +227,20 @@ mk_unit "$s" lunarwing-weechat-acme; fix_set "$s" lunarwing-weechat-acme " * sta
 run_hc "$s" LUNARWING_TENANTS_FILE="$s/nonexistent.json"
 assert_eq "$(svc_field "$OUT" lunarwing-weechat-acme status)" "critical" "S11: unreadable registry → down weechat still critical (never masks)"
 
+# ── S12: retired Nanocode services remain visible but never trigger healing ─
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;          fix_set "$s" lunarwing-acme          " * status: started" 0; enable_unit "$s" lunarwing-acme
+mk_unit "$s" lunarwing-nanocode-acme; fix_set "$s" lunarwing-nanocode-acme " * status: crashed" 1
+run_hc "$s"
+assert_eq "$(svc_field "$OUT" lunarwing-nanocode-acme status)" "skipped" "S12: retired Nanocode service → skipped"
+assert_eq "$(svc_field "$OUT" lunarwing-nanocode-acme state)" "crashed" "S12: retired Nanocode state remains visible"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S12: retired Nanocode service cannot degrade host"
+assert_eq "$RC" 0 "S12: retired Nanocode service keeps exit 0"
+
+s="$(new_scenario)"
+run_hc "$s" SERVICES=lunarwing-nanocode-ghost
+assert_eq "$(svc_field "$OUT" lunarwing-nanocode-ghost status)" "skipped" "S12: missing retired Nanocode service → skipped"
+assert_eq "$RC" 0 "S12: missing retired Nanocode service keeps exit 0"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

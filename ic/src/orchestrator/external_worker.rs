@@ -2,7 +2,7 @@
 //! protocol (legacy alias `ironclaw-agent-v1` is still offered for workers
 //! built before the rename).
 //!
-//! External workers are persistent containers (nanocode, pebble, opencode, etc.) that the
+//! External workers are persistent containers (Pebble, OpenCode, Kimi Code, etc.) that the
 //! orchestrator connects to on demand rather than creating per-job.
 
 use std::collections::HashMap;

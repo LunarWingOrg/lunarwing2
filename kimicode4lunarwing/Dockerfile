@@ -20,6 +20,9 @@ RUN set -e; \
 # Install ws (WebSocket library) and typescript. package.json pins a reviewed release.
 COPY scripts/package.json scripts/tsconfig.json ./scripts/
 COPY scripts/*.ts ./scripts/
+# entrypoint_config_test.js reads ../entrypoint.sh — ship it in the build
+# stage so the in-build test gate validates the actual shipped entrypoint.
+COPY entrypoint.sh /build/entrypoint.sh
 
 WORKDIR /build/scripts
 RUN npm install --omit=dev --ignore-scripts && \

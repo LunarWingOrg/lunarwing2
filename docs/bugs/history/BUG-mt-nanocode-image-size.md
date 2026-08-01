@@ -1,4 +1,8 @@
-# Multi-tenant Nanocode image distribution is too large
+# Multi-tenant Nanocode image distribution was too large
+
+> **Status: CLOSED BY RETIREMENT (2026-07-31).** Nanocode source, image builds,
+> and runtime startup are removed. Existing images and stopped containers remain
+> available for operator-controlled backup or cleanup.
 
 > **Status: STILL-OPEN (verified against current source on 2026-07-28).** The worker
 > image build and healthcheck issues from the 1.1.4 systemd pass are fixed, but

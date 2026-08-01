@@ -6,7 +6,6 @@ networks:
     driver: bridge
 
 volumes:
-  nanocode_logs:
   opencode_logs:
   kimi_logs:
   pebble_logs:
@@ -52,26 +51,6 @@ services:
       interval: 5s
       timeout: 2s
       retries: 6
-
-  # ── Nanocode Worker ────────────────────
-  nanocode_worker:
-    build:
-      context: ../lunarcode4lunarwing
-      dockerfile: Dockerfile
-    environment:
-      - NANOCODE_MODE=websocket
-      - WS_ROLE=server
-      - AGENT_AUTH_TOKEN=${HARNESS_AUTH_TOKEN:-test-token}
-      - TENSORZERO_API_KEY=${MOCK_API_KEY:-test-key}
-      - WS_PORT=9090
-    ports: ["8444:8443", "9090:9090"]
-    networks: [test_harness]
-    volumes: [nanocode_logs:/logs]
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8443/ready"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
 
   # ── Opencode Worker ────────────────────
   opencode_worker:

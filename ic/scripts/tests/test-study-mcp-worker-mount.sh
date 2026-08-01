@@ -194,13 +194,6 @@ if grep -q 'LW2STUDYMCP_ALLOW_WRITE' "$opencode_unit"; then
   exit 1
 fi
 
-render_worker_quadlet test nanocode 8443
-nanocode_unit="$(tenant_quadlet_dir test)/lunarwing-nanocode-test.container"
-if grep -q 'LW2STUDYMCP\|/opt/lw2studymcp\|/var/lib/lw2studymcp\|UserNS=keep-id' "$nanocode_unit"; then
-  printf 'Study Notes mount leaked into nanocode quadlet\n' >&2
-  exit 1
-fi
-
 # Disabling core writes retains latest state for worker reads.
 configure_study_mcp test "$study_home" false
 grep -Fqx "LW2STUDYMCP_STATE_HOME=$study_state" "$(tenant_env_dir test)/lunarwing.env"

@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use secrecy::{ExposeSecret, SecretString};
+
 use crate::secrets::SecretsStore;
 use crate::tools::ToolError;
 use crate::tools::mcp::config::{
@@ -35,6 +37,12 @@ pub async fn create_client_from_config(
     user_id: &str,
 ) -> Result<McpClient, McpFactoryError> {
     let server_name = server.name.clone();
+    server
+        .validate()
+        .map_err(|error| McpFactoryError::InvalidConfig {
+            name: server_name.clone(),
+            reason: error.to_string(),
+        })?;
     validate_managed_study_notes_runtime(&server).map_err(|error| {
         McpFactoryError::InvalidConfig {
             name: server_name.clone(),
@@ -43,9 +51,25 @@ pub async fn create_client_from_config(
     })?;
 
     match server.effective_transport() {
-        EffectiveTransport::Stdio { command, args, env } => {
+        EffectiveTransport::Stdio {
+            command,
+            args,
+            env,
+            env_secrets,
+        } => {
+            let resolved_env =
+                resolve_stdio_env(&server_name, env, env_secrets, secrets.as_deref(), user_id)
+                    .await?;
             let transport = process_manager
-                .spawn_stdio(&server_name, command, args.to_vec(), env.clone())
+                .spawn_stdio(
+                    &server_name,
+                    command,
+                    args.to_vec(),
+                    resolved_env
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.expose_secret())),
+                    !env_secrets.is_empty(),
+                )
                 .await
                 .map_err(|e| McpFactoryError::StdioSpawn {
                     name: server_name.clone(),
@@ -124,6 +148,48 @@ pub async fn create_client_from_config(
     }
 }
 
+/// Resolve configured values and owner-scoped secret references for one spawn.
+/// Resolver-owned secret strings are zeroized when client creation finishes.
+async fn resolve_stdio_env(
+    server_name: &str,
+    env: &std::collections::HashMap<String, String>,
+    env_secrets: &std::collections::HashMap<String, String>,
+    secrets: Option<&(dyn SecretsStore + Send + Sync)>,
+    user_id: &str,
+) -> Result<Vec<(String, SecretString)>, McpFactoryError> {
+    let mut resolved = env
+        .iter()
+        .map(|(name, value)| (name.clone(), SecretString::from(value.clone())))
+        .collect::<Vec<_>>();
+
+    if env_secrets.is_empty() {
+        return Ok(resolved);
+    }
+
+    let secrets = secrets.ok_or_else(|| McpFactoryError::InvalidConfig {
+        name: server_name.to_string(),
+        reason: "secret environment references require an available secrets store".to_string(),
+    })?;
+
+    for (env_name, secret_name) in env_secrets {
+        let secret = secrets
+            .get_decrypted(user_id, secret_name)
+            .await
+            .map_err(|error| McpFactoryError::InvalidConfig {
+                name: server_name.to_string(),
+                reason: format!(
+                    "failed to resolve secret '{secret_name}' for environment variable '{env_name}': {error}"
+                ),
+            })?;
+        resolved.push((
+            env_name.clone(),
+            SecretString::from(secret.expose().to_string()),
+        ));
+    }
+
+    Ok(resolved)
+}
+
 /// Release all runtime state associated with an MCP client.
 pub(crate) async fn shutdown_client_runtime(
     server_name: &str,
@@ -157,6 +223,73 @@ pub(crate) async fn shutdown_client_runtime(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn test_secrets_store() -> Arc<crate::secrets::InMemorySecretsStore> {
+        let key = secrecy::SecretString::from(crate::secrets::keychain::generate_master_key_hex());
+        let crypto = Arc::new(crate::secrets::SecretsCrypto::new(key).expect("test crypto"));
+        Arc::new(crate::secrets::InMemorySecretsStore::new(crypto))
+    }
+
+    #[tokio::test]
+    async fn resolves_owner_scoped_stdio_secret_environment() {
+        let store = test_secrets_store();
+        store
+            .create(
+                "owner-a",
+                crate::secrets::CreateSecretParams::new("api_token", "secret-value"),
+            )
+            .await
+            .expect("create secret");
+
+        let env = std::collections::HashMap::from([("LOG_LEVEL".to_string(), "warn".to_string())]);
+        let refs =
+            std::collections::HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]);
+        let resolved = resolve_stdio_env("server", &env, &refs, Some(store.as_ref()), "owner-a")
+            .await
+            .expect("resolve secret environment");
+
+        let resolved = resolved
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.expose_secret()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(resolved.get("LOG_LEVEL"), Some(&"warn"));
+        assert_eq!(resolved.get("API_TOKEN"), Some(&"secret-value"));
+    }
+
+    #[tokio::test]
+    async fn stdio_secret_environment_fails_closed() {
+        let refs =
+            std::collections::HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]);
+        let no_store = resolve_stdio_env(
+            "server",
+            &std::collections::HashMap::new(),
+            &refs,
+            None,
+            "owner-a",
+        )
+        .await
+        .expect_err("missing store must fail");
+        assert!(no_store.to_string().contains("secrets store"));
+
+        let store = test_secrets_store();
+        store
+            .create(
+                "owner-a",
+                crate::secrets::CreateSecretParams::new("api_token", "owner-a-value"),
+            )
+            .await
+            .expect("create owner-a secret");
+        let wrong_owner = resolve_stdio_env(
+            "server",
+            &std::collections::HashMap::new(),
+            &refs,
+            Some(store.as_ref()),
+            "owner-b",
+        )
+        .await
+        .expect_err("missing owner secret must fail");
+        assert!(wrong_owner.to_string().contains("api_token"));
+    }
 
     #[tokio::test]
     async fn test_factory_non_oauth_http_has_session_manager() {

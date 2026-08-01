@@ -23,7 +23,7 @@ and how to enable it.
 
 | | **Worker mode** (Option 1) | **`ssh` / `ssh_git` tools** (Option 2) | **WASM `ssh` tool** (Option 3) |
 |---|---|---|---|
-| How the agent invokes it | `create_job(mode="nanocode"/"pebble"/"opencode"…)` with SSH commands | the `ssh` / `ssh_git` built-in tools | the `ssh` WASM tool |
+| How the agent invokes it | `create_job(mode="pebble"/"opencode"/"kimi"…)` with SSH commands | the `ssh` / `ssh_git` built-in tools | the `ssh` WASM tool |
 | Runs where | worker **container** | **gateway process** (in-process) | gateway process (host fn) |
 | Transport | worker's own `git`/`ssh` via `SSH_AUTH_SOCK` | `ssh`: in-process russh; `ssh_git`: shell-out `git` | host fn reuses the in-process russh client |
 | Isolation of the SSH op | **High** (container) | Low (gateway process) | Low (russh runs host-side) |
@@ -46,7 +46,7 @@ and how to enable it.
 ## Mechanism 1 — Worker mode (Option 1)
 
 **What it is.** The agent creates a background job on an external worker
-(nanocode/pebble/opencode) with `create_job(mode="nanocode", …)`. The worker
+(pebble/opencode/kimi) with `create_job(mode="opencode", …)`. The worker
 container has the harness's ssh-agent socket bind-mounted and `SSH_AUTH_SOCK`
 set, so ordinary `git`/`ssh` inside the container authenticate through the
 daemon's agent. Keys stay in the daemon; the worker only gets signing capability
@@ -68,9 +68,9 @@ in this path). Keys never enter the container.
 benefits from container isolation and the worker's toolchain. The cost is
 container spin-up latency and resource use.
 
-**Agent usage.** `create_job(title, description, mode="nanocode")` with a
+**Agent usage.** `create_job(title, description, mode="opencode")` with a
 description that runs the git/ssh commands. See the worker docs
-(`docs/ops/WORKER-CONTAINERS.md`, `NANOCODE-MULTITENANT.md`).
+(`docs/ops/WORKER-CONTAINERS.md`).
 
 ---
 
