@@ -24,6 +24,16 @@ variables:
   PYTHONDONTWRITEBYTECODE: "1"
   CI_LINT_RUNNER_TAG: lint
   CI_RUST_RUNNER_TAG: rust-x86_64
+  # Job base images, digest-pinned on Docker Hub. When Docker Hub's anonymous
+  # pull rate limit (100 pulls/6h per egress IPv4) is exhausted, jobs die
+  # before tests run with `toomanyrequests` on image pull — see the
+  # "Docker Hub pull rate limits" section of .gitlab/README.md. To ride out
+  # an exhausted quota without a repo change, mirror these images into the
+  # project container registry (same digests; they are content-addressed) and
+  # override any of these variables at project/group level.
+  CI_LINT_IMAGE: "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
+  CI_RUST_IMAGE: "docker.io/library/rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663"
+  CI_GITLEAKS_IMAGE: "docker.io/zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
   # sccache: shared compile-artifact cache across the Rust jobs (installed by
   # bootstrap-sccache.sh; nothing required on the runner host). The 80G value
   # is only the eviction cap — actual usage tracks what the workspace needs.
@@ -34,7 +44,7 @@ variables:
 
 .lint-job:
   image:
-    name: "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
+    name: "$CI_LINT_IMAGE"
   tags:
     - "$CI_LINT_RUNNER_TAG"
 
@@ -58,7 +68,7 @@ variables:
 
 .rust-job:
   image:
-    name: "docker.io/library/rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663"
+    name: "$CI_RUST_IMAGE"
 
   tags:
     - "$CI_RUST_RUNNER_TAG"
@@ -90,7 +100,7 @@ variables:
 # rust-toolchain.toml is moved aside so rustup selects the image rustc.
 .rust-msrv-job:
   image:
-    name: "docker.io/library/rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663"
+    name: "$CI_RUST_IMAGE"
   tags:
     - "$CI_RUST_RUNNER_TAG"
   before_script:
@@ -115,7 +125,7 @@ variables:
 
 .gitleaks-job:
   image:
-    name: "docker.io/zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
+    name: "$CI_GITLEAKS_IMAGE"
     entrypoint: [""]
   tags:
     - "$CI_LINT_RUNNER_TAG"
