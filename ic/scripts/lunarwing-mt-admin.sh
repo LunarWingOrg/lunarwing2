@@ -1577,19 +1577,34 @@ ports_allocate() {
 ports_enable_darkirc() {
   local name="$1"
   require_cmd jq
+  # ISSUE-012 (follow-up): registry read-modify-rename must run under the shared
+  # ports lock, same as ports_set_weechat. Reentrancy-safe: when called from
+  # ports_allocate() (which already holds the lock) acquire is a no-op and we
+  # must NOT release the caller's lock — only release if we acquired it here.
+  local had_lock="$PORTS_LOCK_HELD"
+  acquire_ports_lock
+  if ! jq -e ".tenants[\"$name\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
   local current
   current="$(jq -r ".tenants[\"$name\"].enable_darkirc // false" "$PORTS_REGISTRY" 2>/dev/null || true)"
-  [[ "$current" == "true" ]] && return 0
+  if [[ "$current" == "true" ]]; then
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    return 0
+  fi
 
   local tmp
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
   if ! jq --arg name "$name" '.tenants[$name].enable_darkirc = true' \
       "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
     rm -f "$tmp"
+    [[ "$had_lock" == "true" ]] || release_ports_lock
     die "failed to enable darkirc flag for tenant '$name'"
   fi
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
+  [[ "$had_lock" == "true" ]] || release_ports_lock
   say "darkirc for tenant '$name': disabled -> enabled" >&2
 }
 
@@ -1598,19 +1613,32 @@ ports_enable_darkirc() {
 ports_enable_proxy() {
   local name="$1"
   require_cmd jq
+  # ISSUE-012 (follow-up): same locked read-modify-rename pattern as
+  # ports_enable_darkirc — see comment there for the reentrancy contract.
+  local had_lock="$PORTS_LOCK_HELD"
+  acquire_ports_lock
+  if ! jq -e ".tenants[\"$name\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
   local current
   current="$(jq -r ".tenants[\"$name\"].enable_proxy // false" "$PORTS_REGISTRY" 2>/dev/null || true)"
-  [[ "$current" == "true" ]] && return 0
+  if [[ "$current" == "true" ]]; then
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    return 0
+  fi
 
   local tmp
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
   if ! jq --arg name "$name" '.tenants[$name].enable_proxy = true' \
       "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
     rm -f "$tmp"
+    [[ "$had_lock" == "true" ]] || release_ports_lock
     die "failed to enable proxy flag for tenant '$name'"
   fi
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
+  [[ "$had_lock" == "true" ]] || release_ports_lock
   say "proxy for tenant '$name': disabled -> enabled" >&2
 }
 
@@ -1674,9 +1702,20 @@ ports_enable_worker() {
     nanocode|pebble|opencode|kimi) ;;
     *) die "ports_enable_worker: unknown worker '$worker'" ;;
   esac
+  # ISSUE-012 (follow-up): same locked read-modify-rename pattern as
+  # ports_enable_darkirc — see comment there for the reentrancy contract.
+  local had_lock="$PORTS_LOCK_HELD"
+  acquire_ports_lock
+  if ! jq -e ".tenants[\"$name\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
   local current
   current="$(jq -r ".tenants[\"$name\"].workers[\"$worker\"] // false" "$PORTS_REGISTRY" 2>/dev/null || true)"
-  [[ "$current" == "true" ]] && return 0
+  if [[ "$current" == "true" ]]; then
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    return 0
+  fi
 
   local tmp
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
@@ -1684,10 +1723,12 @@ ports_enable_worker() {
       .tenants[$name].workers = ((.tenants[$name].workers // {}) + { ($w): true })
     ' "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
     rm -f "$tmp"
+    [[ "$had_lock" == "true" ]] || release_ports_lock
     die "failed to enable worker '$worker' for tenant '$name'"
   fi
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
+  [[ "$had_lock" == "true" ]] || release_ports_lock
   say "worker '$worker' for tenant '$name': disabled -> enabled" >&2
 }
 
