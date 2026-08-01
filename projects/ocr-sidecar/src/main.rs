@@ -2003,7 +2003,7 @@ mod tests {
 
     #[test]
     fn bearer_token_eq_compares_exactly() {
-        let token = "0123456789abcdef0123456789abcdef";
+        let token = "0123456789abcdef0123456789abcdef"; // gitleaks:allow
         assert!(bearer_token_eq(token, token));
         // Same length, one byte different.
         assert!(!bearer_token_eq("0123456789abcdef0123456789abcdee", token));

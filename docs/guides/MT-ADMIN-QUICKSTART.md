@@ -268,7 +268,7 @@ Verify the relay is running inside WeeChat:
 From the host machine, confirm WeeChat's relay is reachable:
 
 ```bash
-curl -u "plain:your-relay-password" http://127.0.0.1:10005/api/version
+curl -u "plain:your-relay-password" http://127.0.0.1:10005/api/version # gitleaks:allow
 ```
 
 You should see WeeChat version info in JSON. If you get a connection refused

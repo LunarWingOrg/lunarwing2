@@ -423,7 +423,7 @@ class DemoProvisionIntegrationTests(unittest.TestCase):
         from .models import SecretRequest
 
         job = Job(id="test3", mode="secrets", demo=True)
-        secret_value = "sup3r-s3cret-v4lue-xyz"
+        secret_value = "sup3r-s3cret-v4lue-xyz"  # gitleaks:allow
         self.runner.run_secret_job(
             job, SecretRequest(tenant="sphinx", name="gotify_app_token", value=secret_value), log_dir=self.tmp
         )
