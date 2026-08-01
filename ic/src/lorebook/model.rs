@@ -159,22 +159,35 @@ impl RawLorebookEntry {
         if self.content.len() > MAX_ENTRY_CONTENT_BYTES {
             return Err("content exceeds byte limit");
         }
-        if self
-            .name
-            .as_ref()
-            .is_some_and(|name| name.len() > MAX_NAME_BYTES)
-        {
-            return Err("name exceeds byte limit");
-        }
-
-        let keys = validate_keys(self.keys)?;
-        let secondary_keys = validate_keys(self.secondary_keys)?;
-        if self
-            .scan_depth
-            .is_some_and(|depth| depth > MAX_ENTRY_SCAN_DEPTH)
-        {
-            return Err("scanDepth exceeds limit");
-        }
+        let name = self.name.and_then(|name| {
+            if name.trim().is_empty() {
+                None
+            } else if name.len() > MAX_NAME_BYTES {
+                tracing::warn!(
+                    path = source_path,
+                    entry = %entry_id,
+                    limit = MAX_NAME_BYTES,
+                    "Discarding oversized lorebook entry name"
+                );
+                None
+            } else {
+                Some(name)
+            }
+        });
+        let keys = clean_keys(source_path, &entry_id, "primary", self.keys);
+        let secondary_keys = clean_keys(source_path, &entry_id, "secondary", self.secondary_keys);
+        let scan_depth = self.scan_depth.map(|depth| {
+            if depth > MAX_ENTRY_SCAN_DEPTH {
+                tracing::warn!(
+                    path = source_path,
+                    entry = %entry_id,
+                    requested = depth,
+                    limit = MAX_ENTRY_SCAN_DEPTH,
+                    "Clamping lorebook entry scanDepth"
+                );
+            }
+            depth.min(MAX_ENTRY_SCAN_DEPTH)
+        });
         let probability = match (self.use_probability, self.probability) {
             (Some(false), _) => 100.0,
             (_, Some(value)) => value.clamp(0.0, 100.0),
@@ -185,7 +198,7 @@ impl RawLorebookEntry {
             source_path: source_path.to_string(),
             entry_id,
             source_index,
-            name: self.name.filter(|name| !name.trim().is_empty()),
+            name,
             keys,
             secondary_keys,
             content: self.content,
@@ -197,30 +210,49 @@ impl RawLorebookEntry {
             probability,
             case_sensitive: self.case_sensitive,
             match_whole_words: self.match_whole_words,
-            scan_depth: self.scan_depth,
+            scan_depth,
         }))
     }
 }
 
-fn validate_keys(keys: StringList) -> Result<Vec<String>, &'static str> {
-    let keys = keys.into_vec();
-    if keys.len() > MAX_KEYS_PER_ENTRY {
-        return Err("key count exceeds limit");
-    }
-    let mut validated = Vec::with_capacity(keys.len());
-    for key in keys {
+fn clean_keys(source_path: &str, entry_id: &str, field: &str, keys: StringList) -> Vec<String> {
+    let mut cleaned = Vec::new();
+    let mut empty = 0usize;
+    let mut oversized = 0usize;
+    let mut regex = 0usize;
+    let mut excess = 0usize;
+    for key in keys.into_vec() {
         if key.trim().is_empty() {
+            empty += 1;
             continue;
         }
         if key.len() > MAX_KEY_BYTES {
-            return Err("key exceeds byte limit");
+            oversized += 1;
+            continue;
         }
         if looks_like_javascript_regex(&key) {
-            return Err("JavaScript regex keys are unsupported");
+            regex += 1;
+            continue;
         }
-        validated.push(key);
+        if cleaned.len() == MAX_KEYS_PER_ENTRY {
+            excess += 1;
+            continue;
+        }
+        cleaned.push(key);
     }
-    Ok(validated)
+    if empty + oversized + regex + excess > 0 {
+        tracing::warn!(
+            path = source_path,
+            entry = %entry_id,
+            field,
+            dropped_empty = empty,
+            dropped_oversized = oversized,
+            dropped_regex = regex,
+            dropped_excess = excess,
+            "Discarding invalid or excess lorebook keys"
+        );
+    }
+    cleaned
 }
 
 fn looks_like_javascript_regex(key: &str) -> bool {
@@ -366,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_regex_entries_do_not_drop_valid_siblings() {
+    fn malformed_entries_do_not_drop_salvageable_siblings() {
         let json = r#"{"entries":{
             "0":{"content":"valid","constant":true},
             "1":{"content":"bad","key":42},
@@ -377,7 +409,40 @@ mod tests {
         }}"#;
         let entries = parse_lorebook("lorebooks/mixed.json", json).expect("outer parse");
         let contents: Vec<_> = entries.iter().map(|entry| entry.content.as_str()).collect();
-        assert_eq!(contents, vec!["valid", "also valid"]);
+        assert_eq!(contents, vec!["valid", "regex", "deep scan", "also valid"]);
+        assert!(entries[1].keys.is_empty());
+        assert_eq!(entries[2].scan_depth, Some(MAX_ENTRY_SCAN_DEPTH));
+    }
+
+    #[test]
+    fn salvages_optional_fields_and_truncates_valid_keys() {
+        let mut keys = vec![
+            serde_json::json!(""),
+            serde_json::json!("k".repeat(MAX_KEY_BYTES + 1)),
+            serde_json::json!("/dragon/i"),
+            serde_json::json!("good"),
+        ];
+        keys.extend((0..70).map(|index| serde_json::json!(format!("key-{index:02}"))));
+        let json = serde_json::json!({
+            "entries": [{
+                "name": "n".repeat(MAX_NAME_BYTES + 1),
+                "keys": keys,
+                "secondary_keys": ["", "s".repeat(MAX_KEY_BYTES + 1), "/fire/i", "fire"],
+                "content": "salvaged",
+                "scanDepth": MAX_ENTRY_SCAN_DEPTH + 50
+            }]
+        });
+
+        let entries = parse_lorebook("lorebooks/salvage.json", &json.to_string()).expect("parse");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.content, "salvaged");
+        assert!(entry.name.is_none());
+        assert_eq!(entry.keys.len(), MAX_KEYS_PER_ENTRY);
+        assert_eq!(entry.keys.first().map(String::as_str), Some("good"));
+        assert_eq!(entry.keys.last().map(String::as_str), Some("key-62"));
+        assert_eq!(entry.secondary_keys, vec!["fire"]);
+        assert_eq!(entry.scan_depth, Some(MAX_ENTRY_SCAN_DEPTH));
     }
 
     #[test]

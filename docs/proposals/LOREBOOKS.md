@@ -104,9 +104,12 @@ Hard runtime bounds:
   haystack bytes, and 128 KiB rendered output.
 - Token budget includes header, labels, wrappers, escaped content, and separators.
 
-Malformed or unsupported individual entries are skipped with warnings so valid
-legacy siblings can load. Invalid outer JSON or shape rejects the complete
-public write.
+Import is tolerant for optional metadata. Oversized names are discarded;
+empty, oversized, and JavaScript-regex keys are discarded individually; excess
+valid keys are truncated; and oversized per-entry `scanDepth` is clamped to
+`100`. Essential content violations, malformed entry shapes, and unknown
+`selectiveLogic` values still skip that entry. Invalid outer JSON or shape
+rejects the complete public write.
 
 ## Deferred SillyTavern Parity
 
@@ -114,6 +117,6 @@ V1 intentionally does not implement insertion positions/roles (`@depth`,
 before/after character, Author's Note, example messages, outlets), recursion,
 vector matching, groups and group scoring, sticky/cooldown/delay, macros,
 character/persona filters, additional matching sources, or global matching
-fallback settings. JavaScript regex keys are rejected instead of being treated
+fallback settings. JavaScript regex keys are discarded instead of being treated
 as plaintext. A dedicated management UI/tool and tokenizer-aware remaining-
 context budget are also deferred.
