@@ -339,7 +339,7 @@ sudo lunarwing-mt-admin.sh restart-worker <tenant> opencode
 sudo lunarwing-mt-admin.sh kill-worker <tenant> opencode
 ```
 
-The same commands accept `nanocode` and `pebble`. Running `podman stop` as root
+The same commands accept `nanocode`, `pebble`, and `kimi`. Running `podman stop` as root
 targets root's unrelated store and runtime directory (`/run/user/0/libpod`), not
 the tenant container. Do not use raw root Podman for tenant workers.
 
@@ -366,6 +366,7 @@ lunarwing-pg-<tenant>.service               # Postgres (rootless Quadlet)
 lunarwing-nanocode-<tenant>.service         # nanocode worker (rootless Quadlet)
 lunarwing-pebble-<tenant>.service           # pebble worker (rootless Quadlet)
 lunarwing-opencode-<tenant>.service         # opencode worker (rootless Quadlet)
+lunarwing-kimi-<tenant>.service             # kimi worker (rootless Quadlet)
 ```
 
 There is no per-tenant `.target`; restart units individually, or use
@@ -382,7 +383,7 @@ sudo rc-service lunarwing-proxy-<tenant> restart            # TensorZero proxy
 sudo rc-service lunarwing-pg-<tenant> restart               # Postgres container
 sudo rc-service lunarwing-weechat-<tenant> restart          # weechat backend
 sudo rc-service lunarwing-weechat-adapter-<tenant> restart  # weechat WS adapter
-# workers (if provisioned): lunarwing-nanocode-<tenant>, lunarwing-pebble-<tenant>, lunarwing-opencode-<tenant>
+# workers (if provisioned): lunarwing-nanocode-<tenant>, lunarwing-pebble-<tenant>, lunarwing-opencode-<tenant>, lunarwing-kimi-<tenant>
 # each worker also has a <unit>-sup babysitter; stop it before stopping a container manually
 ```
 
@@ -442,7 +443,7 @@ Primary block:
 | +8 | Pebble WSS |
 | +9 | WeeChat adapter |
 
-Extended block (registry v6+; opencode_wss/health added in v11):
+Extended block (registry v6+; opencode_wss/health added in v11, coord_admin added in v13):
 
 | Offset | Service |
 |--------|---------|
@@ -450,3 +451,8 @@ Extended block (registry v6+; opencode_wss/health added in v11):
 | ebase+4 | pebble_health |
 | ebase+7 | opencode_wss |
 | ebase+8 | opencode_health |
+| ebase+9 | coord_admin |
+
+Kimi worker ports are separate (registry v12+): each tenant gets `kimi_wss` and
+`kimi_health` from a dedicated `kimi_range` (30000-39999), not from the primary
+or extended blocks.
