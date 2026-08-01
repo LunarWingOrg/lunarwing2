@@ -128,8 +128,18 @@ pub struct ReflexRouter {
     /// Fuzzy hit counter: normalized pattern → hit count.
     /// Promotes to exact cache when threshold is reached.
     fuzzy_hits: Arc<RwLock<HashMap<String, u32>>>,
+    /// Promoted input variants → canonical stored pattern.
+    ///
+    /// When a fuzzy variant is promoted into the exact cache, this map
+    /// remembers which stored pattern it came from so match bookkeeping
+    /// (e.g. `bump_reflex_pattern_match`) can target the canonical row.
+    promoted_variants: Arc<RwLock<HashMap<String, String>>>,
     /// Similarity threshold for fuzzy matching.
     fuzzy_threshold: f64,
+    /// How many fuzzy matches before a pattern is promoted to exact cache.
+    promotion_threshold: u32,
+    /// Maximum fuzzy candidates to evaluate per route call.
+    max_candidates: usize,
     /// Embedding provider for semantic matching (None = tier disabled).
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     /// Cosine similarity threshold for semantic matching.
@@ -141,10 +151,14 @@ pub struct ReflexRouter {
 impl ReflexRouter {
     /// Create a new empty reflex router with the default threshold.
     pub fn new() -> Self {
+        let fuzzy = FuzzyConfig::default();
         Self {
             patterns: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_hits: Arc::new(RwLock::new(HashMap::new())),
-            fuzzy_threshold: DEFAULT_FUZZY_THRESHOLD,
+            promoted_variants: Arc::new(RwLock::new(HashMap::new())),
+            fuzzy_threshold: fuzzy.threshold,
+            promotion_threshold: fuzzy.promotion_threshold,
+            max_candidates: fuzzy.max_candidates,
             embedding_provider: None,
             semantic_threshold: DEFAULT_SEMANTIC_THRESHOLD,
             pattern_embeddings: Arc::new(RwLock::new(HashMap::new())),
@@ -156,7 +170,10 @@ impl ReflexRouter {
         Self {
             patterns: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_hits: Arc::new(RwLock::new(HashMap::new())),
+            promoted_variants: Arc::new(RwLock::new(HashMap::new())),
             fuzzy_threshold: threshold.clamp(0.0, 1.0),
+            promotion_threshold: PROMOTION_THRESHOLD,
+            max_candidates: MAX_FUZZY_CANDIDATES,
             embedding_provider: None,
             semantic_threshold: DEFAULT_SEMANTIC_THRESHOLD,
             pattern_embeddings: Arc::new(RwLock::new(HashMap::new())),
@@ -175,17 +192,41 @@ impl ReflexRouter {
         self
     }
 
+    /// Configure fuzzy matching parameters.
+    pub fn with_fuzzy_config(mut self, config: FuzzyConfig) -> Self {
+        self.fuzzy_threshold = config.threshold.clamp(0.0, 1.0);
+        self.promotion_threshold = config.promotion_threshold;
+        self.max_candidates = config.max_candidates;
+        self
+    }
+
     /// Try to route a user input to a compiled reflex tool.
     ///
     /// First tries exact match (O(1)), then falls back to fuzzy
     /// matching against all known patterns.
     pub async fn try_route(&self, input: &str) -> Option<String> {
+        self.try_route_match(input).await.map(|m| m.tool_name)
+    }
+
+    /// Like [`try_route`](Self::try_route), but also reports which stored
+    /// pattern matched (`matched_pattern`), so callers can attribute the hit
+    /// to the canonical database row even for fuzzy/semantic/promoted hits.
+    pub async fn try_route_match(&self, input: &str) -> Option<FuzzyMatch> {
         let normalized = normalize_pattern(input);
         let patterns = self.patterns.read().await;
 
         // 1. Exact match — fast path
         if let Some(tool) = patterns.get(&normalized) {
-            return Some(tool.clone());
+            // A promoted fuzzy variant resolves to its canonical pattern.
+            let canonical = {
+                let promoted = self.promoted_variants.read().await;
+                promoted.get(&normalized).cloned().unwrap_or(normalized)
+            };
+            return Some(FuzzyMatch {
+                tool_name: tool.clone(),
+                matched_pattern: canonical,
+                score: 1.0,
+            });
         }
 
         // 2. Fuzzy fallback — only if we have patterns to check
@@ -196,22 +237,22 @@ impl ReflexRouter {
         // Drop the read lock so we can use fuzzy_hits
         drop(patterns);
 
-        if let Some(tool) = self.fuzzy_route(&normalized).await {
-            return Some(tool);
+        if let Some(m) = self.fuzzy_route(&normalized).await {
+            return Some(m);
         }
 
         // 3. Semantic fallback — only if embedding provider is set
         if self.embedding_provider.is_some()
-            && let Some(tool) = self.semantic_route(&normalized).await
+            && let Some(m) = self.semantic_route(&normalized).await
         {
-            return Some(tool);
+            return Some(m);
         }
 
         None
     }
 
     /// Fuzzy fallback: scan all patterns for similarity.
-    async fn fuzzy_route(&self, normalized: &str) -> Option<String> {
+    async fn fuzzy_route(&self, normalized: &str) -> Option<FuzzyMatch> {
         let patterns = self.patterns.read().await;
 
         // Pre-filter: only consider patterns that share at least
@@ -259,7 +300,7 @@ impl ReflexRouter {
             }
 
             // Cap the scan to avoid pathological cases
-            if candidates.len() >= MAX_FUZZY_CANDIDATES {
+            if candidates.len() >= self.max_candidates {
                 break;
             }
         }
@@ -276,7 +317,8 @@ impl ReflexRouter {
                 // Track fuzzy hit for auto-promotion.
                 // We pass the user's normalized input so that specific variant
                 // can be promoted to the exact-match fast path.
-                self.bump_fuzzy_hit(normalized, tool_name).await;
+                self.bump_fuzzy_hit(normalized, tool_name, &best_pattern)
+                    .await;
 
                 tracing::debug!(
                     "Reflex fuzzy match: '{}' ≈ '{}' (score: {:.3})",
@@ -286,7 +328,11 @@ impl ReflexRouter {
                 );
             }
 
-            return tool;
+            return tool.map(|tool_name| FuzzyMatch {
+                tool_name,
+                matched_pattern: best_pattern,
+                score,
+            });
         }
 
         drop(patterns);
@@ -294,7 +340,7 @@ impl ReflexRouter {
     }
 
     /// Semantic fallback: embed the query and compare against cached pattern embeddings.
-    async fn semantic_route(&self, normalized: &str) -> Option<String> {
+    async fn semantic_route(&self, normalized: &str) -> Option<FuzzyMatch> {
         let provider = self.embedding_provider.as_ref()?;
         let query_embedding = match provider.embed(normalized).await {
             Ok(emb) => emb,
@@ -304,32 +350,42 @@ impl ReflexRouter {
             }
         };
 
-        let embeddings = self.pattern_embeddings.read().await;
-        if embeddings.is_empty() {
-            return None;
-        }
-
-        let mut best_pattern: Option<&str> = None;
-        let mut best_score: f64 = 0.0;
-
-        for (pattern, emb) in embeddings.iter() {
-            let score = cosine_similarity(&query_embedding, emb);
-            if score > best_score {
-                best_score = score;
-                best_pattern = Some(pattern);
+        // Scope the embeddings read guard: `refresh()` acquires
+        // patterns.write → embeddings.write, so holding embeddings while
+        // acquiring patterns would invert the lock order and could deadlock.
+        let (best_pattern, best_score) = {
+            let embeddings = self.pattern_embeddings.read().await;
+            if embeddings.is_empty() {
+                return None;
             }
-        }
+
+            let mut best_pattern: Option<String> = None;
+            let mut best_score: f64 = 0.0;
+
+            for (pattern, emb) in embeddings.iter() {
+                let score = cosine_similarity(&query_embedding, emb);
+                if score > best_score {
+                    best_score = score;
+                    best_pattern = Some(pattern.clone());
+                }
+            }
+            (best_pattern, best_score)
+        };
 
         if best_score >= self.semantic_threshold {
             let patterns = self.patterns.read().await;
-            if let Some(tool) = best_pattern.and_then(|p| patterns.get(p).cloned()) {
+            if let Some(tool) = best_pattern.as_ref().and_then(|p| patterns.get(p).cloned()) {
                 tracing::debug!(
                     "Reflex semantic match: '{}' ≈ '{}' (cosine: {:.3})",
                     normalized,
-                    best_pattern.unwrap_or("?"),
+                    best_pattern.as_deref().unwrap_or("?"),
                     best_score
                 );
-                return Some(tool);
+                return Some(FuzzyMatch {
+                    tool_name: tool,
+                    matched_pattern: best_pattern.unwrap_or_default(),
+                    score: best_score,
+                });
             }
         }
 
@@ -338,17 +394,23 @@ impl ReflexRouter {
 
     /// Bump the fuzzy hit counter for a specific input variant and promote
     /// to the exact-match cache if the promotion threshold is reached.
-    async fn bump_fuzzy_hit(&self, normalized_input: &str, tool_name: &str) {
+    async fn bump_fuzzy_hit(&self, normalized_input: &str, tool_name: &str, canonical: &str) {
         let mut hits = self.fuzzy_hits.write().await;
         let count = hits.entry(normalized_input.to_string()).or_insert(0);
         *count += 1;
 
-        if *count >= PROMOTION_THRESHOLD {
+        if *count >= self.promotion_threshold {
             // Promote: insert this specific input variant into the exact-match cache
             // so subsequent calls are O(1) instead of fuzzy.
             let mut patterns = self.patterns.write().await;
             patterns.insert(normalized_input.to_string(), tool_name.to_string());
             drop(patterns);
+
+            // Remember the canonical pattern so match bookkeeping targets the
+            // stored database row, not the promoted input variant.
+            let mut promoted = self.promoted_variants.write().await;
+            promoted.insert(normalized_input.to_string(), canonical.to_string());
+            drop(promoted);
 
             tracing::info!(
                 "Reflex variant '{}' promoted to fast path for tool '{}' ({} fuzzy hits)",
@@ -396,7 +458,7 @@ impl ReflexRouter {
                     score,
                 });
             }
-            if candidates.len() >= MAX_FUZZY_CANDIDATES {
+            if candidates.len() >= self.max_candidates {
                 break;
             }
         }
@@ -409,6 +471,11 @@ impl ReflexRouter {
             return Some(best);
         }
 
+        // Release the fuzzy-scan read guard before the semantic fallback —
+        // re-acquiring patterns below while this guard is alive could
+        // self-deadlock if a writer (refresh) queues in between.
+        drop(patterns);
+
         // 3. Semantic fallback
         if let Some(provider) = self.embedding_provider.as_ref() {
             let query_embedding = match provider.embed(&normalized).await {
@@ -419,21 +486,27 @@ impl ReflexRouter {
                 }
             };
 
-            let embeddings = self.pattern_embeddings.read().await;
-            if embeddings.is_empty() {
-                return None;
-            }
-
-            let mut best_pattern: Option<String> = None;
-            let mut best_score: f64 = 0.0;
-
-            for (pattern, emb) in embeddings.iter() {
-                let score = cosine_similarity(&query_embedding, emb);
-                if score > best_score {
-                    best_score = score;
-                    best_pattern = Some(pattern.clone());
+            // Scope the embeddings read guard (see semantic_route: refresh()
+            // takes patterns.write → embeddings.write, so the inverse order
+            // here would risk an ABBA deadlock).
+            let (best_pattern, best_score) = {
+                let embeddings = self.pattern_embeddings.read().await;
+                if embeddings.is_empty() {
+                    return None;
                 }
-            }
+
+                let mut best_pattern: Option<String> = None;
+                let mut best_score: f64 = 0.0;
+
+                for (pattern, emb) in embeddings.iter() {
+                    let score = cosine_similarity(&query_embedding, emb);
+                    if score > best_score {
+                        best_score = score;
+                        best_pattern = Some(pattern.clone());
+                    }
+                }
+                (best_pattern, best_score)
+            };
 
             if best_score >= self.semantic_threshold {
                 let patterns = self.patterns.read().await;
@@ -456,8 +529,11 @@ impl ReflexRouter {
             Ok(records) => {
                 let mut patterns = self.patterns.write().await;
                 let mut embeddings = self.pattern_embeddings.write().await;
+                let mut promoted = self.promoted_variants.write().await;
                 patterns.clear();
                 embeddings.clear();
+                promoted.clear();
+                drop(promoted);
                 for record in &records {
                     if record.status == "active" {
                         patterns
@@ -606,9 +682,11 @@ impl Default for FuzzyConfig {
 pub struct ReflexCompiler {
     builder: Arc<dyn SoftwareBuilder>,
     store: Arc<dyn Database>,
+    user_id: String,
     check_interval: Duration,
     min_match_count: u32,
     max_patterns_per_run: usize,
+    max_patterns_per_user: usize,
 }
 
 impl ReflexCompiler {
@@ -616,16 +694,20 @@ impl ReflexCompiler {
     pub fn new(
         builder: Arc<dyn SoftwareBuilder>,
         store: Arc<dyn Database>,
+        user_id: String,
         check_interval: Duration,
         min_match_count: u32,
         max_patterns_per_run: usize,
+        max_patterns_per_user: usize,
     ) -> Self {
         Self {
             builder,
             store,
+            user_id,
             check_interval,
             min_match_count,
             max_patterns_per_run,
+            max_patterns_per_user,
         }
     }
 
@@ -649,6 +731,7 @@ impl ReflexCompiler {
         match self
             .store
             .find_recurring_job_patterns(
+                &self.user_id,
                 self.min_match_count as i32,
                 self.max_patterns_per_run as i32,
             )
@@ -669,13 +752,40 @@ impl ReflexCompiler {
     async fn compile_pattern(&self, description: &str) {
         let normalized = normalize_pattern(description);
 
-        // Check if already compiled
-        match self.store.get_reflex_pattern("default", &normalized).await {
-            Ok(Some((_, status))) if status == "active" => {
-                tracing::debug!("Reflex pattern already compiled: {}", normalized);
+        // Check if already compiled — active patterns are done, and disabled
+        // patterns stay disabled (user-deleted via CLI or auto-disabled after
+        // repeated build failures); 'failed' and 'evicted' rows fall through
+        // so they are retried.
+        match self
+            .store
+            .get_reflex_pattern(&self.user_id, &normalized)
+            .await
+        {
+            Ok(Some((_, status))) if status == "active" || status == "disabled" => {
+                tracing::debug!("Reflex pattern skipped (status {}): {}", status, normalized);
                 return;
             }
             _ => {}
+        }
+
+        // Enforce the per-user active pattern cap.
+        match self.store.list_reflex_patterns(&self.user_id).await {
+            Ok(existing) => {
+                let active = existing.iter().filter(|p| p.status == "active").count();
+                if active >= self.max_patterns_per_user {
+                    tracing::warn!(
+                        "Reflex pattern cap reached for user '{}' ({} active, max {}); skipping '{}'",
+                        self.user_id,
+                        active,
+                        self.max_patterns_per_user,
+                        normalized
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Failed to count reflex patterns for cap check: {}", e);
+            }
         }
 
         tracing::info!("Reflex compiler triggered for pattern: {}", description);
@@ -702,7 +812,7 @@ impl ReflexCompiler {
                     );
                     if let Err(e) = self
                         .store
-                        .upsert_reflex_pattern("default", &normalized, description, &safe_name)
+                        .upsert_reflex_pattern(&self.user_id, &normalized, description, &safe_name)
                         .await
                     {
                         tracing::warn!(
@@ -718,6 +828,19 @@ impl ReflexCompiler {
                         description,
                         result.error
                     );
+                    if let Err(e) = self
+                        .store
+                        .record_reflex_compilation_failure(
+                            &self.user_id,
+                            &normalized,
+                            description,
+                            &safe_name,
+                            3,
+                        )
+                        .await
+                    {
+                        tracing::debug!("Failed to record compilation failure: {}", e);
+                    }
                 }
             }
             Err(e) => {
@@ -744,6 +867,16 @@ impl Default for EvictionConfig {
         Self {
             check_interval: Duration::from_secs(24 * 60 * 60), // daily
             stale_after_days: 30,
+        }
+    }
+}
+
+impl EvictionConfig {
+    /// Create an `EvictionConfig` from reflex config values.
+    pub fn new(check_interval: Duration, stale_after_days: i32) -> Self {
+        Self {
+            check_interval,
+            stale_after_days,
         }
     }
 }
@@ -817,17 +950,21 @@ impl ReflexEvictor {
 pub fn spawn_reflex_compiler(
     builder: Arc<dyn SoftwareBuilder>,
     store: Arc<dyn Database>,
+    user_id: String,
     check_interval: Duration,
     min_match_count: u32,
     max_patterns_per_run: usize,
+    max_patterns_per_user: usize,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let compiler = ReflexCompiler::new(
             builder,
             store,
+            user_id,
             check_interval,
             min_match_count,
             max_patterns_per_run,
+            max_patterns_per_user,
         );
         compiler.run_loop().await;
     })
@@ -1138,6 +1275,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_try_route_match_reports_canonical_pattern() {
+        // Fuzzy hits must report the canonical stored pattern (for DB
+        // bookkeeping), and promotion must not lose that mapping.
+        let router = ReflexRouter::new();
+        router.register("summarize logs", "tool_summarize").await;
+
+        // Exact hit reports the pattern itself.
+        let m = router
+            .try_route_match("summarize logs")
+            .await
+            .expect("exact hit");
+        assert_eq!(m.matched_pattern, "summarize logs");
+
+        let variant = "summarize the logs please";
+
+        // Fuzzy hit (before promotion) reports the canonical pattern.
+        let m = router.try_route_match(variant).await.expect("fuzzy hit");
+        assert_eq!(m.tool_name, "tool_summarize");
+        assert_eq!(m.matched_pattern, "summarize logs");
+
+        // Drive the variant to promotion.
+        for _ in 1..PROMOTION_THRESHOLD {
+            router.try_route(variant).await;
+        }
+
+        // Promoted variant now hits the exact cache, but must still resolve
+        // to the canonical pattern.
+        let m = router.try_route_match(variant).await.expect("promoted hit");
+        assert_eq!(m.tool_name, "tool_summarize");
+        assert_eq!(
+            m.matched_pattern, "summarize logs",
+            "promoted variant should resolve to the canonical pattern"
+        );
+    }
+
     // ── FuzzyMatch details ──
 
     #[tokio::test]
@@ -1350,6 +1523,107 @@ mod tests {
 
         let patterns = backend.list_reflex_patterns("test-user").await.unwrap();
         assert_eq!(patterns[0].status, "disabled");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "libsql")]
+    async fn test_reflex_store_record_compilation_failure() {
+        use crate::db::libsql::LibSqlBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test_reflex_failure.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // First failure inserts a 'failed' row with attempts = 1.
+        backend
+            .record_reflex_compilation_failure(
+                "test-user",
+                "broken pattern",
+                "Broken pattern",
+                "reflex_aaa",
+                3,
+            )
+            .await
+            .unwrap();
+
+        let patterns = backend.list_reflex_patterns("test-user").await.unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].status, "failed");
+        assert_eq!(patterns[0].compilation_attempts, 1);
+        assert_eq!(patterns[0].match_count, 0);
+
+        // Second failure increments; still below the limit.
+        backend
+            .record_reflex_compilation_failure(
+                "test-user",
+                "broken pattern",
+                "Broken pattern",
+                "reflex_bbb",
+                3,
+            )
+            .await
+            .unwrap();
+        let patterns = backend.list_reflex_patterns("test-user").await.unwrap();
+        assert_eq!(patterns[0].status, "failed");
+        assert_eq!(patterns[0].compilation_attempts, 2);
+
+        // Third failure hits the limit and disables the pattern.
+        backend
+            .record_reflex_compilation_failure(
+                "test-user",
+                "broken pattern",
+                "Broken pattern",
+                "reflex_ccc",
+                3,
+            )
+            .await
+            .unwrap();
+        let patterns = backend.list_reflex_patterns("test-user").await.unwrap();
+        assert_eq!(patterns[0].status, "disabled");
+        assert_eq!(patterns[0].compilation_attempts, 3);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "libsql")]
+    async fn test_reflex_store_upsert_reactivates_failed_pattern() {
+        use crate::db::libsql::LibSqlBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test_reflex_reactivate.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // Two failed attempts, then a successful build upsert.
+        for name in ["reflex_aaa", "reflex_bbb"] {
+            backend
+                .record_reflex_compilation_failure(
+                    "test-user",
+                    "flaky pattern",
+                    "Flaky pattern",
+                    name,
+                    3,
+                )
+                .await
+                .unwrap();
+        }
+
+        backend
+            .upsert_reflex_pattern("test-user", "flaky pattern", "Flaky pattern", "reflex_good")
+            .await
+            .unwrap();
+
+        let patterns = backend.list_reflex_patterns("test-user").await.unwrap();
+        assert_eq!(patterns.len(), 1, "no duplicate rows");
+        assert_eq!(patterns[0].status, "active", "success reactivates");
+        assert_eq!(
+            patterns[0].tool_name, "reflex_good",
+            "success records the new tool name"
+        );
+        assert_eq!(
+            patterns[0].compilation_attempts, 0,
+            "success resets the failure counter"
+        );
     }
 
     #[tokio::test]
