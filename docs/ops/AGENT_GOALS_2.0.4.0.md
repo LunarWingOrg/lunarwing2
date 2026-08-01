@@ -29,7 +29,40 @@ Test Coverage — ✅ Comprehensive 9 E2E tests + 20+ unit tests covering: faile
 13. [x] implement tier 2 updates in docs/ops/CRATE_AUDIT_v2.0.3.0.md
 14. [ ] followup to number 12 - see previous attempt for reference aj/kimi-14-20260801-0601 - wtf does this mean? ERROR: Job failed: failed to pull image "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b" with specified policies [always]: Error response from daemon: toomanyrequests: You have reached your unauthenticated pull rate limit. https://www.docker.com/increase-rate-limit (manager.go:343:124s)
 15. [x] take look at Advisory Status (`deny.toml`) in docs/ops/CRATE_AUDIT_v2.0.3.0.md and install cargo-deny using rustup, cargo, then remove items marked as`now unblocked`
-16. [x] address p0 issues in docs/ops/GOAL_GAP_SUGGESTIONS.md
+16. [ ] fix issue detected in cargo-deny under securty stage in CI/CD - Processing triggers for libc-bin (2.36-9+deb12u14) ...
+bash .gitlab/scripts/bootstrap-sccache.sh
+bash .gitlab/scripts/install-cargo-deny.sh
+/tmp/tmp.QJnTx635RO/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz: OK
+cargo-deny 0.20.2
+PATH="$CI_PROJECT_DIR/.ci-bin:$PATH" bash .gitlab/scripts/cargo-ci.sh deny check
+info: syncing channel updates for 1.96.1-x86_64-unknown-linux-gnu
+info: latest update on 2026-06-30 for version 1.96.1 (31fca3adb 2026-06-26)
+info: downloading component clippy
+error[vulnerability]: Stores can mix up type indices between engines
+    ┌─ /builds/lunarwing/lunarwing2/ic/Cargo.lock:797:1
+    │
+797 │ wasmtime 36.0.12 registry+https://github.com/rust-lang/crates.io-index
+    │ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ security vulnerability detected
+    │
+    ├ ID: RUSTSEC-2026-0222
+    ├ Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0222
+    ├ This is an entry in the RustSec database for the Wasmtime security advisory
+      located at
+      https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-hgjw-h833-99q9
+      For more information see the GitHub-hosted security advisory.
+    ├ Announcement: https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-hgjw-h833-99q9
+    ├ Solution: Upgrade to >=24.0.12, <25.0.0 OR >=36.0.13, <37.0.0 OR >=46.0.2, <47.0.0 OR >=47.0.3 (try `cargo update -p wasmtime`)
+    ├ wasmtime v36.0.12
+      ├── lunarwing v2.0.4
+      ├── wasmtime-wasi v36.0.12
+      │   └── lunarwing v2.0.4 (*)
+      ├── wasmtime-wasi-io v36.0.12
+      │   └── wasmtime-wasi v36.0.12 (*)
+      └── wiggle v36.0.12
+          └── wasmtime-wasi v36.0.12 (*)
+advisories FAILED, bans ok, licenses ok, sources ok
+Cleaning up project directory and file based variables 00:02
+ERROR: Job failed: exit code 1
 17. [x] address 2. Priority findings in docs/ops/CICD_LOGIC_REVIEW.md
 18. [x] address p1 issues in docs/ops/GOAL_GAP_SUGGESTIONS.md
 19. [x] address 3. Parity gaps vs. the plan (Phase 1 scope) in docs/ops/CICD_LOGIC_REVIEW.md
