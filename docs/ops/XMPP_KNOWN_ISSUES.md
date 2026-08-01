@@ -18,4 +18,4 @@ Reconciled 2026-06-07.
   boundary and the `ALLOW_PRIVATE_IPS` model; a future phase can reuse
   `config/helpers.rs::validate_base_url`.
 - **OMEMO MUC fallback spam / rare stuck processing loop** — historically observed; appear resolved
-  (`docs/bugs/XMPP-OMEMO-BUG-TO-DO.md`). Reopen if they recur.
+  (`docs/bugs/history/XMPP-OMEMO-BUG-TO-DO.md`). Reopen if they recur.
