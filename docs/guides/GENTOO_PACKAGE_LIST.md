@@ -193,6 +193,9 @@ and a running network. These are assumed present and not listed above.
 ## Cross-reference
 
 - Arch Linux equivalent: [`ARCHLINUX_PACKAGE_LIST.md`](ARCHLINUX_PACKAGE_LIST.md)
+- Debian equivalent: [`DEBIAN_PACKAGE_LIST.md`](DEBIAN_PACKAGE_LIST.md)
+- Ubuntu equivalent: [`UBUNTU_PACKAGE_LIST.md`](UBUNTU_PACKAGE_LIST.md)
+- Fedora equivalent: [`FEDORA_PACKAGE_LIST.md`](FEDORA_PACKAGE_LIST.md)
 - Setup walkthrough: [`../ops/MT-GENTOO-SETUP-AND-CHANGES-MADE.md`](../ops/MT-GENTOO-SETUP-AND-CHANGES-MADE.md)
 - Admin quickstart: [`MT-ADMIN-QUICKSTART.md`](MT-ADMIN-QUICKSTART.md)
 - Production reference: [`../ops/MULTITENANCY-PRODUCTION.md`](../ops/MULTITENANCY-PRODUCTION.md)
