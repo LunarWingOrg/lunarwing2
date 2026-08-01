@@ -3018,7 +3018,8 @@ fn allow_private_attachment_ips() -> bool {
 async fn policy_checked_download_client(
     url: &str,
     allow_private: bool,
-) -> Result<reqwest::Client, String> {    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid attachment URL: {e}"))?;
+) -> Result<reqwest::Client, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid attachment URL: {e}"))?;
     match parsed.scheme() {
         "https" => {}
         "http" if allow_private => {}
@@ -3826,7 +3827,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), // cloud metadata
-            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),     // CGNAT
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),      // CGNAT
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             IpAddr::V4(Ipv4Addr::BROADCAST),
             IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
