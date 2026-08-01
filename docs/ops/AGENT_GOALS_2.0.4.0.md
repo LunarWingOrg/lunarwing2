@@ -47,7 +47,7 @@ Required first scope: make Phase 0/1 and Stage A correct before starting activat
 30. [ ] review darkirc key exchange implementation (only if completed)
 31. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs - prev attempt: rarity/kimi-31-20260801-0601
 32. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
-33. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs - see prev attempt for reference rarity/kimi-33-20260801-1203
+33. [ ] update any ops docs in docs/ops that may contain outdated information. verify against code rather than docs - see prev attempts for reference: rarity/kimi-33-20260801-1203 and rarity/kimi-33-20260801-0900
 34. [x] write up proper plan document in docs/proposals for integrating docs/proposals/MULTIAGENTTEAMORCHESTRATION into the next release, 2.0.4.0
 35. [ ] review work on reflex compiler
 36. [ ] update any proposals docs in docs/proposals that may contain outdated information. verify against code rather than docs
