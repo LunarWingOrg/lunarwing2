@@ -61,7 +61,11 @@ Completed safe slice:
   `ExtensionManager` level and must recreate/initialize the client, rediscover
   tools, replace wrappers atomically, publish accurate status, and honor lifecycle
   cancellation generations.
+- CLI removal now uses the authenticated gateway by default, routing through
+  `ExtensionManager` so active transports stop and owned tools unregister before
+  persisted configuration is deleted. Gateway unavailability fails closed;
+  explicit `--offline` permits persisted-only removal after the daemon is stopped.
 
 Still deferred: automatic package installation pending provenance/sandbox policy,
 safe automatic crash recovery, worker-local MCP, general runtime adapters, and MCP
-gateway integration.
+gateway integration beyond current lifecycle controls.

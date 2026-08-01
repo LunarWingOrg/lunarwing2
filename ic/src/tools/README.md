@@ -187,6 +187,20 @@ the next startup. Pass `--offline` to request that behavior explicitly. A custom
 `--url` also requires an explicit `--token`, so a stored gateway credential is
 never forwarded to an overridden origin.
 
+Removal also uses the authenticated gateway by default so `ExtensionManager` can
+stop the transport, unregister owned tools, and delete persisted configuration as
+one lifecycle operation:
+
+```bash
+lunarwing mcp remove local-files
+```
+
+Removal does not fall back to offline deletion if the gateway cannot be reached.
+Because a connection can fail after request delivery, inspect status before retrying.
+After stopping LunarWing, `lunarwing mcp remove local-files --offline` performs an
+explicit persisted-only removal. As with toggle, custom `--url` requires explicit
+`--token`.
+
 #### LunarWing Study Notes
 
 LunarWing can seed the shared [lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp)

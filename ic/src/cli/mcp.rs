@@ -116,6 +116,18 @@ pub enum McpCommand {
     Remove {
         /// Server name to remove
         name: String,
+
+        /// Gateway URL for stopping a running MCP server before removal
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Gateway auth token (required with --url; otherwise reads configuration or env)
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Remove persisted configuration without contacting the running gateway
+        #[arg(long)]
+        offline: bool,
     },
 
     /// List configured MCP servers
@@ -208,7 +220,12 @@ pub async fn run_mcp_command(
 ) -> anyhow::Result<()> {
     match cmd {
         McpCommand::Add(args) => add_server(*args, config_path, no_db).await,
-        McpCommand::Remove { name } => remove_server(name, config_path, no_db).await,
+        McpCommand::Remove {
+            name,
+            url,
+            token,
+            offline,
+        } => remove_server(name, url, token, offline, config_path, no_db).await,
         McpCommand::List { verbose } => list_servers(verbose, config_path, no_db).await,
         McpCommand::Auth { name, user } => auth_server(name, user, config_path, no_db).await,
         McpCommand::Test { name, user } => test_server(name, user, config_path, no_db).await,
@@ -371,19 +388,55 @@ async fn add_server(
 /// Remove an MCP server.
 async fn remove_server(
     name: String,
+    gateway_url: Option<String>,
+    gateway_token: Option<String>,
+    offline: bool,
     config_path: Option<&Path>,
     no_db: bool,
 ) -> anyhow::Result<()> {
     let db = connect_db(config_path, no_db).await?;
+    let servers = load_servers(db.as_ref()).await?;
+    if servers.get(&name).is_none() {
+        anyhow::bail!("Server '{name}' not found");
+    }
+
+    if !offline {
+        match apply_live_remove(
+            &name,
+            gateway_url.as_deref(),
+            gateway_token.as_deref(),
+            config_path,
+            db.as_ref(),
+        )
+        .await?
+        {
+            LiveMcpResult::Applied(message) => {
+                println!();
+                println!("  ✓ {message}");
+                println!();
+                return Ok(());
+            }
+            LiveMcpResult::Unavailable(reason) => {
+                anyhow::bail!(
+                    "Live MCP removal unavailable ({reason}). No offline configuration deletion was attempted; if the request reached the gateway, its outcome may be unknown. Check status, or stop LunarWing and rerun with --offline for persisted-only removal."
+                );
+            }
+        }
+    }
+
+    eprintln!(
+        "  Warning: --offline removes configuration only; it does not stop a running MCP process or unregister its tools."
+    );
+
     if let Some(db) = db.as_ref() {
-        config::load_mcp_servers_from_db_or_migrate(db.store.as_ref(), &db.owner_id).await?;
         config::remove_mcp_server_db(db.store.as_ref(), &db.owner_id, &name).await?;
     } else {
         config::remove_mcp_server(&name).await?;
     }
 
     println!();
-    println!("  ✓ Removed MCP server '{}'", name);
+    println!("  ✓ Removed MCP server '{name}' from persisted configuration.");
+    println!("    Offline removal did not contact or stop a running LunarWing process.");
     println!();
 
     Ok(())
@@ -881,13 +934,13 @@ async fn toggle_server(
         )
         .await?
         {
-            LiveToggleResult::Applied(message) => {
+            LiveMcpResult::Applied(message) => {
                 println!();
                 println!("  ✓ {message}");
                 println!();
                 return Ok(());
             }
-            LiveToggleResult::Unavailable(reason) => {
+            LiveMcpResult::Unavailable(reason) => {
                 eprintln!("  Gateway unavailable ({reason}); saving for next startup.");
             }
         }
@@ -922,9 +975,37 @@ async fn toggle_server(
     Ok(())
 }
 
-enum LiveToggleResult {
+enum LiveMcpResult {
     Applied(String),
     Unavailable(String),
+}
+
+#[derive(Clone, Copy)]
+enum LiveMcpAction {
+    Activate,
+    Deactivate,
+    Toggle,
+    Remove,
+}
+
+impl LiveMcpAction {
+    fn endpoint(self) -> &'static str {
+        match self {
+            Self::Activate => "activate",
+            Self::Deactivate => "deactivate",
+            Self::Toggle => "toggle",
+            Self::Remove => "remove",
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Activate => "activation",
+            Self::Deactivate => "deactivation",
+            Self::Toggle => "toggle",
+            Self::Remove => "removal",
+        }
+    }
 }
 
 async fn apply_live_toggle(
@@ -934,7 +1015,41 @@ async fn apply_live_toggle(
     token_override: Option<&str>,
     config_path: Option<&Path>,
     db: Option<&McpDbContext>,
-) -> anyhow::Result<LiveToggleResult> {
+) -> anyhow::Result<LiveMcpResult> {
+    let action = match enabled {
+        Some(true) => LiveMcpAction::Activate,
+        Some(false) => LiveMcpAction::Deactivate,
+        None => LiveMcpAction::Toggle,
+    };
+    apply_live_lifecycle(name, action, url_override, token_override, config_path, db).await
+}
+
+async fn apply_live_remove(
+    name: &str,
+    url_override: Option<&str>,
+    token_override: Option<&str>,
+    config_path: Option<&Path>,
+    db: Option<&McpDbContext>,
+) -> anyhow::Result<LiveMcpResult> {
+    apply_live_lifecycle(
+        name,
+        LiveMcpAction::Remove,
+        url_override,
+        token_override,
+        config_path,
+        db,
+    )
+    .await
+}
+
+async fn apply_live_lifecycle(
+    name: &str,
+    action: LiveMcpAction,
+    url_override: Option<&str>,
+    token_override: Option<&str>,
+    config_path: Option<&Path>,
+    db: Option<&McpDbContext>,
+) -> anyhow::Result<LiveMcpResult> {
     let config = match Config::from_env_with_toml(config_path).await {
         Ok(config) => Some(config),
         Err(error) if config_path.is_some() => return Err(anyhow::anyhow!("{error:#}")),
@@ -971,23 +1086,19 @@ async fn apply_live_toggle(
             .or(persisted_token)
     };
     let Some(token) = token.filter(|token| !token.trim().is_empty()) else {
-        return Ok(LiveToggleResult::Unavailable(
+        return Ok(LiveMcpResult::Unavailable(
             "no gateway auth token was provided".to_string(),
         ));
     };
 
-    let action = match enabled {
-        Some(true) => "activate",
-        Some(false) => "deactivate",
-        None => "toggle",
-    };
+    let action_endpoint = action.endpoint();
     let mut endpoint = url::Url::parse(base_url.trim_end_matches('/'))
         .map_err(|error| anyhow::anyhow!("Invalid gateway URL '{base_url}': {error}"))?;
     endpoint
         .path_segments_mut()
         .map_err(|_| anyhow::anyhow!("Gateway URL cannot be used as a base URL"))?
         .pop_if_empty()
-        .extend(["api", "extensions", name, action]);
+        .extend(["api", "extensions", name, action_endpoint]);
     let response = match reqwest::Client::new()
         .post(endpoint.clone())
         .bearer_auth(token.trim())
@@ -997,7 +1108,7 @@ async fn apply_live_toggle(
     {
         Ok(response) => response,
         Err(error) => {
-            return Ok(LiveToggleResult::Unavailable(format!(
+            return Ok(LiveMcpResult::Unavailable(format!(
                 "could not connect to {endpoint}: {error}"
             )));
         }
@@ -1005,8 +1116,9 @@ async fn apply_live_toggle(
     if response.status() == reqwest::StatusCode::NOT_FOUND
         || response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
     {
-        return Ok(LiveToggleResult::Unavailable(format!(
-            "gateway does not support live MCP {action}"
+        return Ok(LiveMcpResult::Unavailable(format!(
+            "gateway does not support live MCP {}",
+            action.noun()
         )));
     }
     if !response.status().is_success() {
@@ -1025,7 +1137,7 @@ async fn apply_live_toggle(
     if payload.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
         anyhow::bail!("Gateway rejected MCP lifecycle change: {message}");
     }
-    Ok(LiveToggleResult::Applied(message))
+    Ok(LiveMcpResult::Applied(message))
 }
 
 struct McpDbContext {
@@ -1139,6 +1251,42 @@ mod tests {
                 assert!(!offline);
             }
             other => panic!("expected toggle command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_remove_live_control_flags_parse() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "remove",
+            "local-files",
+            "--url",
+            "http://127.0.0.1:3000",
+            "--token",
+            "test-token",
+        ])
+        .expect("parse live remove flags");
+        match parsed.cmd {
+            McpCommand::Remove {
+                name,
+                url,
+                token,
+                offline,
+            } => {
+                assert_eq!(name, "local-files");
+                assert_eq!(url.as_deref(), Some("http://127.0.0.1:3000"));
+                assert_eq!(token.as_deref(), Some("test-token"));
+                assert!(!offline);
+            }
+            other => panic!("expected remove command, got {other:?}"),
         }
     }
 
@@ -1263,8 +1411,8 @@ mod tests {
         .await
         .expect("live toggle");
         match result {
-            LiveToggleResult::Applied(message) => assert_eq!(message, "deactivated live"),
-            LiveToggleResult::Unavailable(reason) => {
+            LiveMcpResult::Applied(message) => assert_eq!(message, "deactivated live"),
+            LiveMcpResult::Unavailable(reason) => {
                 panic!("test gateway unexpectedly unavailable: {reason}")
             }
         }
@@ -1305,8 +1453,8 @@ mod tests {
         .await
         .expect("live implicit toggle");
         match result {
-            LiveToggleResult::Applied(message) => assert_eq!(message, "toggled live"),
-            LiveToggleResult::Unavailable(reason) => {
+            LiveMcpResult::Applied(message) => assert_eq!(message, "toggled live"),
+            LiveMcpResult::Unavailable(reason) => {
                 panic!("test gateway unexpectedly unavailable: {reason}")
             }
         }
@@ -1326,10 +1474,10 @@ mod tests {
         .await
         .expect("missing explicit token is an offline fallback");
         match result {
-            LiveToggleResult::Unavailable(reason) => {
+            LiveMcpResult::Unavailable(reason) => {
                 assert!(reason.contains("no gateway auth token"));
             }
-            LiveToggleResult::Applied(message) => {
+            LiveMcpResult::Applied(message) => {
                 panic!("unexpected live transition: {message}")
             }
         }
@@ -1354,14 +1502,83 @@ mod tests {
         .await
         .expect("404 is an offline fallback");
         match result {
-            LiveToggleResult::Unavailable(reason) => {
+            LiveMcpResult::Unavailable(reason) => {
                 assert!(reason.contains("does not support"));
             }
-            LiveToggleResult::Applied(message) => {
+            LiveMcpResult::Applied(message) => {
                 panic!("unexpected live transition: {message}")
             }
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_apply_live_mcp_remove_calls_authenticated_gateway() {
+        use axum::extract::Path as AxumPath;
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        async fn remove(
+            AxumPath(name): AxumPath<String>,
+            headers: HeaderMap,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(name, "local-files");
+            assert_eq!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer test-token")
+            );
+            Json(serde_json::json!({
+                "success": true,
+                "message": "removed live"
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test gateway");
+        let address = listener.local_addr().expect("gateway address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/api/extensions/{name}/remove", post(remove)),
+            )
+            .await
+        });
+
+        let result = apply_live_remove(
+            "local-files",
+            Some(&format!("http://{address}")),
+            Some("test-token"),
+            None,
+            None,
+        )
+        .await
+        .expect("live remove");
+        match result {
+            LiveMcpResult::Applied(message) => assert_eq!(message, "removed live"),
+            LiveMcpResult::Unavailable(reason) => {
+                panic!("test gateway unexpectedly unavailable: {reason}")
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_custom_remove_url_requires_explicit_token() {
+        let result = apply_live_remove("local-files", Some("http://127.0.0.1:9"), None, None, None)
+            .await
+            .expect("missing token is reported as unavailable");
+        match result {
+            LiveMcpResult::Unavailable(reason) => {
+                assert!(reason.contains("no gateway auth token"));
+            }
+            LiveMcpResult::Applied(message) => {
+                panic!("unexpected live removal: {message}")
+            }
+        }
     }
 
     #[test]

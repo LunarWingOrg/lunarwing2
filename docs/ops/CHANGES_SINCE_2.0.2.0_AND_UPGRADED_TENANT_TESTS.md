@@ -88,6 +88,11 @@ lifecycle/status commands go through `lunarwing-mt-admin.sh` — never bare
   `Mcp-Session-Id` / `Content-Type` / `Accept` headers are now rejected.
 - Owner-scoped DB setting is authoritative for MCP state when DB is enabled;
   disk config migrates once into the configured owner.
+- `lunarwing mcp remove` now uses the authenticated gateway to stop active
+  transports, unregister tools, and delete config through `ExtensionManager`.
+  Gateway failure never triggers fallback config deletion; because delivery can
+  be ambiguous, inspect status before retrying. `--offline` explicitly removes
+  persisted config only after the tenant is stopped.
 
 ### 1.6 Self-improving skills repair (machinery was inert; now functional)
 
@@ -268,8 +273,10 @@ For each worker type the tenant selected (`--with-opencode`, `--with-pebble`,
    gone; Activate → fresh handshake, tools rediscovered.
 5. Header validation: attempt to save an HTTP MCP config with duplicate or
    reserved headers (`Mcp-Session-Id`, `Content-Type`, `Accept`) → rejected.
-6. Reminder for testers: CLI `mcp update`/`mcp remove` are persistence-only —
-   restart the tenant (or use web/conversational surfaces) for runtime effect.
+6. CLI remove: while the tenant runs, `lunarwing mcp remove <name>` stops the
+   transport, unregisters its tools, and removes config. With the gateway stopped,
+   default removal must fail without deleting config; `--offline` then performs
+   persisted-only removal.
 7. Owner scope: if the tenant uses a non-default owner, confirm MCP state
    migrated into that owner's scope and did not strand under `default`.
 
