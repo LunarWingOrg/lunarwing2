@@ -1,9 +1,12 @@
 # Self-Heal Repair Followups (triaged)
 
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** Notifier timeout,
-> truncated-state recovery, and systemd timer installation/removal have landed.
-> Escalation cooldown (6a) remains open; per-tenant application-level health
+> **Current status (2026-08-01, branch `aj/kimi-24-20260801-1203`): §A COMPLETE.**
+> Notifier timeout, truncated-state recovery, systemd timer installation/removal,
+> and the escalation cooldown (6a — per-service, sidecar epoch, notifier-success-
+> gated; watchdog v2.1.0) have all landed. Per-tenant application-level health
 > (10) remains deferred.
+>
+> _Previous (2026-07-20, rev `50c8f99`): PARTIAL — 6a open, 10 deferred._
 
 Followups for the host-global health-check + self-heal pipeline
 (`ic-infrastructure-health-check/`: `infrastructure-health-check.sh` → `lunarwing-self-heal.sh`,
@@ -22,7 +25,7 @@ each item is directly actionable.
 | 6c | Notifier timeout | ✅ | trivial | **FIXED** `2b462f95` |
 | 6b | Truncated-state recovery | ✅ | easy | **FIXED** |
 | 2 | systemd `.timer/.service` scheduling | ✅ | moderate | **FIXED** |
-| 6a | Escalation cooldown / rate-limit | ✅ | moderate | do now (one design choice) |
+| 6a | Escalation cooldown / rate-limit | ✅ | moderate | **FIXED** 2026-08-01 (`aj/kimi-24-20260801-1203`) |
 | 10 | Per-tenant app-level health (Pattern C) | ✅ | involved | **defer** (own design pass) |
 | 1 | Propagate 4 fixes to staging/prod | ❌ ops | n/a | mostly done — redeploy only |
 | 3 | Version bump 1.1.3→1.1.4 + test sweep | ❌ release | n/a | release prep |
@@ -101,9 +104,22 @@ All edits are in `ic/scripts/lunarwing-mt-admin.sh`:
 
 ### Needs one design choice — do now
 
-#### 6a. Escalation cooldown / rate-limit — *moderate (~12–16 lines)*
-No cooldown exists today: `escalatedAt` is written at `:413` but never read, and escalate fires
-unconditionally at `:550` (flapping) and `:557` (max retries). A flap→recover→reflap loop can flood
+#### 6a. Escalation cooldown / rate-limit — ✅ FIXED (2026-08-01, `aj/kimi-24-20260801-1203`)
+Implemented as spec'd below, with two refinements: the cooldown is **per-service**
+(sidecar `$SELF_HEAL_STATE_DIR/.last_escalation_page.<svc>`, svc name sanitized)
+rather than one global file — resolving the "distinct service's first page
+suppressed" concern raised in the design note — and the epoch is written **only
+after the notifier exits 0**, so a failed page never arms the cooldown.
+`SELF_HEAL_ESCALATE_COOLDOWN` (default 3600, `0`/`false`/`no`/`off` disables);
+suppressed pages still write the escalation report and keep `escalated=true`,
+and log `ESCALATE_PAGE_SUPPRESSED` to `actions.log`. Also added
+`SELF_HEAL_NOTIFY_SCRIPT` (default `$SCRIPT_DIR/send-notification.sh`) so the
+page path is testable. Coverage: chaos CH15a–d (reflap suppression, expiry
+resume, disabled, per-service isolation, failed page) + matrix section P.
+Historical design record retained below.
+
+> **Original spec (pre-fix):** No cooldown existed: `escalatedAt` was written but never read, and escalate fired
+unconditionally on flapping and on max retries. A flap→recover→reflap loop could flood
 Gotify.
 
 - **Change:** add `SELF_HEAL_ESCALATE_COOLDOWN="${SELF_HEAL_ESCALATE_COOLDOWN:-3600}"` near the

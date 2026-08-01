@@ -1,12 +1,12 @@
 # LunarWing Infrastructure Health Check System
 
-_Last updated: 2026-06-24 — self-heal watchdog v2.0.0; LunarVision check added._
+_Last updated: 2026-08-01 — self-heal watchdog v2.1.0; NetBird check + escalation page cooldown added._
 
 Automated health monitoring and self-healing for LunarWing infrastructure.
-Nine parallel component checks aggregate into a JSON report; a separate
+Ten parallel component checks aggregate into a JSON report; a separate
 watchdog reads that report and auto-remediates unhealthy services with a grace
-period, exponential backoff, a flapping guard, post-restart verification, and
-multi-tenant awareness.
+period, exponential backoff, a flapping guard, post-restart verification,
+multi-tenant awareness, and a per-service escalation page cooldown.
 
 ## Architecture
 
@@ -21,6 +21,7 @@ cron-wrapper.sh
   │     ├── health-tensorzero.sh       (proxy p50/p95, error rate, queue, GPU)
   │     ├── health-models.sh           (LLM provider APIs)
   │     ├── health-lunarvision.sh      (OCR + VL sidecar: health, metrics, VL status)
+  │     ├── health-netbird.sh          (NetBird tunnel daemon + management plane)
   │     └── health-{systemd,openrc,launchd}.sh  (service manager — one, auto-detected)
   │
   └── lunarwing-self-heal.sh           (reads report → restarts → verifies → escalates)
@@ -112,6 +113,7 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 | tensorzero | health-tensorzero.sh | Proxy latency/errors (from ClickHouse) + GPU | `p50_ms`, `p95_ms`, `error_rate`, `queue_depth`, `gpu_utilization` |
 | models | health-models.sh | OpenRouter / OpenAI / Anthropic / local LLM APIs | per-provider `status`, `latency_ms`, `last_error` |
 | lunarvision | health-lunarvision.sh | OCR + VL sidecar `/health` and `/vision/metrics` | `service_status`, `ocr_available`, `vl_available`, `capabilities`, `latency_ms`, cache `hit_rate`, `rate_limited`, `avg_latency_ms` |
+| netbird | health-netbird.sh | NetBird tunnel daemon (`netbird status`) + management plane | `daemon`, `management`, `latency_ms` |
 | systemd / openrc / launchd | health-{systemd,openrc,launchd}.sh | Service-manager unit state (incl. per-tenant) | `metrics.units` / `.services` / `.agents` |
 
 A check that cannot reach its target generally reports `critical`; several
@@ -150,6 +152,9 @@ checks can instead be **disabled** so they report `healthy` with
 | `HEALTH_LUNARVISION_REQUIRE_VL` | health-lunarvision.sh | `false` | Degrade if the VL backend is not confirmed available |
 | `HEALTH_LUNARVISION_LATENCY_DEGRADED_MS` | health-lunarvision.sh | `2000` | Health-endpoint latency threshold for `degraded` |
 | `HEALTH_LUNARVISION_LATENCY_CRITICAL_MS` | health-lunarvision.sh | `5000` | Health-endpoint latency threshold for `critical` |
+| `HEALTH_NETBIRD_ENABLED` | health-netbird.sh | `true` | Non-`true` disables (reports healthy/disabled) |
+| `NETBIRD_BINARY` | health-netbird.sh | `netbird` | netbird CLI path/name; **absent binary disables the probe** (tunnel provider is not netbird) |
+| `HEALTH_NETBIRD_TIMEOUT` | health-netbird.sh | `5` | `netbird status` probe timeout (seconds) |
 | `OPENROUTER_API_KEY` | health-models.sh | (empty) | OpenRouter key; unset → provider `unknown` (degraded) |
 | `OPENAI_API_KEY` | health-models.sh | (empty) | OpenAI key; unset → provider `unknown` (degraded) |
 | `ANTHROPIC_API_KEY` | health-models.sh | (empty) | Anthropic key; unset → provider `unknown` (degraded) |
@@ -176,6 +181,7 @@ HEALTH_XMPP_SERVER=''        # skip the XMPP reachability probe
 HEALTH_OMEMO_ENABLED=false   # skip the OMEMO store probe
 HEALTH_MODELS_ENABLED=false  # skip the LLM-provider probe
 HEALTH_LUNARVISION_ENABLED=false  # skip the OCR/VL sidecar probe
+HEALTH_NETBIRD_ENABLED=false # skip the NetBird tunnel-daemon probe
 HEALTHCHECK_NOTIFY=false     # don't page on every per-run degrade (let self-heal escalations page instead)
 ```
 
@@ -217,12 +223,13 @@ Report shape:
 
 ## Self-Healing
 
-`lunarwing-self-heal.sh` (v2.0.0) reads the latest health report and:
+`lunarwing-self-heal.sh` (v2.1.0) reads the latest health report and:
 
 1. **Maps** unhealthy logical components to base service names
    (`gateway → lunarwing`, …) and discovers per-tenant init sub-units from the
    service-manager report; resolves per-tenant systemd **user** units to the
-   owning OS user via the tenant registry.
+   owning OS user via the tenant registry. Host-global components (the NetBird
+   daemon) are remediated even in MT mode.
 2. **Grace period** — waits for N consecutive unhealthy observations before the
    first restart (absorbs transient blips).
 3. **Restarts**, then **verifies** recovery by re-running the component's own
@@ -233,7 +240,8 @@ Report shape:
 5. **Flapping guard** — a service restarted too many times inside the window is
    escalated, not looped.
 6. **Escalates** via Gotify (bounded by a timeout) after max retries or on
-   flapping.
+   flapping, with a **per-service page cooldown** so a flap→recover→reflap
+   loop can't flood the pager.
 7. **Tracks state** in `$LUNARWING_BASE_DIR/workspace/reports/self-heal/state.json`,
    clears any service the latest report calls healthy ("report as truth"), and
    auto-prunes stale, non-escalated entries.
@@ -250,6 +258,8 @@ wedge it.
 | xmpp | `xmpp-bridge` | health-xmpp.sh |
 | tensorzero | `tensorzero-gateway` | health-tensorzero.sh |
 | clickhouse | `clickhouse-server` | health-clickhouse.sh |
+| lunarvision | `ocr-sidecar` (`LUNARVISION_SERVICE` override) | health-lunarvision.sh |
+| netbird | `netbird` (`NETBIRD_SERVICE` override) — host-global, remediated even in MT mode | health-netbird.sh |
 | omemo, ratelimit, models | _(none — feature/external, never remediated)_ | — |
 
 On systemd the base names get a `.service` suffix; per-tenant sub-units
@@ -293,6 +303,8 @@ is not valid JSON).
 | — | `SELF_HEAL_FLAP_WINDOW_SECS` | 3600 | Flapping detection window (seconds) |
 | — | `SELF_HEAL_HISTORY_MAX` | 20 | Cap on `restart_history[]` length (must be ≥ flap-max) |
 | — | `SELF_HEAL_ESCALATE_TIMEOUT` | 30 | Timeout (s) around the notifier so a hung Gotify can't stall a tick |
+| — | `SELF_HEAL_ESCALATE_COOLDOWN` | 3600 | Per-service cooldown (s) between escalation pages; `0` (or `false`/`no`/`off`) disables. State + escalation report are still written when a page is suppressed |
+| — | `SELF_HEAL_NOTIFY_SCRIPT` | `<script-dir>/send-notification.sh` | Notifier invoked for escalations (tests / non-Gotify paging integrations) |
 | — | `SELF_HEAL_MAX_REPORT_AGE` | 0 | Refuse to act on a report older than this many seconds; `0` disables |
 | — | `SELF_HEAL_REMEDY_LOGICAL` | true | `false` → remediate **only** discovered init sub-units, not logical base services (MT hosts) |
 | — | `SELF_HEAL_STATE_DIR` | `<reports>/../self-heal` | State + lock + escalation directory |
@@ -306,8 +318,9 @@ path is preferred because on some platforms — e.g. Umbrel — `/etc/` is not
 persistent across app updates.)
 
 The self-heal state directory holds `state.json`, `actions.log`,
-`self-heal.lock`, transient `escalation-*.json`, and (on corruption) a single
-`state.json.corrupt` forensic copy.
+`self-heal.lock`, transient `escalation-*.json`, per-service
+`.last_escalation_page.<svc>` page-cooldown sidecars, and (on corruption) a
+single `state.json.corrupt` forensic copy.
 
 > **Backoff is a cross-tick gate**, not an in-run sleep: a failed service's
 > `next_attempt_at` is pushed out by `compute_backoff`, so the run never blocks
@@ -321,7 +334,9 @@ The self-heal state directory holds `state.json`, `actions.log`,
 > (and probes `podman inspect` health for container units), and
 > `health-openrc.sh` auto-discovers tenant init scripts under `INITD_DIR`. On MT
 > hosts set `SELF_HEAL_REMEDY_LOGICAL=false` so the watchdog doesn't try to
-> restart non-existent base services.
+> restart non-existent base services. Host-global components are exempt from
+> that skip: the NetBird daemon is a single host-level service carrying every
+> tenant's tunnel, so `netbird` is still remediated in MT mode.
 
 ## Cron / Timer Setup
 
@@ -403,10 +418,11 @@ bash tests/test-health-openrc.sh            # health-openrc.sh probe scenarios (
 | Suite | Script | What it does |
 |-------|--------|--------------|
 | `regression` | `test-self-heal.sh` | Original regression checks (jq precedence, backoff, grace, flapping, …). |
-| `matrix` | `test-self-heal-matrix.sh` | The full A–O matrix in `--dry-run` against synthetic reports (~120 assertions). |
-| `chaos` | `chaos-harness.sh` | Drives the **real** self-heal loop (kill → restart → verify → recover/escalate) against a mock init system. |
+| `matrix` | `test-self-heal-matrix.sh` | The full A–P matrix in `--dry-run` against synthetic reports (~135 assertions). |
+| `chaos` | `chaos-harness.sh` | Drives the **real** self-heal loop (kill → restart → verify → recover/escalate) against a mock init system, incl. the escalation page cooldown (CH15). |
 | `openrc` | `test-health-openrc.sh` | Exercises `health-openrc.sh` (discovery dedup, real exit-code capture, per-unit timeout, missing/stopped units). |
-| `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 68 assertions: reachability, HTTP codes, JSON parsing, VL availability logic, metrics integration, cache/rate-limit stats, capabilities inference, disabled mode). |
+| `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 81 assertions: reachability, HTTP codes, JSON parsing, VL availability logic, metrics integration, cache/rate-limit stats, capabilities inference, disabled mode). |
+| `netbird` | `test-health-netbird.sh` | Exercises `health-netbird.sh` (mock netbird binary, 28 assertions: disabled/absent auto-skip, connected, management-disconnected degraded, daemon-down critical, probe timeout, binary override). |
 | — | `lib.sh` | Shared harness + the mock init system (sourced, not run directly). |
 
 `run-all.sh` runs each suite in its own process, tallies per-suite
