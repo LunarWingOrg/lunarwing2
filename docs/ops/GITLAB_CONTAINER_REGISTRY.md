@@ -2,12 +2,11 @@
 
 Goal: enable GitLab's built-in container registry for `lunarwing/lunarwing2`
 and publish the external-worker images (`worker-nanocode`, `worker-pebble`,
-`worker-opencode`) from CI, so MT hosts can pull prebuilt images instead of
-building locally on every upgrade.
+`worker-opencode`, `worker-kimi`) from CI, so MT hosts can pull prebuilt
+images instead of building locally on every upgrade.
 
-The CI side lives in `.gitlab/ci/containers.yml` (branch
-`c0ntainers/mcr/v2.0.3.0`). The server side must be done once on the GitLab
-host by someone with access.
+The CI side lives in `.gitlab/ci/containers.yml` (merged to master). The
+server side must be done once on the GitLab host by someone with access.
 
 **Environment (confirmed 2026-07-29):** GitLab runs as a Docker container
 behind **Traefik** (`proxy` network, `websecure` entrypoint, `letsencrypt`
@@ -137,13 +136,14 @@ ever stall, raise `forwardingTimeouts` on the entrypoint or on the
 
 ## 2. CI: build and push worker images
 
-`.gitlab/ci/containers.yml` adds three jobs to a new `containers` stage:
+`.gitlab/ci/containers.yml` adds four jobs to a new `containers` stage:
 
 | Job | Context | Image pushed |
 |---|---|---|
 | `worker-nanocode-image` | `lunarcode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-nanocode:{sha,latest}` |
 | `worker-pebble-image` | repo root (Dockerfile in `pebble4lunarwing/`) | `$CI_REGISTRY_IMAGE/worker-pebble:{sha,latest}` |
 | `worker-opencode-image` | `opencode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-opencode:{sha,latest}` |
+| `worker-kimi-image` | `kimicode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-kimi:{sha,latest}` |
 
 Details:
 
@@ -155,12 +155,12 @@ Details:
   survive (matches the mt-admin `--format docker` convention).
 - Auth uses the automatic `$CI_REGISTRY_USER` / `$CI_REGISTRY_PASSWORD`
   per-job credentials — nothing to configure.
-- Jobs run **automatically on the default branch** when the relevant worker
-  directory changes, and are **manual** on every other pipeline (run the
-  pipeline, click the job).
-- Variables: `NANOCODE_REF` (default `v1.2.28`), `WITH_TOOLCHAINS` for
-  opencode (default `false`; set `true` on a manual pipeline run for the fat
-  toolchain image — mirrors mt-admin's `--with-toolchains`).
+- **All** image jobs are **manual-only on every pipeline** (run the pipeline,
+  click the job) — multi-GB builds never start automatically.
+- Variables: `NANOCODE_REF` (default `v1.2.28`), `KIMI_CODE_VERSION` (default
+  `0.30.0`), `WITH_TOOLCHAINS` for opencode and kimi (default `false`; set
+  `true` on a manual pipeline run for the fat toolchain image — mirrors
+  mt-admin's `--with-toolchains`).
 - If gcr.io is unreachable from the runners, pull the executor image
   elsewhere, push it into our registry once section 1 is done, and update
   `.container-job`'s `image:name`.
