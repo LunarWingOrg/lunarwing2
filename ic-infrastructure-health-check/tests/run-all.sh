@@ -2,7 +2,7 @@
 # Aggregate runner for the self-heal chaos test suite.
 #
 #   bash tests/run-all.sh                 # run every suite
-#   bash tests/run-all.sh matrix chaos    # run a subset (regression|matrix|chaos)
+#   bash tests/run-all.sh matrix chaos    # run a subset (see --list)
 #
 # Each suite runs in its own process against its own throwaway sandbox; this
 # wrapper tallies the per-suite results and returns non-zero if any failed.
@@ -21,8 +21,10 @@ declare -A SUITES=(
     [chaos]="chaos-harness.sh"
     [openrc]="test-health-openrc.sh"
     [systemd]="test-health-systemd.sh"
+    [lunarvision]="test-health-lunarvision.sh"
+    [netbird]="test-health-netbird.sh"
 )
-ORDER=(regression matrix chaos openrc systemd)
+ORDER=(regression matrix chaos openrc systemd lunarvision netbird)
 
 # --list: print available suites and exit (for CI introspection). Derived from
 # ORDER so it can never drift out of sync with the registered suites.
