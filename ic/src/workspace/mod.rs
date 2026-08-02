@@ -406,6 +406,27 @@ impl WorkspaceStorage {
         }
     }
 
+    async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => {
+                repo.get_files_limited(user_id, agent_id, directory, suffix, limit)
+                    .await
+            }
+            Self::Db(db) => {
+                db.get_files_limited(user_id, agent_id, directory, suffix, limit)
+                    .await
+            }
+        }
+    }
+
     async fn list_all_paths(
         &self,
         user_id: &str,
@@ -833,6 +854,8 @@ impl Workspace {
             .update_document_and_replace_chunks(doc.id, content, &prepared)
             .await?;
 
+        self.invalidate_lorebook_cache(&self.user_id, &path);
+
         self.storage.get_document_by_id(doc.id).await
     }
 
@@ -960,6 +983,8 @@ impl Workspace {
             .update_document_and_replace_chunks(doc.id, content, &prepared)
             .await?;
 
+        self.invalidate_lorebook_cache(&scope, &path);
+
         let document = self.storage.get_document_by_id(doc.id).await?;
         Ok(WriteResult {
             document,
@@ -1051,7 +1076,9 @@ impl Workspace {
         let path = normalize_path(path);
         self.storage
             .delete_document_by_path(&self.user_id, self.agent_id, &path)
-            .await
+            .await?;
+        self.invalidate_lorebook_cache(&self.user_id, &path);
+        Ok(())
     }
 
     /// List files and directories in a path.
@@ -1121,6 +1148,25 @@ impl Workspace {
         self.storage
             .list_files_limited(&self.user_id, self.agent_id, &directory, suffix, limit)
             .await
+    }
+
+    /// Fetch bounded direct files and content from primary scope only.
+    pub(crate) async fn get_primary_files_limited(
+        &self,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        let directory = normalize_directory(directory);
+        self.storage
+            .get_files_limited(&self.user_id, self.agent_id, &directory, suffix, limit)
+            .await
+    }
+
+    fn invalidate_lorebook_cache(&self, scope: &str, path: &str) {
+        if is_lorebook_json_file(path) {
+            crate::lorebook::invalidate_cache(scope, self.agent_id);
+        }
     }
 
     /// List all files recursively (flat list of all paths).
@@ -2409,6 +2455,62 @@ mod runtime_index_tests {
         assert_eq!(entries[0].content, "lore 00");
         assert_eq!(entries[15].content, "lore 15");
         assert!(entries.iter().all(|entry| entry.content != "nested"));
+    }
+
+    #[tokio::test]
+    async fn lorebook_cache_invalidates_on_write_and_delete() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let path = "lorebooks/cache.json";
+        workspace
+            .write(path, r#"[{"constant":true,"content":"first"}]"#)
+            .await
+            .expect("write first revision");
+        assert_eq!(
+            crate::lorebook::load_lorebook_entries(&workspace).await[0].content,
+            "first"
+        );
+
+        workspace
+            .write(path, r#"[{"constant":true,"content":"second"}]"#)
+            .await
+            .expect("write second revision");
+        assert_eq!(
+            crate::lorebook::load_lorebook_entries(&workspace).await[0].content,
+            "second"
+        );
+
+        workspace.delete(path).await.expect("delete lorebook");
+        assert!(
+            crate::lorebook::load_lorebook_entries(&workspace)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn lorebook_cache_detects_direct_database_revision_change() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let path = "lorebooks/direct.json";
+        workspace
+            .write(path, r#"[{"constant":true,"content":"first"}]"#)
+            .await
+            .expect("write first revision");
+        let first = crate::lorebook::load_lorebook_entries(&workspace).await;
+        assert_eq!(first[0].content, "first");
+
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let document = workspace.read_primary(path).await.expect("read document");
+        workspace
+            .storage
+            .update_document(
+                document.id,
+                r#"[{"constant":true,"content":"direct update"}]"#,
+            )
+            .await
+            .expect("direct database update");
+
+        let changed = crate::lorebook::load_lorebook_entries(&workspace).await;
+        assert_eq!(changed[0].content, "direct update");
     }
 
     #[tokio::test]

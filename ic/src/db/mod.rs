@@ -907,6 +907,15 @@ pub trait WorkspaceStore: Send + Sync {
         suffix: &str,
         limit: usize,
     ) -> Result<Vec<WorkspaceEntry>, WorkspaceError>;
+    /// Fetch bounded direct files and their content in deterministic path order.
+    async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError>;
     async fn list_all_paths(
         &self,
         user_id: &str,

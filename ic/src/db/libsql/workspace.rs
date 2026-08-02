@@ -685,6 +685,61 @@ impl WorkspaceStore for LibSqlBackend {
         Ok(entries)
     }
 
+    async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        let conn = self
+            .connect()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: e.to_string(),
+            })?;
+        let agent_id = agent_id.map(|id| id.to_string());
+        let directory = directory.trim_end_matches('/');
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, agent_id, path, content,
+                       created_at, updated_at, metadata
+                FROM memory_documents
+                WHERE user_id = ?1 AND agent_id IS ?2
+                  AND (?3 = '' OR substr(path, 1, length(?3)) = ?3)
+                  AND instr(substr(path, length(?3) + 1), '/') = 0
+                  AND (?4 = '' OR lower(substr(path, -length(?4))) = lower(?4))
+                ORDER BY path
+                LIMIT ?5
+                "#,
+                params![user_id, agent_id.as_deref(), prefix, suffix, limit],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Bounded file fetch failed: {e}"),
+            })?;
+
+        let mut documents = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Bounded file fetch query failed: {e}"),
+            })?
+        {
+            documents.push(row_to_memory_document(&row));
+        }
+        Ok(documents)
+    }
+
     async fn list_all_paths(
         &self,
         user_id: &str,
@@ -1530,6 +1585,34 @@ mod tests {
             .await
             .expect("insert chunk");
         (doc_id, chunk_id)
+    }
+
+    #[tokio::test]
+    async fn bounded_file_fetch_returns_content_ordered_and_scope_isolated() {
+        let (backend, _dir) = setup_backend().await;
+        let conn = backend.connect().await.expect("connect");
+        for (user, path, content) in [
+            ("primary", "lorebooks/b.json", "b"),
+            ("primary", "lorebooks/a.json", "a"),
+            ("primary", "lorebooks/nested/c.json", "nested"),
+            ("secondary", "lorebooks/other.json", "other"),
+        ] {
+            conn.execute(
+                "INSERT INTO memory_documents (id, user_id, path, content, metadata) VALUES (?1, ?2, ?3, ?4, '{}')",
+                params![Uuid::new_v4().to_string(), user, path, content],
+            )
+            .await
+            .expect("insert document");
+        }
+
+        let documents =
+            WorkspaceStore::get_files_limited(&backend, "primary", None, "lorebooks", ".json", 1)
+                .await
+                .expect("bounded fetch");
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].path, "lorebooks/a.json");
+        assert_eq!(documents[0].content, "a");
     }
 
     #[tokio::test]

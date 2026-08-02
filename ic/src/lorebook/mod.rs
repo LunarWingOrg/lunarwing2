@@ -4,12 +4,15 @@
 //! implementation intentionally supports a documented SillyTavern import
 //! subset rather than claiming complete World Info parity.
 
+mod cache;
 pub mod engine;
 pub mod model;
 
 pub use model::{LorebookEntry, LorebookError, SelectiveLogic, parse_lorebook};
 
 use regex::Regex;
+use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::config::LorebookConfig;
 use crate::llm::{ChatMessage, Role};
@@ -31,6 +34,18 @@ pub(crate) const LOREBOOK_HEADER: &str = "## Lorebook Reference\n\nThe following
 /// Missing, unreadable, malformed, oversized, and unsafe documents degrade to
 /// a partial result rather than failing the agent turn.
 pub async fn load_lorebook_entries(workspace: &Workspace) -> Vec<LorebookEntry> {
+    load_lorebook_entries_cached(workspace)
+        .await
+        .as_ref()
+        .to_vec()
+}
+
+async fn load_lorebook_entries_cached(workspace: &Workspace) -> Arc<[LorebookEntry]> {
+    let key = cache::ScopeKey::new(workspace.user_id(), workspace.agent_id());
+    if let Some(entries) = cache::CACHE.get_recent_empty(&key) {
+        return entries;
+    }
+
     let listing = match workspace
         .list_primary_files_limited(LOREBOOK_DIR, ".json", MAX_LOREBOOK_FILES + 1)
         .await
@@ -38,34 +53,46 @@ pub async fn load_lorebook_entries(workspace: &Workspace) -> Vec<LorebookEntry> 
         Ok(listing) => listing,
         Err(error) => {
             tracing::debug!(%error, "No lorebook directory available");
-            return Vec::new();
+            return Arc::from([]);
         }
     };
 
-    let files = listing;
-    if files.len() > MAX_LOREBOOK_FILES {
+    if listing.len() > MAX_LOREBOOK_FILES {
         tracing::warn!(
-            count = files.len(),
+            count = listing.len(),
             limit = MAX_LOREBOOK_FILES,
             "Lorebook file limit reached; ignoring remaining files"
         );
     }
 
+    let revisions: Vec<_> = listing
+        .iter()
+        .take(MAX_LOREBOOK_FILES)
+        .map(cache::DocumentRevision::from)
+        .collect();
+    if let Some(entries) = cache::CACHE.get(&key, &revisions) {
+        return entries;
+    }
+
+    let files = match workspace
+        .get_primary_files_limited(LOREBOOK_DIR, ".json", MAX_LOREBOOK_FILES + 1)
+        .await
+    {
+        Ok(files) => files,
+        Err(error) => {
+            tracing::debug!(%error, "Could not load lorebook files");
+            return Arc::from([]);
+        }
+    };
+
     let mut entries = Vec::new();
     let mut total_bytes = 0usize;
-    for item in files.into_iter().take(MAX_LOREBOOK_FILES) {
-        let document = match workspace.read_primary(&item.path).await {
-            Ok(document) => document,
-            Err(error) => {
-                tracing::debug!(path = %item.path, %error, "Could not read lorebook");
-                continue;
-            }
-        };
+    for document in files.into_iter().take(MAX_LOREBOOK_FILES) {
         if document.content.is_empty() {
             continue;
         }
         if document.content.len() > model::MAX_LOREBOOK_FILE_BYTES {
-            tracing::warn!(path = %item.path, "Skipping oversized lorebook");
+            tracing::warn!(path = %document.path, "Skipping oversized lorebook");
             continue;
         }
         if document.content.len() > MAX_TOTAL_LOREBOOK_BYTES.saturating_sub(total_bytes) {
@@ -77,10 +104,10 @@ pub async fn load_lorebook_entries(workspace: &Workspace) -> Vec<LorebookEntry> 
         }
         total_bytes = total_bytes.saturating_add(document.content.len());
 
-        let mut parsed = match parse_lorebook(&item.path, &document.content) {
+        let mut parsed = match parse_lorebook(&document.path, &document.content) {
             Ok(parsed) => parsed,
             Err(error) => {
-                tracing::warn!(path = %item.path, %error, "Skipping malformed lorebook");
+                tracing::warn!(path = %document.path, %error, "Skipping malformed lorebook");
                 continue;
             }
         };
@@ -88,19 +115,20 @@ pub async fn load_lorebook_entries(workspace: &Workspace) -> Vec<LorebookEntry> 
         // loading repeats validation: unsafe entries are skipped individually,
         // while an unsafe cross-entry combination skips the whole file.
         parsed.retain(|entry| {
-            crate::workspace::reject_lorebook_if_injected(&item.path, &render_entry(entry)).is_ok()
+            crate::workspace::reject_lorebook_if_injected(&document.path, &render_entry(entry))
+                .is_ok()
         });
         if !parsed.is_empty() {
             let combined = decoded_entry_text(parsed.iter());
-            if crate::workspace::reject_lorebook_if_injected(&item.path, &combined).is_err() {
-                tracing::warn!(path = %item.path, "Skipping unsafe lorebook document");
+            if crate::workspace::reject_lorebook_if_injected(&document.path, &combined).is_err() {
+                tracing::warn!(path = %document.path, "Skipping unsafe lorebook document");
                 continue;
             }
         }
 
         let remaining = MAX_TOTAL_LOREBOOK_ENTRIES.saturating_sub(entries.len());
         let loaded = parsed.len().min(remaining);
-        tracing::debug!(path = %item.path, count = loaded, "Loaded lorebook");
+        tracing::debug!(path = %document.path, count = loaded, "Loaded lorebook");
         entries.extend(parsed.into_iter().take(remaining));
         if entries.len() == MAX_TOTAL_LOREBOOK_ENTRIES {
             tracing::warn!(
@@ -110,7 +138,13 @@ pub async fn load_lorebook_entries(workspace: &Workspace) -> Vec<LorebookEntry> 
             break;
         }
     }
+    let entries: Arc<[LorebookEntry]> = entries.into();
+    cache::CACHE.insert(key, revisions, Arc::clone(&entries));
     entries
+}
+
+pub(crate) fn invalidate_cache(user_id: &str, agent_id: Option<Uuid>) {
+    cache::CACHE.invalidate(&cache::ScopeKey::new(user_id, agent_id));
 }
 
 /// Build activated lorebook reference text for one agent turn.
@@ -129,7 +163,7 @@ pub async fn build_active_block(
         return None;
     }
 
-    let entries = load_lorebook_entries(workspace).await;
+    let entries = load_lorebook_entries_cached(workspace).await;
     if entries.is_empty() {
         return None;
     }

@@ -2862,17 +2862,24 @@ mod tests {
     }
 
     #[test]
-    fn final_answer_classification_rejects_leaked_prose() {
-        assert!(!eval_python_bool(
-            r#"looks_like_final_answer("*chortles* Oops - let me fix that!")"#
-        ));
-        assert!(!eval_python_bool(
-            r#"looks_like_final_answer("The answer is 42")"#
-        ));
-        assert!(!eval_python_bool(r#"looks_like_final_answer("x" * 79)"#));
-        assert!(eval_python_bool(r#"looks_like_final_answer("x" * 80)"#));
+    fn leaked_roleplay_or_meta_classification_is_strong_signal_only() {
         assert!(eval_python_bool(
-            r#"looks_like_final_answer("Investigation complete: the orchestrator now retries malformed prose responses and stops after two bounded correction attempts.")"#
+            r#"signals_leaked_roleplay_or_meta("*chortles* Oops - let me fix that!")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("The answer is 42")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("Loops are useful")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("Wrong answers should be corrected with evidence.")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("*chortles and flicks tail*")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("*Important*")"#
         ));
     }
 

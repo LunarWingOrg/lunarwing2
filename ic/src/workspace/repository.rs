@@ -294,6 +294,46 @@ impl Repository {
             .collect())
     }
 
+    /// Fetch at most `limit` direct files and their content, ordered by path.
+    pub async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        let conn = self.conn().await?;
+        let directory = directory.trim_end_matches('/');
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, agent_id, path, content,
+                       created_at, updated_at, metadata
+                FROM memory_documents
+                WHERE user_id = $1 AND agent_id IS NOT DISTINCT FROM $2
+                  AND ($3 = '' OR LEFT(path, CHAR_LENGTH($3)) = $3)
+                  AND POSITION('/' IN SUBSTRING(path FROM CHAR_LENGTH($3) + 1)) = 0
+                  AND ($4 = '' OR LOWER(RIGHT(path, CHAR_LENGTH($4))) = LOWER($4))
+                ORDER BY path
+                LIMIT $5
+                "#,
+                &[&user_id, &agent_id, &prefix, &suffix, &limit],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Bounded file fetch failed: {e}"),
+            })?;
+
+        Ok(rows.iter().map(|row| self.row_to_document(row)).collect())
+    }
+
     /// List all file paths in the workspace (flat list).
     pub async fn list_all_paths(
         &self,
