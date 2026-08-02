@@ -305,10 +305,12 @@ is 60 seconds:
 
 `ic/src/tools/tool.rs:343-348`
 
-The canonical execution wrapper applies that generic timeout around the entire
-tool future:
+Both normal chat/Engine execution and the local job worker apply that generic
+deadline around the entire tool future. The incident's `source=direct` local job
+used the worker-specific wrapper:
 
-`ic/src/tools/execute.rs:63-67`
+- `ic/src/tools/execute.rs:63-67`
+- `ic/src/worker/job.rs:611-617`
 
 When the outer 60-second timeout fires, it drops the shell future before the
 shell's internal 120-second timeout and cleanup branch necessarily run. Tokio's
