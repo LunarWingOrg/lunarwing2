@@ -12,15 +12,15 @@
 //! 4. **Auto-promotion** — Frequently-matched fuzzy hits are promoted to the
 //!    exact-match cache so subsequent calls are O(1).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use strsim::jaro_winkler;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::db::Database;
+use crate::db::{Database, ReflexPatternHit};
 use crate::tools::builder::{BuildRequirement, Language, SoftwareBuilder, SoftwareType};
 use crate::workspace::EmbeddingProvider;
 
@@ -114,6 +114,230 @@ pub struct FuzzyMatch {
     pub matched_pattern: String,
     /// The similarity score (0.0–1.0).
     pub score: f64,
+}
+
+// ── Match-count write-behind ────────────────
+
+/// Production cadence for reflex telemetry writes.
+pub const REFLEX_HIT_FLUSH_INTERVAL: Duration = Duration::from_secs(3);
+/// Bounded wait for the final best-effort shutdown flush.
+pub const REFLEX_HIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Hard ceiling for distinct owner/pattern pairs retained in memory.
+const DEFAULT_MAX_PENDING_REFLEX_HITS: usize = 4096;
+const MAX_REFLEX_HIT_FLUSH_BACKOFF: Duration = Duration::from_secs(60);
+
+type ReflexHitKey = (String, String);
+
+#[derive(Debug, Default)]
+struct PendingHit {
+    count: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReflexHitState {
+    pending: HashMap<ReflexHitKey, PendingHit>,
+    flushing: HashSet<ReflexHitKey>,
+}
+
+/// Bounded, synchronous accumulator for reflex match telemetry.
+///
+/// `record()` performs no async work and never creates a task. One background
+/// worker periodically drains the map and sends a single database batch.
+pub struct ReflexHitAccumulator {
+    state: Mutex<ReflexHitState>,
+    max_unique_keys: usize,
+}
+
+impl ReflexHitAccumulator {
+    pub fn new(max_unique_keys: usize) -> Self {
+        Self {
+            state: Mutex::new(ReflexHitState::default()),
+            max_unique_keys,
+        }
+    }
+
+    /// Record one hit without awaiting database I/O.
+    ///
+    /// Returns `false` only when admitting a new key would exceed the hard cap.
+    pub fn record(&self, user_id: &str, normalized_pattern: &str) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let key = (user_id.to_string(), normalized_pattern.to_string());
+        if let Some(hit) = state.pending.get_mut(&key) {
+            hit.count = hit.count.saturating_add(1);
+            return true;
+        }
+
+        let already_flushing = state.flushing.contains(&key);
+        if !already_flushing && unique_hit_keys(&state) >= self.max_unique_keys {
+            return false;
+        }
+
+        state.pending.insert(key, PendingHit { count: 1 });
+        true
+    }
+
+    /// Number of distinct keys currently pending or being flushed.
+    pub fn tracked_key_count(&self) -> usize {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        unique_hit_keys(&state)
+    }
+
+    async fn flush_once(&self, store: &dyn Database) -> Result<usize, crate::error::DatabaseError> {
+        let Some(batch) = self.take_batch() else {
+            return Ok(0);
+        };
+        let hits = batch.database_hits();
+        let flushed = hits.len();
+        store.bump_reflex_pattern_matches(&hits).await?;
+        batch.complete();
+        Ok(flushed)
+    }
+
+    fn take_batch(&self) -> Option<PendingReflexBatch<'_>> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.pending.is_empty() {
+            return None;
+        }
+
+        let hits = std::mem::take(&mut state.pending);
+        state.flushing.extend(hits.keys().cloned());
+        Some(PendingReflexBatch {
+            accumulator: self,
+            hits: Some(hits),
+        })
+    }
+
+    fn finish_batch(&self, hits: HashMap<ReflexHitKey, PendingHit>, succeeded: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        for (key, hit) in hits {
+            state.flushing.remove(&key);
+            if !succeeded {
+                let pending = state.pending.entry(key).or_default();
+                pending.count = pending.count.saturating_add(hit.count);
+            }
+        }
+    }
+}
+
+impl Default for ReflexHitAccumulator {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_PENDING_REFLEX_HITS)
+    }
+}
+
+fn unique_hit_keys(state: &ReflexHitState) -> usize {
+    state.flushing.len()
+        + state
+            .pending
+            .keys()
+            .filter(|key| !state.flushing.contains(*key))
+            .count()
+}
+
+struct PendingReflexBatch<'a> {
+    accumulator: &'a ReflexHitAccumulator,
+    hits: Option<HashMap<ReflexHitKey, PendingHit>>,
+}
+
+impl PendingReflexBatch<'_> {
+    fn database_hits(&self) -> Vec<ReflexPatternHit> {
+        self.hits
+            .as_ref()
+            .into_iter()
+            .flat_map(|hits| hits.iter())
+            .map(|((user_id, normalized_pattern), hit)| ReflexPatternHit {
+                user_id: user_id.clone(),
+                normalized_pattern: normalized_pattern.clone(),
+                count: hit.count,
+            })
+            .collect()
+    }
+
+    fn complete(mut self) {
+        if let Some(hits) = self.hits.take() {
+            self.accumulator.finish_batch(hits, true);
+        }
+    }
+}
+
+impl Drop for PendingReflexBatch<'_> {
+    fn drop(&mut self) {
+        if let Some(hits) = self.hits.take() {
+            self.accumulator.finish_batch(hits, false);
+        }
+    }
+}
+
+/// Handle for the single reflex hit-flush worker.
+pub struct ReflexHitFlusher {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ReflexHitFlusher {
+    /// Request a final flush and wait no longer than `timeout`.
+    pub async fn shutdown(mut self, timeout: Duration) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if tokio::time::timeout(timeout, &mut self.task).await.is_err() {
+            self.task.abort();
+            let _ = self.task.await;
+            tracing::debug!("Timed out flushing reflex hit telemetry during shutdown");
+        }
+    }
+}
+
+/// Spawn one periodic worker for all reflex hit telemetry.
+pub fn spawn_reflex_hit_flusher(
+    accumulator: Arc<ReflexHitAccumulator>,
+    store: Arc<dyn Database>,
+    flush_interval: Duration,
+) -> ReflexHitFlusher {
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(run_reflex_hit_flusher(
+        accumulator,
+        store,
+        flush_interval,
+        shutdown_rx,
+    ));
+    ReflexHitFlusher {
+        shutdown: Some(shutdown),
+        task,
+    }
+}
+
+async fn run_reflex_hit_flusher(
+    accumulator: Arc<ReflexHitAccumulator>,
+    store: Arc<dyn Database>,
+    flush_interval: Duration,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) {
+    let flush_interval = flush_interval.max(Duration::from_millis(1));
+    let mut delay = flush_interval;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                if let Err(error) = accumulator.flush_once(store.as_ref()).await {
+                    tracing::debug!(%error, "Final reflex hit telemetry flush failed");
+                }
+                return;
+            }
+            _ = tokio::time::sleep(delay) => {
+                match accumulator.flush_once(store.as_ref()).await {
+                    Ok(_) => delay = flush_interval,
+                    Err(error) => {
+                        tracing::debug!(%error, "Reflex hit telemetry flush failed; backing off");
+                        delay = delay
+                            .checked_mul(2)
+                            .unwrap_or(MAX_REFLEX_HIT_FLUSH_BACKOFF)
+                            .min(MAX_REFLEX_HIT_FLUSH_BACKOFF);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── ReflexRouter ────────────────────
@@ -995,6 +1219,105 @@ pub fn spawn_reflex_evictor(
 mod tests {
     use super::*;
     use crate::db::{Database, ReflexStore};
+
+    // ── Match-count write-behind ──
+
+    #[test]
+    fn reflex_hit_accumulator_coalesces_and_caps_unique_keys() {
+        let accumulator = ReflexHitAccumulator::new(2);
+        assert!(accumulator.record("user-a", "pattern-a"));
+        assert!(accumulator.record("user-a", "pattern-a"));
+        assert!(accumulator.record("user-a", "pattern-b"));
+        assert!(!accumulator.record("user-a", "pattern-c"));
+        assert_eq!(accumulator.tracked_key_count(), 2);
+
+        let batch = accumulator.take_batch().expect("pending batch");
+        let mut hits = batch.database_hits();
+        hits.sort_by(|left, right| left.normalized_pattern.cmp(&right.normalized_pattern));
+        assert_eq!(hits[0].normalized_pattern, "pattern-a");
+        assert_eq!(hits[0].count, 2);
+        assert_eq!(hits[1].normalized_pattern, "pattern-b");
+        assert_eq!(hits[1].count, 1);
+        batch.complete();
+        assert_eq!(accumulator.tracked_key_count(), 0);
+    }
+
+    #[test]
+    fn reflex_hit_accumulator_counts_in_flight_keys_and_requeues() {
+        let accumulator = ReflexHitAccumulator::new(1);
+        assert!(accumulator.record("user-a", "pattern-a"));
+        let batch = accumulator.take_batch().expect("pending batch");
+
+        assert!(accumulator.record("user-a", "pattern-a"));
+        assert!(!accumulator.record("user-a", "pattern-b"));
+        drop(batch);
+
+        let retry = accumulator.take_batch().expect("requeued batch");
+        let hits = retry.database_hits();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].count, 2);
+        retry.complete();
+        assert_eq!(accumulator.tracked_key_count(), 0);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn reflex_hit_accumulator_flushes_one_additive_batch() {
+        use crate::db::libsql::LibSqlBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("reflex_hit_accumulator.db");
+        let backend = Arc::new(LibSqlBackend::new_local(&db_path).await.unwrap());
+        backend.run_migrations().await.unwrap();
+        backend
+            .upsert_reflex_pattern("user-a", "pattern-a", "Pattern A", "tool-a")
+            .await
+            .unwrap();
+        backend
+            .upsert_reflex_pattern("user-a", "pattern-b", "Pattern B", "tool-b")
+            .await
+            .unwrap();
+        let initial: HashMap<_, _> = backend
+            .list_reflex_patterns("user-a")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|pattern| (pattern.normalized_pattern, pattern.match_count))
+            .collect();
+        assert_eq!(initial["pattern-a"], 1);
+        assert_eq!(initial["pattern-b"], 1);
+
+        let accumulator = Arc::new(ReflexHitAccumulator::new(2));
+        assert!(accumulator.record("user-a", "pattern-a"));
+        assert!(accumulator.record("user-a", "pattern-a"));
+        assert!(accumulator.record("user-a", "pattern-b"));
+        let store: Arc<dyn Database> = backend.clone();
+        assert_eq!(accumulator.flush_once(store.as_ref()).await.unwrap(), 2);
+
+        let patterns = backend.list_reflex_patterns("user-a").await.unwrap();
+        let counts: HashMap<_, _> = patterns
+            .into_iter()
+            .map(|pattern| (pattern.normalized_pattern, pattern.match_count))
+            .collect();
+        assert_eq!(counts["pattern-a"], 3);
+        assert_eq!(counts["pattern-b"], 2);
+        assert_eq!(accumulator.tracked_key_count(), 0);
+
+        assert!(accumulator.record("user-a", "pattern-a"));
+        let store: Arc<dyn Database> = backend.clone();
+        let flusher =
+            spawn_reflex_hit_flusher(Arc::clone(&accumulator), store, Duration::from_secs(60));
+        flusher.shutdown(Duration::from_secs(2)).await;
+
+        let patterns = backend.list_reflex_patterns("user-a").await.unwrap();
+        let counts: HashMap<_, _> = patterns
+            .into_iter()
+            .map(|pattern| (pattern.normalized_pattern, pattern.match_count))
+            .collect();
+        assert_eq!(counts["pattern-a"], 4);
+        assert_eq!(counts["pattern-b"], 2);
+        assert_eq!(accumulator.tracked_key_count(), 0);
+    }
 
     // ── Normalization ──
 
