@@ -247,6 +247,53 @@ impl Repository {
             .collect())
     }
 
+    /// List at most `limit` direct files in a directory with a suffix.
+    pub async fn list_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
+        let conn = self.conn().await?;
+        let directory = directory.trim_end_matches('/');
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = conn
+            .query(
+                r#"
+                SELECT path, updated_at, LEFT(content, 200) AS content_preview
+                FROM memory_documents
+                WHERE user_id = $1 AND agent_id IS NOT DISTINCT FROM $2
+                  AND ($3 = '' OR LEFT(path, CHAR_LENGTH($3)) = $3)
+                  AND POSITION('/' IN SUBSTRING(path FROM CHAR_LENGTH($3) + 1)) = 0
+                  AND ($4 = '' OR LOWER(RIGHT(path, CHAR_LENGTH($4))) = LOWER($4))
+                ORDER BY path
+                LIMIT $5
+                "#,
+                &[&user_id, &agent_id, &prefix, &suffix, &limit],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Limited file listing failed: {e}"),
+            })?;
+
+        Ok(rows
+            .iter()
+            .map(|row| WorkspaceEntry {
+                path: row.get("path"),
+                is_directory: false,
+                updated_at: row.get("updated_at"),
+                content_preview: row.get("content_preview"),
+            })
+            .collect())
+    }
+
     /// List all file paths in the workspace (flat list).
     pub async fn list_all_paths(
         &self,
