@@ -771,28 +771,28 @@ pub trait ReflexStore: Send + Sync {
     /// Disable a reflex pattern by ID.
     async fn disable_reflex_pattern(&self, id: Uuid) -> Result<bool, DatabaseError>;
 
+    /// Increment match counts and update timestamps for a batch of patterns.
+    ///
+    /// Implementations must use one backend batch/transaction and apply each
+    /// delta additively. An empty batch is a no-op.
+    async fn bump_reflex_pattern_matches(
+        &self,
+        hits: &[ReflexPatternHit],
+    ) -> Result<(), DatabaseError>;
+
     /// Increment one pattern by one match.
     async fn bump_reflex_pattern_match(
         &self,
         user_id: &str,
         normalized_pattern: &str,
-    ) -> Result<(), DatabaseError>;
-
-    /// Increment match counts and update timestamps for a batch of patterns.
-    ///
-    /// Implementations should override this with one atomic batch operation.
-    /// The default preserves compatibility for lightweight store implementations.
-    async fn bump_reflex_pattern_matches(
-        &self,
-        hits: &[ReflexPatternHit],
     ) -> Result<(), DatabaseError> {
-        for hit in hits {
-            for _ in 0..hit.count {
-                self.bump_reflex_pattern_match(&hit.user_id, &hit.normalized_pattern)
-                    .await?;
-            }
-        }
-        Ok(())
+        let hit = ReflexPatternHit {
+            user_id: user_id.to_string(),
+            normalized_pattern: normalized_pattern.to_string(),
+            count: 1,
+        };
+        self.bump_reflex_pattern_matches(std::slice::from_ref(&hit))
+            .await
     }
 
     /// Record a failed compilation attempt for a reflex pattern.
