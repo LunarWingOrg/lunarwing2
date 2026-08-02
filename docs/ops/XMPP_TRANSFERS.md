@@ -134,7 +134,7 @@ Component "files.example.com" "http_upload"
 
 - [`../architecture/XMPP_FILE_TRANSFERS.md`](../architecture/XMPP_FILE_TRANSFERS.md) — full implementation details
 - [`../bugs/history/XMPP-OMEMO-BUG-TO-DO.md`](../bugs/history/XMPP-OMEMO-BUG-TO-DO.md) — archived OMEMO bug tracker
-- [`history/AGENT_GOALS_2.0.3.0.md`](history/AGENT_GOALS_2.0.3.0.md) — archived release goals that included XMPP polish
+- [`history/GOALS_1.1.5.md`](history/GOALS_1.1.5.md) — archived v1.1.5 goals that included XMPP polish
 - [`../../ic/testing/lunarwing-xmpp/README.md`](../../ic/testing/lunarwing-xmpp/README.md) — test harness setup
 
 ---
