@@ -1382,6 +1382,10 @@ mod tests {
                 handle_message_timeout: Duration::from_secs(400),
                 self_repair_op_timeout: Duration::from_secs(60),
                 session_prune_timeout: Duration::from_secs(30),
+                lorebook: crate::config::LorebookConfig {
+                    enabled: false,
+                    ..crate::config::LorebookConfig::default()
+                },
                 reflex: crate::config::ReflexConfig::default(),
             },
             deps,
@@ -2273,6 +2277,10 @@ mod tests {
                 handle_message_timeout: Duration::from_secs(400),
                 self_repair_op_timeout: Duration::from_secs(60),
                 session_prune_timeout: Duration::from_secs(30),
+                lorebook: crate::config::LorebookConfig {
+                    enabled: false,
+                    ..crate::config::LorebookConfig::default()
+                },
                 reflex: crate::config::ReflexConfig::default(),
             },
             deps,
@@ -2404,6 +2412,10 @@ mod tests {
                     handle_message_timeout: Duration::from_secs(400),
                     self_repair_op_timeout: Duration::from_secs(60),
                     session_prune_timeout: Duration::from_secs(30),
+                    lorebook: crate::config::LorebookConfig {
+                        enabled: false,
+                        ..crate::config::LorebookConfig::default()
+                    },
                     reflex: crate::config::ReflexConfig::default(),
                 },
                 deps,
