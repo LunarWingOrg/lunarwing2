@@ -460,12 +460,14 @@ After `d2ff7b8`, the adapter drops the original serialized string and parses
 
 `ic/src/bridge/effect_adapter.rs:775-786`
 
-This correctly bounds newly executed outputs before they enter Engine/Monty
-state. For outputs at or below the safety size limit it also restores leak
-redaction and policy enforcement, plus injection sanitization when that check is
-enabled or policy-forced. Oversized output is truncated first and returned
-before those later safety stages, so `d2ff7b8` does not by itself guarantee
-redaction of the retained prefix. The new regression test passed:
+This makes Engine V2 consume the safety layer's transformed output instead of
+the original serialization. Inputs already over the configured size limit are
+truncated before they enter Engine/Monty state. Inputs at or below that limit
+also receive leak redaction and policy enforcement, plus injection sanitization
+when that check is enabled or policy-forced. Those later transformations are not
+re-capped and can change the final length. Oversized output returns immediately
+after truncation, so `d2ff7b8` does not by itself guarantee redaction of the
+retained prefix. The new regression test passed:
 
 ```text
 bridge::effect_adapter::tests::
@@ -749,9 +751,10 @@ resource use.
 **Not established:** a sandbox escape, Monty VM leak, Wasmtime per-call store
 leak, or 37.6 GB LunarWing main-process RSS.
 
-**Valid secondary fix:** `d2ff7b8` feeds the safety layer's bounded output into
-Engine V2 after the tool has produced its full result. Normal-sized outputs also
-receive the later redaction/policy stages; oversized prefixes currently do not.
+**Valid secondary fix:** `d2ff7b8` feeds the safety layer's transformed output
+into Engine V2 after the tool has produced its full result. Oversized inputs are
+truncated; normal-sized inputs receive the later redaction/policy stages, whose
+output is not re-capped; oversized prefixes currently receive no redaction.
 
 The release checklist should not mark the broad “MEMLEAK” item complete solely
 because `d2ff7b8` landed. The output-boundary defect is fixed; process-group
