@@ -162,6 +162,62 @@ def signals_execution_intent(text):
     return any(phrase in lower for phrase in exec_phrases)
 
 
+def strip_stage_directions(text):
+    """Remove paired *roleplay directions* before classifying prose."""
+    parts = []
+    cursor = 0
+    while cursor < len(text):
+        start = text.find("*", cursor)
+        if start < 0:
+            parts.append(text[cursor:])
+            break
+        end = text.find("*", start + 1)
+        if end < 0:
+            parts.append(text[cursor:])
+            break
+        parts.append(text[cursor:start])
+        cursor = end + 1
+    return "".join(parts).strip()
+
+
+def is_simple_goal(goal):
+    """Return whether a short goal is conversational rather than task-oriented."""
+    goal_lower = goal.lower().strip()
+    if len(goal_lower) >= 60:
+        return False
+
+    normalized = goal_lower
+    for punctuation in [".", ",", "!", "?", ";", ":"]:
+        normalized = normalized.replace(punctuation, " ")
+    padded = " " + " ".join(normalized.split()) + " "
+    simple_patterns = [
+        "standby", "thanks", "thank you", "hello", "got it",
+        "understood", "ok", "okay", "ready", "proceed",
+    ]
+    for pattern in simple_patterns:
+        if " " + pattern + " " in padded:
+            return True
+    return False
+
+
+def looks_like_final_answer(text):
+    """Reject short roleplay or retry commentary while allowing real prose."""
+    cleaned = strip_stage_directions(text)
+    if len(cleaned) < 20:
+        return False
+
+    lower = cleaned.lower()
+    meta_patterns = [
+        "oops", "let me fix", "let me try", "i tried to",
+        "that's not", "that is not", "wrong", "mistake",
+    ]
+    for pattern in meta_patterns:
+        if pattern in lower:
+            return False
+
+    return len(cleaned) >= 80
+
+
 def format_output(result, max_chars=8000):
     """Format code execution result for the next LLM context message."""
     parts = []
@@ -586,8 +642,8 @@ def run_loop(context, goal, actions, state, config):
                 __transition_to__("completed", "FINAL() in text")
                 return complete_result(state, "completed", final_answer)
 
-            # Check for tool intent nudge (V1 semantics: consecutive counter,
-            # only resets on non-intent text, NOT on action/code responses)
+            # Check for tool intent nudge. The same bounded counter also guards
+            # format-recovery nudges below.
             if nudge_enabled and consecutive_nudges < max_nudges and signals_tool_intent(text):
                 consecutive_nudges += 1
                 append_message(
@@ -596,6 +652,22 @@ def run_loop(context, goal, actions, state, config):
                     "You said you would perform an action, but you did not include any tool calls.\n"
                     "Do NOT describe what you intend to do — actually call the tool now.\n"
                     "Use the tool_calls mechanism to invoke the appropriate tool.",
+                )
+                continue
+
+            # A task response that is only short prose, roleplay, or retry
+            # commentary usually means the model slipped out of CodeAct mode.
+            if (nudge_enabled
+                    and consecutive_nudges < max_nudges
+                    and not is_simple_goal(goal)
+                    and not looks_like_final_answer(text)):
+                consecutive_nudges += 1
+                append_message(
+                    working_messages,
+                    "User",
+                    "Your last response was plain text and did not complete this task.\n"
+                    "Respond with a ```repl code block containing tool calls or FINAL().\n"
+                    "Do not respond with plain text only.",
                 )
                 continue
 
@@ -641,6 +713,20 @@ def run_loop(context, goal, actions, state, config):
             # Format output for next LLM context
             output = format_output(result)
             append_message(working_messages, "User", output)
+
+            if (result.get("had_error")
+                    and "SyntaxError" in output
+                    and nudge_enabled
+                    and consecutive_nudges < max_nudges):
+                consecutive_nudges += 1
+                append_message(
+                    working_messages,
+                    "User",
+                    "Your last ```repl block was not valid Python.\n"
+                    "Respond with a corrected ```repl block containing tool calls or FINAL().",
+                )
+            elif not result.get("had_error"):
+                consecutive_nudges = 0
 
             # Check for FINAL() in code output
             if result.get("final_answer") is not None:
@@ -721,8 +807,8 @@ def run_loop(context, goal, actions, state, config):
         elif resp_type == "actions":
             state["_obligation_resolved"] = True
             # Tier 0: structured tool calls.
-            # NOTE: consecutive_nudges is NOT reset here (V1 semantics).
-            # Only non-intent text responses reset the counter.
+            # Structured calls do not reset the counter; successful CodeAct
+            # execution and accepted non-intent text do.
             calls = response.get("calls", [])
             append_message(
                 working_messages,

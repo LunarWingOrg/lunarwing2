@@ -802,6 +802,7 @@ mod tests {
             ..ThreadConfig::default()
         };
         let (mut exec, _signal_tx) = make_loop(vec![text_response("ok")], Vec::new(), config).await;
+        exec.thread.goal = "ok".to_string();
         exec.run().await.expect("run should complete");
 
         let system = exec
@@ -822,6 +823,7 @@ mod tests {
             ThreadConfig::default(),
         )
         .await;
+        exec.thread.goal = "ok".to_string();
         exec.run().await.expect("run should complete");
 
         let system = exec
@@ -852,6 +854,7 @@ mod tests {
             make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(32);
         let mut exec = exec.with_event_tx(event_tx);
+        exec.thread.goal = "hello".to_string();
 
         let outcome = exec.run().await.expect("streamed orchestrator should run");
 
@@ -939,7 +942,7 @@ mod tests {
                 }),
             ],
             vec![
-                Ok(LlmStreamChunk::TextDelta("Done!".to_string())),
+                Ok(LlmStreamChunk::TextDelta("FINAL(\"Done!\")".to_string())),
                 Ok(LlmStreamChunk::Done {
                     usage: Some(TokenUsage {
                         input_tokens: 5,
@@ -1016,6 +1019,7 @@ mod tests {
         ]]));
         let (mut execution, _signal_tx) =
             make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+        execution.thread.goal = "hello".to_string();
 
         let outcome = execution
             .run()
@@ -1037,6 +1041,7 @@ mod tests {
             ThreadConfig::default(),
         )
         .await;
+        exec.thread.goal = "hello".to_string();
 
         let outcome = exec.run().await.unwrap();
         assert!(matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "Hello!"));
@@ -1050,7 +1055,7 @@ mod tests {
         let (mut exec, _tx) = make_loop(
             vec![
                 action_response("test_tool", "call_1"),
-                text_response("Done!"),
+                text_response("FINAL(\"Done!\")"),
             ],
             vec![Ok(ActionResult {
                 call_id: "call_1".into(),
@@ -1151,6 +1156,7 @@ mod tests {
             ThreadConfig::default(),
         )
         .await;
+        exec.thread.goal = "got it".to_string();
 
         tx.send(ThreadSignal::InjectMessage(ThreadMessage::user(
             "injected!",
@@ -1173,7 +1179,7 @@ mod tests {
         let (mut exec, _tx) = make_loop(
             vec![
                 text_response("Let me search for that"),
-                text_response("The answer is 42"),
+                text_response("FINAL(\"The answer is 42\")"),
             ],
             vec![],
             ThreadConfig {
@@ -1199,6 +1205,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leaked_prose_is_nudged_back_to_codeact() {
+        let (mut exec, _tx) = make_loop(
+            vec![
+                text_response("*chortles* Oops - let me fix that!"),
+                code_response("FINAL('recovered')"),
+            ],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "recovered"
+        ));
+        assert_eq!(exec.thread.step_count, 2);
+        assert!(exec.thread.internal_messages.iter().any(|message| {
+            message
+                .content
+                .contains("plain text and did not complete this task")
+        }));
+    }
+
+    #[tokio::test]
+    async fn conversational_goal_accepts_short_text() {
+        let (mut exec, _tx) = make_loop(
+            vec![text_response("*tail flicks* Standing by.")],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+        exec.thread.goal = "standby for rebuild".to_string();
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) }
+                if response == "*tail flicks* Standing by."
+        ));
+        assert_eq!(exec.thread.step_count, 1);
+    }
+
+    #[tokio::test]
+    async fn substantive_plain_text_answer_is_accepted() {
+        let answer = "Investigation complete: the orchestrator now retries malformed prose responses and stops after two bounded correction attempts.";
+        let (mut exec, _tx) =
+            make_loop(vec![text_response(answer)], vec![], ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == answer
+        ));
+        assert_eq!(exec.thread.step_count, 1);
+    }
+
+    #[tokio::test]
+    async fn leaked_prose_nudge_cap_accepts_last_response() {
+        let (mut exec, _tx) = make_loop(
+            vec![
+                text_response("*chortles* Oops."),
+                text_response("*tail flicks* Let me try again."),
+                text_response("Still not code."),
+            ],
+            vec![],
+            ThreadConfig {
+                max_tool_intent_nudges: 2,
+                ..ThreadConfig::default()
+            },
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "Still not code."
+        ));
+        assert_eq!(exec.thread.step_count, 3);
+    }
+
+    #[tokio::test]
+    async fn successful_code_resets_prose_nudge_counter() {
+        let (mut exec, _tx) = make_loop(
+            vec![
+                text_response("*chortles* Oops."),
+                code_response("value = 42"),
+                text_response("*tail flicks* Let me try again."),
+                text_response("Still not code."),
+                code_response("FINAL('recovered after reset')"),
+            ],
+            vec![],
+            ThreadConfig {
+                max_tool_intent_nudges: 2,
+                ..ThreadConfig::default()
+            },
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) }
+                if response == "recovered after reset"
+        ));
+        assert_eq!(exec.thread.step_count, 5);
+    }
+
+    #[tokio::test]
+    async fn prose_inside_code_block_gets_syntax_nudge() {
+        let (mut exec, _tx) = make_loop(
+            vec![
+                code_response("This is prose, not valid Python."),
+                code_response("FINAL('syntax recovered')"),
+            ],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "syntax recovered"
+        ));
+        assert_eq!(exec.thread.step_count, 2);
+        assert!(
+            exec.thread
+                .internal_messages
+                .iter()
+                .any(|message| { message.content.contains("was not valid Python") })
+        );
+    }
+
+    #[tokio::test]
     async fn events_are_recorded() {
         let (mut exec, _tx) = make_loop(
             vec![text_response("Hello!")],
@@ -1206,6 +1347,7 @@ mod tests {
             ThreadConfig::default(),
         )
         .await;
+        exec.thread.goal = "hello".to_string();
 
         exec.run().await.unwrap();
 
@@ -1557,7 +1699,7 @@ mod tests {
         let (mut exec, _tx) = make_loop(
             vec![
                 action_response("test_tool", "call_xK9mZq123"),
-                text_response("Done!"),
+                text_response("FINAL(\"Done!\")"),
             ],
             vec![Ok(ActionResult {
                 call_id: String::new(), // EffectExecutor returns empty
@@ -1601,7 +1743,7 @@ mod tests {
         let (mut exec, _tx) = make_loop(
             vec![
                 action_response("test_tool", "call_evt_id_42"),
-                text_response("ok"),
+                text_response("FINAL(\"ok\")"),
             ],
             vec![Ok(ActionResult {
                 call_id: String::new(),
@@ -1682,7 +1824,7 @@ mod tests {
                 },
                 usage: TokenUsage::default(),
             },
-            text_response("I couldn't access that tool"),
+            text_response("FINAL(\"I couldn't access that tool\")"),
         ]));
         let effects = Arc::new(MockEffects::new(vec![missing_action], vec![]));
         let leases = Arc::new(LeaseManager::new());
@@ -1743,7 +1885,7 @@ mod tests {
         let (mut exec, _tx) = make_loop(
             vec![
                 action_response("test_tool", "call_clean_id"),
-                text_response("All done"),
+                text_response("FINAL(\"All done\")"),
             ],
             vec![Ok(ActionResult {
                 call_id: String::new(),
