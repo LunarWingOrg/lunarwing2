@@ -189,7 +189,11 @@ def is_simple_goal(goal):
     normalized = goal_lower
     for punctuation in [".", ",", "!", "?", ";", ":"]:
         normalized = normalized.replace(punctuation, " ")
-    padded = " " + " ".join(normalized.split()) + " "
+    normalized = " ".join(normalized.split())
+    if normalized in ["restarted", "restart complete", "rebooted", "back online"]:
+        return True
+
+    padded = " " + normalized + " "
     simple_patterns = [
         "standby", "thanks", "thank you", "hello", "got it",
         "understood", "ok", "okay", "ready", "proceed",
