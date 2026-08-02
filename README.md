@@ -217,6 +217,8 @@ Additional test surfaces:
 | Project blog | [https://blog.lunarwing.org/](https://blog.lunarwing.org/) |
 | Canonical source (Gitlab) | [https://git.lunarwing.org/lunarwing/lunarwing2](https://git.lunarwing.org/lunarwing/lunarwing2) |
 
+#### In order to help us expand documentation, we now have a knowledge MCP server (which will be integrated into LunarWing2 itself) - Please see: [pending]
+
 ## Project and community
 
 LunarWing focuses on user freedom, self-hostable infrastructure, and open communication protocols. Read the [manifesto](MANIFESTO.md) for the project philosophy and the [community guide](COMMUNITY.md) for participation details.
