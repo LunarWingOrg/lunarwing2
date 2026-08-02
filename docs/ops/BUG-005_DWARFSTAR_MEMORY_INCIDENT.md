@@ -51,18 +51,19 @@ The strongest evidence identifies Rust compilation as the dominant workload:
   That profile is consistent with parallel `rustc` processes and inconsistent
   with an idle 150 MB daemon.
 
-The incident is therefore best classified as:
+The incident is therefore best classified, at high confidence, as:
 
-> A Rust build ran through LunarWing's available local worker/shell path under,
-> or charged to, the LunarWing service cgroup. That path had no build-specific
-> resource ceiling or reliable process-tree cleanup on timeout/cancellation.
+> An unbounded Rust build ran through LunarWing's available local worker/shell
+> path under, or charged to, the LunarWing service cgroup. That path lacked
+> reliable process-tree cleanup on timeout/cancellation.
 
-Cgroups did not leak memory. They correctly accounted for the aggregate memory
-used by the daemon and its charged descendants, including compiler memory,
-file/page cache, and kernel allocations. The product defects are the missing
-resource boundary, inconsistent timeout ownership, and incomplete process-tree
-cleanup around local shell work. The evidence does not establish a sandbox
-escape: local execution was an intentional backend when Docker was unavailable.
+The cgroup did not itself leak memory: systemd correctly reported aggregate
+unit usage. Exact peak attribution was not sampled, so the compiler/page-cache
+split remains inferred rather than measured directly. The source-backed product
+defects are the missing build-specific resource boundary, inconsistent timeout
+ownership, and incomplete process-tree cleanup around local shell work. The
+evidence does not establish a sandbox escape: local execution was an intentional
+backend when Docker was unavailable.
 
 Commit `d2ff7b8` fixes a separate, real Engine V2 output-boundary bug. It should
 be retained, but it is not sufficient to explain or fix this incident.
