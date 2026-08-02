@@ -24,6 +24,8 @@ use crate::secrets::CredentialMapping;
 /// Each must be explicitly granted.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
+    /// Approval policy applied before invoking this tool.
+    pub approval: WasmApprovalPolicy,
     /// Read files from workspace.
     pub workspace_read: Option<WorkspaceCapability>,
     /// Make HTTP requests.
@@ -36,6 +38,42 @@ pub struct Capabilities {
     pub webhook: Option<WebhookCapability>,
     /// Run commands on preconfigured SSH hosts (Option 3).
     pub ssh: Option<SshCapability>,
+}
+
+/// Declarative approval policy for a WASM tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WasmApprovalPolicy {
+    /// Tool calls run without an approval prompt.
+    #[default]
+    Never,
+    /// Prompt unless user previously auto-approved this tool.
+    UnlessAutoApproved,
+    /// Prompt for every invocation.
+    Always,
+}
+
+impl WasmApprovalPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::UnlessAutoApproved => "unless_auto_approved",
+            Self::Always => "always",
+        }
+    }
+}
+
+impl std::str::FromStr for WasmApprovalPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "never" => Ok(Self::Never),
+            "unless_auto_approved" => Ok(Self::UnlessAutoApproved),
+            "always" => Ok(Self::Always),
+            _ => Err(format!("Unknown WASM approval policy: {value}")),
+        }
+    }
 }
 
 /// SSH capability — the allowlist of host aliases this tool may target with

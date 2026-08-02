@@ -13,6 +13,7 @@ Status of all WASM tool sources in `ic/tools-src/`.
 ## Code & Development
 
 - [x] GitHub (`github/`) - repository management, issues, PRs, commits, branches
+- [x] Self-hosted GitLab (`gitlab/`) - projects, issues, merge requests, branches, files, search, and pipelines
 - [x] LLM Context (`llm-context/`) - LLM context management
 - [x] Web Search (`web-search/`) - web search capabilities
 
