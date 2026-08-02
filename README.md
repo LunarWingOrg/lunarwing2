@@ -5,16 +5,17 @@
 LunarWing is a self-hosted, privacy-focused AI agent runtime and operations platform written in Rust. It connects agents to open communication protocols, extensible WASM tools, and operator-controlled infrastructure.
 
 <p align="center">
-  <img src="./crszsslw2412c09c1-8ea9-46bd-8063-084ccdd2f332.jpg" alt="LunarWing" width="400">
+  <img src="./lw2_a.jpg" alt="LunarWing" width="1400">
 </p>
 
-## LunarWing v2
+## v2
 
-The v2 line introduces a new execution engine (Engine V2), a browser-based multi-tenant onboarding console, richer gateway interactions, a refreshed foundation for skills, memory, workers, and tools, and more.
+The v2 line introduces a new execution engine (Engine V2), a browser-based multi-tenant onboarding console, richer gateway interactions, a refreshed foundation for skills, memory, workers, and tools, and much more.
 
 ## Quick links
 
 - [Website](https://lunarwing.org/)
+- [Blog](https://blog.lunarwing.org/)
 - [Documentation index](docs/README.md)
 - [Community guide](COMMUNITY.md)
 - [Project manifesto](MANIFESTO.md)
@@ -56,15 +57,7 @@ DarkIRC is opt-in. It is neither rendered nor built for a new tenant unless the 
 
 ### External workers
 
-LunarWing can attach persistent Pebble, OpenCode, or Kimi Code worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant. Nanocode is retired; see [`docs/ops/NANOCODE-REMOVAL.md`](docs/ops/NANOCODE-REMOVAL.md).
-
-External `create_job` calls default to no conversation history. Set
-`context_scope: "recent"` to send bounded user/assistant messages from current
-thread as untrusted reference context; task description remains authoritative.
-
-Local and Docker `create_job` workers default to 200 tool-call iterations. Set
-`max_iterations: 300` (up to 500) for large multi-fix write tasks. Named
-external workers manage their own iteration policy and reject this option.
+LunarWing can attach persistent Pebble, OpenCode, or Kimi Code worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant.
 
 ### Skills and self-improvement
 
@@ -100,7 +93,7 @@ Demo mode does not create tenants or modify host services. The launcher still cr
 
 The supported production path assumes Python 3.10 or newer with `venv` and pip, a Linux host using systemd or OpenRC, root or sudo access, Docker or Podman, `jq`, `git`, download access on first launch, and adequate time and disk space for builds.
 
-For distro-specific prerequisites, use the [Gentoo/OpenRC package list](docs/guides/GENTOO_PACKAGE_LIST.md) or the [Arch Linux/systemd package list](docs/guides/ARCHLINUX_PACKAGE_LIST.md).
+For distro-specific prerequisites, see: docs/guides/
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh doctor
@@ -216,6 +209,8 @@ Additional test surfaces:
 | Known bugs and status | [docs/bugs/README.md](docs/bugs/README.md) |
 | Project blog | [https://blog.lunarwing.org/](https://blog.lunarwing.org/) |
 | Canonical source (Gitlab) | [https://git.lunarwing.org/lunarwing/lunarwing2](https://git.lunarwing.org/lunarwing/lunarwing2) |
+
+#### In order to help us expand documentation, we now have a knowledge MCP server (which will be integrated into LunarWing2 itself) - Please see: [pending]
 
 ## Project and community
 
