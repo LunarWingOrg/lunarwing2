@@ -2,7 +2,7 @@
 
 Sandboxed LunarWing tool for GitLab REST API v4. Ported from NearAI IronHub's
 GitLab tool, adapted for LunarWing WIT 0.3, self-hosted base URLs, host-side PAT
-injection, bounded errors, and explicit approval.
+injection, bounded errors, and approval gating.
 
 ## Supported Actions
 
@@ -18,7 +18,8 @@ injection, bounded errors, and explicit approval.
 - CI/CD: `list_pipelines`, `get_pipeline`, `list_jobs`
 - Profile: `current_user`
 
-`project` accepts a numeric project ID or `group/project`. Issue and merge
+`project` accepts a numeric project ID or `group/project`, as a JSON string or
+number, and may also be spelled `project_id`. Issue and merge
 request `iid` values are project-local IDs shown by GitLab, not global IDs.
 `get_file_content` returns base64 to preserve arbitrary file bytes.
 
@@ -35,8 +36,9 @@ Bundled capability file grants only:
 https://git.lunarwing.org/api/v4/
 ```
 
-No wildcard host grant exists. Every call requires explicit approval, including
-when global or session auto-approval is enabled.
+No wildcard host grant exists. Calls require approval by default; you may
+choose "always allow" at the prompt, per-session, or via global auto-approval
+config to skip subsequent prompts.
 
 Merge approval and merge actions require current merge-request HEAD `sha`.
 Existing-file updates and deletes require current `last_commit_id`; obtain it

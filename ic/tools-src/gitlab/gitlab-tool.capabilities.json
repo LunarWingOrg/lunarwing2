@@ -3,7 +3,7 @@
   "wit_version": "0.3.0",
   "description": "Manage projects, issues, merge requests, branches, repository files, search, and pipelines on self-hosted GitLab. The personal access token is injected host-side and never exposed to WASM.",
   "capabilities": {
-    "approval": "always",
+    "approval": "unless_auto_approved",
     "http": {
       "allowlist": [
         {
