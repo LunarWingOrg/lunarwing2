@@ -426,7 +426,7 @@ Each tenant gets its own Docker/Podman container named `lunarwing-pg-<name>`, bo
 The container is created with `--restart unless-stopped` so it survives host reboots when using Docker. Podman has no daemon to honor that policy, so each tenant's container gets a first-class **supervised unit** instead:
 
 - **OpenRC** — a dedicated `/etc/init.d/lunarwing-pg-<name>` service (which the main daemon `need`s) `podman start`s the container and waits for `pg_isready`; supported workers get `/etc/init.d/lunarwing-{pebble,opencode,kimi}-<name>` the same way. See [`MT-GENTOO-SETUP-AND-CHANGES-MADE.md`](MT-GENTOO-SETUP-AND-CHANGES-MADE.md).
-- **Podman + systemd (rootless)** — a per-tenant **Quadlet** `.container` at `~/.config/containers/systemd/lunarwing-pg-<name>.container` (`Restart=on-failure`, `HealthCmd=pg_isready`), which the podman user-generator turns into `lunarwing-pg-<name>.service` at `daemon-reload`. This supersedes the older `podman generate systemd` approach. See [`../proposals/MT_SYSTEMD_PARITY.md`](../proposals/MT_SYSTEMD_PARITY.md).
+- **Podman + systemd (rootless)** — a per-tenant **Quadlet** `.container` at `~/.config/containers/systemd/lunarwing-pg-<name>.container` (`Restart=on-failure`, `HealthCmd=pg_isready`), which the podman user-generator turns into `lunarwing-pg-<name>.service` at `daemon-reload`. This supersedes the older `podman generate systemd` approach. See the archived [`MT_SYSTEMD_PARITY.md`](../internal/history/proposals/MT_SYSTEMD_PARITY.md) implementation plan.
 
 ## Container Runtime
 
