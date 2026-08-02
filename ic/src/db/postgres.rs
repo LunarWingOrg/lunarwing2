@@ -1389,9 +1389,7 @@ impl ReflexStore for PgBackend {
         for ((user_id, pattern), count) in merged {
             user_ids.push(user_id);
             patterns.push(pattern);
-            counts.push(i64::try_from(count).map_err(|_| {
-                DatabaseError::Constraint("reflex pattern hit count exceeds i64".to_string())
-            })?);
+            counts.push(count.min(i32::MAX as u64) as i64);
         }
 
         let conn = self.store.pool().get().await?;
