@@ -775,9 +775,15 @@ impl EffectBridgeAdapter {
         match result {
             Ok(output) => {
                 let sanitized = self.safety.sanitize_tool_output(lookup_name, &output);
-                let wrapped = self.safety.wrap_for_llm(lookup_name, &sanitized.content);
-                let output_value = serde_json::from_str::<serde_json::Value>(&output)
-                    .unwrap_or(serde_json::Value::String(wrapped));
+                // Parsing the original JSON here would bypass truncation and redaction.
+                drop(output);
+                let output_value = serde_json::from_str::<serde_json::Value>(&sanitized.content)
+                    .unwrap_or_else(|_| {
+                        serde_json::Value::String(
+                            self.safety.wrap_for_llm(lookup_name, &sanitized.content),
+                        )
+                    });
+                drop(sanitized);
 
                 if (lookup_name == "tool_activate" || lookup_name == "tool_auth")
                     && let Some(err) = Self::auth_gate_from_extension_result(
@@ -1428,6 +1434,85 @@ FINAL(echoed + "|" + http_result["error"])"#,
             supervised_timeout_secs: 300,
             prompt_context: Arc::from([]),
         }
+    }
+
+    struct PayloadTool;
+
+    #[async_trait]
+    impl Tool for PayloadTool {
+        fn name(&self) -> &str {
+            "payload"
+        }
+
+        fn description(&self) -> &str {
+            "Return a test payload"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "payload": { "type": "string" } },
+                "required": ["payload"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::success(
+                serde_json::json!({ "payload": params["payload"] }),
+                std::time::Duration::from_millis(1),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_output_honors_safety_size_limit_before_monty_conversion() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(PayloadTool)).await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&lunarwing_safety::SafetyConfig {
+                max_output_length: 128,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        let thread_id = lunarwing_engine::ThreadId::new();
+
+        let small = adapter
+            .execute_action(
+                "payload",
+                serde_json::json!({ "payload": "small" }),
+                &lease(),
+                &exec_ctx(thread_id, Some("small")),
+            )
+            .await
+            .expect("small payload should execute");
+        assert_eq!(small.output["payload"], "small");
+
+        let oversized = adapter
+            .execute_action(
+                "payload",
+                serde_json::json!({ "payload": "x".repeat(4096) }),
+                &lease(),
+                &exec_ctx(thread_id, Some("oversized")),
+            )
+            .await
+            .expect("oversized payload should execute");
+        let bounded = oversized
+            .output
+            .as_str()
+            .expect("modified output should cross the engine boundary as bounded text");
+        assert!(bounded.contains("truncated: showing 128/"));
+        assert!(
+            bounded.len() < 512,
+            "bounded output was {} bytes",
+            bounded.len()
+        );
+        assert!(!bounded.contains(&"x".repeat(256)));
     }
 
     #[tokio::test]
