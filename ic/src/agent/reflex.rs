@@ -329,15 +329,19 @@ async fn run_reflex_hit_flusher(
                     Ok(_) => delay = flush_interval,
                     Err(error) => {
                         tracing::debug!(%error, "Reflex hit telemetry flush failed; backing off");
-                        delay = delay
-                            .checked_mul(2)
-                            .unwrap_or(MAX_REFLEX_HIT_FLUSH_BACKOFF)
-                            .min(MAX_REFLEX_HIT_FLUSH_BACKOFF);
+                        delay = next_reflex_hit_flush_delay(delay);
                     }
                 }
             }
         }
     }
+}
+
+fn next_reflex_hit_flush_delay(delay: Duration) -> Duration {
+    delay
+        .checked_mul(2)
+        .unwrap_or(MAX_REFLEX_HIT_FLUSH_BACKOFF)
+        .min(MAX_REFLEX_HIT_FLUSH_BACKOFF)
 }
 
 // ── ReflexRouter ────────────────────
@@ -355,8 +359,8 @@ pub struct ReflexRouter {
     /// Promoted input variants → canonical stored pattern.
     ///
     /// When a fuzzy variant is promoted into the exact cache, this map
-    /// remembers which stored pattern it came from so match bookkeeping
-    /// (e.g. `bump_reflex_pattern_match`) can target the canonical row.
+    /// remembers which stored pattern it came from so write-behind match
+    /// bookkeeping can target the canonical database row.
     promoted_variants: Arc<RwLock<HashMap<String, String>>>,
     /// Similarity threshold for fuzzy matching.
     fuzzy_threshold: f64,
@@ -1260,6 +1264,22 @@ mod tests {
         assert_eq!(accumulator.tracked_key_count(), 0);
     }
 
+    #[test]
+    fn reflex_hit_flush_backoff_doubles_and_caps() {
+        assert_eq!(
+            next_reflex_hit_flush_delay(Duration::from_secs(3)),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            next_reflex_hit_flush_delay(Duration::from_secs(48)),
+            MAX_REFLEX_HIT_FLUSH_BACKOFF
+        );
+        assert_eq!(
+            next_reflex_hit_flush_delay(Duration::MAX),
+            MAX_REFLEX_HIT_FLUSH_BACKOFF
+        );
+    }
+
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn reflex_hit_accumulator_flushes_one_additive_batch() {
@@ -1317,6 +1337,41 @@ mod tests {
         assert_eq!(counts["pattern-a"], 4);
         assert_eq!(counts["pattern-b"], 2);
         assert_eq!(accumulator.tracked_key_count(), 0);
+
+        backend.bump_reflex_pattern_matches(&[]).await.unwrap();
+        backend
+            .bump_reflex_pattern_matches(&[
+                ReflexPatternHit {
+                    user_id: "user-a".to_string(),
+                    normalized_pattern: "pattern-a".to_string(),
+                    count: 2,
+                },
+                ReflexPatternHit {
+                    user_id: "user-a".to_string(),
+                    normalized_pattern: "pattern-a".to_string(),
+                    count: 3,
+                },
+                ReflexPatternHit {
+                    user_id: "user-a".to_string(),
+                    normalized_pattern: "pattern-b".to_string(),
+                    count: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let patterns = backend.list_reflex_patterns("user-a").await.unwrap();
+        let pattern_a = patterns
+            .iter()
+            .find(|pattern| pattern.normalized_pattern == "pattern-a")
+            .expect("pattern-a");
+        let pattern_b = patterns
+            .iter()
+            .find(|pattern| pattern.normalized_pattern == "pattern-b")
+            .expect("pattern-b");
+        assert_eq!(pattern_a.match_count, 9);
+        assert!(pattern_a.last_matched_at.is_some());
+        assert_eq!(pattern_b.match_count, 2);
     }
 
     // ── Normalization ──
