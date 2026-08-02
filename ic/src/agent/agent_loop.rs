@@ -1272,7 +1272,7 @@ impl Agent {
                     .unwrap_or_default(),
             );
             let channels = Arc::clone(&self.channels);
-            let msg = message.clone();
+            let msg = message.outbound_routing_snapshot();
             let flush: crate::channels::coalesce::FlushFn = Arc::new(move |content| {
                 let channels = Arc::clone(&channels);
                 let msg = msg.clone();
