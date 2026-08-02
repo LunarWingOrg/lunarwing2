@@ -8,13 +8,14 @@ LunarWing is a self-hosted, privacy-focused AI agent runtime and operations plat
   <img src="./lw2_a.jpg" alt="LunarWing" width="1400">
 </p>
 
-## LunarWing v2
+## v2
 
-The v2 line introduces a new execution engine (Engine V2), a browser-based multi-tenant onboarding console, richer gateway interactions, a refreshed foundation for skills, memory, workers, and tools, and more.
+The v2 line introduces a new execution engine (Engine V2), a browser-based multi-tenant onboarding console, richer gateway interactions, a refreshed foundation for skills, memory, workers, and tools, and much more.
 
 ## Quick links
 
 - [Website](https://lunarwing.org/)
+- [Blog](https://blog.lunarwing.org/)
 - [Documentation index](docs/README.md)
 - [Community guide](COMMUNITY.md)
 - [Project manifesto](MANIFESTO.md)
