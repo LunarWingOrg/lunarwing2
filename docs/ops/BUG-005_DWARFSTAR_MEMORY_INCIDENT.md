@@ -311,9 +311,10 @@ It does not configure:
 - a cgroup/scope;
 - a descendant-process reaper.
 
-Its stdout and stderr retention is bounded to 64 KiB per stream and remaining
-output is drained to a sink (`shell.rs:703-742`). Therefore verbose Cargo output
-was not the source of tens of gigabytes of retained strings.
+It reads at most 64 KiB of raw bytes from each output stream before lossy UTF-8
+conversion and drains the remainder to a sink (`shell.rs:703-742`). Conversion
+and stream-combining can add overhead, but this path still cannot retain tens of
+gigabytes of Cargo output.
 
 ### Timeout ownership is inconsistent
 
