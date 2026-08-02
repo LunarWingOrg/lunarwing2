@@ -14,7 +14,7 @@
 ---
 
 1. [ ] (test kimidevroutine) This is a test. Create a markdown file called R1.md in docs/ops - Populate it with a list of every file's name that exists in docs/architecture - do not delete it. commit the file. check off item from box as usual
-2. [ ] (test kimidevroutine) This is a test. Create a markdown file called A1.md in docs/ops - Populate it with list of every file's name that exists in docs/proposals - do not delete it. commit the file. check off item from box as usual
+2. [x] (test kimidevroutine) This is a test. Create a markdown file called A1.md in docs/ops - Populate it with list of every file's name that exists in docs/proposals - do not delete it. commit the file. check off item from box as usual
 3. [ ] Go thru the document: docs/ops/SUNBURST_BUG_LIST.md - you may edit the document - look at each bug in the list and if it was already fixed, mark it as fixed. if it wasnt, mark accordingly
 4. [ ] take a look at the document here: docs/ops/BUG-005_DWARFSTAR_MEMORY_INCIDENT.md - cross-verify with any other relevant documents/code - make edits to this doc if necessary
 5. [ ] go thru docs/ops and see if anything needs updating
