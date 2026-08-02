@@ -1249,6 +1249,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restarted_goal_accepts_short_text_without_retry() {
+        let (mut exec, _tx) = make_loop(
+            vec![text_response("*tail flicks* Back online.")],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+        exec.thread.goal = "restarted".to_string();
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) }
+                if response == "*tail flicks* Back online."
+        ));
+        assert_eq!(exec.thread.step_count, 1);
+    }
+
+    #[tokio::test]
     async fn substantive_plain_text_answer_is_accepted() {
         let answer = "Investigation complete: the orchestrator now retries malformed prose responses and stops after two bounded correction attempts.";
         let (mut exec, _tx) =
