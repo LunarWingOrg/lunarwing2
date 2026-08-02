@@ -201,23 +201,19 @@ fn is_ignorable_format_char(ch: char) -> bool {
 
 /// Lorebook-specific injection scan: sanitizer matches over raw and
 /// canonicalized text plus direct instruction-override phrasing.
-pub(crate) fn reject_lorebook_if_injected(
-    path: &str,
-    content: &str,
-) -> Result<(), WorkspaceError> {
+pub(crate) fn reject_lorebook_if_injected(path: &str, content: &str) -> Result<(), WorkspaceError> {
     reject_if_injected(path, content)?;
     let canonical = canonical_prompt_scan_text(content);
     if canonical != content {
         reject_if_injected(path, &canonical)?;
     }
 
-    static DIRECT_OVERRIDE_RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| {
-            regex::Regex::new(
+    static DIRECT_OVERRIDE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
                 r"(?i)\b(?:disregard|ignore|forget|override|bypass|discard|abandon|reject|supersede)\s+(?:(?:all|any|the|your|prior|previous|system|developer|safety|security|earlier|above|initial)\s+){0,4}(?:instructions?|prompts?|polic(?:y|ies)|rules?|guardrails?|constraints?|context|memory|secrets?|safety|security)\b|\b(?:do\s+not|don't|never|no\s+longer)\s+(?:obey|follow|respect|heed|adhere\s+to|comply\s+with)\s+(?:(?:all|any|the|your|prior|previous|system|developer|safety|security|earlier|above|initial)\s+){0,4}(?:instructions?|prompts?|polic(?:y|ies)|rules?|guardrails?|constraints?)\b|\b(?:act as|pretend to be)\s+(?:the\s+)?(?:system|developer|assistant|user)\b",
             )
             .unwrap() // safety: hardcoded literal
-        });
+    });
     if DIRECT_OVERRIDE_RE.is_match(&canonical) {
         let reason = "direct instruction override detected".to_string();
         tracing::warn!(
