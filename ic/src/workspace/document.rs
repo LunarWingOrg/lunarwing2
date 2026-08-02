@@ -160,6 +160,17 @@ impl WorkspaceEntry {
     }
 }
 
+/// A bounded direct-file read used by prompt-time configuration loaders.
+#[derive(Debug, Clone)]
+pub struct WorkspaceFileContent {
+    /// Workspace-relative path.
+    pub path: String,
+    /// Full content, guaranteed by the query to fit the requested per-file cap.
+    pub content: String,
+    /// Last modification time, used to fingerprint cache entries.
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Merge workspace entries from multiple scopes into a deduplicated, sorted list.
 ///
 /// When the same path appears in multiple scopes:
