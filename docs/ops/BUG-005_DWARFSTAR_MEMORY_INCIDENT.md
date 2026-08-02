@@ -200,6 +200,14 @@ job_mode: worker
 status:   cancelled
 ```
 
+For direct scheduler jobs, `save_job()` persists `source=direct` but omits the
+`job_mode` column, so the schema default supplies `worker`. That value does not
+prove a Docker backend was requested or used; `source=direct` and the scheduler
+path identify this as a local job:
+
+- `ic/src/history/store.rs:145-198`
+- `ic/migrations/V5__claude_code.sql:1-2`
+
 Recorded actions included:
 
 ```text
@@ -523,8 +531,9 @@ Monty/Wasmtime leak.
 `mode=worker` is an availability-dependent compatibility value: it maps to the
 Docker container manager when present and to the local scheduler otherwise. The
 dynamic schema already distinguishes these cases, so local routing is not itself
-a sandbox escape. Persisted `job_mode=worker`, however, does not reveal which
-backend actually ran and complicated this investigation.
+a sandbox escape. Persisted `job_mode=worker` is also the database default for
+direct jobs, so it does not reveal which backend actually ran and complicated
+this investigation.
 
 Recommended behavior:
 
