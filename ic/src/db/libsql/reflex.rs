@@ -254,9 +254,7 @@ impl ReflexStore for LibSqlBackend {
             .map_err(|error| DatabaseError::Query(error.to_string()))?;
         let now = fmt_ts(&Utc::now());
         for ((user_id, pattern), count) in merged {
-            let count = i64::try_from(count).map_err(|_| {
-                DatabaseError::Constraint("reflex pattern hit count exceeds i64".to_string())
-            })?;
+            let count = count.min(i32::MAX as u64) as i64;
             statement
                 .execute(params![user_id, pattern, count, now.as_str()])
                 .await
