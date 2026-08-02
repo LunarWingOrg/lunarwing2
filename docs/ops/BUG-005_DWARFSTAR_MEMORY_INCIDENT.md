@@ -474,7 +474,10 @@ It remains a partial boundary fix:
 - tools still construct and serialize full output before sanitization;
 - `job_events` builds its aggregate before the safety cap;
 - multiple bounded copies remain downstream;
-- historical persisted output is not migrated;
+- `d2ff7b8` performs no eager migration of persisted data. The default Engine
+  orchestrator already lazily truncates historical `ActionResult` messages to
+  8,000 characters before reuse, but source job/event rows remain unchanged
+  (`ic/crates/lunarwing_engine/orchestrator/default.py:258-274,485-501`);
 - aggregate history retention is not bounded by a per-result limit.
 
 Chronologically, `d2ff7b8` was committed after the incident. It cannot be cited
