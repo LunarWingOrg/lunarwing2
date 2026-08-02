@@ -481,8 +481,9 @@ mod tests {
 
         // GitLab-style namespaced path parameters must work: branch names and
         // group/project paths are percent-encoded into a single segment.
-        let gitlab = AllowlistValidator::new(vec![EndpointPattern::host("git.lunarwing.org")
-            .with_path_prefix("/api/v4/")]);
+        let gitlab = AllowlistValidator::new(vec![
+            EndpointPattern::host("git.lunarwing.org").with_path_prefix("/api/v4/"),
+        ]);
         let result = gitlab.validate(
             "https://git.lunarwing.org/api/v4/projects/35/repository/branches/dwarfstar%2Ftest-write-ops",
             "DELETE",
