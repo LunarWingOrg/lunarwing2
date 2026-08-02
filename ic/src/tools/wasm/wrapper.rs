@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use wasmtime::Store;
 use wasmtime::component::{Linker, ResourceTable};
@@ -372,6 +373,32 @@ impl StoreData {
     }
 }
 
+/// Read an HTTP response without buffering past the configured body limit.
+async fn read_capped_http_body<S, B, E>(stream: S, max_bytes: usize) -> Result<Vec<u8>, String>
+where
+    S: futures::Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    let mut stream = std::pin::pin!(stream);
+    let mut body = Vec::with_capacity(max_bytes.min(64 * 1024));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("Failed to read response body: {error}"))?;
+        let bytes = chunk.as_ref();
+        let new_len = body
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| "Response body size overflow".to_string())?;
+        if new_len > max_bytes {
+            return Err(format!(
+                "Response body too large: more than {max_bytes} bytes"
+            ));
+        }
+        body.extend_from_slice(bytes);
+    }
+    Ok(body)
+}
+
 // Provide WASI context for the WASM component.
 // Required because tools are compiled with wasm32-wasip2 target.
 impl WasiView for StoreData {
@@ -630,19 +657,10 @@ impl lunarwing::agent::host::Host for StoreData {
                 ));
             }
 
-            // Read body with a size cap to prevent memory exhaustion.
-            let body = response
-                .bytes()
-                .await
-                .map_err(|e| format!("Failed to read response body: {}", e))?;
-            if body.len() > max_response {
-                return Err(format!(
-                    "Response body too large: {} bytes exceeds limit of {} bytes",
-                    body.len(),
-                    max_response
-                ));
-            }
-            let body = body.to_vec();
+            // Enforce the cap while streaming. Content-Length can be absent or
+            // understated for chunked/compressed responses, so checking only
+            // after `bytes().await` would still permit unbounded buffering.
+            let body = read_capped_http_body(response.bytes_stream(), max_response).await?;
 
             // Leak detection on response body
             if let Ok(body_str) = std::str::from_utf8(&body) {
@@ -2121,6 +2139,7 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::routing::post;
     use axum::{Json, Router};
+    use futures::stream;
     use serde_json::json;
     use tokio::net::TcpListener;
     use tokio::sync::{Mutex as AsyncMutex, oneshot};
@@ -2141,6 +2160,36 @@ mod tests {
     use crate::tools::tool::Tool;
     use crate::tools::wasm::capabilities::{Capabilities, WasmApprovalPolicy};
     use crate::tools::wasm::runtime::{WasmRuntimeConfig, WasmToolRuntime};
+
+    #[tokio::test]
+    async fn capped_http_body_accepts_exact_limit() {
+        let chunks = stream::iter(vec![Ok::<_, String>(b"abc"), Ok(b"def")]);
+        let body = super::read_capped_http_body(chunks, 6)
+            .await
+            .expect("body at the limit should succeed");
+        assert_eq!(body, b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn capped_http_body_rejects_streaming_overflow() {
+        let chunks = stream::iter(vec![Ok::<_, String>(b"abcd"), Ok(b"efgh")]);
+        let error = super::read_capped_http_body(chunks, 6)
+            .await
+            .expect_err("body over the limit should fail");
+        assert!(error.contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn capped_http_body_propagates_chunk_error() {
+        let chunks = stream::iter(vec![
+            Ok::<_, String>(b"abc"),
+            Err("connection reset".to_string()),
+        ]);
+        let error = super::read_capped_http_body(chunks, 6)
+            .await
+            .expect_err("stream failure should fail the request");
+        assert!(error.contains("connection reset"));
+    }
 
     #[test]
     fn declarative_approval_policy_and_ssh_override_are_enforced() {
