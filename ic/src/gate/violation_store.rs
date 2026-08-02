@@ -10,8 +10,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,16 @@ struct ViolationFile {
     agents: HashMap<String, AgentViolations>,
 }
 
+const MAX_TRACKED_AGENTS: usize = 1_024;
+const MAX_RECORDS_PER_AGENT: usize = 32;
+const MAX_AGENT_ID_BYTES: usize = 512;
+const MAX_REASON_BYTES: usize = 2_048;
+const MAX_HOOK_BYTES: usize = 256;
+const MAX_CHANNEL_BYTES: usize = 1_024;
+const MAX_PERSISTED_BYTES: u64 = 16 * 1024 * 1024;
+const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
+const PERSIST_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Tunables for violation escalation.
 #[derive(Debug, Clone)]
 pub struct ViolationStoreConfig {
@@ -83,13 +94,13 @@ impl Default for ViolationStoreConfig {
 impl ViolationStoreConfig {
     /// Load from environment, falling back to defaults.
     ///
-    /// - `COORD_VIOLATION_MAX` (default 3)
+    /// - `COORD_VIOLATION_MAX` (default 3, capped at 64)
     /// - `COORD_VIOLATION_DISABLE_DURATION` (default 86400)
     /// - `COORD_VIOLATION_DECAY` (default 604800)
     pub fn from_env() -> Self {
         let mut config = Self::default();
         if let Some(v) = parse_env_u64("COORD_VIOLATION_MAX") {
-            config.max_violations = v as u32;
+            config.max_violations = v.clamp(1, MAX_RECORDS_PER_AGENT as u64) as u32;
         }
         if let Some(v) = parse_env_u64("COORD_VIOLATION_DISABLE_DURATION") {
             config.disable_duration_secs = v;
@@ -98,6 +109,11 @@ impl ViolationStoreConfig {
             config.decay_secs = v;
         }
         config
+    }
+
+    fn normalized(mut self) -> Self {
+        self.max_violations = self.max_violations.clamp(1, MAX_RECORDS_PER_AGENT as u32);
+        self
     }
 }
 
@@ -112,13 +128,22 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+#[derive(Debug)]
+enum PersistCommand {
+    Dirty,
+    Flush(mpsc::Sender<()>),
+    Shutdown,
+}
+
 /// Persistent violation store shared by coordination hooks and the
 /// coordination gate. Cheap to clone: wrap in `Arc`.
 #[derive(Debug)]
 pub struct ViolationStore {
     path: PathBuf,
     config: ViolationStoreConfig,
-    inner: Mutex<HashMap<String, AgentViolations>>,
+    inner: Arc<Mutex<HashMap<String, AgentViolations>>>,
+    persist_tx: Option<mpsc::SyncSender<PersistCommand>>,
+    writer: Option<JoinHandle<()>>,
 }
 
 impl ViolationStore {
@@ -134,17 +159,24 @@ impl ViolationStore {
 
     /// Open (or create) the store at an explicit path, loading existing state.
     pub fn new(path: PathBuf, config: ViolationStoreConfig) -> Self {
-        let agents = load_from_disk(&path);
+        let config = config.normalized();
+        let mut agents = load_from_disk(&path);
+        normalize_loaded_agents(&mut agents, now_secs(), config.decay_secs);
+        let inner = Arc::new(Mutex::new(agents));
+        let (persist_tx, writer) = start_persistence_worker(path.clone(), Arc::clone(&inner));
         Self {
             path,
             config,
-            inner: Mutex::new(agents),
+            inner,
+            persist_tx,
+            writer,
         }
     }
 
     /// Record a violation and return the agent's resulting status.
     ///
-    /// Strike 3 (or `max_violations`) sets the auto-disable window.
+    /// Strike 3 (or `max_violations`) sets the auto-disable window. Persistence
+    /// is debounced on a dedicated thread; the request path never performs disk I/O.
     pub fn record_violation(
         &self,
         agent: &str,
@@ -165,21 +197,38 @@ impl ViolationStore {
         channel: &str,
         now: u64,
     ) -> ViolationStatus {
-        let mut guard = lock(&self.inner);
-        let entry = guard.entry(agent.to_string()).or_default();
-        prune_decayed(entry, now, self.config.decay_secs);
-        entry.records.push(ViolationRecord {
-            timestamp_secs: now,
-            reason: reason.to_string(),
-            hook: hook.to_string(),
-            channel: channel.to_string(),
-        });
-        let strikes = entry.records.len() as u32;
-        if strikes >= self.config.max_violations && entry.disabled_until_secs.is_none() {
-            entry.disabled_until_secs = Some(now + self.config.disable_duration_secs);
+        if agent.len() > MAX_AGENT_ID_BYTES {
+            tracing::warn!(
+                agent_len = agent.len(),
+                "Rejected oversized violation actor ID"
+            );
+            return self.capacity_status(now);
         }
-        let status = status_of(entry, now);
-        persist(&self.path, &guard);
+        let status = {
+            let mut guard = lock(&self.inner);
+            if !guard.contains_key(agent) && !admit_actor(&mut guard, now, self.config.decay_secs) {
+                tracing::warn!("Violation actor limit reached; failing closed for new actor");
+                return self.capacity_status(now);
+            }
+            let entry = guard.entry(agent.to_string()).or_default();
+            prune_decayed(entry, now, self.config.decay_secs);
+            if entry.records.len() == MAX_RECORDS_PER_AGENT {
+                entry.records.remove(0);
+            }
+            entry.records.push(ViolationRecord {
+                timestamp_secs: now,
+                reason: bounded_text(reason, MAX_REASON_BYTES),
+                hook: bounded_text(hook, MAX_HOOK_BYTES),
+                channel: bounded_text(channel, MAX_CHANNEL_BYTES),
+            });
+            let strikes = entry.records.len() as u32;
+            if strikes >= self.config.max_violations && entry.disabled_until_secs.is_none() {
+                entry.disabled_until_secs =
+                    Some(now.saturating_add(self.config.disable_duration_secs));
+            }
+            status_of(entry, now, self.config.decay_secs)
+        };
+        self.schedule_persist();
         status
     }
 
@@ -188,7 +237,7 @@ impl ViolationStore {
         let now = now_secs();
         let guard = lock(&self.inner);
         match guard.get(agent) {
-            Some(entry) => status_of(entry, now),
+            Some(entry) => status_of(entry, now, self.config.decay_secs),
             None => ViolationStatus::Active,
         }
     }
@@ -199,41 +248,107 @@ impl ViolationStore {
         let guard = lock(&self.inner);
         guard
             .iter()
-            .map(|(agent, entry)| (agent.clone(), status_of(entry, now)))
+            .map(|(agent, entry)| (agent.clone(), status_of(entry, now, self.config.decay_secs)))
             .collect()
     }
 
     /// Whether the agent is currently disabled (manual or auto, unexpired).
     pub fn is_disabled(&self, agent: &str) -> bool {
         matches!(self.status(agent), ViolationStatus::Disabled { .. })
-            || lock(&self.inner)
-                .get(agent)
-                .is_some_and(|e| e.manual_disabled)
     }
 
     /// Reset all violations and re-enable the agent.
     pub fn clear(&self, agent: &str) {
-        let mut guard = lock(&self.inner);
-        guard.remove(agent);
-        persist(&self.path, &guard);
+        {
+            let mut guard = lock(&self.inner);
+            guard.remove(agent);
+        }
+        self.persist_immediately();
     }
 
     /// Manually disable the agent until [`ViolationStore::manual_enable`] or
     /// [`ViolationStore::clear`].
     pub fn manual_disable(&self, agent: &str) {
-        let mut guard = lock(&self.inner);
-        guard.entry(agent.to_string()).or_default().manual_disabled = true;
-        persist(&self.path, &guard);
+        if agent.len() > MAX_AGENT_ID_BYTES {
+            tracing::warn!(
+                agent_len = agent.len(),
+                "Rejected oversized manual-disable actor ID"
+            );
+            return;
+        }
+        {
+            let mut guard = lock(&self.inner);
+            if !guard.contains_key(agent)
+                && !make_room_for_admin_actor(&mut guard, now_secs(), self.config.decay_secs)
+            {
+                tracing::warn!("Violation actor limit reached; manual disable was not recorded");
+                return;
+            }
+            guard.entry(agent.to_string()).or_default().manual_disabled = true;
+        }
+        self.persist_immediately();
     }
 
     /// Re-enable a manually disabled agent (violations are kept).
     pub fn manual_enable(&self, agent: &str) {
-        let mut guard = lock(&self.inner);
-        if let Some(entry) = guard.get_mut(agent) {
-            entry.manual_disabled = false;
-            entry.disabled_until_secs = None;
+        {
+            let mut guard = lock(&self.inner);
+            if let Some(entry) = guard.get_mut(agent) {
+                entry.manual_disabled = false;
+                entry.disabled_until_secs = None;
+            }
         }
-        persist(&self.path, &guard);
+        self.persist_immediately();
+    }
+
+    fn capacity_status(&self, now: u64) -> ViolationStatus {
+        ViolationStatus::Disabled {
+            until_secs: now.saturating_add(self.config.disable_duration_secs),
+        }
+    }
+
+    fn schedule_persist(&self) {
+        let Some(tx) = &self.persist_tx else {
+            persist_snapshot(&self.path, &self.inner);
+            return;
+        };
+        match tx.try_send(PersistCommand::Dirty) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!("Violation persistence worker stopped; persisting synchronously");
+                persist_snapshot(&self.path, &self.inner);
+            }
+        }
+    }
+
+    fn persist_immediately(&self) {
+        let Some(tx) = &self.persist_tx else {
+            persist_snapshot(&self.path, &self.inner);
+            return;
+        };
+        let (ack_tx, ack_rx) = mpsc::channel();
+        if tx.send(PersistCommand::Flush(ack_tx)).is_err()
+            || ack_rx.recv_timeout(PERSIST_ACK_TIMEOUT).is_err()
+        {
+            tracing::warn!("Violation persistence worker unavailable; persisting synchronously");
+            persist_snapshot(&self.path, &self.inner);
+        }
+    }
+}
+
+impl Drop for ViolationStore {
+    fn drop(&mut self) {
+        let shutdown_sent = self
+            .persist_tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(PersistCommand::Shutdown).is_ok());
+        let joined = self
+            .writer
+            .take()
+            .is_none_or(|writer| writer.join().is_ok());
+        if !shutdown_sent || !joined {
+            persist_snapshot(&self.path, &self.inner);
+        }
     }
 }
 
@@ -251,6 +366,11 @@ fn prune_decayed(entry: &mut AgentViolations, now: u64, decay_secs: u64) {
     entry
         .records
         .retain(|r| now.saturating_sub(r.timestamp_secs) < decay_secs);
+    if entry.records.len() > MAX_RECORDS_PER_AGENT {
+        entry
+            .records
+            .drain(..entry.records.len() - MAX_RECORDS_PER_AGENT);
+    }
     // An expired automatic disable clears independently of strike decay so a
     // later violation can re-arm the disable window (ISSUE-008). Manual
     // disables carry no timestamp and are unaffected.
@@ -262,7 +382,15 @@ fn prune_decayed(entry: &mut AgentViolations, now: u64, decay_secs: u64) {
     }
 }
 
-fn status_of(entry: &AgentViolations, now: u64) -> ViolationStatus {
+fn active_record_count(entry: &AgentViolations, now: u64, decay_secs: u64) -> usize {
+    entry
+        .records
+        .iter()
+        .filter(|record| now.saturating_sub(record.timestamp_secs) < decay_secs)
+        .count()
+}
+
+fn status_of(entry: &AgentViolations, now: u64, decay_secs: u64) -> ViolationStatus {
     if entry.manual_disabled {
         return ViolationStatus::Disabled {
             until_secs: u64::MAX,
@@ -273,44 +401,204 @@ fn status_of(entry: &AgentViolations, now: u64) -> ViolationStatus {
     {
         return ViolationStatus::Disabled { until_secs: until };
     }
-    match entry.records.len() {
+    match active_record_count(entry, now, decay_secs) {
         0 => ViolationStatus::Active,
         1 => ViolationStatus::Warning,
         _ => ViolationStatus::FinalWarning,
     }
 }
 
+fn admit_actor(agents: &mut HashMap<String, AgentViolations>, now: u64, decay_secs: u64) -> bool {
+    prune_inactive_agents(agents, now, decay_secs);
+    agents.len() < MAX_TRACKED_AGENTS
+}
+
+fn make_room_for_admin_actor(
+    agents: &mut HashMap<String, AgentViolations>,
+    now: u64,
+    decay_secs: u64,
+) -> bool {
+    if admit_actor(agents, now, decay_secs) {
+        return true;
+    }
+    let eviction = agents
+        .iter()
+        .filter(|(_, entry)| !entry.manual_disabled)
+        .min_by_key(|(_, entry)| {
+            entry
+                .records
+                .last()
+                .map_or(0, |record| record.timestamp_secs)
+        })
+        .map(|(agent, _)| agent.clone());
+    eviction.is_some_and(|agent| agents.remove(&agent).is_some())
+}
+
+fn prune_inactive_agents(agents: &mut HashMap<String, AgentViolations>, now: u64, decay_secs: u64) {
+    agents.retain(|_, entry| {
+        prune_decayed(entry, now, decay_secs);
+        entry.manual_disabled || !entry.records.is_empty() || entry.disabled_until_secs.is_some()
+    });
+}
+
+fn normalize_loaded_agents(
+    agents: &mut HashMap<String, AgentViolations>,
+    now: u64,
+    decay_secs: u64,
+) {
+    prune_inactive_agents(agents, now, decay_secs);
+    agents.retain(|agent, entry| {
+        if agent.len() > MAX_AGENT_ID_BYTES {
+            return false;
+        }
+        for record in &mut entry.records {
+            record.reason = bounded_text(&record.reason, MAX_REASON_BYTES);
+            record.hook = bounded_text(&record.hook, MAX_HOOK_BYTES);
+            record.channel = bounded_text(&record.channel, MAX_CHANNEL_BYTES);
+        }
+        true
+    });
+    if agents.len() > MAX_TRACKED_AGENTS {
+        let mut keys: Vec<_> = agents
+            .iter()
+            .map(|(agent, entry)| {
+                (
+                    agent.clone(),
+                    entry.manual_disabled,
+                    entry
+                        .records
+                        .last()
+                        .map_or(0, |record| record.timestamp_secs),
+                )
+            })
+            .collect();
+        keys.sort_by_key(|(_, manual, timestamp)| (*manual, *timestamp));
+        for (agent, _, _) in keys.into_iter().take(agents.len() - MAX_TRACKED_AGENTS) {
+            agents.remove(&agent);
+        }
+    }
+}
+
+fn bounded_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn start_persistence_worker(
+    path: PathBuf,
+    inner: Arc<Mutex<HashMap<String, AgentViolations>>>,
+) -> (
+    Option<mpsc::SyncSender<PersistCommand>>,
+    Option<JoinHandle<()>>,
+) {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let writer = std::thread::Builder::new()
+        .name("violation-persist".to_string())
+        .spawn(move || persistence_worker(&path, &inner, rx));
+    match writer {
+        Ok(writer) => (Some(tx), Some(writer)),
+        Err(err) => {
+            tracing::warn!(error = %err, "Failed to start violation persistence worker");
+            (None, None)
+        }
+    }
+}
+
+fn persistence_worker(
+    path: &PathBuf,
+    inner: &Arc<Mutex<HashMap<String, AgentViolations>>>,
+    rx: mpsc::Receiver<PersistCommand>,
+) {
+    while let Ok(command) = rx.recv() {
+        match command {
+            PersistCommand::Dirty if !debounce_and_persist(path, inner, &rx) => return,
+            PersistCommand::Dirty => {}
+            PersistCommand::Flush(ack) => {
+                persist_snapshot(path, inner);
+                let _ = ack.send(());
+            }
+            PersistCommand::Shutdown => {
+                persist_snapshot(path, inner);
+                return;
+            }
+        }
+    }
+    persist_snapshot(path, inner);
+}
+
+/// Returns false when the worker consumed a shutdown/disconnect signal.
+fn debounce_and_persist(
+    path: &PathBuf,
+    inner: &Arc<Mutex<HashMap<String, AgentViolations>>>,
+    rx: &mpsc::Receiver<PersistCommand>,
+) -> bool {
+    let deadline = Instant::now() + PERSIST_DEBOUNCE;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(PersistCommand::Dirty) => {}
+            Ok(PersistCommand::Flush(ack)) => {
+                persist_snapshot(path, inner);
+                let _ = ack.send(());
+                return true;
+            }
+            Ok(PersistCommand::Shutdown) => {
+                persist_snapshot(path, inner);
+                return false;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                persist_snapshot(path, inner);
+                return true;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                persist_snapshot(path, inner);
+                return false;
+            }
+        }
+    }
+}
+
 fn load_from_disk(path: &PathBuf) -> HashMap<String, AgentViolations> {
-    match std::fs::read_to_string(path) {
+    let content = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > MAX_PERSISTED_BYTES => {
+            tracing::warn!(path = %path.display(), size = metadata.len(), "Coordination violations file exceeds size limit, starting empty");
+            return HashMap::new();
+        }
+        Ok(_) => std::fs::read_to_string(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(err) => Err(err),
+    };
+    match content {
         Ok(content) => match serde_json::from_str::<ViolationFile>(&content) {
             Ok(file) => file.agents,
             Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "Coordination violations file is invalid JSON, starting empty"
-                );
+                tracing::warn!(path = %path.display(), error = %err, "Coordination violations file is invalid JSON, starting empty");
                 HashMap::new()
             }
         },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
         Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "Failed to read coordination violations file, starting empty"
-            );
+            tracing::warn!(path = %path.display(), error = %err, "Failed to read coordination violations file, starting empty");
             HashMap::new()
         }
     }
 }
 
+fn persist_snapshot(path: &PathBuf, inner: &Mutex<HashMap<String, AgentViolations>>) {
+    let snapshot = lock(inner).clone();
+    persist(path, &snapshot);
+}
+
 /// Atomic write: serialize to a temp file in the same directory, then rename.
 fn persist(path: &PathBuf, agents: &HashMap<String, AgentViolations>) {
-    let file = ViolationFile {
+    let json = match serde_json::to_vec_pretty(&ViolationFile {
         agents: agents.clone(),
-    };
-    let json = match serde_json::to_vec_pretty(&file) {
+    }) {
         Ok(json) => json,
         Err(err) => {
             tracing::warn!(error = %err, "Failed to serialize coordination violations");
@@ -458,5 +746,38 @@ mod tests {
         // Manual disable is independent of the expiry normalization.
         store.manual_disable("agent-g");
         assert!(store.is_disabled("agent-g"));
+    }
+
+    #[test]
+    fn test_violation_flood_is_bounded() {
+        let store = test_store();
+        let oversized = "x".repeat(MAX_REASON_BYTES * 2);
+        for index in 0..(MAX_TRACKED_AGENTS + 10) {
+            store.record_violation(&format!("agent-{index}"), &oversized, "hook", "channel");
+        }
+        for _ in 0..(MAX_RECORDS_PER_AGENT + 10) {
+            store.record_violation("agent-0", &oversized, "hook", "channel");
+        }
+
+        let guard = lock(&store.inner);
+        assert_eq!(guard.len(), MAX_TRACKED_AGENTS);
+        let records = &guard["agent-0"].records;
+        assert_eq!(records.len(), MAX_RECORDS_PER_AGENT);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.reason.len() == MAX_REASON_BYTES)
+        );
+    }
+
+    #[test]
+    fn test_oversized_actor_fails_closed_without_storage() {
+        let store = test_store();
+        let actor = "a".repeat(MAX_AGENT_ID_BYTES + 1);
+        assert!(matches!(
+            store.record_violation(&actor, "reason", "hook", "channel"),
+            ViolationStatus::Disabled { .. }
+        ));
+        assert!(!lock(&store.inner).contains_key(&actor));
     }
 }
