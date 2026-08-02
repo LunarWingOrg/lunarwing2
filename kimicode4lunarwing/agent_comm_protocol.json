@@ -10,7 +10,8 @@
     "ping_interval_ms": 20000,
     "auth": {
       "method": "bearer",
-      "token_env": "AGENT_AUTH_TOKEN"
+      "token_env": "AGENT_AUTH_TOKEN",
+      "required": false
     }
   },
 
@@ -82,7 +83,7 @@
   },
 
   "error_codes": {
-    "4001": "Unauthorized — invalid or missing auth token",
+    "4001": "Unauthorized — invalid or missing configured auth token",
     "4002": "Task not found — cancel referencing unknown task_id",
     "4003": "Timeout — task exceeded timeout_ms",
     "4004": "Rate limited — too many concurrent tasks",

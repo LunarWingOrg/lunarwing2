@@ -19,6 +19,7 @@ x-worker-base: &worker-base
     - path: ${EXTRA_ENV_FILE:-.env.secrets}
       required: false
   environment: &worker-env
+    # Optional. A non-empty value enables bearer authentication.
     AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:-}
     LUNARWING_WORKER_ID: ${LUNARWING_WORKER_ID:-worker-kimi-01}
     KIMI_API_KEY: ${KIMI_API_KEY:-}

@@ -7,16 +7,15 @@ WebSocket bridge that integrates [Kimi Code CLI](https://github.com/MoonshotAI/k
 ### Docker
 
 ```bash
-AGENT_AUTH_TOKEN="$(openssl rand -hex 32)"
-export AGENT_AUTH_TOKEN KIMI_API_KEY
 docker compose build
 docker compose up -d lunarwing-worker
 ```
 
-Server mode refuses to start without `AGENT_AUTH_TOKEN`, including loopback-only
-deployments. Browser clients can reach loopback ports, so loopback is not an
-authentication boundary. Build with `WITH_TOOLCHAINS=true` for same Rust, Go,
-C/C++, Python, and native development packages as OpenCode worker.
+Server mode does not require `AGENT_AUTH_TOKEN`. When set, the bridge requires
+the same value as a bearer token from clients. Default Compose host publication
+is loopback-only; configure a token when exposing the bridge to other hosts or
+untrusted container networks. Build with `WITH_TOOLCHAINS=true` for same Rust,
+Go, C/C++, Python, and native development packages as OpenCode worker.
 
 ### CLI mode (one-shot)
 
@@ -36,7 +35,7 @@ Add to `config.toml` under `LUNARWING_BASE_DIR`:
 [[sandbox.external_workers]]
 name = "kimi"
 url = "ws://localhost:9090/ws/agent"
-auth_token = "same value as AGENT_AUTH_TOKEN"
+# auth_token = "same optional value as AGENT_AUTH_TOKEN"
 timeout_ms = 3600000
 prompt_context = { max_messages = 12, max_chars_per_message = 2000, max_total_chars = 12000 }
 ```
