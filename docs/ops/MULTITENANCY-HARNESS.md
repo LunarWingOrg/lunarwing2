@@ -4,82 +4,73 @@ How to run multiple isolated LunarWing instances on the same host using the test
 
 For a single instance, see [`HARNESS-SINGLE-TENANT.md`](HARNESS-SINGLE-TENANT.md).
 
-## Port Map
+## Canonical Two-Tenant Flow
 
-Every port used by the harness is now configurable via `LUNARWING_TEST_*` env vars.
-Set them before running `init` to generate env files with your chosen ports.
+The `mt-*` commands create two isolated roots, `${LUNARWING_MT_ROOT}-a` and
+`${LUNARWING_MT_ROOT}-b`. `LUNARWING_MT_ROOT` defaults to
+`${TMPDIR:-/tmp}/lunarwing-mt`; set it before `mt-init` if the state should live
+elsewhere. The built-in flow assigns the following fixed, non-overlapping ports:
 
-| Service | Variable | Default | Description |
-|---------|----------|---------|-------------|
-| PostgreSQL | `LUNARWING_TEST_PG_PORT` | 5432 | Postgres container host port |
-| TensorZero proxy | `LUNARWING_TEST_PROXY_PORT` | 3002 | Local LLM routing proxy |
-| TensorZero proxy bind | `LUNARWING_TEST_PROXY_BIND` | 127.0.0.1 | Proxy listen address |
-| Gateway (REST API) | `LUNARWING_TEST_GATEWAY_PORT` | 8765 | LunarWing gateway HTTP |
-| HTTP webhook | `LUNARWING_TEST_HTTP_PORT` | 9098 | Inbound webhook listener |
-| XMPP bridge | `LUNARWING_TEST_BRIDGE_BIND` | 127.0.0.1:8787 | Bridge HTTP bind (host:port) |
-| Weechat relay | `LUNARWING_TEST_WEECHAT_PORT` | 9001 | Weechat relay port (future) |
+| Service | Tenant A | Tenant B |
+|---------|----------|----------|
+| PostgreSQL | 15432 | 15433 |
+| TensorZero proxy | 13002 | 13003 |
+| Gateway | 18765 | 18766 |
+| HTTP webhook | 19098 | 19099 |
+| XMPP bridge | 18787 | 18788 |
+| WeeChat relay (reserved) | 19001 | 19002 |
 
-## Example: Two Instances Side-by-Side
-
-### Instance A (defaults)
-
-```bash
-cd ic
-scripts/lunarwing-xmpp-test-env.sh init
-scripts/lunarwing-xmpp-test-env.sh up
-```
-
-### Instance B (all ports shifted)
+On the Linux dev VM, use the release profile and constrain every command that
+may invoke Cargo to six CPUs and six jobs:
 
 ```bash
 cd ic
-export LUNARWING_TEST_ROOT=/tmp/lunarwing-tenant-b
-export LUNARWING_TEST_PG_PORT=5433
-export LUNARWING_TEST_PG_CONTAINER=lunarwing-test-postgres-b
-export LUNARWING_TEST_PROXY_PORT=3003
-export LUNARWING_TEST_GATEWAY_PORT=8766
-export LUNARWING_TEST_HTTP_PORT=9099
-export LUNARWING_TEST_BRIDGE_BIND=127.0.0.1:8788
-export LUNARWING_TEST_WEECHAT_PORT=9002
+export LUNARWING_TEST_PROFILE=release
+export CARGO_BUILD_JOBS=6
 
-scripts/lunarwing-xmpp-test-env.sh init
-scripts/lunarwing-xmpp-test-env.sh up
+scripts/lunarwing-xmpp-test-env.sh mt-init
+taskset -c 0-5 scripts/lunarwing-xmpp-test-env.sh build
+taskset -c 0-5 scripts/lunarwing-xmpp-test-env.sh mt-up
+scripts/lunarwing-xmpp-test-env.sh mt-verify
+scripts/lunarwing-xmpp-test-env.sh mt-status
+scripts/lunarwing-xmpp-test-env.sh mt-down
 ```
 
-Both stacks run independently with no port conflicts.
+`mt-up` rebuilds the available WASM extensions once, installs them into both
+tenant roots, and starts both stacks using the detected platform path. Always
+run `mt-down` after the test, including after a failed `mt-verify`.
 
-## Secret Management Instructions:
+For libSQL instead of PostgreSQL, export
+`LUNARWING_MT_DATABASE_KIND=libsql` before `mt-init`. To inspect gateway tokens,
+run `scripts/lunarwing-xmpp-test-env.sh mt-tokens` in a private terminal; the
+command prints bearer tokens and its output must not be pasted into logs or
+issues.
 
-# For tenant A:                                                                                                       
-  source /tmp/lunarwing-mt-a/env/lunarwing.env                                                                          
-  python3 ic_sm/scripts_4_db/insert_secret_pg.py ...                                                                  
-                                                            
-  # For tenant B:                                           
-  source /tmp/lunarwing-mt-b/env/lunarwing.env                                                                          
-  python3 ic_sm/scripts_4_db/insert_secret_pg.py ...
+## Secret Handling
 
-### Each tenant will have own master key and its own database on its own port so source the env vars is the way to go here.
-
-## Notes
-
-- Each instance needs its own `LUNARWING_TEST_ROOT` for isolated state/env/logs/pids.
-- Each instance needs its own `LUNARWING_TEST_PG_CONTAINER` name to avoid Docker container conflicts.
-- The `DATABASE_URL` is auto-derived from `PG_PORT` unless you override `LUNARWING_TEST_DATABASE_URL` explicitly.
-- For libSQL instances, port conflicts are only on the service ports (no database container).
-- Systemd unit names are also configurable via `LUNARWING_TEST_SERVICE_NAME`, `LUNARWING_TEST_BRIDGE_SERVICE_NAME`, and `LUNARWING_TEST_PROXY_SERVICE_NAME`.
+Each generated tenant env has its own database, owner ID, gateway token, and
+secrets master key. The files are mode `0600`; do not source them in a shared
+shell or print their contents. Configure only the test credentials each tenant
+needs through supported application/setup flows. Do **not** use
+`ic_sm/scripts_4_db/insert_secret_pg.py` here: it is a migration/repair helper,
+not the harness secret-management interface.
 
 ## Platform Support
 
 The harness is cross-platform. Init system detection is automatic:
 
-| Platform | `mt-up`/`mt-down` method | Service unit format |
-|----------|--------------------------|---------------------|
-| macOS | launchd user agents | `.plist` in `$TEST_ROOT/launchd/` → `~/Library/LaunchAgents/` |
-| Linux (systemd) | systemd user units | `.service` in `$TEST_ROOT/systemd/` → `~/.config/systemd/user/` |
-| Linux (OpenRC) | rc-service (direct) | direct process management fallback |
-| Other | direct PID management | — |
+| Platform | `mt-up`/`mt-down` method | Generated service files |
+|----------|--------------------------|-------------------------|
+| macOS | launchd user agents | `.plist` under each tenant root, installed in `~/Library/LaunchAgents/` |
+| Linux (systemd) | systemd user units | `.service` under each tenant root, installed in `~/.config/systemd/user/` |
+| Linux (OpenRC) | direct PID management | None; the test harness does not install OpenRC services |
+| Other | direct PID management | None |
 
-> **Note — OpenRC not yet been FULLY validated:** The OpenRC path has been implemented but has not been tested end-to-end on a real OpenRC system. (However, this task WILL be completed very soon...) `_mt_detect_init()` correctly identifies OpenRC and `doctor` reports `rc-service` status, but neither `mt-up`/`mt-down` nor single-tenant `up`/`down` have been run on Gentoo, Alpine, or any other OpenRC host. Treat the OpenRC path as best-effort until a full test is completed.
+> **OpenRC validation status:** `_mt_detect_init()` recognizes OpenRC, but the
+> `mt-*` lifecycle deliberately falls back to the same direct process path as an
+> unknown init. It does not exercise the production OpenRC units. This path has
+> not been verified end-to-end on a current Gentoo host; treat it as unverified,
+> not as evidence of production OpenRC parity.
 
 ### macOS Prerequisites
 
@@ -109,14 +100,20 @@ docker pull pgvector/pgvector:pg16
 
 ```bash
 cd ic
+export LUNARWING_TEST_PROFILE=release
+export CARGO_BUILD_JOBS=6
 scripts/lunarwing-xmpp-test-env.sh mt-init
-scripts/lunarwing-xmpp-test-env.sh build --with-wasm  # builds daemon, bridge, + all 20 WASM
-scripts/lunarwing-xmpp-test-env.sh mt-up              # auto-detects macOS, renders + loads plists
+scripts/lunarwing-xmpp-test-env.sh build
+scripts/lunarwing-xmpp-test-env.sh mt-up  # renders and loads tenant-scoped plists
 scripts/lunarwing-xmpp-test-env.sh mt-verify
 scripts/lunarwing-xmpp-test-env.sh mt-down
 ```
 
-`mt-up` automatically renders launchd plists and calls `launchctl load` — you do not need to run `mt-render-launchd` separately. Plists are tenant-scoped (`com.lunarwing.test.mt-a.*`, `com.lunarwing.test.mt-b.*`) so both tenants coexist in `~/Library/LaunchAgents/` without label conflicts. `mt-down` unloads all agents and removes them.
+`mt-up` automatically builds and installs available WASM extensions, renders
+launchd plists, and loads them; do not run a separate `build --with-wasm` or
+`mt-render-launchd`. Plists are tenant-scoped (`com.lunarwing.test.mt-a.*`,
+`com.lunarwing.test.mt-b.*`) so both tenants coexist in
+`~/Library/LaunchAgents/`. `mt-down` unloads all agents and removes them.
 
 ### Single-tenant on macOS
 
