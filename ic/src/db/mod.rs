@@ -771,12 +771,29 @@ pub trait ReflexStore: Send + Sync {
     /// Disable a reflex pattern by ID.
     async fn disable_reflex_pattern(&self, id: Uuid) -> Result<bool, DatabaseError>;
 
-    /// Increment match count and update last_matched_at for a pattern.
+    /// Increment one pattern by one match.
     async fn bump_reflex_pattern_match(
         &self,
         user_id: &str,
         normalized_pattern: &str,
     ) -> Result<(), DatabaseError>;
+
+    /// Increment match counts and update timestamps for a batch of patterns.
+    ///
+    /// Implementations should override this with one atomic batch operation.
+    /// The default preserves compatibility for lightweight store implementations.
+    async fn bump_reflex_pattern_matches(
+        &self,
+        hits: &[ReflexPatternHit],
+    ) -> Result<(), DatabaseError> {
+        for hit in hits {
+            for _ in 0..hit.count {
+                self.bump_reflex_pattern_match(&hit.user_id, &hit.normalized_pattern)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
 
     /// Record a failed compilation attempt for a reflex pattern.
     ///
@@ -828,6 +845,14 @@ pub trait ReflexStore: Send + Sync {
         query_embedding: &[f32],
         limit: i32,
     ) -> Result<Vec<(ReflexPatternRecord, f64)>, DatabaseError>;
+}
+
+/// Additive reflex match-count update used by write-behind batching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflexPatternHit {
+    pub user_id: String,
+    pub normalized_pattern: String,
+    pub count: u64,
 }
 
 /// A persisted reflex pattern record.
