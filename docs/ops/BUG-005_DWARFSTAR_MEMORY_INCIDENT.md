@@ -433,10 +433,10 @@ After `d2ff7b8`, the adapter drops the original serialized string and parses
 
 This correctly bounds newly executed outputs before they enter Engine/Monty
 state. For outputs at or below the safety size limit it also restores leak
-redaction, policy enforcement, and injection sanitization. Oversized output is
-truncated first and returned before those later safety stages, so `d2ff7b8` does
-not by itself guarantee redaction of the retained prefix. The new regression
-test passed:
+redaction and policy enforcement, plus injection sanitization when that check is
+enabled or policy-forced. Oversized output is truncated first and returned
+before those later safety stages, so `d2ff7b8` does not by itself guarantee
+redaction of the retained prefix. The new regression test passed:
 
 ```text
 bridge::effect_adapter::tests::
