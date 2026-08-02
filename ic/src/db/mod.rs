@@ -916,6 +916,7 @@ pub trait WorkspaceStore: Send + Sync {
         suffix: &str,
         limit: usize,
         max_file_bytes: usize,
+        max_total_bytes: usize,
     ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError>;
     async fn list_all_paths(
         &self,
