@@ -825,12 +825,14 @@ mod tests {
     }
 
     #[test]
-    fn gitlab_sidecar_pins_host_and_requires_approval() {
+    fn gitlab_sidecar_pins_host_and_gates_approval() {
         let json = include_str!("../../../tools-src/gitlab/gitlab-tool.capabilities.json");
         let file = CapabilitiesFile::from_json(json).expect("GitLab sidecar should parse");
         let caps = file.to_capabilities();
 
-        assert_eq!(caps.approval, WasmApprovalPolicy::Always);
+        // Calls prompt by default, but the user may always-allow the tool
+        // (per-session or via global auto-approve config).
+        assert_eq!(caps.approval, WasmApprovalPolicy::UnlessAutoApproved);
         let http = caps.http.expect("GitLab HTTP capability");
         assert_eq!(http.allowlist.len(), 1);
         assert_eq!(http.allowlist[0].host, "git.lunarwing.org");
