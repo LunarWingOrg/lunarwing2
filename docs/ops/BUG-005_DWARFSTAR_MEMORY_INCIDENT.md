@@ -9,7 +9,14 @@
 >
 > The running binary's embedded source revision was not independently recorded.
 >
-> **Investigation branch:** `memleakfix4/cmc/v2.0.4.0`, commit `6c82e8c`
+> **Investigation baseline:** `memleakfix4/cmc/v2.0.4.0`, commit `6c82e8c`;
+> the report itself was added one commit later as `11b673d`.
+>
+> **Cross-verification:** Rechecked against repository HEAD `1e319bf` on
+> 2026-08-02. The source-level failure chain and open remediation status remain
+> current. Historical tenant journal, database, filesystem, and `/proc` figures
+> below are preserved investigation evidence; they cannot be independently
+> reproduced from this checkout alone.
 >
 > **Confidence:** High that Rust compilation drove the observed service-cgroup
 > peaks; no evidence confirms a Monty, Wasmtime, or LunarWing-process heap leak.
