@@ -1449,6 +1449,7 @@ async fn handle_execute_actions_parallel(
         let mut join_set = tokio::task::JoinSet::new();
         let effects = effects.clone();
 
+        let mut pending_lease_uses = Vec::with_capacity(runnable.len());
         for (idx, lease) in runnable {
             let pc_name = parsed[idx].name.clone();
             let pc_params = parsed[idx].params.clone();
@@ -1469,6 +1470,7 @@ async fn handle_execute_actions_parallel(
             };
             let ps = summarize_params(&pc_name, &pc_params);
 
+            pending_lease_uses.push(lease.id);
             join_set.spawn(async move {
                 let result = execute_single_action(
                     &effects,
@@ -1487,27 +1489,41 @@ async fn handle_execute_actions_parallel(
         let mut execution_stopped = false;
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
-                Ok((idx, lease_id, result)) => match result {
-                    Ok((result_json, event, output)) => {
-                        if interrupted_result_needs_refund(&result_json) {
+                Ok((idx, lease_id, result)) => {
+                    if let Some(position) = pending_lease_uses
+                        .iter()
+                        .position(|pending_id| *pending_id == lease_id)
+                    {
+                        pending_lease_uses.swap_remove(position);
+                    }
+                    match result {
+                        Ok((result_json, event, output)) => {
+                            if interrupted_result_needs_refund(&result_json) {
+                                let _ = leases.refund_use(lease_id).await;
+                            }
+                            slot_results[idx] = Some(result_json);
+                            slot_events[idx] = Some(event);
+                            slot_outputs[idx] = Some(output);
+                        }
+                        Err(EngineError::ExecutionStopped) => {
+                            if !execution_stopped {
+                                execution_stopped = true;
+                                join_set.abort_all();
+                            }
                             let _ = leases.refund_use(lease_id).await;
                         }
-                        slot_results[idx] = Some(result_json);
-                        slot_events[idx] = Some(event);
-                        slot_outputs[idx] = Some(output);
+                        Err(error) => return Err(error),
                     }
-                    Err(EngineError::ExecutionStopped) => {
-                        let _ = leases.refund_use(lease_id).await;
-                        execution_stopped = true;
-                    }
-                    Err(error) => return Err(error),
-                },
+                }
                 Err(e) => {
-                    debug!("parallel action execution task panicked: {e}");
+                    debug!("parallel action execution task failed: {e}");
                 }
             }
         }
         if execution_stopped {
+            for lease_id in pending_lease_uses {
+                let _ = leases.refund_use(lease_id).await;
+            }
             return Err(EngineError::ExecutionStopped);
         }
     }
@@ -3199,6 +3215,18 @@ mod tests {
 
     struct StoppedEffects;
 
+    struct StopAndHangEffects {
+        started: tokio::sync::Barrier,
+    }
+
+    impl StopAndHangEffects {
+        fn new() -> Self {
+            Self {
+                started: tokio::sync::Barrier::new(2),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl EffectExecutor for EmptyEffects {
         async fn execute_action(
@@ -3248,6 +3276,44 @@ mod tests {
                 effects: vec![EffectType::ReadLocal],
                 requires_approval: false,
             }])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for StopAndHangEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.started.wait().await;
+            if action_name == "stop_tool" {
+                Err(EngineError::ExecutionStopped)
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![
+                test_action_def("stop_tool"),
+                test_action_def("hang_tool"),
+            ])
+        }
+    }
+
+    fn test_action_def(name: &str) -> ActionDef {
+        ActionDef {
+            name: name.into(),
+            description: format!("{name} test tool"),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            effects: vec![EffectType::ReadLocal],
+            requires_approval: false,
         }
     }
 
@@ -3373,6 +3439,69 @@ mod tests {
         assert_eq!(
             leases.check(lease.id).await.unwrap().uses_remaining,
             Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_host_policy_stop_aborts_hanging_sibling() {
+        let code = r#"
+__execute_actions_parallel__([
+    {"name": "stop_tool", "params": {}, "call_id": "stop"},
+    {"name": "hang_tool", "params": {}, "call_id": "hang"},
+])
+FINAL("unreached")
+"#;
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(PendingStreamLlm);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(StopAndHangEffects::new());
+        let leases = Arc::new(LeaseManager::new());
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(2))
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let (_signal_tx, mut signal_rx) = signal_channel(16);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_orchestrator(
+                code,
+                &mut thread,
+                &llm,
+                &effects,
+                &leases,
+                &policy,
+                &mut signal_rx,
+                &CancellationToken::new(),
+                None,
+                None,
+                None,
+                &serde_json::json!({}),
+            ),
+        )
+        .await
+        .expect("stop should abort and drain the hanging sibling promptly")
+        .expect("orchestrator should return Ok");
+
+        assert!(matches!(result.outcome, ThreadOutcome::Stopped));
+        assert_eq!(thread.state, ThreadState::Completed);
+        assert!(
+            thread
+                .events
+                .iter()
+                .all(|event| !matches!(event.kind, EventKind::ActionFailed { .. }))
+        );
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(2)
         );
     }
 
