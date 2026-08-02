@@ -234,16 +234,18 @@ During the second stop, systemd reported approximately:
 Those values cannot explain the main service's 37.6 GB peak and were not folded
 into `lunarwing-dwarfstar.service` accounting.
 
-### 5. No resource ceiling on the main tenant unit
+### 5. No resource ceiling declared by the main tenant unit
 
-The generated multi-tenant unit contains no `MemoryHigh=`, `MemoryMax=`,
-`MemorySwapMax=`, `CPUQuota=`, or comparable build-specific limit:
+The generated multi-tenant unit declares no `MemoryHigh=`, `MemoryMax=`,
+`MemorySwapMax=`, `CPUQuota=`, `TasksMax=`, or comparable build-specific limit:
 
 `ic/scripts/lunarwing-mt-admin.sh:6498-6523`
 
 `NoNewPrivileges=true` and `PrivateTmp=true` are security controls, not resource
-limits. The service was therefore free to consume host memory until global
-reclaim, swap pressure, or OOM intervention.
+limits. The unit therefore supplied no tenant-specific ceiling; only inherited
+slice limits, system-wide reclaim/swap policy, or OOM intervention could bound
+it. The investigation did not record every ancestor cgroup limit, so this report
+does not claim that no host-level control existed.
 
 ## Source-level failure chain
 
@@ -463,7 +465,8 @@ as the root-cause fix for the observed compiler-driven peak.
 - Direct shell execution has no dedicated process group or cgroup.
 - The generic 60-second timeout can preempt the shell's internal 120-second
   cleanup path.
-- The main tenant unit had no memory or swap ceiling.
+- The generated main tenant unit declared no memory, swap, PID, or CPU ceiling;
+  inherited ancestor-cgroup controls were not fully recorded.
 - Actual Engine/job payload sizes were orders of magnitude too small to explain
   37.6 GB directly.
 - `d2ff7b8` fixes a real output-safety bypass but not local-build isolation.
@@ -669,7 +672,8 @@ Cross-verification against source baseline `1e319bf` on 2026-08-02 confirmed:
   120 seconds;
 - scheduler cancellation still aborts the Tokio task after 100 ms without an OS
   process-tree cleanup contract;
-- the generated main tenant unit still has no memory, swap, PID, or CPU ceiling;
+- the generated main tenant unit still declares no memory, swap, PID, or CPU
+  ceiling (independent inherited slice limits remain possible);
 - `taskset -c 0-5 cargo test -j6 --lib bridge::effect_adapter::tests::engine_output_honors_safety_size_limit_before_monty_conversion -- --exact --nocapture --test-threads=6`
   passed (`1 passed; 0 failed`).
 
