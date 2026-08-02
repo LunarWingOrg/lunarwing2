@@ -629,7 +629,8 @@ Sample at least once per second:
 
 ## Verification record
 
-On investigation branch `6c82e8c`:
+The original investigation used source baseline `6c82e8c`; the report was added
+in `11b673d`. Its recorded checks were:
 
 - `taskset ... cargo test --lib engine_output_honors_safety_size_limit_before_monty_conversion`: passed.
 - `taskset ... cargo check`: passed.
@@ -639,6 +640,23 @@ On investigation branch `6c82e8c`:
 - No live tenant was restarted or modified during the investigation.
 - Database inspection was read-only and limited to metadata, counts, timestamps,
   action names, commands, and byte sizes needed for attribution.
+
+Cross-verification against source baseline `1e319bf` on 2026-08-02 confirmed:
+
+- no relevant source changes since tenant revision `5b507966`, other than the
+  Engine output-boundary fix `d2ff7b8`;
+- Docker-unavailable `mode=worker` still routes through the local scheduler;
+- direct shell execution still lacks process-group ownership and `kill_on_drop`;
+- the generic tool deadline remains 60 seconds while the shell default remains
+  120 seconds;
+- scheduler cancellation still aborts the Tokio task after 100 ms without an OS
+  process-tree cleanup contract;
+- the generated main tenant unit still has no memory, swap, PID, or CPU ceiling;
+- `taskset -c 0-5 cargo test -j6 --lib bridge::effect_adapter::tests::engine_output_honors_safety_size_limit_before_monty_conversion -- --exact --nocapture --test-threads=6`
+  passed (`1 passed; 0 failed`).
+
+No live tenant or historical incident data was accessed during this
+cross-verification.
 
 ## Research provenance
 
