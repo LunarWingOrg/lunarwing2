@@ -285,8 +285,15 @@ runs a separate in-process `Worker` through the scheduler:
 This is deliberate availability-dependent routing, not source evidence of a
 sandbox escape. The dynamic tool description says “local backend” when external
 workers are configured without a sandbox, and the no-sandbox schema describes a
-local tracked job. The operational problem is that this local backend can run
-host shell commands in the main service cgroup without build-specific limits.
+local tracked job. Host shell availability is conditional: `app.rs` registers
+development tools when local tools are enabled or when builder mode is enabled
+and the sandbox is disabled. The persisted shell actions prove that condition
+was met for this incident. The operational problem is that this local backend
+then ran host shell commands in the main service cgroup without build-specific
+limits:
+
+- `ic/src/app.rs:474-485,941-947`
+- `ic/src/tools/registry.rs:425-438`
 
 ### The host shell has no process-group boundary
 
