@@ -44,8 +44,10 @@ artifacts. `up` does not build missing binaries.
 
 ```bash
 cd ic
+export LUNARWING_TEST_PROFILE=release
+export CARGO_BUILD_JOBS=6
 scripts/lunarwing-xmpp-test-env.sh init
-scripts/lunarwing-xmpp-test-env.sh build --with-wasm
+taskset -c 0-5 scripts/lunarwing-xmpp-test-env.sh build --with-wasm
 scripts/lunarwing-xmpp-test-env.sh up
 scripts/lunarwing-xmpp-test-env.sh verify
 scripts/lunarwing-xmpp-test-env.sh down
