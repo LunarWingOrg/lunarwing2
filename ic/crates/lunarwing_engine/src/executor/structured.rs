@@ -240,6 +240,7 @@ pub async fn execute_action_calls(
         let mut join_set = tokio::task::JoinSet::new();
         let effects = effects.clone();
 
+        let mut pending_lease_uses = Vec::with_capacity(runnable_indices.len());
         for (idx, lease) in runnable_indices {
             let call = calls[idx].clone();
             let mut ctx = context.clone();
@@ -247,6 +248,7 @@ pub async fn execute_action_calls(
             let effects = effects.clone();
             let lease = lease.clone();
 
+            pending_lease_uses.push(lease.id);
             join_set.spawn(async move {
                 let result = effects
                     .execute_action(&call.action_name, call.parameters.clone(), &lease, &ctx)
@@ -259,22 +261,34 @@ pub async fn execute_action_calls(
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
                 Ok((idx, lease_id, result, call, ctx)) => {
+                    if let Some(position) = pending_lease_uses
+                        .iter()
+                        .position(|pending_id| *pending_id == lease_id)
+                    {
+                        pending_lease_uses.swap_remove(position);
+                    }
                     if interrupted_call_needs_refund(&result) {
                         let _ = leases.refund_use(lease_id).await;
                     }
                     if matches!(&result, Err(EngineError::ExecutionStopped)) {
-                        execution_stopped = true;
+                        if !execution_stopped {
+                            execution_stopped = true;
+                            join_set.abort_all();
+                        }
                     } else {
                         slot_results[idx] = Some(classify_exec_result(result, &call, &ctx));
                     }
                 }
                 Err(e) => {
-                    // Task panicked — should not happen, but handle gracefully
-                    tracing::debug!("parallel tool execution task panicked: {e}");
+                    // Task panicked or was aborted after a sibling stopped.
+                    tracing::debug!("parallel tool execution task failed: {e}");
                 }
             }
         }
         if execution_stopped {
+            for lease_id in pending_lease_uses {
+                let _ = leases.refund_use(lease_id).await;
+            }
             return Ok(ActionBatchResult {
                 results: Vec::new(),
                 events: Vec::new(),
@@ -456,6 +470,18 @@ mod tests {
         }
     }
 
+    struct StopAndHangEffects {
+        started: tokio::sync::Barrier,
+    }
+
+    impl StopAndHangEffects {
+        fn new() -> Self {
+            Self {
+                started: tokio::sync::Barrier::new(2),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl EffectExecutor for MockEffects {
         async fn execute_action(
@@ -484,6 +510,31 @@ mod tests {
             _leases: &[CapabilityLease],
         ) -> Result<Vec<ActionDef>, EngineError> {
             Ok(self.actions.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for StopAndHangEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _params: serde_json::Value,
+            _lease: &CapabilityLease,
+            _ctx: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.started.wait().await;
+            if action_name == "stop_tool" {
+                Err(EngineError::ExecutionStopped)
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![test_action("stop_tool"), test_action("hang_tool")])
         }
     }
 
@@ -991,6 +1042,73 @@ mod tests {
         assert!(result.events.is_empty());
         assert_eq!(
             leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_stopped_aborts_and_drains_parallel_sibling() {
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let effects: Arc<dyn EffectExecutor> = Arc::new(StopAndHangEffects::new());
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+        let stop_lease = leases
+            .grant(
+                thread.id,
+                "stop",
+                GrantedActions::Specific(vec!["stop_tool".into()]),
+                None,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        let hang_lease = leases
+            .grant(
+                thread.id,
+                "hang",
+                GrantedActions::Specific(vec!["hang_tool".into()]),
+                None,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        let calls = vec![
+            ActionCall {
+                id: "call_stop".into(),
+                action_name: "stop_tool".into(),
+                parameters: serde_json::json!({}),
+            },
+            ActionCall {
+                id: "call_hang".into(),
+                action_name: "hang_tool".into(),
+                parameters: serde_json::json!({}),
+            },
+        ];
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[]),
+        )
+        .await
+        .expect("stop should abort and drain the hanging sibling promptly")
+        .unwrap();
+
+        assert!(matches!(result.need_approval, Some(ThreadOutcome::Stopped)));
+        assert!(result.results.is_empty());
+        assert!(result.events.is_empty());
+        assert_eq!(
+            leases.check(stop_lease.id).await.unwrap().uses_remaining,
+            Some(1)
+        );
+        assert_eq!(
+            leases.check(hang_lease.id).await.unwrap().uses_remaining,
             Some(1)
         );
     }
