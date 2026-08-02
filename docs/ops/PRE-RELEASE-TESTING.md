@@ -64,7 +64,7 @@ two-tenant flows.
 With a harness or staging gateway already running, execute:
 
 ```bash
-GATEWAY_URL=http://127.0.0.1:9098 \
+GATEWAY_URL=http://127.0.0.1:8765 \
 GATEWAY_AUTH_TOKEN='<token>' \
   ./ic/scripts/release-test.sh
 ```
