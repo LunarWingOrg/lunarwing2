@@ -51,7 +51,7 @@ enum PreflightOutcome {
 ///    Denied calls produce error results immediately. RequireApproval interrupts
 ///    the entire batch.
 /// 2. **Execute** (parallel): All approved calls run concurrently via `JoinSet`.
-///    Results are collected and merged in original call order.
+///    Results are merged in call order unless a stop aborts and drains the batch.
 pub async fn execute_action_calls(
     calls: &[ActionCall],
     thread: &Thread,
