@@ -387,9 +387,11 @@ There are real host-side retention risks that warrant separate work:
 
 - complete thread/event/conversation objects cached in `HybridStore`;
 - startup-only terminal-state eviction;
-- unbounded collected Python stdout outside Monty's heap limit;
-- detached Tokio tasks when pending handles are dropped;
-- checkpoint/history duplication.
+- Python stdout collected in a host `String` with no explicit byte cap; Monty's
+  duration/allocation/memory limits and the Engine iteration budget are only
+  indirect bounds;
+- spawned Tokio work that may continue when an unawaited `JoinHandle` is dropped;
+- checkpoint/history duplication without an independent aggregate byte cap.
 
 These are not dismissed. They simply do not match the direct compiler evidence
 for this incident.
@@ -397,8 +399,10 @@ for this incident.
 Key paths:
 
 - `ic/src/bridge/store_adapter.rs:71-88,117-207`
-- `ic/crates/lunarwing_engine/src/executor/orchestrator.rs`
-- `ic/crates/lunarwing_engine/src/executor/scripting.rs`
+- `ic/src/bridge/router.rs:1088-1103`
+- `ic/crates/lunarwing_engine/src/executor/orchestrator.rs:111-120,327-638,1750-1780`
+- `ic/crates/lunarwing_engine/src/executor/scripting.rs:49-55,274-379,423-756`
+- `ic/crates/lunarwing_engine/orchestrator/default.py:299-369`
 
 ### Wasmtime lifecycle
 
@@ -411,7 +415,8 @@ No evidence ties a Wasmtime store leak to the 34.8/37.6 GB peaks.
 
 Separate WASM defects were found and should be tracked independently:
 
-- a channel polling child task can detach during shutdown;
+- shutdown aborts only the stored polling supervisor handle; dropping its active
+  inner polling `JoinHandle` detaches that task;
 - running `spawn_blocking` callbacks can outlive outer async timeouts;
 - channel epoch interruption is configured without an advancing epoch ticker;
 - host allocations are outside guest linear-memory limits;
@@ -419,9 +424,11 @@ Separate WASM defects were found and should be tracked independently:
 
 Key paths:
 
-- `ic/src/tools/wasm/wrapper.rs`
-- `ic/src/channels/wasm/wrapper.rs:2278-2562,2950-2968`
-- `ic/src/tools/wasm/limits.rs`
+- `ic/src/tools/wasm/runtime.rs:153-232`
+- `ic/src/channels/wasm/runtime.rs:117-179`
+- `ic/src/tools/wasm/wrapper.rs:622-645,1204-1302,1473-1496`
+- `ic/src/channels/wasm/wrapper.rs:455-476,1153-1229,2278-2562,2950-2968`
+- `ic/src/tools/wasm/limits.rs:62-160`
 
 ## Commit `d2ff7b8`: valid but secondary
 
