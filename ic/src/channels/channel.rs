@@ -125,6 +125,18 @@ impl IncomingMessage {
         }
     }
 
+    /// Clone only the fields needed to route an outbound response.
+    ///
+    /// Attachment bytes and inbound content can be large and are never needed by
+    /// channel response implementations. Clearing them prevents delayed outbound
+    /// work from retaining the full inbound payload.
+    pub fn outbound_routing_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.content.clear();
+        snapshot.attachments.clear();
+        snapshot
+    }
+
     /// Set the thread ID.
     pub fn with_thread(mut self, thread_id: impl Into<String>) -> Self {
         let thread_id = thread_id.into();
