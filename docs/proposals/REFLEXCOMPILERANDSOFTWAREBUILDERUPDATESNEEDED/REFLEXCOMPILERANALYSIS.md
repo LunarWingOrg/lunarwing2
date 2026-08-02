@@ -12,14 +12,14 @@ The wiring gaps in §5 were addressed (first pass adapted from branch `anattempt
 
 | Gap | Status |
 |-----|--------|
-| 5.1 Embedding provider never wired | **FIXED** — `Workspace::embedding_provider()` accessor; `Agent::new()` attaches it to the router |
-| 5.2 `bump_reflex_pattern_match()` never called | **FIXED** — dispatcher bumps match count after successful fast-path execution |
+| 5.1 Embedding provider never wired | **FIXED** — `Agent::new()` attaches the workspace provider, but `REFLEX_SEMANTIC_ENABLED` is a separate default-off opt-in and cache state is checked before provider I/O |
+| 5.2 `bump_reflex_pattern_match()` never called | **FIXED** — successful routes synchronously merge canonical owner-scoped hits into a bounded accumulator; one worker writes additive database batches |
 | 5.3 `ReflexEvictor` never spawned | **FIXED** — spawned in `Agent::run()` with `EvictionConfig` from `ReflexConfig` |
 | 5.4 Hardcoded `"default"` user_id | **FIXED** — `ReflexCompiler` takes `user_id`; `find_recurring_job_patterns` filters per-user in both backends |
 | 5.5 `compilation_attempts` never incremented | **FIXED** (2nd pass) — first-pass `increment_reflex_compilation_attempts` was a 0-row UPDATE (rows only exist after a successful upsert); replaced with `record_reflex_compilation_failure` upsert that inserts `status='failed'` rows and auto-disables after 3 attempts; successful retry reactivates with the new tool name and resets the counter |
 | 5.6 No v2 safety/hooks/approval on reflex path | OPEN — architectural (intentional fast-path); needs design decision |
 | 5.7 `FuzzyConfig` defined but unused | **FIXED** — wired into `ReflexRouter` (`with_fuzzy_config`, router fields) |
-| 5.8 Missing config options | **FIXED** — `fuzzy_threshold`, `semantic_threshold`, `eviction_check_interval`, `eviction_stale_days`, `max_patterns_per_user` added with env overrides; the per-user cap is enforced by the compiler |
+| 5.8 Missing config options | **FIXED** — `fuzzy_threshold`, default-off `semantic_enabled`, `semantic_threshold`, eviction settings, and `max_patterns_per_user` have env overrides; the per-user cap is enforced by the compiler |
 | 5.9 libSQL boolean divergence | OPEN — documented, correct as-is |
 | 5.10 PG prune re-query missing embedding columns | **FIXED** |
 | 5.11 No engine v2 bridge adapter | OPEN — large architectural effort |
@@ -29,7 +29,9 @@ Additional second-pass fix (not in original gap list): `compile_pattern` only sk
 
 Third-pass fix (2026-08-01, branch `aj/kimi-6-20260801-0002`, adopts `aj/kimi-6-20260731-2101` incl. the owner-scoped bump fix): `semantic_route()` and `try_route_with_details()` held `pattern_embeddings.read` while acquiring `patterns.read`, the inverse of `refresh()`'s `patterns.write` → `embeddings.write` order — a latent ABBA deadlock that becomes reachable in production once gap 5.1 wires the embedding provider. The embeddings guard is now scoped to the best-match computation and dropped before touching `patterns`; `try_route_with_details` also drops its fuzzy-scan `patterns` guard before the semantic fallback re-acquires it.
 
-Verification: 50 reflex unit tests + 10 e2e integration tests pass on `aj/kimi-6-20260801-0002`; `cargo check --all-targets` clean.
+Fourth-pass fix (2026-08-02): attaching an embedding provider no longer implicitly enables semantic matching. `REFLEX_SEMANTIC_ENABLED` defaults off, and an empty pattern-vector cache is checked before query embedding. Per-route PostgreSQL/libSQL writes were replaced with a bounded write-behind accumulator and one periodic worker. Failed/cancelled batches requeue with capped exponential backoff; PostgreSQL uses one additive `UNNEST` update, libSQL uses one prepared transaction, and shutdown attempts a bounded final flush.
+
+Verification for the fourth pass includes semantic no-provider-call regressions, accumulator cap/requeue/backoff tests, libSQL additive batch/empty/duplicate/final-flush coverage, both backend compile surfaces, and the scoped full checks recorded with release item 7.
 
 ---
 
