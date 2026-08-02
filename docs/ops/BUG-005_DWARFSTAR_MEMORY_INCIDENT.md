@@ -254,10 +254,11 @@ The generated multi-tenant unit declares no `MemoryHigh=`, `MemoryMax=`,
 `ic/scripts/lunarwing-mt-admin.sh:6498-6523`
 
 `NoNewPrivileges=true` and `PrivateTmp=true` are security controls, not resource
-limits. The unit therefore supplied no tenant-specific ceiling; only inherited
-slice limits, system-wide reclaim/swap policy, or OOM intervention could bound
-it. The investigation did not record every ancestor cgroup limit, so this report
-does not claim that no host-level control existed.
+limits. The generated unit therefore supplied no tenant-specific ceiling;
+inherited slice limits, service-manager defaults/drop-ins, system-wide
+reclaim/swap policy, or OOM intervention could still bound it. The investigation
+did not record every ancestor or manager-level control, so this report does not
+claim that no host-level limit existed.
 
 ## Source-level failure chain
 
