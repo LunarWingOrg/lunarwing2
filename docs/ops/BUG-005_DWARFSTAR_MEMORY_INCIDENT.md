@@ -432,8 +432,11 @@ After `d2ff7b8`, the adapter drops the original serialized string and parses
 `ic/src/bridge/effect_adapter.rs:775-786`
 
 This correctly bounds newly executed outputs before they enter Engine/Monty
-state and restores redaction/policy modifications for normal-sized output. The
-new regression test passed:
+state. For outputs at or below the safety size limit it also restores leak
+redaction, policy enforcement, and injection sanitization. Oversized output is
+truncated first and returned before those later safety stages, so `d2ff7b8` does
+not by itself guarantee redaction of the retained prefix. The new regression
+test passed:
 
 ```text
 bridge::effect_adapter::tests::
@@ -710,8 +713,9 @@ failure. Systemd cgroup accounting correctly exposed the aggregate resource use.
 **Not established:** a sandbox escape, Monty VM leak, Wasmtime per-call store
 leak, or 37.6 GB LunarWing main-process RSS.
 
-**Valid secondary fix:** `d2ff7b8` bounds and sanitizes newly executed Engine V2
-tool results after the tool has produced them.
+**Valid secondary fix:** `d2ff7b8` feeds the safety layer's bounded output into
+Engine V2 after the tool has produced its full result. Normal-sized outputs also
+receive the later redaction/policy stages; oversized prefixes currently do not.
 
 The release checklist should not mark the broad “MEMLEAK” item complete solely
 because `d2ff7b8` landed. The output-boundary defect is fixed; process-group
