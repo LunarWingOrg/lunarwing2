@@ -27,6 +27,15 @@ impl ApprovalRequirement {
     pub fn is_required(&self) -> bool {
         !matches!(self, Self::Never)
     }
+
+    /// Whether an interactive invocation must prompt after applying auto-approval state.
+    pub fn needs_prompt(self, globally_auto_approved: bool, session_auto_approved: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::UnlessAutoApproved => !globally_auto_approved && !session_auto_approved,
+            Self::Always => true,
+        }
+    }
 }
 
 /// Precomputed autonomous tool scope for background jobs and routines.
@@ -791,6 +800,15 @@ mod tests {
         assert!(!ApprovalRequirement::Never.is_required());
         assert!(ApprovalRequirement::UnlessAutoApproved.is_required());
         assert!(ApprovalRequirement::Always.is_required());
+    }
+
+    #[test]
+    fn approval_requirement_always_ignores_auto_approval() {
+        assert!(ApprovalRequirement::Always.needs_prompt(true, true));
+        assert!(!ApprovalRequirement::UnlessAutoApproved.needs_prompt(true, false));
+        assert!(!ApprovalRequirement::UnlessAutoApproved.needs_prompt(false, true));
+        assert!(ApprovalRequirement::UnlessAutoApproved.needs_prompt(false, false));
+        assert!(!ApprovalRequirement::Never.needs_prompt(false, false));
     }
 
     #[test]

@@ -1353,6 +1353,25 @@ pub(super) fn extract_wasm_metadata(
     Ok((description, schema))
 }
 
+fn approval_requirement_for(
+    capabilities: &Capabilities,
+) -> crate::tools::tool::ApprovalRequirement {
+    if capabilities.ssh.is_some() {
+        return crate::tools::tool::ApprovalRequirement::Always;
+    }
+    match capabilities.approval {
+        crate::tools::wasm::WasmApprovalPolicy::Never => {
+            crate::tools::tool::ApprovalRequirement::Never
+        }
+        crate::tools::wasm::WasmApprovalPolicy::UnlessAutoApproved => {
+            crate::tools::tool::ApprovalRequirement::UnlessAutoApproved
+        }
+        crate::tools::wasm::WasmApprovalPolicy::Always => {
+            crate::tools::tool::ApprovalRequirement::Always
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for WasmToolWrapper {
     fn name(&self) -> &str {
@@ -1509,11 +1528,7 @@ impl Tool for WasmToolWrapper {
         // A WASM tool granted the SSH capability can run remote commands — always
         // require explicit approval, matching the built-in ssh tool. Other WASM
         // tools keep the default (Never).
-        if self.capabilities.ssh.is_some() {
-            crate::tools::tool::ApprovalRequirement::Always
-        } else {
-            crate::tools::tool::ApprovalRequirement::Never
-        }
+        approval_requirement_for(&self.capabilities)
     }
 
     fn requires_sanitization(&self) -> bool {
@@ -2122,9 +2137,28 @@ mod tests {
         TEST_GOOGLE_OAUTH_TOKEN, TEST_OAUTH_CLIENT_ID, TEST_OAUTH_CLIENT_SECRET,
         test_secrets_store,
     };
+    use crate::tools::tool::ApprovalRequirement;
     use crate::tools::tool::Tool;
-    use crate::tools::wasm::capabilities::Capabilities;
+    use crate::tools::wasm::capabilities::{Capabilities, WasmApprovalPolicy};
     use crate::tools::wasm::runtime::{WasmRuntimeConfig, WasmToolRuntime};
+
+    #[test]
+    fn declarative_approval_policy_and_ssh_override_are_enforced() {
+        let mut capabilities = Capabilities {
+            approval: WasmApprovalPolicy::UnlessAutoApproved,
+            ..Capabilities::default()
+        };
+        assert_eq!(
+            super::approval_requirement_for(&capabilities),
+            ApprovalRequirement::UnlessAutoApproved
+        );
+
+        capabilities.ssh = Some(crate::tools::wasm::SshCapability::default());
+        assert_eq!(
+            super::approval_requirement_for(&capabilities),
+            ApprovalRequirement::Always
+        );
+    }
 
     /// Instantiation smoke test for the Option-3 `ssh` WASM guest.
     ///
