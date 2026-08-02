@@ -140,9 +140,10 @@ storage mutation.
 
 Lorebooks are prompt-visible configuration. Raw JSON and decoded fields receive
 canonicalized prompt-injection checks on default writes, named-layer writes,
-and legacy loads. Only primary-scope lorebooks load. Loads use one bounded,
-path-ordered database query and cache validated parsed entries by primary
-scope, agent, and document revision; writes and deletes invalidate immediately.
+and legacy loads. Only primary-scope lorebooks load. Cache validation uses a
+bounded revision query; cache misses fetch size-capped content in one
+path-ordered query. Parsed entries are cached by primary scope, agent, and
+document revision; writes and deletes invalidate immediately.
 Empty listings receive a short negative cache, while revision checks detect
 legacy/direct-database changes. Group-chat activation
 defaults off. Database listing, file, entry, key, scan, token, operation, and

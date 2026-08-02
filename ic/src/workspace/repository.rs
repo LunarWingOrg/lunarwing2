@@ -13,6 +13,7 @@ use crate::error::WorkspaceError;
 
 use crate::workspace::document::{
     DocumentVersion, MemoryChunk, MemoryDocument, VersionSummary, WorkspaceEntry,
+    WorkspaceFileContent,
 };
 use crate::workspace::search::{RankedResult, SearchConfig, SearchResult, fuse_results};
 
@@ -302,7 +303,8 @@ impl Repository {
         directory: &str,
         suffix: &str,
         limit: usize,
-    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError> {
         let conn = self.conn().await?;
         let directory = directory.trim_end_matches('/');
         let prefix = if directory.is_empty() {
@@ -311,11 +313,12 @@ impl Repository {
             format!("{directory}/")
         };
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let max_file_bytes = i64::try_from(max_file_bytes).unwrap_or(i64::MAX);
         let rows = conn
             .query(
                 r#"
-                SELECT id, user_id, agent_id, path, content,
-                       created_at, updated_at, metadata
+                WITH limited AS (
+                SELECT path, content, updated_at
                 FROM memory_documents
                 WHERE user_id = $1 AND agent_id IS NOT DISTINCT FROM $2
                   AND ($3 = '' OR LEFT(path, CHAR_LENGTH($3)) = $3)
@@ -323,15 +326,34 @@ impl Repository {
                   AND ($4 = '' OR LOWER(RIGHT(path, CHAR_LENGTH($4))) = LOWER($4))
                 ORDER BY path
                 LIMIT $5
+                )
+                SELECT path, content, updated_at
+                FROM limited
+                WHERE OCTET_LENGTH(content) <= $6
+                ORDER BY path
                 "#,
-                &[&user_id, &agent_id, &prefix, &suffix, &limit],
+                &[
+                    &user_id,
+                    &agent_id,
+                    &prefix,
+                    &suffix,
+                    &limit,
+                    &max_file_bytes,
+                ],
             )
             .await
             .map_err(|e| WorkspaceError::SearchFailed {
                 reason: format!("Bounded file fetch failed: {e}"),
             })?;
 
-        Ok(rows.iter().map(|row| self.row_to_document(row)).collect())
+        Ok(rows
+            .iter()
+            .map(|row| WorkspaceFileContent {
+                path: row.get("path"),
+                content: row.get("content"),
+                updated_at: row.get("updated_at"),
+            })
+            .collect())
     }
 
     /// List all file paths in the workspace (flat list).

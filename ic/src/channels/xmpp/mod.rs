@@ -2920,6 +2920,12 @@ struct InboundAttachmentExtraction {
     clear_body: bool,
 }
 
+struct InboundAttachmentUrls {
+    downloads: Vec<(String, Option<String>)>,
+    recognized: Vec<String>,
+    clear_body: bool,
+}
+
 async fn await_with_deadline<T>(
     duration: Duration,
     future: impl Future<Output = T>,
@@ -2992,12 +2998,11 @@ async fn deliver_inbound_job_without_downloads(
     tx: &mpsc::Sender<IncomingMessage>,
     reply_targets: &Arc<RwLock<LruCache<Uuid, String>>>,
 ) {
-    let (_, recognized_urls, clear_body) =
-        collect_inbound_attachment_urls(&job.payloads, &job.incoming.content);
-    if clear_body {
+    let urls = collect_inbound_attachment_urls(&job.payloads, &job.incoming.content);
+    if urls.clear_body {
         job.incoming.content.clear();
     } else {
-        job.incoming.content = strip_attachment_urls(job.incoming.content, &recognized_urls);
+        job.incoming.content = strip_attachment_urls(job.incoming.content, &urls.recognized);
     }
     job.incoming.attachments.clear();
 
@@ -3010,17 +3015,18 @@ async fn deliver_inbound_job_without_downloads(
     }
 }
 
-fn collect_inbound_attachment_urls(
-    payloads: &[Element],
-    body: &str,
-) -> (Vec<(String, Option<String>)>, Vec<String>, bool) {
+fn collect_inbound_attachment_urls(payloads: &[Element], body: &str) -> InboundAttachmentUrls {
     let mut downloads = collect_oob_urls(payloads, MAX_OOB_ATTACHMENTS + 1);
     if downloads.len() > MAX_OOB_ATTACHMENTS {
         tracing::warn!(
             max = MAX_OOB_ATTACHMENTS,
             "Too many attachment URLs in stanza; clearing body and skipping downloads"
         );
-        return (Vec::new(), Vec::new(), true);
+        return InboundAttachmentUrls {
+            downloads: Vec::new(),
+            recognized: Vec::new(),
+            clear_body: true,
+        };
     }
 
     let mut recognized_urls: Vec<String> = downloads.iter().map(|(url, _)| url.clone()).collect();
@@ -3038,7 +3044,11 @@ fn collect_inbound_attachment_urls(
                 max = MAX_OOB_ATTACHMENTS,
                 "Too many attachment URLs in stanza; clearing body and skipping downloads"
             );
-            return (Vec::new(), Vec::new(), true);
+            return InboundAttachmentUrls {
+                downloads: Vec::new(),
+                recognized: Vec::new(),
+                clear_body: true,
+            };
         }
         let url = token.to_string();
         known.insert(url.clone());
@@ -3046,7 +3056,11 @@ fn collect_inbound_attachment_urls(
         recognized_urls.push(url);
     }
 
-    (downloads, recognized_urls, false)
+    InboundAttachmentUrls {
+        downloads,
+        recognized: recognized_urls,
+        clear_body: false,
+    }
 }
 
 /// Extract downloadable attachments referenced by an incoming message: OOB URLs
@@ -3058,13 +3072,13 @@ async fn extract_inbound_attachments(
     payloads: &[Element],
     body: &str,
 ) -> InboundAttachmentExtraction {
-    let (urls, recognized_urls, clear_body) = collect_inbound_attachment_urls(payloads, body);
+    let urls = collect_inbound_attachment_urls(payloads, body);
 
-    if urls.is_empty() {
+    if urls.downloads.is_empty() {
         return InboundAttachmentExtraction {
             attachments: Vec::new(),
-            recognized_urls,
-            clear_body,
+            recognized_urls: urls.recognized,
+            clear_body: urls.clear_body,
         };
     }
 
@@ -3073,7 +3087,7 @@ async fn extract_inbound_attachments(
     // N * timeout. `buffered` keeps the results in stanza order. Each download
     // builds its own egress-policy-checked client (see
     // `policy_checked_download_client`).
-    let downloads = futures::stream::iter(urls)
+    let downloads = futures::stream::iter(urls.downloads)
         .map(|(url, _desc)| {
             async move {
                 match download_oob_file(&url).await {
@@ -3110,8 +3124,8 @@ async fn extract_inbound_attachments(
 
     InboundAttachmentExtraction {
         attachments,
-        recognized_urls,
-        clear_body,
+        recognized_urls: urls.recognized,
+        clear_body: urls.clear_body,
     }
 }
 

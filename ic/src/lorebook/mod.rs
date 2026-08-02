@@ -75,7 +75,12 @@ async fn load_lorebook_entries_cached(workspace: &Workspace) -> Arc<[LorebookEnt
     }
 
     let files = match workspace
-        .get_primary_files_limited(LOREBOOK_DIR, ".json", MAX_LOREBOOK_FILES + 1)
+        .get_primary_files_limited(
+            LOREBOOK_DIR,
+            ".json",
+            MAX_LOREBOOK_FILES + 1,
+            model::MAX_LOREBOOK_FILE_BYTES,
+        )
         .await
     {
         Ok(files) => files,

@@ -29,6 +29,7 @@ use tokio::time::Instant;
 
 const DELIVERY_QUEUE_CAPACITY: usize = 64;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Async flush callback invoked with the final merged content.
 pub type FlushFn = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -181,18 +182,25 @@ pub struct CoalesceBuffer {
     /// Readers own active submissions. `flush_all` takes the writer so every
     /// submission started before shutdown is queued and processed first.
     delivery_barrier: Arc<RwLock<()>>,
+    shutdown_timeout: Duration,
 }
 
 impl CoalesceBuffer {
     /// Create a buffer with the given config.
     pub fn new(config: CoalesceConfig) -> Self {
-        Self::new_with_delivery_limits(config, DELIVERY_QUEUE_CAPACITY, DELIVERY_TIMEOUT)
+        Self::new_with_delivery_limits(
+            config,
+            DELIVERY_QUEUE_CAPACITY,
+            DELIVERY_TIMEOUT,
+            SHUTDOWN_TIMEOUT,
+        )
     }
 
     fn new_with_delivery_limits(
         config: CoalesceConfig,
         queue_capacity: usize,
         delivery_timeout: Duration,
+        shutdown_timeout: Duration,
     ) -> Self {
         let (commands, receiver) = mpsc::channel(queue_capacity.max(1));
         let actor = CoalesceActor {
@@ -207,6 +215,7 @@ impl CoalesceBuffer {
             config,
             commands,
             delivery_barrier: Arc::new(RwLock::new(())),
+            shutdown_timeout,
         }
     }
 
@@ -246,6 +255,18 @@ impl CoalesceBuffer {
 
     /// Flush every pending message (thread termination / engine shutdown).
     pub async fn flush_all(&self) {
+        if tokio::time::timeout(self.shutdown_timeout, self.flush_all_inner())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                timeout_ms = self.shutdown_timeout.as_millis(),
+                "Timed out flushing coalesced responses during shutdown"
+            );
+        }
+    }
+
+    async fn flush_all_inner(&self) {
         let _delivery_guard = self.delivery_barrier.write().await;
         let (response, result) = oneshot::channel();
         if self
@@ -729,7 +750,12 @@ mod tests {
     async fn test_stalled_delivery_times_out_and_actor_continues() {
         let mut config = test_config();
         config.window = Duration::from_secs(1);
-        let buffer = CoalesceBuffer::new_with_delivery_limits(config, 2, Duration::from_secs(5));
+        let buffer = CoalesceBuffer::new_with_delivery_limits(
+            config,
+            2,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        );
         let started = Arc::new(tokio::sync::Notify::new());
         let flush: FlushFn = {
             let started = Arc::clone(&started);
@@ -757,7 +783,12 @@ mod tests {
     async fn test_bounded_queue_backpressures_while_delivery_stalls() {
         let mut config = test_config();
         config.window = Duration::from_secs(1);
-        let buffer = CoalesceBuffer::new_with_delivery_limits(config, 1, Duration::from_secs(60));
+        let buffer = CoalesceBuffer::new_with_delivery_limits(
+            config,
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+        );
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let stalled: FlushFn = {
@@ -801,10 +832,48 @@ mod tests {
     async fn test_shutdown_finishes_after_stalled_delivery_timeout() {
         let mut config = test_config();
         config.window = Duration::from_secs(60);
-        let buffer = CoalesceBuffer::new_with_delivery_limits(config, 2, Duration::from_secs(5));
+        let buffer = CoalesceBuffer::new_with_delivery_limits(
+            config,
+            2,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        );
         let flush: FlushFn =
             Arc::new(move |_| Box::pin(async move { std::future::pending::<()>().await }));
         buffer.submit(key(), "STATUS: pending".into(), flush).await;
+
+        let shutdown = {
+            let buffer = buffer.clone();
+            tokio::spawn(async move { buffer.flush_all().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        shutdown.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_has_aggregate_deadline() {
+        let mut config = test_config();
+        config.window = Duration::from_secs(60);
+        let buffer = CoalesceBuffer::new_with_delivery_limits(
+            config,
+            2,
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        let stalled: FlushFn =
+            Arc::new(move |_| Box::pin(async move { std::future::pending::<()>().await }));
+        buffer
+            .submit(key(), "STATUS: first".into(), stalled.clone())
+            .await;
+        buffer
+            .submit(
+                ChannelKey::new("agent-1", "xmpp", "coord@conference.example", "thread-2"),
+                "STATUS: second".into(),
+                stalled,
+            )
+            .await;
 
         let shutdown = {
             let buffer = buffer.clone();

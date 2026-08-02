@@ -22,6 +22,8 @@ use crate::bootstrap::lunarwing_base_dir;
 const MAX_ACTORS: usize = 1_024;
 const MAX_RECORDS_PER_ACTOR: usize = 64;
 const MAX_RECORD_FIELD_BYTES: usize = 256;
+const MAX_ACTOR_ID_BYTES: usize = 512;
+const MAX_PERSISTED_BYTES: u64 = 64 * 1024 * 1024;
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Escalation status for an agent's coordination violations.
@@ -154,6 +156,8 @@ impl ViolationStore {
     }
 
     fn new_with_debounce(path: PathBuf, config: ViolationStoreConfig, debounce: Duration) -> Self {
+        let mut config = config;
+        config.max_violations = config.max_violations.clamp(1, MAX_RECORDS_PER_ACTOR as u32);
         let now = now_secs();
         let mut agents = load_from_disk(&path);
         prune_all(&mut agents, now, config.decay_secs);
@@ -214,6 +218,15 @@ impl ViolationStore {
         channel: &str,
         now: u64,
     ) -> ViolationStatus {
+        if agent.len() > MAX_ACTOR_ID_BYTES {
+            tracing::warn!(
+                agent_len = agent.len(),
+                "Coordination violation actor ID too large"
+            );
+            return ViolationStatus::Disabled {
+                until_secs: now.saturating_add(self.config.disable_duration_secs),
+            };
+        }
         let mut guard = lock(&self.inner);
         let pruned = prune_all(&mut guard.agents, now, self.config.decay_secs);
         if !guard.agents.contains_key(agent)
@@ -228,7 +241,9 @@ impl ViolationStore {
                 self.schedule_persist();
             }
             tracing::warn!(agent, "Coordination violation actor cap reached");
-            return ViolationStatus::Active;
+            return ViolationStatus::Disabled {
+                until_secs: now.saturating_add(self.config.disable_duration_secs),
+            };
         }
         let entry = guard.agents.entry(agent.to_string()).or_default();
         entry.records.push(ViolationRecord {
@@ -242,7 +257,7 @@ impl ViolationStore {
         let strikes = entry.records.len() as u32;
         let max_violations = self.config.max_violations.min(MAX_RECORDS_PER_ACTOR as u32);
         if strikes >= max_violations && entry.disabled_until_secs.is_none() {
-            entry.disabled_until_secs = Some(now + self.config.disable_duration_secs);
+            entry.disabled_until_secs = Some(now.saturating_add(self.config.disable_duration_secs));
         }
         let status = status_of(entry, now);
         guard.generation = guard.generation.wrapping_add(1);
@@ -254,6 +269,11 @@ impl ViolationStore {
     /// Current status for an agent (active violations only; expired disables clear).
     pub fn status(&self, agent: &str) -> ViolationStatus {
         let now = now_secs();
+        if agent.len() > MAX_ACTOR_ID_BYTES {
+            return ViolationStatus::Disabled {
+                until_secs: now.saturating_add(self.config.disable_duration_secs),
+            };
+        }
         let mut guard = lock(&self.inner);
         let (status, remove, mut changed) = match guard.agents.get_mut(agent) {
             Some(entry) => {
@@ -317,15 +337,19 @@ impl ViolationStore {
     /// Manually disable the agent until [`ViolationStore::manual_enable`] or
     /// [`ViolationStore::clear`].
     pub fn manual_disable(&self, agent: &str) {
+        if agent.len() > MAX_ACTOR_ID_BYTES {
+            tracing::warn!(agent_len = agent.len(), "Manual-disable actor ID too large");
+            return;
+        }
         let mut guard = lock(&self.inner);
         let now = now_secs();
         prune_all(&mut guard.agents, now, self.config.decay_secs);
-        if !guard.agents.contains_key(agent) && guard.agents.len() >= MAX_ACTORS {
-            if !evict_oldest_non_manual(&mut guard.agents)
-                && let Some(oldest) = oldest_actor(&guard.agents, false)
-            {
-                guard.agents.remove(&oldest);
-            }
+        if !guard.agents.contains_key(agent)
+            && guard.agents.len() >= MAX_ACTORS
+            && !evict_oldest_non_manual(&mut guard.agents)
+        {
+            tracing::warn!("Coordination violation actor cap reached; manual disable not stored");
+            return;
         }
         let entry = guard.agents.entry(agent.to_string()).or_default();
         entry.manual_disabled = true;
@@ -480,7 +504,21 @@ fn status_of(entry: &AgentViolations, now: u64) -> ViolationStatus {
 }
 
 fn load_from_disk(path: &Path) -> HashMap<String, AgentViolations> {
-    match std::fs::read_to_string(path) {
+    let content = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > MAX_PERSISTED_BYTES => {
+            tracing::warn!(
+                path = %path.display(),
+                size = metadata.len(),
+                max = MAX_PERSISTED_BYTES,
+                "Coordination violations file exceeds size limit, starting empty"
+            );
+            return HashMap::new();
+        }
+        Ok(_) => std::fs::read_to_string(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(err) => Err(err),
+    };
+    match content {
         Ok(content) => match serde_json::from_str::<ViolationFile>(&content) {
             Ok(file) => file.agents,
             Err(err) => {
@@ -492,7 +530,6 @@ fn load_from_disk(path: &Path) -> HashMap<String, AgentViolations> {
                 HashMap::new()
             }
         },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
@@ -725,6 +762,19 @@ mod tests {
         assert_eq!(guard.agents.len(), MAX_ACTORS);
         assert_eq!(guard.agents["busy"].records.len(), MAX_RECORDS_PER_ACTOR);
         assert!(!guard.agents.contains_key("agent-0000"));
+    }
+
+    #[test]
+    fn test_oversized_actor_fails_closed_without_storage() {
+        let store = test_store();
+        let actor = "a".repeat(MAX_ACTOR_ID_BYTES + 1);
+
+        assert!(matches!(
+            store.record_violation(&actor, "reason", "hook", "channel"),
+            ViolationStatus::Disabled { .. }
+        ));
+        assert!(store.is_disabled(&actor));
+        assert!(!lock(&store.inner).agents.contains_key(&actor));
     }
 
     #[test]

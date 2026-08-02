@@ -38,7 +38,7 @@ use crate::history::{
     AgentJobRecord, AgentJobSummary, ConversationMessage, ConversationSummary, JobEventRecord,
     LlmCallRecord, SandboxJobRecord, SandboxJobSummary, SettingRow,
 };
-use crate::workspace::{MemoryChunk, MemoryDocument, WorkspaceEntry};
+use crate::workspace::{MemoryChunk, MemoryDocument, WorkspaceEntry, WorkspaceFileContent};
 use crate::workspace::{SearchConfig, SearchResult};
 
 /// Create a database backend from configuration, run migrations, and return it.
@@ -915,7 +915,8 @@ pub trait WorkspaceStore: Send + Sync {
         directory: &str,
         suffix: &str,
         limit: usize,
-    ) -> Result<Vec<MemoryDocument>, WorkspaceError>;
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError>;
     async fn list_all_paths(
         &self,
         user_id: &str,

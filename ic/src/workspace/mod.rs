@@ -54,8 +54,8 @@ mod search;
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{
     DocumentVersion, IDENTITY_PATHS, MemoryChunk, MemoryDocument, VersionSummary, WorkspaceEntry,
-    is_engine_runtime_path, is_identity_path, is_search_indexable_path, merge_workspace_entries,
-    paths,
+    WorkspaceFileContent, is_engine_runtime_path, is_identity_path, is_search_indexable_path,
+    merge_workspace_entries, paths,
 };
 pub use embedding_cache::{CachedEmbeddingProvider, EmbeddingCacheConfig};
 pub use embeddings::{
@@ -413,15 +413,16 @@ impl WorkspaceStorage {
         directory: &str,
         suffix: &str,
         limit: usize,
-    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError> {
         match self {
             #[cfg(feature = "postgres")]
             Self::Repo(repo) => {
-                repo.get_files_limited(user_id, agent_id, directory, suffix, limit)
+                repo.get_files_limited(user_id, agent_id, directory, suffix, limit, max_file_bytes)
                     .await
             }
             Self::Db(db) => {
-                db.get_files_limited(user_id, agent_id, directory, suffix, limit)
+                db.get_files_limited(user_id, agent_id, directory, suffix, limit, max_file_bytes)
                     .await
             }
         }
@@ -1156,10 +1157,18 @@ impl Workspace {
         directory: &str,
         suffix: &str,
         limit: usize,
-    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError> {
         let directory = normalize_directory(directory);
         self.storage
-            .get_files_limited(&self.user_id, self.agent_id, &directory, suffix, limit)
+            .get_files_limited(
+                &self.user_id,
+                self.agent_id,
+                &directory,
+                suffix,
+                limit,
+                max_file_bytes,
+            )
             .await
     }
 
