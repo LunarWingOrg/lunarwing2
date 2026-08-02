@@ -261,6 +261,7 @@ impl ReflexStore for LibSqlBackend {
                 .execute(params![user_id, pattern, count, now.as_str()])
                 .await
                 .map_err(|error| DatabaseError::Query(error.to_string()))?;
+            statement.reset();
         }
         drop(statement);
         tx.commit()
