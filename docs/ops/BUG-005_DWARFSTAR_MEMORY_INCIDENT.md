@@ -2,6 +2,10 @@
 
 > **Status:** RECLASSIFIED — unbounded local build and subprocess-lifecycle failure
 >
+> **Identifier scope:** This report's `BUG-005` label is not the unrelated
+> `BUG-005` (“Multica Daemon Connection Refused”) in
+> `docs/ops/SUNBURST_BUG_LIST.md`.
+>
 > **Incident:** 2026-08-01/2026-08-02, tenant `dwarfstar`
 >
 > **Tenant worktree revision checked out before the incident:**
