@@ -4,8 +4,8 @@
 //! calls use **async dispatch**: each tool call returns a Monty `ExternalFuture`
 //! via `resume_pending()`, allowing Python code to use `await` and
 //! `asyncio.gather()` for parallel execution. When all tasks are blocked,
-//! Monty yields `ResolveFutures` and we execute pending tools concurrently
-//! via `JoinSet`.
+//! Monty yields `ResolveFutures`; pending tool and LLM tasks are polled in
+//! completion order so a stop can abort and drain unfinished siblings.
 //!
 //! Follows the RLM (Recursive Language Model) pattern:
 //! - Thread context injected as Python variables (not LLM attention input)
