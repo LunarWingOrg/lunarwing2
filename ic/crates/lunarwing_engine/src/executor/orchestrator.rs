@@ -1176,7 +1176,8 @@ async fn handle_execute_action(
 /// Returns a list of result dicts (one per call, in order). Each result has the
 /// same shape as `__execute_action__` output, plus an optional gate pause payload.
 ///
-/// Events are emitted in original call order after all parallel executions complete.
+/// On normal completion, events are emitted in original call order. A stop aborts
+/// and drains unfinished siblings without emitting their events.
 async fn handle_execute_actions_parallel(
     args: &[MontyObject],
     thread: &mut Thread,
