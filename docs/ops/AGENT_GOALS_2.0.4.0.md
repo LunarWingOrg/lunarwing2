@@ -9,6 +9,8 @@
 
 #### Please check off item before the final commit/push. You may add a note to the item to say if it was completed 100%, failed, or other kind of status
 
+###### (S) is usually noted to denote tasks that can be temporarily deferred
+
 ---
 
 1. [ ] Go thru the document: docs/ops/SUNBURST_BUG_LIST.md - you may edit the document - look at each bug in the list and if it was already fixed, mark it as fixed. if it wasnt, mark accordingly
@@ -35,7 +37,7 @@ ic/src/workspace/mod.rs:848-871 , 984-1017, 1791-1795). Large growing files can 
 21. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.4.0 explaining all relevant changes since v2.0.3.0 as well as revising and including an ACCURATE VERSION OF`known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is:`UNKNOWN` — The file you write will be`RELEASE-v2.0.4.0.md` and should be written to the ROOT of the repo. When complete with draft, move on to another task, which is: Improve accuracy of the first draft of release notes (from previous task) -`RELEASE-v2.0.4.0.md`
 22. [ ] update anything outdated in docs/proposals
 23. [ ] update anything outdated that is in docs/ops
-24. [ ] update anything outdated in docs/guides - there are a ton of guides in here which have not been updated since v1. many are no longer relevant. they can be placed into archive
+24. [ ] update anything outdated in docs/guides - there are a ton of guides in here which have not been updated since v1. many are no longer relevant. they can be placed into archive: docs/guides/history
 25. [ ] review release notes draft and update anything inaccurate or changed since time of writing first draft (referencing item #21)
 
 ---
