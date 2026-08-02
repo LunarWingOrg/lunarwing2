@@ -22,7 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
+use futures::StreamExt;
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock, Semaphore};
 
 /// Async flush callback invoked with the final merged content.
 pub type FlushFn = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -68,6 +69,12 @@ pub struct CoalesceConfig {
     pub max_merges: usize,
     /// Merged content cap; overflow flushes pending first (default 420).
     pub max_message_length: usize,
+    /// Maximum number of detached deliveries (`COALESCE_MAX_DELIVERIES`, default 32).
+    pub max_in_flight_deliveries: usize,
+    /// Per-delivery deadline (`COALESCE_DELIVERY_TIMEOUT_SEC`, default 10 seconds).
+    pub delivery_timeout: Duration,
+    /// Overall shutdown-flush deadline (`COALESCE_SHUTDOWN_TIMEOUT_SEC`, default 15 seconds).
+    pub shutdown_timeout: Duration,
     /// Channels (JIDs/names) where coalescing applies (`COORD_CHANNELS`).
     pub coordination_channels: Vec<String>,
 }
@@ -79,6 +86,9 @@ impl Default for CoalesceConfig {
             window: Duration::from_secs(2),
             max_merges: 3,
             max_message_length: 420,
+            max_in_flight_deliveries: 32,
+            delivery_timeout: Duration::from_secs(10),
+            shutdown_timeout: Duration::from_secs(15),
             coordination_channels: Vec::new(),
         }
     }
@@ -91,17 +101,26 @@ impl CoalesceConfig {
         if let Ok(v) = std::env::var("COALESCE_ENABLED") {
             config.enabled = v.eq_ignore_ascii_case("true") || v == "1";
         }
-        if let Some(secs) = std::env::var("COALESCE_WINDOW_SEC")
-            .ok()
-            .and_then(|v| v.trim().parse::<f64>().ok())
-        {
-            config.window = Duration::from_secs_f64(secs.max(0.1));
+        if let Some(secs) = duration_from_env("COALESCE_WINDOW_SEC", 0.1) {
+            config.window = secs;
         }
         if let Some(n) = std::env::var("COALESCE_MAX_MERGES")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
         {
             config.max_merges = n;
+        }
+        if let Some(n) = std::env::var("COALESCE_MAX_DELIVERIES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            config.max_in_flight_deliveries = n.max(1);
+        }
+        if let Some(timeout) = duration_from_env("COALESCE_DELIVERY_TIMEOUT_SEC", 0.1) {
+            config.delivery_timeout = timeout;
+        }
+        if let Some(timeout) = duration_from_env("COALESCE_SHUTDOWN_TIMEOUT_SEC", 0.1) {
+            config.shutdown_timeout = timeout;
         }
         if let Ok(v) = std::env::var("COORD_CHANNELS") {
             config.coordination_channels = v
@@ -124,6 +143,14 @@ impl CoalesceConfig {
             .iter()
             .any(|configured| channel == configured.to_lowercase())
     }
+}
+
+fn duration_from_env(name: &str, minimum: f64) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite())
+        .map(|seconds| Duration::from_secs_f64(seconds.max(minimum)))
 }
 
 struct PendingMessage {
@@ -156,16 +183,21 @@ pub struct CoalesceBuffer {
     /// Readers own active submissions/deliveries. `flush_all` takes the writer
     /// so it cannot return while a detached callback is still running.
     delivery_barrier: Arc<RwLock<()>>,
+    /// Admission control prevents stalled transports from creating unbounded tasks.
+    delivery_slots: Arc<Semaphore>,
 }
 
 impl CoalesceBuffer {
     /// Create a buffer with the given config.
-    pub fn new(config: CoalesceConfig) -> Self {
+    pub fn new(mut config: CoalesceConfig) -> Self {
+        config.max_in_flight_deliveries = config.max_in_flight_deliveries.max(1);
+        let delivery_slots = Arc::new(Semaphore::new(config.max_in_flight_deliveries));
         Self {
             config,
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(0)),
             delivery_barrier: Arc::new(RwLock::new(())),
+            delivery_slots,
         }
     }
 
@@ -223,7 +255,7 @@ impl CoalesceBuffer {
         }
 
         if let Some((flush, content)) = early_flush {
-            spawn_flush(flush, content, delivery_guard);
+            self.spawn_flush(flush, content, delivery_guard).await;
         } else {
             drop(delivery_guard);
         }
@@ -259,7 +291,9 @@ impl CoalesceBuffer {
     fn spawn_timer(&self, key: ChannelKey, generation: u64) {
         let pending = Arc::clone(&self.pending);
         let delivery_barrier = Arc::clone(&self.delivery_barrier);
+        let delivery_slots = Arc::clone(&self.delivery_slots);
         let window = self.config.window;
+        let delivery_timeout = self.config.delivery_timeout;
         tokio::spawn(async move {
             tokio::time::sleep(window).await;
             let _delivery_guard = delivery_barrier.read_owned().await;
@@ -271,26 +305,78 @@ impl CoalesceBuffer {
                 }
             };
             if let Some(taken) = taken {
-                (taken.flush)(taken.content).await;
+                deliver_with_slot(taken, delivery_slots, delivery_timeout).await;
             }
+        });
+    }
+
+    async fn spawn_flush(&self, flush: FlushFn, content: String, guard: OwnedRwLockReadGuard<()>) {
+        let permit = tokio::time::timeout(
+            self.config.delivery_timeout,
+            Arc::clone(&self.delivery_slots).acquire_owned(),
+        )
+        .await;
+        let Ok(Ok(permit)) = permit else {
+            tracing::warn!("Dropping coalesced response after delivery queue timeout");
+            return;
+        };
+        let delivery_timeout = self.config.delivery_timeout;
+        tokio::spawn(async move {
+            // Keep both guards for the callback lifetime so shutdown observes
+            // this delivery and stalled transports cannot exceed the task cap.
+            let _delivery_guard = guard;
+            let _permit = permit;
+            deliver_with_timeout(flush, content, delivery_timeout).await;
         });
     }
 
     /// Flush every pending message (thread termination / engine shutdown).
     pub async fn flush_all(&self) {
+        if tokio::time::timeout(self.config.shutdown_timeout, self.flush_all_inner())
+            .await
+            .is_err()
+        {
+            tracing::warn!("Timed out flushing coalesced responses during shutdown");
+        }
+    }
+
+    async fn flush_all_inner(&self) {
         let _delivery_guard = Arc::clone(&self.delivery_barrier).write_owned().await;
         let taken: Vec<PendingMessage> = {
             let mut guard = self.pending.lock().await;
             guard.drain().map(|(_, p)| p).collect()
         };
-        for pending in taken {
-            (pending.flush)(pending.content).await;
-        }
+        let concurrency = self.config.max_in_flight_deliveries;
+        let delivery_timeout = self.config.delivery_timeout;
+        futures::stream::iter(taken)
+            .for_each_concurrent(concurrency, |pending| async move {
+                deliver_with_timeout(pending.flush, pending.content, delivery_timeout).await;
+            })
+            .await;
     }
 
     /// Number of currently buffered messages (tests/diagnostics).
     pub async fn pending_count(&self) -> usize {
         self.pending.lock().await.len()
+    }
+}
+
+async fn deliver_with_slot(
+    pending: PendingMessage,
+    delivery_slots: Arc<Semaphore>,
+    delivery_timeout: Duration,
+) {
+    let permit = tokio::time::timeout(delivery_timeout, delivery_slots.acquire_owned()).await;
+    let Ok(Ok(_permit)) = permit else {
+        tracing::warn!("Dropping coalesced response after delivery queue timeout");
+        return;
+    };
+    deliver_with_timeout(pending.flush, pending.content, delivery_timeout).await;
+}
+
+async fn deliver_with_timeout(flush: FlushFn, content: String, timeout: Duration) {
+    if tokio::time::timeout(timeout, flush(content)).await.is_err() {
+        tracing::warn!("Timed out delivering coalesced response");
     }
 }
 
@@ -300,17 +386,6 @@ fn is_alert(content: &str) -> bool {
         .trim_start()
         .get(..6)
         .is_some_and(|p| p.eq_ignore_ascii_case("alert:"))
-}
-
-fn spawn_flush(flush: FlushFn, content: String, guard: OwnedRwLockReadGuard<()>) {
-    tokio::spawn(async move {
-        // Hold the delivery-barrier read guard for the callback's lifetime:
-        // `flush_all`'s write guard must wait for detached deliveries. The
-        // guard must be moved INTO the task — binding it only as a function
-        // parameter drops it when this function returns.
-        let _guard = guard;
-        flush(content).await;
-    });
 }
 
 /// Split `"TAG: rest"` into `(Some("TAG"), "rest")` for uppercase tags.
@@ -359,6 +434,9 @@ mod tests {
             window: Duration::from_millis(50),
             max_merges: 3,
             max_message_length: 100,
+            max_in_flight_deliveries: 4,
+            delivery_timeout: Duration::from_secs(1),
+            shutdown_timeout: Duration::from_secs(2),
             coordination_channels: vec!["coord@conference.example".to_string()],
         }
     }
@@ -505,6 +583,80 @@ mod tests {
         let delivered = sent.lock().await.clone();
         assert_eq!(delivered, vec!["STATUS: pending".to_string()]);
         assert_eq!(buffer.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_delivery_timeout_prevents_shutdown_hang() {
+        let mut config = test_config();
+        config.window = Duration::from_millis(5);
+        config.delivery_timeout = Duration::from_millis(20);
+        config.shutdown_timeout = Duration::from_millis(100);
+        let buffer = CoalesceBuffer::new(config);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let flush: FlushFn = {
+            let started = Arc::clone(&started);
+            Arc::new(move |_| {
+                let started = Arc::clone(&started);
+                Box::pin(async move {
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                })
+            })
+        };
+
+        buffer.submit(key(), "STATUS: stuck".into(), flush).await;
+        started.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), buffer.flush_all())
+                .await
+                .is_ok(),
+            "shutdown must not wait forever for a stalled transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delivery_limit_backpressures_early_flushes() {
+        let mut config = test_config();
+        config.max_merges = 1;
+        config.max_in_flight_deliveries = 1;
+        let buffer = CoalesceBuffer::new(config);
+        let callback_gate = Arc::new(Semaphore::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let flush: FlushFn = {
+            let callback_gate = Arc::clone(&callback_gate);
+            let started = Arc::clone(&started);
+            Arc::new(move |_| {
+                let callback_gate = Arc::clone(&callback_gate);
+                let started = Arc::clone(&started);
+                Box::pin(async move {
+                    started.notify_one();
+                    let _permit = callback_gate.acquire().await;
+                })
+            })
+        };
+
+        buffer
+            .submit(key(), "STATUS: first".into(), flush.clone())
+            .await;
+        buffer
+            .submit(key(), "STATUS: second".into(), flush.clone())
+            .await;
+        started.notified().await;
+        buffer
+            .submit(key(), "STATUS: third".into(), flush.clone())
+            .await;
+        let blocked = {
+            let buffer = buffer.clone();
+            let flush = flush.clone();
+            tokio::spawn(async move { buffer.submit(key(), "STATUS: fourth".into(), flush).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+
+        callback_gate.add_permits(1);
+        assert_eq!(blocked.await.unwrap(), CoalesceDecision::Buffered);
+        callback_gate.add_permits(1);
+        buffer.flush_all().await;
     }
 
     #[tokio::test]
