@@ -14,7 +14,7 @@ use crate::db::WorkspaceStore;
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::workspace::{
     DocumentVersion, MemoryChunk, MemoryDocument, RankedResult, SearchConfig, SearchResult,
-    VersionSummary, WorkspaceEntry, fuse_results,
+    VersionSummary, WorkspaceEntry, WorkspaceFileContent, fuse_results,
 };
 
 use chrono::Utc;
@@ -683,6 +683,74 @@ impl WorkspaceStore for LibSqlBackend {
             });
         }
         Ok(entries)
+    }
+
+    async fn read_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError> {
+        let conn = self
+            .connect()
+            .await
+            .map_err(|error| WorkspaceError::SearchFailed {
+                reason: error.to_string(),
+            })?;
+        let agent_id = agent_id.map(|id| id.to_string());
+        let directory = directory.trim_end_matches('/');
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let max_file_bytes = i64::try_from(max_file_bytes).unwrap_or(i64::MAX);
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT path, content, updated_at
+                FROM memory_documents
+                WHERE user_id = ?1 AND agent_id IS ?2
+                  AND (?3 = '' OR substr(path, 1, length(?3)) = ?3)
+                  AND instr(substr(path, length(?3) + 1), '/') = 0
+                  AND (?4 = '' OR lower(substr(path, -length(?4))) = lower(?4))
+                  AND length(CAST(content AS BLOB)) <= ?6
+                ORDER BY path
+                LIMIT ?5
+                "#,
+                params![
+                    user_id,
+                    agent_id.as_deref(),
+                    prefix,
+                    suffix,
+                    limit,
+                    max_file_bytes
+                ],
+            )
+            .await
+            .map_err(|error| WorkspaceError::SearchFailed {
+                reason: format!("Limited file read failed: {error}"),
+            })?;
+
+        let mut files = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| WorkspaceError::SearchFailed {
+                reason: format!("Limited file read query failed: {error}"),
+            })?
+        {
+            files.push(WorkspaceFileContent {
+                path: get_text(&row, 0),
+                content: get_text(&row, 1),
+                updated_at: get_ts(&row, 2),
+            });
+        }
+        Ok(files)
     }
 
     async fn list_all_paths(
