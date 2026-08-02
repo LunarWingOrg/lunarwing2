@@ -1,6 +1,6 @@
 # BUG-005: Dwarfstar memory incident investigation
 
-> **Status:** RECLASSIFIED — unbounded local build and subprocess-lifecycle failure
+> **Status:** RECLASSIFIED — resource-unbounded local build and subprocess-lifecycle failure
 >
 > **Identifier scope:** This report's `BUG-005` label is not the unrelated
 > `BUG-005` (“Multica Daemon Connection Refused”) in
@@ -53,9 +53,9 @@ The strongest evidence identifies Rust compilation as the dominant workload:
 
 The incident is therefore best classified, at high confidence, as:
 
-> An unbounded Rust build ran through LunarWing's available local worker/shell
-> path under, or charged to, the LunarWing service cgroup. That path lacked
-> reliable process-tree cleanup on timeout/cancellation.
+> A resource-unbounded Rust build ran through LunarWing's available local
+> worker/shell path under, or charged to, the LunarWing service cgroup. That path
+> lacked reliable process-tree cleanup on timeout/cancellation.
 
 The cgroup did not itself leak memory: systemd correctly reported aggregate
 unit usage. Exact peak attribution was not sampled, so the compiler/page-cache
@@ -742,8 +742,9 @@ original investigation's provenance and were not independently reproduced.
 
 ## Final classification
 
-**Primary incident:** an unbounded local Rust build plus process-tree lifecycle
-failure. Systemd cgroup accounting correctly exposed the aggregate resource use.
+**Primary incident:** a resource-unbounded local Rust build plus process-tree
+lifecycle failure. Systemd cgroup accounting correctly exposed the aggregate
+resource use.
 
 **Not established:** a sandbox escape, Monty VM leak, Wasmtime per-call store
 leak, or 37.6 GB LunarWing main-process RSS.
