@@ -603,9 +603,11 @@ Builds should run in a dedicated container or cgroup with explicit limits:
 - CPU quota or bounded Cargo parallelism;
 - wall-clock deadline.
 
-The existing native build helper detects cgroup constraints to choose Cargo job
-count, but it does not create an isolation boundary. Detection is not a
-substitute for enforcement.
+The repository's native build helper detects inherited cgroup constraints to
+choose `cargo build -j`, but it does not create an isolation boundary and the
+incident invoked `cargo test` directly rather than through that helper
+(`scripts/build-lunarwing.sh:200-371,523-562`). Detection is not a substitute
+for enforcement.
 
 ### P1: add a tenant safety ceiling
 
