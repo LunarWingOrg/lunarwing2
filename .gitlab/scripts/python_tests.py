@@ -21,6 +21,8 @@ ROOT_SUITES = [
     "hermes_kawarimi.mapper_tests",
     "hermes_kawarimi.config_tests",
     "hermes_kawarimi.loader_tests",
+    "hermes_kawarimi.loader_populate_tests",
+    "hermes_kawarimi.cli_tests",
 ]
 
 

@@ -125,6 +125,19 @@ def main() -> int:
                         f"{image} (resolved: {resolved_image})"
                     )
 
+            rules = value.get("rules", [])
+            if isinstance(rules, list):
+                for index, rule in enumerate(rules, start=1):
+                    if (
+                        isinstance(rule, dict)
+                        and rule.get("when") == "manual"
+                        and "allow_failure" not in rule
+                    ):
+                        errors.append(
+                            f"{path.relative_to(ROOT)}:{name} manual rule {index} must "
+                            "explicitly set allow_failure"
+                        )
+
             script = value.get("script", [])
             if isinstance(script, str):
                 script = [script]
