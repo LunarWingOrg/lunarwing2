@@ -211,17 +211,26 @@ fn normalize_path(path: &str) -> Result<String, String> {
             .map_err(|_| format!("Invalid percent-encoding in path segment: {raw_segment}"))?;
         let segment = segment.as_ref();
 
-        // Encoded separators introduce ambiguous semantics across downstream handlers.
-        if segment.contains('/') || segment.contains('\\') {
-            return Err("Path segment contains encoded path separator".to_string());
+        // Backslash stays rejected: it is an ambiguous separator on some
+        // downstream stacks and has no legitimate use in allowlisted HTTPS
+        // API paths.
+        if segment.contains('\\') {
+            return Err("Path segment contains encoded backslash separator".to_string());
         }
 
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
+        // An encoded `/` (e.g. GitLab `group%2Fproject` or `feature%2Fbranch`
+        // path parameters) is treated as a real separator so the allowlist
+        // matches against the fully decoded, canonical path hierarchy.
+        // Encoded dot segments collapse exactly like literal ones, so
+        // traversal smuggling (`..%2F..`) stays blocked.
+        for part in segment.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    segments.pop();
+                }
+                _ => segments.push(part.to_string()),
             }
-            _ => segments.push(segment.to_string()),
         }
     }
 
@@ -441,6 +450,13 @@ mod tests {
         assert_eq!(normalize_path("/v1/%2e%2e/admin").unwrap(), "/admin");
         assert_eq!(normalize_path("/").unwrap(), "/");
         assert_eq!(normalize_path("/v1/").unwrap(), "/v1/");
+        // Encoded `/` decodes to a real separator before normalization.
+        assert_eq!(
+            normalize_path("/api/v4/projects/lunarwing%2Flunarwing2").unwrap(),
+            "/api/v4/projects/lunarwing/lunarwing2"
+        );
+        assert_eq!(normalize_path("/v1/..%2F../root").unwrap(), "/root");
+        assert!(normalize_path("/v1/%5Cadmin").is_err());
     }
 
     #[test]
@@ -456,9 +472,35 @@ mod tests {
     }
 
     #[test]
-    fn test_encoded_separator_rejected() {
+    fn test_encoded_separator_normalized() {
         let validator = validator_with_patterns();
+        // An encoded `/` inside a segment decodes to a real separator and the
+        // allowlist matches the canonical decoded hierarchy.
         let result = validator.validate("https://api.openai.com/v1/%2Fadmin", "GET");
+        assert!(result.is_allowed());
+
+        // GitLab-style namespaced path parameters must work: branch names and
+        // group/project paths are percent-encoded into a single segment.
+        let gitlab = AllowlistValidator::new(vec![EndpointPattern::host("git.lunarwing.org")
+            .with_path_prefix("/api/v4/")]);
+        let result = gitlab.validate(
+            "https://git.lunarwing.org/api/v4/projects/35/repository/branches/dwarfstar%2Ftest-write-ops",
+            "DELETE",
+        );
+        assert!(result.is_allowed());
+        let result = gitlab.validate(
+            "https://git.lunarwing.org/api/v4/projects/lunarwing%2Flunarwing2",
+            "GET",
+        );
+        assert!(result.is_allowed());
+
+        // Encoded separators cannot smuggle traversal past the prefix check:
+        // `..%2F..` collapses two levels, leaving the prefix unmatched.
+        let result = validator.validate("https://api.openai.com/v1/..%2F../root", "GET");
+        assert!(!result.is_allowed());
+
+        // Encoded backslash stays rejected as an ambiguous separator.
+        let result = validator.validate("https://api.openai.com/v1/%5Cadmin", "GET");
         assert!(!result.is_allowed());
         if let super::AllowlistResult::Denied(reason) = result {
             assert!(matches!(reason, DenyReason::InvalidUrl(_)));
