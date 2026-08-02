@@ -806,6 +806,10 @@ mod tests {
             handle_message_timeout: std::time::Duration::from_secs(300),
             self_repair_op_timeout: std::time::Duration::from_secs(60),
             session_prune_timeout: std::time::Duration::from_secs(30),
+            lorebook: crate::config::LorebookConfig {
+                enabled: false,
+                ..crate::config::LorebookConfig::default()
+            },
             reflex: crate::config::ReflexConfig::default(),
         };
         let cm = Arc::new(ContextManager::new(5));

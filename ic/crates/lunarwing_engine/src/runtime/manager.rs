@@ -1223,7 +1223,7 @@ mod tests {
             self.entered.notify_one();
             self.release.notified().await;
             Ok(LlmOutput {
-                response: LlmResponse::Text("done".into()),
+                response: LlmResponse::Text("FINAL(\"done\")".into()),
                 usage: TokenUsage::default(),
             })
         }
@@ -1555,7 +1555,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_and_join() {
         let store = Arc::new(MockStore::new());
-        let mgr = make_manager_with_store(MockLlm::text("Hello!"), Arc::clone(&store));
+        let mgr = make_manager_with_store(MockLlm::text("FINAL(\"Hello!\")"), Arc::clone(&store));
         let project = ProjectId::new();
         let mut events = mgr.subscribe_events();
 
@@ -1879,7 +1879,7 @@ mod tests {
             ) -> Result<LlmOutput, EngineError> {
                 self.release.notified().await;
                 Ok(LlmOutput {
-                    response: LlmResponse::Text("done".into()),
+                    response: LlmResponse::Text("FINAL(\"done\")".into()),
                     usage: TokenUsage::default(),
                 })
             }

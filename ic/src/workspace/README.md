@@ -28,6 +28,8 @@ workspace/
 ├── daily/                 <- Daily logs
 │   ├── 2024-01-15.md
 │   └── 2024-01-16.md
+├── lorebooks/             <- Bounded SillyTavern-style world-lore JSON
+│   └── fantasy.json
 ├── projects/              <- Arbitrary structure
 │   └── alpha/
 │       ├── README.md
@@ -121,12 +123,27 @@ When a workspace has additional read scopes (via `with_additional_read_scopes`),
 | IDENTITY.md | `read_primary()` | Identity is per-user |
 | TOOLS.md | `read_primary()` | Tool config is per-user |
 | BOOTSTRAP.md | `read_primary()` | Onboarding is per-user |
+| lorebooks/*.json | `list_primary()`/`read_primary()` | Prompt-visible world lore is per-user |
 | MEMORY.md | `read()` | Shared memory is a feature |
 | daily/*.md | `read()` | Shared daily logs are a feature |
 
 **Why:** Without this, a user with read access to another scope could silently inherit that scope's identity if their own copy is missing. The agent would present itself as the wrong user — a correctness and security issue.
 
 **Design rule:** If you want shared identity across users, seed the same content into each user's scope at setup time. Don't rely on multi-scope fallback for identity files.
+
+### Lorebooks
+
+`lorebooks/*.json` accepts the bounded SillyTavern World Info import subset and
+native list shape documented in `docs/proposals/LOREBOOKS.md`. Create or update
+a lorebook using `memory_write` with `append: false`; append is rejected before
+storage mutation.
+
+Lorebooks are prompt-visible configuration. Raw JSON and decoded fields receive
+canonicalized prompt-injection checks on default writes, named-layer writes,
+and legacy loads. Only primary-scope lorebooks load. Group-chat activation
+defaults off. Database listing, file, entry, key, scan, token, operation, and
+rendered-output limits bound per-turn work; see the proposal for exact values
+and unsupported SillyTavern behavior.
 
 ## Heartbeat System
 

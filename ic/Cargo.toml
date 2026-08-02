@@ -105,6 +105,7 @@ lunarwing_skills = { path = "crates/lunarwing_skills", version = "2.0.4" }
 # Safety/sanitization
 lunarwing_safety = { path = "crates/lunarwing_safety", version = "2.0.4" }
 regex = "1"
+unicode-normalization = "0.1"
 
 # Fuzzy string matching for the reflex router
 strsim = "0.11"

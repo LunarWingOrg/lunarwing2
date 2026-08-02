@@ -2845,6 +2845,37 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn simple_goal_classification_is_short_and_conversational() {
+        assert!(eval_python_bool(r#"is_simple_goal("standby for rebuild")"#));
+        assert!(eval_python_bool(r#"is_simple_goal("Thanks!")"#));
+        assert!(eval_python_bool(r#"is_simple_goal("restarted")"#));
+        assert!(!eval_python_bool(
+            r#"is_simple_goal("restarted, now run tests")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"is_simple_goal("standby for rebuild and restart, then test crafted attachment URLs against the SSRF policy")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"is_simple_goal("investigate the orchestrator")"#
+        ));
+    }
+
+    #[test]
+    fn final_answer_classification_rejects_leaked_prose() {
+        assert!(!eval_python_bool(
+            r#"looks_like_final_answer("*chortles* Oops - let me fix that!")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"looks_like_final_answer("The answer is 42")"#
+        ));
+        assert!(!eval_python_bool(r#"looks_like_final_answer("x" * 79)"#));
+        assert!(eval_python_bool(r#"looks_like_final_answer("x" * 80)"#));
+        assert!(eval_python_bool(
+            r#"looks_like_final_answer("Investigation complete: the orchestrator now retries malformed prose responses and stops after two bounded correction attempts.")"#
+        ));
+    }
+
     #[tokio::test]
     async fn load_orchestrator_without_store_returns_default() {
         let (code, version) = load_orchestrator(None, ProjectId::new(), true).await;

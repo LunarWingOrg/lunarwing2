@@ -1,0 +1,36 @@
+{
+  "name": "gitlab",
+  "display_name": "Self-hosted GitLab",
+  "kind": "tool",
+  "version": "0.1.0",
+  "wit_version": "0.3.0",
+  "description": "Manage projects, issues, merge requests, branches, files, search, and pipelines on self-hosted GitLab",
+  "keywords": [
+    "gitlab",
+    "git",
+    "repositories",
+    "issues",
+    "merge requests",
+    "pipelines",
+    "self-hosted"
+  ],
+  "source": {
+    "dir": "tools-src/gitlab",
+    "capabilities": "gitlab-tool.capabilities.json",
+    "crate_name": "gitlab-tool"
+  },
+  "artifacts": {
+    "wasm32-wasip2": {
+      "url": null,
+      "sha256": null
+    }
+  },
+  "auth_summary": {
+    "method": "manual",
+    "provider": "Self-hosted GitLab",
+    "secrets": ["gitlab_token"],
+    "shared_auth": null,
+    "setup_url": "https://git.lunarwing.org/-/user_settings/personal_access_tokens"
+  },
+  "tags": ["development", "git", "self-hosted"]
+}

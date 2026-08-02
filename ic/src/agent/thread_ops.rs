@@ -1256,23 +1256,20 @@ impl Agent {
 
             for (idx, tc) in deferred_tool_calls.iter().enumerate() {
                 if let Some(tool) = self.tools().get(&tc.name).await {
-                    // Match dispatcher.rs: when auto_approve_tools is true, skip
-                    // all approval checks (including ApprovalRequirement::Always).
-                    let (needs_approval, allow_always) = if self.config.auto_approve_tools {
-                        (false, true)
-                    } else {
-                        use crate::tools::ApprovalRequirement;
-                        let requirement = tool.requires_approval(&tc.arguments);
-                        let needs = match requirement {
-                            ApprovalRequirement::Never => false,
-                            ApprovalRequirement::UnlessAutoApproved => {
-                                let sess = session.lock().await;
-                                !sess.is_tool_auto_approved(&tc.name)
-                            }
-                            ApprovalRequirement::Always => true,
-                        };
-                        (needs, !matches!(requirement, ApprovalRequirement::Always))
+                    use crate::tools::ApprovalRequirement;
+                    let requirement = tool.requires_approval(&tc.arguments);
+                    let session_auto_approved = match requirement {
+                        ApprovalRequirement::UnlessAutoApproved
+                            if !self.config.auto_approve_tools =>
+                        {
+                            let sess = session.lock().await;
+                            sess.is_tool_auto_approved(&tc.name)
+                        }
+                        _ => false,
                     };
+                    let needs_approval = requirement
+                        .needs_prompt(self.config.auto_approve_tools, session_auto_approved);
+                    let allow_always = !matches!(requirement, ApprovalRequirement::Always);
 
                     if needs_approval {
                         approval_needed = Some((idx, tc.clone(), tool, allow_always));

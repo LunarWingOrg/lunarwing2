@@ -3306,7 +3306,7 @@ mod tests {
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager_with_response(
             Arc::clone(&store) as Arc<dyn Store>,
-            "Coverage is now 82%!\n\nNext focus: none\nGoal achieved: yes",
+            "FINAL(\"\"\"Coverage is now 82%!\n\nNext focus: none\nGoal achieved: yes\"\"\")",
         );
         let project_id = ProjectId::new();
 

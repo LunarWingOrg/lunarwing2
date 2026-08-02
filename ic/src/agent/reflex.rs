@@ -844,6 +844,15 @@ impl ReflexCompiler {
                 }
             }
             Err(e) => {
+                // Intentional: Err(ToolError) here means an infrastructure
+                // failure (LLM timeout, network, provider outage), not a bad
+                // pattern. These are transient, so we do NOT call
+                // record_reflex_compilation_failure or increment attempts —
+                // the pattern is retried on the next check_interval once the
+                // provider recovers, rather than being auto-disabled.
+                // TODO(future): add a separate infra-error counter with
+                // exponential backoff as a circuit breaker for persistent
+                // infrastructure failures.
                 tracing::error!("Reflex compiler error for pattern '{}': {}", description, e);
             }
         }

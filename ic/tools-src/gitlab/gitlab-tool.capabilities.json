@@ -1,0 +1,55 @@
+{
+  "version": "0.1.0",
+  "wit_version": "0.3.0",
+  "description": "Manage projects, issues, merge requests, branches, repository files, search, and pipelines on self-hosted GitLab. The personal access token is injected host-side and never exposed to WASM.",
+  "capabilities": {
+    "approval": "always",
+    "http": {
+      "allowlist": [
+        {
+          "host": "git.lunarwing.org",
+          "path_prefix": "/api/v4/",
+          "methods": ["GET", "POST", "PUT", "DELETE"]
+        }
+      ],
+      "credentials": {
+        "gitlab_token": {
+          "secret_name": "gitlab_token",
+          "location": {
+            "type": "header",
+            "name": "PRIVATE-TOKEN"
+          },
+          "host_patterns": ["git.lunarwing.org"]
+        }
+      },
+      "rate_limit": {
+        "requests_per_minute": 120,
+        "requests_per_hour": 4000
+      },
+      "max_request_bytes": 2097152,
+      "max_response_bytes": 8388608,
+      "timeout_secs": 60
+    },
+    "workspace": {
+      "allowed_prefixes": ["config/gitlab.json"]
+    },
+    "secrets": {
+      "allowed_names": ["gitlab_token"]
+    }
+  },
+  "auth": {
+    "secret_name": "gitlab_token",
+    "display_name": "Self-hosted GitLab",
+    "instructions": "Create a GitLab personal access token with api scope, then store it as the LunarWing secret gitlab_token. This bundled grant is restricted to git.lunarwing.org.",
+    "setup_url": "https://git.lunarwing.org/-/user_settings/personal_access_tokens",
+    "env_var": "GITLAB_TOKEN"
+  },
+  "setup": {
+    "required_secrets": [
+      {
+        "name": "gitlab_token",
+        "prompt": "GitLab personal access token with api scope"
+      }
+    ]
+  }
+}
