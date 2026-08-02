@@ -83,7 +83,7 @@ impl Agent {
         );
         let prompt_context = prompt_context_from_chat_messages(&initial_messages);
 
-        let system_prompt = if let Some(ws) = self.workspace() {
+        let mut system_prompt = if let Some(ws) = self.workspace() {
             match ws
                 .system_prompt_for_context_tz(is_group_chat, user_tz)
                 .await
@@ -98,6 +98,26 @@ impl Agent {
         } else {
             None
         };
+
+        // Inject activated lorebook reference text (untrusted data, not
+        // instructions) after identity files for this turn.
+        if let Some(workspace) = self.workspace() {
+            let activation_scope = thread_id.to_string();
+            if let Some(block) = crate::lorebook::build_active_block(
+                workspace,
+                &initial_messages,
+                &activation_scope,
+                is_group_chat,
+                &self.config.lorebook,
+            )
+            .await
+            {
+                system_prompt = Some(match system_prompt {
+                    Some(prompt) => format!("{prompt}\n\n{block}"),
+                    None => block,
+                });
+            }
+        }
 
         // Select and prepare active skills (if skills system is enabled).
         let cavepony_activation = self.resolve_cavepony_activation(message).await;
@@ -638,19 +658,20 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
             }
 
             // Check if tool requires approval
-            if !self.agent.config.auto_approve_tools
-                && let Some(tool) = tool_opt
-            {
+            if let Some(tool) = tool_opt {
                 use crate::tools::ApprovalRequirement;
                 let requirement = tool.requires_approval(&tc.arguments);
-                let needs_approval = match requirement {
-                    ApprovalRequirement::Never => false,
-                    ApprovalRequirement::UnlessAutoApproved => {
+                let session_auto_approved = match requirement {
+                    ApprovalRequirement::UnlessAutoApproved
+                        if !self.agent.config.auto_approve_tools =>
+                    {
                         let sess = self.session.lock().await;
-                        !sess.is_tool_auto_approved(&tc.name)
+                        sess.is_tool_auto_approved(&tc.name)
                     }
-                    ApprovalRequirement::Always => true,
+                    _ => false,
                 };
+                let needs_approval = requirement
+                    .needs_prompt(self.agent.config.auto_approve_tools, session_auto_approved);
 
                 if needs_approval {
                     // In non-DM relay channels, auto-deny approval-
@@ -1382,6 +1403,10 @@ mod tests {
                 handle_message_timeout: Duration::from_secs(400),
                 self_repair_op_timeout: Duration::from_secs(60),
                 session_prune_timeout: Duration::from_secs(30),
+                lorebook: crate::config::LorebookConfig {
+                    enabled: false,
+                    ..crate::config::LorebookConfig::default()
+                },
                 reflex: crate::config::ReflexConfig::default(),
             },
             deps,
@@ -2273,6 +2298,10 @@ mod tests {
                 handle_message_timeout: Duration::from_secs(400),
                 self_repair_op_timeout: Duration::from_secs(60),
                 session_prune_timeout: Duration::from_secs(30),
+                lorebook: crate::config::LorebookConfig {
+                    enabled: false,
+                    ..crate::config::LorebookConfig::default()
+                },
                 reflex: crate::config::ReflexConfig::default(),
             },
             deps,
@@ -2404,6 +2433,10 @@ mod tests {
                     handle_message_timeout: Duration::from_secs(400),
                     self_repair_op_timeout: Duration::from_secs(60),
                     session_prune_timeout: Duration::from_secs(30),
+                    lorebook: crate::config::LorebookConfig {
+                        enabled: false,
+                        ..crate::config::LorebookConfig::default()
+                    },
                     reflex: crate::config::ReflexConfig::default(),
                 },
                 deps,

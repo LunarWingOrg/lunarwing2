@@ -59,6 +59,7 @@ pub mod hooks;
 #[cfg(feature = "import")]
 pub mod import;
 pub mod llm;
+pub mod lorebook;
 pub mod observability;
 pub mod orchestrator;
 pub mod pairing;

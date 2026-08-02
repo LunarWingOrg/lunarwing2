@@ -37,8 +37,87 @@ pub struct AgentConfig {
     pub self_repair_op_timeout: Duration,
     /// Max time for session pruning.
     pub session_prune_timeout: Duration,
+    /// SillyTavern-import-subset lorebook behavior.
+    pub lorebook: LorebookConfig,
     /// Reflex compiler configuration.
     pub reflex: ReflexConfig,
+}
+
+/// Lorebook activation configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LorebookConfig {
+    /// Master feature switch.
+    pub enabled: bool,
+    /// Permit primary-scope lorebooks in group chats. Disabled by default to
+    /// avoid exposing private lore through participant-controlled triggers.
+    pub allow_group_chats: bool,
+    /// Newest visible user/assistant messages scanned for trigger keys.
+    pub scan_depth: usize,
+    /// Maximum activated entries injected into one prompt.
+    pub max_entries: usize,
+    /// Approximate token budget for the complete rendered lorebook block.
+    pub token_budget: usize,
+}
+
+impl LorebookConfig {
+    /// Hard cap for `LOREBOOK_SCAN_DEPTH`.
+    pub const MAX_SCAN_DEPTH: usize = 100;
+    /// Hard cap for `LOREBOOK_MAX_ENTRIES`.
+    pub const MAX_ACTIVE_ENTRIES: usize = 64;
+    /// Hard cap for `LOREBOOK_TOKEN_BUDGET`.
+    pub const MAX_TOKEN_BUDGET: usize = 16_000;
+
+    fn resolve() -> Result<Self, ConfigError> {
+        let defaults = Self::default();
+        Self {
+            enabled: parse_bool_env("LOREBOOK_ENABLED", defaults.enabled)?,
+            allow_group_chats: parse_bool_env(
+                "LOREBOOK_ALLOW_GROUP_CHATS",
+                defaults.allow_group_chats,
+            )?,
+            scan_depth: parse_optional_env("LOREBOOK_SCAN_DEPTH", defaults.scan_depth)?,
+            max_entries: parse_optional_env("LOREBOOK_MAX_ENTRIES", defaults.max_entries)?,
+            token_budget: parse_optional_env("LOREBOOK_TOKEN_BUDGET", defaults.token_budget)?,
+        }
+        .validated()
+    }
+
+    fn validated(self) -> Result<Self, ConfigError> {
+        validate_limit("LOREBOOK_SCAN_DEPTH", self.scan_depth, Self::MAX_SCAN_DEPTH)?;
+        validate_limit(
+            "LOREBOOK_MAX_ENTRIES",
+            self.max_entries,
+            Self::MAX_ACTIVE_ENTRIES,
+        )?;
+        validate_limit(
+            "LOREBOOK_TOKEN_BUDGET",
+            self.token_budget,
+            Self::MAX_TOKEN_BUDGET,
+        )?;
+        Ok(self)
+    }
+}
+
+impl Default for LorebookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_group_chats: false,
+            scan_depth: 10,
+            max_entries: 20,
+            token_budget: 1200,
+        }
+    }
+}
+
+fn validate_limit(key: &str, value: usize, maximum: usize) -> Result<(), ConfigError> {
+    if value > maximum {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_string(),
+            message: format!("must be at most {maximum}, got {value}"),
+        });
+    }
+    Ok(())
 }
 
 /// Configuration for the reflex compiler.
@@ -103,6 +182,10 @@ impl AgentConfig {
             handle_message_timeout: Duration::from_secs(630),
             self_repair_op_timeout: Duration::from_secs(60),
             session_prune_timeout: Duration::from_secs(30),
+            lorebook: LorebookConfig {
+                enabled: false,
+                ..LorebookConfig::default()
+            },
             reflex: ReflexConfig::default(),
         }
     }
@@ -175,6 +258,7 @@ impl AgentConfig {
                 "AGENT_SESSION_PRUNE_TIMEOUT_SECS",
                 settings.agent.session_prune_timeout_secs,
             )?),
+            lorebook: LorebookConfig::resolve()?,
             reflex: ReflexConfig {
                 enabled: parse_bool_env("REFLEX_COMPILER_ENABLED", false)?,
                 check_interval: Duration::from_secs(parse_optional_env(
@@ -214,5 +298,27 @@ mod tests {
         let settings = Settings::default(); // default is "UTC"
         let config = AgentConfig::resolve(&settings).expect("resolve");
         assert_eq!(config.default_timezone, "UTC");
+    }
+
+    #[test]
+    fn lorebook_defaults_are_bounded_and_group_private() {
+        let config = LorebookConfig::default()
+            .validated()
+            .expect("valid defaults");
+        assert!(config.enabled);
+        assert!(!config.allow_group_chats);
+        assert_eq!(config.scan_depth, 10);
+        assert_eq!(config.max_entries, 20);
+        assert_eq!(config.token_budget, 1200);
+    }
+
+    #[test]
+    fn lorebook_rejects_values_above_hard_limits() {
+        let result = LorebookConfig {
+            scan_depth: LorebookConfig::MAX_SCAN_DEPTH + 1,
+            ..LorebookConfig::default()
+        }
+        .validated();
+        assert!(matches!(result, Err(ConfigError::InvalidValue { .. })));
     }
 }

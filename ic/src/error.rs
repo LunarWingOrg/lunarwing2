@@ -322,6 +322,12 @@ pub enum WorkspaceError {
     #[error("Write rejected for '{path}': prompt injection detected ({reason})")]
     InjectionRejected { path: String, reason: String },
 
+    #[error("Invalid lorebook document '{path}': {reason}")]
+    InvalidLorebook { path: String, reason: String },
+
+    #[error("Append not supported for '{path}': {reason}")]
+    AppendNotSupported { path: String, reason: String },
+
     #[error("Version not found: document {document_id} version {version}")]
     VersionNotFound { document_id: Uuid, version: i32 },
 

@@ -4511,6 +4511,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "unicode-normalization",
  "url",
  "urlencoding",
  "uuid",

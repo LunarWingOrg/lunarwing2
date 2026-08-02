@@ -898,6 +898,15 @@ pub trait WorkspaceStore: Send + Sync {
         agent_id: Option<Uuid>,
         directory: &str,
     ) -> Result<Vec<WorkspaceEntry>, WorkspaceError>;
+    /// List bounded direct files whose names end with `suffix`.
+    async fn list_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceEntry>, WorkspaceError>;
     async fn list_all_paths(
         &self,
         user_id: &str,

@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::tools::wasm::capabilities::{
     Capabilities, EndpointPattern, HttpCapability, RateLimitConfig, SecretsCapability,
-    ToolInvokeCapability,
+    ToolInvokeCapability, WasmApprovalPolicy,
 };
 
 /// Trust level for a WASM tool.
@@ -123,6 +123,7 @@ pub struct StoredWasmToolWithBinary {
 pub struct StoredCapabilities {
     pub id: Uuid,
     pub wasm_tool_id: Uuid,
+    pub approval: WasmApprovalPolicy,
     pub http_allowlist: Vec<EndpointPattern>,
     pub allowed_secrets: Vec<String>,
     pub tool_aliases: HashMap<String, String>,
@@ -137,7 +138,10 @@ pub struct StoredCapabilities {
 impl StoredCapabilities {
     /// Convert to runtime Capabilities struct.
     pub fn to_capabilities(&self) -> Capabilities {
-        let mut caps = Capabilities::default();
+        let mut caps = Capabilities {
+            approval: self.approval,
+            ..Capabilities::default()
+        };
 
         // Workspace read
         if !self.workspace_read_prefixes.is_empty() {
@@ -445,7 +449,7 @@ impl WasmToolStore for PostgresWasmToolStore {
         let row = client
             .query_opt(
                 r#"
-                SELECT id, wasm_tool_id, http_allowlist, allowed_secrets, tool_aliases,
+                SELECT id, wasm_tool_id, approval_policy, http_allowlist, allowed_secrets, tool_aliases,
                        requests_per_minute, requests_per_hour, max_request_body_bytes,
                        max_response_body_bytes, workspace_read_prefixes, http_timeout_secs
                 FROM tool_capabilities
@@ -469,6 +473,10 @@ impl WasmToolStore for PostgresWasmToolStore {
                 Ok(Some(StoredCapabilities {
                     id: r.get("id"),
                     wasm_tool_id: r.get("wasm_tool_id"),
+                    approval: r
+                        .get::<_, String>("approval_policy")
+                        .parse()
+                        .map_err(WasmStorageError::InvalidData)?,
                     http_allowlist,
                     allowed_secrets: r.get("allowed_secrets"),
                     tool_aliases,
@@ -788,7 +796,7 @@ impl WasmToolStore for LibSqlWasmToolStore {
         let mut rows = conn
             .query(
                 r#"
-                SELECT id, wasm_tool_id, http_allowlist, allowed_secrets, tool_aliases,
+                SELECT id, wasm_tool_id, approval_policy, http_allowlist, allowed_secrets, tool_aliases,
                        requests_per_minute, requests_per_hour, max_request_body_bytes,
                        max_response_body_bytes, workspace_read_prefixes, http_timeout_secs
                 FROM tool_capabilities
@@ -811,15 +819,20 @@ impl WasmToolStore for LibSqlWasmToolStore {
                 let tool_id_str: String = row
                     .get(1)
                     .map_err(|e| WasmStorageError::Database(e.to_string()))?;
-                let http_allowlist_str: String = row.get::<String>(2).unwrap_or_default();
-                let allowed_secrets_str: String = row.get::<String>(3).unwrap_or_default();
-                let tool_aliases_str: String = row.get::<String>(4).unwrap_or_default();
-                let rpm: i64 = row.get::<i64>(5).unwrap_or(60);
-                let rph: i64 = row.get::<i64>(6).unwrap_or(1000);
-                let max_req: i64 = row.get::<i64>(7).unwrap_or(1048576);
-                let max_resp: i64 = row.get::<i64>(8).unwrap_or(10485760);
-                let ws_prefixes_str: String = row.get::<String>(9).unwrap_or_default();
-                let timeout: i64 = row.get::<i64>(10).unwrap_or(30);
+                let approval: WasmApprovalPolicy = row
+                    .get::<String>(2)
+                    .unwrap_or_else(|_| "never".to_string())
+                    .parse()
+                    .map_err(WasmStorageError::InvalidData)?;
+                let http_allowlist_str: String = row.get::<String>(3).unwrap_or_default();
+                let allowed_secrets_str: String = row.get::<String>(4).unwrap_or_default();
+                let tool_aliases_str: String = row.get::<String>(5).unwrap_or_default();
+                let rpm: i64 = row.get::<i64>(6).unwrap_or(60);
+                let rph: i64 = row.get::<i64>(7).unwrap_or(1000);
+                let max_req: i64 = row.get::<i64>(8).unwrap_or(1048576);
+                let max_resp: i64 = row.get::<i64>(9).unwrap_or(10485760);
+                let ws_prefixes_str: String = row.get::<String>(10).unwrap_or_default();
+                let timeout: i64 = row.get::<i64>(11).unwrap_or(30);
 
                 let http_allowlist: Vec<EndpointPattern> =
                     serde_json::from_str(&http_allowlist_str).unwrap_or_default();
@@ -837,6 +850,7 @@ impl WasmToolStore for LibSqlWasmToolStore {
                     wasm_tool_id: tool_id_str
                         .parse()
                         .map_err(|e: uuid::Error| WasmStorageError::InvalidData(e.to_string()))?,
+                    approval,
                     http_allowlist,
                     allowed_secrets,
                     tool_aliases,
@@ -1032,8 +1046,13 @@ fn libsql_row_to_tool_at(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use uuid::Uuid;
+
+    use crate::tools::wasm::WasmApprovalPolicy;
     use crate::tools::wasm::storage::{
-        ToolStatus, TrustLevel, compute_binary_hash, verify_binary_integrity,
+        StoredCapabilities, ToolStatus, TrustLevel, compute_binary_hash, verify_binary_integrity,
     };
 
     #[test]
@@ -1081,5 +1100,28 @@ mod tests {
             ToolStatus::Quarantined
         );
         assert!("invalid".parse::<ToolStatus>().is_err());
+    }
+
+    #[test]
+    fn stored_capabilities_preserve_approval_policy() {
+        let stored = StoredCapabilities {
+            id: Uuid::new_v4(),
+            wasm_tool_id: Uuid::new_v4(),
+            approval: WasmApprovalPolicy::Always,
+            http_allowlist: Vec::new(),
+            allowed_secrets: Vec::new(),
+            tool_aliases: HashMap::new(),
+            requests_per_minute: 60,
+            requests_per_hour: 1000,
+            max_request_body_bytes: 1_048_576,
+            max_response_body_bytes: 10_485_760,
+            workspace_read_prefixes: Vec::new(),
+            http_timeout_secs: 30,
+        };
+
+        assert_eq!(
+            stored.to_capabilities().approval,
+            WasmApprovalPolicy::Always
+        );
     }
 }

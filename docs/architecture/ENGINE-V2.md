@@ -101,11 +101,11 @@ Threads form a tree via `ThreadTree`. Parent threads can spawn children, and chi
 1. Check signals (Stop, InjectMessage) via mpsc::Receiver
 2. Build context (messages + available actions from active leases)
 3. Call LLM via `LlmBackend::complete_stream()` (with a `complete()` fallback for non-streaming backends)
-4. If Text: check tool intent nudge, return if final response
+4. If Text: check tool-intent and leaked-prose recovery, return accepted final response
 5. If ActionCalls (Tier 0): find lease -> check policy -> consume use -> execute -> record
 6. If Code (Tier 1): execute Python via Monty with context-as-variables
 7. Record Step, emit ThreadEvents
-8. Repeat until: text response, stop signal, max iterations, or approval needed
+8. Repeat until: accepted text response, stop signal, max iterations, or approval needed
 ```
 
 ### Two Execution Tiers
@@ -148,6 +148,10 @@ The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execut
 - Can be patched by the self-improvement mission and versioned in the Store when
   `ORCHESTRATOR_SELF_MODIFY=true`
 - Falls back to compiled-in default (v0) if disabled or patches fail (3+ consecutive failures triggers rollback)
+- Nudges short roleplay or retry prose back into a `repl` block for non-conversational
+  goals, with a default two-attempt cap; substantive prose and short conversational
+  goals remain valid terminal responses. Syntax-invalid `repl` blocks use the same
+  bounded correction before terminal delivery through shared channels such as XMPP.
 - Async dispatch of tool calls with `asyncio.gather()` for parallel execution
 - Default orchestrator source: `ic/crates/lunarwing_engine/orchestrator/default.py`
 
