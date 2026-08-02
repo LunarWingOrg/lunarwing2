@@ -57,15 +57,7 @@ DarkIRC is opt-in. It is neither rendered nor built for a new tenant unless the 
 
 ### External workers
 
-LunarWing can attach persistent Pebble, OpenCode, or Kimi Code worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant. Nanocode is retired; see [`docs/ops/NANOCODE-REMOVAL.md`](docs/ops/NANOCODE-REMOVAL.md).
-
-External `create_job` calls default to no conversation history. Set
-`context_scope: "recent"` to send bounded user/assistant messages from current
-thread as untrusted reference context; task description remains authoritative.
-
-Local and Docker `create_job` workers default to 200 tool-call iterations. Set
-`max_iterations: 300` (up to 500) for large multi-fix write tasks. Named
-external workers manage their own iteration policy and reject this option.
+LunarWing can attach persistent Pebble, OpenCode, or Kimi Code worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant.
 
 ### Skills and self-improvement
 
@@ -101,7 +93,7 @@ Demo mode does not create tenants or modify host services. The launcher still cr
 
 The supported production path assumes Python 3.10 or newer with `venv` and pip, a Linux host using systemd or OpenRC, root or sudo access, Docker or Podman, `jq`, `git`, download access on first launch, and adequate time and disk space for builds.
 
-For distro-specific prerequisites, use the [Gentoo/OpenRC package list](docs/guides/GENTOO_PACKAGE_LIST.md) or the [Arch Linux/systemd package list](docs/guides/ARCHLINUX_PACKAGE_LIST.md).
+For distro-specific prerequisites, see: docs/guides/
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh doctor
