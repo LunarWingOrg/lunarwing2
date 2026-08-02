@@ -16,7 +16,7 @@
 > **Investigation baseline:** `memleakfix4/cmc/v2.0.4.0`, commit `6c82e8c`;
 > the report itself was added one commit later as `11b673d`.
 >
-> **Cross-verification:** Rechecked against repository HEAD `1e319bf` on
+> **Cross-verification:** Rechecked against source baseline `1e319bf` on
 > 2026-08-02. The timeout, process-tree, and unit-resource findings remain
 > current. Cross-verification corrected the original interpretation of
 > `mode=worker`: current source deliberately routes it to the local scheduler
