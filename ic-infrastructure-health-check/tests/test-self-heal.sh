@@ -62,18 +62,24 @@ assert_absent   "$oA" "Cannot index string"                        "A: pass-2 jq
 
 # ── B: backoff (item 1) ─────────────────────────────────────────────────────
 B="$(sb)"; report "$B" "$GW"
+B_started="$(now)"
 run_dry "$B" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false >/dev/null
+B_finished="$(now)"
 nb="$(state_of "$B" '.lunarwing.next_attempt_at')"
-assert_range "$((nb - $(now)))" 0 60 "B1: exponential schedules next_attempt_at in [0,60]"
+assert_range "$nb" "$B_started" "$((B_finished + 60))" "B1: exponential schedules next_attempt_at within the jitter window"
 oB2="$(run_dry "$B" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
 # (only asserts the gate when the jittered delay was > 0; if 0 a restart is fine)
-if [[ "$((nb - $(now)))" -gt 1 ]]; then
+remaining=$((nb - $(now)))
+if [[ "$remaining" -gt 1 ]]; then
   assert_contains "$oB2" "BACKOFF" "B2: second run gated by backoff"
 else ok "B2: backoff was 0 (jitter) — no gate expected"; fi
 Bl="$(sb)"; report "$Bl" "$GW"
+Bl_started="$(now)"
 run_dry "$Bl" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false \
     SELF_HEAL_BACKOFF_STRATEGY=linear SELF_HEAL_BACKOFF_BASE=300 >/dev/null
-assert_range "$(( $(state_of "$Bl" '.lunarwing.next_attempt_at') - $(now) ))" 299 301 "B3: linear strategy is deterministic (now+base)"
+Bl_finished="$(now)"
+Bl_next="$(state_of "$Bl" '.lunarwing.next_attempt_at')"
+assert_range "$Bl_next" "$((Bl_started + 300))" "$((Bl_finished + 300))" "B3: linear strategy is deterministic (now+base)"
 
 # ── C: grace period (item 2) ────────────────────────────────────────────────
 C="$(sb)"; report "$C" "$GW"
@@ -136,8 +142,11 @@ I1="$(sb)"; report "$I1" "$GW"
 oI1="$(run_dry "$I1" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_VERIFY_HEALTH=false -- --grace-checks 1)"
 assert_contains "$oI1" "would run: systemctl restart lunarwing" "I1: --grace-checks 1 restarts on first observation"
 I2="$(sb)"; report "$I2" "$GW"
+I2_started="$(now)"
 run_dry "$I2" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_VERIFY_HEALTH=false -- --grace-checks 1 --backoff-strategy linear --backoff-base 200 >/dev/null
-assert_range "$(( $(state_of "$I2" '.lunarwing.next_attempt_at') - $(now) ))" 199 201 "I2: --backoff-strategy/-base flags honored"
+I2_finished="$(now)"
+I2_next="$(state_of "$I2" '.lunarwing.next_attempt_at')"
+assert_range "$I2_next" "$((I2_started + 200))" "$((I2_finished + 200))" "I2: --backoff-strategy/-base flags honored"
 I3="$(sb)"; mkdir -p "$I3/checks"; report "$I3" "$GW"
 printf '#!/usr/bin/env bash\necho %s\n' "'{\"status\":\"healthy\"}'" > "$I3/checks/health-gateway.sh"; chmod +x "$I3/checks/health-gateway.sh"
 run_dry "$I3" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_HEALTH_CHECK_DIR="$I3/checks" -- --verify-health false >/dev/null

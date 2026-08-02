@@ -39,6 +39,7 @@ worker-pebble-image:
       --destination "$CI_REGISTRY_IMAGE/worker-pebble:latest"
   rules:
     - when: manual
+      allow_failure: true
 
 worker-opencode-image:
   extends: .container-job
@@ -55,6 +56,7 @@ worker-opencode-image:
       --destination "$CI_REGISTRY_IMAGE/worker-opencode:latest"
   rules:
     - when: manual
+      allow_failure: true
 
 worker-kimi-image:
   extends: .container-job
@@ -72,3 +74,4 @@ worker-kimi-image:
       --destination "$CI_REGISTRY_IMAGE/worker-kimi:latest"
   rules:
     - when: manual
+      allow_failure: true

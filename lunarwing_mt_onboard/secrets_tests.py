@@ -176,8 +176,13 @@ class TestParseTenantEnv(unittest.TestCase):
                 os.unlink(f.name)
 
     def test_missing_env_file(self):
-        with self.assertRaises(FileNotFoundError):
-            secrets_ops.parse_tenant_env("__nonexistent_tenant__")
+        with patch("builtins.open", side_effect=FileNotFoundError) as open_file:
+            with self.assertRaises(FileNotFoundError):
+                secrets_ops.parse_tenant_env("__nonexistent_tenant__")
+
+        open_file.assert_called_once_with(
+            "/home/__nonexistent_tenant__/lunarwing/env/lunarwing.env"
+        )
 
 
 class TestCrypto(unittest.TestCase):

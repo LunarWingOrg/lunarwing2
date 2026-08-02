@@ -1,3 +1,36 @@
+# Shell Harness CI Failure
+
+## Resolution (2026-08-02)
+
+Only one assertion failed: self-heal regression B1. Production correctly permits
+full-jitter delay `0`, meaning `next_attempt_at` can equal script start time. Test
+subtracted a later wall-clock sample, so crossing a one-second boundary converted
+legal delay `0` into observed delay `-1`. Fix brackets script execution and checks
+stored absolute timestamp against invocation window. Same bracketing now protects
+linear backoff assertions from slow-runner clock drift.
+
+Goal 11 audit also found and fixed two independent CI gaps:
+
+- Manual container image jobs now declare `allow_failure: true`; GitLab otherwise
+  treats `rules: when: manual` as blocking and leaves pipelines blocked.
+- Python unit job now runs Kawarimi CLI and population suites instead of silently
+  omitting them.
+- CI config validator now rejects manual rules that leave blocking behavior
+  implicit.
+- Missing-env test now mocks file absence, avoiding host-dependent `/home`
+  traversal errors for non-root developers.
+
+## Verification
+
+- GitLab config validator: 8 YAML files passed.
+- Python syntax: 96 files passed.
+- Shell syntax: 155 scripts and 3 hooks passed.
+- Focused Python tests: 9 passed, including all newly added CI suites.
+- Health harness: 295 passed, 0 failed across regression, matrix, chaos,
+  OpenRC, and systemd suites.
+
+## Original Pipeline Log
+
 2026-08-02T04:56:16.430028Z 00O [0KRunning with gitlab-runner 19.2.0 (39acda30)[0;m
 2026-08-02T04:56:16.430066Z 00O [0K  on lunarwing-lint-docker lYlWumyKW, system ID: r_dLo2MDLTpMm2[0;m
 2026-08-02T04:56:16.430164Z 00O section_start:1785646576:prepare_executor
@@ -1616,4 +1649,3 @@
 2026-08-02T04:59:10.561883Z 00O section_end:1785646750:cleanup_file_variables
 [0K
 2026-08-02T04:59:10.738883Z 00O [31;1mERROR: Job failed: exit code 1[0;m
-
