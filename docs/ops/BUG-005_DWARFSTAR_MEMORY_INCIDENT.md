@@ -1,6 +1,6 @@
 # BUG-005: Dwarfstar memory incident investigation
 
-> **Status:** RECLASSIFIED — build-process isolation and cancellation failure
+> **Status:** RECLASSIFIED — unbounded local build and subprocess-lifecycle failure
 >
 > **Incident:** 2026-08-01/2026-08-02, tenant `dwarfstar`
 >
@@ -13,10 +13,13 @@
 > the report itself was added one commit later as `11b673d`.
 >
 > **Cross-verification:** Rechecked against repository HEAD `1e319bf` on
-> 2026-08-02. The source-level failure chain and open remediation status remain
-> current. Historical tenant journal, database, filesystem, and `/proc` figures
-> below are preserved investigation evidence; they cannot be independently
-> reproduced from this checkout alone.
+> 2026-08-02. The timeout, process-tree, and unit-resource findings remain
+> current. Cross-verification corrected the original interpretation of
+> `mode=worker`: current source deliberately routes it to the local scheduler
+> when no container job manager exists, and describes that backend as local.
+> Historical tenant journal, database, filesystem, and `/proc` figures below are
+> preserved investigation evidence; they cannot be independently reproduced
+> from this checkout alone.
 >
 > **Confidence:** High that Rust compilation drove the observed service-cgroup
 > peaks; no evidence confirms a Monty, Wasmtime, or LunarWing-process heap leak.
@@ -46,15 +49,16 @@ The strongest evidence identifies Rust compilation as the dominant workload:
 
 The incident is therefore best classified as:
 
-> A Rust build escaped its intended worker isolation, ran under or was charged
-> to the LunarWing service cgroup without a memory ceiling, and was not reliably
-> terminated when the owning tool/job timed out or was cancelled.
+> A Rust build ran through LunarWing's available local worker/shell path under,
+> or charged to, the LunarWing service cgroup. That path had no build-specific
+> resource ceiling or reliable process-tree cleanup on timeout/cancellation.
 
 Cgroups did not leak memory. They correctly accounted for the aggregate memory
 used by the daemon and its charged descendants, including compiler memory,
-file/page cache, and kernel allocations. The product defect is the placement,
-resource isolation, timeout ownership, and process-tree cleanup around local
-shell work.
+file/page cache, and kernel allocations. The product defects are the missing
+resource boundary, inconsistent timeout ownership, and incomplete process-tree
+cleanup around local shell work. The evidence does not establish a sandbox
+escape: local execution was an intentional backend when Docker was unavailable.
 
 Commit `d2ff7b8` fixes a separate, real Engine V2 output-boundary bug. It should
 be retained, but it is not sufficient to explain or fix this incident.
@@ -243,7 +247,7 @@ reclaim, swap pressure, or OOM intervention.
 
 ## Source-level failure chain
 
-### Sandbox detection permits local fallback
+### Docker availability selects the local worker backend
 
 At startup, Docker availability is probed. If Docker is missing or not running,
 the code logs that the sandbox is disabled for the session and does not create
@@ -257,13 +261,18 @@ The incident journal contained:
 Docker is installed but not running -- sandbox disabled for this session.
 ```
 
-For `create_job(mode="worker")`, the implementation uses the container only
-when `sandbox_enabled()` is true. Otherwise it calls `execute_local(...)`:
+For `create_job(mode="worker")`, the implementation uses a container only when
+`sandbox_enabled()` is true. Otherwise it calls `execute_local(...)`, which
+runs a separate in-process `Worker` through the scheduler:
 
-`ic/src/tools/builtin/job.rs:1436-1517`
+- `ic/src/tools/builtin/job.rs:468-515,1436-1517`
+- `ic/src/agent/scheduler.rs:119-237`
 
-Thus a mode named `worker`, normally expected to provide container isolation,
-can silently become an in-process local worker when the sandbox is unavailable.
+This is deliberate availability-dependent routing, not source evidence of a
+sandbox escape. The dynamic tool description says “local backend” when external
+workers are configured without a sandbox, and the no-sandbox schema describes a
+local tracked job. The operational problem is that this local backend can run
+host shell commands in the main service cgroup without build-specific limits.
 
 ### The host shell has no process-group boundary
 
@@ -449,14 +458,15 @@ as the root-cause fix for the observed compiler-driven peak.
   size was approximately 2.91 GB during that invocation.
 - Job `775d1565` invoked Cargo tests and its shell calls timed out.
 - Cargo processes were observed after earlier tool timeouts.
-- `mode=worker` selects local execution when the sandbox manager is absent.
+- `mode=worker` deliberately selects the local scheduler when no container job
+  manager exists; its dynamic schema describes that configuration as local.
 - Direct shell execution has no dedicated process group or cgroup.
 - The generic 60-second timeout can preempt the shell's internal 120-second
   cleanup path.
 - The main tenant unit had no memory or swap ceiling.
 - Actual Engine/job payload sizes were orders of magnitude too small to explain
   37.6 GB directly.
-- `d2ff7b8` fixes a real output-safety bypass but not build isolation.
+- `d2ff7b8` fixes a real output-safety bypass but not local-build isolation.
 
 ### High-confidence inference
 
@@ -496,16 +506,23 @@ Monty/Wasmtime leak.
 
 ## Recommended remediation
 
-### P0: fail closed for worker isolation
+### P1: make the effective backend explicit
 
-`mode=worker` should not silently become in-process local execution when its
-sandbox is unavailable.
+`mode=worker` is an availability-dependent compatibility value: it maps to the
+Docker container manager when present and to the local scheduler otherwise. The
+dynamic schema already distinguishes these cases, so local routing is not itself
+a sandbox escape. Persisted `job_mode=worker`, however, does not reveal which
+backend actually ran and complicated this investigation.
 
 Recommended behavior:
 
-- Return an explicit “worker sandbox unavailable” error.
-- If local execution remains supported, expose it as a distinct, explicit mode
-  such as `mode=local` with an approval boundary and clear warning.
+- Record and expose an effective backend such as `local`, `docker`, or the named
+  external worker in job status, events, and telemetry.
+- Warn clearly when the effective backend is local and lacks container/cgroup
+  isolation.
+- Let deployments that require isolation reject local execution through an
+  explicit policy; do not silently reinterpret a permitted local backend as
+  sandboxed.
 - Preserve named external workers (`opencode`, `kimi`, etc.) as separate,
   separately accounted backends.
 
@@ -643,9 +660,10 @@ in `11b673d`. Its recorded checks were:
 
 Cross-verification against source baseline `1e319bf` on 2026-08-02 confirmed:
 
-- no relevant source changes since tenant revision `5b507966`, other than the
-  Engine output-boundary fix `d2ff7b8`;
-- Docker-unavailable `mode=worker` still routes through the local scheduler;
+- among incident-relevant source paths, the only change since tenant revision
+  `5b507966` was the Engine output-boundary fix `d2ff7b8`;
+- Docker-unavailable `mode=worker` still deliberately routes through the local
+  scheduler, and its dynamic schema describes the effective backend as local;
 - direct shell execution still lacks process-group ownership and `kill_on_drop`;
 - the generic tool deadline remains 60 seconds while the shell default remains
   120 seconds;
@@ -671,22 +689,26 @@ include:
 - `aj-codebase-study/wasm-tool-sandbox.md`
 - `aj-codebase-study/tools-infrastructure.md`
 
-All material claims in this report were rechecked against current source,
-current host state, journal records, persisted metadata, or build-artifact
-timestamps. The study notes are orientation, not authority.
+The 2026-08-02 cross-verification also consulted shared topic
+`tools-builtin-impls` (`aj-codebase-study/tools-builtin-impls.md` and
+`rares-codebase-study/tools-builtin-impls.md`) as an initial map. All current
+behavioral claims were then checked directly against source and repository
+history. Historical host, journal, database, and artifact claims retain the
+original investigation's provenance and were not independently reproduced.
 
 ## Final classification
 
-**Primary incident:** build resource isolation/accounting and process-tree
-lifecycle failure.
+**Primary incident:** an unbounded local Rust build plus process-tree lifecycle
+failure. Systemd cgroup accounting correctly exposed the aggregate resource use.
 
-**Not established:** a Monty VM leak, Wasmtime per-call store leak, or 37.6 GB
-LunarWing main-process RSS.
+**Not established:** a sandbox escape, Monty VM leak, Wasmtime per-call store
+leak, or 37.6 GB LunarWing main-process RSS.
 
 **Valid secondary fix:** `d2ff7b8` bounds and sanitizes newly executed Engine V2
 tool results after the tool has produced them.
 
 The release checklist should not mark the broad “MEMLEAK” item complete solely
-because `d2ff7b8` landed. The output-boundary defect is fixed; the P0 worker
-fallback, process-group cancellation, and build resource-isolation defects
-remain to be implemented and verified.
+because `d2ff7b8` landed. The output-boundary defect is fixed; process-group
+cancellation and per-build resource controls remain open. Effective-backend
+attribution and an optional fail-closed deployment policy remain recommended
+hardening.
