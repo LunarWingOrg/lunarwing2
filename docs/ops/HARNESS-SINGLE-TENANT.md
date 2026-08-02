@@ -7,31 +7,42 @@ For running two isolated tenants side-by-side, see [`MULTITENANCY-HARNESS.md`](M
 
 ## Important: Build Behaviour
 
-`up` does **not** build anything automatically. If binaries or WASM artifacts are missing, the stack will fail to start or the gateway will report zero channels and tools. Always run the build steps explicitly before `up`.
+`up` does **not** build anything automatically. If binaries or WASM artifacts
+are missing, the stack will fail to start or the gateway will report zero
+channels and tools. Always run `build --with-wasm` before `up`; that command
+builds the daemon, bridge, REPL client, and all available WASM extensions, then
+installs the WASM artifacts into the isolated test state directory.
+
+The harness script defaults to a debug profile, but this repository does not use
+full debug builds. Set `LUNARWING_TEST_PROFILE=release`. On the Linux dev VM,
+run the build through `taskset` and cap Cargo jobs as shown below.
 
 ## Quick Start
 
 ```bash
 cd ic
+export LUNARWING_TEST_PROFILE=release
+export CARGO_BUILD_JOBS=6
 
 # 1. Create isolated env, state, run, and log dirs
 scripts/lunarwing-xmpp-test-env.sh init
 
-# 2. Build daemon + bridge + all 20 WASM channels/tools
-scripts/lunarwing-xmpp-test-env.sh build --with-wasm
+# 2. Build runnable binaries and all available WASM channels/tools; install WASM
+#    as part of the same command
+taskset -c 0-5 scripts/lunarwing-xmpp-test-env.sh build --with-wasm
 
-# 3. Install WASM artifacts into the test state dir
-scripts/lunarwing-xmpp-test-env.sh install-wasm
-
-# 4. Start full stack: postgres → proxy → bridge → daemon
+# 3. Start full stack: postgres → proxy → bridge → daemon
 scripts/lunarwing-xmpp-test-env.sh up
 
-# 5. Run health checks
+# 4. Run health checks
 scripts/lunarwing-xmpp-test-env.sh verify
 
-# 6. Tear down
+# 5. Tear down, including after a failed verification
 scripts/lunarwing-xmpp-test-env.sh down
 ```
+
+On macOS, where `taskset` is unavailable, run the same build command without
+the `taskset -c 0-5` prefix.
 
 ## Platform Support
 
