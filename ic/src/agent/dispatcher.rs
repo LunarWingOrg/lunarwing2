@@ -638,19 +638,20 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
             }
 
             // Check if tool requires approval
-            if !self.agent.config.auto_approve_tools
-                && let Some(tool) = tool_opt
-            {
+            if let Some(tool) = tool_opt {
                 use crate::tools::ApprovalRequirement;
                 let requirement = tool.requires_approval(&tc.arguments);
-                let needs_approval = match requirement {
-                    ApprovalRequirement::Never => false,
-                    ApprovalRequirement::UnlessAutoApproved => {
+                let session_auto_approved = match requirement {
+                    ApprovalRequirement::UnlessAutoApproved
+                        if !self.agent.config.auto_approve_tools =>
+                    {
                         let sess = self.session.lock().await;
-                        !sess.is_tool_auto_approved(&tc.name)
+                        sess.is_tool_auto_approved(&tc.name)
                     }
-                    ApprovalRequirement::Always => true,
+                    _ => false,
                 };
+                let needs_approval = requirement
+                    .needs_prompt(self.agent.config.auto_approve_tools, session_auto_approved);
 
                 if needs_approval {
                     // In non-DM relay channels, auto-deny approval-

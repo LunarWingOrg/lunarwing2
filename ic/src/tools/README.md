@@ -35,6 +35,10 @@ The main agent provides generic infrastructure; tools are self-contained units t
 - Rate limits and timeouts
 - Auth setup instructions (see below)
 - Workspace paths the tool can read
+- Approval policy: `never` (default), `unless_auto_approved`, or `always`
+
+`always` cannot be bypassed by global or session auto-approval. WASM tools with
+SSH capability always use `always`, regardless of declared policy.
 
 ### What Does NOT Go in Main Agent
 
