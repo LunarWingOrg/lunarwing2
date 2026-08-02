@@ -20,6 +20,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::{BoxFuture, join_all};
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 use monty::{
     ExcType, ExtFunctionResult, LimitedTracker, MontyException, MontyObject, MontyRun,
     NameLookupResult, PrintWriter, ResourceLimits, RunProgress,
@@ -649,74 +652,27 @@ pub async fn execute_code_with_skills(
             }
 
             // ── ResolveFutures: parallel execution ────────────────
-            // Resolves both tool calls and LLM calls that were deferred
-            // via resume_pending(). All pending tokio tasks are awaited
-            // and their results fed back to Monty.
+            // Poll deferred tool and LLM tasks in completion order so a stop
+            // can abort and drain unfinished siblings immediately. Results are
+            // still fed back to Monty in its original pending-call order.
             RunProgress::ResolveFutures(resolve) => {
                 let pending_ids = resolve.pending_call_ids().to_vec();
                 debug!(pending = ?pending_ids, "Monty: ResolveFutures — resolving {} pending futures", pending_ids.len());
 
-                let mut results: Vec<(u32, ExtFunctionResult)> =
-                    Vec::with_capacity(pending_ids.len());
-                let mut first_gate = None;
+                let resolution = resolve_pending_futures(
+                    &pending_ids,
+                    &mut pending_futures,
+                    PendingResolutionState {
+                        leases,
+                        context,
+                        action_results: &mut action_results,
+                        events: &mut events,
+                        recursive_tokens: &mut recursive_tokens,
+                    },
+                )
+                .await;
 
-                for &mid in &pending_ids {
-                    let ext_result = if let Some(pf) = pending_futures.remove(&mid) {
-                        match pf {
-                            PendingFuture::Tool {
-                                handle,
-                                action_name,
-                                call_id,
-                                lease_id,
-                                params_summary,
-                            } => {
-                                match resolve_tool_future(
-                                    handle,
-                                    &action_name,
-                                    &call_id,
-                                    lease_id,
-                                    params_summary,
-                                    leases,
-                                    context,
-                                    &mut action_results,
-                                    &mut events,
-                                )
-                                .await
-                                {
-                                    ToolFutureResolution::Monty(result) => Some(result),
-                                    ToolFutureResolution::GatePaused(outcome) => {
-                                        if first_gate.is_none() {
-                                            first_gate = Some(outcome);
-                                        }
-                                        None
-                                    }
-                                    ToolFutureResolution::Stopped => {
-                                        if first_gate.is_none() {
-                                            first_gate = Some(
-                                                crate::runtime::messaging::ThreadOutcome::Stopped,
-                                            );
-                                        }
-                                        None
-                                    }
-                                }
-                            }
-                            PendingFuture::Llm { handle } => {
-                                Some(resolve_llm_future(handle, &mut recursive_tokens).await)
-                            }
-                        }
-                    } else {
-                        debug!(call_id = mid, "ResolveFutures: unknown pending call_id");
-                        Some(ExtFunctionResult::Error(MontyException::new(
-                            ExcType::RuntimeError,
-                            Some(format!("unknown pending call_id {mid}")),
-                        )))
-                    };
-                    if let Some(ext_result) = ext_result {
-                        results.push((mid, ext_result));
-                    }
-                }
-
-                if let Some(outcome) = first_gate {
+                if let Some(outcome) = resolution.interrupt {
                     return Ok(CodeExecutionResult {
                         return_value: serde_json::Value::Null,
                         stdout,
@@ -730,7 +686,7 @@ pub async fn execute_code_with_skills(
                 }
 
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    resolve.resume(results, PrintWriter::Collect(&mut stdout))
+                    resolve.resume(resolution.results, PrintWriter::Collect(&mut stdout))
                 })) {
                     Ok(Ok(p)) => progress = p,
                     Ok(Err(e)) => {
@@ -848,16 +804,244 @@ enum PendingFuture {
         lease_id: crate::types::capability::LeaseId,
         params_summary: Option<String>,
     },
-    /// LLM call (llm_query / llm_query_batched / rlm_query).
+    /// LLM call (llm_query / llm_query_batched).
     Llm {
         handle: tokio::task::JoinHandle<(ExtFunctionResult, TokenUsage)>,
     },
+}
+
+/// Completed deferred computation, including metadata needed for ordered
+/// resolution and lease accounting after sibling cancellation.
+enum PendingFutureCompletion {
+    Tool {
+        monty_call_id: u32,
+        result: Result<Result<ActionResult, EngineError>, tokio::task::JoinError>,
+        action_name: String,
+        call_id: String,
+        lease_id: crate::types::capability::LeaseId,
+        params_summary: Option<String>,
+    },
+    Llm {
+        monty_call_id: u32,
+        result: Result<(ExtFunctionResult, TokenUsage), tokio::task::JoinError>,
+    },
+}
+
+impl PendingFuture {
+    fn into_completion(
+        self,
+        monty_call_id: u32,
+    ) -> (
+        tokio::task::AbortHandle,
+        BoxFuture<'static, PendingFutureCompletion>,
+    ) {
+        match self {
+            Self::Tool {
+                handle,
+                action_name,
+                call_id,
+                lease_id,
+                params_summary,
+            } => {
+                let abort_handle = handle.abort_handle();
+                let completion = async move {
+                    PendingFutureCompletion::Tool {
+                        monty_call_id,
+                        result: handle.await,
+                        action_name,
+                        call_id,
+                        lease_id,
+                        params_summary,
+                    }
+                }
+                .boxed();
+                (abort_handle, completion)
+            }
+            Self::Llm { handle } => {
+                let abort_handle = handle.abort_handle();
+                let completion = async move {
+                    PendingFutureCompletion::Llm {
+                        monty_call_id,
+                        result: handle.await,
+                    }
+                }
+                .boxed();
+                (abort_handle, completion)
+            }
+        }
+    }
+}
+
+impl PendingFutureCompletion {
+    fn monty_call_id(&self) -> u32 {
+        match self {
+            Self::Tool { monty_call_id, .. } | Self::Llm { monty_call_id, .. } => *monty_call_id,
+        }
+    }
+
+    fn execution_stopped(&self) -> bool {
+        matches!(
+            self,
+            Self::Tool {
+                result: Ok(Err(EngineError::ExecutionStopped)),
+                ..
+            }
+        )
+    }
+}
+
+struct CollectedPendingFutures {
+    completions: HashMap<u32, PendingFutureCompletion>,
+    direct_results: HashMap<u32, ExtFunctionResult>,
+    execution_stopped: bool,
+}
+
+struct PendingResolution {
+    results: Vec<(u32, ExtFunctionResult)>,
+    interrupt: Option<crate::runtime::messaging::ThreadOutcome>,
+}
+
+struct PendingResolutionState<'a> {
+    leases: &'a LeaseManager,
+    context: &'a ThreadExecutionContext,
+    action_results: &'a mut Vec<ActionResult>,
+    events: &'a mut Vec<EventKind>,
+    recursive_tokens: &'a mut TokenUsage,
 }
 
 enum ToolFutureResolution {
     Monty(ExtFunctionResult),
     GatePaused(crate::runtime::messaging::ThreadOutcome),
     Stopped,
+}
+
+async fn collect_pending_futures(
+    pending_ids: &[u32],
+    pending_futures: &mut HashMap<u32, PendingFuture>,
+) -> CollectedPendingFutures {
+    let mut futures: FuturesUnordered<BoxFuture<'static, PendingFutureCompletion>> =
+        FuturesUnordered::new();
+    let mut abort_handles = HashMap::with_capacity(pending_ids.len());
+    let mut direct_results = HashMap::with_capacity(pending_ids.len());
+
+    for &mid in pending_ids {
+        if let Some(pending) = pending_futures.remove(&mid) {
+            let (abort_handle, completion) = pending.into_completion(mid);
+            abort_handles.insert(mid, abort_handle);
+            futures.push(completion);
+        } else {
+            debug!(call_id = mid, "ResolveFutures: unknown pending call_id");
+            direct_results.insert(mid, unknown_pending_result(mid));
+        }
+    }
+
+    let mut completions = HashMap::with_capacity(futures.len());
+    let mut execution_stopped = false;
+    while let Some(completion) = futures.next().await {
+        let mid = completion.monty_call_id();
+        abort_handles.remove(&mid);
+        if !execution_stopped && completion.execution_stopped() {
+            execution_stopped = true;
+            for abort_handle in abort_handles.values() {
+                abort_handle.abort();
+            }
+            for (pending_mid, pending) in pending_futures.drain() {
+                let (abort_handle, completion) = pending.into_completion(pending_mid);
+                abort_handle.abort();
+                futures.push(completion);
+            }
+        }
+        completions.insert(mid, completion);
+    }
+
+    CollectedPendingFutures {
+        completions,
+        direct_results,
+        execution_stopped,
+    }
+}
+
+fn unknown_pending_result(monty_call_id: u32) -> ExtFunctionResult {
+    ExtFunctionResult::Error(MontyException::new(
+        ExcType::RuntimeError,
+        Some(format!("unknown pending call_id {monty_call_id}")),
+    ))
+}
+
+async fn resolve_pending_futures(
+    pending_ids: &[u32],
+    pending_futures: &mut HashMap<u32, PendingFuture>,
+    mut state: PendingResolutionState<'_>,
+) -> PendingResolution {
+    let mut collected = collect_pending_futures(pending_ids, pending_futures).await;
+    if collected.execution_stopped {
+        for completion in collected.completions.into_values() {
+            settle_completion_after_stop(completion, state.leases, state.recursive_tokens).await;
+        }
+        return PendingResolution {
+            results: Vec::new(),
+            interrupt: Some(crate::runtime::messaging::ThreadOutcome::Stopped),
+        };
+    }
+
+    let mut results = Vec::with_capacity(pending_ids.len());
+    let mut interrupt = None;
+    for &mid in pending_ids {
+        if let Some(result) = collected.direct_results.remove(&mid) {
+            results.push((mid, result));
+            continue;
+        }
+        let Some(completion) = collected.completions.remove(&mid) else {
+            debug!(call_id = mid, "ResolveFutures: completion missing");
+            results.push((mid, unknown_pending_result(mid)));
+            continue;
+        };
+        match resolve_pending_completion(completion, &mut state).await {
+            ToolFutureResolution::Monty(result) => results.push((mid, result)),
+            ToolFutureResolution::GatePaused(outcome) => {
+                if interrupt.is_none() {
+                    interrupt = Some(outcome);
+                }
+            }
+            ToolFutureResolution::Stopped => {
+                interrupt = Some(crate::runtime::messaging::ThreadOutcome::Stopped);
+            }
+        }
+    }
+
+    PendingResolution { results, interrupt }
+}
+
+async fn resolve_pending_completion(
+    completion: PendingFutureCompletion,
+    state: &mut PendingResolutionState<'_>,
+) -> ToolFutureResolution {
+    match completion {
+        PendingFutureCompletion::Tool {
+            result,
+            action_name,
+            call_id,
+            lease_id,
+            params_summary,
+            ..
+        } => {
+            resolve_tool_completion(
+                result,
+                &action_name,
+                &call_id,
+                lease_id,
+                params_summary,
+                state.leases,
+                state.context,
+                state.action_results,
+                state.events,
+            )
+            .await
+        }
+        PendingFutureCompletion::Llm { result, .. } => {
+            ToolFutureResolution::Monty(resolve_llm_completion(result, state.recursive_tokens))
+        }
+    }
 }
 
 /// Result of preflight checks (lease + policy) for a tool call.
@@ -1071,13 +1255,10 @@ async fn handle_llm_query_batched(
         ..LlmCallConfig::default()
     };
 
-    let mut handles = Vec::with_capacity(prompts.len());
-    for prompt in &prompts {
-        let llm = Arc::clone(llm);
+    let calls = prompts.iter().map(|prompt| {
         let config = config.clone();
         let ctx = context_arg.clone();
-        let prompt = prompt.clone();
-        handles.push(tokio::spawn(async move {
+        async move {
             let mut messages = Vec::new();
             if let Some(ctx) = ctx {
                 messages.push(ThreadMessage::system(format!(
@@ -1088,19 +1269,19 @@ async fn handle_llm_query_batched(
                     "You are a helpful sub-agent. Answer concisely.",
                 ));
             }
-            messages.push(ThreadMessage::user(prompt));
+            messages.push(ThreadMessage::user(prompt.clone()));
             llm.complete(&messages, &[], &config).await
-        }));
-    }
+        }
+    });
 
-    // Collect results
+    // Keep all requests in this task so aborting the outer pending future drops
+    // every in-flight LLM call instead of detaching nested tokio tasks.
     let mut results = Vec::with_capacity(prompts.len());
     let mut total_input = 0u64;
     let mut total_output = 0u64;
-
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(output)) => {
+    for completion in join_all(calls).await {
+        match completion {
+            Ok(output) => {
                 total_input += output.usage.input_tokens;
                 total_output += output.usage.output_tokens;
                 let text = match output.response {
@@ -1110,12 +1291,7 @@ async fn handle_llm_query_batched(
                 };
                 results.push(MontyObject::String(text));
             }
-            Ok(Err(e)) => {
-                results.push(MontyObject::String(format!("Error: {e}")));
-            }
-            Err(e) => {
-                results.push(MontyObject::String(format!("Error: task failed: {e}")));
-            }
+            Err(e) => results.push(MontyObject::String(format!("Error: {e}"))),
         }
     }
 
@@ -1307,10 +1483,10 @@ async fn handle_llm_query_batched_standalone(
 
 // ── Future resolution helpers ───────────────────────────────
 
-/// Resolve a pending tool execution future.
+/// Resolve a completed tool execution task.
 #[allow(clippy::too_many_arguments)]
-async fn resolve_tool_future(
-    handle: tokio::task::JoinHandle<Result<ActionResult, EngineError>>,
+async fn resolve_tool_completion(
+    completion: Result<Result<ActionResult, EngineError>, tokio::task::JoinError>,
     action_name: &str,
     call_id: &str,
     lease_id: crate::types::capability::LeaseId,
@@ -1320,7 +1496,7 @@ async fn resolve_tool_future(
     action_results: &mut Vec<ActionResult>,
     events: &mut Vec<EventKind>,
 ) -> ToolFutureResolution {
-    match handle.await {
+    match completion {
         Ok(Ok(result)) => {
             events.push(EventKind::ActionExecuted {
                 step_id: context.step_id,
@@ -1408,24 +1584,57 @@ async fn resolve_tool_future(
     }
 }
 
-/// Resolve a pending LLM call future, accumulating token usage.
-async fn resolve_llm_future(
-    handle: tokio::task::JoinHandle<(ExtFunctionResult, TokenUsage)>,
+fn resolve_llm_completion(
+    completion: Result<(ExtFunctionResult, TokenUsage), tokio::task::JoinError>,
     recursive_tokens: &mut TokenUsage,
 ) -> ExtFunctionResult {
-    match handle.await {
+    match completion {
         Ok((result, tokens)) => {
             recursive_tokens.input_tokens += tokens.input_tokens;
             recursive_tokens.output_tokens += tokens.output_tokens;
             result
         }
         Err(e) => {
-            debug!("async LLM task panicked: {e}");
+            debug!("async LLM task failed: {e}");
             ExtFunctionResult::Error(MontyException::new(
                 ExcType::RuntimeError,
-                Some(format!("LLM call panicked: {e}")),
+                Some(format!("LLM call failed: {e}")),
             ))
         }
+    }
+}
+
+async fn settle_completion_after_stop(
+    completion: PendingFutureCompletion,
+    leases: &LeaseManager,
+    recursive_tokens: &mut TokenUsage,
+) {
+    match completion {
+        PendingFutureCompletion::Tool {
+            result, lease_id, ..
+        } => {
+            let interrupted = matches!(
+                result,
+                Ok(Err(EngineError::ExecutionStopped))
+                    | Ok(Err(EngineError::GatePaused {
+                        resume_output: None,
+                        ..
+                    }))
+            ) || result
+                .as_ref()
+                .is_err_and(tokio::task::JoinError::is_cancelled);
+            if interrupted {
+                let _ = leases.refund_use(lease_id).await;
+            }
+        }
+        PendingFutureCompletion::Llm {
+            result: Ok((_, tokens)),
+            ..
+        } => {
+            recursive_tokens.input_tokens += tokens.input_tokens;
+            recursive_tokens.output_tokens += tokens.output_tokens;
+        }
+        PendingFutureCompletion::Llm { result: Err(_), .. } => {}
     }
 }
 
@@ -1649,6 +1858,7 @@ mod tests {
     use crate::types::step::{ActionResult, StepId};
     use crate::types::thread::{Thread, ThreadConfig, ThreadType};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct MockEffects {
         results: Mutex<Vec<Result<ActionResult, EngineError>>>,
@@ -1667,6 +1877,37 @@ mod tests {
 
         fn calls_snapshot(&self) -> Vec<(String, serde_json::Value)> {
             self.calls.lock().unwrap().clone()
+        }
+    }
+
+    struct StopAndHangEffects {
+        started: tokio::sync::Barrier,
+        hanging_dropped: Arc<AtomicBool>,
+    }
+
+    impl StopAndHangEffects {
+        fn new(hanging_dropped: Arc<AtomicBool>) -> Self {
+            Self {
+                started: tokio::sync::Barrier::new(2),
+                hanging_dropped,
+            }
+        }
+    }
+
+    struct StopAfterLlmStartsEffects {
+        started: Arc<tokio::sync::Barrier>,
+    }
+
+    struct HangingLlm {
+        started: Arc<tokio::sync::Barrier>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1699,6 +1940,72 @@ mod tests {
             _leases: &[CapabilityLease],
         ) -> Result<Vec<ActionDef>, EngineError> {
             Ok(self.actions.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for StopAndHangEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _params: serde_json::Value,
+            _lease: &CapabilityLease,
+            _ctx: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            let _drop_flag =
+                (action_name == "hang_tool").then(|| DropFlag(Arc::clone(&self.hanging_dropped)));
+            self.started.wait().await;
+            if action_name == "stop_tool" {
+                Err(EngineError::ExecutionStopped)
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![test_action("hang_tool"), test_action("stop_tool")])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for StopAfterLlmStartsEffects {
+        async fn execute_action(
+            &self,
+            _action_name: &str,
+            _params: serde_json::Value,
+            _lease: &CapabilityLease,
+            _ctx: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.started.wait().await;
+            Err(EngineError::ExecutionStopped)
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![test_action("stop_tool")])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::llm::LlmBackend for HangingLlm {
+        fn model_name(&self) -> &str {
+            "hanging"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[crate::types::message::ThreadMessage],
+            _actions: &[ActionDef],
+            _config: &crate::traits::llm::LlmCallConfig,
+        ) -> Result<crate::traits::llm::LlmOutput, EngineError> {
+            let _drop_flag = DropFlag(Arc::clone(&self.dropped));
+            self.started.wait().await;
+            std::future::pending().await
         }
     }
 
@@ -1782,13 +2089,23 @@ mod tests {
         thread: &Thread,
         leases: &LeaseManager,
     ) -> Result<CodeExecutionResult, EngineError> {
+        run_code_with_runtime(code, effects, Arc::new(StubLlm), thread, leases).await
+    }
+
+    async fn run_code_with_runtime(
+        code: &str,
+        effects: Arc<dyn EffectExecutor>,
+        llm: Arc<dyn crate::traits::llm::LlmBackend>,
+        thread: &Thread,
+        leases: &LeaseManager,
+    ) -> Result<CodeExecutionResult, EngineError> {
         let policy = PolicyEngine::new();
         let ctx = make_exec_context(thread);
 
         execute_code(
             code,
             thread,
-            &(Arc::new(StubLlm) as Arc<dyn crate::traits::llm::LlmBackend>),
+            &llm,
             &effects,
             leases,
             &policy,
@@ -2150,6 +2467,89 @@ FINAL("must not reach")"#,
         assert!(result.action_results.is_empty());
         assert!(result.events.is_empty());
         assert!(result.final_answer.is_none());
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_stopped_aborts_hanging_tool_sibling() {
+        let thread = make_test_thread();
+        let hanging_dropped = Arc::new(AtomicBool::new(false));
+        let effects: Arc<dyn EffectExecutor> =
+            Arc::new(StopAndHangEffects::new(Arc::clone(&hanging_dropped)));
+        let leases = LeaseManager::new();
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(2))
+            .await
+            .unwrap();
+        let code = r#"
+import asyncio
+await asyncio.gather(hang_tool(), stop_tool())
+FINAL("must not reach")
+"#;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_code_with_leases(code, effects, &thread, &leases),
+        )
+        .await
+        .expect("stop should abort and drain the hanging tool promptly")
+        .unwrap();
+
+        assert!(matches!(
+            result.need_approval,
+            Some(crate::runtime::messaging::ThreadOutcome::Stopped)
+        ));
+        assert!(result.action_results.is_empty());
+        assert!(result.events.is_empty());
+        assert!(hanging_dropped.load(Ordering::SeqCst));
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_stopped_aborts_hanging_llm_sibling() {
+        let thread = make_test_thread();
+        let started = Arc::new(tokio::sync::Barrier::new(2));
+        let llm_dropped = Arc::new(AtomicBool::new(false));
+        let effects: Arc<dyn EffectExecutor> = Arc::new(StopAfterLlmStartsEffects {
+            started: Arc::clone(&started),
+        });
+        let llm: Arc<dyn crate::traits::llm::LlmBackend> = Arc::new(HangingLlm {
+            started,
+            dropped: Arc::clone(&llm_dropped),
+        });
+        let leases = LeaseManager::new();
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(1))
+            .await
+            .unwrap();
+        let code = r#"
+import asyncio
+await asyncio.gather(llm_query("hang"), stop_tool())
+FINAL("must not reach")
+"#;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_code_with_runtime(code, effects, llm, &thread, &leases),
+        )
+        .await
+        .expect("stop should abort and drain the hanging LLM call promptly")
+        .unwrap();
+
+        assert!(matches!(
+            result.need_approval,
+            Some(crate::runtime::messaging::ThreadOutcome::Stopped)
+        ));
+        assert!(result.action_results.is_empty());
+        assert!(result.events.is_empty());
+        assert!(llm_dropped.load(Ordering::SeqCst));
+        assert_eq!(result.recursive_tokens, TokenUsage::default());
         assert_eq!(
             leases.check(lease.id).await.unwrap().uses_remaining,
             Some(1)
