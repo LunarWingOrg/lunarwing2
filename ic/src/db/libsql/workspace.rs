@@ -626,6 +626,65 @@ impl WorkspaceStore for LibSqlBackend {
         Ok(entries)
     }
 
+    async fn list_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
+        let conn = self
+            .connect()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: e.to_string(),
+            })?;
+        let agent_id = agent_id.map(|id| id.to_string());
+        let directory = directory.trim_end_matches('/');
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT path, updated_at, substr(content, 1, 200) AS content_preview
+                FROM memory_documents
+                WHERE user_id = ?1 AND agent_id IS ?2
+                  AND (?3 = '' OR substr(path, 1, length(?3)) = ?3)
+                  AND instr(substr(path, length(?3) + 1), '/') = 0
+                  AND (?4 = '' OR lower(substr(path, -length(?4))) = lower(?4))
+                ORDER BY path
+                LIMIT ?5
+                "#,
+                params![user_id, agent_id.as_deref(), prefix, suffix, limit],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Limited file listing failed: {e}"),
+            })?;
+
+        let mut entries = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Limited file listing query failed: {e}"),
+            })?
+        {
+            entries.push(WorkspaceEntry {
+                path: get_text(&row, 0),
+                is_directory: false,
+                updated_at: get_opt_ts(&row, 1),
+                content_preview: get_opt_text(&row, 2),
+            });
+        }
+        Ok(entries)
+    }
+
     async fn list_all_paths(
         &self,
         user_id: &str,
