@@ -715,9 +715,13 @@ Cross-verification against source baseline `1e319bf` on 2026-08-02 confirmed:
 - scheduler cancellation still aborts the Tokio task after 100 ms without an OS
   process-tree cleanup contract;
 - the generated main tenant unit still declares no memory, swap, PID, or CPU
-  ceiling (independent inherited slice limits remain possible);
+  ceiling (inherited slice limits and manager defaults/drop-ins remain possible);
 - `taskset -c 0-5 cargo test -j6 --lib bridge::effect_adapter::tests::engine_output_honors_safety_size_limit_before_monty_conversion -- --exact --nocapture --test-threads=6`
-  passed (`1 passed; 0 failed`).
+  passed (`1 passed; 0 failed`);
+- the two exact `lunarwing_engine` output-history tests passed (`1 passed` each);
+- `taskset -c 0-5 cargo test -j6 -p lunarwing_safety adversarial -- --nocapture --test-threads=6`
+  passed (`98 passed; 0 failed`);
+- `scripts/tests/test-build-lunarwing.sh` passed (`37 passed; 0 failed`).
 
 No live tenant or historical incident data was accessed during this
 cross-verification.
