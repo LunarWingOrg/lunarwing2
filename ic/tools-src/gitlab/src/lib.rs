@@ -42,7 +42,8 @@ impl exports::lunarwing::agent::tool::Guest for GitlabTool {
          issues and comments, merge requests and approvals, branches, repository files, \
          search, pipelines, jobs, and current-user lookup. Use project numeric ID or \
          group/project path; use per-project iid for issues and merge requests. Token is \
-         injected by LunarWing and never exposed to WASM. Every call requires explicit approval."
+         injected by LunarWing and never exposed to WASM. Calls require approval unless \
+         you choose to always allow this tool."
             .to_string()
     }
 }
@@ -381,6 +382,26 @@ mod tests {
     fn action_parser_rejects_unknown_fields() {
         let input = r#"{"action":"current_user","token":"must-not-be-accepted"}"#;
         assert!(parse_action(input).is_err());
+    }
+
+    #[test]
+    fn project_accepts_numeric_id_string_id_and_project_id_alias() {
+        for input in [
+            r#"{"action":"list_issues","project":35}"#,
+            r#"{"action":"list_issues","project":"35"}"#,
+            r#"{"action":"list_issues","project":"group/repo"}"#,
+            r#"{"action":"list_issues","project_id":35}"#,
+            r#"{"action":"list_issues","project_id":"group/repo"}"#,
+        ] {
+            let action = parse_action(input).unwrap_or_else(|e| panic!("rejected {input}: {e}"));
+            let GitlabAction::ListIssues { project, .. } = action else {
+                panic!("wrong variant for {input}");
+            };
+            assert!(!project.is_empty());
+        }
+
+        // Negative IDs are not valid project references.
+        assert!(parse_action(r#"{"action":"list_issues","project":-1}"#).is_err());
     }
 
     #[test]
