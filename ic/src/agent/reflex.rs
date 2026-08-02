@@ -7,8 +7,8 @@
 //!
 //! 1. **Exact match** — O(1) hash lookup on normalized input. Fast path.
 //! 2. **Fuzzy match** — Jaro-Winkler similarity against known patterns.
-//! 3. **Semantic match** — Embedding cosine similarity (requires an
-//!    `EmbeddingProvider`). Silently skipped when no provider is configured.
+//! 3. **Semantic match** — Opt-in embedding cosine similarity (requires an
+//!    `EmbeddingProvider`). Disabled by default because providers may be remote.
 //! 4. **Auto-promotion** — Frequently-matched fuzzy hits are promoted to the
 //!    exact-match cache so subsequent calls are O(1).
 
@@ -140,8 +140,10 @@ pub struct ReflexRouter {
     promotion_threshold: u32,
     /// Maximum fuzzy candidates to evaluate per route call.
     max_candidates: usize,
-    /// Embedding provider for semantic matching (None = tier disabled).
+    /// Embedding provider used when semantic matching is enabled.
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    /// Separate default-off switch for semantic matching.
+    semantic_enabled: bool,
     /// Cosine similarity threshold for semantic matching.
     semantic_threshold: f64,
     /// In-memory cache: normalized pattern → embedding vector.
@@ -160,6 +162,7 @@ impl ReflexRouter {
             promotion_threshold: fuzzy.promotion_threshold,
             max_candidates: fuzzy.max_candidates,
             embedding_provider: None,
+            semantic_enabled: false,
             semantic_threshold: DEFAULT_SEMANTIC_THRESHOLD,
             pattern_embeddings: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -175,14 +178,21 @@ impl ReflexRouter {
             promotion_threshold: PROMOTION_THRESHOLD,
             max_candidates: MAX_FUZZY_CANDIDATES,
             embedding_provider: None,
+            semantic_enabled: false,
             semantic_threshold: DEFAULT_SEMANTIC_THRESHOLD,
             pattern_embeddings: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Attach an embedding provider to enable semantic matching (tier 3).
+    /// Attach the embedding provider used by the optional semantic tier.
     pub fn with_embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
         self.embedding_provider = Some(provider);
+        self
+    }
+
+    /// Enable or disable semantic matching independently of the compiler.
+    pub fn with_semantic_enabled(mut self, enabled: bool) -> Self {
+        self.semantic_enabled = enabled;
         self
     }
 
@@ -241,8 +251,9 @@ impl ReflexRouter {
             return Some(m);
         }
 
-        // 3. Semantic fallback — only if embedding provider is set
-        if self.embedding_provider.is_some()
+        // 3. Semantic fallback — explicitly opt-in because this may call a
+        // remote embedding provider before the normal LLM path.
+        if self.semantic_enabled
             && let Some(m) = self.semantic_route(&normalized).await
         {
             return Some(m);
@@ -341,6 +352,12 @@ impl ReflexRouter {
 
     /// Semantic fallback: embed the query and compare against cached pattern embeddings.
     async fn semantic_route(&self, normalized: &str) -> Option<FuzzyMatch> {
+        // Check local state before contacting a potentially remote provider.
+        // A router with no cached pattern vectors cannot produce a match.
+        if self.pattern_embeddings.read().await.is_empty() {
+            return None;
+        }
+
         let provider = self.embedding_provider.as_ref()?;
         let query_embedding = match provider.embed(normalized).await {
             Ok(emb) => emb,
@@ -355,10 +372,6 @@ impl ReflexRouter {
         // acquiring patterns would invert the lock order and could deadlock.
         let (best_pattern, best_score) = {
             let embeddings = self.pattern_embeddings.read().await;
-            if embeddings.is_empty() {
-                return None;
-            }
-
             let mut best_pattern: Option<String> = None;
             let mut best_score: f64 = 0.0;
 
@@ -476,48 +489,10 @@ impl ReflexRouter {
         // self-deadlock if a writer (refresh) queues in between.
         drop(patterns);
 
-        // 3. Semantic fallback
-        if let Some(provider) = self.embedding_provider.as_ref() {
-            let query_embedding = match provider.embed(&normalized).await {
-                Ok(emb) => emb,
-                Err(e) => {
-                    tracing::debug!("Reflex semantic embed failed (details): {}", e);
-                    return None;
-                }
-            };
-
-            // Scope the embeddings read guard (see semantic_route: refresh()
-            // takes patterns.write → embeddings.write, so the inverse order
-            // here would risk an ABBA deadlock).
-            let (best_pattern, best_score) = {
-                let embeddings = self.pattern_embeddings.read().await;
-                if embeddings.is_empty() {
-                    return None;
-                }
-
-                let mut best_pattern: Option<String> = None;
-                let mut best_score: f64 = 0.0;
-
-                for (pattern, emb) in embeddings.iter() {
-                    let score = cosine_similarity(&query_embedding, emb);
-                    if score > best_score {
-                        best_score = score;
-                        best_pattern = Some(pattern.clone());
-                    }
-                }
-                (best_pattern, best_score)
-            };
-
-            if best_score >= self.semantic_threshold {
-                let patterns = self.patterns.read().await;
-                if let Some(tool) = best_pattern.as_ref().and_then(|p| patterns.get(p).cloned()) {
-                    return Some(FuzzyMatch {
-                        tool_name: tool,
-                        matched_pattern: best_pattern.unwrap_or_default(),
-                        score: best_score,
-                    });
-                }
-            }
+        // 3. Semantic fallback. Reuse the production path so diagnostics
+        // honor the same opt-in switch and cache-before-provider ordering.
+        if self.semantic_enabled {
+            return self.semantic_route(&normalized).await;
         }
 
         None
@@ -546,7 +521,7 @@ impl ReflexRouter {
                 drop(patterns);
                 drop(embeddings);
 
-                if self.embedding_provider.is_some() {
+                if self.semantic_enabled && self.embedding_provider.is_some() {
                     self.embed_missing_patterns(store, user_id, &records).await;
                 }
             }
@@ -636,9 +611,14 @@ impl ReflexRouter {
         self.semantic_threshold
     }
 
-    /// Whether the semantic tier is enabled.
+    /// Whether an embedding provider is available to the semantic tier.
     pub fn has_embedding_provider(&self) -> bool {
         self.embedding_provider.is_some()
+    }
+
+    /// Whether semantic matching is explicitly enabled.
+    pub fn semantic_enabled(&self) -> bool {
+        self.semantic_enabled
     }
 }
 
@@ -1861,6 +1841,7 @@ mod tests {
         let provider = Arc::new(MockEmbeddings::new(64));
         let router = ReflexRouter::new()
             .with_embedding_provider(provider.clone())
+            .with_semantic_enabled(true)
             .with_semantic_threshold(0.5);
 
         // Register a pattern
@@ -1882,6 +1863,7 @@ mod tests {
         // by registering a pattern that won't match exactly or fuzzily
         let router2 = ReflexRouter::new()
             .with_embedding_provider(provider.clone())
+            .with_semantic_enabled(true)
             .with_semantic_threshold(0.5);
 
         router2
@@ -1920,6 +1902,7 @@ mod tests {
         // different strings will have low similarity
         let router = ReflexRouter::new()
             .with_embedding_provider(provider.clone())
+            .with_semantic_enabled(true)
             .with_semantic_threshold(0.99);
 
         router.register("summarize my logs", "tool_summarize").await;
@@ -1946,6 +1929,7 @@ mod tests {
         let provider = Arc::new(MockEmbeddings::new(64));
         let router = ReflexRouter::with_threshold(0.99) // strict fuzzy so it won't fuzzy-match
             .with_embedding_provider(provider.clone())
+            .with_semantic_enabled(true)
             .with_semantic_threshold(0.9);
 
         // Register a pattern under a different key so exact match won't fire
@@ -1967,27 +1951,57 @@ mod tests {
         assert_eq!(result, Some("tool_alpha".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_reflex_router_semantic_threshold_accessor() {
+    #[test]
+    fn test_reflex_router_semantic_configuration() {
         let router = ReflexRouter::new();
+        assert!(!router.semantic_enabled());
         assert!((router.semantic_threshold() - DEFAULT_SEMANTIC_THRESHOLD).abs() < 1e-6);
 
-        let router2 = ReflexRouter::new().with_semantic_threshold(0.9);
-        assert!((router2.semantic_threshold() - 0.9).abs() < 1e-6);
+        let configured = ReflexRouter::new()
+            .with_semantic_enabled(true)
+            .with_semantic_threshold(0.9);
+        assert!(configured.semantic_enabled());
+        assert!((configured.semantic_threshold() - 0.9).abs() < 1e-6);
     }
 
     #[tokio::test]
-    async fn test_reflex_router_semantic_empty_cache() {
-        use crate::workspace::MockEmbeddings;
+    async fn test_reflex_router_semantic_disabled_does_not_call_provider() {
+        use crate::workspace::{CachedEmbeddingProvider, EmbeddingCacheConfig, MockEmbeddings};
 
-        let provider = Arc::new(MockEmbeddings::new(64));
+        let provider = Arc::new(CachedEmbeddingProvider::new(
+            Arc::new(MockEmbeddings::new(64)),
+            EmbeddingCacheConfig { max_entries: 8 },
+        ));
+        let pattern_embedding = provider.embed("hello world").await.unwrap();
+        assert_eq!(provider.len(), 1);
+
+        let router = ReflexRouter::new().with_embedding_provider(provider.clone());
+        router.register("hello world", "tool_hello").await;
+        router
+            .pattern_embeddings
+            .write()
+            .await
+            .insert("hello world".to_string(), pattern_embedding);
+
+        assert_eq!(router.try_route("unrelated query here").await, None);
+        assert_eq!(provider.len(), 1, "disabled semantic tier called provider");
+    }
+
+    #[tokio::test]
+    async fn test_reflex_router_semantic_empty_cache_does_not_call_provider() {
+        use crate::workspace::{CachedEmbeddingProvider, EmbeddingCacheConfig, MockEmbeddings};
+
+        let provider = Arc::new(CachedEmbeddingProvider::new(
+            Arc::new(MockEmbeddings::new(64)),
+            EmbeddingCacheConfig { max_entries: 8 },
+        ));
         let router = ReflexRouter::new()
-            .with_embedding_provider(provider)
+            .with_embedding_provider(provider.clone())
+            .with_semantic_enabled(true)
             .with_semantic_threshold(0.5);
 
         router.register("hello world", "tool_hello").await;
-        // Don't populate embedding cache — semantic should gracefully return None
-        let result = router.try_route("unrelated query here").await;
-        assert_eq!(result, None);
+        assert_eq!(router.try_route("unrelated query here").await, None);
+        assert!(provider.is_empty(), "empty pattern cache called provider");
     }
 }
