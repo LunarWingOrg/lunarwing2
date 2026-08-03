@@ -76,6 +76,7 @@ tenant_writers_active "$TENANT" || writer_rc=$?
   exit 1
 }
 
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 INIT_SYSTEM=openrc
 OPENRC_INITD_DIR="$TEST_ROOT/init.d"
 mkdir -p "$OPENRC_INITD_DIR"
@@ -98,6 +99,7 @@ tenant_writers_active "$TENANT" || writer_rc=$?
 lock_active=false
 readiness_checked=false
 stop_checked=false
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 DARKIRC_WRITER_LOCK_HELD=false
 darkirc_scope_id() { printf '00112233445566778899aabbccddeeff\n'; }
 darkirc_writer_lock() {
@@ -106,6 +108,7 @@ darkirc_writer_lock() {
 }
 darkirc_writer_unlock() {
   lock_active=false
+  # shellcheck disable=SC2034  # Updates sourced mt-admin lock state.
   DARKIRC_WRITER_LOCK_HELD=false
 }
 run_darkirc_key_helper() {
