@@ -63,6 +63,8 @@ pub struct TurnInfo {
     pub started_at: String,
     pub completed_at: Option<String>,
     pub tool_calls: Vec<ToolCallInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +76,12 @@ pub struct ToolCallInfo {
     pub result_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReasoningSummary {
+    pub narrative: String,
+    pub decisions: Vec<ToolDecisionDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -281,7 +289,7 @@ pub enum SseEvent {
         message: Option<String>,
     },
 
-    /// Agent reasoning update (why it chose specific tools).
+    /// Safe reasoning summary for selected tools.
     #[serde(rename = "reasoning_update")]
     ReasoningUpdate {
         narrative: String,
