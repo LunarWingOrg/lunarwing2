@@ -530,7 +530,8 @@ impl AppBuilder {
             None
         };
 
-        // Load WASM tools and MCP servers concurrently
+        // Load WASM tools before MCP servers so dynamic tool-name ownership is
+        // deterministic. MCP startup rejects names already claimed by WASM.
         let wasm_tools_future = {
             let wasm_tool_runtime = wasm_tool_runtime.clone();
             let secrets_store = self.secrets_store.clone();
@@ -665,7 +666,11 @@ impl AppBuilder {
                                 "Suppressed managed Study Notes write mode without live opt-in"
                             );
                         }
-                        let enabled: Vec<_> = servers.enabled_servers().cloned().collect();
+                        let enabled: Vec<_> = servers
+                            .enabled_servers()
+                            .filter(|server| server.should_auto_start())
+                            .cloned()
+                            .collect();
                         if !enabled.is_empty() {
                             tracing::debug!(
                                 "Loading {} configured MCP server(s)...",
@@ -680,9 +685,11 @@ impl AppBuilder {
                             let tools = Arc::clone(&tools);
                             let pm = Arc::clone(&pm);
                             let owner_id = owner_id.clone();
+                            let startup_db = db.clone();
 
                             join_set.spawn(async move {
                                 let server_name = server.name.clone();
+                                let expected_server = server.clone();
 
                                 let client = match crate::tools::mcp::create_client_from_config(
                                     server,
@@ -709,20 +716,58 @@ impl AppBuilder {
                                         let tool_count = mcp_tools.len();
                                         match client.create_tools().await {
                                             Ok(tool_impls) => {
-                                                let mut registered_tools = Vec::new();
-                                                for tool in tool_impls {
-                                                    if tools
-                                                        .register_if_vacant(Arc::clone(&tool))
-                                                        .await
+                                                if let Err(conflicts) = tools
+                                                    .replace_runtime_tools(&[], tool_impls.clone())
+                                                    .await
+                                                {
+                                                    tracing::warn!(
+                                                        server = %server_name,
+                                                        tools = ?conflicts,
+                                                        "Rejected startup MCP runtime because tool names conflict"
+                                                    );
+                                                    if let Err(cleanup_error) = crate::tools::mcp::factory::shutdown_client_runtime(
+                                                        &server_name,
+                                                        Some(&client),
+                                                        &mcp_sm,
+                                                        &pm,
+                                                    )
+                                                    .await
                                                     {
-                                                        registered_tools.push(tool);
-                                                    } else {
                                                         tracing::warn!(
                                                             server = %server_name,
-                                                            tool = %tool.name(),
-                                                            "Skipped startup MCP tool because its name is already registered"
+                                                            error = %cleanup_error,
+                                                            "Failed to clean up MCP runtime after startup tool conflict"
                                                         );
                                                     }
+                                                    let disabled = if let Some(ref database) = startup_db {
+                                                        crate::tools::mcp::config::disable_mcp_server_if_unchanged_db(
+                                                            database.as_ref(),
+                                                            &owner_id,
+                                                            &expected_server,
+                                                        )
+                                                        .await
+                                                    } else {
+                                                        crate::tools::mcp::config::disable_mcp_server_if_unchanged(
+                                                            &expected_server,
+                                                        )
+                                                        .await
+                                                    };
+                                                    match disabled {
+                                                        Ok(true) => tracing::warn!(
+                                                            server = %server_name,
+                                                            "Disabled MCP server after startup tool conflict"
+                                                        ),
+                                                        Ok(false) => tracing::warn!(
+                                                            server = %server_name,
+                                                            "MCP server changed during startup conflict handling; left persisted state unchanged"
+                                                        ),
+                                                        Err(error) => tracing::warn!(
+                                                            server = %server_name,
+                                                            %error,
+                                                            "Failed to disable MCP server after startup tool conflict"
+                                                        ),
+                                                    }
+                                                    return None;
                                                 }
                                                 tracing::debug!(
                                                     "Loaded {} tools from MCP server '{}'",
@@ -732,7 +777,7 @@ impl AppBuilder {
                                                 return Some((
                                                     server_name,
                                                     Arc::new(client),
-                                                    registered_tools,
+                                                    tool_impls,
                                                 ));
                                             }
                                             Err(e) => {
@@ -834,8 +879,8 @@ impl AppBuilder {
             }
         };
 
-        let (dev_loaded_tool_names, startup_mcp_clients) =
-            tokio::join!(wasm_tools_future, mcp_servers_future);
+        let dev_loaded_tool_names = wasm_tools_future.await;
+        let startup_mcp_clients = mcp_servers_future.await;
 
         // Load registry catalog entries for extension discovery
         let mut catalog_entries = match crate::registry::RegistryCatalog::load_or_embedded() {
@@ -909,6 +954,7 @@ impl AppBuilder {
                         .await;
                 }
             }
+            manager.start_mcp_supervisor().await;
 
             Some(manager)
         };

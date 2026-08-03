@@ -137,12 +137,12 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 |------|------------------|
 | Install | Registry CLI, `lunarwing mcp add`, conversational `tool_install`, authenticated web API, and browser MCP install form accept validated HTTP or structured stdio config. Install persists config but does not activate it. |
 | Activate/deactivate | `ExtensionManager` initializes clients, discovers tools, tracks exact tool ownership, and tears down transport/session/process state. Desired `enabled` state persists. CLI toggle uses the authenticated gateway when available, falls back to persisted state when unavailable, and accepts `--offline` to request persisted-only behavior explicitly. |
-| Update | CLI `lunarwing mcp update` changes persisted config only. Conversational `tool_update` always requires approval and attempts to restart an active server. Authenticated `POST /api/extensions/{name}/update` also attempts the restart immediately; browser MCP panel has no update editor. Config remains updated if reactivation fails, so inspect returned message and active status. |
-| Remove | Web and conversational removal use `ExtensionManager`. CLI removal uses the authenticated gateway by default so active tools and runtime state are removed before config; `--offline` is explicit persisted-only cleanup. |
+| Update | CLI `lunarwing mcp update` changes persisted config only. Conversational `tool_update` always requires approval and attempts to restart an active server. Authenticated `POST /api/extensions/{name}/update` also attempts the restart immediately; browser MCP panel has no update editor. Config remains updated if reactivation fails, but unchanged persisted intent is disabled until explicit activation. Inspect returned message and active status. |
+| Remove | Web and conversational removal use `ExtensionManager`. CLI removal uses the authenticated gateway by default. Persisted removal happens before active tool/runtime cleanup so a crash cannot restore stale intent; `--offline` is explicit persisted-only cleanup. |
 | Diagnostics | `lunarwing doctor` validates config and reports transport, enabled state, and stdio command availability. |
 | Protocol surface | Tool discovery and tool calls are implemented. General MCP resources, prompts, subscriptions, sampling, elicitation, and WebSocket transport are not implemented. |
 | Runtime placement | Host-local and remote MCP are implemented. Generic worker-local MCP, MCP-over-WASM, and a dedicated shared MCP gateway are not implemented. |
-| Reliability | Explicit activate/deactivate/update/remove cleanup is implemented. Automatic child crash recovery and per-server lifecycle timeout controls are not implemented. |
+| Reliability | Explicit activate/deactivate/update/remove cleanup and whole-runtime host-local stdio crash recovery are implemented. Recovery uses isolated cancellable tasks, five-attempt circuit breaking, a 30-second stability window, jittered bounded backoff, all-or-none tool registration, and internal cleanup deadlines. Configurable per-server lifecycle timeout controls are not implemented. |
 
 #### Host-local stdio MCP servers
 
@@ -191,6 +191,18 @@ values remain visible to the trusted child and potentially to other processes wi
 the same OS privileges; use WASM tools when host-side credential injection is
 required. When `env_secrets` is non-empty, LunarWing suppresses raw MCP child
 stderr content to avoid copying an accidentally printed secret into daemon logs.
+
+If an active managed stdio child exits unexpectedly, `ExtensionManager` removes its
+dead wrappers, re-reads the owner's enabled config, resolves secret references again,
+starts and initializes a fresh client, rediscovers tools, and atomically registers the
+replacement wrappers. Each server recovers in its own cancellable task. Five unstable
+restart attempts use jittered exponential backoff; 30 healthy seconds reset the
+attempt window. Further failure opens a visible circuit and requires explicit
+activation instead of restart-storming. Disable, update, remove, and application
+shutdown cancel and serialize with recovery so they cannot resurrect the old runtime.
+Recovery and child cleanup have internal deadlines. This supervision does not install
+missing commands or packages; initial activation still fails explicitly when the
+configured executable or required secret is unavailable.
 
 MCP servers can be deactivated without uninstalling them. Deactivation unloads
 only that server's registered tools, closes its transport and session, stops a

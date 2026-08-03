@@ -798,6 +798,9 @@ pub struct ExtensionInfo {
     pub command: Option<String>,
     pub authenticated: bool,
     pub active: bool,
+    /// MCP runtime is rebuilding or waiting for retry.
+    #[serde(default)]
+    pub recovering: bool,
     /// Desired startup state for MCP servers. Omitted for other extension kinds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,

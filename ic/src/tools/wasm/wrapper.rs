@@ -1420,6 +1420,10 @@ impl Tool for WasmToolWrapper {
         self.schemas.advertised()
     }
 
+    fn is_wasm_tool(&self) -> bool {
+        true
+    }
+
     fn discovery_schema(&self) -> serde_json::Value {
         self.schemas.discovery()
     }

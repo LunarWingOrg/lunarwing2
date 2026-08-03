@@ -56,11 +56,17 @@ The issue mentions improving integration tests on the Gentoo VM and writing a he
 ---
 
 ### #223 — Create DarkIRC key exchange
-**Status**: 🟡 Open
+**Status**: 🟠 Partially implemented (secure Stage A)
 
-Request for an automated DarkIRC key exchange script. DarkIRC is still opt-in (`--enable-darkirc`), and no key exchange automation script was found in `ic/scripts/` or `docs/`.
+Phase 0/1 and Stage A now provide measured compatibility attestation,
+contact-preserving config ownership, stable tenant scopes, adoption and
+structured migration, plus public-only `prepare`, `respond`, deferred
+`complete`, `cancel`, inspection, and recovery through mt-admin. Full peer
+fingerprint authorization is mandatory and completion stops at `Installed`.
 
-**Verdict**: **Genuinely open.** No key exchange automation exists.
+**Verdict**: **Stage A complete; lifecycle remains open.** Activation/rollback,
+round-trip confirmation, rotation, revocation, same-host pairing, and delivery
+surfaces remain disabled pending their separate security stages.
 
 ---
 

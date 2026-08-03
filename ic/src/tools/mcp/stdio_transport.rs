@@ -38,6 +38,7 @@ const SAFE_INHERITED_ENV: &[&str] = &[
     "XDG_DATA_HOME",
     "XDG_RUNTIME_DIR",
 ];
+const MCP_CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(windows)]
 const SAFE_INHERITED_ENV_WINDOWS: &[&str] = &[
@@ -202,6 +203,25 @@ impl StdioMcpTransport {
             child: Arc::new(Mutex::new(child)),
         })
     }
+
+    /// Return the child exit status without waiting for a running process.
+    pub async fn exit_status(&self) -> Result<Option<std::process::ExitStatus>, ToolError> {
+        self.child.lock().await.try_wait().map_err(|error| {
+            ToolError::ExternalService(format!(
+                "[{}] Failed to query MCP server status: {error}",
+                self.server_name
+            ))
+        })
+    }
+
+    /// Whether stdout processing ended while child may still be alive.
+    pub async fn reader_finished(&self) -> bool {
+        self.reader_handle
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
 }
 
 #[async_trait]
@@ -222,18 +242,20 @@ impl McpTransport for StdioMcpTransport {
     }
 
     async fn shutdown(&self) -> Result<(), ToolError> {
-        // Kill the child process.
-        {
+        let kill_timed_out = tokio::time::timeout(MCP_CHILD_SHUTDOWN_TIMEOUT, async {
             let mut child = self.child.lock().await;
             let _ = child.kill().await;
-        }
+        })
+        .await
+        .is_err();
 
-        // Abort the reader tasks.
         if let Some(handle) = self.reader_handle.lock().await.take() {
             handle.abort();
+            let _ = handle.await;
         }
         if let Some(handle) = self.stderr_handle.lock().await.take() {
             handle.abort();
+            let _ = handle.await;
         }
 
         // Drain pending requests so waiters wake immediately instead of
@@ -244,7 +266,14 @@ impl McpTransport for StdioMcpTransport {
         }
 
         tracing::debug!("[{}] Stdio transport shut down", self.server_name);
-        Ok(())
+        if kill_timed_out {
+            Err(ToolError::ExternalService(format!(
+                "[{}] Timed out stopping MCP server process",
+                self.server_name
+            )))
+        } else {
+            Ok(())
+        }
     }
 
     fn supports_http_features(&self) -> bool {

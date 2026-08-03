@@ -21,7 +21,7 @@ Add
 | DarkIRC key exchange automation | v2.0.4 | `docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md` |
 | Self-Healing Capabilities analysis of any missing pieces from all the new components. Implementation of missing pieces to follow | v2.0.4 | `docs/proposals/CHAOS_FOLLOWUP_TESTS.md`, `docs/proposals/IC_REPAIR_FOLLOWUPS.md` |
 | More Crate Updates | v2.0.4 | |
-| MCP Overhaul Part 1 — host-local install/lifecycle, diagnostics, and owner-scoped secret references implemented; safe crash recovery remains open | v2.0.4 | `docs/ops/MCP_ADDITIONS.md`, `docs/proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md` |
+| MCP Overhaul Part 1 — DONE: host-local install/lifecycle, diagnostics, owner-scoped secret references, and safe whole-runtime stdio crash recovery | v2.0.4 | `docs/ops/MCP_ADDITIONS.md`, `docs/proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md` |
 | Reflex compiler improvements | v2.0.4 | `docs/proposals/REFLEX_COMPILER_V2_UPGRADE_PLAN.md`, `docs/proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED/` |
 | Multi-agent agent team orchestration via XMPP | v2.0.4 | `docs/proposals/MULTIAGENTTEAMORCHESTRATION_INTEGRATION_PLAN_v2.0.4.0.md` |
 | IronClaw port backlog — top 3 easiest additions | v2.0.4 | `docs/proposals/IRONCLAW_TOP3_EASIEST_PLAN.md`, `docs/proposals/OLDPROJECT_PORT_ANALYSES/` |

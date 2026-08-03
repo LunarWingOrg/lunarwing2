@@ -1030,8 +1030,9 @@ async fn async_main() -> anyhow::Result<()> {
             }
         })
         ;
-    // Clone context_manager for the reaper before it's moved into Agent::new()
+    // Clone runtime managers needed after their primary handles move into Agent::new().
     let reaper_context_manager = Arc::clone(&components.context_manager);
+    let extension_manager_for_shutdown = components.extension_manager.clone();
 
     // Capture db reference for SIGHUP handler before it's moved into AgentDeps (Unix only)
     #[cfg(unix)]
@@ -1313,18 +1314,23 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
-    Arc::new(agent).run().await?;
+    let agent_result = Arc::new(agent).run().await;
 
     // ── Shutdown ────────────────────────────────────────────────────────
 
     // Signal background tasks (SIGHUP handler, etc.) to gracefully shut down
     let _ = shutdown_tx.send(());
 
+    lunarwing::bridge::router::shutdown_engine().await;
+
     if let Some(ref mgr) = external_worker_manager {
         mgr.drain_pool().await;
     }
 
-    // Shut down all stdio MCP server child processes.
+    if let Some(manager) = extension_manager_for_shutdown {
+        manager.shutdown_mcp_supervisor().await;
+    }
+    // Shut down all stdio MCP server child processes after recovery has stopped.
     components.mcp_process_manager.shutdown_all().await;
 
     // Flush LLM trace recording if enabled
@@ -1356,6 +1362,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     tracing::debug!("Agent shutdown complete");
 
+    agent_result?;
     Ok(())
 }
 

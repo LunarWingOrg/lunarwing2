@@ -201,7 +201,10 @@ json5 = { version = "0.4", optional = true }
 
 # Unix process signalling for graceful tunnel shutdown
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["signal", "process", "user"] }
+bs58 = "0.5.1"
+cap-fs-ext = "3.4.5"
+cap-std = "3.4.5"
+nix = { version = "0.30", features = ["fs", "signal", "process", "user"] }
 
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]

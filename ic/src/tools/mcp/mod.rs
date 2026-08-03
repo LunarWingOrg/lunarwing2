@@ -45,7 +45,7 @@ pub use auth::{is_authenticated, refresh_access_token};
 pub use client::McpClient;
 pub use config::{McpServerConfig, McpServersFile, OAuthConfig};
 pub use factory::{McpFactoryError, create_client_from_config};
-pub use process::McpProcessManager;
+pub use process::{McpProcessManager, McpProcessState};
 pub use protocol::{InitializeResult, McpRequest, McpResponse, McpTool};
 pub use session::McpSessionManager;
 pub use transport::McpTransport;
