@@ -250,6 +250,8 @@ generate_unique_darkirc_scope_id() {
 
 ensure_darkirc_scope_id() {
   local name="$1" current matches scope_id tmp
+  local had_lock="$PORTS_LOCK_HELD"
+  acquire_ports_lock
   jq -e --arg name "$name" \
     '(.tenants // {}) | has($name) and (.[$name].enable_darkirc == true)' \
     "$PORTS_REGISTRY" >/dev/null 2>&1 || die "tenant '$name' is missing or DarkIRC is disabled"
@@ -261,6 +263,7 @@ ensure_darkirc_scope_id() {
       '[.tenants // {} | to_entries[] | select(.value.darkirc_scope_id == $scope)] | length' \
       "$PORTS_REGISTRY" 2>/dev/null)" || die "failed to validate DarkIRC scope ID for tenant '$name'"
     [[ "$matches" == "1" ]] || die "duplicate DarkIRC scope ID for tenant '$name'"
+    [[ "$had_lock" == "true" ]] || release_ports_lock
     printf '%s' "$current"
     return 0
   fi
@@ -274,6 +277,7 @@ ensure_darkirc_scope_id() {
   fi
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
+  [[ "$had_lock" == "true" ]] || release_ports_lock
   printf '%s' "$scope_id"
 }
 
@@ -598,6 +602,17 @@ Commands:
 
   patch-env <name>                 Add missing env vars (e.g. ORCHESTRATOR_PORT)
   patch-env-all                    Patch env for all registered tenants
+
+  darkirc-contact list|status|doctor|adopt ...
+                                   Inventory/adopt contacts using fingerprints only
+  darkirc-contact prepare|respond|complete|cancel|exchanges ...
+                                   Public-only Stage A exchange; complete is deferred
+  darkirc-contact export-migration|stage-migration|import-migration|migration-ready|recover ...
+                                   Structured, settled-state DarkIRC migration
+  darkirc-contact validate-migration --in - [--unbound]
+                                   Validate a manifest without tenant-state writes
+  darkirc-health <tenant> --strict [--json]
+                                   Diagnostic daemon/adapter connectivity check
 
   migrate-owner-scope <name>       Rekey DB data from 'default' to tenant scope
     --from <old_scope>             Old owner_id (default: 'default')
@@ -4034,6 +4049,11 @@ run_darkirc_key_helper() {
 
 darkirc_contact_command() {
   local operation="${1:-}" name="${2:-}"
+  if [[ "$operation" == doctor && "$name" == --all ]]; then
+    [[ $# -eq 2 ]] || die "darkirc-contact doctor --all accepts no extra arguments"
+    darkirc_contact_doctor_all
+    return
+  fi
   [[ -n "$operation" && -n "$name" ]] \
     || die "usage: darkirc-contact <operation> <tenant> [contact] [options]"
   shift 2
@@ -4068,17 +4088,53 @@ _darkirc_contact_command_locked() {
 
   local -a helper_args=("$operation" --tenant "$name" --scope-id "$scope_id")
   case "$operation" in
-    status|prepare|respond|complete)
+    status)
       contact="${1:-}"
-      [[ -n "$contact" ]] || die "darkirc-contact $operation requires contact name"
-      shift
-      helper_args+=(--contact "$contact")
+      [[ -n "$contact" && $# -eq 1 ]] || die "darkirc-contact status requires exactly one contact name"
+      helper_args+=(--contact "$contact" --json)
       ;;
-    list|doctor|adopt|cancel|exchanges|recover|migration-ready|export-migration|stage-migration|import-migration|restore-migration) ;;
+    prepare)
+      contact="${1:-}"
+      [[ -n "$contact" ]] || die "darkirc-contact prepare requires contact name"
+      shift
+      darkirc_exchange_prepare_args helper_args "$contact" "$@"
+      ;;
+    respond)
+      contact="${1:-}"
+      [[ -n "$contact" ]] || die "darkirc-contact respond requires contact name"
+      shift
+      darkirc_exchange_respond_args helper_args "$contact" "$@"
+      ;;
+    complete)
+      contact="${1:-}"
+      [[ -n "$contact" ]] || die "darkirc-contact complete requires contact name"
+      shift
+      darkirc_exchange_complete_args helper_args "$contact" "$@"
+      ;;
+    cancel)
+      darkirc_exchange_cancel_args helper_args "$@"
+      ;;
+    list|doctor|exchanges)
+      [[ $# -eq 0 ]] || die "darkirc-contact $operation accepts no extra arguments"
+      helper_args+=(--json)
+      ;;
+    adopt)
+      [[ $# -eq 1 && "$1" == --yes ]] || die "adoption requires --yes"
+      helper_args+=(--yes --json)
+      ;;
+    recover|migration-ready|export-migration|import-migration)
+      [[ $# -eq 0 ]] || die "darkirc-contact $operation accepts no extra arguments"
+      helper_args+=(--json)
+      ;;
+    stage-migration)
+      [[ $# -eq 2 && "$1" == --in && "$2" == - ]] \
+        || die "stage-migration requires --in -"
+      ;;
+    restore-migration)
+      [[ $# -eq 0 ]] || die "restore-migration accepts no extra arguments"
+      ;;
     *) die "unsupported DarkIRC contact operation '$operation'" ;;
   esac
-  [[ "$operation" != "complete" ]] || helper_args+=(--defer-apply)
-  helper_args+=("$@")
 
   if [[ "$operation" == restore-migration ]]; then
     with_darkirc_writer_lock "$name" restore_darkirc_migration_locked "$name" "$scope_id"
@@ -4093,6 +4149,92 @@ _darkirc_contact_command_locked() {
       run_darkirc_key_helper "$name" "${helper_args[@]}"
       ;;
   esac
+}
+
+darkirc_exchange_prepare_args() {
+  local -n args_ref="$1"
+  local contact="$2" out="" expires="" json=false
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --out) [[ $# -ge 2 && -z "$out" ]] || die "prepare requires one --out value"; out="$2"; shift 2 ;;
+      --expires) [[ $# -ge 2 && -z "$expires" ]] || die "prepare accepts one --expires value"; expires="$2"; shift 2 ;;
+      --json) [[ "$json" == false ]] || die "duplicate --json"; json=true; shift ;;
+      *) die "unknown prepare argument: $1" ;;
+    esac
+  done
+  [[ -n "$out" ]] || die "prepare requires --out <file|->"
+  args_ref+=(--contact "$contact" --out "$out")
+  [[ -z "$expires" ]] || args_ref+=(--expires "$expires")
+  [[ "$json" == false ]] || args_ref+=(--json)
+}
+
+darkirc_exchange_respond_args() {
+  local -n args_ref="$1"
+  local contact="$2" input="" out="" fingerprint="" expires="" json=false
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --in) [[ $# -ge 2 && -z "$input" ]] || die "respond requires one --in value"; input="$2"; shift 2 ;;
+      --out) [[ $# -ge 2 && -z "$out" ]] || die "respond requires one --out value"; out="$2"; shift 2 ;;
+      --expect-peer-fingerprint) [[ $# -ge 2 && -z "$fingerprint" ]] || die "respond requires one fingerprint"; fingerprint="$2"; shift 2 ;;
+      --expires) [[ $# -ge 2 && -z "$expires" ]] || die "respond accepts one --expires value"; expires="$2"; shift 2 ;;
+      --json) [[ "$json" == false ]] || die "duplicate --json"; json=true; shift ;;
+      *) die "unknown respond argument: $1" ;;
+    esac
+  done
+  [[ -n "$input" && -n "$out" && -n "$fingerprint" ]] \
+    || die "respond requires --in, --out, and --expect-peer-fingerprint"
+  args_ref+=(--contact "$contact" --in "$input" --out "$out" --expect-peer-fingerprint "$fingerprint")
+  [[ -z "$expires" ]] || args_ref+=(--expires "$expires")
+  [[ "$json" == false ]] || args_ref+=(--json)
+}
+
+darkirc_exchange_complete_args() {
+  local -n args_ref="$1"
+  local contact="$2" input="" exchange_id="" fingerprint="" json=false
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --in) [[ $# -ge 2 && -z "$input" ]] || die "complete requires one --in value"; input="$2"; shift 2 ;;
+      --exchange-id) [[ $# -ge 2 && -z "$exchange_id" ]] || die "complete requires one exchange ID"; exchange_id="$2"; shift 2 ;;
+      --expect-peer-fingerprint) [[ $# -ge 2 && -z "$fingerprint" ]] || die "complete requires one fingerprint"; fingerprint="$2"; shift 2 ;;
+      --defer-apply) shift ;;
+      --json) [[ "$json" == false ]] || die "duplicate --json"; json=true; shift ;;
+      *) die "unknown complete argument: $1" ;;
+    esac
+  done
+  [[ -n "$input" && -n "$exchange_id" && -n "$fingerprint" ]] \
+    || die "complete requires --in, --exchange-id, and --expect-peer-fingerprint"
+  args_ref+=(--contact "$contact" --in "$input" --exchange-id "$exchange_id" \
+    --expect-peer-fingerprint "$fingerprint" --defer-apply)
+  [[ "$json" == false ]] || args_ref+=(--json)
+}
+
+darkirc_exchange_cancel_args() {
+  local -n args_ref="$1"
+  local exchange_id="" json=false
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --exchange-id) [[ $# -ge 2 && -z "$exchange_id" ]] || die "cancel requires one exchange ID"; exchange_id="$2"; shift 2 ;;
+      --json) [[ "$json" == false ]] || die "duplicate --json"; json=true; shift ;;
+      *) die "unknown cancel argument: $1" ;;
+    esac
+  done
+  [[ -n "$exchange_id" ]] || die "cancel requires --exchange-id"
+  args_ref+=(--exchange-id "$exchange_id")
+  [[ "$json" == false ]] || args_ref+=(--json)
+}
+
+darkirc_contact_doctor_all() {
+  local name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if tenant_darkirc_enabled "$name"; then
+      _darkirc_contact_command_locked doctor "$name"
+    fi
+  done < <(all_tenant_names)
 }
 
 darkirc_prepare_tenant_dirs() {
@@ -10063,6 +10205,55 @@ main() {
     status)
       [[ -n "${1:-}" ]] || die "usage: status <name>"
       status_tenant "$1"
+      ;;
+
+    darkirc-contact)
+      require_root
+      local darkirc_operation="${1:-}"
+      if [[ "$darkirc_operation" == validate-migration ]]; then
+        shift
+        local darkirc_input=false darkirc_unbound=false
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --in) [[ $# -ge 2 && "$2" == - ]] || die "validate-migration accepts stdin only (--in -)"; darkirc_input=true; shift 2 ;;
+            --json) shift ;;
+            --unbound) darkirc_unbound=true; shift ;;
+            *) die "unexpected validate-migration argument: $1" ;;
+          esac
+        done
+        [[ "$darkirc_input" == true ]] || die "validate-migration requires --in -"
+        run_darkirc_manifest_validator "$darkirc_unbound"
+      else
+        case "$darkirc_operation" in
+          list|status|doctor|exchanges) ports_registry_require_readonly ;;
+          *) ports_registry_init ;;
+        esac
+        darkirc_contact_command "$darkirc_operation" "${@:2}"
+      fi
+      ;;
+
+    darkirc-health)
+      require_root
+      local health_tenant="" health_strict=false health_json=false
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --strict) health_strict=true; shift ;;
+          --json) health_json=true; shift ;;
+          -*) die "unknown flag: $1" ;;
+          *) [[ -z "$health_tenant" ]] || die "unexpected argument: $1"; health_tenant="$1"; shift ;;
+        esac
+      done
+      [[ "$health_strict" == true && -n "$health_tenant" ]] \
+        || die "darkirc-health requires <tenant> --strict"
+      health_tenant="$(sanitize_name "$health_tenant")"
+      ports_registry_require_readonly
+      if darkirc_health_strict "$health_tenant" 10 "$health_json"; then
+        if [[ "$health_json" == true ]]; then
+          printf '{"status":"ok","tenant":"%s","irc_connected":true}\n' "$health_tenant"
+        fi
+      else
+        die "strict DarkIRC health failed for tenant '$health_tenant'"
+      fi
       ;;
 
     tokens)
