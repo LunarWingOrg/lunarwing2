@@ -160,6 +160,8 @@ fn url_matches_scoped_prefix(request_url: &str, allowed_prefix: &str) -> bool {
     request.origin() == allowed.origin() && request.path().starts_with(allowed.path())
 }
 
+const GITLAB_CONFIG_PATH: &str = "config/gitlab.json";
+
 /// Workspace reader backed by pre-loaded data.
 ///
 /// Loaded asynchronously before WASM execution so the sync host function
@@ -174,6 +176,13 @@ impl crate::tools::wasm::WorkspaceReader for PreloadedWorkspaceReader {
     }
 }
 
+fn direct_workspace_preload_path(prefixes: &[String]) -> Option<&str> {
+    match prefixes {
+        [path] if path == GITLAB_CONFIG_PATH => Some(path),
+        _ => None,
+    }
+}
+
 /// Pre-load workspace documents matching the given prefixes into a sync reader.
 async fn preload_workspace_reader(
     workspace: &crate::workspace::Workspace,
@@ -181,27 +190,34 @@ async fn preload_workspace_reader(
 ) -> PreloadedWorkspaceReader {
     let mut data = HashMap::new();
 
-    let paths = match workspace.list_all().await {
-        Ok(paths) => paths,
-        Err(e) => {
-            tracing::debug!("Failed to list workspace for WASM pre-load: {e}");
-            return PreloadedWorkspaceReader { data };
+    // GitLab grants access to one exact config file. Avoid recursively listing
+    // every workspace/read scope on every tool call just to find that path.
+    // Other grants retain prefix semantics and therefore still require listing.
+    let matching = if let Some(path) = direct_workspace_preload_path(prefixes) {
+        vec![path.to_string()]
+    } else {
+        let paths = match workspace.list_all().await {
+            Ok(paths) => paths,
+            Err(e) => {
+                tracing::debug!("Failed to list workspace for WASM pre-load: {e}");
+                return PreloadedWorkspaceReader { data };
+            }
+        };
+
+        if prefixes.is_empty() {
+            paths
+        } else {
+            paths
+                .into_iter()
+                .filter(|path| prefixes.iter().any(|prefix| path.starts_with(prefix)))
+                .collect()
         }
     };
 
-    let matching: Vec<&String> = if prefixes.is_empty() {
-        paths.iter().collect()
-    } else {
-        paths
-            .iter()
-            .filter(|p| prefixes.iter().any(|pfx| p.starts_with(pfx)))
-            .collect()
-    };
-
     for path in matching {
-        match workspace.read(path).await {
+        match workspace.read(&path).await {
             Ok(doc) => {
-                data.insert(path.clone(), doc.content);
+                data.insert(path, doc.content);
             }
             Err(e) => {
                 tracing::debug!(path = %path, "Failed to pre-load workspace doc for WASM: {e}");
@@ -3742,6 +3758,26 @@ mod tests {
             result.missing_required,
             vec!["google_oauth_token".to_string()]
         );
+    }
+
+    #[test]
+    fn test_gitlab_config_uses_direct_workspace_preload() {
+        assert_eq!(
+            super::direct_workspace_preload_path(&[super::GITLAB_CONFIG_PATH.to_string()]),
+            Some(super::GITLAB_CONFIG_PATH)
+        );
+        assert_eq!(
+            super::direct_workspace_preload_path(&["config/".to_string()]),
+            None
+        );
+        assert_eq!(
+            super::direct_workspace_preload_path(&[
+                super::GITLAB_CONFIG_PATH.to_string(),
+                "notes/".to_string(),
+            ]),
+            None
+        );
+        assert_eq!(super::direct_workspace_preload_path(&[]), None);
     }
 
     #[test]
