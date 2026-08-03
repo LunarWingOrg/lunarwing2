@@ -68,7 +68,8 @@ of tenant provisioning (unless `--no-health` is passed). This function:
 3. Writes a config env file (`/etc/lunarwing/health.env`, mode 0600) if absent —
    includes `LUNARWING_BASE_DIR`, `LUNARWING_SERVICE_MANAGER`, tenant registry
    path, and MT-hardening flags. If the file already exists, only the
-   `LUNARWING_SERVICE_MANAGER` line is reconciled (preserving operator edits).
+   `LUNARWING_SERVICE_MANAGER` and `SELF_HEAL_TENANTS_FILE` lines are
+   reconciled (preserving operator edits).
 4. Writes a launcher script that sources the env file and execs `cron-wrapper.sh`.
 5. Schedules the launcher:
    - **systemd**: installs + enables `lunarwing-mt-health.{service,timer}`
@@ -84,7 +85,8 @@ without duplicating the schedule.
 
 ### Path 2: `install-lunarwing-watchdog.sh` (manual, complementary)
 
-`ic/scripts/install-lunarwing-watchdog.sh` (run as root, **once per host**;
+`ic/scripts/install-lunarwing-watchdog.sh` (run as root on systemd/OpenRC —
+launchd runs rootless as a user agent — **once per host**;
 auto-detects systemd / OpenRC / launchd) is the installer for the **service-level
 watchdog**. On systemd it:
 

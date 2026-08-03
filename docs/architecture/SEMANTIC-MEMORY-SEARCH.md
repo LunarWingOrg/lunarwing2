@@ -71,10 +71,10 @@ and profile data) with the shared safety `Sanitizer`. High-severity prompt
 injection patterns return `WorkspaceError::InjectionRejected`; the memory tool
 maps that to a not-authorized error.
 
-Layer-aware `write_to_layer()` and `append_to_layer()` currently apply layer
-permissions and privacy classification but do not call this system-prompt
-injection guard. Callers must not use a custom layer to bypass the default-scope
-write path for prompt-bearing files.
+Layer-aware `write_to_layer()` and `append_to_layer()` apply layer
+permissions and privacy classification, and run the same system-prompt
+injection guard as the default-scope path (appends to prompt-visible files
+re-validate the concatenated content).
 
 ### Step 2: Document Chunking
 
