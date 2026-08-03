@@ -161,16 +161,52 @@ release_ports_lock() {
 with_tenant_lifecycle_lock() {
   local name="$1"
   shift
+  [[ "$name" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
+    || die "invalid tenant name for lifecycle lock"
   require_cmd flock
-  mkdir -p "$TENANT_LIFECYCLE_LOCK_DIR"
+  [[ ! -L "$TENANT_LIFECYCLE_LOCK_DIR" ]]
+  install -d -o root -g root -m 0700 "$TENANT_LIFECYCLE_LOCK_DIR"
+  [[ "$(stat -c '%u:%a' "$TENANT_LIFECYCLE_LOCK_DIR" 2>/dev/null)" == "0:700" ]] \
+    || die "unsafe tenant lifecycle lock directory"
   local lock_fd result
+  if [[ -n "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD:-}" ]]; then
+    lock_fd="$LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD"
+    [[ "$lock_fd" =~ ^[0-9]+$ \
+      && "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT:-}" == "$name" \
+      && -e "/proc/self/fd/$lock_fd" \
+      && "$(stat -c '%d:%i' "/proc/self/fd/$lock_fd" 2>/dev/null)" \
+        == "$(stat -c '%d:%i' "$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" 2>/dev/null)" ]] \
+      || die "invalid active tenant lifecycle lock"
+    flock -x -n "$lock_fd" || die "active tenant lifecycle lock is not held"
+    "$@"
+    return
+  fi
+  if [[ -n "${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD:-}" ]]; then
+    lock_fd="$LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD"
+    [[ "$lock_fd" =~ ^[0-9]+$ \
+      && "${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT:-}" == "$name" \
+      && -e "/proc/self/fd/$lock_fd" \
+      && "$(stat -c '%d:%i' "/proc/self/fd/$lock_fd" 2>/dev/null)" \
+        == "$(stat -c '%d:%i' "$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" 2>/dev/null)" ]] \
+      || die "invalid inherited tenant lifecycle lock"
+    flock -x -n "$lock_fd" || die "inherited tenant lifecycle lock is not held"
+    LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
+    LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
+    "$@" || result=$?
+    result="${result:-0}"
+    unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
+    return "$result"
+  fi
   exec {lock_fd}>"$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" || return 1
   if ! flock -x "$lock_fd"; then
     exec {lock_fd}>&-
     return 1
   fi
+  LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
+  LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
   "$@" || result=$?
   result="${result:-0}"
+  unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
   flock -u "$lock_fd" || result=1
   exec {lock_fd}>&-
   return "$result"
@@ -182,6 +218,63 @@ generate_token() {
   else
     printf 'replace-with-random-token-%s' "$(date +%s)"
   fi
+}
+
+# Generate a non-secret registry identity. Callers hold the ports lock while
+# checking uniqueness and persisting the value.
+generate_darkirc_scope_id() {
+  require_cmd od
+  local scope_id
+  scope_id="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ "$scope_id" =~ ^[0-9a-f]{32}$ && "$scope_id" != "00000000000000000000000000000000" ]] \
+    || die "failed to generate DarkIRC scope ID"
+  printf '%s' "$scope_id"
+}
+
+generate_unique_darkirc_scope_id() {
+  local scope_id attempts=0 jq_status
+  while (( attempts < 16 )); do
+    scope_id="$(generate_darkirc_scope_id)"
+    if jq -e --arg scope "$scope_id" \
+        '[.tenants // {} | to_entries[] | select(.value.darkirc_scope_id == $scope)] | length == 0' \
+        "$PORTS_REGISTRY" >/dev/null 2>&1; then
+      printf '%s' "$scope_id"
+      return 0
+    fi
+    jq_status=$?
+    [[ "$jq_status" == "1" ]] || die "failed to validate DarkIRC scope ID uniqueness"
+    attempts=$((attempts + 1))
+  done
+  die "failed to allocate unique DarkIRC scope ID"
+}
+
+ensure_darkirc_scope_id() {
+  local name="$1" current matches scope_id tmp
+  jq -e --arg name "$name" \
+    '(.tenants // {}) | has($name) and (.[$name].enable_darkirc == true)' \
+    "$PORTS_REGISTRY" >/dev/null 2>&1 || die "tenant '$name' is missing or DarkIRC is disabled"
+  current="$(jq -r --arg name "$name" '.tenants[$name].darkirc_scope_id // empty' \
+    "$PORTS_REGISTRY" 2>/dev/null)" || die "failed to read DarkIRC scope ID for tenant '$name'"
+  if [[ -n "$current" ]]; then
+    validate_darkirc_scope_id "$current"
+    matches="$(jq -r --arg scope "$current" \
+      '[.tenants // {} | to_entries[] | select(.value.darkirc_scope_id == $scope)] | length' \
+      "$PORTS_REGISTRY" 2>/dev/null)" || die "failed to validate DarkIRC scope ID for tenant '$name'"
+    [[ "$matches" == "1" ]] || die "duplicate DarkIRC scope ID for tenant '$name'"
+    printf '%s' "$current"
+    return 0
+  fi
+
+  scope_id="$(generate_unique_darkirc_scope_id)"
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  if ! jq --arg name "$name" --arg scope "$scope_id" \
+      '.tenants[$name].darkirc_scope_id = $scope' "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    die "failed to store DarkIRC scope ID for tenant '$name'"
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  printf '%s' "$scope_id"
 }
 
 sanitize_name() {
@@ -1044,7 +1137,7 @@ ports_registry_init() {
       registry_needs_repair="true"
     fi
   fi
-  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "13" || "$registry_needs_repair" == "true" ]]; then
+  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "14" || "$registry_needs_repair" == "true" ]]; then
     acquire_ports_lock
   fi
 
@@ -1277,6 +1370,7 @@ ports_migrate() {
   if [[ "$current_version" -lt 11 ]]; then ports_migrate_v11; fi
   if [[ "$current_version" -lt 12 ]]; then ports_migrate_v12; fi
   if [[ "$current_version" -lt 13 ]]; then ports_migrate_v13; fi
+  if [[ "$current_version" -lt 14 ]]; then ports_migrate_v14; fi
 }
 
 # v8 -> v9: rename extended_ports.reserved_5 -> vision_service.
@@ -1453,6 +1547,49 @@ ports_migrate_v13() {
   say "port registry migrated to v13 (coord_admin dedicated at extended_base+9)"
 }
 
+# v13 -> v14: stable non-secret identity for every DarkIRC-enabled tenant.
+ports_migrate_v14() {
+  local name tmp next scope
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  cp "$PORTS_REGISTRY" "$tmp"
+  if ! jq -e '
+      [(.tenants // {}) | to_entries[]
+        | select(.value.enable_darkirc == true)
+        | (.value.darkirc_scope_id // "")
+        | select(length > 0)] as $ids
+      | all($ids[]; test("^[0-9a-f]{32}$") and . != "00000000000000000000000000000000")
+      and (($ids | unique | length) == ($ids | length))
+    ' "$tmp" >/dev/null; then
+    rm -f "$tmp"
+    die "failed to migrate port registry to v14: invalid or duplicate scope ID"
+  fi
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    scope="$(jq -r --arg name "$name" '.tenants[$name].darkirc_scope_id // empty' "$tmp")"
+    [[ -z "$scope" ]] || continue
+    while :; do
+      scope="$(generate_darkirc_scope_id)"
+      if ! jq -e --arg scope "$scope" \
+        '.tenants // {} | to_entries | any(.value.darkirc_scope_id == $scope)' \
+        "$tmp" >/dev/null; then
+        break
+      fi
+    done
+    next="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+    jq --arg name "$name" --arg scope "$scope" \
+      '.tenants[$name].darkirc_scope_id = $scope' "$tmp" >"$next" \
+      || { rm -f "$tmp" "$next"; die "failed to assign DarkIRC scope ID"; }
+    mv "$next" "$tmp"
+  done < <(jq -r '.tenants // {} | to_entries[] | select(.value.enable_darkirc == true) | .key' "$tmp")
+  next="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  jq '.version = 14' "$tmp" >"$next" \
+    || { rm -f "$tmp" "$next"; die "failed to migrate port registry to v14"; }
+  mv "$next" "$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "port registry migrated to v14 (stable DarkIRC scope IDs)"
+}
+
 ports_allocate() {
   local name="$1"
   local enable_darkirc="${2:-false}"
@@ -1463,9 +1600,19 @@ ports_allocate() {
   # (bash closes the ${...} at the first `}`, appending a stray `}` and
   # corrupting the JSON), so default explicitly instead.
   local workers_json="${4:-}"
+  local requested_darkirc_scope="${5:-}"
   [[ -n "$workers_json" ]] || workers_json='{}'
   require_cmd jq
   acquire_ports_lock
+  if [[ -n "$requested_darkirc_scope" ]]; then
+    [[ "$enable_darkirc" == "true" ]] \
+      || die "DarkIRC import scope requires --enable-darkirc"
+    validate_darkirc_scope_id "$requested_darkirc_scope"
+    jq -e --arg scope "$requested_darkirc_scope" --arg name "$name" \
+      '.tenants // {} | to_entries | any(.key != $name and .value.darkirc_scope_id == $scope)' \
+      "$PORTS_REGISTRY" >/dev/null 2>&1 \
+      && die "DarkIRC import scope is already assigned"
+  fi
 
   # Resumable (F4): if this tenant already has a block, reuse it (echo its
   # base_port) instead of dying — so re-running add-tenant after a mid-flow failure
@@ -1474,6 +1621,12 @@ ports_allocate() {
   local existing
   existing="$(jq -r ".tenants[\"$name\"].base_port // empty" "$PORTS_REGISTRY" 2>/dev/null || true)"
   if [[ -n "$existing" ]]; then
+    if [[ -n "$requested_darkirc_scope" ]]; then
+      local existing_scope
+      existing_scope="$(jq -r --arg name "$name" '.tenants[$name].darkirc_scope_id // empty' "$PORTS_REGISTRY")"
+      [[ "$existing_scope" == "$requested_darkirc_scope" ]] \
+        || die "existing tenant has a different DarkIRC scope"
+    fi
     say "tenant '$name' already has ports allocated (base $existing); reusing for resume" >&2
     # Reconcile the darkirc flag on resume (H2): add_tenant()'s env/unit writers
     # (write_tenant_lunarwing_env, render_tenant_*_units, start_tenant_*) gate on
@@ -1524,7 +1677,11 @@ ports_allocate() {
       opencode: (.opencode // false),
       kimi:     (.kimi     // false)
     }' <<<"$workers_json" 2>/dev/null || echo '{"nanocode":false,"pebble":false,"opencode":false,"kimi":false}')"
-  jq --arg name "$name" --argjson base "$base" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson darkirc "$darkirc_json" --argjson proxy "$proxy_json" --argjson workers "$workers_norm" '
+  local darkirc_scope=""
+  if [[ "$enable_darkirc" == true ]]; then
+    darkirc_scope="${requested_darkirc_scope:-$(generate_unique_darkirc_scope_id)}"
+  fi
+  jq --arg name "$name" --argjson base "$base" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson darkirc "$darkirc_json" --arg scope "$darkirc_scope" --argjson proxy "$proxy_json" --argjson workers "$workers_norm" '
     ( .range.start // 10000 ) as $rstart
     | ( .extended_range.start // 20000 ) as $estart
     | ( .extended_block_size // 10 ) as $ebs
@@ -1536,6 +1693,7 @@ ports_allocate() {
         user: $name,
         created_at: $ts,
         enable_darkirc: $darkirc,
+        darkirc_scope_id: (if $darkirc then $scope else null end),
         enable_proxy: $proxy,
         enable_weechat: true,
         workers: $workers,
@@ -1602,13 +1760,16 @@ ports_enable_darkirc() {
   local current
   current="$(jq -r ".tenants[\"$name\"].enable_darkirc // false" "$PORTS_REGISTRY" 2>/dev/null || true)"
   if [[ "$current" == "true" ]]; then
+    ensure_darkirc_scope_id "$name" >/dev/null
     [[ "$had_lock" == "true" ]] || release_ports_lock
     return 0
   fi
 
-  local tmp
+  local tmp scope_id
+  scope_id="$(generate_unique_darkirc_scope_id)"
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
-  if ! jq --arg name "$name" '.tenants[$name].enable_darkirc = true' \
+  if ! jq --arg name "$name" --arg scope "$scope_id" \
+      '.tenants[$name].enable_darkirc = true | .tenants[$name].darkirc_scope_id = $scope' \
       "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
     rm -f "$tmp"
     [[ "$had_lock" == "true" ]] || release_ports_lock
