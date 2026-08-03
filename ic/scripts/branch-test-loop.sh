@@ -188,7 +188,7 @@ run_branch() {
   local gateway_port
   gateway_port="$(jq -r ".tenants[\"${tenant}\"].ports.gateway" /etc/lunarwing/ports.json)"
   local ready=0
-  for i in $(seq 1 30); do
+  for _ in $(seq 1 30); do
     curl -sf "http://127.0.0.1:${gateway_port}/healthz" >/dev/null 2>&1 && { ready=1; break; }
     sleep 2
   done

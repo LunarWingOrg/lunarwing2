@@ -215,7 +215,7 @@ Do not ask questions. Just create it." >/dev/null
   ok "routine created (id=$id)"
 
   say "sending 3 identical events..."
-  for i in 1 2 3; do
+  for _ in 1 2 3; do
     api_send "dedup-test-trigger" >/dev/null 2>&1 || true
     sleep 2
   done

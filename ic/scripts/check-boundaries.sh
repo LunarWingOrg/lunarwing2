@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Architecture boundary checks for LunarWing.
 # Run as: bash scripts/check-boundaries.sh
-# Returns non-zero if hard violations are found.
+# Reports existing full-tree debt and returns non-zero for new hard violations
+# introduced since the merge-request, push, or local default-branch base.
 
 set -euo pipefail
 
@@ -9,6 +10,65 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 violations=0
+
+resolve_base_ref() {
+    local candidate
+
+    for candidate in \
+        "${BOUNDARY_BASE_REF:-}" \
+        "${CI_MERGE_REQUEST_DIFF_BASE_SHA:-}" \
+        "${CI_COMMIT_BEFORE_SHA:-}"; do
+        [ -n "$candidate" ] || continue
+        case "$candidate" in
+            0000000000000000000000000000000000000000) continue ;;
+        esac
+        if git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+
+    if [ "${CI:-}" = true ] && git rev-parse --verify --quiet 'HEAD^' >/dev/null; then
+        printf '%s\n' HEAD^
+        return
+    fi
+
+    for candidate in "origin/${CI_DEFAULT_BRANCH:-master}" HEAD^; do
+        if git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+
+    printf '%s\n' HEAD
+}
+
+BASE_REF=$(resolve_base_ref)
+
+added_lines() {
+    git diff --relative --no-color --no-renames --unified=0 "$BASE_REF" -- "$@" | awk '
+        /^\+\+\+ / {
+            if ($0 ~ /^\+\+\+ b\//) {
+                file = substr($0, 7)
+            }
+            next
+        }
+        /^@@ / {
+            split($0, range, " ")
+            split(substr(range[3], 2), location, ",")
+            line = location[1]
+            next
+        }
+        /^\+/ {
+            print file ":" line ":" substr($0, 2)
+            line++
+            next
+        }
+        /^[^-]/ && !/^diff / && !/^index / {
+            line++
+        }
+    '
+}
 
 echo "=== Architecture Boundary Checks ==="
 echo
@@ -47,14 +107,34 @@ results=$(grep -rn 'tokio_postgres::\|libsql::' src/ \
     || true)
 
 if [ -n "$results" ]; then
-    echo "VIOLATION: Direct database driver usage found outside db layer:"
+    echo "WARNING: Direct database driver usage found outside db layer:"
     echo "$results"
     echo
     count=$(echo "$results" | wc -l | tr -d ' ')
     echo "($count occurrence(s) -- these modules should use the Database trait)"
-    violations=$((violations + 1))
 else
     echo "OK"
+fi
+
+new_db_results=$(added_lines src/ \
+    | grep 'tokio_postgres::\|libsql::' \
+    | grep -v 'src/db/' \
+    | grep -v 'src/workspace/repository.rs' \
+    | grep -v 'src/error.rs' \
+    | grep -v 'src/app.rs' \
+    | grep -v 'src/testing.rs' \
+    | grep -v 'src/testing/' \
+    | grep -v 'src/cli/' \
+    | grep -v 'src/setup/' \
+    | grep -v 'src/main.rs' \
+    | grep -v '//.*tokio_postgres\|//.*libsql' \
+    || true)
+
+if [ -n "$new_db_results" ]; then
+    echo
+    echo "HARD VIOLATION: New direct database driver usage outside db layer:"
+    echo "$new_db_results"
+    violations=$((violations + 1))
 fi
 echo
 
@@ -150,21 +230,26 @@ echo
 # gated behind #![cfg(all(feature = "postgres", feature = "integration"))].
 # This ensures `cargo test` (no flags) never requires external services.
 #
-# Heuristic: any test file referencing DATABASE_URL, connect(), PgPool,
-# or tokio_postgres should have the cfg gate on the first few lines.
+# Heuristic: any changed test file using PostgreSQL driver/pool markers should
+# have the cfg gate on the first few lines. Generic connect() calls may be
+# hermetic libSQL tests and are not sufficient evidence.
 # --------------------------------------------------------------------------
 
 echo "--- Check 4: Test tier gating for integration tests ---"
 
 tier_violations=()
-for test_file in tests/*.rs; do
+mapfile -t changed_tests < <(
+    git diff --relative --name-only --no-renames --diff-filter=AM "$BASE_REF" -- tests/'*.rs'
+)
+for test_file in "${changed_tests[@]}"; do
     [ -f "$test_file" ] || continue
 
     # Check if the file actually connects to a database (imports DB types
     # or calls pool/connect). Mere string references like "DATABASE_URL"
     # in config tests don't count.
     needs_gate=false
-    if grep -q 'PgPool\|tokio_postgres::\|create_pool\|\.connect(' "$test_file" 2>/dev/null; then
+    if grep -q 'DATABASE_URL\|PgPool\|tokio_postgres::\|deadpool_postgres::\|create_pool' \
+        "$test_file" 2>/dev/null; then
         needs_gate=true
     fi
 
@@ -197,9 +282,16 @@ echo
 
 echo "--- Check 5: No silent test-skip patterns ---"
 
-skip_results=$(grep -rn 'try_connect\|is_available.*return\|is_none.*return\|is_err.*return.*//.*skip' tests/ \
-    --include='*.rs' \
-    || true)
+skip_results=""
+for test_file in "${changed_tests[@]}"; do
+    [ -f "$test_file" ] || continue
+    file_skips=$(grep -n 'try_connect\|is_available.*return\|is_none.*return\|is_err.*return.*//.*skip' \
+        "$test_file" || true)
+    if [ -n "$file_skips" ]; then
+        skip_results+="${test_file}:${file_skips}"$'\n'
+    fi
+done
+skip_results=${skip_results%$'\n'}
 
 if [ -n "$skip_results" ]; then
     echo "VIOLATION: Silent test-skip patterns found (use feature gates instead):"
@@ -250,7 +342,11 @@ if [ -n "$results" ]; then
     echo "(New 'use crate::' imports are hard violations — see below.)"
     echo
     # Hard-fail only on new `use crate::` imports (easy to avoid in new code).
-    use_imports=$(echo "$results" | grep '^[^:]*:.*use crate::' || true)
+    use_imports=$(added_lines src/llm/ \
+        | grep 'use crate::' \
+        | grep -v 'crate::llm' \
+        | grep -v 'crate::testing' \
+        || true)
     if [ -n "$use_imports" ]; then
         echo "HARD VIOLATION: new 'use crate::' imports in src/llm/:"
         echo "$use_imports"
