@@ -33,7 +33,7 @@
 //! they run with the most restrictive permissions. Only tools explicitly marked
 //! as `verified` or `system` in the database get elevated trust.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -45,6 +45,18 @@ use crate::tools::wasm::capabilities_schema::CapabilitiesFile;
 use crate::tools::wasm::{
     Capabilities, OAuthRefreshConfig, WasmError, WasmStorageError, WasmToolRuntime, WasmToolStore,
 };
+
+// Names installed before tenant tooling standardized the `-tool` suffix. Keep
+// files for rollback, but never compile both old and current copies at startup.
+const LEGACY_RENAMED_TOOL_STEMS: &[&str] = &[
+    "gitlab",
+    "gotify",
+    "llm-context",
+    "multica-bridge",
+    "ssh",
+    "vision-analyze",
+    "web-search",
+];
 
 /// Error during WASM tool loading.
 #[derive(Debug, thiserror::Error)]
@@ -280,14 +292,25 @@ impl WasmToolLoader {
             tool_entries.push((name, path, if has_cap { Some(cap_path) } else { None }));
         }
 
-        // Load all tools in parallel (file I/O + WASM compilation + registration)
-        let load_futures = tool_entries
-            .iter()
-            .map(|(name, path, cap_path)| self.load_from_files(name, path, cap_path.as_deref()));
+        let shadowed_legacy_names =
+            shadowed_legacy_tool_names(tool_entries.iter().map(|(name, _, _)| name.as_str()));
+        tool_entries.sort_by(|left, right| left.0.cmp(&right.0));
 
-        let load_results = futures::future::join_all(load_futures).await;
-
-        for ((name, path, _), result) in tool_entries.into_iter().zip(load_results) {
+        // Wasmtime compilation has a large transient allocator footprint. Loading
+        // sequentially prevents one blocking thread and glibc arena per installed
+        // component from retaining startup high-water memory.
+        for (name, path, cap_path) in tool_entries {
+            if shadowed_legacy_names.contains(&name) {
+                tracing::warn!(
+                    legacy = name,
+                    replacement = %format!("{name}-tool"),
+                    "Skipping legacy WASM tool artifact because current replacement exists"
+                );
+                continue;
+            }
+            let result = self
+                .load_from_files(&name, &path, cap_path.as_deref())
+                .await;
             match result {
                 Ok(()) => {
                     results.loaded.push(name);
@@ -728,7 +751,23 @@ pub async fn discover_tools(dir: &Path) -> Result<HashMap<String, DiscoveredTool
         );
     }
 
+    for legacy_name in shadowed_legacy_tool_names(tools.keys().map(String::as_str)) {
+        tools.remove(&legacy_name);
+    }
+
     Ok(tools)
+}
+
+fn shadowed_legacy_tool_names<'a>(names: impl Iterator<Item = &'a str>) -> HashSet<String> {
+    let names = names.collect::<HashSet<_>>();
+    names
+        .iter()
+        .filter(|name| {
+            LEGACY_RENAMED_TOOL_STEMS.contains(name)
+                && names.contains(format!("{name}-tool").as_str())
+        })
+        .map(|name| (*name).to_string())
+        .collect()
 }
 
 /// A discovered WASM tool (not yet loaded).
@@ -858,6 +897,22 @@ mod tests {
         let tools = discover_tools(dir.path()).await.unwrap();
         assert_eq!(tools.len(), 1);
         assert!(tools["gotify"].capabilities_path.is_some());
+    }
+
+    #[tokio::test]
+    async fn discover_tools_prefers_current_name_over_legacy_alias() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("gitlab.wasm"), b"legacy").unwrap();
+        std::fs::write(dir.path().join("gitlab-tool.wasm"), b"current").unwrap();
+        std::fs::write(dir.path().join("custom.wasm"), b"custom").unwrap();
+        std::fs::write(dir.path().join("custom-tool.wasm"), b"also-custom").unwrap();
+
+        let tools = discover_tools(dir.path()).await.unwrap();
+
+        assert!(!tools.contains_key("gitlab"));
+        assert!(tools.contains_key("gitlab-tool"));
+        assert!(tools.contains_key("custom"));
+        assert!(tools.contains_key("custom-tool"));
     }
 
     #[tokio::test]
