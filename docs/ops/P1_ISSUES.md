@@ -1,34 +1,19 @@
-#P1 FINDINGS
+# P1 Findings
 
-1. Coalescer can OOM and hang shutdown. Commits f57b4a0, c995575, f25c42a. Detached flush tasks have no timeout/backpressure and capture cloned IncomingMessages (
-ic/src/channels/coalesce.rs:225-231
-, 258-276, 305-313; 
-ic/src/agent/agent_loop.rs:1274-1292
-). XMPP messages may contain ten 20 MiB attachments. Stalled outbound queue permits unlimited tasks retaining roughly 200 MiB each; flush_all() then waits forever. Use bounded delivery queue/semaphore, timeout sends, and capture only routing metadata.
-2. Violation flood causes unbounded O(N²) synchronous persistence. Commits 1384b95, fec6865. Every violation holds global std::sync::Mutex, clones and pretty-serializes entire map, then synchronously writes/renames it (
-ic/src/gate/violation_store.rs:168-183
-, 250-263, 309-333). Sender records lack global bounds/pruning. Flood grows RAM/disk and blocks Tokio workers. Cap actors/records and use debounced async persistence outside lock.
-3. WASM response cap applies after full buffering. Newly exposed by GitLab commit 2870e35. response.bytes().await buffers entire chunked/compressed response before checking 8 MiB limit (
-ic/src/tools/wasm/wrapper.rs:622-645
-). Concurrent oversized responses can OOM daemon. Stream chunks and abort once cumulative size exceeds cap.
-4. Default lorebook path reloads full corpus every turn. Commits caa13d4, 7636d46. Each direct turn performs listing plus up to 16 sequential reads, reparses up to 2 MiB JSON, and rescans 1,024 entries (
-ic/src/agent/dispatcher.rs:102-120 , 
-ic/src/lorebook/mod.rs:33-113 ). Lorebooks default enabled (
-ic/src/config/agent.rs:101-109
-). Cache by path/version and fetch bounded content in one indexed query.
-5. Lorebook scan-depth cache can allocate 25.6 MiB per turn. Commit 88ed8a3. Cache keys use requested depth rather than effective min(depth, messages.len()) (
-ic/src/lorebook/engine.rs:269-294
-). One 128 KiB message plus entries using depths 1 through 100 creates 100 identical raw and lowercase windows. Canonicalize depth and cap aggregate cache bytes.
-6. Concise valid answers trigger up to three LLM calls. Commit 3bba05c. Any non-simple task answer below 80 characters fails looks_like_final_answer() and receives two retries (
-ic/crates/lunarwing_engine/orchestrator/default.py:207-222
-, 662-676). This triples latency, token cost, and provider load for common concise answers. Remove length heuristic; retry only explicit tool-intent or leaked-roleplay patterns.
-7. Unbounded DNS lookup blocks whole XMPP event loop. Commit 8b01a53. Attachment lookup_host().await runs before reqwest timeout and inline within stanza processing (
-ic/src/channels/xmpp/mod.rs:922-934
-, 1552, 3043-3059). Slow resolver can stop messages, presence, IQ handling, and outbound draining indefinitely. Add DNS/whole-extraction deadlines and move downloads to bounded workers.
-8. Gate expiry holds global gate mutex across DB I/O. Commit f25c42a. run_if_absent() keeps store-wide mutex while finalizing thread, revoking leases, persisting events, and scanning every conversation (
-ic/src/gate/store.rs:313-324
-, 
-ic/src/bridge/router.rs:927-969
-, 
-ic/crates/lunarwing_engine/src/runtime/conversation.rs:275-284
-). Expiration burst becomes O(gates × conversations) and blocks all gate operations. Use keyed reservation/CAS and direct conversation lookup.
+All findings below were fixed and verified for goal 6 on 2026-08-02.
+
+1. **Fixed: coalescer OOM and shutdown hangs.** Commits f57b4a0, c995575, and f25c42a introduced detached flush tasks without timeout/backpressure and cloned full `IncomingMessage` payloads. `ic/src/channels/coalesce.rs` now uses one bounded FIFO actor, a 64-command queue, 10-second delivery deadlines, and a 15-second aggregate shutdown deadline. `ic/src/agent/agent_loop.rs` captures routing context without content or attachments. Ordering, merge, alert-bypass, stale-timer, backpressure, and shutdown regressions are covered.
+
+2. **Fixed: violation-flood memory and synchronous O(N^2) persistence.** Commits 1384b95 and fec6865 persisted the entire violation map under a global mutex for every violation. `ic/src/gate/violation_store.rs` now caps actors, records, actor IDs, record fields, and persisted input; globally prunes stale actors; and uses one capacity-1 debounced writer with generation snapshots and capped retry backoff. Serialization and filesystem I/O occur outside the state lock, and drop performs one final flush attempt.
+
+3. **Fixed: WASM response cap after full buffering.** Commit 2870e35 used `response.bytes().await` before enforcing the 8 MiB cap. `ic/src/tools/wasm/wrapper.rs` now checks declared length early, streams decoded chunks, checks cumulative size before append, and aborts over-limit responses. Missing/underreported lengths and exact-boundary responses are covered; interceptor responses use the same cap.
+
+4. **Fixed: full lorebook corpus reload on every turn.** Commits caa13d4 and 7636d46 performed one listing plus up to 16 sequential reads and reparsed unchanged JSON. Lorebook loading now checks a bounded path/version listing, reuses a scope/agent LRU of validated parsed entries, invalidates on writes/deletes, and fetches all cache-miss content in one path-ordered query. PostgreSQL and libSQL apply the path limit before a SQL-side per-file byte cap, preventing oversized rows or metadata from entering the prompt loader.
+
+5. **Fixed: scan-depth cache amplification.** Commit 88ed8a3 keyed scan windows by requested depth. `ic/src/lorebook/engine.rs` now keys by `min(requested_depth, messages.len())`, caps aggregate raw/lowercase cache bytes and entry count, and evaluates non-cacheable windows without changing matching behavior. Regressions cover depths 1 through 100, aggregate bounds, and expanding Unicode lowercase output.
+
+6. **Fixed: concise valid answers retried.** Commit 3bba05c rejected non-simple answers below 80 characters. `ic/crates/lunarwing_engine/orchestrator/default.py` no longer uses answer length. Retries now require explicit tool intent or strong roleplay/retry-meta signals, with word-bounded matching to avoid false positives such as `Loops are useful`. The Engine V2 loop and embedded-Python classifier suites cover concise completion and retry behavior.
+
+7. **Fixed: XMPP DNS/extraction stalls.** Commit 8b01a53 awaited unbounded DNS and attachment extraction inline in stanza processing. `ic/src/channels/xmpp/mod.rs` now uses 5-second DNS and 60-second whole-extraction deadlines plus a bounded FIFO attachment worker. Queue saturation never awaits downloader capacity: messages are delivered without downloads while recognized sensitive URLs are stripped. Excess URL sets fail closed with bounded work; each extraction allows at most four concurrent downloads and ten attachments.
+
+8. **Fixed: gate expiry held global mutex across DB I/O.** Commit f25c42a serialized unrelated gates while thread finalization, lease revocation, event persistence, and conversation scans ran. `ic/src/gate/store.rs` now uses short-held index locking plus per-key reservations and generation checks across async finalization. Unrelated keys proceed concurrently, queued stale replacements are invalidated after successful finalization, and `ic/src/bridge/router.rs` untracks through the gate's direct conversation ID.

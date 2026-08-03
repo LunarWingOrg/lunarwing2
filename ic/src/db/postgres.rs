@@ -27,7 +27,7 @@ use crate::history::{
 };
 use crate::workspace::{
     DocumentVersion, MemoryChunk, MemoryDocument, Repository, SearchConfig, SearchResult,
-    VersionSummary, WorkspaceEntry,
+    VersionSummary, WorkspaceEntry, WorkspaceFileContent,
 };
 
 /// PostgreSQL database backend.
@@ -752,6 +752,20 @@ impl WorkspaceStore for PgBackend {
     ) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
         self.repo
             .list_files_limited(user_id, agent_id, directory, suffix, limit)
+            .await
+    }
+
+    async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError> {
+        self.repo
+            .get_files_limited(user_id, agent_id, directory, suffix, limit, max_file_bytes)
             .await
     }
 

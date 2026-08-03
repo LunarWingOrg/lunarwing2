@@ -38,7 +38,7 @@ use crate::history::{
     AgentJobRecord, AgentJobSummary, ConversationMessage, ConversationSummary, JobEventRecord,
     LlmCallRecord, SandboxJobRecord, SandboxJobSummary, SettingRow,
 };
-use crate::workspace::{MemoryChunk, MemoryDocument, WorkspaceEntry};
+use crate::workspace::{MemoryChunk, MemoryDocument, WorkspaceEntry, WorkspaceFileContent};
 use crate::workspace::{SearchConfig, SearchResult};
 
 /// Create a database backend from configuration, run migrations, and return it.
@@ -907,6 +907,16 @@ pub trait WorkspaceStore: Send + Sync {
         suffix: &str,
         limit: usize,
     ) -> Result<Vec<WorkspaceEntry>, WorkspaceError>;
+    /// Fetch bounded direct files and their content in deterministic path order.
+    async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError>;
     async fn list_all_paths(
         &self,
         user_id: &str,

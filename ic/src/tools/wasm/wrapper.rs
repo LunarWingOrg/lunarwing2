@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::{Stream, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use wasmtime::Store;
 use wasmtime::component::{Linker, ResourceTable};
@@ -383,6 +384,40 @@ impl WasiView for StoreData {
     }
 }
 
+fn enforce_response_size(size: u64, max_response_bytes: usize) -> Result<(), String> {
+    if size > max_response_bytes as u64 {
+        return Err(format!(
+            "Response body too large: {} bytes exceeds limit of {} bytes",
+            size, max_response_bytes
+        ));
+    }
+    Ok(())
+}
+
+async fn collect_capped_response_body<S, E>(
+    stream: S,
+    content_length: Option<u64>,
+    max_response_bytes: usize,
+) -> Result<Vec<u8>, String>
+where
+    S: Stream<Item = Result<bytes::Bytes, E>>,
+    E: std::fmt::Display,
+{
+    if let Some(content_length) = content_length {
+        enforce_response_size(content_length, max_response_bytes)?;
+    }
+
+    let mut body = Vec::new();
+    futures::pin_mut!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Failed to read response body: {e}"))?;
+        let new_size = (body.len() as u64).saturating_add(chunk.len() as u64);
+        enforce_response_size(new_size, max_response_bytes)?;
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 // Implement the generated Host trait from bindgen.
 //
 // This registers all 6 host functions under the `lunarwing:agent/host` namespace:
@@ -533,6 +568,8 @@ impl lunarwing::agent::host::Host for StoreData {
                 interceptor.before_request(&req).await
             });
             if let Some(resp) = intercepted {
+                let resp_body = resp.body.into_bytes();
+                enforce_response_size(resp_body.len() as u64, max_response_bytes)?;
                 let resp_headers: HashMap<String, String> = resp
                     .headers
                     .iter()
@@ -543,7 +580,7 @@ impl lunarwing::agent::host::Host for StoreData {
                 return Ok(lunarwing::agent::host::HttpResponse {
                     status: resp.status,
                     headers_json: resp_headers_json,
-                    body: resp.body.into_bytes(),
+                    body: resp_body,
                 });
             }
         }
@@ -619,30 +656,14 @@ impl lunarwing::agent::host::Host for StoreData {
                 .collect();
             let headers_json = serde_json::to_string(&response_headers).unwrap_or_default();
 
-            // Check Content-Length header for early rejection of oversized responses.
-            let max_response = max_response_bytes;
-            if let Some(cl) = response.content_length()
-                && cl as usize > max_response
-            {
-                return Err(format!(
-                    "Response body too large: {} bytes exceeds limit of {} bytes",
-                    cl, max_response
-                ));
-            }
-
-            // Read body with a size cap to prevent memory exhaustion.
-            let body = response
-                .bytes()
-                .await
-                .map_err(|e| format!("Failed to read response body: {}", e))?;
-            if body.len() > max_response {
-                return Err(format!(
-                    "Response body too large: {} bytes exceeds limit of {} bytes",
-                    body.len(),
-                    max_response
-                ));
-            }
-            let body = body.to_vec();
+            // Stream body so absent or inaccurate Content-Length cannot bypass the cap.
+            let content_length = response.content_length();
+            let body = collect_capped_response_body(
+                response.bytes_stream(),
+                content_length,
+                max_response_bytes,
+            )
+            .await?;
 
             // Leak detection on response body
             if let Ok(body_str) = std::str::from_utf8(&body) {
@@ -2141,6 +2162,50 @@ mod tests {
     use crate::tools::tool::Tool;
     use crate::tools::wasm::capabilities::{Capabilities, WasmApprovalPolicy};
     use crate::tools::wasm::runtime::{WasmRuntimeConfig, WasmToolRuntime};
+
+    fn response_chunks(
+        sizes: &[usize],
+    ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + use<> {
+        futures::stream::iter(
+            sizes
+                .iter()
+                .map(|size| Ok(bytes::Bytes::from(vec![b'x'; *size])))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[tokio::test]
+    async fn response_without_content_length_cannot_exceed_cap() {
+        let error = super::collect_capped_response_body(response_chunks(&[4, 5]), None, 8)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Response body too large: 9 bytes exceeds limit of 8 bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_with_underreported_content_length_cannot_exceed_cap() {
+        let error = super::collect_capped_response_body(response_chunks(&[4, 5]), Some(1), 8)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Response body too large: 9 bytes exceeds limit of 8 bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_at_cap_boundary_succeeds() {
+        let body = super::collect_capped_response_body(response_chunks(&[3, 5]), None, 8)
+            .await
+            .unwrap();
+
+        assert_eq!(body, b"xxxxxxxx");
+    }
 
     #[test]
     fn declarative_approval_policy_and_ssh_override_are_enforced() {

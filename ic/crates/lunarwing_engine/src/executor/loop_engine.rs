@@ -1222,11 +1222,32 @@ mod tests {
             ThreadOutcome::Completed { response: Some(response) } if response == "recovered"
         ));
         assert_eq!(exec.thread.step_count, 2);
-        assert!(exec.thread.internal_messages.iter().any(|message| {
-            message
-                .content
-                .contains("plain text and did not complete this task")
-        }));
+        assert!(
+            exec.thread
+                .internal_messages
+                .iter()
+                .any(|message| { message.content.contains("roleplay or retry commentary") })
+        );
+    }
+
+    #[tokio::test]
+    async fn leaked_roleplay_only_is_nudged_back_to_codeact() {
+        let (mut exec, _tx) = make_loop(
+            vec![
+                text_response("*chortles and flicks tail*"),
+                code_response("FINAL('recovered')"),
+            ],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "recovered"
+        ));
+        assert_eq!(exec.thread.step_count, 2);
     }
 
     #[tokio::test]
@@ -1268,8 +1289,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn substantive_plain_text_answer_is_accepted() {
-        let answer = "Investigation complete: the orchestrator now retries malformed prose responses and stops after two bounded correction attempts.";
+    async fn concise_plain_text_answer_is_accepted() {
+        let answer = "The answer is 42";
         let (mut exec, _tx) =
             make_loop(vec![text_response(answer)], vec![], ThreadConfig::default()).await;
 
@@ -1312,7 +1333,7 @@ mod tests {
                 text_response("*chortles* Oops."),
                 code_response("value = 42"),
                 text_response("*tail flicks* Let me try again."),
-                text_response("Still not code."),
+                text_response("Oops, I need to retry."),
                 code_response("FINAL('recovered after reset')"),
             ],
             vec![],

@@ -140,7 +140,12 @@ storage mutation.
 
 Lorebooks are prompt-visible configuration. Raw JSON and decoded fields receive
 canonicalized prompt-injection checks on default writes, named-layer writes,
-and legacy loads. Only primary-scope lorebooks load. Group-chat activation
+and legacy loads. Only primary-scope lorebooks load. Cache validation uses a
+bounded revision query; cache misses fetch size-capped content in one
+path-ordered query. Parsed entries are cached by primary scope, agent, and
+document revision; writes and deletes invalidate immediately.
+Empty listings receive a short negative cache, while revision checks detect
+legacy/direct-database changes. Group-chat activation
 defaults off. Database listing, file, entry, key, scan, token, operation, and
 rendered-output limits bound per-turn work; see the proposal for exact values
 and unsupported SillyTavern behavior.

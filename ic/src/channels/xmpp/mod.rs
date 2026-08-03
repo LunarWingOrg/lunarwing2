@@ -7,6 +7,7 @@ mod config;
 pub mod omemo;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -55,6 +56,8 @@ const OMEMO_SEND_TIMEOUT_SECS: u64 = 10;
 const MUC_ADMIN_NS: &str = "http://jabber.org/protocol/muc#admin";
 const OUTBOUND_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60 * 60);
 const OOB_DOWNLOAD_TIMEOUT_SECS: u64 = 30;
+const OOB_DNS_TIMEOUT_SECS: u64 = 5;
+const OOB_EXTRACTION_TIMEOUT_SECS: u64 = 60;
 const OOB_MAX_FILE_SIZE: u64 = 20 * 1024 * 1024;
 /// Max OOB attachments processed from a single stanza (matches the WASM host's
 /// per-message attachment cap). Bounds the download work a peer can trigger.
@@ -62,6 +65,9 @@ const MAX_OOB_ATTACHMENTS: usize = 10;
 /// Max OOB file downloads run concurrently, so one slow URL can't serialize the
 /// whole batch (and block the bridge's client event loop) for N * timeout.
 const MAX_CONCURRENT_OOB_DOWNLOADS: usize = 4;
+/// Pending inbound messages awaiting attachment extraction. One FIFO worker
+/// preserves message order while bounding memory and task creation.
+const INBOUND_ATTACHMENT_QUEUE_CAPACITY: usize = 16;
 
 #[derive(Debug, Clone, Default)]
 struct EncryptedRoomState {
@@ -113,6 +119,17 @@ struct OutboundMessage {
     preferred_device_id: Option<u32>,
     /// Files to upload (XEP-0363) and deliver as OOB URLs after the text body.
     attachments: Vec<OutboundAttachment>,
+}
+
+#[derive(Debug)]
+struct InboundAttachmentJob {
+    payloads: Vec<Element>,
+    incoming: IncomingMessage,
+    target_jid: String,
+}
+
+tokio::task_local! {
+    static INBOUND_ATTACHMENT_TX: mpsc::Sender<InboundAttachmentJob>;
 }
 
 #[derive(Debug)]
@@ -860,8 +877,15 @@ impl Channel for XmppChannel {
         let outbound_tx = self.outbound_tx.clone();
         let http_upload_service = Arc::clone(&self.http_upload_service);
         let pairing_store = PairingStore::new();
+        let (inbound_attachment_tx, inbound_attachment_rx) =
+            mpsc::channel(INBOUND_ATTACHMENT_QUEUE_CAPACITY);
+        let inbound_worker = tokio::spawn(run_inbound_attachment_worker(
+            inbound_attachment_rx,
+            tx.clone(),
+            Arc::clone(&reply_targets),
+        ));
 
-        tokio::spawn(async move {
+        tokio::spawn(INBOUND_ATTACHMENT_TX.scope(inbound_attachment_tx.clone(), async move {
             loop {
                 tokio::select! {
                     event = client.next() => {
@@ -1088,7 +1112,15 @@ impl Channel for XmppChannel {
                     }
                 }
             }
-        });
+
+            drop(inbound_attachment_tx);
+            inbound_worker.abort();
+            if let Err(error) = inbound_worker.await
+                && !error.is_cancelled()
+            {
+                tracing::warn!(%error, "XMPP inbound attachment worker failed");
+            }
+        }));
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
@@ -1549,26 +1581,24 @@ async fn handle_message_stanza(
             .or_insert_with(HashSet::new);
     }
 
-    let extraction = extract_inbound_attachments(&msg.payloads, &content).await;
-    // Strip every recognized attachment URL (successful download or not) so
-    // key-bearing `aesgcm://` URLs never survive into content.
-    let content = strip_attachment_urls(content, &extraction.recognized_urls);
-    let attachments = extraction.attachments;
-
     let mut incoming = IncomingMessage::new("xmpp", target_jid.clone(), content)
         .with_owner_id(&config.jid)
         .with_thread(&thread_id)
         .with_sender_id(sender_id)
-        .with_metadata(metadata)
-        .with_attachments(attachments);
+        .with_metadata(metadata);
     if is_groupchat && let Some(nick) = jid_resource(&from_jid) {
         incoming = incoming.with_user_name(nick);
     }
 
-    reply_targets.write().await.put(incoming.id, target_jid);
-
-    if tx.send(incoming).await.is_err() {
-        tracing::warn!("XMPP message stream receiver dropped");
+    let job = InboundAttachmentJob {
+        payloads: msg.payloads,
+        incoming,
+        target_jid,
+    };
+    if let Ok(inbound_attachment_tx) = INBOUND_ATTACHMENT_TX.try_with(Clone::clone) {
+        queue_or_deliver_inbound_job(&inbound_attachment_tx, job, tx, reply_targets).await;
+    } else {
+        deliver_inbound_attachment_job(job, tx, reply_targets).await;
     }
 
     Ok(())
@@ -2886,6 +2916,151 @@ struct InboundAttachmentExtraction {
     /// of successful downloads — before the text reaches the model or
     /// persisted history.
     recognized_urls: Vec<String>,
+    /// Too many URLs to strip with bounded work. Callers must clear content.
+    clear_body: bool,
+}
+
+struct InboundAttachmentUrls {
+    downloads: Vec<(String, Option<String>)>,
+    recognized: Vec<String>,
+    clear_body: bool,
+}
+
+async fn await_with_deadline<T>(
+    duration: Duration,
+    future: impl Future<Output = T>,
+    operation: &str,
+) -> Result<T, String> {
+    tokio::time::timeout(duration, future)
+        .await
+        .map_err(|_| format!("{operation} timed out after {}s", duration.as_secs()))
+}
+
+async fn run_inbound_attachment_worker(
+    mut jobs: mpsc::Receiver<InboundAttachmentJob>,
+    tx: mpsc::Sender<IncomingMessage>,
+    reply_targets: Arc<RwLock<LruCache<Uuid, String>>>,
+) {
+    while let Some(job) = jobs.recv().await {
+        deliver_inbound_attachment_job(job, &tx, &reply_targets).await;
+    }
+}
+
+async fn queue_or_deliver_inbound_job(
+    jobs: &mpsc::Sender<InboundAttachmentJob>,
+    job: InboundAttachmentJob,
+    tx: &mpsc::Sender<IncomingMessage>,
+    reply_targets: &Arc<RwLock<LruCache<Uuid, String>>>,
+) {
+    match jobs.try_send(job) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(job)) => {
+            tracing::warn!(
+                capacity = INBOUND_ATTACHMENT_QUEUE_CAPACITY,
+                "XMPP inbound attachment queue full; delivering without downloads"
+            );
+            deliver_inbound_job_without_downloads(job, tx, reply_targets).await;
+        }
+        Err(mpsc::error::TrySendError::Closed(job)) => {
+            tracing::warn!("XMPP inbound attachment worker stopped; delivering without downloads");
+            deliver_inbound_job_without_downloads(job, tx, reply_targets).await;
+        }
+    }
+}
+
+async fn deliver_inbound_attachment_job(
+    mut job: InboundAttachmentJob,
+    tx: &mpsc::Sender<IncomingMessage>,
+    reply_targets: &Arc<RwLock<LruCache<Uuid, String>>>,
+) {
+    let extraction = extract_inbound_attachments(&job.payloads, &job.incoming.content).await;
+    // Strip every recognized attachment URL (successful download or not) so
+    // key-bearing `aesgcm://` URLs never survive into content.
+    if extraction.clear_body {
+        job.incoming.content.clear();
+    } else {
+        job.incoming.content =
+            strip_attachment_urls(job.incoming.content, &extraction.recognized_urls);
+    }
+    job.incoming.attachments = extraction.attachments;
+
+    reply_targets
+        .write()
+        .await
+        .put(job.incoming.id, job.target_jid);
+    if tx.send(job.incoming).await.is_err() {
+        tracing::warn!("XMPP message stream receiver dropped");
+    }
+}
+
+async fn deliver_inbound_job_without_downloads(
+    mut job: InboundAttachmentJob,
+    tx: &mpsc::Sender<IncomingMessage>,
+    reply_targets: &Arc<RwLock<LruCache<Uuid, String>>>,
+) {
+    let urls = collect_inbound_attachment_urls(&job.payloads, &job.incoming.content);
+    if urls.clear_body {
+        job.incoming.content.clear();
+    } else {
+        job.incoming.content = strip_attachment_urls(job.incoming.content, &urls.recognized);
+    }
+    job.incoming.attachments.clear();
+
+    reply_targets
+        .write()
+        .await
+        .put(job.incoming.id, job.target_jid);
+    if tx.send(job.incoming).await.is_err() {
+        tracing::warn!("XMPP message stream receiver dropped");
+    }
+}
+
+fn collect_inbound_attachment_urls(payloads: &[Element], body: &str) -> InboundAttachmentUrls {
+    let mut downloads = collect_oob_urls(payloads, MAX_OOB_ATTACHMENTS + 1);
+    if downloads.len() > MAX_OOB_ATTACHMENTS {
+        tracing::warn!(
+            max = MAX_OOB_ATTACHMENTS,
+            "Too many attachment URLs in stanza; clearing body and skipping downloads"
+        );
+        return InboundAttachmentUrls {
+            downloads: Vec::new(),
+            recognized: Vec::new(),
+            clear_body: true,
+        };
+    }
+
+    let mut recognized_urls: Vec<String> = downloads.iter().map(|(url, _)| url.clone()).collect();
+    let mut known: HashSet<String> = recognized_urls.iter().cloned().collect();
+
+    for token in body
+        .split_whitespace()
+        .filter(|token| token.starts_with("aesgcm://"))
+    {
+        if known.contains(token) {
+            continue;
+        }
+        if recognized_urls.len() == MAX_OOB_ATTACHMENTS {
+            tracing::warn!(
+                max = MAX_OOB_ATTACHMENTS,
+                "Too many attachment URLs in stanza; clearing body and skipping downloads"
+            );
+            return InboundAttachmentUrls {
+                downloads: Vec::new(),
+                recognized: Vec::new(),
+                clear_body: true,
+            };
+        }
+        let url = token.to_string();
+        known.insert(url.clone());
+        downloads.push((url.clone(), None));
+        recognized_urls.push(url);
+    }
+
+    InboundAttachmentUrls {
+        downloads,
+        recognized: recognized_urls,
+        clear_body: false,
+    }
 }
 
 /// Extract downloadable attachments referenced by an incoming message: OOB URLs
@@ -2897,43 +3072,22 @@ async fn extract_inbound_attachments(
     payloads: &[Element],
     body: &str,
 ) -> InboundAttachmentExtraction {
-    let mut urls = collect_oob_urls(payloads, MAX_OOB_ATTACHMENTS);
-    let oob_total = payloads.iter().filter(|p| p.is("x", ns::OOB)).count();
-    if oob_total > MAX_OOB_ATTACHMENTS {
-        tracing::warn!(
-            count = oob_total,
-            max = MAX_OOB_ATTACHMENTS,
-            "Too many OOB URLs in stanza; downloading only the first {MAX_OOB_ATTACHMENTS}"
-        );
-    }
+    let urls = collect_inbound_attachment_urls(payloads, body);
 
-    // Add encrypted-media URLs found only in the (decrypted) body, deduped
-    // against the OOB elements and bounded by the same per-stanza cap.
-    let known: HashSet<String> = urls.iter().map(|(u, _)| u.clone()).collect();
-    for url in collect_aesgcm_urls(body, MAX_OOB_ATTACHMENTS) {
-        if urls.len() >= MAX_OOB_ATTACHMENTS {
-            break;
-        }
-        if !known.contains(&url) {
-            urls.push((url, None));
-        }
-    }
-
-    if urls.is_empty() {
+    if urls.downloads.is_empty() {
         return InboundAttachmentExtraction {
             attachments: Vec::new(),
-            recognized_urls: Vec::new(),
+            recognized_urls: urls.recognized,
+            clear_body: urls.clear_body,
         };
     }
-
-    let recognized_urls: Vec<String> = urls.iter().map(|(u, _)| u.clone()).collect();
 
     // Download up to MAX_CONCURRENT_OOB_DOWNLOADS files at once so a single slow
     // URL can't serialize the whole batch (and stall the client event loop) for
     // N * timeout. `buffered` keeps the results in stanza order. Each download
     // builds its own egress-policy-checked client (see
     // `policy_checked_download_client`).
-    let attachments = futures::stream::iter(urls)
+    let downloads = futures::stream::iter(urls.downloads)
         .map(|(url, _desc)| {
             async move {
                 match download_oob_file(&url).await {
@@ -2953,12 +3107,25 @@ async fn extract_inbound_attachments(
         })
         .buffered(MAX_CONCURRENT_OOB_DOWNLOADS)
         .filter_map(|opt| async move { opt })
-        .collect()
-        .await;
+        .collect::<Vec<_>>();
+    let attachments = match await_with_deadline(
+        Duration::from_secs(OOB_EXTRACTION_TIMEOUT_SECS),
+        downloads,
+        "inbound attachment extraction",
+    )
+    .await
+    {
+        Ok(attachments) => attachments,
+        Err(error) => {
+            tracing::warn!(%error, "XMPP inbound attachment extraction aborted");
+            Vec::new()
+        }
+    };
 
     InboundAttachmentExtraction {
         attachments,
-        recognized_urls,
+        recognized_urls: urls.recognized,
+        clear_body: urls.clear_body,
     }
 }
 
@@ -3040,8 +3207,13 @@ async fn policy_checked_download_client(
         .port_or_known_default()
         .ok_or_else(|| "attachment URL has no usable port".to_string())?;
 
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-        .await
+    let resolved = await_with_deadline(
+        Duration::from_secs(OOB_DNS_TIMEOUT_SECS),
+        tokio::net::lookup_host((host.as_str(), port)),
+        "attachment DNS resolution",
+    )
+    .await?;
+    let addrs: Vec<std::net::SocketAddr> = resolved
         .map_err(|e| format!("failed to resolve attachment host: {e}"))?
         .collect();
     if addrs.is_empty() {
@@ -3110,6 +3282,7 @@ fn collect_oob_urls(payloads: &[Element], max: usize) -> Vec<(String, Option<Str
 ///
 /// Only the explicit encrypted-media scheme is collected — plain `https://`
 /// links in a body are intentionally not auto-downloaded.
+#[cfg(test)]
 fn collect_aesgcm_urls(text: &str, max: usize) -> Vec<String> {
     text.split_whitespace()
         .filter(|tok| tok.starts_with("aesgcm://"))
@@ -3795,6 +3968,101 @@ mod tests {
         assert!(!redacted.contains('?'));
 
         assert_eq!(redact_url_for_log("not a url"), "<invalid-url>");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_deadline_times_out_paused_resolver() {
+        let error = await_with_deadline(
+            Duration::from_secs(OOB_DNS_TIMEOUT_SECS),
+            std::future::pending::<()>(),
+            "attachment DNS resolution",
+        )
+        .await
+        .expect_err("paused resolver must time out");
+
+        assert_eq!(error, "attachment DNS resolution timed out after 5s");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn extraction_deadline_times_out_paused_work() {
+        let error = await_with_deadline(
+            Duration::from_secs(OOB_EXTRACTION_TIMEOUT_SECS),
+            std::future::pending::<()>(),
+            "inbound attachment extraction",
+        )
+        .await
+        .expect_err("paused extraction must time out");
+
+        assert_eq!(error, "inbound attachment extraction timed out after 60s");
+    }
+
+    #[tokio::test]
+    async fn saturated_attachment_queue_strips_url_and_delivers_without_download() {
+        let (jobs_tx, mut jobs_rx) = mpsc::channel(1);
+        jobs_tx
+            .try_send(InboundAttachmentJob {
+                payloads: Vec::new(),
+                incoming: IncomingMessage::new("xmpp", "first@example.com", "first"),
+                target_jid: "first@example.com".to_string(),
+            })
+            .expect("fill attachment queue");
+
+        let fragment = hex::encode([7u8; 44]);
+        let url = format!("aesgcm://files.invalid/file.bin#{fragment}");
+        let job = InboundAttachmentJob {
+            payloads: Vec::new(),
+            incoming: IncomingMessage::new(
+                "xmpp",
+                "second@example.com",
+                format!("before {url} after"),
+            ),
+            target_jid: "second@example.com".to_string(),
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        let reply_targets = Arc::new(RwLock::new(LruCache::new(
+            NonZeroUsize::new(2).expect("non-zero cache size"),
+        )));
+
+        queue_or_deliver_inbound_job(&jobs_tx, job, &tx, &reply_targets).await;
+
+        let incoming = rx.recv().await.expect("overload fallback delivered");
+        assert_eq!(incoming.content, "before  after");
+        assert!(incoming.attachments.is_empty());
+        assert!(!incoming.content.contains(&fragment));
+        assert_eq!(
+            jobs_rx
+                .recv()
+                .await
+                .expect("queued job remains first")
+                .target_jid,
+            "first@example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn excess_attachment_urls_fail_closed_without_downloads() {
+        let body = (0..=MAX_OOB_ATTACHMENTS)
+            .map(|index| {
+                let fragment = hex::encode([index as u8; 44]);
+                format!("aesgcm://files.invalid/{index}.bin#{fragment}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let job = InboundAttachmentJob {
+            payloads: Vec::new(),
+            incoming: IncomingMessage::new("xmpp", "sender@example.com", body),
+            target_jid: "sender@example.com".to_string(),
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        let reply_targets = Arc::new(RwLock::new(LruCache::new(
+            NonZeroUsize::new(1).expect("non-zero cache size"),
+        )));
+
+        deliver_inbound_job_without_downloads(job, &tx, &reply_targets).await;
+
+        let incoming = rx.recv().await.expect("fail-closed message delivered");
+        assert!(incoming.content.is_empty());
+        assert!(incoming.attachments.is_empty());
     }
 
     /// Regression for the credential-leak finding: when an `aesgcm://`
