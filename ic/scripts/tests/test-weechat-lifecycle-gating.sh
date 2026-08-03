@@ -283,6 +283,19 @@ ACTION_LOG="$FIXTURE/actions.log"
 ACTION_FAIL=""
 REGISTRY_STATE=true
 ensure_init_system() { :; }
+# This harness exercises WeeChat transaction ordering and same-tenant
+# serialization without requiring a root-owned production lock directory.
+with_tenant_lifecycle_lock() {
+  local name="$1" lock_fd result=0
+  shift
+  mkdir -p "$TENANT_LIFECYCLE_LOCK_DIR"
+  exec {lock_fd}>"$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock"
+  flock -x "$lock_fd"
+  "$@" || result=$?
+  flock -u "$lock_fd"
+  eval "exec ${lock_fd}>&-"
+  return "$result"
+}
 weechat_lifecycle_stop_disable() {
   printf 'stop-disable\n' >>"$ACTION_LOG"
   [[ "$ACTION_FAIL" != "stop-disable" ]]
