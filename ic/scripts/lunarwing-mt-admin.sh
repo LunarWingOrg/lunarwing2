@@ -2363,65 +2363,283 @@ build_tenant() {
 
 # ── Darkirc daemon build (shared, not per-tenant) ────────────────────────────
 
-build_darkirc() {
-  local tenant_name="${1:-}" darkirc_src="" build_user=""
+darkirc_validate_root_owned_directory() {
+  local path="$1" rest component current="" owner mode
+  [[ "$path" == /* && -d "$path" ]] || return 1
+  rest="${path#/}"
+  while [[ -n "$rest" ]]; do
+    component="${rest%%/*}"
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+    current="$current/$component"
+    [[ -d "$current" && ! -L "$current" ]] || return 1
+    owner="$(stat -c '%u' "$current" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$current" 2>/dev/null || true)"
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+    if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+  done
+}
 
-  if [[ -n "$tenant_name" ]]; then
-    build_user="$tenant_name"
-    local envf
-    envf="$(tenant_env_dir "$tenant_name")/lunarwing.env"
-    if [[ -f "$envf" ]]; then
-      darkirc_src="$(_read_env_value "$envf" DARKIRC_SOURCE)"
-    fi
-    [[ -n "$darkirc_src" ]] || darkirc_src="$DARKIRC_SOURCE"
-    [[ -n "$darkirc_src" ]] || darkirc_src="$(tenant_home "$tenant_name")/darkfi"
-  else
-    # Fleet-wide build: run as the invoking (sudo) user, never root. Root has no
-    # per-user rust toolchain under rustup, and root-owned source/artifacts break
-    # the tenant-run daemon.
-    build_user="${SUDO_USER:-$(id -un)}"
-    [[ -n "$darkirc_src" ]] || darkirc_src="$DARKIRC_SOURCE"
-    [[ -n "$darkirc_src" ]] || die "darkirc source path not configured — set DARKIRC_SOURCE/LUNARWING_MT_DARKIRC_SOURCE or pass --tenant <name>"
+darkirc_validate_clean_root_checkout() {
+  local path="$1" expected_revision="${2:-}" revision dirty git_dir common_dir unsafe
+  darkirc_validate_root_owned_directory "$path" || return 1
+  revision="$(git -C "$path" rev-parse HEAD 2>/dev/null)" || return 1
+  [[ -z "$expected_revision" || "$revision" == "$expected_revision" ]] || return 1
+  dirty="$(git -C "$path" status --porcelain --untracked-files=all 2>/dev/null)" || return 1
+  [[ -z "$dirty" ]] || return 1
+  git_dir="$(git -C "$path" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  common_dir="$(git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  for git_path in "$git_dir" "$common_dir"; do
+    darkirc_validate_root_owned_directory "$git_path" || return 1
+    unsafe="$(find "$git_path" -xdev \( -type l -o ! -user root -o -perm /022 \) -print -quit 2>/dev/null)" \
+      || return 1
+    [[ -z "$unsafe" ]] || return 1
+  done
+  ! git -C "$path" ls-tree -r "$revision" | grep -Eq '^(120000|160000) '
+}
+
+ensure_darkirc_build_user() {
+  require_cmd useradd
+  require_cmd passwd
+  require_cmd setpriv
+  if ! id "$DARKIRC_BUILD_USER" >/dev/null 2>&1; then
+    useradd --system --no-create-home --home-dir "$DARKIRC_BUILD_HOME" \
+      --shell "$(command -v nologin || printf '/sbin/nologin')" \
+      --comment "LunarWing unprivileged build worker" "$DARKIRC_BUILD_USER"
   fi
+  local build_uid build_gid build_groups account_home account_shell account_state
+  build_uid="$(id -u "$DARKIRC_BUILD_USER")"
+  build_gid="$(id -g "$DARKIRC_BUILD_USER")"
+  build_groups="$(id -G "$DARKIRC_BUILD_USER")"
+  account_home="$(getent passwd "$DARKIRC_BUILD_USER" | cut -d: -f6)"
+  account_shell="$(getent passwd "$DARKIRC_BUILD_USER" | cut -d: -f7)"
+  account_state="$(passwd -S "$DARKIRC_BUILD_USER" 2>/dev/null | awk '{print $2}')"
+  [[ "$build_uid" -ne 0 && "$build_groups" == "$build_gid" \
+    && "$account_home" == "$DARKIRC_BUILD_HOME" \
+    && "$account_shell" == */nologin \
+    && ( "$account_state" == L || "$account_state" == LK ) ]] \
+    || die "DarkIRC build account must be locked, dedicated, and have no supplementary groups"
+  DARKIRC_BUILD_GROUP="$(id -gn "$DARKIRC_BUILD_USER")"
+  [[ ! -L "$DARKIRC_BUILD_HOME" && ( ! -e "$DARKIRC_BUILD_HOME" || -d "$DARKIRC_BUILD_HOME" ) ]] \
+    || die "unsafe DarkIRC build home"
+  install -d -o root -g root -m 0711 "$DARKIRC_BUILD_HOME"
+  [[ "$(stat -c '%u:%a' "$DARKIRC_BUILD_HOME" 2>/dev/null)" == "0:711" ]] \
+    || die "DarkIRC build home must be root-owned mode 0711"
+}
 
-  [[ "$build_user" != "root" ]] || die "refusing to build darkirc as root — pass --tenant <name>, or invoke via sudo from a user that has a rust toolchain"
+darkirc_validate_build_artifact() {
+  local artifact="$1" owner links
+  [[ -f "$artifact" && ! -L "$artifact" && -x "$artifact" ]] || return 1
+  owner="$(stat -c '%U' "$artifact" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$artifact" 2>/dev/null || true)"
+  [[ "$owner" == "$DARKIRC_BUILD_USER" && "$links" == 1 ]]
+}
+
+darkirc_path_components_safe() {
+  local path="$1" rest component current=""
+  [[ "$path" == /* ]] || return 1
+  rest="${path#/}"
+  while [[ -n "$rest" ]]; do
+    component="${rest%%/*}"
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+    current="$current/$component"
+    [[ ! -L "$current" ]] || return 1
+    if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+  done
+}
+
+darkirc_validate_root_executable() {
+  local path="$1" mode owner links
+  darkirc_path_components_safe "$path" || return 1
+  darkirc_validate_root_owned_directory "$(dirname "$path")" || return 1
+  [[ -f "$path" && ! -L "$path" && -x "$path" ]] || return 1
+  mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+  owner="$(stat -c '%u' "$path" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$path" 2>/dev/null || true)"
+  [[ "$owner" == 0 && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$mode & 07022) == 0 ))
+}
+
+install_darkirc_key_helper() {
+  local archive_root cargo_home artifact
+  require_cmd cargo
+  require_cmd taskset
+  require_cmd tar
+  darkirc_validate_clean_root_checkout "$LUNARWING_ROOT" \
+    || die "trusted LunarWing admin checkout must be root-owned, non-writable, and clean"
+  ensure_darkirc_build_user
+  [[ "$DARKIRC_KEY_HELPER_BUILD_ROOT" == /var/cache/lunarwing/* \
+    && "$DARKIRC_KEY_HELPER_BUILD_ROOT" != *'/../'* \
+    && ! -L "$DARKIRC_KEY_HELPER_BUILD_ROOT" ]] \
+    || die "DarkIRC helper build root must be a safe /var/cache/lunarwing path"
+  rm -rf -- "$DARKIRC_KEY_HELPER_BUILD_ROOT"
+  install -d -o "$DARKIRC_BUILD_USER" -g "$DARKIRC_BUILD_GROUP" -m 0700 \
+    "$DARKIRC_KEY_HELPER_BUILD_ROOT"
+  archive_root="$DARKIRC_KEY_HELPER_BUILD_ROOT/source"
+  install -d -o root -g root -m 0700 "$archive_root"
+  git -C "$LUNARWING_ROOT" archive --format=tar HEAD | tar -x -C "$archive_root"
+  chown -R "$DARKIRC_BUILD_USER:$DARKIRC_BUILD_GROUP" "$archive_root"
+  cargo_home="$(mktemp -d "$DARKIRC_BUILD_HOME/cargo.XXXXXX")"
+  install -d -o root -g root -m 0700 "$cargo_home/.cargo"
+  chown -R "$DARKIRC_BUILD_USER:$DARKIRC_BUILD_GROUP" "$cargo_home"
+  say "building trusted DarkIRC key helper as $DARKIRC_BUILD_USER ..."
+  setpriv --reuid="$(id -u "$DARKIRC_BUILD_USER")" \
+    --regid="$(id -g "$DARKIRC_BUILD_USER")" --clear-groups --no-new-privs -- \
+    env -i HOME="$cargo_home" PATH="/usr/bin:/bin" CARGO_HOME="$cargo_home/.cargo" \
+    CARGO_TARGET_DIR="$DARKIRC_KEY_HELPER_BUILD_ROOT" \
+    taskset -c 0-1 cargo build --manifest-path "$archive_root/ic/Cargo.toml" \
+      --release -j2 --bin lunarwing-darkirc-key-helper \
+    || die "DarkIRC key helper build failed"
+  darkirc_validate_clean_root_checkout "$LUNARWING_ROOT" \
+    || die "DarkIRC helper build changed trusted LunarWing checkout"
+  rm -rf -- "$cargo_home"
+  artifact="$DARKIRC_KEY_HELPER_BUILD_ROOT/release/lunarwing-darkirc-key-helper"
+  darkirc_validate_build_artifact "$artifact" \
+    || die "DarkIRC key helper artifact failed ownership validation"
+  install -d -o root -g root -m 0755 "$(dirname "$DARKIRC_KEY_HELPER")"
+  install -o root -g root -m 0755 "$artifact" "$DARKIRC_KEY_HELPER"
+  darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
+    || die "installed DarkIRC key helper failed ownership validation"
+}
+
+write_darkirc_compatibility() {
+  local source_revision="$1" test_user="$2" digest tmp
+  require_cmd jq
+  require_cmd sha256sum
+  [[ "$DARKIRC_BIN" == "/usr/local/bin/darkirc" ]] \
+    || die "managed DarkIRC config requires binary path /usr/local/bin/darkirc"
+  [[ "$source_revision" == "$DARKIRC_APPROVED_REV" ]] \
+    || die "DarkIRC source revision is not approved for managed config"
+  digest="$(sha256sum "$DARKIRC_BIN")"
+  digest="sha256:${digest%% *}"
+  darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
+    || die "DarkIRC key helper is missing or unsafe"
+  id "$test_user" >/dev/null 2>&1 || die "DarkIRC self-test user '$test_user' does not exist"
+  sudo -u "$test_user" env -i HOME="$(getent passwd "$test_user" | cut -d: -f6)" PATH="/usr/bin:/bin" \
+    "$DARKIRC_KEY_HELPER" self-test-generator \
+    --generator-profile darkfi-a05956d41-chacha-v1 \
+    --binary-sha256 "$digest" --binary-path "$DARKIRC_BIN" \
+    --key-format darkfi-chacha-base58-32 --source-revision "$source_revision" >/dev/null \
+    || die "installed DarkIRC generator failed compatibility self-test"
+  install -d -o root -g root -m 0755 "$(dirname "$DARKIRC_COMPAT_FILE")"
+  tmp="$(mktemp "$DARKIRC_COMPAT_FILE.tmp.XXXXXX")"
+  jq -n --arg digest "$digest" --arg revision "$source_revision" \
+    '{schema:"lunarwing.darkirc-compat/v1",profile_id:"darkfi-a05956d41-chacha-v1",binary_sha256:$digest,key_format:"darkfi-chacha-base58-32",source_revision:$revision}' \
+    >"$tmp" || { rm -f "$tmp"; die "failed to create DarkIRC compatibility attestation"; }
+  chmod 0600 "$tmp"
+  chown root:root "$tmp"
+  mv "$tmp" "$DARKIRC_COMPAT_FILE"
+  darkirc_load_compatibility
+}
+
+build_darkirc() {
+  local tenant_name="${1:-}" darkirc_src test_user build_tree built_bin source_revision cargo_home
+  local previous_binary="" previous_compatibility="" previous_helper=""
+  local publish_pending=false helper_publish_pending=false binary_candidate=""
+  darkirc_src="${DARKIRC_SOURCE:-/var/cache/lunarwing/darkfi-source}"
+  test_user="${tenant_name:-${SUDO_USER:-nobody}}"
+  [[ "$test_user" != root ]] || test_user=nobody
 
   say "acquiring build lock for darkirc ..."
   (
     flock -x 200
-
-    # Clone darkfi as the build user if absent, so the source tree and build
-    # artifacts are owned by that user (no root-owned files) — "clone as the user".
+    [[ "$DARKIRC_REV" == "$DARKIRC_APPROVED_REV" ]] \
+      || die "DarkIRC revision is not approved: $DARKIRC_REV"
     if [[ ! -d "$darkirc_src/.git" ]]; then
-      say "darkirc source not present at $darkirc_src — cloning $DARKIRC_REPO ($DARKIRC_REV) as $build_user ..."
-      sudo -u "$build_user" git clone "$DARKIRC_REPO" "$darkirc_src" || die "darkirc clone failed"
-      if [[ -n "$DARKIRC_REV" && "$DARKIRC_REV" != "master" ]]; then
-        sudo -u "$build_user" git -C "$darkirc_src" checkout "$DARKIRC_REV" || die "darkirc checkout '$DARKIRC_REV' failed"
-      fi
-    else
-      say "darkirc source present at $darkirc_src ($(sudo -u "$build_user" git -C "$darkirc_src" rev-parse --short HEAD 2>/dev/null || echo unknown)) — using as-is"
+      local source_parent
+      source_parent="$(dirname "$darkirc_src")"
+      [[ -d "$source_parent" ]] || install -d -o root -g root -m 0700 "$source_parent"
+      darkirc_validate_root_owned_directory "$source_parent" \
+        || die "DarkIRC source parent must be root-owned and non-writable"
+      say "darkirc source not present at $darkirc_src — cloning pinned source as root ..."
+      git clone "$DARKIRC_REPO" "$darkirc_src" || die "darkirc clone failed"
+      git -C "$darkirc_src" checkout --detach "$DARKIRC_REV" \
+        || die "darkirc checkout '$DARKIRC_REV' failed"
     fi
+    darkirc_validate_clean_root_checkout "$darkirc_src" "$DARKIRC_REV" \
+      || die "DarkIRC source must be root-owned, clean, and at approved revision"
+    [[ -f "$darkirc_src/Makefile" && -f "$darkirc_src/bin/darkirc/Cargo.toml" ]] \
+      || die "approved DarkIRC source layout is incomplete"
 
-    [[ -f "$darkirc_src/Makefile" ]] || die "darkirc Makefile not found (expected darkfi repo root)"
-    [[ -f "$darkirc_src/bin/darkirc/Cargo.toml" ]] || die "darkirc Cargo.toml not found"
-
-    local cargo_env="if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; else export PATH=\"\$HOME/.cargo/bin:\$PATH\"; fi;"
-
-    # Build with darkfi's make as the build user (mirrors build_tenant): uses that
-    # user's rust toolchain and leaves no root-owned artifacts.
-    say "building darkirc from $darkirc_src via make (as $build_user) ..."
-    sudo -u "$build_user" bash -c "$cargo_env cd '$darkirc_src' && make darkirc" \
+    ensure_darkirc_build_user
+    install -d -o root -g root -m 0711 "$DARKIRC_BUILD_ROOT"
+    build_tree="$(mktemp -d "$DARKIRC_BUILD_ROOT/build.XXXXXX")"
+    cleanup_darkirc_build() {
+      if [[ "$publish_pending" == true ]]; then
+        if [[ -n "$previous_binary" ]]; then mv -f -- "$previous_binary" "$DARKIRC_BIN"; previous_binary=""; else rm -f -- "$DARKIRC_BIN"; fi
+        if [[ -n "$previous_compatibility" ]]; then mv -f -- "$previous_compatibility" "$DARKIRC_COMPAT_FILE"; previous_compatibility=""; else rm -f -- "$DARKIRC_COMPAT_FILE"; fi
+      fi
+      if [[ "$helper_publish_pending" == true ]]; then
+        if [[ -n "$previous_helper" ]]; then mv -f -- "$previous_helper" "$DARKIRC_KEY_HELPER"; previous_helper=""; else rm -f -- "$DARKIRC_KEY_HELPER"; fi
+      fi
+      [[ -z "$previous_binary" ]] || rm -f -- "$previous_binary"
+      [[ -z "$previous_compatibility" ]] || rm -f -- "$previous_compatibility"
+      [[ -z "$previous_helper" ]] || rm -f -- "$previous_helper"
+      [[ -z "$binary_candidate" ]] || rm -f -- "$binary_candidate"
+      [[ -z "${build_tree:-}" ]] || rm -rf -- "$build_tree"
+      [[ -z "${cargo_home:-}" ]] || rm -rf -- "$cargo_home"
+    }
+    trap cleanup_darkirc_build EXIT
+    git -C "$darkirc_src" archive --format=tar "$DARKIRC_APPROVED_REV" | tar -x -C "$build_tree"
+    chown -R "$DARKIRC_BUILD_USER:$DARKIRC_BUILD_GROUP" "$build_tree"
+    cargo_home="$(mktemp -d "$DARKIRC_BUILD_HOME/cargo.XXXXXX")"
+    install -d -o root -g root -m 0700 "$cargo_home/.cargo"
+    chown -R "$DARKIRC_BUILD_USER:$DARKIRC_BUILD_GROUP" "$cargo_home"
+    say "building darkirc as $DARKIRC_BUILD_USER from disposable source copy ..."
+    setpriv --reuid="$(id -u "$DARKIRC_BUILD_USER")" \
+      --regid="$(id -g "$DARKIRC_BUILD_USER")" --clear-groups --no-new-privs -- \
+      env -i HOME="$cargo_home" PATH="/usr/bin:/bin" CARGO_HOME="$cargo_home/.cargo" \
+      MAKEFLAGS=-j2 taskset -c 0-1 make -C "$build_tree" darkirc \
       || die "darkirc build failed"
+    darkirc_validate_clean_root_checkout "$darkirc_src" "$DARKIRC_REV" \
+      || die "DarkIRC build changed trusted source checkout"
+    built_bin="$build_tree/darkirc"
+    darkirc_validate_build_artifact "$built_bin" \
+      || die "darkirc build artifact failed ownership validation"
+    source_revision="$(git -C "$darkirc_src" rev-parse HEAD 2>/dev/null)" \
+      || die "could not attest DarkIRC source revision"
+    [[ "$source_revision" == "$DARKIRC_APPROVED_REV" ]] \
+      || die "DarkIRC checkout is at unapproved revision $source_revision"
 
-    local built_bin="$darkirc_src/darkirc"
-    [[ -x "$built_bin" ]] || die "darkirc binary not found at $built_bin"
-
-    # Install the shared daemon binary — the only root-privileged step.
+    if [[ -e "$DARKIRC_KEY_HELPER" ]]; then
+      darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
+        || die "installed DarkIRC key helper is unsafe; refusing transactional replacement"
+      previous_helper="$(mktemp "$(dirname "$DARKIRC_KEY_HELPER")/.helper.rollback.XXXXXX")"
+      install -o root -g root -m 0755 "$DARKIRC_KEY_HELPER" "$previous_helper"
+    fi
+    helper_publish_pending=true
+    install_darkirc_key_helper
     say "installing darkirc to $DARKIRC_BIN ..."
-    install -m 0755 "$built_bin" "$DARKIRC_BIN"
-
+    install -d -o root -g root -m 0755 "$(dirname "$DARKIRC_BIN")"
+    binary_candidate="$(mktemp "$(dirname "$DARKIRC_BIN")/.darkirc.XXXXXX")"
+    install -o root -g root -m 0755 "$built_bin" "$binary_candidate"
+    if [[ -e "$DARKIRC_BIN" ]]; then
+      darkirc_validate_root_executable "$DARKIRC_BIN" \
+        || die "installed DarkIRC binary is unsafe; refusing transactional replacement"
+      previous_binary="$(mktemp "$(dirname "$DARKIRC_BIN")/.darkirc.rollback.XXXXXX")"
+      install -o root -g root -m 0755 "$DARKIRC_BIN" "$previous_binary"
+    fi
+    install -d -o root -g root -m 0755 "$(dirname "$DARKIRC_COMPAT_FILE")"
+    if [[ -e "$DARKIRC_COMPAT_FILE" ]]; then
+      [[ -f "$DARKIRC_COMPAT_FILE" && ! -L "$DARKIRC_COMPAT_FILE" \
+        && "$(stat -c '%u:%a' "$DARKIRC_COMPAT_FILE" 2>/dev/null)" == "0:600" ]] \
+        || die "installed DarkIRC compatibility attestation is unsafe"
+      previous_compatibility="$(mktemp "$(dirname "$DARKIRC_COMPAT_FILE")/.compat.rollback.XXXXXX")"
+      install -o root -g root -m 0600 "$DARKIRC_COMPAT_FILE" "$previous_compatibility"
+    fi
+    publish_pending=true
+    mv "$binary_candidate" "$DARKIRC_BIN"
+    binary_candidate=""
+    rm -rf -- "$build_tree" "$cargo_home"
+    build_tree=""; cargo_home=""
+    write_darkirc_compatibility "$source_revision" "$test_user"
+    publish_pending=false
+    helper_publish_pending=false
+    rm -f -- "$previous_binary" "$previous_compatibility" "$previous_helper"
+    previous_binary=""; previous_compatibility=""; previous_helper=""
     say "darkirc build complete: $DARKIRC_BIN"
-    "$DARKIRC_BIN" --version || say "(darkirc --version not supported, skipping)"
+    sudo -u "$test_user" "$DARKIRC_BIN" --version \
+      || say "(darkirc --version not supported, skipping)"
   ) 200>"$BUILD_LOCK"
 }
 
