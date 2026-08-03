@@ -3816,29 +3816,31 @@ ENVEOF
 }
 
 write_tenant_darkirc_adapter_env() {
-  local name="$1"
+  local name="$1" lock_owned="false"
+  if [[ "$DARKIRC_WRITER_LOCK_HELD" != "true" ]]; then
+    darkirc_writer_lock "$name"
+    lock_owned="true"
+  fi
 
-  local path adapter_port darkirc_irc_port lunarwing_env
+  local path adapter_port darkirc_irc_port lunarwing_env adapter_secret
   path="$(tenant_env_dir "$name")/darkirc-adapter.env"
   lunarwing_env="$(tenant_env_dir "$name")/lunarwing.env"
   adapter_port="$(ports_get "$name" darkirc_adapter)" || true
   darkirc_irc_port="$(ports_get "$name" darkirc_irc)" || true
-
-  local adapter_secret
-  adapter_secret="$(_read_env_value "$lunarwing_env" DARKIRC_ADAPTER_SECRET)"
+  adapter_secret="$(read_tenant_env_value "$name" "$lunarwing_env" DARKIRC_ADAPTER_SECRET)" \
+    || die "could not safely read DarkIRC adapter secret for tenant '$name'"
   [[ -n "$adapter_secret" ]] || adapter_secret="$(generate_token | cut -c1-32)"
 
   if [[ -f "$TEMPLATES_DIR/darkirc-adapter.env.template" ]]; then
-    render_template \
-      "darkirc-adapter.env.template" "$path" \
+    render_template_content \
+      "darkirc-adapter.env.template" \
       "TENANT_NAME=$name" \
       "DARKIRC_IRC_PORT=$darkirc_irc_port" \
       "DARKIRC_ADAPTER_PORT=$adapter_port" \
-      "ADAPTER_SECRET=$adapter_secret"
+      "ADAPTER_SECRET=$adapter_secret" \
+      | write_tenant_file_atomic "$name" "$path" 600
   else
-    (
-      umask 077
-      cat >"$path" <<ENVEOF
+    cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600
 DARKIRC_HOST=127.0.0.1
 DARKIRC_PORT=$darkirc_irc_port
 DARKIRC_NICK=${name}-bridge
@@ -3849,54 +3851,306 @@ ADAPTER_PORT=$adapter_port
 ADAPTER_SECRET=$adapter_secret
 ADAPTER_LOG_LEVEL=INFO
 ENVEOF
-    )
   fi
-  chmod 0600 "$path"
-  chown "$name:$name" "$path"
   say "wrote: $path"
+  if [[ "$lock_owned" == "true" ]]; then
+    darkirc_writer_unlock
+  fi
+}
+
+darkirc_scope_id() {
+  local name="$1"
+  jq -r --arg name "$name" '.tenants[$name].darkirc_scope_id // empty' \
+    "$PORTS_REGISTRY" 2>/dev/null
+}
+
+validate_darkirc_scope_id() {
+  local scope_id="$1"
+  [[ "$scope_id" =~ ^[0-9a-f]{32}$ && "$scope_id" != "00000000000000000000000000000000" ]] \
+    || die "invalid DarkIRC scope ID"
+}
+
+darkirc_writer_lock() {
+  local name="$1" scope_id lock_file mode owner links enabled current_scope current_enabled
+  [[ "$PORTS_LOCK_HELD" != "true" ]] \
+    || die "DarkIRC writer lock must be acquired before registry lock"
+  acquire_ports_lock
+  scope_id="$(darkirc_scope_id "$name")"
+  enabled="$(jq -r --arg name "$name" '.tenants[$name].enable_darkirc // false' "$PORTS_REGISTRY" 2>/dev/null || true)"
+  release_ports_lock
+  [[ "$enabled" == true ]] || die "DarkIRC is disabled for tenant '$name'"
+  validate_darkirc_scope_id "$scope_id"
+  if [[ "$DARKIRC_WRITER_LOCK_HELD" == "true" ]]; then
+    [[ "$DARKIRC_WRITER_SCOPE" == "$scope_id" ]] \
+      || die "cannot nest DarkIRC writer locks for different tenants"
+    return 0
+  fi
+  require_cmd flock
+  darkirc_path_components_safe "$(dirname "$DARKIRC_WRITER_LOCK_DIR")" \
+    || die "unsafe DarkIRC writer lock parent"
+  install -d -o root -g root -m 0700 "$DARKIRC_WRITER_LOCK_DIR"
+  mode="$(stat -c '%a' "$DARKIRC_WRITER_LOCK_DIR" 2>/dev/null || true)"
+  owner="$(stat -c '%u' "$DARKIRC_WRITER_LOCK_DIR" 2>/dev/null || true)"
+  [[ "$mode" == 700 && "$owner" == 0 && ! -L "$DARKIRC_WRITER_LOCK_DIR" ]] \
+    || die "unsafe DarkIRC writer lock directory"
+  lock_file="$DARKIRC_WRITER_LOCK_DIR/$scope_id.lock"
+  [[ ! -L "$lock_file" && ( ! -e "$lock_file" || -f "$lock_file" ) ]] \
+    || die "unsafe DarkIRC writer lock file"
+  if [[ ! -e "$lock_file" ]]; then
+    (umask 077; : >"$lock_file")
+  fi
+  chmod 0600 "$lock_file"
+  owner="$(stat -c '%u' "$lock_file" 2>/dev/null || true)"
+  mode="$(stat -c '%a' "$lock_file" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$lock_file" 2>/dev/null || true)"
+  [[ "$owner" == 0 && "$mode" == 600 && "$links" == 1 ]] \
+    || die "unsafe DarkIRC writer lock file"
+  if [[ -n "${LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD:-}" ]]; then
+    local inherited_fd="$LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD"
+    local inherited_scope="${LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE:-}"
+    [[ "$inherited_fd" =~ ^[0-9]+$ && "$inherited_scope" == "$scope_id" \
+      && -e "/proc/self/fd/$inherited_fd" ]] \
+      || die "invalid inherited DarkIRC writer lock"
+    [[ "$(stat -c '%d:%i' "/proc/self/fd/$inherited_fd" 2>/dev/null)" \
+      == "$(stat -c '%d:%i' "$lock_file" 2>/dev/null)" ]] \
+      || die "inherited DarkIRC writer lock does not match tenant scope"
+    flock -x -n "$inherited_fd" || die "inherited DarkIRC writer lock is not held"
+    DARKIRC_WRITER_LOCK_FD="$inherited_fd"
+    DARKIRC_WRITER_LOCK_INHERITED="true"
+  else
+    exec {DARKIRC_WRITER_LOCK_FD}>"$lock_file"
+    flock -x -w 10 "$DARKIRC_WRITER_LOCK_FD" \
+      || die "DarkIRC config update is busy for tenant '$name'"
+  fi
+  acquire_ports_lock
+  current_scope="$(darkirc_scope_id "$name")"
+  current_enabled="$(jq -r --arg name "$name" '.tenants[$name].enable_darkirc // false' "$PORTS_REGISTRY" 2>/dev/null || true)"
+  release_ports_lock
+  [[ "$current_enabled" == true && "$current_scope" == "$scope_id" ]] \
+    || die "DarkIRC tenant identity changed while acquiring writer lock"
+  DARKIRC_WRITER_LOCK_HELD="true"
+  DARKIRC_WRITER_SCOPE="$scope_id"
+}
+
+darkirc_writer_unlock() {
+  [[ "$DARKIRC_WRITER_LOCK_HELD" == "true" ]] || return 0
+  if [[ "$DARKIRC_WRITER_LOCK_INHERITED" != "true" ]]; then
+    flock -u "$DARKIRC_WRITER_LOCK_FD"
+    eval "exec ${DARKIRC_WRITER_LOCK_FD}>&-"
+  fi
+  DARKIRC_WRITER_LOCK_HELD="false"
+  DARKIRC_WRITER_LOCK_FD=""
+  DARKIRC_WRITER_SCOPE=""
+  DARKIRC_WRITER_LOCK_INHERITED="false"
+}
+
+with_darkirc_writer_lock() {
+  local name="$1" result=0
+  shift
+  darkirc_writer_lock "$name"
+  "$@" || result=$?
+  darkirc_writer_unlock
+  return "$result"
+}
+
+darkirc_load_compatibility() {
+  require_cmd jq
+  require_cmd sha256sum
+  darkirc_path_components_safe "$DARKIRC_COMPAT_FILE" \
+    || die "unsafe DarkIRC compatibility attestation path"
+  darkirc_validate_root_owned_directory "$(dirname "$DARKIRC_COMPAT_FILE")" \
+    || die "unsafe DarkIRC compatibility attestation parent"
+  [[ -f "$DARKIRC_COMPAT_FILE" && ! -L "$DARKIRC_COMPAT_FILE" ]] \
+    || die "DarkIRC compatibility attestation is missing: $DARKIRC_COMPAT_FILE"
+  local mode owner links schema profile digest key_format source_revision actual
+  mode="$(stat -c '%a' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  owner="$(stat -c '%u' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  [[ "$mode" == 600 && "$owner" == 0 && "$links" == 1 ]] \
+    || die "DarkIRC compatibility attestation must be root-owned, single-link mode 0600"
+  schema="$(jq -r '.schema // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  profile="$(jq -r '.profile_id // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  digest="$(jq -r '.binary_sha256 // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  key_format="$(jq -r '.key_format // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  source_revision="$(jq -r '.source_revision // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
+  [[ "$schema" == "lunarwing.darkirc-compat/v1" \
+    && "$profile" == "darkfi-a05956d41-chacha-v1" \
+    && "$key_format" == "darkfi-chacha-base58-32" \
+    && "$source_revision" == "$DARKIRC_APPROVED_REV" \
+    && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "unsupported DarkIRC compatibility attestation"
+  darkirc_validate_root_executable "$DARKIRC_BIN" \
+    || die "attested DarkIRC binary is missing or unsafe: $DARKIRC_BIN"
+  actual="$(sha256sum "$DARKIRC_BIN")"
+  actual="sha256:${actual%% *}"
+  [[ "$actual" == "$digest" ]] || die "DarkIRC binary digest does not match attestation"
+  DARKIRC_COMPAT_ARGS=(
+    --generator-profile "$profile"
+    --binary-sha256 "$digest"
+    --binary-path "$DARKIRC_BIN"
+    --key-format "$key_format"
+    --source-revision "$source_revision"
+  )
+}
+
+run_darkirc_manifest_validator() {
+  local unbound="${1:-false}"
+  darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
+    || die "trusted DarkIRC key helper is missing; run build-darkirc before machine import"
+  if [[ "$unbound" == "true" ]]; then
+    "$DARKIRC_KEY_HELPER" validate-migration --json --unbound
+  else
+    darkirc_load_compatibility
+    "$DARKIRC_KEY_HELPER" validate-migration --json "${DARKIRC_COMPAT_ARGS[@]}"
+  fi
+}
+
+run_darkirc_key_helper() {
+  local name="$1"
+  shift
+  darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
+    || die "DarkIRC key helper is missing or unsafe: $DARKIRC_KEY_HELPER"
+  darkirc_load_compatibility
+  local uid gid home
+  uid="$(id -u "$name")" || die "cannot resolve uid for tenant '$name'"
+  gid="$(id -g "$name")" || die "cannot resolve gid for tenant '$name'"
+  home="$(tenant_home "$name")"
+  (
+    cd "$home"
+    exec sudo -u "$name" env -i HOME="$home" PATH="/usr/bin:/bin" \
+      "$DARKIRC_KEY_HELPER" "$@" "${DARKIRC_COMPAT_ARGS[@]}" \
+      --expected-uid "$uid" --expected-gid "$gid"
+  )
+}
+
+darkirc_contact_command() {
+  local operation="${1:-}" name="${2:-}"
+  [[ -n "$operation" && -n "$name" ]] \
+    || die "usage: darkirc-contact <operation> <tenant> [contact] [options]"
+  shift 2
+  name="$(sanitize_name "$name")"
+  case "$operation" in
+    list|status|doctor|exchanges)
+      _darkirc_contact_command_locked "$operation" "$name" "$@"
+      ;;
+    *)
+      with_tenant_lifecycle_lock "$name" _darkirc_contact_command_locked \
+        "$operation" "$name" "$@"
+      ;;
+  esac
+}
+
+restore_darkirc_migration_locked() {
+  local name="$1" scope_id="$2"
+  run_darkirc_key_helper "$name" stage-migration \
+    --tenant "$name" --scope-id "$scope_id"
+  run_darkirc_key_helper "$name" import-migration \
+    --tenant "$name" --scope-id "$scope_id"
+}
+
+_darkirc_contact_command_locked() {
+  local operation="$1" name="$2" contact=""
+  shift 2
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  tenant_darkirc_enabled "$name" || die "DarkIRC is disabled for tenant '$name'"
+  local scope_id
+  scope_id="$(darkirc_scope_id "$name")"
+  validate_darkirc_scope_id "$scope_id"
+
+  local -a helper_args=("$operation" --tenant "$name" --scope-id "$scope_id")
+  case "$operation" in
+    status|prepare|respond|complete)
+      contact="${1:-}"
+      [[ -n "$contact" ]] || die "darkirc-contact $operation requires contact name"
+      shift
+      helper_args+=(--contact "$contact")
+      ;;
+    list|doctor|adopt|cancel|exchanges|recover|migration-ready|export-migration|stage-migration|import-migration|restore-migration) ;;
+    *) die "unsupported DarkIRC contact operation '$operation'" ;;
+  esac
+  [[ "$operation" != "complete" ]] || helper_args+=(--defer-apply)
+  helper_args+=("$@")
+
+  if [[ "$operation" == restore-migration ]]; then
+    with_darkirc_writer_lock "$name" restore_darkirc_migration_locked "$name" "$scope_id"
+    return 0
+  fi
+
+  case "$operation" in
+    adopt|prepare|respond|complete|cancel|recover|migration-ready|export-migration|stage-migration|import-migration)
+      with_darkirc_writer_lock "$name" run_darkirc_key_helper "$name" "${helper_args[@]}"
+      ;;
+    list|status|doctor|exchanges)
+      run_darkirc_key_helper "$name" "${helper_args[@]}"
+      ;;
+  esac
+}
+
+darkirc_prepare_tenant_dirs() {
+  local name="$1" state_dir config_dir datastore_dir path
+  state_dir="$(tenant_state_dir "$name")"
+  config_dir="$state_dir/darkirc"
+  datastore_dir="$config_dir/datastore"
+  for path in "$state_dir" "$config_dir" "$datastore_dir"; do
+    darkirc_path_components_safe "$path" \
+      || die "unsafe DarkIRC state path for tenant '$name': $path"
+  done
+  sudo -u "$name" mkdir -p "$config_dir" "$datastore_dir" \
+    || die "could not create DarkIRC state directories for '$name'"
+  sudo -u "$name" chmod 0700 "$config_dir" "$datastore_dir" \
+    || die "could not secure DarkIRC state directories for '$name'"
+  for path in "$state_dir" "$config_dir" "$datastore_dir"; do
+    darkirc_path_components_safe "$path" \
+      || die "unsafe DarkIRC state path for tenant '$name': $path"
+  done
+  [[ -d "$config_dir" && ! -L "$config_dir" \
+    && -d "$datastore_dir" && ! -L "$datastore_dir" ]] \
+    || die "DarkIRC state path is not a regular directory for '$name'"
 }
 
 generate_darkirc_config() {
-  local name="$1"
-  local state_dir
+  local name="$1" state_dir config_dir irc_port rpc_port log_dir scope_id baseline
+  local registry_lock_owned="false" writer_lock_owned="false"
   state_dir="$(tenant_state_dir "$name")"
+  config_dir="$state_dir/darkirc"
 
-  local config_dir="$state_dir/darkirc"
-  mkdir -p "$config_dir" "$config_dir/datastore" 2>/dev/null || true
-  chmod 0700 "$config_dir"
-
-  mkdir -p "$state_dir/logs" 2>/dev/null || true
-
-  local irc_port rpc_port
+  if [[ "$DARKIRC_WRITER_LOCK_HELD" != "true" ]]; then
+    darkirc_writer_lock "$name"
+    writer_lock_owned="true"
+  fi
+  if [[ "$PORTS_LOCK_HELD" != "true" ]]; then
+    acquire_ports_lock
+    registry_lock_owned="true"
+  fi
+  scope_id="$(ensure_darkirc_scope_id "$name")"
   irc_port="$(ports_get "$name" darkirc_irc)" || die "no darkirc_irc port for tenant '$name'"
   rpc_port="$(ports_get "$name" darkirc_rpc)" || die "no darkirc_rpc port for tenant '$name'"
-
-  local log_dir
   log_dir="$(tenant_log_dir "$name")"
 
-  local toml_out="$config_dir/darkirc_config.toml"
-  if [[ -f "$TEMPLATES_DIR/darkirc_config.toml.template" ]]; then
-    render_template \
-      "darkirc_config.toml.template" "$toml_out" \
-      "TENANT_NAME=$name" \
-      "IRC_PORT=$irc_port" \
-      "RPC_PORT=$rpc_port" \
-      "CONFIG_DIR=$config_dir" \
-      "LOG_DIR=$log_dir"
-  else
-    die "darkirc config template not found at $TEMPLATES_DIR/darkirc_config.toml.template"
+  # Keep the registry snapshot locked through the semantic config commit so its
+  # scope and target ports cannot diverge from the generated baseline.
+  darkirc_prepare_tenant_dirs "$name"
+  [[ -f "$TEMPLATES_DIR/darkirc_config.toml.template" ]] \
+    || die "darkirc config template not found at $TEMPLATES_DIR/darkirc_config.toml.template"
+  baseline="$(render_template_content \
+    "darkirc_config.toml.template" \
+    "TENANT_NAME=$name" \
+    "IRC_PORT=$irc_port" \
+    "RPC_PORT=$rpc_port" \
+    "CONFIG_DIR=$config_dir" \
+    "LOG_DIR=$log_dir")"
+  printf '%s' "$baseline" | run_darkirc_key_helper "$name" rewrite-baseline \
+    --tenant "$name" --scope-id "$scope_id" >/dev/null \
+    || die "DarkIRC semantic config update failed for tenant '$name'"
+  [[ -f "$config_dir/darkirc_config.toml" && ! -L "$config_dir/darkirc_config.toml" ]] \
+    || die "DarkIRC helper did not produce a config for '$name'"
+  if [[ "$registry_lock_owned" == "true" ]]; then
+    release_ports_lock
   fi
-
-  chmod 0700 "$config_dir"
-  chmod 0600 "$toml_out"
-
-  # The darkirc daemon runs as the tenant user, so it must own its config dir,
-  # rendered config, and datastore. This function runs as root during add-tenant,
-  # so chown the whole tree to the tenant — otherwise the daemon gets EACCES on
-  # its config and fails to start.
-  chown -R "$name:$name" "$config_dir"
-
-  say "darkirc config generated for $name (irc=$irc_port rpc=$rpc_port)"
+  if [[ "$writer_lock_owned" == "true" ]]; then
+    darkirc_writer_unlock
+  fi
+  say "darkirc config updated for $name (irc=$irc_port rpc=$rpc_port scope=$scope_id)"
 }
 
 # ── External-worker config.toml generation ────────────────────────────────────
