@@ -7,8 +7,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::channels::ChannelManager;
 use crate::channels::wasm::{
@@ -92,10 +95,45 @@ struct ChannelRuntimeState {
     wasm_channel_owner_actor_ids: std::collections::HashMap<String, String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpRuntimeHealth {
+    Healthy,
+    Recovering,
+    RetryPending,
+}
+
 struct ActiveMcpServer {
     owner_id: String,
     client: Arc<McpClient>,
     tools: Vec<Arc<dyn Tool>>,
+    managed_stdio: bool,
+    generation: u64,
+    health: McpRuntimeHealth,
+    restart_failures: u32,
+    retry_after: Option<Instant>,
+}
+
+struct McpRecoveryCandidate {
+    name: String,
+    owner_id: String,
+    generation: u64,
+}
+
+struct PreparedMcpRuntime {
+    client: Arc<McpClient>,
+    tools: Vec<Arc<dyn Tool>>,
+}
+
+const MCP_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(2);
+const MCP_RESTART_BACKOFF_BASE: Duration = Duration::from_secs(1);
+const MCP_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+fn mcp_restart_backoff(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(6);
+    MCP_RESTART_BACKOFF_BASE
+        .checked_mul(1_u32 << exponent)
+        .unwrap_or(MCP_RESTART_BACKOFF_MAX)
+        .min(MCP_RESTART_BACKOFF_MAX)
 }
 
 #[derive(Default)]
@@ -163,6 +201,10 @@ pub struct ExtensionManager {
     mcp_lifecycle_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Active MCP clients and their exact registered tools, keyed by server name.
     active_mcp_servers: RwLock<HashMap<String, ActiveMcpServer>>,
+    /// Monotonic runtime identity used to reject stale crash-recovery work.
+    mcp_runtime_generation: AtomicU64,
+    /// Background host-local stdio recovery supervisor and cancellation signal.
+    mcp_supervisor: Mutex<Option<(CancellationToken, tokio::task::JoinHandle<()>)>>,
 
     // WASM tool infrastructure
     wasm_tool_runtime: Option<Arc<WasmToolRuntime>>,
@@ -290,6 +332,8 @@ impl ExtensionManager {
             mcp_process_manager,
             mcp_lifecycle_locks: Mutex::new(HashMap::new()),
             active_mcp_servers: RwLock::new(HashMap::new()),
+            mcp_runtime_generation: AtomicU64::new(1),
+            mcp_supervisor: Mutex::new(None),
             wasm_tool_runtime,
             wasm_tools_dir,
             wasm_channels_dir,
@@ -308,6 +352,56 @@ impl ExtensionManager {
             gateway_token: std::env::var("GATEWAY_AUTH_TOKEN").ok(),
             gateway_mode: std::sync::atomic::AtomicBool::new(false),
             gateway_base_url: RwLock::new(None),
+        }
+    }
+
+    fn next_mcp_runtime_generation(&self) -> u64 {
+        self.mcp_runtime_generation.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Start monitoring host-local stdio MCP runtimes for unexpected exits.
+    ///
+    /// The task keeps only a weak manager reference between checks, so it cannot
+    /// keep application state alive after normal shutdown.
+    pub async fn start_mcp_supervisor(self: &Arc<Self>) {
+        let mut supervisor = self.mcp_supervisor.lock().await;
+        if supervisor
+            .as_ref()
+            .is_some_and(|(_, handle)| !handle.is_finished())
+        {
+            return;
+        }
+        if let Some((cancel, stale)) = supervisor.take() {
+            cancel.cancel();
+            let _ = stale.await;
+        }
+
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let manager = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(MCP_SUPERVISOR_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = task_cancel.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                manager.supervise_mcp_runtimes_once().await;
+            }
+        });
+        *supervisor = Some((cancel, handle));
+    }
+
+    /// Stop crash recovery before application shutdown tears down MCP children.
+    pub async fn shutdown_mcp_supervisor(&self) {
+        if let Some((cancel, supervisor)) = self.mcp_supervisor.lock().await.take() {
+            cancel.cancel();
+            let _ = supervisor.await;
         }
     }
 
@@ -553,12 +647,19 @@ impl ExtensionManager {
             );
             return;
         }
+        let managed_stdio = self.mcp_process_manager.get(&name).await.is_some();
+        let generation = self.next_mcp_runtime_generation();
         self.active_mcp_servers.write().await.insert(
             name,
             ActiveMcpServer {
                 owner_id: self.user_id.clone(),
                 client,
                 tools,
+                managed_stdio,
+                generation,
+                health: McpRuntimeHealth::Healthy,
+                restart_failures: 0,
+                retry_after: None,
             },
         );
     }
@@ -1054,9 +1155,11 @@ impl ExtensionManager {
                         let authenticated = is_authenticated(server, &self.secrets, user_id).await;
                         let (active, tools) = {
                             let active_servers = self.active_mcp_servers.read().await;
-                            let active_server = active_servers
-                                .get(&server.name)
-                                .filter(|runtime| runtime.owner_id == user_id);
+                            let active_server =
+                                active_servers.get(&server.name).filter(|runtime| {
+                                    runtime.owner_id == user_id
+                                        && runtime.health == McpRuntimeHealth::Healthy
+                                });
                             let tools = active_server
                                 .map(|runtime| {
                                     runtime
@@ -1657,15 +1760,21 @@ impl ExtensionManager {
                 Ok(info)
             }
             ExtensionKind::McpServer => {
+                let health = self
+                    .active_mcp_servers
+                    .read()
+                    .await
+                    .get(name)
+                    .filter(|runtime| runtime.owner_id == user_id)
+                    .map(|runtime| runtime.health);
                 let info = serde_json::json!({
                     "name": name,
                     "kind": "mcp_server",
-                    "connected": self
-                        .active_mcp_servers
-                        .read()
-                        .await
-                        .get(name)
-                        .is_some_and(|runtime| runtime.owner_id == user_id),
+                    "connected": health == Some(McpRuntimeHealth::Healthy),
+                    "recovering": matches!(
+                        health,
+                        Some(McpRuntimeHealth::Recovering | McpRuntimeHealth::RetryPending)
+                    ),
                 });
                 Ok(info)
             }
@@ -1763,6 +1872,227 @@ impl ExtensionManager {
             crate::tools::mcp::config::disable_mcp_server_if_unchanged(expected).await
         }
         .map_err(|error| ExtensionError::Config(error.to_string()))
+    }
+
+    async fn supervise_mcp_runtimes_once(&self) {
+        let candidates = {
+            let runtimes = self.active_mcp_servers.read().await;
+            runtimes
+                .iter()
+                .filter(|(_, runtime)| runtime.managed_stdio)
+                .map(|(name, runtime)| McpRecoveryCandidate {
+                    name: name.clone(),
+                    owner_id: runtime.owner_id.clone(),
+                    generation: runtime.generation,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for candidate in candidates {
+            self.recover_mcp_runtime_if_needed(candidate).await;
+        }
+    }
+
+    async fn recover_mcp_runtime_if_needed(&self, candidate: McpRecoveryCandidate) {
+        let _lifecycle_guard = self.lock_mcp_lifecycle(&candidate.name).await;
+        if !self.claim_mcp_recovery(&candidate).await {
+            return;
+        }
+
+        let server = match self
+            .get_mcp_server(&candidate.name, &candidate.owner_id)
+            .await
+        {
+            Ok(server)
+                if server.enabled
+                    && matches!(
+                        server.effective_transport(),
+                        crate::tools::mcp::config::EffectiveTransport::Stdio { .. }
+                    ) =>
+            {
+                server
+            }
+            Ok(_) | Err(crate::tools::mcp::config::ConfigError::ServerNotFound { .. }) => {
+                self.stop_mcp_runtime(&candidate.name, &candidate.owner_id)
+                    .await;
+                return;
+            }
+            Err(_) => {
+                self.schedule_mcp_recovery_retry(&candidate, "configuration unavailable")
+                    .await;
+                return;
+            }
+        };
+
+        self.rebuild_mcp_runtime(candidate, server).await;
+    }
+
+    async fn claim_mcp_recovery(&self, candidate: &McpRecoveryCandidate) -> bool {
+        let (health, retry_after) = {
+            let runtimes = self.active_mcp_servers.read().await;
+            let Some(runtime) = runtimes.get(&candidate.name).filter(|runtime| {
+                runtime.owner_id == candidate.owner_id
+                    && runtime.generation == candidate.generation
+                    && runtime.managed_stdio
+            }) else {
+                return false;
+            };
+            (runtime.health, runtime.retry_after)
+        };
+
+        let should_recover = match health {
+            McpRuntimeHealth::Recovering => false,
+            McpRuntimeHealth::RetryPending => {
+                retry_after.is_none_or(|retry| retry <= Instant::now())
+            }
+            McpRuntimeHealth::Healthy => {
+                match self.mcp_process_manager.state(&candidate.name).await {
+                    Ok(crate::tools::mcp::McpProcessState::Running) => false,
+                    Ok(crate::tools::mcp::McpProcessState::Exited(status)) => {
+                        tracing::warn!(server = %candidate.name, %status, "Host-local MCP server exited unexpectedly");
+                        true
+                    }
+                    Ok(crate::tools::mcp::McpProcessState::Missing) | Err(_) => {
+                        tracing::warn!(server = %candidate.name, "Host-local MCP server runtime is missing");
+                        true
+                    }
+                }
+            }
+        };
+        if !should_recover {
+            return false;
+        }
+
+        let dead_tools = {
+            let mut runtimes = self.active_mcp_servers.write().await;
+            let Some(runtime) = runtimes.get_mut(&candidate.name).filter(|runtime| {
+                runtime.owner_id == candidate.owner_id && runtime.generation == candidate.generation
+            }) else {
+                return false;
+            };
+            runtime.health = McpRuntimeHealth::Recovering;
+            runtime.retry_after = None;
+            runtime.tools.clone()
+        };
+        for tool in &dead_tools {
+            self.tool_registry
+                .unregister_if_same(tool.name(), tool)
+                .await;
+        }
+        true
+    }
+
+    async fn rebuild_mcp_runtime(&self, candidate: McpRecoveryCandidate, server: McpServerConfig) {
+        let (old_client, old_tools) = {
+            let runtimes = self.active_mcp_servers.read().await;
+            let Some(runtime) = runtimes.get(&candidate.name).filter(|runtime| {
+                runtime.owner_id == candidate.owner_id && runtime.generation == candidate.generation
+            }) else {
+                return;
+            };
+            (Arc::clone(&runtime.client), runtime.tools.clone())
+        };
+
+        if let Err(error) = self
+            .shutdown_mcp_runtime(&candidate.name, Some(old_client.as_ref()))
+            .await
+        {
+            tracing::warn!(server = %candidate.name, %error, "MCP crash cleanup was incomplete");
+        }
+        let prepared = match self
+            .prepare_mcp_runtime(&candidate.name, &candidate.owner_id, server)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                self.schedule_mcp_recovery_retry(&candidate, "runtime initialization failed")
+                    .await;
+                return;
+            }
+        };
+
+        let replacement_tools = prepared.tools.clone();
+        if let Err(conflicts) = self
+            .tool_registry
+            .replace_runtime_tools(&old_tools, replacement_tools)
+            .await
+        {
+            tracing::warn!(server = %candidate.name, tools = ?conflicts, "MCP recovery tool replacement conflicted");
+            self.cleanup_failed_mcp_activation(&candidate.name, prepared.client.as_ref())
+                .await;
+            self.schedule_mcp_recovery_retry(&candidate, "tool registration conflict")
+                .await;
+            return;
+        }
+
+        self.finish_mcp_recovery(candidate, prepared).await;
+    }
+
+    async fn finish_mcp_recovery(
+        &self,
+        candidate: McpRecoveryCandidate,
+        prepared: PreparedMcpRuntime,
+    ) {
+        let generation = self.next_mcp_runtime_generation();
+        let mut runtimes = self.active_mcp_servers.write().await;
+        let Some(runtime) = runtimes.get_mut(&candidate.name).filter(|runtime| {
+            runtime.owner_id == candidate.owner_id && runtime.generation == candidate.generation
+        }) else {
+            drop(runtimes);
+            for tool in &prepared.tools {
+                self.tool_registry
+                    .unregister_if_same(tool.name(), tool)
+                    .await;
+            }
+            self.cleanup_failed_mcp_activation(&candidate.name, prepared.client.as_ref())
+                .await;
+            return;
+        };
+        runtime.client = prepared.client;
+        runtime.tools = prepared.tools;
+        runtime.generation = generation;
+        runtime.health = McpRuntimeHealth::Healthy;
+        runtime.restart_failures = 0;
+        runtime.retry_after = None;
+        let tool_count = runtime.tools.len();
+        drop(runtimes);
+
+        tracing::info!(server = %candidate.name, tools = tool_count, "Recovered host-local MCP server");
+        self.broadcast_extension_status(
+            &candidate.owner_id,
+            &candidate.name,
+            "active",
+            Some("Host-local MCP server recovered after an unexpected exit"),
+        )
+        .await;
+    }
+
+    async fn schedule_mcp_recovery_retry(
+        &self,
+        candidate: &McpRecoveryCandidate,
+        reason: &'static str,
+    ) {
+        let mut runtimes = self.active_mcp_servers.write().await;
+        let Some(runtime) = runtimes.get_mut(&candidate.name).filter(|runtime| {
+            runtime.owner_id == candidate.owner_id && runtime.generation == candidate.generation
+        }) else {
+            return;
+        };
+        runtime.restart_failures = runtime.restart_failures.saturating_add(1);
+        let delay = mcp_restart_backoff(runtime.restart_failures);
+        runtime.health = McpRuntimeHealth::RetryPending;
+        runtime.retry_after = Some(Instant::now() + delay);
+        let failures = runtime.restart_failures;
+        drop(runtimes);
+
+        tracing::warn!(server = %candidate.name, failures, retry_seconds = delay.as_secs(), reason, "MCP recovery scheduled for retry");
+        self.broadcast_extension_status(
+            &candidate.owner_id,
+            &candidate.name,
+            "recovering",
+            Some("Host-local MCP server recovery failed; retry scheduled"),
+        )
+        .await;
     }
 
     async fn stop_mcp_runtime(&self, name: &str, user_id: &str) -> StoppedMcpRuntime {
@@ -3579,27 +3909,12 @@ impl ExtensionManager {
         Ok(())
     }
 
-    async fn activate_mcp_locked(
+    async fn prepare_mcp_runtime(
         &self,
         name: &str,
         user_id: &str,
         server: McpServerConfig,
-    ) -> Result<ActivateResult, ExtensionError> {
-        if let Some(runtime) = self.active_mcp_servers.read().await.get(name) {
-            return Ok(ActivateResult {
-                name: name.to_string(),
-                kind: ExtensionKind::McpServer,
-                tools_loaded: runtime
-                    .tools
-                    .iter()
-                    .map(|tool| tool.name().to_string())
-                    .collect(),
-                message: format!("MCP server '{name}' already active"),
-            });
-        }
-
-        // Clear resources left by an interrupted activation before reconnecting.
-        self.stop_mcp_runtime(name, user_id).await;
+    ) -> Result<PreparedMcpRuntime, ExtensionError> {
         let client = Arc::new(
             crate::tools::mcp::create_client_from_config(
                 server,
@@ -3609,30 +3924,62 @@ impl ExtensionManager {
                 user_id,
             )
             .await
-            .map_err(|e| ExtensionError::ActivationFailed(e.to_string()))?,
+            .map_err(|error| ExtensionError::ActivationFailed(error.to_string()))?,
         );
 
-        // Try to list and create tools.
-        // A 401/auth error means the server requires OAuth — surface as
-        // AuthRequired so the activate handler triggers the OAuth flow.
-        // Some servers (e.g. GitHub MCP) return 400 with "Authorization header
-        // is badly formatted" instead of 401 when auth is missing or invalid.
         if let Err(error) = client.list_tools().await {
             self.cleanup_failed_mcp_activation(name, client.as_ref())
                 .await;
             return Err(Self::classify_mcp_activation_error(error.to_string()));
         }
-
-        let tool_impls = match client.create_tools().await {
-            Ok(tools) => tools,
+        match client.create_tools().await {
+            Ok(tools) => Ok(PreparedMcpRuntime { client, tools }),
             Err(error) => {
                 self.cleanup_failed_mcp_activation(name, client.as_ref())
                     .await;
-                return Err(ExtensionError::ActivationFailed(error.to_string()));
+                Err(ExtensionError::ActivationFailed(error.to_string()))
             }
-        };
+        }
+    }
+
+    async fn activate_mcp_locked(
+        &self,
+        name: &str,
+        user_id: &str,
+        server: McpServerConfig,
+    ) -> Result<ActivateResult, ExtensionError> {
+        let active_tools = self
+            .active_mcp_servers
+            .read()
+            .await
+            .get(name)
+            .filter(|runtime| {
+                runtime.owner_id == user_id && runtime.health == McpRuntimeHealth::Healthy
+            })
+            .map(|runtime| {
+                runtime
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect::<Vec<_>>()
+            });
+        if let Some(tools_loaded) = active_tools {
+            return Ok(ActivateResult {
+                name: name.to_string(),
+                kind: ExtensionKind::McpServer,
+                tools_loaded,
+                message: format!("MCP server '{name}' already active"),
+            });
+        }
+
+        self.stop_mcp_runtime(name, user_id).await;
+        let managed_stdio = matches!(
+            server.effective_transport(),
+            crate::tools::mcp::config::EffectiveTransport::Stdio { .. }
+        );
+        let prepared = self.prepare_mcp_runtime(name, user_id, server).await?;
         let mut registered_tools = Vec::new();
-        for tool in tool_impls {
+        for tool in prepared.tools {
             if self
                 .tool_registry
                 .register_if_vacant(Arc::clone(&tool))
@@ -3651,21 +3998,23 @@ impl ExtensionManager {
             .iter()
             .map(|tool| tool.name().to_string())
             .collect::<Vec<_>>();
+        let generation = self.next_mcp_runtime_generation();
 
         self.active_mcp_servers.write().await.insert(
             name.to_string(),
             ActiveMcpServer {
                 owner_id: user_id.to_string(),
-                client,
+                client: prepared.client,
                 tools: registered_tools,
+                managed_stdio,
+                generation,
+                health: McpRuntimeHealth::Healthy,
+                restart_failures: 0,
+                retry_after: None,
             },
         );
 
-        tracing::info!(
-            "Activated MCP server '{}' with {} tools",
-            name,
-            tool_names.len()
-        );
+        tracing::info!(server = %name, tools = tool_names.len(), "Activated MCP server");
         self.broadcast_extension_status(user_id, name, "active", None)
             .await;
 
@@ -3673,7 +4022,7 @@ impl ExtensionManager {
             name: name.to_string(),
             kind: ExtensionKind::McpServer,
             tools_loaded: tool_names,
-            message: format!("Connected to '{}' and loaded tools", name),
+            message: format!("Connected to '{name}' and loaded tools"),
         })
     }
 
@@ -5269,15 +5618,16 @@ mod tests {
     use std::collections::HashMap;
     use std::fmt::Debug;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
 
     use crate::context::JobContext;
     use crate::extensions::ExtensionManager;
     use crate::extensions::manager::{
-        FallbackDecision, build_wasm_channel_runtime_config_updates, combine_install_errors,
-        fallback_decision, infer_kind_from_url, normalize_hosted_callback_url,
+        FallbackDecision, McpRuntimeHealth, build_wasm_channel_runtime_config_updates,
+        combine_install_errors, fallback_decision, infer_kind_from_url,
+        normalize_hosted_callback_url,
     };
     use crate::extensions::{ExtensionError, ExtensionKind, ExtensionSource, InstallResult};
     use crate::tools::{Tool, ToolError, ToolOutput};
@@ -5324,6 +5674,11 @@ fi
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
+      if [ -n "$MCP_FAIL_RESTART_ONCE_FILE" ] && [ -e "$MCP_CRASH_ONCE_FILE" ] && [ ! -e "$MCP_FAIL_RESTART_ONCE_FILE" ]; then
+        : > "$MCP_FAIL_RESTART_ONCE_FILE"
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"fixture restart failure"}}'
+        exit 18
+      fi
       printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}'
       ;;
     *'"method":"tools/list"'*)
@@ -5331,6 +5686,10 @@ while IFS= read -r line; do
         printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"fixture list failure"}}'
       else
         printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"ping","description":"Ping","inputSchema":{"type":"object"}}]}}'
+        if [ -n "$MCP_CRASH_ONCE_FILE" ] && [ ! -e "$MCP_CRASH_ONCE_FILE" ]; then
+          : > "$MCP_CRASH_ONCE_FILE"
+          exit 17
+        fi
       fi
       ;;
   esac
@@ -5344,6 +5703,38 @@ done
         permissions.set_mode(0o700);
         std::fs::set_permissions(&script_path, permissions).expect("make fixture executable");
         script_path
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_mcp_start_count(path: &std::path::Path, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let starts = std::fs::read_to_string(path).unwrap_or_default();
+                if starts.lines().count() >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("MCP fixture did not reach expected start count");
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_mcp_exit(manager: &ExtensionManager, name: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    manager.mcp_process_manager.state(name).await,
+                    Ok(crate::tools::mcp::McpProcessState::Exited(_))
+                ) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("MCP fixture did not exit");
     }
 
     fn require_eq<T>(actual: T, expected: T, label: &str) -> Result<(), String>
@@ -5957,6 +6348,206 @@ done
             .await
             .expect("replacement remains registered");
         assert!(Arc::ptr_eq(&registered, &replacement));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stdio_mcp_crash_rebuilds_client_and_tools() {
+        use crate::tools::mcp::McpServerConfig;
+
+        let (store, dir) = make_test_store().await;
+        let script_path = write_mcp_lifecycle_fixture(&dir);
+        let starts_path = dir.path().join("mcp-recovery-starts.log");
+        let crash_path = dir.path().join("mcp-crash-once");
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(store),
+        );
+        let mut config = McpServerConfig::new_stdio(
+            "fixture-recovery",
+            script_path.to_string_lossy(),
+            vec![starts_path.to_string_lossy().into_owned()],
+            HashMap::from([(
+                "MCP_CRASH_ONCE_FILE".to_string(),
+                crash_path.to_string_lossy().into_owned(),
+            )]),
+        );
+        config.enabled = false;
+        manager
+            .install_mcp_config(config, "test")
+            .await
+            .expect("install recovery fixture");
+        manager
+            .activate("fixture-recovery", "test")
+            .await
+            .expect("activate recovery fixture");
+        let old_tool = manager
+            .tool_registry
+            .get("fixture-recovery_ping")
+            .await
+            .expect("initial MCP tool");
+        wait_for_mcp_exit(&manager, "fixture-recovery").await;
+
+        manager.supervise_mcp_runtimes_once().await;
+        wait_for_mcp_start_count(&starts_path, 2).await;
+
+        let new_tool = manager
+            .tool_registry
+            .get("fixture-recovery_ping")
+            .await
+            .expect("recovered MCP tool");
+        assert!(!Arc::ptr_eq(&old_tool, &new_tool));
+        assert!(matches!(
+            manager
+                .mcp_process_manager
+                .state("fixture-recovery")
+                .await
+                .expect("recovered process state"),
+            crate::tools::mcp::McpProcessState::Running
+        ));
+        let listed = manager
+            .list(Some(ExtensionKind::McpServer), false, "test")
+            .await
+            .expect("list recovered MCP server");
+        assert!(listed[0].active);
+        manager
+            .deactivate("fixture-recovery", "test")
+            .await
+            .expect("stop recovered fixture");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stdio_mcp_recovery_retries_full_runtime_after_failure() {
+        use crate::tools::mcp::McpServerConfig;
+
+        let (store, dir) = make_test_store().await;
+        let script_path = write_mcp_lifecycle_fixture(&dir);
+        let starts_path = dir.path().join("mcp-retry-starts.log");
+        let crash_path = dir.path().join("mcp-crash-once");
+        let fail_path = dir.path().join("mcp-restart-fail-once");
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(store),
+        );
+        let mut config = McpServerConfig::new_stdio(
+            "fixture-retry",
+            script_path.to_string_lossy(),
+            vec![starts_path.to_string_lossy().into_owned()],
+            HashMap::from([
+                (
+                    "MCP_CRASH_ONCE_FILE".to_string(),
+                    crash_path.to_string_lossy().into_owned(),
+                ),
+                (
+                    "MCP_FAIL_RESTART_ONCE_FILE".to_string(),
+                    fail_path.to_string_lossy().into_owned(),
+                ),
+            ]),
+        );
+        config.enabled = false;
+        manager
+            .install_mcp_config(config, "test")
+            .await
+            .expect("install retry fixture");
+        manager
+            .activate("fixture-retry", "test")
+            .await
+            .expect("activate retry fixture");
+        wait_for_mcp_exit(&manager, "fixture-retry").await;
+
+        manager.supervise_mcp_runtimes_once().await;
+        wait_for_mcp_start_count(&starts_path, 2).await;
+        assert!(!manager.tool_registry.has("fixture-retry_ping").await);
+        {
+            let mut runtimes = manager.active_mcp_servers.write().await;
+            let runtime = runtimes.get_mut("fixture-retry").expect("retry runtime");
+            assert_eq!(runtime.health, McpRuntimeHealth::RetryPending);
+            assert_eq!(runtime.restart_failures, 1);
+            runtime.retry_after = Some(Instant::now());
+        }
+
+        manager.supervise_mcp_runtimes_once().await;
+        wait_for_mcp_start_count(&starts_path, 3).await;
+        assert!(manager.tool_registry.has("fixture-retry_ping").await);
+        assert_eq!(
+            manager.active_mcp_servers.read().await["fixture-retry"].health,
+            McpRuntimeHealth::Healthy
+        );
+        manager
+            .deactivate("fixture-retry", "test")
+            .await
+            .expect("stop retry fixture");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stdio_mcp_disable_cancels_pending_recovery() {
+        use crate::tools::mcp::McpServerConfig;
+
+        let (store, dir) = make_test_store().await;
+        let script_path = write_mcp_lifecycle_fixture(&dir);
+        let starts_path = dir.path().join("mcp-disable-starts.log");
+        let crash_path = dir.path().join("mcp-crash-once");
+        let fail_path = dir.path().join("mcp-restart-fail-once");
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(Arc::clone(&store)),
+        );
+        let mut config = McpServerConfig::new_stdio(
+            "fixture-disable",
+            script_path.to_string_lossy(),
+            vec![starts_path.to_string_lossy().into_owned()],
+            HashMap::from([
+                (
+                    "MCP_CRASH_ONCE_FILE".to_string(),
+                    crash_path.to_string_lossy().into_owned(),
+                ),
+                (
+                    "MCP_FAIL_RESTART_ONCE_FILE".to_string(),
+                    fail_path.to_string_lossy().into_owned(),
+                ),
+            ]),
+        );
+        config.enabled = false;
+        manager
+            .install_mcp_config(config, "test")
+            .await
+            .expect("install disable fixture");
+        manager
+            .activate("fixture-disable", "test")
+            .await
+            .expect("activate disable fixture");
+        wait_for_mcp_exit(&manager, "fixture-disable").await;
+        manager.supervise_mcp_runtimes_once().await;
+        wait_for_mcp_start_count(&starts_path, 2).await;
+
+        manager
+            .deactivate("fixture-disable", "test")
+            .await
+            .expect("disable during retry");
+        manager.supervise_mcp_runtimes_once().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let starts = std::fs::read_to_string(&starts_path).expect("read process starts");
+        assert_eq!(starts.lines().count(), 2);
+        assert!(!manager.tool_registry.has("fixture-disable_ping").await);
+        assert!(manager.active_mcp_servers.read().await.is_empty());
+        let stored = crate::tools::mcp::config::load_mcp_servers_from_db(store.as_ref(), "test")
+            .await
+            .expect("reload disabled fixture");
+        assert!(
+            !stored
+                .get("fixture-disable")
+                .expect("stored fixture")
+                .enabled
+        );
     }
 
     #[cfg(unix)]
