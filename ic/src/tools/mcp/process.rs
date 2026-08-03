@@ -13,9 +13,18 @@ use crate::tools::mcp::stdio_transport::StdioMcpTransport;
 use crate::tools::mcp::transport::McpTransport;
 use crate::tools::tool::ToolError;
 
+/// Current health of one managed stdio process.
+#[derive(Debug)]
+pub enum McpProcessState {
+    Running,
+    Exited(std::process::ExitStatus),
+    Missing,
+}
+
 /// Manages stdio MCP server processes.
 ///
-/// Handles spawning, tracking, and shutdown of child processes.
+/// Handles spawning, tracking, and shutdown of child processes. Higher-level
+/// recovery belongs to `ExtensionManager`, which also owns clients and tools.
 pub struct McpProcessManager {
     transports: RwLock<HashMap<String, Arc<StdioMcpTransport>>>,
 }
@@ -52,6 +61,17 @@ impl McpProcessManager {
     /// Get a transport by server name.
     pub async fn get(&self, name: &str) -> Option<Arc<StdioMcpTransport>> {
         self.transports.read().await.get(name).cloned()
+    }
+
+    /// Query one managed process without waiting for it to exit.
+    pub async fn state(&self, name: &str) -> Result<McpProcessState, ToolError> {
+        let Some(transport) = self.get(name).await else {
+            return Ok(McpProcessState::Missing);
+        };
+        Ok(match transport.exit_status().await? {
+            Some(status) => McpProcessState::Exited(status),
+            None => McpProcessState::Running,
+        })
     }
 
     /// Shut down all managed transports.
@@ -105,6 +125,48 @@ mod tests {
         let manager = McpProcessManager::new();
         let servers = manager.managed_servers().await;
         assert!(servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_reports_missing_running_and_exited() {
+        let manager = McpProcessManager::new();
+        assert!(matches!(
+            manager.state("server").await.expect("missing state"),
+            McpProcessState::Missing
+        ));
+
+        manager
+            .spawn_stdio(
+                "server",
+                "cat",
+                Vec::new(),
+                HashMap::<String, String>::new(),
+                false,
+            )
+            .await
+            .expect("spawn cat");
+        assert!(matches!(
+            manager.state("server").await.expect("running state"),
+            McpProcessState::Running
+        ));
+        manager.shutdown("server").await.expect("shutdown cat");
+
+        manager
+            .spawn_stdio(
+                "server",
+                "false",
+                Vec::new(),
+                HashMap::<String, String>::new(),
+                false,
+            )
+            .await
+            .expect("spawn false");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(matches!(
+            manager.state("server").await.expect("exited state"),
+            McpProcessState::Exited(_)
+        ));
+        manager.shutdown("server").await.expect("clean up false");
     }
 
     #[tokio::test]
