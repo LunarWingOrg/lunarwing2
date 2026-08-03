@@ -334,6 +334,11 @@ impl SandboxManager {
         if let Some(dir) = spawner.xdg_runtime_dir() {
             cmd.env("XDG_RUNTIME_DIR", dir);
         }
+        // wait_with_output only captures piped stdio (unlike Command::output,
+        // which pipes implicitly): set the pipes explicitly or output is empty.
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
         let child = cmd.spawn().map_err(|e| SandboxError::ExecutionFailed {
             reason: e.to_string(),
