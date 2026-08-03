@@ -191,6 +191,15 @@ cargo check -j6
 cargo test -j6 -- --test-threads=6
 ```
 
+Normal development and test profiles retain line tables for useful backtraces without full
+variable-level debug information. Use the explicit full-debug profile only when an interactive
+debugger needs complete symbols:
+
+```bash
+cargo build --profile full-debug
+cargo test --profile full-debug
+```
+
 Additional test surfaces:
 
 - [Rust and browser E2E tests](ic/tests/e2e/README.md)
