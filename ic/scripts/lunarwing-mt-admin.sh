@@ -1168,6 +1168,15 @@ ENDJSON
   release_ports_lock
 }
 
+# Inspection commands must not create or migrate host state.
+ports_registry_require_readonly() {
+  require_cmd jq
+  [[ -f "$PORTS_REGISTRY" && ! -L "$PORTS_REGISTRY" ]] \
+    || die "port registry not found: $PORTS_REGISTRY"
+  jq -e '.tenants | type == "object"' "$PORTS_REGISTRY" >/dev/null 2>&1 \
+    || die "invalid port registry: $PORTS_REGISTRY"
+}
+
 ports_migrate_v2() {
   say "migrating port registry v1 -> v2 (reserved_0 -> orchestrator) ..."
   local tmp
@@ -8338,6 +8347,50 @@ _set_tenant_weechat_enabled_locked() {
   ports_set_weechat "$name" true || return 1
   weechat_reconcile_units "$name" || return 1
   weechat_lifecycle_enable_start "$name" || return 1
+}
+
+# Diagnostic-only in Stage A. Both init-managed services and authenticated
+# adapter connectivity must be healthy; this does not activate an exchange.
+darkirc_health_strict() {
+  local name="$1" attempts="${2:-10}" quiet="${3:-false}"
+  local adapter_port env_path secret response attempt
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || return 1
+  tenant_darkirc_enabled "$name" || return 1
+  ensure_init_system
+
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _systemctl_user "$name" is-active --quiet "lunarwing-darkirc-${name}.service" \
+      || return 1
+    _systemctl_user "$name" is-active --quiet "lunarwing-darkirc-adapter-${name}.service" \
+      || return 1
+  else
+    rc-service "lunarwing-darkirc-${name}" status >/dev/null 2>&1 || return 1
+    rc-service "lunarwing-darkirc-adapter-${name}" status >/dev/null 2>&1 || return 1
+  fi
+
+  adapter_port="$(ports_get "$name" darkirc_adapter 2>/dev/null || true)"
+  [[ "$adapter_port" =~ ^[0-9]+$ ]] || return 1
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  secret="$(read_tenant_env_value \
+    "$name" "$env_path" DARKIRC_ADAPTER_SECRET 2>/dev/null)" || return 1
+  [[ -n "$secret" ]] || return 1
+  require_cmd curl
+  require_cmd jq
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    response="$(printf 'Authorization: Bearer %s\n' "$secret" | \
+      curl -fsS --max-time 2 --header @- \
+        "http://127.0.0.1:${adapter_port}/health" 2>/dev/null || true)"
+    if jq -e '(.status == "ok") and (.irc_connected == true)' <<<"$response" \
+      >/dev/null 2>&1; then
+      [[ "$quiet" == true ]] || say "strict DarkIRC health passed for $name"
+      return 0
+    fi
+    [[ "$attempt" -lt "$attempts" ]] && sleep 1
+  done
+  say "strict DarkIRC health failed for $name" >&2
+  return 1
 }
 
 uninstall_tenant_openrc() {
