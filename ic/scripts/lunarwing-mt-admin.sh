@@ -8301,8 +8301,10 @@ start_tenant_openrc() {
     say "  (weechat disabled for $name — not starting lunarwing-weechat{,-adapter}-${name})"
   fi
   if tenant_darkirc_enabled "$name"; then
-    rc-service "lunarwing-darkirc-${name}" start 2>/dev/null || say "  (lunarwing-darkirc-${name} skipped — optional)"
-    rc-service "lunarwing-darkirc-adapter-${name}" start 2>/dev/null || say "  (lunarwing-darkirc-adapter-${name} skipped — optional)"
+    rc-service "lunarwing-darkirc-${name}" start \
+      || die "failed to start OpenRC service lunarwing-darkirc-${name}"
+    rc-service "lunarwing-darkirc-adapter-${name}" start \
+      || die "failed to start OpenRC service lunarwing-darkirc-adapter-${name}"
   fi
   if tenant_proxy_enabled "$name"; then
     rc-service "lunarwing-proxy-${name}" start
@@ -8353,8 +8355,14 @@ stop_tenant_openrc() {
       return 1
     fi
   fi
-  rc-service "lunarwing-darkirc-adapter-${name}" stop 2>/dev/null || true
-  rc-service "lunarwing-darkirc-${name}" stop 2>/dev/null || true
+  if tenant_darkirc_enabled "$name"; then
+    rc-service "lunarwing-darkirc-adapter-${name}" stop \
+      || rc-service "lunarwing-darkirc-adapter-${name}" status 2>&1 | grep -Eqi 'stopped|inactive|dead' \
+      || die "failed to stop OpenRC service lunarwing-darkirc-adapter-${name}"
+    rc-service "lunarwing-darkirc-${name}" stop \
+      || rc-service "lunarwing-darkirc-${name}" status 2>&1 | grep -Eqi 'stopped|inactive|dead' \
+      || die "failed to stop OpenRC service lunarwing-darkirc-${name}"
+  fi
   # Worker babysitters: stop the supervisors so they don't respawn the stopped containers.
   for worker in nanocode pebble opencode kimi; do
     rc-service "lunarwing-${worker}-${name}-sup" stop 2>/dev/null || true
@@ -9292,6 +9300,17 @@ start_tenant() {
 
   say "=== Starting tenant: $name ==="
 
+  local darkirc_config
+  darkirc_config="$(tenant_state_dir "$name")/darkirc/darkirc_config.toml"
+  if tenant_darkirc_enabled "$name" \
+      && [[ ! -f "$darkirc_config" || -L "$darkirc_config" ]]; then
+    darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
+      && [[ -f "$DARKIRC_COMPAT_FILE" ]] \
+      || die "DarkIRC config is missing and attested helper is unavailable; run build-darkirc"
+    say "finalizing deferred DarkIRC config before start ..."
+    generate_darkirc_config "$name"
+  fi
+
   retire_tenant_nanocode "$name" \
     || die "failed to retire legacy Nanocode resources for tenant '$name'; refusing start"
 
@@ -9478,6 +9497,69 @@ migration_export_boundary() {
   shift
   name="$(sanitize_name "$name")"
   with_tenant_lifecycle_lock "$name" migration_export_boundary_locked "$name" "$@"
+}
+
+upgrade_wrapper_child() {
+  local name="$1"
+  shift
+  local -a inherited_env=(
+    "LUNARWING_MT_UPGRADE_BOUNDARY_TENANT=$name"
+    "LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD=$LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD"
+    "LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT=$name"
+    "LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD=$LUNARWING_MT_ACTIVE_UPGRADE_LOCK_FD"
+  )
+  if [[ "$DARKIRC_WRITER_LOCK_HELD" == true ]]; then
+    inherited_env+=(
+      "LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD=$DARKIRC_WRITER_LOCK_FD"
+      "LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE=$DARKIRC_WRITER_SCOPE"
+    )
+  fi
+  env "${inherited_env[@]}" "$SCRIPT_DIR/upgrade-tenant.sh" "$@"
+}
+
+upgrade_wrapper_boundary_locked() {
+  local name="$1" upgrade_lock_fd result=0
+  shift
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
+    || die "failed to open tenant upgrade lock"
+  flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
+  LUNARWING_MT_ACTIVE_UPGRADE_LOCK_FD="$upgrade_lock_fd"
+  if tenant_darkirc_enabled "$name"; then
+    with_darkirc_writer_lock "$name" upgrade_wrapper_child "$name" "$@" || result=$?
+  else
+    upgrade_wrapper_child "$name" "$@" || result=$?
+  fi
+  unset LUNARWING_MT_ACTIVE_UPGRADE_LOCK_FD
+  flock -u "$upgrade_lock_fd" || result=1
+  exec {upgrade_lock_fd}>&-
+  return "$result"
+}
+
+upgrade_wrapper_boundary() {
+  local name="$1"
+  shift
+  name="$(sanitize_name "$name")"
+  with_tenant_lifecycle_lock "$name" upgrade_wrapper_boundary_locked "$name" "$@"
+}
+
+validate_upgrade_wrapper_boundary_locked() {
+  local name="$1" upgrade_fd="${LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD:-}"
+  [[ "${LUNARWING_MT_UPGRADE_BOUNDARY_TENANT:-}" == "$name" ]] \
+    || die "upgrade wrapper boundary tenant marker mismatch"
+  inherited_lock_fd_is_held "$upgrade_fd" "${BUILD_LOCK}.${name}.upgrade" \
+    || die "invalid inherited tenant upgrade lock"
+  if tenant_darkirc_enabled "$name"; then
+    with_darkirc_writer_lock "$name" true
+  elif [[ -n "${LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD:-}${LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE:-}" ]]; then
+    die "unexpected inherited DarkIRC writer lock for disabled tenant '$name'"
+  fi
+}
+
+validate_upgrade_wrapper_boundary() {
+  local name="$1"
+  name="$(sanitize_name "$name")"
+  with_tenant_lifecycle_lock "$name" validate_upgrade_wrapper_boundary_locked "$name"
 }
 
 validate_migration_export_boundary_locked() {
@@ -10397,6 +10479,22 @@ main() {
       _lifecycle_name="$(sanitize_name "$1")"
       shift
       migration_export_boundary "$_lifecycle_name" "$@"
+      ;;
+
+    upgrade-wrapper-boundary)
+      require_root
+      [[ $# -ge 1 ]] || die "usage: upgrade-wrapper-boundary <name> [upgrade options]"
+      ports_registry_init
+      _lifecycle_name="$(sanitize_name "$1")"
+      shift
+      upgrade_wrapper_boundary "$_lifecycle_name" "$@"
+      ;;
+
+    validate-upgrade-wrapper-boundary)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: validate-upgrade-wrapper-boundary <name>"
+      ports_registry_require_readonly
+      validate_upgrade_wrapper_boundary "$1"
       ;;
 
     validate-migration-export-boundary)

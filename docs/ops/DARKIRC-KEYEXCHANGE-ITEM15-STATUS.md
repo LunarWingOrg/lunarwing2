@@ -29,6 +29,11 @@ Phase 0/1 and most Stage A are implemented. Existing capabilities include:
 - Bounded pending state and private-key reuse checks.
 - Durable tombstones and deferred activation.
 
+Installed Stage A records remain secret-bearing pending state until Stage B can
+health-gate activation. They intentionally continue to block migration and
+managed upgrade. They no longer consume the separate 128-entry active exchange
+quota; retained installed state has its own contact-count and byte bounds.
+
 Full automation remains incomplete. These surfaces stay disabled:
 
 - Stage B activation and rollback.
@@ -45,6 +50,9 @@ Full automation remains incomplete. These surfaces stay disabled:
   archives are removed.
 - H3 improved: six completion crash windows are covered. Real two-user
   isolation and live `/proc`, stdout, stderr, and journal leak tests remain open.
+- DarkFi generator execution now has a fixed deadline and combined output cap.
+  Timeout or oversized output kills the isolated process group and reaps the
+  child before exchange locks are released; focused tests pass.
 - Item 15 remains `[ ]`; its goal entry points to this status document.
 
 ## High-Severity Work
@@ -112,9 +120,9 @@ Remaining H3 evidence requires a suitable live host:
 | H2 | High | Fixed; verified 2026-08-03 | Mt-admin retains lifecycle and DarkIRC writer locks across readiness, writer stop, manifest pinning, and bundle seal. Deterministic contenders remain blocked until release. |
 | H3 | High | Partially fixed | Six Stage A completion crash windows and unit-visible secret surfaces have regressions. Real two-user isolation and live process/log leak scans remain required. |
 | M1 | Medium | Open | Daemon, helper, and compatibility attestation publish separately. Normal failures roll back, but publication is not reader-atomic or host-crash recoverable. |
-| M2 | Medium | Open | Import pins bundle content but does not reject unsafe source ownership or group/world-readable mode. |
+| M2 | Medium | Fixed; verified 2026-08-03 | Import opens the source once, accepts only root or the validated invoking sudo user as owner, rejects links and group/world access, and pins bytes through the validated descriptor. Interrupted structured imports resume only with a matching protected marker and stopped writers. |
 | M3 | Medium | Open; pre-existing | `upgrade-tenant.sh` performs legacy WeeChat `systemctl --user` cleanup directly and lacks OpenRC parity. Lifecycle belongs in mt-admin. |
-| M4 | Medium | Open | DarkFi key generation has no process timeout while the core exchange lock is held. A hung generator can block tenant key operations. |
+| M4 | Medium | Fixed; verified 2026-08-03 | DarkFi generation has a fixed runtime and combined stdout/stderr cap; timeout or overflow kills the process group and reaps the child before returning. |
 | L1 | Low | Open | `doctor` transaction-directory inspection uses ambient filesystem reads instead of capability-relative no-follow access. |
 | L2 | Low | Partially fixed | `docs/README.md` still says Phase 0 is unimplemented, while publication documentation overclaims atomicity. |
 
@@ -123,7 +131,7 @@ Remaining H3 evidence requires a suitable live host:
 Validation completed after the H1/H2 implementation and H3 regression work:
 
 - Core DarkIRC key-manager tests: 82 passed.
-- DarkIRC key-helper tests: 16 passed.
+- DarkIRC key-helper tests: 20 passed.
 - `cargo check`: passed.
 - `cargo fmt --all -- --check`: passed.
 - Targeted clippy with warnings denied: passed.
@@ -150,15 +158,13 @@ substitute for that evidence.
    process/output/journal secret-leak scans.
 2. Make daemon, helper, and attestation publication reader-coherent and
    host-crash recoverable; correct atomicity wording meanwhile.
-3. Reject migration bundles with unsafe source ownership or mode.
-4. Bound DarkFi generator runtime while the exchange lock is held.
-5. Move legacy wrapper lifecycle cleanup into mt-admin with systemd and OpenRC
+3. Move legacy wrapper lifecycle cleanup into mt-admin with systemd and OpenRC
    parity.
-6. Convert `doctor` transaction inspection to capability-relative no-follow
+4. Convert `doctor` transaction inspection to capability-relative no-follow
    reads.
-7. Reconcile stale DarkIRC status documents, then rerun targeted Rust, shell,
+5. Reconcile stale DarkIRC status documents, then rerun targeted Rust, shell,
    format, clippy, check, and required CI validation.
-8. After Stage A closes, implement Stage B, Stage C, Stage D, then optional
+6. After Stage A closes, implement Stage B, Stage C, Stage D, then optional
    delivery surfaces under their promotion gates.
 
 ## Relevant Files

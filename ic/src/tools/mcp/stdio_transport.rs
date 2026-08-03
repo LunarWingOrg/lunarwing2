@@ -213,6 +213,15 @@ impl StdioMcpTransport {
             ))
         })
     }
+
+    /// Whether stdout processing ended while child may still be alive.
+    pub async fn reader_finished(&self) -> bool {
+        self.reader_handle
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
 }
 
 #[async_trait]
@@ -242,9 +251,11 @@ impl McpTransport for StdioMcpTransport {
 
         if let Some(handle) = self.reader_handle.lock().await.take() {
             handle.abort();
+            let _ = handle.await;
         }
         if let Some(handle) = self.stderr_handle.lock().await.take() {
             handle.abort();
+            let _ = handle.await;
         }
 
         // Drain pending requests so waiters wake immediately instead of

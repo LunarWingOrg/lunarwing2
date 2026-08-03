@@ -29,7 +29,7 @@
 #   sudo ic/scripts/import-tenant.sh <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped]
 #        [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]
 #        [--with-vision] [--docker-group]
-#        [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]
+#        [--owner-scope <old_scope>] [--dry-run] [--yes] [--resume] [--force]
 # Encrypted bundles read their passphrase from KAWARIMI_PASS_FD, KAWARIMI_PASS,
 # KAWARIMI_PASS_FILE, or an interactive prompt, in that order. The passphrase is
 # fed to 7z over stdin and never placed in command argv.
@@ -76,6 +76,7 @@ OWNER_SCOPE=""
 DRY_RUN=false
 AUTO_YES=false
 FORCE=false
+RESUME=false
 MAX_BUNDLE_BYTES="${KAWARIMI_MAX_BUNDLE_BYTES:-107374182400}"
 MAX_STATE_BYTES="${KAWARIMI_MAX_STATE_BYTES:-107374182400}"
 MAX_STATE_ENTRIES="${KAWARIMI_MAX_STATE_ENTRIES:-1000000}"
@@ -97,6 +98,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)       DRY_RUN=true; shift ;;
     --yes|-y)        AUTO_YES=true; shift ;;
     --force)         FORCE=true; shift ;;
+    --resume)        RESUME=true; shift ;;
     -*)              printf 'unknown arg: %s\n' "$1" >&2; exit 2 ;;
     *)               BUNDLE="$1"; shift ;;
   esac
@@ -108,6 +110,55 @@ banner() { printf '\n========== %s ==========\n' "$*"; }
 note()   { printf '  · %s\n' "$*"; }
 confirm() { $AUTO_YES && return 0; local a; read -r -p "$1 [y/N] " a; [[ "$a" == y || "$a" == Y ]]; }
 run()    { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; return 0; fi; printf '  + %s\n' "$*"; "$@"; }
+
+bundle_owner_is_trusted() {
+  local owner="$1" sudo_uid="${SUDO_UID:-}" sudo_user="${SUDO_USER:-}" resolved_uid
+  [[ "$owner" == 0 ]] && return 0
+  [[ "$sudo_uid" =~ ^[0-9]+$ && "$sudo_uid" != 0 && -n "$sudo_user" ]] || return 1
+  resolved_uid="$(id -u -- "$sudo_user" 2>/dev/null || true)"
+  [[ "$resolved_uid" == "$sudo_uid" && "$owner" == "$sudo_uid" ]]
+}
+
+prepare_resume_marker_dir() {
+  RESUME_MARKER_DIR="$IMPORT_STAGE_ROOT/resume"
+  [[ ! -L "$RESUME_MARKER_DIR" ]] || die "Kawarimi resume marker directory is a symlink"
+  if [[ ! -e "$RESUME_MARKER_DIR" ]]; then
+    (umask 077; mkdir -- "$RESUME_MARKER_DIR") \
+      || die "could not create Kawarimi resume marker directory"
+  fi
+  [[ -d "$RESUME_MARKER_DIR" && ! -L "$RESUME_MARKER_DIR" \
+    && "$(stat -c '%u:%a' "$RESUME_MARKER_DIR" 2>/dev/null)" == "$EUID:700" ]] \
+    || die "unsafe Kawarimi resume marker directory"
+}
+
+write_resume_marker() {
+  local marker="$RESUME_MARKER_DIR/$TENANT" tmp
+  tmp="$(mktemp "$RESUME_MARKER_DIR/.${TENANT}.XXXXXX")" \
+    || die "could not create import resume marker"
+  chmod 0600 "$tmp"
+  printf 'schema=lunarwing.kawarimi-resume/v1\ntenant=%s\nscope_id=%s\nbundle_sha256=%s\n' \
+    "$TENANT" "$DARKIRC_SCOPE_ID" "$BUNDLE_SHA256" >"$tmp"
+  mv -f -- "$tmp" "$marker" || die "could not publish import resume marker"
+}
+
+validate_resume_marker() {
+  local marker="$RESUME_MARKER_DIR/$TENANT" owner mode links
+  [[ -f "$marker" && ! -L "$marker" ]] || die "no trusted partial-import marker for '$TENANT'"
+  owner="$(stat -c '%u' "$marker" 2>/dev/null || true)"
+  mode="$(stat -c '%a' "$marker" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$marker" 2>/dev/null || true)"
+  [[ "$owner" == "$EUID" && "$mode" == 600 && "$links" == 1 ]] \
+    || die "unsafe partial-import marker for '$TENANT'"
+  grep -Fqx 'schema=lunarwing.kawarimi-resume/v1' "$marker" \
+    && grep -Fqx "tenant=$TENANT" "$marker" \
+    && grep -Fqx "scope_id=$DARKIRC_SCOPE_ID" "$marker" \
+    && grep -Fqx "bundle_sha256=$BUNDLE_SHA256" "$marker" \
+    || die "partial-import marker does not match tenant, scope, and bundle"
+}
+
+clear_resume_marker() {
+  rm -f -- "$RESUME_MARKER_DIR/$TENANT"
+}
 
 stream_bundle_manifest() {
   if [[ "$BUNDLE_FORMAT" == 7z ]]; then
@@ -692,7 +743,7 @@ reconcile_owner_scope() {
   note "owner-scope continuity verified for '$TENANT'"
 }
 
-[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] [--with-vision] [--docker-group] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
+[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--resume] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] [--with-vision] [--docker-group] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
 [[ -f "$BUNDLE" ]] || die "bundle not found: $BUNDLE"
 [[ ! -L "$BUNDLE" ]] || die "bundle path must not be a symlink"
 [[ "$(id -u)" -eq 0 ]] || die "run as root (sudo) — mt-admin needs root"
@@ -704,6 +755,18 @@ case "$BUNDLE" in
   *.tar) BUNDLE_FORMAT=tar ;;
   *) die "bundle must end in .7z or .tar" ;;
 esac
+
+BUNDLE_SOURCE="$BUNDLE"
+exec {BUNDLE_SOURCE_FD}<"$BUNDLE_SOURCE" \
+  || die "could not open bundle source"
+bundle_owner="$(stat -Lc '%u' "/proc/self/fd/$BUNDLE_SOURCE_FD" 2>/dev/null || true)"
+bundle_mode="$(stat -Lc '%a' "/proc/self/fd/$BUNDLE_SOURCE_FD" 2>/dev/null || true)"
+bundle_links="$(stat -Lc '%h' "/proc/self/fd/$BUNDLE_SOURCE_FD" 2>/dev/null || true)"
+bundle_owner_is_trusted "$bundle_owner" \
+  && [[ "$bundle_mode" =~ ^[0-7]+$ && "$bundle_links" == 1 ]] \
+  || die "bundle source must be an owner-controlled single-link regular file"
+(( (8#$bundle_mode & 077) == 0 && (8#$bundle_mode & 0400) != 0 )) \
+  || die "bundle source must be owner-readable and inaccessible to group or others"
 
 MT="${LUNARWING_MT_ADMIN:-$SCRIPT_DIR/lunarwing-mt-admin.sh}"
 WEECHAT_PREFLIGHT="$SCRIPT_DIR/lunarwing-weechat-preflight.sh"
@@ -720,19 +783,19 @@ trap 'rm -rf "$WORK"' EXIT
 # Pin the caller-supplied credential bundle before any validation. Validation
 # and every later extraction then operate on the same owner-only non-/tmp copy,
 # so a writable source directory cannot swap archive contents between checks.
-BUNDLE_SOURCE="$BUNDLE"
-bundle_links="$(stat -c '%h' "$BUNDLE_SOURCE" 2>/dev/null || true)"
-[[ "$bundle_links" == 1 ]] || die "bundle must be a single-link regular file"
-bundle_size="$(stat -c '%s' "$BUNDLE_SOURCE" 2>/dev/null || true)"
+bundle_size="$(stat -Lc '%s' "/proc/self/fd/$BUNDLE_SOURCE_FD" 2>/dev/null || true)"
 [[ "$bundle_size" =~ ^[0-9]+$ ]] || die "could not inspect bundle size"
 (( bundle_size <= MAX_BUNDLE_BYTES )) \
   || die "bundle exceeds KAWARIMI_MAX_BUNDLE_BYTES"
 BUNDLE="$WORK/input.$BUNDLE_FORMAT"
-( umask 077; cp --no-dereference -- "$BUNDLE_SOURCE" "$BUNDLE" ) \
+( umask 077; cat <&"$BUNDLE_SOURCE_FD" >"$BUNDLE" ) \
   || die "could not pin bundle contents for validation"
+exec {BUNDLE_SOURCE_FD}<&-
 [[ -f "$BUNDLE" && ! -L "$BUNDLE" ]] \
   || die "bundle source changed to a non-regular file while being pinned"
 chmod 0600 "$BUNDLE"
+BUNDLE_SHA256="$(sha256sum "$BUNDLE" | cut -d' ' -f1)"
+[[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "could not hash pinned bundle"
 if [[ "$BUNDLE_FORMAT" == 7z ]]; then
   acquire_import_passphrase
   validate_7z_archive
@@ -820,6 +883,7 @@ if $HAS_DARKIRC_MANIFEST; then
     || die "$DARKIRC_MANIFEST_NAME is present without darkirc_migration=true metadata"
   [[ "$BUNDLE_DARKIRC_MANIFEST_MODE_OK" == true ]] \
     || die "$DARKIRC_MANIFEST_NAME must be a mode-0600 regular file"
+  prepare_resume_marker_dir
 fi
 if $DARKIRC_ENABLED; then
   valid_scope_id "$DARKIRC_SCOPE_ID" \
@@ -861,7 +925,7 @@ if $DARKIRC_ENABLED; then
     SCOPE_OWNER="$(jq -r --arg scope "$DARKIRC_SCOPE_ID" \
       '.tenants // {} | to_entries[] | select(.value.darkirc_scope_id == $scope) | .key' \
       "$PORTS_REGISTRY" 2>/dev/null | head -1)"
-    [[ -z "$SCOPE_OWNER" ]] \
+    [[ -z "$SCOPE_OWNER" || ( "$RESUME" == true && "$SCOPE_OWNER" == "$TENANT" ) ]] \
       || die "DarkIRC scope ID is already registered to '$SCOPE_OWNER'; refusing clone/import"
   else
     # A pristine destination has no registry yet. add-tenant will initialize it
@@ -888,8 +952,35 @@ SOURCE_MASTER_KEY="$(manifest_value SECRETS_MASTER_KEY)"
 [[ "$SOURCE_MASTER_KEY" =~ ^[0-9a-fA-F]{64}$ ]] \
   || die "bundle has a missing or invalid SECRETS_MASTER_KEY — the restored DB's encrypted secrets would be unrecoverable; abort"
 if jq -e ".tenants[\"$TENANT\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
-  $FORCE || die "tenant '$TENANT' already exists in $PORTS_REGISTRY — refusing (use --force only to re-import over it)"
-  say "WARNING: tenant '$TENANT' already exists — proceeding due to --force"
+  if $RESUME; then
+    $DARKIRC_ENABLED && $HAS_DARKIRC_MANIFEST \
+      || die "--resume is supported only for structured DarkIRC migrations"
+    existing_scope="$(jq -r --arg tenant "$TENANT" '.tenants[$tenant].darkirc_scope_id // empty' "$PORTS_REGISTRY")"
+    existing_enabled="$(jq -r --arg tenant "$TENANT" '.tenants[$tenant].enable_darkirc // false' "$PORTS_REGISTRY")"
+    [[ "$existing_enabled" == true && "$existing_scope" == "$DARKIRC_SCOPE_ID" ]] \
+      || die "existing tenant does not match resumable DarkIRC scope and enablement"
+    validate_resume_marker
+    HOME_T="$(getent passwd "$TENANT" | cut -d: -f6 2>/dev/null || true)"
+    [[ -n "$HOME_T" ]] || die "resumable tenant '$TENANT' has no OS account"
+    LWROOT="$HOME_T/lunarwing"
+    ENVF="$LWROOT/env/lunarwing.env"
+    BRIDGE_ENVF="$LWROOT/env/xmpp-bridge.env"
+    VISION_ENVF="$LWROOT/env/vision.env"
+    validate_import_target_roots
+    resume_writers_rc=0
+    "$MT" writers-active "$TENANT" >/dev/null 2>&1 || resume_writers_rc=$?
+    case "$resume_writers_rc" in
+      1) ;;
+      0) die "cannot resume while tenant '$TENANT' has active writers" ;;
+      *) die "cannot verify stopped writers for resumable tenant '$TENANT'" ;;
+    esac
+    say "resuming interrupted DarkIRC import for matching tenant '$TENANT'"
+  else
+    $FORCE || die "tenant '$TENANT' already exists in $PORTS_REGISTRY — refusing (use --resume for a matching interrupted DarkIRC import)"
+    say "WARNING: tenant '$TENANT' already exists — proceeding due to --force"
+  fi
+elif $RESUME; then
+  die "--resume requires an existing partially imported tenant"
 fi
 XMPP_JID="$(sed -n 's/^XMPP_JID=//p' "$WORK/manifest-lunarwing.env" | head -1)"; XMPP_JID="${XMPP_JID%$'\r'}"
 XMPP_ALLOW_FROM="$(manifest_value XMPP_ALLOW_FROM)"
@@ -930,7 +1021,16 @@ $DARKIRC_ENABLED && add_args+=(--enable-darkirc --darkirc-scope-id "$DARKIRC_SCO
 $WITH_PEBBLE  && add_args+=(--with-pebble)
 $WITH_OPENCODE && add_args+=(--with-opencode)
 $WITH_KIMI && add_args+=(--with-kimi)
-run "$MT" "${add_args[@]}"
+if $RESUME; then
+  note "trusted matching partial import found; skipping add-tenant"
+else
+  if ! $DRY_RUN && $HAS_DARKIRC_MANIFEST; then
+    # Publish recovery intent before provisioning: add-tenant may fail after
+    # reserving the scope, and that partial state must remain safely resumable.
+    write_resume_marker
+  fi
+  run "$MT" "${add_args[@]}"
+fi
 
 HOME_T="$(getent passwd "$TENANT" | cut -d: -f6 2>/dev/null || echo "/home/$TENANT")"
 LWROOT="$HOME_T/lunarwing"
@@ -982,8 +1082,7 @@ reconcile_owner_scope
 if $HAS_DARKIRC_MANIFEST; then
   banner "6/8  DarkIRC contacts"
   run_bundle_manifest_stdin \
-    "$MT" darkirc-contact stage-migration "$TENANT" --in -
-  run "$MT" darkirc-contact import-migration "$TENANT"
+    "$MT" darkirc-contact restore-migration "$TENANT"
   note "DarkIRC contacts imported through the target baseline and scope contract"
 fi
 unset KAWARIMI_ARCHIVE_PASS
@@ -1015,6 +1114,10 @@ run "$MT" install-wasm "$TENANT"   # lay down current v1.1.4 .wasm artifacts
 
 banner "WeeChat migration preflight"
 run "$WEECHAT_PREFLIGHT" "$TENANT"
+
+if ! $DRY_RUN && $HAS_DARKIRC_MANIFEST; then
+  clear_resume_marker
+fi
 
 # ---- 8. cutover ---------------------------------------------------------------
 banner "8/8  Cutover"

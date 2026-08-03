@@ -450,6 +450,11 @@ A repeated operation with the same offer, fingerprint, and state is
 idempotent. A different key for an active nickname is a conflict, not an
 implicit update. The caller must use the rotation flow.
 
+`Installed` Stage A records remain protected maintenance state until deferred
+Stage B performs strict health-gated promotion. They do not consume active
+pending count or byte quota, but still block migration and remain available for
+idempotent replay. Separate retained-state bounds limit their disk footprint.
+
 ### CLI Flow
 
 The implemented Stage A contract is:
@@ -666,6 +671,8 @@ easier to detect.
   service unit, shell variable printed under `set -x`, or HTTP request.
 - Do not print the raw key-generator output. Capture stdout and stderr; on
   failure, log the exit status and a sanitized category only.
+- Do not run the key generator without bounded output, a fixed deadline, and
+  kill/reap cleanup for its dedicated process group.
 - Do not write secrets to `/tmp`, a repo checkout, the LunarWing workspace, a
   world/group-readable file, a QR code, clipboard history, ticket, or chat.
 - Do not create, commit, or rely on `darkirc_keypair.yaml`. It is not the

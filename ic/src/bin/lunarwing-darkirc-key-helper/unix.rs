@@ -7,8 +7,13 @@ use std::io::{self, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use cap_fs_ext::{
     DirExt, FollowSymlinks, OpenOptionsExt as CapOpenOptionsExt, OpenOptionsFollowExt,
@@ -26,6 +31,8 @@ use lunarwing::darkirc_key_manager::{
     respond_exchange_with_generator, stage_migration, update_baseline, validate_migration,
     validate_migration_unbound,
 };
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 use rand::RngCore;
 use secrecy::SecretString;
 use serde::Serialize;
@@ -34,6 +41,9 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
 const ATTESTED_DARKIRC_PATH: &str = "/usr/local/bin/darkirc";
+const GENERATOR_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_GENERATOR_OUTPUT_BYTES: usize = 8 * 1024;
+const GENERATOR_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Default)]
 struct Options {
@@ -511,19 +521,130 @@ struct ArtifactPath {
 }
 
 fn generate_keypair() -> Result<KeypairOutput> {
-    let mut output = Command::new(ATTESTED_DARKIRC_PATH)
+    let mut command = Command::new(ATTESTED_DARKIRC_PATH);
+    command
         .arg("--gen-chacha-keypair")
         .env_clear()
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    let (mut stdout, mut stderr, success) =
+        capture_generator_output(command, GENERATOR_TIMEOUT, MAX_GENERATOR_OUTPUT_BYTES)?;
+    parse_generator_output(&mut stdout, &mut stderr, success)
+}
+
+fn capture_generator_output(
+    mut command: Command,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>, bool)> {
+    command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .map_err(KeyManagerError::Io)?;
-    parse_generator_output(
-        &mut output.stdout,
-        &mut output.stderr,
-        output.status.success(),
-    )
+        .process_group(0);
+    let mut child = command.spawn().map_err(KeyManagerError::Io)?;
+    let Some(stdout) = child.stdout.take() else {
+        kill_generator_process_group(&mut child);
+        let _ = child.wait();
+        return Err(KeyManagerError::InvalidCompatibility);
+    };
+    let Some(stderr) = child.stderr.take() else {
+        kill_generator_process_group(&mut child);
+        let _ = child.wait();
+        return Err(KeyManagerError::InvalidCompatibility);
+    };
+    let total = Arc::new(AtomicUsize::new(0));
+    let overflow = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_bounded_output_reader(
+        stdout,
+        Arc::clone(&total),
+        Arc::clone(&overflow),
+        output_limit,
+    );
+    let stderr_reader = spawn_bounded_output_reader(
+        stderr,
+        Arc::clone(&total),
+        Arc::clone(&overflow),
+        output_limit,
+    );
+    let started = Instant::now();
+    let mut forced_stop = false;
+    let status = loop {
+        if overflow.load(Ordering::Acquire) || started.elapsed() >= timeout {
+            forced_stop = true;
+            kill_generator_process_group(&mut child);
+            break child.wait();
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Close pipes held by unexpected descendants before joining readers.
+                kill_generator_process_group(&mut child);
+                break Ok(status);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                forced_stop = true;
+                kill_generator_process_group(&mut child);
+                let _ = child.wait();
+                break Err(error);
+            }
+        }
+        thread::sleep(GENERATOR_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
+    };
+    let stdout = join_output_reader(stdout_reader);
+    let stderr = join_output_reader(stderr_reader);
+    let stdout = stdout?;
+    let stderr = stderr?;
+    let status = status.map_err(KeyManagerError::Io)?;
+    if forced_stop || overflow.load(Ordering::Acquire) {
+        return Err(KeyManagerError::InvalidCompatibility);
+    }
+    Ok((stdout, stderr, status.success()))
+}
+
+fn kill_generator_process_group(child: &mut Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+fn spawn_bounded_output_reader<R>(
+    mut reader: R,
+    total: Arc<AtomicUsize>,
+    overflow: Arc<AtomicBool>,
+    output_limit: usize,
+) -> thread::JoinHandle<io::Result<Zeroizing<Vec<u8>>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Zeroizing::new(Vec::new());
+        let mut buffer = Zeroizing::new([0_u8; 4096]);
+        loop {
+            let count = reader.read(&mut *buffer)?;
+            if count == 0 {
+                return Ok(output);
+            }
+            let previous = total
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_add(count))
+                })
+                .unwrap_or(usize::MAX);
+            if previous.saturating_add(count) > output_limit {
+                overflow.store(true, Ordering::Release);
+                return Ok(output);
+            }
+            output.extend_from_slice(&buffer[..count]);
+        }
+    })
+}
+
+fn join_output_reader(
+    reader: thread::JoinHandle<io::Result<Zeroizing<Vec<u8>>>>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    reader
+        .join()
+        .map_err(|_| KeyManagerError::InvalidCompatibility)?
+        .map_err(KeyManagerError::Io)
 }
 
 fn generated_exchange_material(options: &Options) -> Result<GeneratedExchangeMaterial> {
@@ -1198,6 +1319,60 @@ mod tests {
             bs58::encode(public.as_bytes()).into_string(),
             bs58::encode(secret).into_string(),
         )
+    }
+
+    #[test]
+    fn generator_runner_captures_bounded_success_output() {
+        let (public, secret) = generator_pair();
+        let script = format!("printf 'Public: {public}\\nSecret: {secret}\\n'");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script).env_clear();
+
+        let (mut stdout, mut stderr, success) =
+            capture_generator_output(command, Duration::from_secs(1), 4096).expect("run generator");
+        let output = parse_generator_output(&mut stdout, &mut stderr, success)
+            .expect("parse captured generator output");
+
+        assert_eq!(output.public_key, public);
+    }
+
+    #[test]
+    fn generator_runner_rejects_stdout_and_stderr_over_caps() {
+        for script in ["printf '12345'", "printf '12345' >&2"] {
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(script).env_clear();
+
+            assert!(matches!(
+                capture_generator_output(command, Duration::from_secs(1), 4),
+                Err(KeyManagerError::InvalidCompatibility)
+            ));
+        }
+    }
+
+    #[test]
+    fn generator_runner_enforces_combined_output_cap() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf '123'; printf '456' >&2")
+            .env_clear();
+
+        assert!(matches!(
+            capture_generator_output(command, Duration::from_secs(1), 5),
+            Err(KeyManagerError::InvalidCompatibility)
+        ));
+    }
+
+    #[test]
+    fn generator_runner_times_out_kills_and_reaps_child() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 5").env_clear();
+        let started = Instant::now();
+
+        let result = capture_generator_output(command, Duration::from_millis(50), 4096);
+
+        assert!(matches!(result, Err(KeyManagerError::InvalidCompatibility)));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

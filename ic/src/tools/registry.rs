@@ -897,8 +897,14 @@ impl ToolRegistry {
         }
         wrapper = wrapper.with_ssh_bridge(reg.ssh_bridge);
 
-        // Register the tool
-        self.register(Arc::new(wrapper)).await;
+        // Dynamic runtimes never replace another runtime's tool implicitly.
+        // Updates must first remove their own exact prior registration.
+        if !self.register_if_vacant(Arc::new(wrapper)).await {
+            return Err(WasmError::ConfigError(format!(
+                "tool name '{}' is already registered",
+                reg.name
+            )));
+        }
 
         // Add credential mappings to the shared registry (for HTTP tool injection)
         if let Some(cr) = &self.credential_registry

@@ -1321,11 +1321,11 @@ async fn async_main() -> anyhow::Result<()> {
     // Signal background tasks (SIGHUP handler, etc.) to gracefully shut down
     let _ = shutdown_tx.send(());
 
+    lunarwing::bridge::router::shutdown_engine().await;
+
     if let Some(ref mgr) = external_worker_manager {
         mgr.drain_pool().await;
     }
-
-    lunarwing::bridge::router::shutdown_engine().await;
 
     if let Some(manager) = extension_manager_for_shutdown {
         manager.shutdown_mcp_supervisor().await;

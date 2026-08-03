@@ -9,6 +9,8 @@ IMPORT_SRC="$IC_DIR/scripts/import-tenant.sh"
 TEST_STAGE_PARENT="$IC_DIR/target"
 mkdir -p "$TEST_STAGE_PARENT"
 export KAWARIMI_IMPORT_STAGE_ROOT="$TEST_STAGE_PARENT/darkirc-import-stage.$$"
+export SUDO_UID="$(id -u)"
+export SUDO_USER="$(id -un)"
 
 failures=0
 
@@ -117,8 +119,10 @@ chmod +x "$tmp/scripts/lunarwing-weechat-preflight.sh"
 
 cat >"$tmp/bin/id" <<'ID'
 #!/usr/bin/env bash
-if [[ "${1:-}" == "-u" ]]; then
+if [[ "${1:-}" == "-u" && $# -eq 1 ]]; then
   printf '0\n'
+elif [[ "${1:-}" == "-u" && "${2:-}" == -- && "${3:-}" == "${SUDO_USER:-}" ]]; then
+  printf '%s\n' "${SUDO_UID:?}"
 else
   exec /usr/bin/id "$@"
 fi
@@ -145,6 +149,7 @@ SECRETS_MASTER_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ENV
 printf 'secret contact material\n' >"$tmp/bundle/state/darkirc/darkirc_config.toml"
 tar cf "$tmp/unsafe.tar" -C "$tmp/bundle" .
+chmod 0600 "$tmp/unsafe.tar"
 printf '{"tenants":{}}\n' >"$tmp/ports.json"
 
 if PATH="$tmp/bin:$PATH" \
@@ -181,6 +186,7 @@ cp "$tmp/bundle/meta.txt" "$tmp/bundle/db.dump" \
 tar cf "$tmp/aliased-duplicate.tar" -C "$tmp/aliased-duplicate-src" .
 tar --append --file "$tmp/aliased-duplicate.tar" \
   --transform='s#^\./#././#' -C "$tmp/aliased-duplicate-src" ./meta.txt
+chmod 0600 "$tmp/aliased-duplicate.tar"
 : >"$tmp/mt.log"
 if PATH="$tmp/bin:$PATH" \
    LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
@@ -214,6 +220,7 @@ META
   cp "$tmp/bundle/manifest-lunarwing.env" "$root/manifest-lunarwing.env"
   tar czf "$root/state.tar.gz" -C "$archive_source" .
   tar cf "$root.tar" -C "$root" .
+  chmod 0600 "$root.tar"
 }
 
 assert_import_rejected_before_mutation() {
@@ -263,6 +270,7 @@ SECRETS_MASTER_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 UNEXPECTED_IMPORT_KEY=must-be-rejected
 ENV
 tar cf "$tmp/invalid-manifest.tar" -C "$tmp/invalid-manifest" .
+chmod 0600 "$tmp/invalid-manifest.tar"
 assert_import_rejected_before_mutation \
   "import rejects dotenv keys outside the carried allowlist" \
   "$tmp/invalid-manifest.tar" "$tmp/invalid-manifest.out"
@@ -305,7 +313,7 @@ case "${1:-}" in
     ;;
   validate-migration-export-boundary) validate_boundary "$2"; exit 0 ;;
   stop-writers) exit 0 ;;
-  writers-active) exit 1 ;;
+  writers-active) [[ -e "${STRUCTURED_TEST_WORK:?}/writers-active" ]] && exit 0 || exit 1 ;;
   *) exit 0 ;;
 esac
 MT
@@ -565,7 +573,13 @@ rm -rf "$export_tmp"
 
 echo "=== structured DarkIRC import is contact-only and same-scope ==="
 structured_tmp="$(mktemp -d)"
-mkdir -p "$structured_tmp/scripts" "$structured_tmp/bin" "$structured_tmp/home/alpha/lunarwing/env"
+export STRUCTURED_FIXTURE_UID="$(id -u)"
+mkdir -p "$structured_tmp/scripts" "$structured_tmp/bin" \
+  "$structured_tmp/home/alpha/lunarwing/env" \
+  "$structured_tmp/home/alpha/lunarwing/state"
+chmod 0700 "$structured_tmp/home/alpha/lunarwing" \
+  "$structured_tmp/home/alpha/lunarwing/env" \
+  "$structured_tmp/home/alpha/lunarwing/state"
 cp "$IMPORT_SRC" "$structured_tmp/scripts/import-tenant.sh"
 chmod +x "$structured_tmp/scripts/import-tenant.sh"
 cat >"$structured_tmp/scripts/lunarwing-mt-admin.sh" <<'MT'
@@ -577,12 +591,18 @@ case "${1:-}" in
   darkirc-scope-id) ;;
   stage-migration) ;;
   import-migration) ;;
+  writers-active) [[ -e "${STRUCTURED_TEST_WORK:?}/writers-active" ]] && exit 0 || exit 1 ;;
+  add-tenant) exit 97 ;;
 esac
 printf '%s\n' "$*" >> "${STRUCTURED_TEST_WORK:?}/mt.log"
 if [[ "${1:-}" == darkirc-contact && "${2:-}" == validate-migration ]]; then
   : >"${STRUCTURED_TEST_WORK:?}/helper-install-attempted"
   cat >/dev/null
   printf '{"scope_id":"00112233445566778899aabbccddeeff"}\n'
+  exit 0
+fi
+if [[ "${1:-}" == darkirc-contact && "${2:-}" == restore-migration ]]; then
+  cat >/dev/null
   exit 0
 fi
 case "${1:-}" in
@@ -597,7 +617,19 @@ PREFLIGHT
 chmod +x "$structured_tmp/scripts/lunarwing-mt-admin.sh" "$structured_tmp/scripts/lunarwing-weechat-preflight.sh"
 cat >"$structured_tmp/bin/id" <<'ID'
 #!/usr/bin/env bash
-if [[ "${1:-}" == -u ]]; then printf '0\n'; else exec /usr/bin/id "$@"; fi
+if [[ "${1:-}" == -u && $# -eq 1 ]]; then
+  if [[ "${FAKE_TENANT_SUDO:-}" == 1 ]]; then
+    printf '%s\n' "${STRUCTURED_FIXTURE_UID:?}"
+  else
+    printf '0\n'
+  fi
+elif [[ "${1:-}" == -u && "${2:-}" == alpha ]]; then
+  printf '%s\n' "${STRUCTURED_FIXTURE_UID:?}"
+elif [[ "${1:-}" == -u && "${2:-}" == -- && "${3:-}" == fixture-operator ]]; then
+  printf '4242\n'
+else
+  exec /usr/bin/id "$@"
+fi
 ID
 chmod +x "$structured_tmp/bin/id"
 cat >"$structured_tmp/bin/getent" <<GETENT
@@ -609,6 +641,15 @@ else
 fi
 GETENT
 chmod +x "$structured_tmp/bin/getent"
+cat >"$structured_tmp/bin/sudo" <<'SUDO'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -u ]]; then shift 2; fi
+exec env FAKE_TENANT_SUDO=1 "$@"
+SUDO
+chmod +x "$structured_tmp/bin/sudo"
+printf 'GATEWAY_AUTH_TOKEN=fixture\n' >"$structured_tmp/home/alpha/lunarwing/env/lunarwing.env"
+printf 'XMPP_JID=alpha@example.invalid\n' >"$structured_tmp/home/alpha/lunarwing/env/xmpp-bridge.env"
+chmod 0600 "$structured_tmp/home/alpha/lunarwing/env/"*.env
 printf '{"tenants":{}}\n' >"$structured_tmp/ports.json"
 cat >"$structured_tmp/bundle-src-meta" <<'META'
 tenant=alpha
@@ -639,6 +680,7 @@ mv "$structured_tmp/bundle-src-db.dump" "$structured_tmp/bundle-src/db.dump"
 mv "$structured_tmp/bundle-src-env" "$structured_tmp/bundle-src/manifest-lunarwing.env"
 mv "$structured_tmp/bundle-src-manifest" "$structured_tmp/bundle-src/darkirc-contacts-v1.json"
 tar cf "$structured_tmp/structured.tar" -C "$structured_tmp/bundle-src" .
+chmod 0600 "$structured_tmp/structured.tar"
 
 structured_output="$(
   PATH="$structured_tmp/bin:$PATH" \
@@ -650,7 +692,7 @@ structured_output="$(
   fail "structured DarkIRC import dry-run succeeds"
 }
 assert_contains "structured import preserves source scope" "$structured_output" "--darkirc-scope-id 00112233445566778899aabbccddeeff"
-assert_contains "structured import stages manifest via stdin" "$structured_output" "stage-migration alpha --in - < darkirc-contacts-v1.json"
+assert_contains "structured import restores manifest under one lock" "$structured_output" "restore-migration alpha < darkirc-contacts-v1.json"
 assert_contains "structured dry-run reports deferred typed validation" "$structured_output" "would typed-validate darkirc-contacts-v1.json"
 if [[ -e "$structured_tmp/helper-install-attempted" ]]; then
   fail "structured import dry-run does not install or build the DarkIRC helper"
@@ -664,6 +706,7 @@ structured_passphrase="structured-darkirc-test-passphrase"
   { printf '%s\n%s\n' "$structured_passphrase" "$structured_passphrase"; } \
     | 7z a -t7z -mhe=on -p "$structured_tmp/structured.7z" ./* >/dev/null
 )
+chmod 0600 "$structured_tmp/structured.7z"
 encrypted_structured_output="$(
   PATH="$structured_tmp/bin:$PATH" \
   LUNARWING_PORTS_REGISTRY="$structured_tmp/ports.json" \
@@ -678,7 +721,154 @@ encrypted_structured_output="$(
 assert_contains "encrypted structured import preserves source scope" \
   "$encrypted_structured_output" "--darkirc-scope-id 00112233445566778899aabbccddeeff"
 assert_contains "encrypted structured import keeps manifest out of extraction" \
-  "$encrypted_structured_output" "stage-migration alpha --in - < darkirc-contacts-v1.json"
+  "$encrypted_structured_output" "restore-migration alpha < darkirc-contacts-v1.json"
+
+cp "$structured_tmp/structured.tar" "$structured_tmp/unsafe-mode.tar"
+chmod 0644 "$structured_tmp/unsafe-mode.tar"
+if PATH="$structured_tmp/bin:$PATH" \
+   LUNARWING_PORTS_REGISTRY="$structured_tmp/ports.json" \
+   STRUCTURED_TEST_WORK="$structured_tmp" \
+   bash "$structured_tmp/scripts/import-tenant.sh" "$structured_tmp/unsafe-mode.tar" \
+     --dry-run --yes --old-stopped >"$structured_tmp/unsafe-mode.out" 2>&1; then
+  fail "import rejects group/world-readable bundle source"
+elif ! grep -Fq 'inaccessible to group or others' "$structured_tmp/unsafe-mode.out"; then
+  fail "unsafe bundle mode is rejected before archive processing"
+else
+  pass "import rejects group/world-readable bundle source before archive processing"
+fi
+
+cat >"$structured_tmp/bin/stat" <<'STAT'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -Lc && "${2:-}" == %u && "${3:-}" == /proc/self/fd/* ]]; then
+  printf '4242\n'
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+STAT
+chmod +x "$structured_tmp/bin/stat"
+if SUDO_UID=4242 SUDO_USER=fixture-operator \
+   PATH="$structured_tmp/bin:$PATH" \
+   LUNARWING_PORTS_REGISTRY="$structured_tmp/ports.json" \
+   STRUCTURED_TEST_WORK="$structured_tmp" \
+   bash "$structured_tmp/scripts/import-tenant.sh" "$structured_tmp/structured.tar" \
+     --dry-run --yes --old-stopped >"$structured_tmp/sudo-owner.out" 2>&1; then
+  pass "import accepts bundle owned by validated invoking SUDO_UID"
+else
+  fail "import accepts bundle owned by validated invoking SUDO_UID"
+fi
+
+cat >"$structured_tmp/bin/stat" <<'STAT'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -Lc && "${2:-}" == %u && "${3:-}" == /proc/self/fd/* ]]; then
+  printf '65534\n'
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+STAT
+chmod +x "$structured_tmp/bin/stat"
+if PATH="$structured_tmp/bin:$PATH" \
+   LUNARWING_PORTS_REGISTRY="$structured_tmp/ports.json" \
+   STRUCTURED_TEST_WORK="$structured_tmp" \
+   bash "$structured_tmp/scripts/import-tenant.sh" "$structured_tmp/structured.tar" \
+     --dry-run --yes --old-stopped >"$structured_tmp/unsafe-owner.out" 2>&1; then
+  fail "import rejects bundle source owned by another user"
+elif ! grep -Fq 'owner-controlled' "$structured_tmp/unsafe-owner.out"; then
+  fail "unsafe bundle owner is rejected before archive processing"
+else
+  pass "import rejects unsafe bundle owner before archive processing"
+fi
+rm -f "$structured_tmp/bin/stat"
+
+cat >"$structured_tmp/ports.json" <<'JSON'
+{"tenants":{"alpha":{"enable_darkirc":true,"darkirc_scope_id":"00112233445566778899aabbccddeeff"}}}
+JSON
+mkdir -p "$KAWARIMI_IMPORT_STAGE_ROOT/resume"
+chmod 0700 "$KAWARIMI_IMPORT_STAGE_ROOT/resume"
+structured_digest="$(sha256sum "$structured_tmp/structured.tar" | cut -d' ' -f1)"
+cat >"$KAWARIMI_IMPORT_STAGE_ROOT/resume/alpha" <<MARKER
+schema=lunarwing.kawarimi-resume/v1
+tenant=alpha
+scope_id=00112233445566778899aabbccddeeff
+bundle_sha256=$structured_digest
+MARKER
+chmod 0600 "$KAWARIMI_IMPORT_STAGE_ROOT/resume/alpha"
+resume_output="$(
+  PATH="$structured_tmp/bin:$PATH" \
+  LUNARWING_PORTS_REGISTRY="$structured_tmp/ports.json" \
+  STRUCTURED_TEST_WORK="$structured_tmp" \
+  bash "$structured_tmp/scripts/import-tenant.sh" "$structured_tmp/structured.tar" \
+    --dry-run --yes --old-stopped --resume 2>&1
+)" || {
+  printf '%s\n' "$resume_output"
+  fail "matching interrupted DarkIRC import can resume"
+}
+assert_contains "resume accepts exact existing DarkIRC scope" \
+  "$resume_output" "resuming interrupted DarkIRC import"
+assert_contains "resume uses one restore transaction" \
+  "$resume_output" "restore-migration alpha < darkirc-contacts-v1.json"
+
+touch "$structured_tmp/writers-active"
+if PATH="$structured_tmp/bin:$PATH" \
+   LUNARWING_PORTS_REGISTRY="$structured_tmp/ports.json" \
+   STRUCTURED_TEST_WORK="$structured_tmp" \
+   bash "$structured_tmp/scripts/import-tenant.sh" "$structured_tmp/structured.tar" \
+     --dry-run --yes --old-stopped --resume >"$structured_tmp/active-resume.out" 2>&1; then
+  fail "resume rejects partial tenant with active writers"
+  cat "$structured_tmp/active-resume.out"
+else
+  pass "resume rejects partial tenant with active writers"
+fi
+rm -f "$structured_tmp/writers-active"
+
+: >"$structured_tmp/mt.log"
+if PATH="$structured_tmp/bin:$PATH" \
+   LUNARWING_PORTS_REGISTRY="$structured_tmp/ports.json" \
+   STRUCTURED_TEST_WORK="$structured_tmp" \
+   bash "$structured_tmp/scripts/import-tenant.sh" "$structured_tmp/structured.tar" \
+     --yes --old-stopped --resume >"$structured_tmp/resume-live.out" 2>&1; then
+  if grep -Fq 'add-tenant' "$structured_tmp/mt.log"; then
+    fail "non-dry-run resume called add-tenant"
+  elif ! grep -Fq 'darkirc-contact restore-migration alpha' "$structured_tmp/mt.log"; then
+    fail "non-dry-run resume did not reach restore-migration"
+  else
+    pass "non-dry-run resume skips add-tenant and reaches restore-migration"
+  fi
+else
+  fail "non-dry-run matching partial import resumes"
+  cat "$structured_tmp/resume-live.out"
+fi
+
+if PATH="$structured_tmp/bin:$PATH" \
+   LUNARWING_PORTS_REGISTRY="$structured_tmp/ports.json" \
+   STRUCTURED_TEST_WORK="$structured_tmp" \
+   bash "$structured_tmp/scripts/import-tenant.sh" "$structured_tmp/structured.tar" \
+     --dry-run --yes --old-stopped --resume >"$structured_tmp/no-marker.out" 2>&1; then
+  fail "resume rejects matching tenant without trusted partial marker"
+else
+  pass "resume rejects matching tenant without trusted partial marker"
+fi
+
+# Recreate marker for mismatch rejection after successful resume cleared it.
+cat >"$KAWARIMI_IMPORT_STAGE_ROOT/resume/alpha" <<MARKER
+schema=lunarwing.kawarimi-resume/v1
+tenant=alpha
+scope_id=00112233445566778899aabbccddeeff
+bundle_sha256=$structured_digest
+MARKER
+chmod 0600 "$KAWARIMI_IMPORT_STAGE_ROOT/resume/alpha"
+cat >"$structured_tmp/ports.json" <<'JSON'
+{"tenants":{"alpha":{"enable_darkirc":true,"darkirc_scope_id":"ffeeddccbbaa99887766554433221100"}}}
+JSON
+if PATH="$structured_tmp/bin:$PATH" \
+   LUNARWING_PORTS_REGISTRY="$structured_tmp/ports.json" \
+   STRUCTURED_TEST_WORK="$structured_tmp" \
+   bash "$structured_tmp/scripts/import-tenant.sh" "$structured_tmp/structured.tar" \
+     --dry-run --yes --old-stopped --resume >"$structured_tmp/wrong-resume.out" 2>&1; then
+  fail "resume rejects existing tenant with different DarkIRC scope"
+else
+  pass "resume rejects mismatched existing DarkIRC scope"
+fi
+printf '{"tenants":{}}\n' >"$structured_tmp/ports.json"
 
 rm -f "$structured_tmp/mt.log"
 if PATH="$structured_tmp/bin:$PATH" \

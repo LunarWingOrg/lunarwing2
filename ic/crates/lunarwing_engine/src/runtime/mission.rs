@@ -7,7 +7,10 @@
 use std::{
     collections::HashMap,
     str::FromStr,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use chrono::{DateTime, Utc};
@@ -128,6 +131,8 @@ pub struct MissionManager {
     notification_tx: tokio::sync::broadcast::Sender<MissionNotification>,
     /// Host-provided prompt guidance keyed by channel name.
     channel_contexts: RwLock<HashMap<String, String>>,
+    /// Runtime feature gate captured during bootstrap and explicit reconciliation.
+    self_improvement_enabled: AtomicBool,
     /// Cancellation and handles for ticker, listener, and outcome watchers.
     task_cancel: CancellationToken,
     task_handles: Mutex<Vec<JoinHandle<()>>>,
@@ -211,6 +216,7 @@ impl MissionManager {
             fire_locks: Arc::new(Mutex::new(HashMap::new())),
             notification_tx,
             channel_contexts: RwLock::new(HashMap::new()),
+            self_improvement_enabled: AtomicBool::new(crate::skill_self_improvement_enabled()),
             task_cancel: CancellationToken::new(),
             task_handles: Mutex::new(Vec::new()),
         }
@@ -240,21 +246,27 @@ impl MissionManager {
     pub async fn shutdown(&self) {
         self.task_cancel.cancel();
         let handles = std::mem::take(&mut *self.task_handles.lock().await);
-        let abort_handles = handles
-            .iter()
-            .map(JoinHandle::abort_handle)
-            .collect::<Vec<_>>();
+        if tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while handles.iter().any(|handle| !handle.is_finished()) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            warn!("mission background tasks did not stop before timeout; aborting them");
+            for handle in &handles {
+                handle.abort();
+            }
+        }
         if tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(1),
             futures::future::join_all(handles),
         )
         .await
         .is_err()
         {
-            warn!("mission background tasks did not stop before timeout; aborting them");
-            for handle in abort_handles {
-                handle.abort();
-            }
+            warn!("aborted mission background tasks did not join before timeout");
         }
     }
 
@@ -281,7 +293,11 @@ impl MissionManager {
     pub async fn bootstrap_project(&self, project_id: ProjectId) -> Result<usize, EngineError> {
         // System operation: load all missions for the project regardless of user.
         let missions = self.store.list_all_missions(project_id).await?;
-        self.bootstrap_from_missions(missions).await
+        let self_improvement_on = crate::skill_self_improvement_enabled();
+        self.self_improvement_enabled
+            .store(self_improvement_on, Ordering::Relaxed);
+        self.bootstrap_from_missions(missions, self_improvement_on)
+            .await
     }
 
     /// Load all active missions across all projects into the active index.
@@ -290,19 +306,44 @@ impl MissionManager {
     /// adds missions from other projects/users that would otherwise remain
     /// inactive after restart.
     pub async fn bootstrap_all_projects(&self) -> Result<usize, EngineError> {
+        self.bootstrap_all_projects_with_gate(crate::skill_self_improvement_enabled())
+            .await
+    }
+
+    async fn bootstrap_all_projects_with_gate(
+        &self,
+        self_improvement_on: bool,
+    ) -> Result<usize, EngineError> {
+        self.self_improvement_enabled
+            .store(self_improvement_on, Ordering::Relaxed);
         let missions = self.store.list_all_active_missions_global().await?;
         let existing: Vec<MissionId> = self.active.read().await.clone();
         let new_missions: Vec<Mission> = missions
             .into_iter()
-            .filter(|m| !existing.contains(&m.id))
+            .filter(|mission| {
+                !existing.contains(&mission.id)
+                    || (!self_improvement_on && is_self_improvement_mission(mission))
+            })
             .collect();
-        self.bootstrap_from_missions(new_missions).await
+        self.bootstrap_from_missions(new_missions, self_improvement_on)
+            .await
     }
 
-    async fn bootstrap_from_missions(&self, missions: Vec<Mission>) -> Result<usize, EngineError> {
+    async fn bootstrap_from_missions(
+        &self,
+        missions: Vec<Mission>,
+        self_improvement_on: bool,
+    ) -> Result<usize, EngineError> {
         let mut active_ids = Vec::new();
         for mut mission in missions {
             if mission.status != MissionStatus::Active {
+                continue;
+            }
+            if !self_improvement_on && is_self_improvement_mission(&mission) {
+                mission.status = MissionStatus::Paused;
+                mission.updated_at = Utc::now();
+                self.store.save_mission(&mission).await?;
+                self.active.write().await.retain(|id| *id != mission.id);
                 continue;
             }
             let mut changed = false;
@@ -476,7 +517,9 @@ impl MissionManager {
                 entity: format!("mission {id}"),
             });
         }
-        if is_self_improvement_mission(&mission) && !crate::skill_self_improvement_enabled() {
+        if is_self_improvement_mission(&mission)
+            && !self.self_improvement_enabled.load(Ordering::Relaxed)
+        {
             return Err(EngineError::Effect {
                 reason: "self-improvement is disabled".into(),
             });
@@ -617,7 +660,9 @@ impl MissionManager {
             debug!(mission_id = %id, "cannot fire paused mission");
             return Ok(None);
         }
-        if is_self_improvement_mission(&mission) && !crate::skill_self_improvement_enabled() {
+        if is_self_improvement_mission(&mission)
+            && !self.self_improvement_enabled.load(Ordering::Relaxed)
+        {
             debug!(mission_id = %id, "self-improvement disabled; mission suppressed");
             return Ok(None);
         }
@@ -1092,7 +1137,8 @@ impl MissionManager {
                                 .take(10)
                                 .collect();
 
-                            let self_improvement_on = crate::skill_self_improvement_enabled();
+                            let self_improvement_on =
+                                mgr.self_improvement_enabled.load(Ordering::Relaxed);
 
                             let active_skills = if self_improvement_on {
                                 collect_patch_candidate_skills(mgr.store.as_ref(), &thread).await
@@ -1126,7 +1172,7 @@ impl MissionManager {
                         // Maintenance has its own event so informational trace
                         // observations and unrelated failures do not consume its
                         // daily budget. Fire only when work exists.
-                        if crate::skill_self_improvement_enabled() {
+                        if mgr.self_improvement_enabled.load(Ordering::Relaxed) {
                             let candidates = collect_prune_candidate_skills(
                                 mgr.store.as_ref(),
                                 thread.project_id,
@@ -1354,6 +1400,8 @@ impl MissionManager {
         user_id: &str,
         self_improvement_on: bool,
     ) -> Result<(), EngineError> {
+        self.self_improvement_enabled
+            .store(self_improvement_on, Ordering::Relaxed);
         // 0. Seed compiled-in orchestrator v0 so it's visible in workspace
         self.seed_orchestrator_v0(project_id).await?;
 
@@ -2447,6 +2495,16 @@ mod tests {
                 .await
                 .values()
                 .filter(|m| m.project_id == project_id)
+                .cloned()
+                .collect())
+        }
+        async fn list_all_active_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
+            Ok(self
+                .missions
+                .read()
+                .await
+                .values()
+                .filter(|mission| mission.status == MissionStatus::Active)
                 .cloned()
                 .collect())
         }
@@ -3994,9 +4052,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_cancels_and_joins_mission_background_tasks() {
+    async fn disabled_self_improvement_reconciles_active_missions_across_projects() {
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_a = ProjectId::new();
+        let project_b = ProjectId::new();
+
+        let mut mission_a = Mission::new(
+            project_a,
+            "test-user",
+            "self-improvement-a",
+            "improve a",
+            MissionCadence::Manual,
+        );
+        mission_a.metadata = serde_json::json!({"self_improvement": true});
+        let mut mission_b = Mission::new(
+            project_b,
+            "test-user",
+            "self-improvement-b",
+            "improve b",
+            MissionCadence::Manual,
+        );
+        mission_b.metadata = serde_json::json!({"self_improvement": true});
+        let regular = Mission::new(
+            project_b,
+            "test-user",
+            "regular",
+            "stay active",
+            MissionCadence::Manual,
+        );
+        for mission in [&mission_a, &mission_b, &regular] {
+            store.save_mission(mission).await.unwrap();
+        }
+
+        let active_count = mgr.bootstrap_all_projects_with_gate(false).await.unwrap();
+
+        assert_eq!(active_count, 1);
+        assert_eq!(
+            store
+                .load_mission(mission_a.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MissionStatus::Paused
+        );
+        assert_eq!(
+            store
+                .load_mission(mission_b.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MissionStatus::Paused
+        );
+        assert_eq!(*mgr.active.read().await, vec![regular.id]);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_and_joins_mission_background_tasks() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
 
         mgr.start_cron_ticker("test-user".into()).await;
         mgr.start_event_listener("test-user".into()).await;

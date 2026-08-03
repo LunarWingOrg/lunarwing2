@@ -293,6 +293,11 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether this exact registration is backed by WASM runtime.
+    fn is_wasm_tool(&self) -> bool {
+        false
+    }
+
     /// Execute the tool with the given parameters.
     async fn execute(
         &self,

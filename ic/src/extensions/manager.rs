@@ -160,6 +160,23 @@ const MCP_RESTART_STABILITY_WINDOW: Duration = Duration::from_secs(30);
 const MCP_RECOVERY_STEP_TIMEOUT: Duration = Duration::from_secs(45);
 const MCP_SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+async fn join_or_abort_tasks(
+    handles: &mut [tokio::task::JoinHandle<()>],
+    timeout: Duration,
+) -> bool {
+    if tokio::time::timeout(timeout, futures::future::join_all(handles.iter_mut()))
+        .await
+        .is_ok()
+    {
+        return false;
+    }
+    for handle in handles.iter() {
+        handle.abort();
+    }
+    let _ = futures::future::join_all(handles.iter_mut()).await;
+    true
+}
+
 fn mcp_restart_backoff(attempt: u32) -> Duration {
     let exponent = attempt.saturating_sub(1).min(6);
     let capped = MCP_RESTART_BACKOFF_BASE
@@ -458,6 +475,7 @@ impl ExtensionManager {
             {
                 tracing::warn!("MCP supervisor did not stop before timeout; aborting task");
                 supervisor.abort();
+                let _ = supervisor.await;
             }
         }
 
@@ -468,22 +486,12 @@ impl ExtensionManager {
         for task in &tasks {
             task.cancel.cancel();
         }
-        let abort_handles = tasks
-            .iter()
-            .map(|task| task.handle.abort_handle())
+        let mut handles = tasks
+            .into_iter()
+            .map(|task| task.handle)
             .collect::<Vec<_>>();
-        let handles = tasks.into_iter().map(|task| task.handle);
-        if tokio::time::timeout(
-            MCP_SUPERVISOR_SHUTDOWN_TIMEOUT,
-            futures::future::join_all(handles),
-        )
-        .await
-        .is_err()
-        {
+        if join_or_abort_tasks(&mut handles, MCP_SUPERVISOR_SHUTDOWN_TIMEOUT).await {
             tracing::warn!("MCP recovery tasks did not stop before timeout; aborting them");
-            for handle in abort_handles {
-                handle.abort();
-            }
         }
     }
 
@@ -1375,12 +1383,12 @@ impl ExtensionManager {
                             needs_setup: false,
                             has_auth: false,
                             installed: true,
-                            activation_error: (health == Some(McpRuntimeHealth::CircuitOpen)).then(
-                                || {
+                            activation_error: (health == Some(McpRuntimeHealth::CircuitOpen)
+                                || server.recovery_circuit_open)
+                                .then(|| {
                                     "Automatic recovery stopped after repeated crashes; activate manually to retry"
                                         .to_string()
-                                },
-                            ),
+                                }),
                             version: None,
                         });
                     }
@@ -1576,8 +1584,13 @@ impl ExtensionManager {
                 Ok(message)
             }
             ExtensionKind::WasmTool => {
-                // Unregister from tool registry
-                self.tool_registry.unregister(name).await;
+                // Remove only exact WASM registration. Other runtimes may use
+                // same name and must retain their ownership.
+                if let Some(tool) = self.tool_registry.get(name).await
+                    && tool.is_wasm_tool()
+                {
+                    self.tool_registry.unregister_if_same(name, &tool).await;
+                }
 
                 // Evict compiled module from runtime cache so reinstall uses fresh binary
                 if let Some(ref rt) = self.wasm_tool_runtime {
@@ -2042,6 +2055,24 @@ impl ExtensionManager {
         .map_err(|error| ExtensionError::Config(error.to_string()))
     }
 
+    async fn persist_mcp_recovery_circuit_open(
+        &self,
+        user_id: &str,
+        name: &str,
+    ) -> Result<(), ExtensionError> {
+        if let Some(ref store) = self.store {
+            crate::tools::mcp::config::mark_mcp_recovery_circuit_open_db(
+                store.as_ref(),
+                user_id,
+                name,
+            )
+            .await
+        } else {
+            crate::tools::mcp::config::mark_mcp_recovery_circuit_open(name).await
+        }
+        .map_err(|error| ExtensionError::Config(error.to_string()))
+    }
+
     async fn rollback_failed_mcp_activation(
         &self,
         user_id: &str,
@@ -2135,6 +2166,9 @@ impl ExtensionManager {
                     Ok(crate::tools::mcp::McpProcessState::Running) => {
                         return McpRecoveryClaim::Skip;
                     }
+                    Ok(crate::tools::mcp::McpProcessState::StdioClosed) => {
+                        tracing::warn!(server = %candidate.name, "Host-local MCP server stdio closed unexpectedly");
+                    }
                     Ok(crate::tools::mcp::McpProcessState::Exited(status)) => {
                         tracing::warn!(server = %candidate.name, %status, "Host-local MCP server exited unexpectedly");
                     }
@@ -2152,26 +2186,21 @@ impl ExtensionManager {
             return McpRecoveryClaim::Skip;
         };
         let dead_tools = runtime.tools.clone();
-        if health == McpRuntimeHealth::RetryPending {
-            runtime.health = McpRuntimeHealth::Recovering;
-            runtime.retry_after = None;
-            return McpRecoveryClaim::Recover(dead_tools);
-        }
-
-        if runtime.healthy_since.elapsed() >= MCP_RESTART_STABILITY_WINDOW {
+        if health == McpRuntimeHealth::Healthy
+            && runtime.healthy_since.elapsed() >= MCP_RESTART_STABILITY_WINDOW
+        {
             runtime.restart_attempts = 0;
         }
-        runtime.restart_attempts = runtime.restart_attempts.saturating_add(1);
-        let attempts = runtime.restart_attempts;
         runtime.retry_after = None;
-        if attempts > MCP_RESTART_MAX_ATTEMPTS {
+        if runtime.restart_attempts >= MCP_RESTART_MAX_ATTEMPTS {
             runtime.health = McpRuntimeHealth::CircuitOpen;
             return McpRecoveryClaim::CircuitOpen {
                 dead_tools,
-                attempts,
+                attempts: runtime.restart_attempts,
             };
         }
-        if attempts > 1 {
+        let attempts = runtime.restart_attempts + 1;
+        if health == McpRuntimeHealth::Healthy && attempts > 1 {
             let delay = mcp_restart_backoff(attempts);
             runtime.health = McpRuntimeHealth::RetryPending;
             runtime.retry_after = Some(Instant::now() + delay);
@@ -2181,6 +2210,7 @@ impl ExtensionManager {
                 delay,
             };
         }
+        runtime.restart_attempts = attempts;
         runtime.health = McpRuntimeHealth::Recovering;
         McpRecoveryClaim::Recover(dead_tools)
     }
@@ -2360,16 +2390,15 @@ impl ExtensionManager {
         }) else {
             return;
         };
-        runtime.restart_attempts = runtime.restart_attempts.saturating_add(1);
         let attempts = runtime.restart_attempts;
-        if attempts > MCP_RESTART_MAX_ATTEMPTS {
+        if attempts >= MCP_RESTART_MAX_ATTEMPTS {
             runtime.health = McpRuntimeHealth::CircuitOpen;
             runtime.retry_after = None;
             drop(runtimes);
             self.open_mcp_recovery_circuit(candidate, attempts).await;
             return;
         }
-        let delay = mcp_restart_backoff(attempts);
+        let delay = mcp_restart_backoff(attempts.saturating_add(1));
         runtime.health = McpRuntimeHealth::RetryPending;
         runtime.retry_after = Some(Instant::now() + delay);
         drop(runtimes);
@@ -2396,6 +2425,12 @@ impl ExtensionManager {
     }
 
     async fn open_mcp_recovery_circuit(&self, candidate: &McpRecoveryCandidate, attempts: u32) {
+        if let Err(error) = self
+            .persist_mcp_recovery_circuit_open(&candidate.owner_id, &candidate.name)
+            .await
+        {
+            tracing::warn!(server = %candidate.name, %error, "Failed to persist MCP recovery circuit state");
+        }
         let client = self
             .active_mcp_servers
             .read()
@@ -4377,8 +4412,14 @@ impl ExtensionManager {
         name: &str,
         user_id: &str,
     ) -> Result<ActivateResult, ExtensionError> {
-        // Check if already active
-        if self.tool_registry.has(name).await {
+        // Check if already active without treating another runtime's name as
+        // this WASM tool's registration.
+        if let Some(registered) = self.tool_registry.get(name).await {
+            if !registered.is_wasm_tool() {
+                return Err(ExtensionError::ActivationFailed(format!(
+                    "Tool name '{name}' is owned by another runtime"
+                )));
+            }
             return Ok(ActivateResult {
                 name: name.to_string(),
                 kind: ExtensionKind::WasmTool,
@@ -5972,7 +6013,7 @@ mod tests {
     use crate::extensions::ExtensionManager;
     use crate::extensions::manager::{
         FallbackDecision, McpRuntimeHealth, build_wasm_channel_runtime_config_updates,
-        combine_install_errors, fallback_decision, infer_kind_from_url,
+        combine_install_errors, fallback_decision, infer_kind_from_url, join_or_abort_tasks,
         normalize_hosted_callback_url,
     };
     use crate::extensions::{ExtensionError, ExtensionKind, ExtensionSource, InstallResult};
@@ -6042,7 +6083,10 @@ while IFS= read -r line; do
         printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"fixture list failure"}}'
       else
         printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"ping","description":"Ping","inputSchema":{"type":"object"}}]}}'
-        if [ "$MCP_CRASH_ALWAYS" = "1" ]; then
+        if [ "$MCP_CLOSE_STDOUT" = "1" ]; then
+          exec 1>&-
+          sleep 60
+        elif [ "$MCP_CRASH_ALWAYS" = "1" ]; then
           exit 17
         elif [ -n "$MCP_CRASH_ONCE_FILE" ] && [ ! -e "$MCP_CRASH_ONCE_FILE" ]; then
           : > "$MCP_CRASH_ONCE_FILE"
@@ -6065,7 +6109,7 @@ done
 
     #[cfg(unix)]
     async fn wait_for_mcp_start_count(path: &std::path::Path, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let starts = std::fs::read_to_string(path).unwrap_or_default();
                 if starts.lines().count() >= expected {
@@ -6076,6 +6120,29 @@ done
         })
         .await
         .expect("MCP fixture did not reach expected start count");
+    }
+
+    #[tokio::test]
+    async fn join_or_abort_tasks_waits_for_aborted_tasks() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_completed = Arc::clone(&completed);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut handles = vec![tokio::spawn(async move {
+            struct CompletionGuard(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for CompletionGuard {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _guard = CompletionGuard(task_completed);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        })];
+        started_rx.await.expect("task started");
+
+        assert!(join_or_abort_tasks(&mut handles, Duration::from_millis(10)).await);
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(handles[0].is_finished());
     }
 
     #[cfg(unix)]
@@ -6817,6 +6884,62 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn test_stdio_mcp_closed_reader_rebuilds_live_child() {
+        use crate::tools::mcp::McpServerConfig;
+
+        let (store, dir) = make_test_store().await;
+        let script_path = write_mcp_lifecycle_fixture(&dir);
+        let starts_path = dir.path().join("mcp-closed-reader-starts.log");
+        let manager = Arc::new(make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(store),
+        ));
+        let mut config = McpServerConfig::new_stdio(
+            "fixture-closed-reader",
+            script_path.to_string_lossy(),
+            vec![starts_path.to_string_lossy().into_owned()],
+            HashMap::from([("MCP_CLOSE_STDOUT".to_string(), "1".to_string())]),
+        );
+        config.enabled = false;
+        manager
+            .install_mcp_config(config, "test")
+            .await
+            .expect("install closed-reader fixture");
+        manager
+            .activate("fixture-closed-reader", "test")
+            .await
+            .expect("activate closed-reader fixture");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    manager
+                        .mcp_process_manager
+                        .state("fixture-closed-reader")
+                        .await,
+                    Ok(crate::tools::mcp::McpProcessState::StdioClosed)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fixture stdout did not close");
+
+        Arc::clone(&manager).supervise_mcp_runtimes_once().await;
+        wait_for_mcp_start_count(&starts_path, 2).await;
+        wait_for_mcp_tool(&manager, "fixture-closed-reader_ping").await;
+        manager
+            .deactivate("fixture-closed-reader", "test")
+            .await
+            .expect("stop closed-reader fixture");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn test_stdio_mcp_recovery_resolves_rotated_secret() {
         use crate::tools::mcp::McpServerConfig;
 
@@ -7084,7 +7207,7 @@ done
             let mut runtimes = manager.active_mcp_servers.write().await;
             let runtime = runtimes.get_mut("fixture-retry").expect("retry runtime");
             assert_eq!(runtime.health, McpRuntimeHealth::RetryPending);
-            assert_eq!(runtime.restart_attempts, 2);
+            assert_eq!(runtime.restart_attempts, 1);
             runtime.retry_after = Some(Instant::now());
         }
 
@@ -7116,7 +7239,7 @@ done
             None,
             dir.path().join("tools"),
             dir.path().join("channels"),
-            Some(store),
+            Some(Arc::clone(&store)),
         ));
         let mut config = McpServerConfig::new_stdio(
             "fixture-failed-rebuild",
@@ -7152,6 +7275,27 @@ done
             .restart_attempts = super::MCP_RESTART_MAX_ATTEMPTS - 1;
 
         Arc::clone(&manager).supervise_mcp_runtimes_once().await;
+        wait_for_mcp_health(
+            &manager,
+            "fixture-failed-rebuild",
+            McpRuntimeHealth::RetryPending,
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&starts_path)
+                .expect("read initial start")
+                .lines()
+                .count(),
+            1
+        );
+        manager
+            .active_mcp_servers
+            .write()
+            .await
+            .get_mut("fixture-failed-rebuild")
+            .expect("retry runtime")
+            .retry_after = Some(Instant::now());
+        Arc::clone(&manager).supervise_mcp_runtimes_once().await;
         wait_for_mcp_start_count(&starts_path, 2).await;
         wait_for_mcp_health(
             &manager,
@@ -7171,6 +7315,28 @@ done
                 .tool_registry
                 .has("fixture-failed-rebuild_ping")
                 .await
+        );
+        let stored = crate::tools::mcp::config::load_mcp_servers_from_db(store.as_ref(), "test")
+            .await
+            .expect("reload circuit-open fixture");
+        assert!(
+            stored
+                .get("fixture-failed-rebuild")
+                .expect("stored circuit-open fixture")
+                .recovery_circuit_open
+        );
+        manager
+            .activate("fixture-failed-rebuild", "test")
+            .await
+            .expect("explicit activation clears circuit");
+        let stored = crate::tools::mcp::config::load_mcp_servers_from_db(store.as_ref(), "test")
+            .await
+            .expect("reload explicitly activated fixture");
+        assert!(
+            !stored
+                .get("fixture-failed-rebuild")
+                .expect("stored activated fixture")
+                .recovery_circuit_open
         );
         manager
             .deactivate("fixture-failed-rebuild", "test")
@@ -7294,7 +7460,7 @@ done
                 let runtime = runtimes
                     .get_mut("fixture-crash-loop")
                     .expect("crash-loop runtime");
-                assert_eq!(runtime.restart_attempts, attempts);
+                assert_eq!(runtime.restart_attempts, attempts - 1);
                 runtime.retry_after = Some(Instant::now());
             }
             Arc::clone(&manager).supervise_mcp_runtimes_once().await;
@@ -7320,7 +7486,7 @@ done
         );
         assert_eq!(
             manager.active_mcp_servers.read().await["fixture-crash-loop"].restart_attempts,
-            super::MCP_RESTART_MAX_ATTEMPTS + 1
+            super::MCP_RESTART_MAX_ATTEMPTS
         );
 
         Arc::clone(&manager).supervise_mcp_runtimes_once().await;
@@ -8369,6 +8535,10 @@ done
         let mgr = make_test_manager(None, dir.path().to_path_buf());
 
         std::fs::write(dir.path().join("gmail.wasm"), b"fake-tool").expect("write tool");
+        let unrelated: Arc<dyn Tool> = Arc::new(NamedTestTool {
+            name: "gmail".to_string(),
+        });
+        mgr.tool_registry.register(Arc::clone(&unrelated)).await;
 
         let listener = tokio::spawn(async {
             std::future::pending::<()>().await;
@@ -8509,6 +8679,12 @@ done
             !mgr.activation_errors.read().await.contains_key("gmail"),
             "stale activation error should be cleared"
         );
+        let registered = mgr
+            .tool_registry
+            .get("gmail")
+            .await
+            .expect("unrelated registration retained");
+        assert!(Arc::ptr_eq(&registered, &unrelated));
 
         let flows = mgr.pending_oauth_flows().read().await;
         assert!(

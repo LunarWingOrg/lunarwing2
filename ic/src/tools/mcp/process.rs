@@ -17,6 +17,7 @@ use crate::tools::tool::ToolError;
 #[derive(Debug)]
 pub enum McpProcessState {
     Running,
+    StdioClosed,
     Exited(std::process::ExitStatus),
     Missing,
 }
@@ -47,13 +48,15 @@ impl McpProcessManager {
     ) -> Result<Arc<StdioMcpTransport>, ToolError> {
         let name = name.into();
         let command = command.into();
+        let mut transports = self.transports.write().await;
+        if transports.contains_key(&name) {
+            return Err(ToolError::ExternalService(format!(
+                "MCP server process '{name}' is already managed"
+            )));
+        }
         let transport =
             Arc::new(StdioMcpTransport::spawn(&name, &command, args, env, suppress_stderr).await?);
-
-        self.transports
-            .write()
-            .await
-            .insert(name, Arc::clone(&transport));
+        transports.insert(name, Arc::clone(&transport));
 
         Ok(transport)
     }
@@ -68,9 +71,13 @@ impl McpProcessManager {
         let Some(transport) = self.get(name).await else {
             return Ok(McpProcessState::Missing);
         };
-        Ok(match transport.exit_status().await? {
-            Some(status) => McpProcessState::Exited(status),
-            None => McpProcessState::Running,
+        if let Some(status) = transport.exit_status().await? {
+            return Ok(McpProcessState::Exited(status));
+        }
+        Ok(if transport.reader_finished().await {
+            McpProcessState::StdioClosed
+        } else {
+            McpProcessState::Running
         })
     }
 
@@ -168,6 +175,76 @@ mod tests {
             McpProcessState::Exited(_)
         ));
         manager.shutdown("server").await.expect("clean up false");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn state_reports_closed_stdio_for_live_child() {
+        let manager = McpProcessManager::new();
+        manager
+            .spawn_stdio(
+                "server",
+                "sh",
+                vec!["-c".to_string(), "exec 1>&-; sleep 10".to_string()],
+                HashMap::<String, String>::new(),
+                false,
+            )
+            .await
+            .expect("spawn live child with closed stdout");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    manager.state("server").await.expect("stdio state"),
+                    McpProcessState::StdioClosed
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reader did not observe stdout closure");
+        manager.shutdown("server").await.expect("clean up child");
+    }
+
+    #[tokio::test]
+    async fn duplicate_process_name_preserves_existing_transport() {
+        let manager = McpProcessManager::new();
+        let first = manager
+            .spawn_stdio(
+                "server",
+                "cat",
+                Vec::new(),
+                HashMap::<String, String>::new(),
+                false,
+            )
+            .await
+            .expect("spawn first process");
+        let error = match manager
+            .spawn_stdio(
+                "server",
+                "cat",
+                Vec::new(),
+                HashMap::<String, String>::new(),
+                false,
+            )
+            .await
+        {
+            Ok(_) => panic!("duplicate process must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("already managed"));
+        let registered = manager
+            .get("server")
+            .await
+            .expect("first transport retained");
+        assert!(Arc::ptr_eq(&first, &registered));
+        manager
+            .shutdown("server")
+            .await
+            .expect("clean up first process");
     }
 
     #[tokio::test]

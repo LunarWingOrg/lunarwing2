@@ -9,6 +9,8 @@ EXPORT_SRC="$IC_DIR/scripts/export-tenant.sh"
 TEST_STAGE_PARENT="$IC_DIR/target"
 mkdir -p "$TEST_STAGE_PARENT"
 export KAWARIMI_IMPORT_STAGE_ROOT="$TEST_STAGE_PARENT/kawarimi-import-stage.$$"
+export SUDO_UID="$(id -u)"
+export SUDO_USER="$(id -un)"
 
 failures=0
 
@@ -87,6 +89,7 @@ VL_MODEL=qwen3-vl
 LUNARWING_AUTH_TOKEN=vision-token
 ENV
   tar cf "$work/kawarimi.tar" -C "$work/bundle-src" .
+  chmod 0600 "$work/kawarimi.tar"
 }
 
 make_test_scripts() {
@@ -313,6 +316,7 @@ printf '%s' "$passphrase" >"$passphrase_fd_file"
   { printf '%s\n%s\n' "$passphrase" "$passphrase"; } \
     | 7z a -t7z -mhe=on -p "$encrypted_bundle" ./* >/dev/null
 )
+chmod 0600 "$encrypted_bundle"
 encrypted_output="$(
   exec 9<"$passphrase_fd_file"
   PATH="$tmp/bin:$PATH" \
@@ -356,6 +360,7 @@ mkdir -p "$tmp/unsafe-manifest"
 cp -a "$tmp/bundle-src/." "$tmp/unsafe-manifest/"
 printf 'DATABASE_URL=postgres://attacker.invalid/override\n' >>"$tmp/unsafe-manifest/manifest-lunarwing.env"
 tar cf "$tmp/unsafe-manifest.tar" -C "$tmp/unsafe-manifest" .
+chmod 0600 "$tmp/unsafe-manifest.tar"
 set +e
 unsafe_manifest_output="$(
   PATH="$tmp/bin:$PATH" \
@@ -376,6 +381,7 @@ mkdir -p "$tmp/unsafe-link"
 cp "$tmp/bundle-src/meta.txt" "$tmp/bundle-src/manifest-lunarwing.env" "$tmp/unsafe-link/"
 ln -s /etc/passwd "$tmp/unsafe-link/db.dump"
 tar cf "$tmp/unsafe-link.tar" -C "$tmp/unsafe-link" .
+chmod 0600 "$tmp/unsafe-link.tar"
 set +e
 unsafe_link_output="$(
   PATH="$tmp/bin:$PATH" \
@@ -400,6 +406,7 @@ cp "$tmp/bundle-src/meta.txt" "$tmp/bundle-src/db.dump" \
   "$tmp/bundle-src/manifest-lunarwing.env" "$tmp/unsafe-state-bundle/"
 cp "$tmp/unsafe-state.tar.gz" "$tmp/unsafe-state-bundle/state.tar.gz"
 tar cf "$tmp/unsafe-state-bundle.tar" -C "$tmp/unsafe-state-bundle" .
+chmod 0600 "$tmp/unsafe-state-bundle.tar"
 set +e
 unsafe_state_output="$(
   PATH="$tmp/bin:$PATH" \
@@ -436,6 +443,7 @@ make_bundle "$invalid_key_tmp"
 sed -i 's/^SECRETS_MASTER_KEY=.*/SECRETS_MASTER_KEY=not-a-master-key/' \
   "$invalid_key_tmp/bundle-src/manifest-lunarwing.env"
 tar cf "$invalid_key_tmp/kawarimi.tar" -C "$invalid_key_tmp/bundle-src" .
+chmod 0600 "$invalid_key_tmp/kawarimi.tar"
 make_test_scripts "$invalid_key_tmp"
 printf '{"tenants":{}}\n' >"$invalid_key_tmp/ports.json"
 set +e

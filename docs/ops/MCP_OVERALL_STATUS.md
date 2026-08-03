@@ -1,13 +1,14 @@
 # MCP Overall Status
 
 **Status as of 2026-08-03:** MCP work is partial overall. MCP Overhaul Part 1 is
-implemented; focused runtime validation remains. Later package, placement, sandbox,
-adapter, and gateway phases remain deferred.
+implemented and its focused automated runtime validation passes. Later package,
+placement, sandbox, adapter, and gateway phases remain deferred.
 
 ## Part 1 Status
 
-Part 1 covers host-local MCP installation and lifecycle. Checkpoint commit `9da4f5c`
-is committed and pushed. Final code review found no concrete remaining bugs.
+Part 1 covers host-local MCP installation and lifecycle. Integration review found
+and fixed additional ownership, persistence, shutdown, and dead-stdio defects after
+checkpoint commit `9da4f5c`.
 
 Implemented scope includes:
 
@@ -20,6 +21,8 @@ Implemented scope includes:
 - Generation-safe lifecycle serialization and all-or-none tool registration.
 - Persistence-before-teardown and conditional activation/update rollback.
 - Bounded recovery and child shutdown, including agent error-return cleanup.
+- Deterministic WASM/MCP tool-name ownership and duplicate server/process rejection.
+- Persistent circuit-open state and recovery of live children whose stdio reader ended.
 - API and browser status for recovering and terminal circuit-open states.
 
 Completed verification:
@@ -30,14 +33,14 @@ Completed verification:
 - `cargo clippy -j2 --all --benches --tests --examples -- -D warnings`
 - `node --check src/channels/web/static/app.js`
 - `git diff --check`
-
-Test targets compile, but the final focused recovery tests were not executed during
-this checkpoint verification.
+- Full `lunarwing_engine` suite: 471 passed.
+- Focused MCP recovery suite: 11 passed.
+- MCP config suite: 49 passed; process suite: 6 passed.
+- Focused shutdown, failed-update, and WASM ownership regressions: passed.
+- `cargo check -j6`: passed.
 
 ## Part 1 Remaining Validation
 
-- Run the focused MCP recovery tests, including crash-loop, cancellation, secret
-  rotation, stability-window, and failed-rebuild cases.
 - Optionally add coverage for startup conflicts across database and disk backends,
   forced supervisor/child shutdown timeout, config-read timeout or unavailability,
   and SSE/browser `recovering -> active/failed` transitions.

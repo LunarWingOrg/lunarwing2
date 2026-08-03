@@ -76,6 +76,11 @@ pub struct McpServerConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// Automatic recovery stopped after repeated unstable restarts.
+    /// Explicit activation clears this marker.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub recovery_circuit_open: bool,
+
     /// Optional description for the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -89,7 +94,16 @@ fn default_true() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl McpServerConfig {
+    /// Whether daemon startup may activate this server automatically.
+    pub fn should_auto_start(&self) -> bool {
+        self.enabled && !self.recovery_circuit_open
+    }
+
     /// Create a new MCP server configuration.
     pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
@@ -99,6 +113,7 @@ impl McpServerConfig {
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
+            recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
         }
@@ -134,6 +149,7 @@ impl McpServerConfig {
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
+            recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
         }
@@ -150,6 +166,7 @@ impl McpServerConfig {
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
+            recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
         }
@@ -658,6 +675,7 @@ fn apply_managed_study_notes_config(
             return None;
         }
         config.enabled = existing.enabled;
+        config.recovery_circuit_open = existing.recovery_circuit_open;
     }
     servers.upsert(config.clone());
     Some(config)
@@ -768,6 +786,23 @@ fn default_schema_version() -> u32 {
 }
 
 impl McpServersFile {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let mut names = std::collections::HashSet::new();
+        for server in &self.servers {
+            server
+                .validate()
+                .map_err(|error| ConfigError::InvalidConfig {
+                    reason: format!("Server '{}': {error}", server.name),
+                })?;
+            if !names.insert(&server.name) {
+                return Err(ConfigError::InvalidConfig {
+                    reason: format!("Duplicate server name: '{}'", server.name),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Get a server by name.
     pub fn get(&self, name: &str) -> Option<&McpServerConfig> {
         self.servers.iter().find(|s| s.name == name)
@@ -878,12 +913,8 @@ pub async fn load_mcp_servers_from(path: impl AsRef<Path>) -> Result<McpServersF
     let content = fs::read_to_string(path).await?;
     let config: McpServersFile = serde_json::from_str(&content)?;
 
-    // Validate every server on load so corrupted configs are caught early
-    for server in &config.servers {
-        server.validate().map_err(|e| ConfigError::InvalidConfig {
-            reason: format!("Server '{}': {}", server.name, e),
-        })?;
-    }
+    // Validate every server and reject ambiguous runtime ownership.
+    config.validate()?;
 
     Ok(config)
 }
@@ -898,6 +929,7 @@ pub async fn save_mcp_servers_to(
     config: &McpServersFile,
     path: impl AsRef<Path>,
 ) -> Result<(), ConfigError> {
+    config.validate()?;
     let path = path.as_ref();
 
     // Ensure parent directory exists
@@ -970,6 +1002,9 @@ pub async fn set_mcp_server_enabled(
             name: name.to_string(),
         })?;
     server.enabled = enabled;
+    if enabled {
+        server.recovery_circuit_open = false;
+    }
     let server = server.clone();
     save_mcp_servers(&servers).await?;
     Ok(server)
@@ -985,6 +1020,9 @@ pub async fn toggle_mcp_server_enabled(name: &str) -> Result<McpServerConfig, Co
             name: name.to_string(),
         })?;
     server.enabled = !server.enabled;
+    if server.enabled {
+        server.recovery_circuit_open = false;
+    }
     let server = server.clone();
     save_mcp_servers(&servers).await?;
     Ok(server)
@@ -1005,6 +1043,19 @@ pub async fn disable_mcp_server_if_unchanged(
     server.enabled = false;
     save_mcp_servers(&servers).await?;
     Ok(true)
+}
+
+/// Persist an open recovery circuit without disabling explicit activation.
+pub async fn mark_mcp_recovery_circuit_open(name: &str) -> Result<(), ConfigError> {
+    let _config_guard = acquire_mcp_config_write_guard().await?;
+    let mut servers = load_mcp_servers().await?;
+    let server = servers
+        .get_mut(name)
+        .ok_or_else(|| ConfigError::ServerNotFound {
+            name: name.to_string(),
+        })?;
+    server.recovery_circuit_open = true;
+    save_mcp_servers(&servers).await
 }
 
 /// Get a specific MCP server configuration.
@@ -1064,6 +1115,7 @@ pub async fn save_mcp_servers_to_db(
     user_id: &str,
     config: &McpServersFile,
 ) -> Result<(), ConfigError> {
+    config.validate()?;
     let value = serde_json::to_value(config)?;
     store
         .set_setting(user_id, "mcp_servers", &value)
@@ -1133,6 +1185,9 @@ pub async fn set_mcp_server_enabled_db(
                 name: name.to_string(),
             })?;
         server.enabled = enabled;
+        if enabled {
+            server.recovery_circuit_open = false;
+        }
         Ok(server.clone())
     })
     .await
@@ -1151,6 +1206,9 @@ pub async fn toggle_mcp_server_enabled_db(
                 name: name.to_string(),
             })?;
         server.enabled = !server.enabled;
+        if server.enabled {
+            server.recovery_circuit_open = false;
+        }
         Ok(server.clone())
     })
     .await
@@ -1175,15 +1233,27 @@ pub async fn disable_mcp_server_if_unchanged_db(
     .await
 }
 
+/// Persist an open recovery circuit in owner-scoped configuration.
+pub async fn mark_mcp_recovery_circuit_open_db(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    name: &str,
+) -> Result<(), ConfigError> {
+    mutate_mcp_servers_db(store, user_id, |servers| {
+        let server = servers
+            .get_mut(name)
+            .ok_or_else(|| ConfigError::ServerNotFound {
+                name: name.to_string(),
+            })?;
+        server.recovery_circuit_open = true;
+        Ok(())
+    })
+    .await
+}
+
 fn parse_mcp_servers_value(value: serde_json::Value) -> Result<McpServersFile, ConfigError> {
     let config: McpServersFile = serde_json::from_value(value)?;
-    for server in &config.servers {
-        server
-            .validate()
-            .map_err(|error| ConfigError::InvalidConfig {
-                reason: format!("Server '{}': {error}", server.name),
-            })?;
-    }
+    config.validate()?;
     Ok(config)
 }
 
@@ -1453,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_study_notes_refresh_preserves_disabled_state() {
+    fn managed_study_notes_refresh_preserves_lifecycle_state() {
         let code = tempdir().unwrap();
         let state = tempdir().unwrap();
         create_study_notes_fixture(code.path());
@@ -1463,6 +1533,7 @@ mod tests {
         let mut existing = study_notes_server_from_home(code.path(), None, false).unwrap();
         existing.description = Some(LEGACY_STUDY_NOTES_DESCRIPTION.to_string());
         existing.enabled = false;
+        existing.recovery_circuit_open = true;
         let mut servers = McpServersFile::default();
         servers.upsert(existing);
         let generated =
@@ -1471,6 +1542,7 @@ mod tests {
         let replacement = apply_managed_study_notes_config(&mut servers, generated)
             .expect("managed config should refresh");
         assert!(!replacement.enabled);
+        assert!(replacement.recovery_circuit_open);
         assert!(
             replacement
                 .always_require_approval
@@ -1573,6 +1645,43 @@ mod tests {
             err.contains("bad-server"),
             "Error should name the offending server, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn load_rejects_duplicate_server_names() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp-servers.json");
+        let duplicate = serde_json::json!({
+            "servers": [
+                {"name": "duplicate", "url": "https://one.example.com"},
+                {"name": "duplicate", "url": "https://two.example.com"}
+            ]
+        });
+        tokio::fs::write(&path, duplicate.to_string())
+            .await
+            .unwrap();
+
+        let error = load_mcp_servers_from(&path).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Duplicate server name: 'duplicate'")
+        );
+    }
+
+    #[test]
+    fn recovery_circuit_blocks_auto_start_until_explicit_enable() {
+        let mut config =
+            McpServerConfig::new_stdio("blocked", "server", Vec::new(), HashMap::new());
+        config.recovery_circuit_open = true;
+        assert!(!config.should_auto_start());
+
+        let mut servers = McpServersFile::default();
+        servers.upsert(config);
+        let server = servers.get_mut("blocked").unwrap();
+        server.enabled = true;
+        server.recovery_circuit_open = false;
+        assert!(server.should_auto_start());
     }
 
     #[test]

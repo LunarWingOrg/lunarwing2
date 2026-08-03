@@ -54,6 +54,7 @@ AUTO_YES=false
 FORCE=false
 PRUNE_OLD_ROOT=false
 TENANT=""
+ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -200,6 +201,13 @@ if $PRUNE_OLD_ROOT; then
   say "old root-store PG container for '$TENANT' removed."
   exit 0
 fi
+
+# Re-enter through mt-admin so one upgrade, lifecycle, and DarkIRC writer lock
+# spans backup, stop, rebuild, reprovision, restore, and final start.
+if [[ "${LUNARWING_MT_UPGRADE_BOUNDARY_TENANT:-}" != "$TENANT" ]]; then
+  exec "$MT" upgrade-wrapper-boundary "$TENANT" "${ORIGINAL_ARGS[@]}"
+fi
+"$MT" validate-upgrade-wrapper-boundary "$TENANT"
 
 MODE="rootless-adopt"; $KEEP_ROOTFUL && MODE="keep-rootful"
 # This tool backs up the root-store DB (step 1) and restores into the fresh

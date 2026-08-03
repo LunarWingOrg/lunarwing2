@@ -3721,7 +3721,7 @@ mod tests {
             .unwrap();
         let policy = Arc::new(PolicyEngine::new());
         let args = [
-            MontyObject::String("echo()".into()),
+            MontyObject::String("result = await echo()".into()),
             json_to_monty(&serde_json::json!({})),
         ];
         let mut actions_this_step = super::super::MAX_ACTIONS_PER_STEP - 1;

@@ -530,7 +530,8 @@ impl AppBuilder {
             None
         };
 
-        // Load WASM tools and MCP servers concurrently
+        // Load WASM tools before MCP servers so dynamic tool-name ownership is
+        // deterministic. MCP startup rejects names already claimed by WASM.
         let wasm_tools_future = {
             let wasm_tool_runtime = wasm_tool_runtime.clone();
             let secrets_store = self.secrets_store.clone();
@@ -665,7 +666,11 @@ impl AppBuilder {
                                 "Suppressed managed Study Notes write mode without live opt-in"
                             );
                         }
-                        let enabled: Vec<_> = servers.enabled_servers().cloned().collect();
+                        let enabled: Vec<_> = servers
+                            .enabled_servers()
+                            .filter(|server| server.should_auto_start())
+                            .cloned()
+                            .collect();
                         if !enabled.is_empty() {
                             tracing::debug!(
                                 "Loading {} configured MCP server(s)...",
@@ -874,8 +879,8 @@ impl AppBuilder {
             }
         };
 
-        let (dev_loaded_tool_names, startup_mcp_clients) =
-            tokio::join!(wasm_tools_future, mcp_servers_future);
+        let dev_loaded_tool_names = wasm_tools_future.await;
+        let startup_mcp_clients = mcp_servers_future.await;
 
         // Load registry catalog entries for extension discovery
         let mut catalog_entries = match crate::registry::RegistryCatalog::load_or_embedded() {

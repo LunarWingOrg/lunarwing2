@@ -177,10 +177,13 @@ sudo ic/scripts/import-tenant.sh /var/lib/lunarwing-migrate/<tenant>-migrate-<st
      [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] \
      [--with-vision] [--docker-group]   # --dry-run first
 ```
-Runs typed bundle validation → `add-tenant --no-health` → `build-tenant` →
+Import accepts only a single-link bundle owned by root or the validated invoking
+sudo user, with no group/other permissions, then pins bytes through that opened
+descriptor. It runs typed bundle validation → `add-tenant --no-health` → `build-tenant` →
 injects carried secrets (including verbatim-verified `SECRETS_MASTER_KEY`) →
 `restore-tenant` and owner-scope reconciliation → structured DarkIRC
-stage/import when present → restores generic `state/` (never `state/darkirc`) →
+restore under one lifecycle/writer-lock boundary when present → restores generic
+`state/` (never `state/darkirc`) →
 `install-wasm` → WeeChat preflight → optional start. Supported worker flags and
 `--with-toolchains` are passed through to `build-tenant`. `--with-vision` builds the LunarVision sidecar image before start; if
 the bundle contains `manifest-vision.env`, import injects the carried `VL_URL`,
@@ -198,6 +201,13 @@ the source `darkirc_scope_id` only when no target registry entry owns it. The
 target helper validates the manifest against its measured DarkIRC binary before
 staging. Import remains stopped by default. If `--start` is explicit, strict
 DarkIRC daemon/adapter health must pass; otherwise import stops the target again.
+
+If a structured DarkIRC import fails after reserving its tenant and scope, rerun
+the exact same bundle and options with `--resume`. Resume requires the root-owned
+marker written before provisioning, matching tenant/scope/bundle digest, safe
+target paths, and stopped writers. It skips `add-tenant`, repeats idempotent build
+and restore phases, and clears the marker only after staging completes. Imports
+from before marker support fail closed and require operator recovery.
 
 The WeeChat preflight checks the restored tenant env against the target port
 registry and installed capabilities before cutover. A preflight FAIL blocks import

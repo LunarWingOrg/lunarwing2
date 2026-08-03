@@ -48,6 +48,9 @@ pub const EXCHANGE_SCHEMA_VERSION: &str = "1";
 pub const MAX_PENDING_BYTES: usize = 64 * 1024;
 pub const MAX_PENDING_EXCHANGES: usize = 128;
 pub const MAX_PENDING_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RETAINED_EXCHANGES: usize = MAX_PENDING_EXCHANGES + MAX_MIGRATION_CONTACTS;
+const MAX_RETAINED_TOTAL_BYTES: usize =
+    MAX_PENDING_TOTAL_BYTES + MAX_MIGRATION_CONTACTS * MAX_PENDING_BYTES;
 pub const ACTIVATION_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 pub const EXTENSION_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const DEFAULT_OFFER_TTL_SECONDS: i64 = 30 * 60;
@@ -2771,6 +2774,8 @@ struct PendingEntry {
 struct PendingInventory {
     entries: Vec<PendingEntry>,
     total_bytes: usize,
+    active_count: usize,
+    active_bytes: usize,
 }
 
 fn pending_inventory(workspace: &Workspace, scope_id: &str) -> Result<PendingInventory> {
@@ -2783,11 +2788,14 @@ fn pending_inventory_from_names(
     scope_id: &str,
     names: Vec<String>,
 ) -> Result<PendingInventory> {
-    if names.len() > MAX_PENDING_EXCHANGES {
+    if names.len() > MAX_RETAINED_EXCHANGES {
         return Err(KeyManagerError::PendingLimit);
     }
     let mut entries = Vec::with_capacity(names.len());
     let mut total_bytes = 0_usize;
+    let mut active_count = 0_usize;
+    let mut active_bytes = 0_usize;
+    let mut installed_count = 0_usize;
     for name in names {
         let offer_id = name
             .strip_suffix(".json")
@@ -2801,18 +2809,38 @@ fn pending_inventory_from_names(
         total_bytes = total_bytes
             .checked_add(bytes.len())
             .ok_or(KeyManagerError::PendingLimit)?;
-        if total_bytes > MAX_PENDING_TOTAL_BYTES {
+        if total_bytes > MAX_RETAINED_TOTAL_BYTES {
             return Err(KeyManagerError::PendingLimit);
         }
         let secret: SecretExchange =
             serde_json::from_slice(&bytes).map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
         validate_pending_secret(&secret, offer_id, scope_id)?;
+        if secret.state == ExchangeState::Installed.as_str() {
+            installed_count = installed_count
+                .checked_add(1)
+                .ok_or(KeyManagerError::PendingLimit)?;
+            if installed_count > MAX_MIGRATION_CONTACTS {
+                return Err(KeyManagerError::PendingLimit);
+            }
+        } else {
+            active_count = active_count
+                .checked_add(1)
+                .ok_or(KeyManagerError::PendingLimit)?;
+            active_bytes = active_bytes
+                .checked_add(bytes.len())
+                .ok_or(KeyManagerError::PendingLimit)?;
+            if active_count > MAX_PENDING_EXCHANGES || active_bytes > MAX_PENDING_TOTAL_BYTES {
+                return Err(KeyManagerError::PendingLimit);
+            }
+        }
         entries.push(PendingEntry { secret });
     }
     validate_pending_entries(&entries)?;
     Ok(PendingInventory {
         entries,
         total_bytes,
+        active_count,
+        active_bytes,
     })
 }
 
@@ -2874,6 +2902,21 @@ fn pending_secret_bytes(secret: &SecretExchange) -> Result<Zeroizing<Vec<u8>>> {
     Ok(bytes)
 }
 
+fn ensure_pending_capacity(
+    inventory: &PendingInventory,
+    added_active_count: usize,
+    added_bytes: usize,
+) -> Result<()> {
+    if inventory.active_count.saturating_add(added_active_count) > MAX_PENDING_EXCHANGES
+        || inventory.active_bytes.saturating_add(added_bytes) > MAX_PENDING_TOTAL_BYTES
+        || inventory.entries.len().saturating_add(added_active_count) > MAX_RETAINED_EXCHANGES
+        || inventory.total_bytes.saturating_add(added_bytes) > MAX_RETAINED_TOTAL_BYTES
+    {
+        return Err(KeyManagerError::PendingLimit);
+    }
+    Ok(())
+}
+
 fn write_new_pending_secret(
     workspace: &Workspace,
     secret: &SecretExchange,
@@ -2882,14 +2925,7 @@ fn write_new_pending_secret(
     let path = offer_id_path(workspace, &secret.offer_id)?;
     let candidate = format!("{path}.next");
     let bytes = pending_secret_bytes(secret)?;
-    let projected_bytes = inventory
-        .total_bytes
-        .checked_add(bytes.len())
-        .ok_or(KeyManagerError::PendingLimit)?;
-    if inventory.entries.len() >= MAX_PENDING_EXCHANGES || projected_bytes > MAX_PENDING_TOTAL_BYTES
-    {
-        return Err(KeyManagerError::PendingLimit);
-    }
+    ensure_pending_capacity(inventory, 1, bytes.len())?;
     if workspace.read_optional(&candidate)?.is_some() {
         return Err(KeyManagerError::RecoveryRequired);
     }
@@ -4719,11 +4755,7 @@ fn validate_pending_promotions(
             .checked_add(candidate.bytes_len)
             .ok_or(KeyManagerError::PendingLimit)
     })?;
-    if inventory.entries.len().saturating_add(candidates.len()) > MAX_PENDING_EXCHANGES
-        || inventory.total_bytes.saturating_add(added_bytes) > MAX_PENDING_TOTAL_BYTES
-    {
-        return Err(KeyManagerError::PendingLimit);
-    }
+    ensure_pending_capacity(inventory, candidates.len(), added_bytes)?;
     let mut combined = inventory
         .entries
         .iter()
@@ -7934,7 +7966,7 @@ my_dm_chacha_secret = "{bob_private}"
     }
 
     #[test]
-    fn structured_migration_preserves_installed_contact_and_replay_tombstones() {
+    fn completed_stage_a_blocks_migration_until_installed_state_is_promoted() {
         let pair = prepared_pair();
         let responder_fingerprint =
             PublicFingerprint::from_encoded_public_key(&pair.responder_public)
@@ -7954,8 +7986,25 @@ my_dm_chacha_secret = "{bob_private}"
         )
         .expect("complete managed contact");
         let source_workspace = Workspace::open(pair.initiator.clone()).expect("source workspace");
+        let inventory = pending_inventory(&source_workspace, SCOPE).expect("installed inventory");
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.active_count, 0);
+        assert_eq!(inventory.active_bytes, 0);
+        ensure_pending_capacity(&inventory, MAX_PENDING_EXCHANGES, 0)
+            .expect("installed record does not consume active exchange count quota");
+        assert!(matches!(
+            migration_ready(&pair.initiator, SCOPE),
+            Err(KeyManagerError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            export_migration(&pair.initiator, SCOPE, &pair.attestation),
+            Err(KeyManagerError::RecoveryRequired)
+        ));
+
+        // Stage B will remove this record only after health-gated activation.
+        // Simulate that future promotion boundary to verify migration payloads.
         remove_pending(&source_workspace, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-            .expect("settle source pending state");
+            .expect("simulate Stage B promotion");
         export_migration(&pair.initiator, SCOPE, &pair.attestation)
             .expect("export managed contact");
         let manifest = fs::read(pair.initiator.darkirc_dir().join(MIGRATION_FILE))
@@ -8008,6 +8057,8 @@ my_dm_chacha_secret = "{bob_private}"
                 })
                 .collect(),
             total_bytes: 0,
+            active_count: MAX_PENDING_EXCHANGES,
+            active_bytes: 0,
         };
         assert!(matches!(
             write_new_pending_secret(&workspace, &secret, &count_limited),
@@ -8016,6 +8067,8 @@ my_dm_chacha_secret = "{bob_private}"
         let bytes_limited = PendingInventory {
             entries: Vec::new(),
             total_bytes: MAX_PENDING_TOTAL_BYTES,
+            active_count: 0,
+            active_bytes: MAX_PENDING_TOTAL_BYTES,
         };
         assert!(matches!(
             write_new_pending_secret(&workspace, &secret, &bytes_limited),
