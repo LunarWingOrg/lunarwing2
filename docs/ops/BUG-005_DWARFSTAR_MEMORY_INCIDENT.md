@@ -860,3 +860,42 @@ because `d2ff7b8` landed. The output-boundary defect is fixed; process-group
 cancellation and per-build resource controls remain open. Effective-backend
 attribution and an optional fail-closed deployment policy remain recommended
 hardening.
+
+## 2026-08-03 postscript — cgroup isolation fix (branch `ds6/dwarfstar/v2.0.4.0`)
+
+The two open items above (process-group cancellation, per-build resource
+controls) are addressed in this branch:
+
+- **Portable tree reaping (all init systems).** New module
+  `ic/src/tools/process.rs`: every tool-spawned workload now leads its own
+  process group with `kill_on_drop`, and a `ProcessTreeGuard` SIGTERM/SIGKILLs
+  the whole group on timeout, cancellation, or drop of the execute future.
+  `ShellTool` now overrides `execution_timeout()` (internal 120 s + 5 s grace)
+  so its own reaping path runs before the generic outer timeout drops the
+  future — the failure mode that orphaned `cargo`/`rustc` during the incident.
+  Wired into `ic/src/tools/builtin/shell.rs`,
+  `ic/src/sandbox/manager.rs::execute_direct`, and the `cargo component build`
+  path in `ic/src/registry/artifacts.rs` (which also gained a 20-minute bound).
+- **systemd transient scopes.** On hosts with a reachable user manager
+  (auto-probed once, cached, graceful fallback), workloads spawn via
+  `systemd-run --user --scope --quiet --collect` under
+  `lunarwing-workloads.slice`, so build memory/CPU is accounted and capped
+  outside `lunarwing-<tenant>.service`. Env knobs:
+  `LUNARWING_WORKLOAD_ISOLATION=auto|none`, `LUNARWING_WORKLOAD_SLICE`,
+  `LUNARWING_WORKLOAD_MEMORY_MAX`.
+- **mt-admin deployment caps.** `render_tenant_systemd_units()` now renders
+  `lunarwing-workloads.slice` (default 6G/8G, CPUQuota 800%, TasksMax 2048)
+  and `lunarwing-build.slice` (16G/24G), and the daemon unit itself gets
+  `MemoryHigh=1536M MemoryMax=2G TasksMax=512` (observed daemon plateau
+  ~450 MiB). `build_tenant()` runs cargo inside the build slice with an
+  explicit `-j` (default `nproc`). All values are `LUNARWING_MT_*`
+  overridable. OpenRC units gain a documented-gap comment; the portable
+  tree-reaping layer still applies there.
+
+Validation so far: `cargo check` clean; new `tools::process` unit tests cover
+group kill on timeout, on future drop, and disarm safety; mt-admin render
+harness `ic/scripts/tests/test-workload-isolation-rendering.sh` (19 checks)
+covers slice rendering, daemon caps, overrides, OpenRC parity, and scoped vs
+nice'd build paths; shellcheck clean. Live tenant validation (scope creation,
+daemon-cgroup flatness during an agent-driven build) is pending a Dwarfstar
+restart.

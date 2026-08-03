@@ -422,6 +422,24 @@ These environment variables change the defaults used by `lunarwing-mt-admin.sh` 
 | `LUNARWING_MT_GOTIFY_TITLE` | (empty) | Default Gotify notification title |
 | `LUNARWING_MT_SOURCE_REPO` | (auto-detected) | Source repo to clone from |
 | `LUNARWING_MT_PROFILE` | `release` | Cargo build profile |
+| `LUNARWING_MT_WORKLOAD_SLICE` | `lunarwing-workloads.slice` | Slice for agent-spawned shell/compile scopes (BUG-005) |
+| `LUNARWING_MT_WORKLOAD_MEMORY_HIGH` | `6G` | Workload slice throttling threshold |
+| `LUNARWING_MT_WORKLOAD_MEMORY_MAX` | `8G` | Workload slice hard memory cap |
+| `LUNARWING_MT_WORKLOAD_CPU_QUOTA` | `800%` | Workload slice CPU quota |
+| `LUNARWING_MT_WORKLOAD_TASKS_MAX` | `2048` | Workload slice task cap |
+| `LUNARWING_MT_BUILD_SLICE` | `lunarwing-build.slice` | Slice for operator-driven `build_tenant` cargo scopes |
+| `LUNARWING_MT_BUILD_JOBS` | `$(nproc)` | Explicit `-j` passed to tenant cargo builds |
+| `LUNARWING_MT_BUILD_MEMORY_HIGH` | `16G` | Build scope throttling threshold |
+| `LUNARWING_MT_BUILD_MEMORY_MAX` | `24G` | Build scope hard memory cap |
+| `LUNARWING_MT_DAEMON_MEMORY_HIGH` | `1536M` | Daemon unit throttling threshold |
+| `LUNARWING_MT_DAEMON_MEMORY_MAX` | `2G` | Daemon unit hard memory cap |
+| `LUNARWING_MT_DAEMON_TASKS_MAX` | `512` | Daemon unit task cap |
+
+The workload/daemon caps exist so agent-spawned compiles are accounted and
+bounded separately from the daemon (BUG-005). The daemon additionally reads
+`LUNARWING_WORKLOAD_ISOLATION` (`auto`|`none`), `LUNARWING_WORKLOAD_SLICE`,
+and `LUNARWING_WORKLOAD_MEMORY_MAX` from its own environment to control
+transient-scope spawning (see `ic/src/tools/process.rs`).
 
 ### Port allocation
 

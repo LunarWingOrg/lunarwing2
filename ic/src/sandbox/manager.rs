@@ -317,29 +317,44 @@ impl SandboxManager {
         cwd: &Path,
         env: HashMap<String, String>,
     ) -> Result<ExecOutput> {
-        use tokio::process::Command;
-
         let start = std::time::Instant::now();
 
+        // Spawn through the workload spawner: fresh process group +
+        // kill_on_drop always, systemd scope isolation when available
+        // (BUG-005). The guard reaps the whole tree on timeout or drop.
+        let spawner = crate::tools::process::workload_spawner().await;
         let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = Command::new("cmd");
-            c.args(["/C", command]);
-            c
+            spawner.command("cmd", &["/C", command])
         } else {
-            let mut c = Command::new("sh");
-            c.args(["-c", command]);
-            c
+            spawner.command("sh", &["-c", command])
         };
 
         cmd.current_dir(cwd);
         cmd.envs(env);
+        if let Some(dir) = spawner.xdg_runtime_dir() {
+            cmd.env("XDG_RUNTIME_DIR", dir);
+        }
 
-        let output = tokio::time::timeout(self.config.timeout, cmd.output())
-            .await
-            .map_err(|_| SandboxError::Timeout(self.config.timeout))?
-            .map_err(|e| SandboxError::ExecutionFailed {
-                reason: e.to_string(),
-            })?;
+        let child = cmd.spawn().map_err(|e| SandboxError::ExecutionFailed {
+            reason: e.to_string(),
+        })?;
+        let mut guard = crate::tools::process::ProcessTreeGuard::new(&child);
+
+        let output = match tokio::time::timeout(self.config.timeout, child.wait_with_output()).await
+        {
+            Ok(output) => {
+                guard.disarm();
+                output.map_err(|e| SandboxError::ExecutionFailed {
+                    reason: e.to_string(),
+                })?
+            }
+            Err(_) => {
+                // The dropped future's kill_on_drop reaps the direct child;
+                // SIGKILL the rest of the process group (BUG-005).
+                guard.kill_tree();
+                return Err(SandboxError::Timeout(self.config.timeout));
+            }
+        };
 
         let max_output: usize = 64 * 1024; // 64 KB, matching container path
         let half_max = max_output / 2;

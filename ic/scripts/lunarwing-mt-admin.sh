@@ -21,6 +21,25 @@ BUILD_LOCK="/var/lock/lunarwing-build.lock"
 TENANT_LIFECYCLE_LOCK_DIR="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/var/lock/lunarwing-tenants}"
 PORTS_LOCK_HELD="false"
 PROFILE="${LUNARWING_MT_PROFILE:-release}"
+# ── BUG-005 resource bounding ────────────────────────────────────────────────
+# Transient heavy workloads (agent shell commands, compiles) must not live in
+# the daemon's own service cgroup. On systemd, the daemon spawns them as
+# transient scopes in WORKLOAD_SLICE (see ic/src/tools/process.rs) and
+# build_tenant runs cargo in BUILD_SLICE; both slices are rendered per-tenant
+# with the caps below. The daemon unit itself gets DAEMON_* caps so a runaway
+# daemon is bounded independently of its workloads.
+WORKLOAD_SLICE="${LUNARWING_MT_WORKLOAD_SLICE:-lunarwing-workloads.slice}"
+WORKLOAD_MEMORY_HIGH="${LUNARWING_MT_WORKLOAD_MEMORY_HIGH:-6G}"
+WORKLOAD_MEMORY_MAX="${LUNARWING_MT_WORKLOAD_MEMORY_MAX:-8G}"
+WORKLOAD_CPU_QUOTA="${LUNARWING_MT_WORKLOAD_CPU_QUOTA:-800%}"
+WORKLOAD_TASKS_MAX="${LUNARWING_MT_WORKLOAD_TASKS_MAX:-2048}"
+BUILD_SLICE="${LUNARWING_MT_BUILD_SLICE:-lunarwing-build.slice}"
+BUILD_JOBS="${LUNARWING_MT_BUILD_JOBS:-$(nproc)}"
+BUILD_MEMORY_HIGH="${LUNARWING_MT_BUILD_MEMORY_HIGH:-16G}"
+BUILD_MEMORY_MAX="${LUNARWING_MT_BUILD_MEMORY_MAX:-24G}"
+DAEMON_MEMORY_HIGH="${LUNARWING_MT_DAEMON_MEMORY_HIGH:-1536M}"
+DAEMON_MEMORY_MAX="${LUNARWING_MT_DAEMON_MEMORY_MAX:-2G}"
+DAEMON_TASKS_MAX="${LUNARWING_MT_DAEMON_TASKS_MAX:-512}"
 SOURCE_REPO="${LUNARWING_MT_SOURCE_REPO:-$LUNARWING_ROOT}"
 DARKIRC_SOURCE="${LUNARWING_MT_DARKIRC_SOURCE:-}"
 DARKIRC_BIN="${LUNARWING_MT_DARKIRC_BIN:-/usr/local/bin/darkirc}"
@@ -2094,6 +2113,28 @@ clone_tenant_repo() {
 
 # ── Build management ─────────────────────────────────────────────────────────
 
+# Run one tenant build step with resource bounding (BUG-005). On systemd the
+# step runs as a transient scope in BUILD_SLICE via the tenant's own user
+# manager, so cargo/rustc memory is capped and accounted outside both the
+# operator's session and the daemon service. Falls back to a plain nice'd
+# invocation when no user manager is reachable (OpenRC, or not yet started).
+_run_tenant_build() {
+  local name="$1" build_cmd="$2"
+  local uid
+  uid="$(id -u "$name")"
+  if [[ "$(ensure_init_system)" == systemd* ]] && command -v systemd-run >/dev/null 2>&1 \
+    && sudo -u "$name" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user show --property=Version >/dev/null 2>&1; then
+    sudo -u "$name" XDG_RUNTIME_DIR="/run/user/$uid" \
+      systemd-run --user --scope --quiet --collect \
+      --slice="$BUILD_SLICE" \
+      --property="MemoryHigh=$BUILD_MEMORY_HIGH" \
+      --property="MemoryMax=$BUILD_MEMORY_MAX" \
+      bash -c "$build_cmd"
+  else
+    sudo -u "$name" nice -n 10 bash -c "$build_cmd"
+  fi
+}
+
 build_tenant() {
   local name="$1"
   local with_wasm="${2:-false}"
@@ -2118,18 +2159,18 @@ build_tenant() {
     local cargo_env="if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; else export PATH=\"\$HOME/.cargo/bin:\$PATH\"; fi;"
 
     say "building lunarwing for $name ..."
-    sudo -u "$name" bash -c "$cargo_env cd '$repo' && cargo build --profile $PROFILE --bin lunarwing" \
+    _run_tenant_build "$name" "$cargo_env cd '$repo' && cargo build --profile $PROFILE --bin lunarwing -j$BUILD_JOBS" \
       || die "lunarwing build failed for $name"
 
     say "building xmpp-bridge for $name ..."
-    sudo -u "$name" bash -c "$cargo_env cd '$repo/bridges/xmpp-bridge' && cargo build --profile $PROFILE" \
+    _run_tenant_build "$name" "$cargo_env cd '$repo/bridges/xmpp-bridge' && cargo build --profile $PROFILE -j$BUILD_JOBS" \
       || die "xmpp-bridge build failed for $name"
 
     if [[ "$with_wasm" == "true" ]]; then
       if ensure_tenant_wasm_toolchain "$name"; then
         say "building WASM extensions for $name ..."
         local wasm_build_ok="true"
-        if ! sudo -u "$name" bash -c "$cargo_env cd '$repo' && bash scripts/build-wasm-extensions.sh"; then
+        if ! _run_tenant_build "$name" "$cargo_env cd '$repo' && CARGO_BUILD_JOBS=$BUILD_JOBS bash scripts/build-wasm-extensions.sh"; then
           if [[ "$require_wasm" == "true" ]]; then
             die "WASM extension build failed for $name; refusing to install stale artifacts"
           fi
@@ -6525,9 +6566,39 @@ KillSignal=SIGTERM
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+# BUG-005: the daemon is capped separately from its transient workloads;
+# shell/compile jobs run in lunarwing-workloads.slice scopes (see
+# ic/src/tools/process.rs), so their memory never lands here.
+MemoryHigh=$DAEMON_MEMORY_HIGH
+MemoryMax=$DAEMON_MEMORY_MAX
+TasksMax=$DAEMON_TASKS_MAX
 
 [Install]
 WantedBy=default.target
+EOF
+
+  # BUG-005: transient workload slices. Agent-spawned shell/compile jobs run
+  # as scopes under lunarwing-workloads.slice; operator-driven builds
+  # (build_tenant) run under lunarwing-build.slice. Slice names are constant
+  # across tenants because each tenant has its own systemd user manager.
+  cat >"$user_unit_dir/$WORKLOAD_SLICE" <<EOF
+[Unit]
+Description=LunarWing transient agent workloads ($name)
+
+[Slice]
+MemoryHigh=$WORKLOAD_MEMORY_HIGH
+MemoryMax=$WORKLOAD_MEMORY_MAX
+CPUQuota=$WORKLOAD_CPU_QUOTA
+TasksMax=$WORKLOAD_TASKS_MAX
+EOF
+
+  cat >"$user_unit_dir/$BUILD_SLICE" <<EOF
+[Unit]
+Description=LunarWing operator build workloads ($name)
+
+[Slice]
+MemoryHigh=$BUILD_MEMORY_HIGH
+MemoryMax=$BUILD_MEMORY_MAX
 EOF
 
   # The pg + worker Quadlet .container units are rendered by the start functions
@@ -7271,6 +7342,14 @@ INITEOF
   cat >"$OPENRC_CONFD_DIR/lunarwing-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 lunarwing_rc_need="xmpp-bridge-${name}${proxy_rc_need}${weechat_rc_need}${darkirc_rc_need}"
+
+# BUG-005 note: agent-spawned shell/compile workloads are isolated into their
+# own process group and reaped on timeout/cancel by the daemon itself (see
+# ic/src/tools/process.rs), so runaway trees cannot leak on any init system.
+# Hard cgroup memory/CPU caps for those workloads are currently applied only
+# on systemd hosts (lunarwing-workloads.slice); OpenRC has no equivalent
+# transient-scope mechanism. Optional process-level caps can be added here:
+#rc_ulimit="-v 8388608"
 CONFD
 
   cat >"$OPENRC_CONFD_DIR/xmpp-bridge-${name}" <<CONFD
