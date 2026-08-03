@@ -16,9 +16,9 @@ use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
-    ApiTokenRecord, ConversationStore, Database, IdentityStore, JobStore, ReflexPatternRecord,
-    ReflexStore, RoutineStore, SandboxStore, SettingsStore, ToolFailureStore, UserIdentityRecord,
-    UserRecord, UserStore, WorkspaceStore,
+    ApiTokenRecord, ConversationStore, Database, IdentityStore, JobStore, ReflexPatternHit,
+    ReflexPatternRecord, ReflexStore, RoutineStore, SandboxStore, SettingsStore, ToolFailureStore,
+    UserIdentityRecord, UserRecord, UserStore, WorkspaceStore,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -27,7 +27,7 @@ use crate::history::{
 };
 use crate::workspace::{
     DocumentVersion, MemoryChunk, MemoryDocument, Repository, SearchConfig, SearchResult,
-    VersionSummary, WorkspaceEntry,
+    VersionSummary, WorkspaceEntry, WorkspaceFileContent,
 };
 
 /// PostgreSQL database backend.
@@ -755,6 +755,20 @@ impl WorkspaceStore for PgBackend {
             .await
     }
 
+    async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError> {
+        self.repo
+            .get_files_limited(user_id, agent_id, directory, suffix, limit, max_file_bytes)
+            .await
+    }
+
     async fn list_all_paths(
         &self,
         user_id: &str,
@@ -1357,12 +1371,52 @@ impl ReflexStore for PgBackend {
         user_id: &str,
         normalized_pattern: &str,
     ) -> Result<(), DatabaseError> {
+        let hit = ReflexPatternHit {
+            user_id: user_id.to_string(),
+            normalized_pattern: normalized_pattern.to_string(),
+            count: 1,
+        };
+        self.bump_reflex_pattern_matches(std::slice::from_ref(&hit))
+            .await
+    }
+
+    async fn bump_reflex_pattern_matches(
+        &self,
+        hits: &[ReflexPatternHit],
+    ) -> Result<(), DatabaseError> {
+        let mut merged = HashMap::<(String, String), u64>::new();
+        for hit in hits.iter().filter(|hit| hit.count > 0) {
+            let count = merged
+                .entry((hit.user_id.clone(), hit.normalized_pattern.clone()))
+                .or_default();
+            *count = count.checked_add(hit.count).ok_or_else(|| {
+                DatabaseError::Constraint("reflex pattern hit count overflow".to_string())
+            })?;
+        }
+        if merged.is_empty() {
+            return Ok(());
+        }
+
+        let mut user_ids = Vec::with_capacity(merged.len());
+        let mut patterns = Vec::with_capacity(merged.len());
+        let mut counts = Vec::with_capacity(merged.len());
+        for ((user_id, pattern), count) in merged {
+            user_ids.push(user_id);
+            patterns.push(pattern);
+            counts.push(count.min(i32::MAX as u64) as i64);
+        }
+
         let conn = self.store.pool().get().await?;
         conn.execute(
-            "UPDATE reflex_patterns \
-             SET match_count = match_count + 1, last_matched_at = NOW(), updated_at = NOW() \
-             WHERE user_id = $1 AND normalized_pattern = $2",
-            &[&user_id, &normalized_pattern],
+            "UPDATE reflex_patterns AS pattern \
+             SET match_count = LEAST(pattern.match_count::bigint + hit.count, 2147483647)::integer, \
+                 last_matched_at = NOW(), updated_at = NOW(), \
+                 status = CASE WHEN pattern.status = 'evicted' THEN 'active' ELSE pattern.status END \
+             FROM UNNEST($1::text[], $2::text[], $3::bigint[]) \
+                  AS hit(user_id, normalized_pattern, count) \
+             WHERE pattern.user_id = hit.user_id \
+               AND pattern.normalized_pattern = hit.normalized_pattern",
+            &[&user_ids, &patterns, &counts],
         )
         .await?;
         Ok(())
@@ -1425,24 +1479,25 @@ impl ReflexStore for PgBackend {
         let mut stale: Vec<ReflexPatternRecord> = rows.iter().map(row_to_reflex_pattern).collect();
 
         if !dry_run && !stale.is_empty() {
-            let ids: Vec<String> = stale.iter().map(|r| r.id.to_string()).collect();
-            conn.execute(
-                "UPDATE reflex_patterns \
-                 SET status = 'evicted', updated_at = NOW() \
-                 WHERE id = ANY($1)",
-                &[&ids.as_slice()],
-            )
-            .await?;
-            // Refresh rows to reflect updated status
+            let ids: Vec<Uuid> = stale.iter().map(|record| record.id).collect();
             let rows = conn
                 .query(
-                    "SELECT id, user_id, normalized_pattern, original_pattern, tool_name, \
-                     match_count, last_matched_at, created_at, updated_at, status, compilation_attempts, \
-                     embedding, embedding_model \
-                     FROM reflex_patterns \
-                     WHERE id = ANY($1) \
+                    "WITH evicted AS (\
+                         UPDATE reflex_patterns \
+                         SET status = 'evicted', updated_at = NOW() \
+                         WHERE id = ANY($1::uuid[]) \
+                           AND status = 'active' \
+                           AND COALESCE(last_matched_at, created_at) < $2 \
+                         RETURNING id, user_id, normalized_pattern, original_pattern, tool_name, \
+                                   match_count, last_matched_at, created_at, updated_at, status, \
+                                   compilation_attempts, embedding, embedding_model\
+                     ) \
+                     SELECT id, user_id, normalized_pattern, original_pattern, tool_name, \
+                            match_count, last_matched_at, created_at, updated_at, status, \
+                            compilation_attempts, embedding, embedding_model \
+                     FROM evicted \
                      ORDER BY COALESCE(last_matched_at, created_at) ASC",
-                    &[&ids.as_slice()],
+                    &[&ids.as_slice(), &cutoff],
                 )
                 .await?;
             stale = rows.iter().map(row_to_reflex_pattern).collect();

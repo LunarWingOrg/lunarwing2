@@ -6,14 +6,21 @@ The Pebble worker (`pebble4lunarwing/`) integrates the Pebble agentic coding har
 
 ### Native (no Docker)
 
+On the Linux dev VM, keep Cargo limited to six CPUs and six jobs:
+
 ```bash
-cd pebble && cargo build --release
-cd ../pebble4lunarwing && cargo build --release
+cd pebble
+taskset -c 0-5 cargo build --release -j6
+cd ../pebble4lunarwing
+taskset -c 0-5 cargo build --release -j6
 
 PEBBLE_BIN=../pebble/target/release/pebble \
 WORKSPACE_ROOT=/tmp/pebble-workspace \
 ./target/release/pebble4lunarwing
 ```
+
+On platforms without `taskset`, omit only the `taskset -c 0-5` prefix and keep
+`-j6`.
 
 ### Docker
 
@@ -42,44 +49,51 @@ user/assistant history. Default `none` preserves prompt-only behavior.
 
 ### Build
 
+Run long worker-image builds in `tmux`:
+
 ```bash
-sudo lunarwing-mt-admin.sh build-pebble-worker
+sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 ```
 
 ### Port Allocation
 
-The v4 port registry migration (`migrate-ports-v4.sh`) assigns `pebble_wss` at offset +8 (previously `reserved_2`).
-
-```bash
-sudo ic/scripts/migrate-ports-v4.sh
-```
-
-The admin script auto-migrates on `add-tenant` and `build-tenant`.
+`lunarwing-mt-admin.sh` initializes and migrates the ports registry before its
+normal tenant operations. The historical v3 → v4 migration assigns
+`pebble_wss` at offset +8; operators should not run `migrate-ports-v4.sh`
+directly during routine provisioning.
 
 ### Start/Stop
 
-Pebble workers start and stop with the tenant:
+Pebble starts and stops with the tenant. For worker-only lifecycle operations,
+use the dedicated commands:
 
 ```bash
-sudo lunarwing-mt-admin.sh start-tenant <name>
-sudo lunarwing-mt-admin.sh stop-tenant <name>
+sudo ic/scripts/lunarwing-mt-admin.sh start-worker <name> pebble
+sudo ic/scripts/lunarwing-mt-admin.sh stop-worker <name> pebble
+sudo ic/scripts/lunarwing-mt-admin.sh restart-worker <name> pebble
 ```
 
 ### Per-Tenant Configuration
 
-Create `pebble.env` in the tenant env directory for pebble-specific overrides:
+Use the supported configuration command; it writes the tenant-owned
+`pebble.env` with mode `0600`:
 
 ```bash
-# /etc/lunarwing/env/<tenant>/pebble.env
-PEBBLE_MODEL=openai/gpt-5.2
-NANOGPT_API_KEY=...
+sudo ic/scripts/lunarwing-mt-admin.sh configure-pebble <name> \
+  --nanogpt-api-key '<key>' \
+  --model openai/gpt-5.2
+sudo ic/scripts/lunarwing-mt-admin.sh restart-worker <name> pebble
 ```
+
+The current command accepts the NanoGPT key on argv, so run it only from a
+private administrative shell and avoid recording the command in shared history
+or logs.
 
 ### Status
 
 ```bash
-sudo lunarwing-mt-admin.sh status <name>
-sudo lunarwing-mt-admin.sh list-ports
+sudo ic/scripts/lunarwing-mt-admin.sh status <name>
+sudo ic/scripts/lunarwing-mt-admin.sh list-tenants
 ```
 
 ## Health Endpoints
@@ -98,23 +112,22 @@ docker image inspect lunarwing-worker-pebble:latest
 
 If missing, build it:
 ```bash
-sudo lunarwing-mt-admin.sh build-pebble-worker
+sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 ```
 
 ### Task failures
 
-Check bridge logs:
+Start with the init-agnostic tenant status rather than calling Docker or Podman
+directly:
+
 ```bash
-docker logs lunarwing-pebble-<tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
 ```
 
-The bridge logs task start/completion and stderr from the pebble process.
+Then inspect the service/container logs through the host's configured init and
+container runtime. The bridge logs task start/completion and subprocess stderr.
 
 ### Agent can't connect
 
-Verify the port is allocated and the container is running:
-```bash
-sudo lunarwing-mt-admin.sh status <tenant>
-```
-
-Check that `config.toml` has the correct `url` pointing to the pebble_wss port.
+The same status command reports the allocated `pebble_wss` port and worker
+state. Check that `config.toml` points at that port.

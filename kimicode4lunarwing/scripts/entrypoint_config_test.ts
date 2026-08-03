@@ -49,6 +49,28 @@ api_key = ""
   assert.equal(readFileSync(target, "utf8"), config)
 })
 
+test("entrypoint accepts a missing Kimi API key", () => {
+  assert.ok(configSectionEnd > 0)
+  const root = mkdtempSync(join(tmpdir(), "kimi-config-no-api-key-"))
+  const home = join(root, "home")
+  const source = join(root, "source.toml")
+  writeFileSync(source, 'api_key = ""\n')
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    KIMI_CODE_HOME: home,
+    KIMI_CONFIG_SOURCE: source,
+  }
+  delete env.KIMI_API_KEY
+
+  const result = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+    encoding: "utf8",
+    env,
+  })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(readFileSync(join(home, "config.toml"), "utf8"), 'api_key = ""\n')
+})
+
 test("entrypoint CLI mode forces print and stream-json", () => {
   assert.match(entrypoint, /exec kimi -p "\$\*" --output-format stream-json/)
 })

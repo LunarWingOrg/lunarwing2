@@ -1,6 +1,12 @@
-# GitHub Issue Status Report
+# Historical GitHub Issue Status Report
+
+> **Snapshot only (2026-07-09).** Issue counts, states, priorities, paths, and
+> recommendations below were not re-queried for v2.0.4.0. The active project is
+> hosted on GitLab; do not use this report as a current issue tracker. It is
+> retained as provenance for the cited GitHub review.
+
 **Generated**: 2026-07-09 (item #5 from AGENT_GOALS_1.1.9.md)
-**Source**: https://github.com/LunarWingOrg/lunarwing/issues
+**Source at the time**: https://github.com/LunarWingOrg/lunarwing/issues
 
 ---
 

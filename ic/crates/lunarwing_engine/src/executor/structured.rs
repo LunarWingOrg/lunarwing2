@@ -44,6 +44,14 @@ enum PreflightOutcome {
     },
 }
 
+async fn refund_preflight_reservations(preflight: &[PreflightOutcome], leases: &LeaseManager) {
+    for outcome in preflight {
+        if let PreflightOutcome::Runnable { lease, .. } = outcome {
+            let _ = leases.refund_use(lease.id).await;
+        }
+    }
+}
+
 /// Execute a batch of action calls using the Tier 0 (structured) approach.
 ///
 /// Two-phase execution:
@@ -51,7 +59,7 @@ enum PreflightOutcome {
 ///    Denied calls produce error results immediately. RequireApproval interrupts
 ///    the entire batch.
 /// 2. **Execute** (parallel): All approved calls run concurrently via `JoinSet`.
-///    Results are collected and merged in original call order.
+///    Results are merged in call order unless a stop aborts and drains the batch.
 pub async fn execute_action_calls(
     calls: &[ActionCall],
     thread: &Thread,
@@ -103,11 +111,16 @@ pub async fn execute_action_calls(
         };
 
         // 2. Find the action definition and check policy
-        let action_def = effects
+        let action_def = match effects
             .available_actions(std::slice::from_ref(&lease))
-            .await?
-            .into_iter()
-            .find(|a| a.name == call.action_name);
+            .await
+        {
+            Ok(actions) => actions.into_iter().find(|a| a.name == call.action_name),
+            Err(error) => {
+                refund_preflight_reservations(&preflight_results, leases).await;
+                return Err(error);
+            }
+        };
 
         if let Some(ref action_def) = action_def {
             let decision = policy.evaluate_with_provenance(
@@ -140,6 +153,7 @@ pub async fn execute_action_calls(
                     continue;
                 }
                 PolicyDecision::RequireApproval { .. } => {
+                    refund_preflight_reservations(&preflight_results, leases).await;
                     // Collect error results from earlier preflight failures
                     for pf in preflight_results {
                         if let PreflightOutcome::Error { result, event, .. } = pf {
@@ -179,9 +193,13 @@ pub async fn execute_action_calls(
         // 3. Atomically find + consume a lease use under a single write lock.
         // This avoids the TOCTOU race where a concurrent call could exhaust
         // the lease between our read-only find (step 1) and this consume.
-        let lease = leases
-            .find_and_consume(thread.id, &call.action_name)
-            .await?;
+        let lease = match leases.find_and_consume(thread.id, &call.action_name).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                refund_preflight_reservations(&preflight_results, leases).await;
+                return Err(error);
+            }
+        };
 
         preflight_results.push(PreflightOutcome::Runnable { index: idx, lease });
     }
@@ -240,6 +258,7 @@ pub async fn execute_action_calls(
         let mut join_set = tokio::task::JoinSet::new();
         let effects = effects.clone();
 
+        let mut pending_lease_uses = Vec::with_capacity(runnable_indices.len());
         for (idx, lease) in runnable_indices {
             let call = calls[idx].clone();
             let mut ctx = context.clone();
@@ -247,6 +266,7 @@ pub async fn execute_action_calls(
             let effects = effects.clone();
             let lease = lease.clone();
 
+            pending_lease_uses.push(lease.id);
             join_set.spawn(async move {
                 let result = effects
                     .execute_action(&call.action_name, call.parameters.clone(), &lease, &ctx)
@@ -259,22 +279,34 @@ pub async fn execute_action_calls(
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
                 Ok((idx, lease_id, result, call, ctx)) => {
+                    if let Some(position) = pending_lease_uses
+                        .iter()
+                        .position(|pending_id| *pending_id == lease_id)
+                    {
+                        pending_lease_uses.swap_remove(position);
+                    }
                     if interrupted_call_needs_refund(&result) {
                         let _ = leases.refund_use(lease_id).await;
                     }
                     if matches!(&result, Err(EngineError::ExecutionStopped)) {
-                        execution_stopped = true;
+                        if !execution_stopped {
+                            execution_stopped = true;
+                            join_set.abort_all();
+                        }
                     } else {
                         slot_results[idx] = Some(classify_exec_result(result, &call, &ctx));
                     }
                 }
                 Err(e) => {
-                    // Task panicked — should not happen, but handle gracefully
-                    tracing::debug!("parallel tool execution task panicked: {e}");
+                    // Task panicked or was aborted after a sibling stopped.
+                    tracing::debug!("parallel tool execution task failed: {e}");
                 }
             }
         }
         if execution_stopped {
+            for lease_id in pending_lease_uses {
+                let _ = leases.refund_use(lease_id).await;
+            }
             return Ok(ActionBatchResult {
                 results: Vec::new(),
                 events: Vec::new(),
@@ -440,6 +472,7 @@ mod tests {
     use crate::types::thread::{Thread, ThreadConfig, ThreadType};
 
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     struct MockEffects {
@@ -452,6 +485,22 @@ mod tests {
             Self {
                 results: Mutex::new(results),
                 actions,
+            }
+        }
+    }
+
+    struct StopAndHangEffects {
+        started: tokio::sync::Barrier,
+    }
+
+    struct FailSecondActionLookupEffects {
+        lookups: AtomicUsize,
+    }
+
+    impl StopAndHangEffects {
+        fn new() -> Self {
+            Self {
+                started: tokio::sync::Barrier::new(2),
             }
         }
     }
@@ -487,6 +536,57 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl EffectExecutor for StopAndHangEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _params: serde_json::Value,
+            _lease: &CapabilityLease,
+            _ctx: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.started.wait().await;
+            if action_name == "stop_tool" {
+                Err(EngineError::ExecutionStopped)
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![test_action("stop_tool"), test_action("hang_tool")])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for FailSecondActionLookupEffects {
+        async fn execute_action(
+            &self,
+            _action_name: &str,
+            _params: serde_json::Value,
+            _lease: &CapabilityLease,
+            _ctx: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            panic!("preflight failure must prevent execution")
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            if self.lookups.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(vec![test_action("echo")])
+            } else {
+                Err(EngineError::Effect {
+                    reason: "action lookup failed".into(),
+                })
+            }
+        }
+    }
+
     fn test_action(name: &str) -> ActionDef {
         ActionDef {
             name: name.into(),
@@ -494,6 +594,13 @@ mod tests {
             parameters_schema: serde_json::json!({"type": "object"}),
             effects: vec![EffectType::ReadLocal],
             requires_approval: false,
+        }
+    }
+
+    fn approval_action(name: &str) -> ActionDef {
+        ActionDef {
+            requires_approval: true,
+            ..test_action(name)
         }
     }
 
@@ -722,6 +829,95 @@ mod tests {
     }
 
     // ── GatePaused(Authentication) tests ─────────────────────
+
+    #[tokio::test]
+    async fn preflight_approval_refunds_earlier_lease_reservations() {
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("echo"), approval_action("approval_tool")],
+            Vec::new(),
+        ));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(2))
+            .await
+            .unwrap();
+        let calls = vec![
+            ActionCall {
+                id: "call_echo".into(),
+                action_name: "echo".into(),
+                parameters: serde_json::json!({}),
+            },
+            ActionCall {
+                id: "call_approval".into(),
+                action_name: "approval_tool".into(),
+                parameters: serde_json::json!({}),
+            },
+        ];
+
+        let result = execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result.need_approval,
+            Some(ThreadOutcome::GatePaused { .. })
+        ));
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_error_refunds_earlier_lease_reservations() {
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let effects: Arc<dyn EffectExecutor> = Arc::new(FailSecondActionLookupEffects {
+            lookups: AtomicUsize::new(0),
+        });
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(2))
+            .await
+            .unwrap();
+        let calls = vec![
+            ActionCall {
+                id: "call_echo".into(),
+                action_name: "echo".into(),
+                parameters: serde_json::json!({}),
+            },
+            ActionCall {
+                id: "call_fails".into(),
+                action_name: "lookup_failure".into(),
+                parameters: serde_json::json!({}),
+            },
+        ];
+
+        let result =
+            execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[]).await;
+
+        assert!(matches!(result, Err(EngineError::Effect { .. })));
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(2)
+        );
+    }
 
     #[tokio::test]
     async fn authentication_gate_interrupts_batch() {
@@ -991,6 +1187,73 @@ mod tests {
         assert!(result.events.is_empty());
         assert_eq!(
             leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_stopped_aborts_and_drains_parallel_sibling() {
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let effects: Arc<dyn EffectExecutor> = Arc::new(StopAndHangEffects::new());
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+        let stop_lease = leases
+            .grant(
+                thread.id,
+                "stop",
+                GrantedActions::Specific(vec!["stop_tool".into()]),
+                None,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        let hang_lease = leases
+            .grant(
+                thread.id,
+                "hang",
+                GrantedActions::Specific(vec!["hang_tool".into()]),
+                None,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        let calls = vec![
+            ActionCall {
+                id: "call_stop".into(),
+                action_name: "stop_tool".into(),
+                parameters: serde_json::json!({}),
+            },
+            ActionCall {
+                id: "call_hang".into(),
+                action_name: "hang_tool".into(),
+                parameters: serde_json::json!({}),
+            },
+        ];
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[]),
+        )
+        .await
+        .expect("stop should abort and drain the hanging sibling promptly")
+        .unwrap();
+
+        assert!(matches!(result.need_approval, Some(ThreadOutcome::Stopped)));
+        assert!(result.results.is_empty());
+        assert!(result.events.is_empty());
+        assert_eq!(
+            leases.check(stop_lease.id).await.unwrap().uses_remaining,
+            Some(1)
+        );
+        assert_eq!(
+            leases.check(hang_lease.id).await.unwrap().uses_remaining,
             Some(1)
         );
     }

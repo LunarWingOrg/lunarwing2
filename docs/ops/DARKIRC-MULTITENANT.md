@@ -27,15 +27,20 @@ You do **not** need to clone DarkFi by hand: `build-darkirc` auto-clones it if t
 
 ## Port Registry Requirements
 
-DarkIRC requires schema v7 in `/etc/lunarwing/ports.json`.
+DarkIRC's three port fields were introduced by schema v7, but the current
+registry schema is **v13**. Normal `lunarwing-mt-admin.sh` commands call
+`ports_registry_init()` and migrate older registries through every version to
+v13 before operating. Do not intentionally leave a production registry at v7.
 
-| Schema | Adds | Script |
-|--------|------|--------|
+| Historical schema | Adds | Standalone migration |
+|-------------------|------|----------------------|
 | v6 | `extended_range`, `extended_base`, `extended_ports.reserved_0..reserved_9` | `ic/scripts/migrate-ports-v6.sh` |
 | v6.1 | `extended_ports.darkirc_adapter` from `reserved_0` | `ic/scripts/migrate-ports-v6.1.sh` |
 | v7 | `extended_ports.darkirc_irc` and `extended_ports.darkirc_rpc` from `reserved_1` and `reserved_2` | `ic/scripts/migrate-ports-v7.sh` |
 
-New tenants created after these changes already receive all three DarkIRC ports. Existing tenants need the migrations.
+New tenants already receive all three DarkIRC ports. Existing registries are
+migrated by the admin script; the standalone v6/v6.1/v7 scripts are retained
+for explicit recovery or rehearsal on old copies.
 
 ### Inspect Current Schema
 
@@ -63,23 +68,19 @@ The exact numbers depend on the tenant's base port. Existing primary ports are n
 
 ### Migrate a Live Registry
 
-Run migrations in order from the repo root:
+Use the admin script rather than stopping at the old DarkIRC-specific v7 step:
 
 ```bash
-sudo ic/scripts/migrate-ports-v6.sh
-sudo ic/scripts/migrate-ports-v6.1.sh
-sudo ic/scripts/migrate-ports-v7.sh
+sudo ic/scripts/lunarwing-mt-admin.sh list-tenants
+jq -e '.version == 13' /etc/lunarwing/ports.json
 ```
 
-Each script:
+`list-tenants` calls `ports_registry_init()`, which acquires the registry lock and
+runs the full v2 → v13 migration chain before printing tenants. Other normal
+admin operations that initialize the registry do the same.
 
-- accepts `PORTS_REGISTRY=/path/to/copy.json` for dry runs on a copy;
-- requires root only when operating on `/etc/lunarwing/ports.json`;
-- writes a timestamped backup next to the registry;
-- validates port uniqueness before replacing the registry;
-- swaps the new registry into place atomically.
-
-Dry-run against a copy first:
+For a DarkIRC-only rehearsal on an old registry copy, the standalone v6,
+v6.1, and v7 scripts remain useful:
 
 ```bash
 cp -p /etc/lunarwing/ports.json /tmp/ports.darkirc-test.json
@@ -89,15 +90,9 @@ PORTS_REGISTRY=/tmp/ports.darkirc-test.json ic/scripts/migrate-ports-v7.sh
 jq '.tenants | to_entries[] | {tenant: .key, extended_ports: .value.extended_ports}' /tmp/ports.darkirc-test.json
 ```
 
-### Inline Migration via Admin Script
-
-`lunarwing-mt-admin.sh` also contains inline migration functions:
-
-- `ports_migrate_v6`
-- `ports_migrate_v6_1`
-- `ports_migrate_v7`
-
-The top-level `ports_migrate()` dispatcher runs them in order. This means normal admin-script flows can bring stale registries forward, while the standalone scripts remain available for explicit operator-controlled upgrades.
+Those standalone scripts establish the DarkIRC fields but intentionally do not
+advance the copy through later schemas. Do not use their final version as the
+expected version of a live production registry.
 
 ## Configure the DarkIRC Source Path (optional)
 
@@ -527,7 +522,7 @@ If the WASM channel is installed but the adapter is down, channel health will re
 
 For each production tenant:
 
-- [ ] `/etc/lunarwing/ports.json` is schema v7.
+- [ ] `/etc/lunarwing/ports.json` is current schema v13.
 - [ ] `darkirc_adapter`, `darkirc_irc`, and `darkirc_rpc` exist under `.extended_ports`.
 - [ ] The tenant (build) user has a working Rust toolchain (`cargo` + `make`). DarkFi source is auto-cloned; set `DARKIRC_SOURCE` only for a custom checkout.
 - [ ] `build-darkirc --tenant <TENANT>` completed (clones + builds as the tenant).

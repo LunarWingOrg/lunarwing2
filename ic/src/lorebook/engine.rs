@@ -17,6 +17,9 @@ pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
 pub const MAX_KEY_CHECKS: usize = 131_072;
 /// Maximum aggregate haystack bytes inspected by plaintext key comparisons.
 pub const MAX_MATCH_SCAN_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum aggregate raw and case-folded bytes retained by scan-window cache.
+const MAX_CACHED_SCAN_WINDOW_BYTES: usize = MAX_SCAN_TEXT_BYTES * 2;
+const MAX_CACHED_SCAN_WINDOWS: usize = LorebookConfig::MAX_SCAN_DEPTH + 1;
 
 /// Conservative token estimate over fully rendered prompt text.
 pub fn approx_tokens(content: &str) -> usize {
@@ -100,6 +103,40 @@ fn scan_window(messages: &[String], depth: usize) -> String {
     }
     selected.reverse();
     selected.join("\n")
+}
+
+#[derive(Default)]
+struct ScanWindowCache {
+    windows: HashMap<usize, (Box<str>, Box<str>)>,
+    bytes: usize,
+}
+
+impl ScanWindowCache {
+    fn with_window<T>(
+        &mut self,
+        messages: &[String],
+        requested_depth: usize,
+        use_window: impl FnOnce(&str, &str) -> T,
+    ) -> T {
+        let effective_depth = requested_depth.min(messages.len());
+        if let Some((raw, folded)) = self.windows.get(&effective_depth) {
+            return use_window(raw, folded);
+        }
+
+        let raw = scan_window(messages, effective_depth).into_boxed_str();
+        let folded = raw.to_lowercase().into_boxed_str();
+        let window_bytes = raw.len().saturating_add(folded.len());
+        let can_cache = self.windows.len() < MAX_CACHED_SCAN_WINDOWS
+            && window_bytes <= MAX_CACHED_SCAN_WINDOW_BYTES.saturating_sub(self.bytes);
+        if !can_cache {
+            return use_window(&raw, &folded);
+        }
+
+        self.bytes = self.bytes.saturating_add(window_bytes);
+        self.windows.insert(effective_depth, (raw, folded));
+        let (raw, folded) = &self.windows[&effective_depth];
+        use_window(raw, folded)
+    }
 }
 
 pub(crate) fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
@@ -269,7 +306,7 @@ pub fn activate<'a>(
     let mut ordered: Vec<_> = entries.iter().collect();
     ordered.sort_by(|left, right| priority_cmp(left, right));
     let seed = activation_seed(activation_scope, messages);
-    let mut windows: HashMap<usize, (String, String)> = HashMap::new();
+    let mut windows = ScanWindowCache::default();
     let mut match_budget = MatchBudget::default();
     let mut matching_exhausted = false;
     let mut active = Vec::new();
@@ -287,17 +324,14 @@ pub fn activate<'a>(
                 .scan_depth
                 .unwrap_or(config.scan_depth)
                 .min(LorebookConfig::MAX_SCAN_DEPTH);
-            let (scan_text, folded_scan_text) = windows.entry(depth).or_insert_with(|| {
-                let scan_text = scan_window(messages, depth);
-                let folded = scan_text.to_lowercase();
-                (scan_text, folded)
-            });
-            match entry_keywords_match_bounded(
-                entry,
-                scan_text,
-                Some(folded_scan_text),
-                &mut match_budget,
-            ) {
+            match windows.with_window(messages, depth, |scan_text, folded_scan_text| {
+                entry_keywords_match_bounded(
+                    entry,
+                    scan_text,
+                    Some(folded_scan_text),
+                    &mut match_budget,
+                )
+            }) {
                 Ok(triggered) => triggered,
                 Err(()) => {
                     tracing::warn!(
@@ -506,6 +540,54 @@ mod tests {
         let window = scan_window(&[message], 1);
         assert!(window.len() <= MAX_SCAN_TEXT_BYTES);
         assert!(window.starts_with("dragon"));
+    }
+
+    #[test]
+    fn scan_window_cache_canonicalizes_one_message_depths() {
+        let messages = ["X".repeat(MAX_SCAN_TEXT_BYTES)];
+        let mut cache = ScanWindowCache::default();
+
+        for depth in 1..=LorebookConfig::MAX_SCAN_DEPTH {
+            cache.with_window(&messages, depth, |raw, folded| {
+                assert_eq!(raw.len(), MAX_SCAN_TEXT_BYTES);
+                assert_eq!(folded.len(), MAX_SCAN_TEXT_BYTES);
+            });
+        }
+
+        assert_eq!(cache.windows.len(), 1);
+        assert_eq!(cache.bytes, MAX_CACHED_SCAN_WINDOW_BYTES);
+    }
+
+    #[test]
+    fn scan_window_cache_has_hard_aggregate_bounds() {
+        let messages: Vec<_> = (0..LorebookConfig::MAX_SCAN_DEPTH)
+            .map(|index| format!("{index:03}{}", "x".repeat(MAX_SCAN_TEXT_BYTES)))
+            .collect();
+        let mut cache = ScanWindowCache::default();
+
+        for depth in 0..=LorebookConfig::MAX_SCAN_DEPTH {
+            cache.with_window(&messages, depth, |raw, folded| {
+                assert!(raw.len() <= MAX_SCAN_TEXT_BYTES);
+                assert_eq!(folded, raw.to_lowercase());
+            });
+        }
+
+        assert!(cache.bytes <= MAX_CACHED_SCAN_WINDOW_BYTES);
+        assert!(cache.windows.len() <= MAX_CACHED_SCAN_WINDOWS);
+    }
+
+    #[test]
+    fn uncached_expanding_unicode_fold_matches_normally() {
+        let messages = ["İ界".repeat(MAX_SCAN_TEXT_BYTES / 3)];
+        let mut cache = ScanWindowCache::default();
+
+        cache.with_window(&messages, 1, |raw, folded| {
+            assert!(raw.is_char_boundary(raw.len()));
+            assert_eq!(folded, raw.to_lowercase());
+        });
+
+        assert!(cache.bytes <= MAX_CACHED_SCAN_WINDOW_BYTES);
+        assert!(cache.windows.len() <= MAX_CACHED_SCAN_WINDOWS);
     }
 
     #[test]

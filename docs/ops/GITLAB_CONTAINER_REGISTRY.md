@@ -155,9 +155,10 @@ Details:
   survive (matches the mt-admin `--format docker` convention).
 - Auth uses the automatic `$CI_REGISTRY_USER` / `$CI_REGISTRY_PASSWORD`
   per-job credentials — nothing to configure.
-- Jobs run **automatically on the default branch** when the relevant worker
-  directory changes, and are **manual** on every other pipeline (run the
-  pipeline, click the job).
+- All three image jobs are **manual-only on every pipeline** and
+  `allow_failure: true`; multi-GB worker builds never start automatically. Run
+  the pipeline and explicitly trigger only the image jobs needed for the
+  release.
 - Variable: `WITH_TOOLCHAINS` for opencode (default `false`; set `true` on a
   manual pipeline run for the fat
   toolchain image — mirrors mt-admin's `--with-toolchains`).

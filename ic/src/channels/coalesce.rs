@@ -15,20 +15,27 @@
 //! - [`CoalesceBuffer::flush_all`] drains pending messages (thread
 //!   termination / engine shutdown).
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
+use futures::FutureExt;
+use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::time::Instant;
+
+const DELIVERY_QUEUE_CAPACITY: usize = 64;
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Async flush callback invoked with the final merged content.
 pub type FlushFn = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Buffering key: one pending message per agent/transport/channel/conversation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChannelKey {
     /// Sending agent identifier (e.g. own JID).
     pub agent_id: String,
@@ -134,6 +141,29 @@ struct PendingMessage {
     generation: u64,
 }
 
+enum Command {
+    Submit {
+        key: ChannelKey,
+        content: String,
+        flush: FlushFn,
+        response: oneshot::Sender<CoalesceDecision>,
+    },
+    FlushAll {
+        response: oneshot::Sender<()>,
+    },
+    PendingCount {
+        response: oneshot::Sender<usize>,
+    },
+}
+
+struct CoalesceActor {
+    config: CoalesceConfig,
+    pending: HashMap<ChannelKey, PendingMessage>,
+    deadlines: BinaryHeap<Reverse<(Instant, u64, ChannelKey)>>,
+    next_generation: u64,
+    delivery_timeout: Duration,
+}
+
 /// Result of submitting a message to the buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoalesceDecision {
@@ -144,39 +174,58 @@ pub enum CoalesceDecision {
     Buffered,
 }
 
-/// Pre-send coalesce buffer. Clone-cheap; all clones share the pending map.
+/// Pre-send coalesce buffer. Clone-cheap; all clones share one bounded actor.
 #[derive(Clone)]
 pub struct CoalesceBuffer {
     config: CoalesceConfig,
-    pending: Arc<Mutex<HashMap<ChannelKey, PendingMessage>>>,
-    /// Monotonic generation source for timer identity. Generations are never
-    /// reused, so a stale timer can never match a replacement entry that was
-    /// inserted after an early flush removed the original (ISSUE-005).
-    next_generation: Arc<AtomicU64>,
-    /// Readers own active submissions/deliveries. `flush_all` takes the writer
-    /// so it cannot return while a detached callback is still running.
+    commands: mpsc::Sender<Command>,
+    /// Readers own active submissions. `flush_all` takes the writer so every
+    /// submission started before shutdown is queued and processed first.
     delivery_barrier: Arc<RwLock<()>>,
+    shutdown_timeout: Duration,
 }
 
 impl CoalesceBuffer {
     /// Create a buffer with the given config.
     pub fn new(config: CoalesceConfig) -> Self {
+        Self::new_with_delivery_limits(
+            config,
+            DELIVERY_QUEUE_CAPACITY,
+            DELIVERY_TIMEOUT,
+            SHUTDOWN_TIMEOUT,
+        )
+    }
+
+    fn new_with_delivery_limits(
+        config: CoalesceConfig,
+        queue_capacity: usize,
+        delivery_timeout: Duration,
+        shutdown_timeout: Duration,
+    ) -> Self {
+        let (commands, receiver) = mpsc::channel(queue_capacity.max(1));
+        let actor = CoalesceActor {
+            config: config.clone(),
+            pending: HashMap::new(),
+            deadlines: BinaryHeap::new(),
+            next_generation: 0,
+            delivery_timeout,
+        };
+        tokio::spawn(actor.run(receiver));
         Self {
             config,
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_generation: Arc::new(AtomicU64::new(0)),
+            commands,
             delivery_barrier: Arc::new(RwLock::new(())),
+            shutdown_timeout,
         }
     }
 
     /// Submit an outbound message for potential coalescing.
     ///
-    /// `flush` is invoked (on a spawned task) with the merged content when
-    /// the window expires, on early flush, or from [`Self::flush_all`].
+    /// `flush` is invoked by one bounded delivery actor when the window
+    /// expires, on early flush, or from [`Self::flush_all`].
     ///
-    /// Lookup, merge, overflow handling, and fresh insertion all happen
-    /// under one map lock so concurrent first submissions for a key merge
-    /// instead of replacing each other (ISSUE-005).
+    /// One actor serializes lookup, merge, overflow handling, delivery, and
+    /// timer expiry so concurrent submissions cannot replace each other.
     pub async fn submit(
         &self,
         key: ChannelKey,
@@ -187,63 +236,145 @@ impl CoalesceBuffer {
             return CoalesceDecision::SendNow(content);
         }
 
-        // Establish submission ownership before touching the map. Shutdown's
-        // write guard then waits for every submission that started before it.
-        let delivery_guard = Arc::clone(&self.delivery_barrier).read_owned().await;
+        // Establish submission ownership before queueing. Shutdown's write
+        // guard waits for every submission that started before it.
+        let _delivery_guard = self.delivery_barrier.read().await;
+        let fallback = content.clone();
+        let (response, result) = oneshot::channel();
+        let command = Command::Submit {
+            key,
+            content,
+            flush,
+            response,
+        };
+        if self.commands.send(command).await.is_err() {
+            return CoalesceDecision::SendNow(fallback);
+        }
+        result.await.unwrap_or(CoalesceDecision::SendNow(fallback))
+    }
 
-        // Collected under the lock; flushed after it is released so delivery
-        // never serializes on (or re-enters) the pending map.
-        let mut early_flush: Option<(FlushFn, String)> = None;
-        let mut arm_timer: Option<u64> = None;
+    /// Flush every pending message (thread termination / engine shutdown).
+    pub async fn flush_all(&self) {
+        if tokio::time::timeout(self.shutdown_timeout, self.flush_all_inner())
+            .await
+            .is_err()
         {
-            let mut guard = self.pending.lock().await;
-            match guard.get_mut(&key) {
-                Some(existing) => {
-                    let merged = merge_contents(&existing.content, &content);
-                    if merged.chars().count() > self.config.max_message_length {
-                        // Overflow: flush pending now, start a fresh window.
-                        if let Some(taken) = guard.remove(&key) {
-                            early_flush = Some((taken.flush, taken.content));
-                        }
-                        arm_timer = Some(self.insert_fresh(&mut guard, &key, content, flush));
-                    } else {
-                        existing.content = merged;
-                        existing.merge_count += 1;
-                        if existing.merge_count >= self.config.max_merges
-                            && let Some(taken) = guard.remove(&key)
-                        {
-                            early_flush = Some((taken.flush, taken.content));
+            tracing::warn!(
+                timeout_ms = self.shutdown_timeout.as_millis(),
+                "Timed out flushing coalesced responses during shutdown"
+            );
+        }
+    }
+
+    async fn flush_all_inner(&self) {
+        let _delivery_guard = self.delivery_barrier.write().await;
+        let (response, result) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::FlushAll { response })
+            .await
+            .is_ok()
+        {
+            let _ = result.await;
+        }
+    }
+
+    /// Number of currently buffered messages (tests/diagnostics).
+    pub async fn pending_count(&self) -> usize {
+        let (response, result) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::PendingCount { response })
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+        result.await.unwrap_or(0)
+    }
+}
+
+impl CoalesceActor {
+    async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
+        loop {
+            self.remove_stale_deadlines();
+            let next_deadline = self.deadlines.peek().map(|Reverse((at, _, _))| *at);
+            let command = match next_deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        command = commands.recv() => command,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            self.flush_due().await;
+                            continue;
                         }
                     }
                 }
-                None => {
-                    arm_timer = Some(self.insert_fresh(&mut guard, &key, content, flush));
-                }
-            }
+                None => commands.recv().await,
+            };
+            let Some(command) = command else {
+                break;
+            };
+            self.handle_command(command).await;
         }
-
-        if let Some((flush, content)) = early_flush {
-            spawn_flush(flush, content, delivery_guard);
-        } else {
-            drop(delivery_guard);
-        }
-        if let Some(generation) = arm_timer {
-            self.spawn_timer(key, generation);
-        }
-        CoalesceDecision::Buffered
     }
 
-    /// Insert a fresh pending entry under the held map lock and return its
-    /// globally unique generation.
-    fn insert_fresh(
-        &self,
-        guard: &mut HashMap<ChannelKey, PendingMessage>,
-        key: &ChannelKey,
-        content: String,
-        flush: FlushFn,
-    ) -> u64 {
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        guard.insert(
+    async fn handle_command(&mut self, command: Command) {
+        match command {
+            Command::Submit {
+                key,
+                content,
+                flush,
+                response,
+            } => {
+                self.handle_submit(key, content, flush).await;
+                let _ = response.send(CoalesceDecision::Buffered);
+            }
+            Command::FlushAll { response } => {
+                let mut pending = self.pending.drain().collect::<Vec<_>>();
+                pending.sort_by_key(|(_, pending)| pending.generation);
+                self.deadlines.clear();
+                for (key, pending) in pending {
+                    self.deliver(&key, pending).await;
+                }
+                let _ = response.send(());
+            }
+            Command::PendingCount { response } => {
+                let _ = response.send(self.pending.len());
+            }
+        }
+    }
+
+    async fn handle_submit(&mut self, key: ChannelKey, content: String, flush: FlushFn) {
+        let mut delivery = None;
+        let mut insert_fresh = false;
+        match self.pending.get_mut(&key) {
+            Some(existing) => {
+                let merged = merge_contents(&existing.content, &content);
+                if merged.chars().count() > self.config.max_message_length {
+                    delivery = self.pending.remove(&key);
+                    insert_fresh = true;
+                } else {
+                    existing.content = merged;
+                    existing.merge_count += 1;
+                    if existing.merge_count >= self.config.max_merges {
+                        delivery = self.pending.remove(&key);
+                    }
+                }
+            }
+            None => insert_fresh = true,
+        }
+        if insert_fresh {
+            self.insert_fresh(key.clone(), content, flush);
+        }
+        if let Some(pending) = delivery {
+            self.deliver(&key, pending).await;
+        }
+    }
+
+    fn insert_fresh(&mut self, key: ChannelKey, content: String, flush: FlushFn) {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.pending.insert(
             key.clone(),
             PendingMessage {
                 content,
@@ -252,45 +383,63 @@ impl CoalesceBuffer {
                 generation,
             },
         );
-        generation
+        self.deadlines.push(Reverse((
+            Instant::now() + self.config.window,
+            generation,
+            key,
+        )));
     }
 
-    /// Arm the window-expiry timer for a freshly inserted entry.
-    fn spawn_timer(&self, key: ChannelKey, generation: u64) {
-        let pending = Arc::clone(&self.pending);
-        let delivery_barrier = Arc::clone(&self.delivery_barrier);
-        let window = self.config.window;
-        tokio::spawn(async move {
-            tokio::time::sleep(window).await;
-            let _delivery_guard = delivery_barrier.read_owned().await;
-            let taken = {
-                let mut guard = pending.lock().await;
-                match guard.get(&key) {
-                    Some(p) if p.generation == generation => guard.remove(&key),
-                    _ => None,
-                }
-            };
-            if let Some(taken) = taken {
-                (taken.flush)(taken.content).await;
+    fn remove_stale_deadlines(&mut self) {
+        while let Some(Reverse((_, generation, key))) = self.deadlines.peek() {
+            if self
+                .pending
+                .get(key)
+                .is_some_and(|pending| pending.generation == *generation)
+            {
+                break;
             }
-        });
-    }
-
-    /// Flush every pending message (thread termination / engine shutdown).
-    pub async fn flush_all(&self) {
-        let _delivery_guard = Arc::clone(&self.delivery_barrier).write_owned().await;
-        let taken: Vec<PendingMessage> = {
-            let mut guard = self.pending.lock().await;
-            guard.drain().map(|(_, p)| p).collect()
-        };
-        for pending in taken {
-            (pending.flush)(pending.content).await;
+            self.deadlines.pop();
         }
     }
 
-    /// Number of currently buffered messages (tests/diagnostics).
-    pub async fn pending_count(&self) -> usize {
-        self.pending.lock().await.len()
+    async fn flush_due(&mut self) {
+        let Some(Reverse((_, generation, key))) = self.deadlines.pop() else {
+            return;
+        };
+        if self
+            .pending
+            .get(&key)
+            .is_some_and(|pending| pending.generation == generation)
+            && let Some(pending) = self.pending.remove(&key)
+        {
+            self.deliver(&key, pending).await;
+        }
+    }
+
+    async fn deliver(&self, key: &ChannelKey, pending: PendingMessage) {
+        let callback =
+            std::panic::catch_unwind(AssertUnwindSafe(|| (pending.flush)(pending.content)));
+        let Ok(callback) = callback else {
+            tracing::error!(channel = %key.channel_id, "Coalesced delivery callback panicked");
+            return;
+        };
+        match tokio::time::timeout(
+            self.delivery_timeout,
+            AssertUnwindSafe(callback).catch_unwind(),
+        )
+        .await
+        {
+            Err(_) => tracing::warn!(
+                channel = %key.channel_id,
+                timeout_ms = self.delivery_timeout.as_millis(),
+                "Coalesced delivery timed out"
+            ),
+            Ok(Err(_)) => {
+                tracing::error!(channel = %key.channel_id, "Coalesced delivery callback panicked");
+            }
+            Ok(Ok(())) => {}
+        }
     }
 }
 
@@ -300,17 +449,6 @@ fn is_alert(content: &str) -> bool {
         .trim_start()
         .get(..6)
         .is_some_and(|p| p.eq_ignore_ascii_case("alert:"))
-}
-
-fn spawn_flush(flush: FlushFn, content: String, guard: OwnedRwLockReadGuard<()>) {
-    tokio::spawn(async move {
-        // Hold the delivery-barrier read guard for the callback's lifetime:
-        // `flush_all`'s write guard must wait for detached deliveries. The
-        // guard must be moved INTO the task — binding it only as a function
-        // parameter drops it when this function returns.
-        let _guard = guard;
-        flush(content).await;
-    });
 }
 
 /// Split `"TAG: rest"` into `(Some("TAG"), "rest")` for uppercase tags.
@@ -352,6 +490,7 @@ pub fn merge_contents(existing: &str, new: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex;
 
     fn test_config() -> CoalesceConfig {
         CoalesceConfig {
@@ -590,7 +729,10 @@ mod tests {
         buffer
             .submit(key(), "STATUS: first".into(), flush.clone())
             .await;
-        buffer.submit(key(), "STATUS: second".into(), flush).await;
+        let early_submit = {
+            let buffer = buffer.clone();
+            tokio::spawn(async move { buffer.submit(key(), "STATUS: second".into(), flush).await })
+        };
         started.notified().await;
 
         let shutdown = {
@@ -600,6 +742,146 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!shutdown.is_finished());
         release.notify_one();
+        early_submit.await.unwrap();
+        shutdown.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stalled_delivery_times_out_and_actor_continues() {
+        let mut config = test_config();
+        config.window = Duration::from_secs(1);
+        let buffer = CoalesceBuffer::new_with_delivery_limits(
+            config,
+            2,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let flush: FlushFn = {
+            let started = Arc::clone(&started);
+            Arc::new(move |_| {
+                let started = Arc::clone(&started);
+                Box::pin(async move {
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                })
+            })
+        };
+        buffer.submit(key(), "STATUS: stalled".into(), flush).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        started.notified().await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let (flush, sent) = collector();
+        let next_key = ChannelKey::new("agent-1", "xmpp", "coord@conference.example", "thread-2");
+        buffer.submit(next_key, "STATUS: next".into(), flush).await;
+        buffer.flush_all().await;
+        assert_eq!(*sent.lock().await, vec!["STATUS: next"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_bounded_queue_backpressures_while_delivery_stalls() {
+        let mut config = test_config();
+        config.window = Duration::from_secs(1);
+        let buffer = CoalesceBuffer::new_with_delivery_limits(
+            config,
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let stalled: FlushFn = {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            Arc::new(move |_| {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                })
+            })
+        };
+        buffer
+            .submit(key(), "STATUS: stalled".into(), stalled)
+            .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        started.notified().await;
+
+        let (flush, _) = collector();
+        let submit = |conversation: &str| {
+            let buffer = buffer.clone();
+            let flush = flush.clone();
+            let key = ChannelKey::new("agent-1", "xmpp", "coord@conference.example", conversation);
+            tokio::spawn(async move { buffer.submit(key, "STATUS: queued".into(), flush).await })
+        };
+        let queued = submit("thread-2");
+        tokio::task::yield_now().await;
+        let backpressured = submit("thread-3");
+        tokio::task::yield_now().await;
+        assert!(!queued.is_finished());
+        assert!(!backpressured.is_finished());
+
+        release.notify_one();
+        queued.await.unwrap();
+        backpressured.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_finishes_after_stalled_delivery_timeout() {
+        let mut config = test_config();
+        config.window = Duration::from_secs(60);
+        let buffer = CoalesceBuffer::new_with_delivery_limits(
+            config,
+            2,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        );
+        let flush: FlushFn =
+            Arc::new(move |_| Box::pin(async move { std::future::pending::<()>().await }));
+        buffer.submit(key(), "STATUS: pending".into(), flush).await;
+
+        let shutdown = {
+            let buffer = buffer.clone();
+            tokio::spawn(async move { buffer.flush_all().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        shutdown.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_has_aggregate_deadline() {
+        let mut config = test_config();
+        config.window = Duration::from_secs(60);
+        let buffer = CoalesceBuffer::new_with_delivery_limits(
+            config,
+            2,
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        let stalled: FlushFn =
+            Arc::new(move |_| Box::pin(async move { std::future::pending::<()>().await }));
+        buffer
+            .submit(key(), "STATUS: first".into(), stalled.clone())
+            .await;
+        buffer
+            .submit(
+                ChannelKey::new("agent-1", "xmpp", "coord@conference.example", "thread-2"),
+                "STATUS: second".into(),
+                stalled,
+            )
+            .await;
+
+        let shutdown = {
+            let buffer = buffer.clone();
+            tokio::spawn(async move { buffer.flush_all().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        tokio::time::advance(Duration::from_secs(5)).await;
         shutdown.await.unwrap();
     }
 

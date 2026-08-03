@@ -13,6 +13,7 @@ use crate::error::WorkspaceError;
 
 use crate::workspace::document::{
     DocumentVersion, MemoryChunk, MemoryDocument, VersionSummary, WorkspaceEntry,
+    WorkspaceFileContent,
 };
 use crate::workspace::search::{RankedResult, SearchConfig, SearchResult, fuse_results};
 
@@ -290,6 +291,67 @@ impl Repository {
                 is_directory: false,
                 updated_at: row.get("updated_at"),
                 content_preview: row.get("content_preview"),
+            })
+            .collect())
+    }
+
+    /// Fetch at most `limit` direct files and their content, ordered by path.
+    pub async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError> {
+        let conn = self.conn().await?;
+        let directory = directory.trim_end_matches('/');
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let max_file_bytes = i64::try_from(max_file_bytes).unwrap_or(i64::MAX);
+        let rows = conn
+            .query(
+                r#"
+                WITH limited AS (
+                SELECT path, content, updated_at
+                FROM memory_documents
+                WHERE user_id = $1 AND agent_id IS NOT DISTINCT FROM $2
+                  AND ($3 = '' OR LEFT(path, CHAR_LENGTH($3)) = $3)
+                  AND POSITION('/' IN SUBSTRING(path FROM CHAR_LENGTH($3) + 1)) = 0
+                  AND ($4 = '' OR LOWER(RIGHT(path, CHAR_LENGTH($4))) = LOWER($4))
+                ORDER BY path
+                LIMIT $5
+                )
+                SELECT path, content, updated_at
+                FROM limited
+                WHERE OCTET_LENGTH(content) <= $6
+                ORDER BY path
+                "#,
+                &[
+                    &user_id,
+                    &agent_id,
+                    &prefix,
+                    &suffix,
+                    &limit,
+                    &max_file_bytes,
+                ],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Bounded file fetch failed: {e}"),
+            })?;
+
+        Ok(rows
+            .iter()
+            .map(|row| WorkspaceFileContent {
+                path: row.get("path"),
+                content: row.get("content"),
+                updated_at: row.get("updated_at"),
             })
             .collect())
     }

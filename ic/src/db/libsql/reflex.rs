@@ -1,11 +1,13 @@
 //! Reflex pattern-related ReflexStore implementation for LibSqlBackend.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use libsql::params;
 use uuid::Uuid;
 
 use super::{LibSqlBackend, fmt_ts, get_i64, get_opt_text, get_opt_ts, get_text, get_ts};
-use crate::db::{ReflexPatternRecord, ReflexStore};
+use crate::db::{ReflexPatternHit, ReflexPatternRecord, ReflexStore};
 use crate::error::DatabaseError;
 
 use chrono::Utc;
@@ -207,18 +209,63 @@ impl ReflexStore for LibSqlBackend {
         user_id: &str,
         normalized_pattern: &str,
     ) -> Result<(), DatabaseError> {
+        let hit = ReflexPatternHit {
+            user_id: user_id.to_string(),
+            normalized_pattern: normalized_pattern.to_string(),
+            count: 1,
+        };
+        self.bump_reflex_pattern_matches(std::slice::from_ref(&hit))
+            .await
+    }
+
+    async fn bump_reflex_pattern_matches(
+        &self,
+        hits: &[ReflexPatternHit],
+    ) -> Result<(), DatabaseError> {
+        let mut merged = HashMap::<(String, String), u64>::new();
+        for hit in hits.iter().filter(|hit| hit.count > 0) {
+            let count = merged
+                .entry((hit.user_id.clone(), hit.normalized_pattern.clone()))
+                .or_default();
+            *count = count.checked_add(hit.count).ok_or_else(|| {
+                DatabaseError::Constraint("reflex pattern hit count overflow".to_string())
+            })?;
+        }
+        if merged.is_empty() {
+            return Ok(());
+        }
+
         let conn = self.connect().await?;
-        let now = fmt_ts(&Utc::now());
-        conn.execute(
-            r#"
+        let tx = conn
+            .transaction()
+            .await
+            .map_err(|error| DatabaseError::Query(error.to_string()))?;
+        let mut statement = tx
+            .prepare(
+                r#"
                 UPDATE reflex_patterns
-                SET match_count = match_count + 1, last_matched_at = ?3, updated_at = ?3
+                SET match_count = MIN(CAST(match_count AS INTEGER) + ?3, 2147483647),
+                    last_matched_at = ?4,
+                    updated_at = ?4,
+                    status = CASE WHEN status = 'evicted' THEN 'active' ELSE status END
                 WHERE user_id = ?1 AND normalized_pattern = ?2
                 "#,
-            params![user_id, normalized_pattern, now],
-        )
-        .await
-        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            )
+            .await
+            .map_err(|error| DatabaseError::Query(error.to_string()))?;
+        let now = fmt_ts(&Utc::now());
+        for ((user_id, pattern), count) in merged {
+            let count = count.min(i32::MAX as u64) as i64;
+            statement
+                .execute(params![user_id, pattern, count, now.as_str()])
+                .await
+                .map_err(|error| DatabaseError::Query(error.to_string()))?;
+            statement.reset();
+        }
+        drop(statement);
+        tx.commit()
+            .await
+            .map_err(|error| DatabaseError::Query(error.to_string()))?;
         Ok(())
     }
 
@@ -277,7 +324,7 @@ impl ReflexStore for LibSqlBackend {
             SELECT_COLS
         );
         let mut rows = conn
-            .query(&sql, params![cutoff])
+            .query(&sql, params![cutoff.clone()])
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
@@ -292,18 +339,26 @@ impl ReflexStore for LibSqlBackend {
 
         if !dry_run && !stale.is_empty() {
             let updated_at = fmt_ts(&now);
-            for record in &mut stale {
-                conn.execute(
-                    "UPDATE reflex_patterns SET status = 'evicted', updated_at = ?2 WHERE id = ?1",
-                    params![record.id.to_string(), updated_at.clone()],
-                )
-                .await
-                .map_err(|e| DatabaseError::Query(e.to_string()))?;
-                // Reflect the eviction in the returned records so callers see the
-                // post-update status (matches the PostgreSQL backend, which re-queries).
-                record.status = "evicted".to_string();
-                record.updated_at = now;
+            let mut evicted = Vec::with_capacity(stale.len());
+            for mut record in stale {
+                let updated = conn
+                    .execute(
+                        "UPDATE reflex_patterns \
+                     SET status = 'evicted', updated_at = ?2 \
+                     WHERE id = ?1 \
+                       AND status = 'active' \
+                       AND COALESCE(last_matched_at, created_at) < ?3",
+                        params![record.id.to_string(), updated_at.clone(), cutoff.clone()],
+                    )
+                    .await
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?;
+                if updated > 0 {
+                    record.status = "evicted".to_string();
+                    record.updated_at = now;
+                    evicted.push(record);
+                }
             }
+            stale = evicted;
         }
 
         Ok(stale)

@@ -1061,7 +1061,27 @@ async fn handle_execute_action(
 
     // 3. Consume a lease use
     if let Err(e) = leases.consume_use(lease.id).await {
-        debug!(error = %e, "lease consumption failed (non-fatal)");
+        let error = format!("lease unavailable: {e}");
+        let output = serde_json::json!({"error": &error});
+        emit_and_record(
+            thread,
+            event_tx,
+            EventKind::ActionFailed {
+                step_id: exec_ctx.step_id,
+                action_name: name.clone(),
+                call_id: call_id.clone(),
+                error,
+                params_summary: summarize_params(&name, &params),
+            },
+            &call_id,
+            &name,
+            &output,
+        );
+        let result = serde_json::json!({
+            "output": output,
+            "is_error": true,
+        });
+        return Ok(ExtFunctionResult::Return(json_to_monty(&result)));
     }
 
     // 4. Execute
@@ -1176,7 +1196,8 @@ async fn handle_execute_action(
 /// Returns a list of result dicts (one per call, in order). Each result has the
 /// same shape as `__execute_action__` output, plus an optional gate pause payload.
 ///
-/// Events are emitted in original call order after all parallel executions complete.
+/// On normal completion, events are emitted in original call order. A stop aborts
+/// and drains unfinished siblings without emitting their events.
 async fn handle_execute_actions_parallel(
     args: &[MontyObject],
     thread: &mut Thread,
@@ -1324,7 +1345,11 @@ async fn handle_execute_actions_parallel(
                                 thread.events.push(ev);
                                 results_json.push(result_json);
                             }
-                            Some(PfOutcome::Runnable { .. }) | None => {
+                            Some(PfOutcome::Runnable { lease }) => {
+                                let _ = leases.refund_use(lease.id).await;
+                                results_json.push(serde_json::json!(null));
+                            }
+                            None => {
                                 results_json.push(serde_json::json!(null));
                             }
                         }
@@ -1369,7 +1394,23 @@ async fn handle_execute_actions_parallel(
 
         // Consume lease
         if let Err(e) = leases.consume_use(lease.id).await {
-            debug!(error = %e, "lease consumption failed (non-fatal)");
+            let error = format!("lease unavailable: {e}");
+            let output = serde_json::json!({"error": &error});
+            preflight.push(Some(PfOutcome::Error {
+                result_json: serde_json::json!({
+                    "output": &output,
+                    "is_error": true,
+                }),
+                event: EventKind::ActionFailed {
+                    step_id,
+                    action_name: pc.name.clone(),
+                    call_id: pc.call_id.clone(),
+                    error,
+                    params_summary: summarize_params(&pc.name, &pc.params),
+                },
+                output,
+            }));
+            continue;
         }
 
         preflight.push(Some(PfOutcome::Runnable { lease }));
@@ -1449,6 +1490,7 @@ async fn handle_execute_actions_parallel(
         let mut join_set = tokio::task::JoinSet::new();
         let effects = effects.clone();
 
+        let mut pending_lease_uses = Vec::with_capacity(runnable.len());
         for (idx, lease) in runnable {
             let pc_name = parsed[idx].name.clone();
             let pc_params = parsed[idx].params.clone();
@@ -1469,6 +1511,7 @@ async fn handle_execute_actions_parallel(
             };
             let ps = summarize_params(&pc_name, &pc_params);
 
+            pending_lease_uses.push(lease.id);
             join_set.spawn(async move {
                 let result = execute_single_action(
                     &effects,
@@ -1487,27 +1530,41 @@ async fn handle_execute_actions_parallel(
         let mut execution_stopped = false;
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
-                Ok((idx, lease_id, result)) => match result {
-                    Ok((result_json, event, output)) => {
-                        if interrupted_result_needs_refund(&result_json) {
+                Ok((idx, lease_id, result)) => {
+                    if let Some(position) = pending_lease_uses
+                        .iter()
+                        .position(|pending_id| *pending_id == lease_id)
+                    {
+                        pending_lease_uses.swap_remove(position);
+                    }
+                    match result {
+                        Ok((result_json, event, output)) => {
+                            if interrupted_result_needs_refund(&result_json) {
+                                let _ = leases.refund_use(lease_id).await;
+                            }
+                            slot_results[idx] = Some(result_json);
+                            slot_events[idx] = Some(event);
+                            slot_outputs[idx] = Some(output);
+                        }
+                        Err(EngineError::ExecutionStopped) => {
+                            if !execution_stopped {
+                                execution_stopped = true;
+                                join_set.abort_all();
+                            }
                             let _ = leases.refund_use(lease_id).await;
                         }
-                        slot_results[idx] = Some(result_json);
-                        slot_events[idx] = Some(event);
-                        slot_outputs[idx] = Some(output);
+                        Err(error) => return Err(error),
                     }
-                    Err(EngineError::ExecutionStopped) => {
-                        let _ = leases.refund_use(lease_id).await;
-                        execution_stopped = true;
-                    }
-                    Err(error) => return Err(error),
-                },
+                }
                 Err(e) => {
-                    debug!("parallel action execution task panicked: {e}");
+                    debug!("parallel action execution task failed: {e}");
                 }
             }
         }
         if execution_stopped {
+            for lease_id in pending_lease_uses {
+                let _ = leases.refund_use(lease_id).await;
+            }
             return Err(EngineError::ExecutionStopped);
         }
     }
@@ -2454,6 +2511,7 @@ mod tests {
     use crate::types::step::ActionResult;
     use crate::types::thread::{ThreadConfig, ThreadType};
     use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     // ── Python helper unit tests via Monty ──────────────────────
@@ -2862,17 +2920,24 @@ mod tests {
     }
 
     #[test]
-    fn final_answer_classification_rejects_leaked_prose() {
-        assert!(!eval_python_bool(
-            r#"looks_like_final_answer("*chortles* Oops - let me fix that!")"#
-        ));
-        assert!(!eval_python_bool(
-            r#"looks_like_final_answer("The answer is 42")"#
-        ));
-        assert!(!eval_python_bool(r#"looks_like_final_answer("x" * 79)"#));
-        assert!(eval_python_bool(r#"looks_like_final_answer("x" * 80)"#));
+    fn leaked_roleplay_or_meta_classification_is_strong_signal_only() {
         assert!(eval_python_bool(
-            r#"looks_like_final_answer("Investigation complete: the orchestrator now retries malformed prose responses and stops after two bounded correction attempts.")"#
+            r#"signals_leaked_roleplay_or_meta("*chortles* Oops - let me fix that!")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("The answer is 42")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("Loops are useful")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("Wrong answers should be corrected with evidence.")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("*chortles and flicks tail*")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("*Important*")"#
         ));
     }
 
@@ -3199,6 +3264,83 @@ mod tests {
 
     struct StoppedEffects;
 
+    struct StopAndHangEffects {
+        started: tokio::sync::Barrier,
+    }
+
+    struct CountingEffects {
+        actions: Vec<ActionDef>,
+        executions: AtomicUsize,
+    }
+
+    struct ExhaustLeaseEffects {
+        leases: Arc<LeaseManager>,
+        executions: AtomicUsize,
+    }
+
+    impl StopAndHangEffects {
+        fn new() -> Self {
+            Self {
+                started: tokio::sync::Barrier::new(2),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for CountingEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ActionResult {
+                call_id: String::new(),
+                action_name: action_name.to_string(),
+                output: serde_json::json!({"ok": true}),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(self.actions.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for ExhaustLeaseEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ActionResult {
+                call_id: String::new(),
+                action_name: action_name.to_string(),
+                output: serde_json::json!({"ok": true}),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            self.leases.consume_use(leases[0].id).await?;
+            Ok(vec![test_action_def("echo")])
+        }
+    }
+
     #[async_trait::async_trait]
     impl EffectExecutor for EmptyEffects {
         async fn execute_action(
@@ -3249,6 +3391,142 @@ mod tests {
                 requires_approval: false,
             }])
         }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for StopAndHangEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.started.wait().await;
+            if action_name == "stop_tool" {
+                Err(EngineError::ExecutionStopped)
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![
+                test_action_def("stop_tool"),
+                test_action_def("hang_tool"),
+            ])
+        }
+    }
+
+    fn test_action_def(name: &str) -> ActionDef {
+        ActionDef {
+            name: name.into(),
+            description: format!("{name} test tool"),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            effects: vec![EffectType::ReadLocal],
+            requires_approval: false,
+        }
+    }
+
+    fn approval_action_def(name: &str) -> ActionDef {
+        ActionDef {
+            requires_approval: true,
+            ..test_action_def(name)
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_preflight_approval_refunds_earlier_lease_reservations() {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        let effects = Arc::new(CountingEffects {
+            actions: vec![
+                test_action_def("echo"),
+                approval_action_def("approval_tool"),
+            ],
+            executions: AtomicUsize::new(0),
+        });
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let leases = Arc::new(LeaseManager::new());
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(2))
+            .await
+            .unwrap();
+        let args = vec![json_to_monty(&serde_json::json!([
+            {"name": "echo", "params": {}, "call_id": "echo"},
+            {"name": "approval_tool", "params": {}, "call_id": "approval"}
+        ]))];
+
+        handle_execute_actions_parallel(
+            &args,
+            &mut thread,
+            &effects_dyn,
+            &leases,
+            &Arc::new(PolicyEngine::new()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn single_action_does_not_execute_after_lease_consumption_failure() {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(1))
+            .await
+            .unwrap();
+        let effects = Arc::new(ExhaustLeaseEffects {
+            leases: Arc::clone(&leases),
+            executions: AtomicUsize::new(0),
+        });
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let args = vec![
+            MontyObject::String("echo".into()),
+            json_to_monty(&serde_json::json!({})),
+        ];
+        let kwargs = vec![(
+            MontyObject::String("call_id".into()),
+            MontyObject::String("echo-call".into()),
+        )];
+
+        handle_execute_action(
+            &args,
+            &kwargs,
+            &mut thread,
+            &effects_dyn,
+            &leases,
+            &Arc::new(PolicyEngine::new()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 0);
+        assert!(thread.events.iter().any(|event| {
+            matches!(event.kind, EventKind::ActionFailed { ref call_id, .. } if call_id == "echo-call")
+        }));
     }
 
     #[tokio::test]
@@ -3373,6 +3651,69 @@ mod tests {
         assert_eq!(
             leases.check(lease.id).await.unwrap().uses_remaining,
             Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_host_policy_stop_aborts_hanging_sibling() {
+        let code = r#"
+__execute_actions_parallel__([
+    {"name": "stop_tool", "params": {}, "call_id": "stop"},
+    {"name": "hang_tool", "params": {}, "call_id": "hang"},
+])
+FINAL("unreached")
+"#;
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(PendingStreamLlm);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(StopAndHangEffects::new());
+        let leases = Arc::new(LeaseManager::new());
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(2))
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let (_signal_tx, mut signal_rx) = signal_channel(16);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_orchestrator(
+                code,
+                &mut thread,
+                &llm,
+                &effects,
+                &leases,
+                &policy,
+                &mut signal_rx,
+                &CancellationToken::new(),
+                None,
+                None,
+                None,
+                &serde_json::json!({}),
+            ),
+        )
+        .await
+        .expect("stop should abort and drain the hanging sibling promptly")
+        .expect("orchestrator should return Ok");
+
+        assert!(matches!(result.outcome, ThreadOutcome::Stopped));
+        assert_eq!(thread.state, ThreadState::Completed);
+        assert!(
+            thread
+                .events
+                .iter()
+                .all(|event| !matches!(event.kind, EventKind::ActionFailed { .. }))
+        );
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(2)
         );
     }
 

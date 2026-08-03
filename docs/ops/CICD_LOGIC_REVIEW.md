@@ -1,9 +1,9 @@
 # CI/CD Logic Review — LunarWing GitLab CI
 
 > **Purpose:** Review the current `.gitlab/` CI/CD logic and surface concrete
-> improvement suggestions. This document is the deliverable for item #2 in
-> `docs/ops/AGENT_GOALS_2.0.3.0.md`. It is **review only**; it does not change
-> CI files.
+> improvement suggestions. This document was the deliverable for item #2 in the
+> archived [`AGENT_GOALS_2.0.3.0.md`](history/AGENT_GOALS_2.0.3.0.md). It is
+> **review only**; it does not change CI files.
 >
 > **Scope reviewed on 2026-07-25, refreshed 2026-07-26:**
 > `.gitlab-ci.yml`, `.gitlab/ci/*.yml`, `.gitlab/scripts/*`,

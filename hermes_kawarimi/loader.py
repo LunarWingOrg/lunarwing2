@@ -178,24 +178,54 @@ def run_import(
         result.error = "start-pg failed (populate needs PostgreSQL up, daemon down)"
         return result
 
-    # 4. populate (daemon down, PostgreSQL still up)
+    # This import owns the PG-only start until a successful result deliberately
+    # leaves the tenant staged or transfers control to start-tenant.
+    postgres_owned = True
     try:
-        counts = _populate(db_url, owner_id, mapped)
-        result.counts = counts  # set before _insert_secrets adds counts["secrets"]
-        _insert_secrets(db_url, master_key, owner_id, mapped, result)
-    except Exception as exc:  # psycopg2 / crypto errors
-        result.error = f"populate failed: {exc}"
-        return result
-
-    # 5. cut over or stage
-    if plan.start:
-        if not phase([mt, "start-tenant", plan.tenant]):
-            result.error = "start-tenant failed (after populate)"
+        # 4. populate (daemon down, PostgreSQL still up)
+        try:
+            counts = _populate(db_url, owner_id, mapped)
+            result.counts = counts  # set before _insert_secrets adds counts["secrets"]
+            _insert_secrets(db_url, master_key, owner_id, mapped, result)
+        except Exception as exc:  # psycopg2 / crypto errors
+            result.error = f"populate failed: {exc}"
             return result
-        result.staged = False
-    else:
-        result.staged = True
-    return result
+
+        # 5. cut over or stage
+        if plan.start:
+            if not phase([mt, "start-tenant", plan.tenant]):
+                result.error = "start-tenant failed (after populate)"
+                return result
+            result.staged = False
+        else:
+            result.staged = True
+        postgres_owned = False
+        return result
+    finally:
+        if postgres_owned:
+            _stop_owned_postgres(mt, plan.tenant, result, on_output)
+
+
+def _stop_owned_postgres(
+    mt: str,
+    tenant: str,
+    result: ImportResult,
+    on_output=None,
+) -> None:
+    """Best-effort cleanup without replacing the original import failure."""
+    try:
+        cleanup = run_command([mt, "stop-pg", tenant], on_output=on_output)
+        result.phases.append(cleanup)
+        if not cleanup.ok:
+            result.warnings.append(
+                "stop-pg cleanup failed after import failure; "
+                "PostgreSQL may still be running"
+            )
+    except Exception as exc:
+        result.warnings.append(
+            f"stop-pg cleanup raised after import failure: {exc}; "
+            "PostgreSQL may still be running"
+        )
 
 
 def _add_tenant_args(mt: str, plan: ImportPlan) -> list[str]:

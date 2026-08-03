@@ -7,20 +7,20 @@
 //!
 //! 1. **Exact match** — O(1) hash lookup on normalized input. Fast path.
 //! 2. **Fuzzy match** — Jaro-Winkler similarity against known patterns.
-//! 3. **Semantic match** — Embedding cosine similarity (requires an
-//!    `EmbeddingProvider`). Silently skipped when no provider is configured.
+//! 3. **Semantic match** — Opt-in embedding cosine similarity (requires an
+//!    `EmbeddingProvider`). Disabled by default because providers may be remote.
 //! 4. **Auto-promotion** — Frequently-matched fuzzy hits are promoted to the
 //!    exact-match cache so subsequent calls are O(1).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use strsim::jaro_winkler;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::db::Database;
+use crate::db::{Database, ReflexPatternHit};
 use crate::tools::builder::{BuildRequirement, Language, SoftwareBuilder, SoftwareType};
 use crate::workspace::EmbeddingProvider;
 
@@ -116,6 +116,234 @@ pub struct FuzzyMatch {
     pub score: f64,
 }
 
+// ── Match-count write-behind ────────────────
+
+/// Production cadence for reflex telemetry writes.
+pub const REFLEX_HIT_FLUSH_INTERVAL: Duration = Duration::from_secs(3);
+/// Bounded wait for the final best-effort shutdown flush.
+pub const REFLEX_HIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Hard ceiling for distinct owner/pattern pairs retained in memory.
+const DEFAULT_MAX_PENDING_REFLEX_HITS: usize = 4096;
+const MAX_REFLEX_HIT_FLUSH_BACKOFF: Duration = Duration::from_secs(60);
+
+type ReflexHitKey = (String, String);
+
+#[derive(Debug, Default)]
+struct PendingHit {
+    count: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReflexHitState {
+    pending: HashMap<ReflexHitKey, PendingHit>,
+    flushing: HashSet<ReflexHitKey>,
+}
+
+/// Bounded, synchronous accumulator for reflex match telemetry.
+///
+/// `record()` performs no async work and never creates a task. One background
+/// worker periodically drains the map and sends a single database batch.
+pub struct ReflexHitAccumulator {
+    state: Mutex<ReflexHitState>,
+    max_unique_keys: usize,
+}
+
+impl ReflexHitAccumulator {
+    pub fn new(max_unique_keys: usize) -> Self {
+        Self {
+            state: Mutex::new(ReflexHitState::default()),
+            max_unique_keys,
+        }
+    }
+
+    /// Record one hit without awaiting database I/O.
+    ///
+    /// Returns `false` only when admitting a new key would exceed the hard cap.
+    pub fn record(&self, user_id: &str, normalized_pattern: &str) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let key = (user_id.to_string(), normalized_pattern.to_string());
+        if let Some(hit) = state.pending.get_mut(&key) {
+            hit.count = hit.count.saturating_add(1);
+            return true;
+        }
+
+        let already_flushing = state.flushing.contains(&key);
+        if !already_flushing && unique_hit_keys(&state) >= self.max_unique_keys {
+            return false;
+        }
+
+        state.pending.insert(key, PendingHit { count: 1 });
+        true
+    }
+
+    /// Number of distinct keys currently pending or being flushed.
+    pub fn tracked_key_count(&self) -> usize {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        unique_hit_keys(&state)
+    }
+
+    async fn flush_once(&self, store: &dyn Database) -> Result<usize, crate::error::DatabaseError> {
+        let Some(batch) = self.take_batch() else {
+            return Ok(0);
+        };
+        let hits = batch.database_hits();
+        let flushed = hits.len();
+        store.bump_reflex_pattern_matches(&hits).await?;
+        batch.complete();
+        Ok(flushed)
+    }
+
+    fn take_batch(&self) -> Option<PendingReflexBatch<'_>> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.pending.is_empty() {
+            return None;
+        }
+
+        let hits = std::mem::take(&mut state.pending);
+        state.flushing.extend(hits.keys().cloned());
+        Some(PendingReflexBatch {
+            accumulator: self,
+            hits: Some(hits),
+        })
+    }
+
+    fn finish_batch(&self, hits: HashMap<ReflexHitKey, PendingHit>, succeeded: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        for (key, hit) in hits {
+            state.flushing.remove(&key);
+            if !succeeded {
+                let pending = state.pending.entry(key).or_default();
+                pending.count = pending.count.saturating_add(hit.count);
+            }
+        }
+    }
+}
+
+impl Default for ReflexHitAccumulator {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_PENDING_REFLEX_HITS)
+    }
+}
+
+fn unique_hit_keys(state: &ReflexHitState) -> usize {
+    state.flushing.len()
+        + state
+            .pending
+            .keys()
+            .filter(|key| !state.flushing.contains(*key))
+            .count()
+}
+
+struct PendingReflexBatch<'a> {
+    accumulator: &'a ReflexHitAccumulator,
+    hits: Option<HashMap<ReflexHitKey, PendingHit>>,
+}
+
+impl PendingReflexBatch<'_> {
+    fn database_hits(&self) -> Vec<ReflexPatternHit> {
+        self.hits
+            .as_ref()
+            .into_iter()
+            .flat_map(|hits| hits.iter())
+            .map(|((user_id, normalized_pattern), hit)| ReflexPatternHit {
+                user_id: user_id.clone(),
+                normalized_pattern: normalized_pattern.clone(),
+                count: hit.count,
+            })
+            .collect()
+    }
+
+    fn complete(mut self) {
+        if let Some(hits) = self.hits.take() {
+            self.accumulator.finish_batch(hits, true);
+        }
+    }
+}
+
+impl Drop for PendingReflexBatch<'_> {
+    fn drop(&mut self) {
+        if let Some(hits) = self.hits.take() {
+            self.accumulator.finish_batch(hits, false);
+        }
+    }
+}
+
+/// Handle for the single reflex hit-flush worker.
+pub struct ReflexHitFlusher {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ReflexHitFlusher {
+    /// Request a final flush and wait no longer than `timeout`.
+    pub async fn shutdown(mut self, timeout: Duration) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if tokio::time::timeout(timeout, &mut self.task).await.is_err() {
+            self.task.abort();
+            let _ = self.task.await;
+            tracing::debug!("Timed out flushing reflex hit telemetry during shutdown");
+        }
+    }
+}
+
+/// Spawn one periodic worker for all reflex hit telemetry.
+pub fn spawn_reflex_hit_flusher(
+    accumulator: Arc<ReflexHitAccumulator>,
+    store: Arc<dyn Database>,
+    flush_interval: Duration,
+) -> ReflexHitFlusher {
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(run_reflex_hit_flusher(
+        accumulator,
+        store,
+        flush_interval,
+        shutdown_rx,
+    ));
+    ReflexHitFlusher {
+        shutdown: Some(shutdown),
+        task,
+    }
+}
+
+async fn run_reflex_hit_flusher(
+    accumulator: Arc<ReflexHitAccumulator>,
+    store: Arc<dyn Database>,
+    flush_interval: Duration,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) {
+    let flush_interval = flush_interval.max(Duration::from_millis(1));
+    let mut delay = flush_interval;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                if let Err(error) = accumulator.flush_once(store.as_ref()).await {
+                    tracing::debug!(%error, "Final reflex hit telemetry flush failed");
+                }
+                return;
+            }
+            _ = tokio::time::sleep(delay) => {
+                match accumulator.flush_once(store.as_ref()).await {
+                    Ok(_) => delay = flush_interval,
+                    Err(error) => {
+                        tracing::debug!(%error, "Reflex hit telemetry flush failed; backing off");
+                        delay = next_reflex_hit_flush_delay(delay);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn next_reflex_hit_flush_delay(delay: Duration) -> Duration {
+    delay
+        .checked_mul(2)
+        .unwrap_or(MAX_REFLEX_HIT_FLUSH_BACKOFF)
+        .min(MAX_REFLEX_HIT_FLUSH_BACKOFF)
+}
+
 // ── ReflexRouter ────────────────────
 
 /// In-memory router for reflex patterns.
@@ -131,8 +359,8 @@ pub struct ReflexRouter {
     /// Promoted input variants → canonical stored pattern.
     ///
     /// When a fuzzy variant is promoted into the exact cache, this map
-    /// remembers which stored pattern it came from so match bookkeeping
-    /// (e.g. `bump_reflex_pattern_match`) can target the canonical row.
+    /// remembers which stored pattern it came from so write-behind match
+    /// bookkeeping can target the canonical database row.
     promoted_variants: Arc<RwLock<HashMap<String, String>>>,
     /// Similarity threshold for fuzzy matching.
     fuzzy_threshold: f64,
@@ -140,8 +368,10 @@ pub struct ReflexRouter {
     promotion_threshold: u32,
     /// Maximum fuzzy candidates to evaluate per route call.
     max_candidates: usize,
-    /// Embedding provider for semantic matching (None = tier disabled).
+    /// Embedding provider used when semantic matching is enabled.
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    /// Separate default-off switch for semantic matching.
+    semantic_enabled: bool,
     /// Cosine similarity threshold for semantic matching.
     semantic_threshold: f64,
     /// In-memory cache: normalized pattern → embedding vector.
@@ -160,6 +390,7 @@ impl ReflexRouter {
             promotion_threshold: fuzzy.promotion_threshold,
             max_candidates: fuzzy.max_candidates,
             embedding_provider: None,
+            semantic_enabled: false,
             semantic_threshold: DEFAULT_SEMANTIC_THRESHOLD,
             pattern_embeddings: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -175,14 +406,21 @@ impl ReflexRouter {
             promotion_threshold: PROMOTION_THRESHOLD,
             max_candidates: MAX_FUZZY_CANDIDATES,
             embedding_provider: None,
+            semantic_enabled: false,
             semantic_threshold: DEFAULT_SEMANTIC_THRESHOLD,
             pattern_embeddings: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Attach an embedding provider to enable semantic matching (tier 3).
+    /// Attach the embedding provider used by the optional semantic tier.
     pub fn with_embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
         self.embedding_provider = Some(provider);
+        self
+    }
+
+    /// Enable or disable semantic matching independently of the compiler.
+    pub fn with_semantic_enabled(mut self, enabled: bool) -> Self {
+        self.semantic_enabled = enabled;
         self
     }
 
@@ -241,8 +479,9 @@ impl ReflexRouter {
             return Some(m);
         }
 
-        // 3. Semantic fallback — only if embedding provider is set
-        if self.embedding_provider.is_some()
+        // 3. Semantic fallback — explicitly opt-in because this may call a
+        // remote embedding provider before the normal LLM path.
+        if self.semantic_enabled
             && let Some(m) = self.semantic_route(&normalized).await
         {
             return Some(m);
@@ -341,6 +580,12 @@ impl ReflexRouter {
 
     /// Semantic fallback: embed the query and compare against cached pattern embeddings.
     async fn semantic_route(&self, normalized: &str) -> Option<FuzzyMatch> {
+        // Check local state before contacting a potentially remote provider.
+        // A router with no cached pattern vectors cannot produce a match.
+        if self.pattern_embeddings.read().await.is_empty() {
+            return None;
+        }
+
         let provider = self.embedding_provider.as_ref()?;
         let query_embedding = match provider.embed(normalized).await {
             Ok(emb) => emb,
@@ -355,10 +600,6 @@ impl ReflexRouter {
         // acquiring patterns would invert the lock order and could deadlock.
         let (best_pattern, best_score) = {
             let embeddings = self.pattern_embeddings.read().await;
-            if embeddings.is_empty() {
-                return None;
-            }
-
             let mut best_pattern: Option<String> = None;
             let mut best_score: f64 = 0.0;
 
@@ -476,48 +717,10 @@ impl ReflexRouter {
         // self-deadlock if a writer (refresh) queues in between.
         drop(patterns);
 
-        // 3. Semantic fallback
-        if let Some(provider) = self.embedding_provider.as_ref() {
-            let query_embedding = match provider.embed(&normalized).await {
-                Ok(emb) => emb,
-                Err(e) => {
-                    tracing::debug!("Reflex semantic embed failed (details): {}", e);
-                    return None;
-                }
-            };
-
-            // Scope the embeddings read guard (see semantic_route: refresh()
-            // takes patterns.write → embeddings.write, so the inverse order
-            // here would risk an ABBA deadlock).
-            let (best_pattern, best_score) = {
-                let embeddings = self.pattern_embeddings.read().await;
-                if embeddings.is_empty() {
-                    return None;
-                }
-
-                let mut best_pattern: Option<String> = None;
-                let mut best_score: f64 = 0.0;
-
-                for (pattern, emb) in embeddings.iter() {
-                    let score = cosine_similarity(&query_embedding, emb);
-                    if score > best_score {
-                        best_score = score;
-                        best_pattern = Some(pattern.clone());
-                    }
-                }
-                (best_pattern, best_score)
-            };
-
-            if best_score >= self.semantic_threshold {
-                let patterns = self.patterns.read().await;
-                if let Some(tool) = best_pattern.as_ref().and_then(|p| patterns.get(p).cloned()) {
-                    return Some(FuzzyMatch {
-                        tool_name: tool,
-                        matched_pattern: best_pattern.unwrap_or_default(),
-                        score: best_score,
-                    });
-                }
-            }
+        // 3. Semantic fallback. Reuse the production path so diagnostics
+        // honor the same opt-in switch and cache-before-provider ordering.
+        if self.semantic_enabled {
+            return self.semantic_route(&normalized).await;
         }
 
         None
@@ -546,7 +749,7 @@ impl ReflexRouter {
                 drop(patterns);
                 drop(embeddings);
 
-                if self.embedding_provider.is_some() {
+                if self.semantic_enabled && self.embedding_provider.is_some() {
                     self.embed_missing_patterns(store, user_id, &records).await;
                 }
             }
@@ -636,9 +839,14 @@ impl ReflexRouter {
         self.semantic_threshold
     }
 
-    /// Whether the semantic tier is enabled.
+    /// Whether an embedding provider is available to the semantic tier.
     pub fn has_embedding_provider(&self) -> bool {
         self.embedding_provider.is_some()
+    }
+
+    /// Whether semantic matching is explicitly enabled.
+    pub fn semantic_enabled(&self) -> bool {
+        self.semantic_enabled
     }
 }
 
@@ -1015,6 +1223,156 @@ pub fn spawn_reflex_evictor(
 mod tests {
     use super::*;
     use crate::db::{Database, ReflexStore};
+
+    // ── Match-count write-behind ──
+
+    #[test]
+    fn reflex_hit_accumulator_coalesces_and_caps_unique_keys() {
+        let accumulator = ReflexHitAccumulator::new(2);
+        assert!(accumulator.record("user-a", "pattern-a"));
+        assert!(accumulator.record("user-a", "pattern-a"));
+        assert!(accumulator.record("user-a", "pattern-b"));
+        assert!(!accumulator.record("user-a", "pattern-c"));
+        assert_eq!(accumulator.tracked_key_count(), 2);
+
+        let batch = accumulator.take_batch().expect("pending batch");
+        let mut hits = batch.database_hits();
+        hits.sort_by(|left, right| left.normalized_pattern.cmp(&right.normalized_pattern));
+        assert_eq!(hits[0].normalized_pattern, "pattern-a");
+        assert_eq!(hits[0].count, 2);
+        assert_eq!(hits[1].normalized_pattern, "pattern-b");
+        assert_eq!(hits[1].count, 1);
+        batch.complete();
+        assert_eq!(accumulator.tracked_key_count(), 0);
+    }
+
+    #[test]
+    fn reflex_hit_accumulator_counts_in_flight_keys_and_requeues() {
+        let accumulator = ReflexHitAccumulator::new(1);
+        assert!(accumulator.record("user-a", "pattern-a"));
+        let batch = accumulator.take_batch().expect("pending batch");
+
+        assert!(accumulator.record("user-a", "pattern-a"));
+        assert!(!accumulator.record("user-a", "pattern-b"));
+        drop(batch);
+
+        let retry = accumulator.take_batch().expect("requeued batch");
+        let hits = retry.database_hits();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].count, 2);
+        retry.complete();
+        assert_eq!(accumulator.tracked_key_count(), 0);
+    }
+
+    #[test]
+    fn reflex_hit_flush_backoff_doubles_and_caps() {
+        assert_eq!(
+            next_reflex_hit_flush_delay(Duration::from_secs(3)),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            next_reflex_hit_flush_delay(Duration::from_secs(48)),
+            MAX_REFLEX_HIT_FLUSH_BACKOFF
+        );
+        assert_eq!(
+            next_reflex_hit_flush_delay(Duration::MAX),
+            MAX_REFLEX_HIT_FLUSH_BACKOFF
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn reflex_hit_accumulator_flushes_one_additive_batch() {
+        use crate::db::libsql::LibSqlBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("reflex_hit_accumulator.db");
+        let backend = Arc::new(LibSqlBackend::new_local(&db_path).await.unwrap());
+        backend.run_migrations().await.unwrap();
+        backend
+            .upsert_reflex_pattern("user-a", "pattern-a", "Pattern A", "tool-a")
+            .await
+            .unwrap();
+        backend
+            .upsert_reflex_pattern("user-a", "pattern-b", "Pattern B", "tool-b")
+            .await
+            .unwrap();
+        let initial: HashMap<_, _> = backend
+            .list_reflex_patterns("user-a")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|pattern| (pattern.normalized_pattern, pattern.match_count))
+            .collect();
+        assert_eq!(initial["pattern-a"], 1);
+        assert_eq!(initial["pattern-b"], 1);
+
+        let accumulator = Arc::new(ReflexHitAccumulator::new(2));
+        assert!(accumulator.record("user-a", "pattern-a"));
+        assert!(accumulator.record("user-a", "pattern-a"));
+        assert!(accumulator.record("user-a", "pattern-b"));
+        let store: Arc<dyn Database> = backend.clone();
+        assert_eq!(accumulator.flush_once(store.as_ref()).await.unwrap(), 2);
+
+        let patterns = backend.list_reflex_patterns("user-a").await.unwrap();
+        let counts: HashMap<_, _> = patterns
+            .into_iter()
+            .map(|pattern| (pattern.normalized_pattern, pattern.match_count))
+            .collect();
+        assert_eq!(counts["pattern-a"], 3);
+        assert_eq!(counts["pattern-b"], 2);
+        assert_eq!(accumulator.tracked_key_count(), 0);
+
+        assert!(accumulator.record("user-a", "pattern-a"));
+        let store: Arc<dyn Database> = backend.clone();
+        let flusher =
+            spawn_reflex_hit_flusher(Arc::clone(&accumulator), store, Duration::from_secs(60));
+        flusher.shutdown(Duration::from_secs(2)).await;
+
+        let patterns = backend.list_reflex_patterns("user-a").await.unwrap();
+        let counts: HashMap<_, _> = patterns
+            .into_iter()
+            .map(|pattern| (pattern.normalized_pattern, pattern.match_count))
+            .collect();
+        assert_eq!(counts["pattern-a"], 4);
+        assert_eq!(counts["pattern-b"], 2);
+        assert_eq!(accumulator.tracked_key_count(), 0);
+
+        backend.bump_reflex_pattern_matches(&[]).await.unwrap();
+        backend
+            .bump_reflex_pattern_matches(&[
+                ReflexPatternHit {
+                    user_id: "user-a".to_string(),
+                    normalized_pattern: "pattern-a".to_string(),
+                    count: 2,
+                },
+                ReflexPatternHit {
+                    user_id: "user-a".to_string(),
+                    normalized_pattern: "pattern-a".to_string(),
+                    count: 3,
+                },
+                ReflexPatternHit {
+                    user_id: "user-a".to_string(),
+                    normalized_pattern: "pattern-b".to_string(),
+                    count: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let patterns = backend.list_reflex_patterns("user-a").await.unwrap();
+        let pattern_a = patterns
+            .iter()
+            .find(|pattern| pattern.normalized_pattern == "pattern-a")
+            .expect("pattern-a");
+        let pattern_b = patterns
+            .iter()
+            .find(|pattern| pattern.normalized_pattern == "pattern-b")
+            .expect("pattern-b");
+        assert_eq!(pattern_a.match_count, 9);
+        assert!(pattern_a.last_matched_at.is_some());
+        assert_eq!(pattern_b.match_count, 2);
+    }
 
     // ── Normalization ──
 
@@ -1727,6 +2085,19 @@ mod tests {
             .unwrap();
         assert_eq!(stale.status, "evicted");
         assert_eq!(fresh.status, "active");
+
+        // A hit buffered before the eviction transaction may land afterward.
+        // Such a hit proves the cached pattern was live and must reactivate it.
+        backend
+            .bump_reflex_pattern_match("test-user", "stale pattern")
+            .await
+            .unwrap();
+        let patterns = backend.list_reflex_patterns("test-user").await.unwrap();
+        let stale = patterns
+            .iter()
+            .find(|pattern| pattern.normalized_pattern == "stale pattern")
+            .unwrap();
+        assert_eq!(stale.status, "active");
     }
 
     #[tokio::test]
@@ -1861,6 +2232,7 @@ mod tests {
         let provider = Arc::new(MockEmbeddings::new(64));
         let router = ReflexRouter::new()
             .with_embedding_provider(provider.clone())
+            .with_semantic_enabled(true)
             .with_semantic_threshold(0.5);
 
         // Register a pattern
@@ -1882,6 +2254,7 @@ mod tests {
         // by registering a pattern that won't match exactly or fuzzily
         let router2 = ReflexRouter::new()
             .with_embedding_provider(provider.clone())
+            .with_semantic_enabled(true)
             .with_semantic_threshold(0.5);
 
         router2
@@ -1920,6 +2293,7 @@ mod tests {
         // different strings will have low similarity
         let router = ReflexRouter::new()
             .with_embedding_provider(provider.clone())
+            .with_semantic_enabled(true)
             .with_semantic_threshold(0.99);
 
         router.register("summarize my logs", "tool_summarize").await;
@@ -1946,6 +2320,7 @@ mod tests {
         let provider = Arc::new(MockEmbeddings::new(64));
         let router = ReflexRouter::with_threshold(0.99) // strict fuzzy so it won't fuzzy-match
             .with_embedding_provider(provider.clone())
+            .with_semantic_enabled(true)
             .with_semantic_threshold(0.9);
 
         // Register a pattern under a different key so exact match won't fire
@@ -1967,27 +2342,57 @@ mod tests {
         assert_eq!(result, Some("tool_alpha".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_reflex_router_semantic_threshold_accessor() {
+    #[test]
+    fn test_reflex_router_semantic_configuration() {
         let router = ReflexRouter::new();
+        assert!(!router.semantic_enabled());
         assert!((router.semantic_threshold() - DEFAULT_SEMANTIC_THRESHOLD).abs() < 1e-6);
 
-        let router2 = ReflexRouter::new().with_semantic_threshold(0.9);
-        assert!((router2.semantic_threshold() - 0.9).abs() < 1e-6);
+        let configured = ReflexRouter::new()
+            .with_semantic_enabled(true)
+            .with_semantic_threshold(0.9);
+        assert!(configured.semantic_enabled());
+        assert!((configured.semantic_threshold() - 0.9).abs() < 1e-6);
     }
 
     #[tokio::test]
-    async fn test_reflex_router_semantic_empty_cache() {
-        use crate::workspace::MockEmbeddings;
+    async fn test_reflex_router_semantic_disabled_does_not_call_provider() {
+        use crate::workspace::{CachedEmbeddingProvider, EmbeddingCacheConfig, MockEmbeddings};
 
-        let provider = Arc::new(MockEmbeddings::new(64));
+        let provider = Arc::new(CachedEmbeddingProvider::new(
+            Arc::new(MockEmbeddings::new(64)),
+            EmbeddingCacheConfig { max_entries: 8 },
+        ));
+        let pattern_embedding = provider.embed("hello world").await.unwrap();
+        assert_eq!(provider.len(), 1);
+
+        let router = ReflexRouter::new().with_embedding_provider(provider.clone());
+        router.register("hello world", "tool_hello").await;
+        router
+            .pattern_embeddings
+            .write()
+            .await
+            .insert("hello world".to_string(), pattern_embedding);
+
+        assert_eq!(router.try_route("unrelated query here").await, None);
+        assert_eq!(provider.len(), 1, "disabled semantic tier called provider");
+    }
+
+    #[tokio::test]
+    async fn test_reflex_router_semantic_empty_cache_does_not_call_provider() {
+        use crate::workspace::{CachedEmbeddingProvider, EmbeddingCacheConfig, MockEmbeddings};
+
+        let provider = Arc::new(CachedEmbeddingProvider::new(
+            Arc::new(MockEmbeddings::new(64)),
+            EmbeddingCacheConfig { max_entries: 8 },
+        ));
         let router = ReflexRouter::new()
-            .with_embedding_provider(provider)
+            .with_embedding_provider(provider.clone())
+            .with_semantic_enabled(true)
             .with_semantic_threshold(0.5);
 
         router.register("hello world", "tool_hello").await;
-        // Don't populate embedding cache — semantic should gracefully return None
-        let result = router.try_route("unrelated query here").await;
-        assert_eq!(result, None);
+        assert_eq!(router.try_route("unrelated query here").await, None);
+        assert!(provider.is_empty(), "empty pattern cache called provider");
     }
 }

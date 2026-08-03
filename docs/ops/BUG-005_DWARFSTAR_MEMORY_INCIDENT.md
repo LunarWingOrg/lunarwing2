@@ -1,6 +1,10 @@
 # BUG-005: Dwarfstar memory incident investigation
 
-> **Status:** RECLASSIFIED — build-process isolation and cancellation failure
+> **Status:** RECLASSIFIED — resource-unbounded local build and subprocess-lifecycle failure
+>
+> **Identifier scope:** This report's `BUG-005` label is not the unrelated
+> `BUG-005` (“Multica Daemon Connection Refused”) in
+> `docs/ops/SUNBURST_BUG_LIST.md`.
 >
 > **Incident:** 2026-08-01/2026-08-02, tenant `dwarfstar`
 >
@@ -9,7 +13,17 @@
 >
 > The running binary's embedded source revision was not independently recorded.
 >
-> **Investigation branch:** `memleakfix4/cmc/v2.0.4.0`, commit `6c82e8c`
+> **Investigation baseline:** `memleakfix4/cmc/v2.0.4.0`, commit `6c82e8c`;
+> the report itself was added one commit later as `11b673d`.
+>
+> **Cross-verification:** Rechecked against source baseline `1e319bf` on
+> 2026-08-02. The timeout, process-tree, and unit-resource findings remain
+> current. Cross-verification corrected the original interpretation of
+> `mode=worker`: current source deliberately routes it to the local scheduler
+> when no container job manager exists, and describes that backend as local.
+> Historical tenant journal, database, filesystem, and `/proc` figures below are
+> preserved investigation evidence; they cannot be independently reproduced
+> from this checkout alone.
 >
 > **Confidence:** High that Rust compilation drove the observed service-cgroup
 > peaks; no evidence confirms a Monty, Wasmtime, or LunarWing-process heap leak.
@@ -37,17 +51,19 @@ The strongest evidence identifies Rust compilation as the dominant workload:
   That profile is consistent with parallel `rustc` processes and inconsistent
   with an idle 150 MB daemon.
 
-The incident is therefore best classified as:
+The incident is therefore best classified, at high confidence, as:
 
-> A Rust build escaped its intended worker isolation, ran under or was charged
-> to the LunarWing service cgroup without a memory ceiling, and was not reliably
-> terminated when the owning tool/job timed out or was cancelled.
+> A resource-unbounded Rust build ran through LunarWing's available local
+> worker/shell path under, or charged to, the LunarWing service cgroup. That path
+> lacked reliable process-tree cleanup on timeout/cancellation.
 
-Cgroups did not leak memory. They correctly accounted for the aggregate memory
-used by the daemon and its charged descendants, including compiler memory,
-file/page cache, and kernel allocations. The product defect is the placement,
-resource isolation, timeout ownership, and process-tree cleanup around local
-shell work.
+The cgroup did not itself leak memory: systemd correctly reported aggregate
+unit usage. Exact peak attribution was not sampled, so the compiler/page-cache
+split remains inferred rather than measured directly. The source-backed product
+defects are the missing build-specific resource boundary, inconsistent timeout
+ownership, and incomplete process-tree cleanup around local shell work. The
+evidence does not establish a sandbox escape: local execution was an intentional
+backend when Docker was unavailable.
 
 Commit `d2ff7b8` fixes a separate, real Engine V2 output-boundary bug. It should
 be retained, but it is not sufficient to explain or fix this incident.
@@ -185,6 +201,14 @@ job_mode: worker
 status:   cancelled
 ```
 
+For direct scheduler jobs, `save_job()` persists `source=direct` but omits the
+`job_mode` column, so the schema default supplies `worker`. That value does not
+prove a Docker backend was requested or used; `source=direct` and the scheduler
+path identify this as a local job:
+
+- `ic/src/history/store.rs:145-198`
+- `ic/migrations/V5__claude_code.sql:1-2`
+
 Recorded actions included:
 
 ```text
@@ -223,20 +247,23 @@ During the second stop, systemd reported approximately:
 Those values cannot explain the main service's 37.6 GB peak and were not folded
 into `lunarwing-dwarfstar.service` accounting.
 
-### 5. No resource ceiling on the main tenant unit
+### 5. No resource ceiling declared by the main tenant unit
 
-The generated multi-tenant unit contains no `MemoryHigh=`, `MemoryMax=`,
-`MemorySwapMax=`, `CPUQuota=`, or comparable build-specific limit:
+The generated multi-tenant unit declares no `MemoryHigh=`, `MemoryMax=`,
+`MemorySwapMax=`, `CPUQuota=`, `TasksMax=`, or comparable build-specific limit:
 
 `ic/scripts/lunarwing-mt-admin.sh:6498-6523`
 
 `NoNewPrivileges=true` and `PrivateTmp=true` are security controls, not resource
-limits. The service was therefore free to consume host memory until global
-reclaim, swap pressure, or OOM intervention.
+limits. The generated unit therefore supplied no tenant-specific ceiling;
+inherited slice limits, service-manager defaults/drop-ins, system-wide
+reclaim/swap policy, or OOM intervention could still bound it. The investigation
+did not record every ancestor or manager-level control, so this report does not
+claim that no host-level limit existed.
 
 ## Source-level failure chain
 
-### Sandbox detection permits local fallback
+### Docker availability selects the local worker backend
 
 At startup, Docker availability is probed. If Docker is missing or not running,
 the code logs that the sandbox is disabled for the session and does not create
@@ -250,13 +277,25 @@ The incident journal contained:
 Docker is installed but not running -- sandbox disabled for this session.
 ```
 
-For `create_job(mode="worker")`, the implementation uses the container only
-when `sandbox_enabled()` is true. Otherwise it calls `execute_local(...)`:
+For `create_job(mode="worker")`, the implementation uses a container only when
+`sandbox_enabled()` is true. Otherwise it calls `execute_local(...)`, which
+runs a separate in-process `Worker` through the scheduler:
 
-`ic/src/tools/builtin/job.rs:1436-1517`
+- `ic/src/tools/builtin/job.rs:468-515,1436-1517`
+- `ic/src/agent/scheduler.rs:119-237`
 
-Thus a mode named `worker`, normally expected to provide container isolation,
-can silently become an in-process local worker when the sandbox is unavailable.
+This is deliberate availability-dependent routing, not source evidence of a
+sandbox escape. The dynamic tool description says “local backend” when external
+workers are configured without a sandbox, and the no-sandbox schema describes a
+local tracked job. Host shell availability is conditional: `app.rs` registers
+development tools when local tools are enabled or when builder mode is enabled
+and the sandbox is disabled. The persisted shell actions prove that condition
+was met for this incident. The operational problem is that this local backend
+then ran host shell commands in the main service cgroup without build-specific
+limits:
+
+- `ic/src/app.rs:474-485,941-947`
+- `ic/src/tools/registry.rs:425-438`
 
 ### The host shell has no process-group boundary
 
@@ -272,9 +311,10 @@ It does not configure:
 - a cgroup/scope;
 - a descendant-process reaper.
 
-Its stdout and stderr retention is bounded to 64 KiB per stream and remaining
-output is drained to a sink (`shell.rs:703-742`). Therefore verbose Cargo output
-was not the source of tens of gigabytes of retained strings.
+It reads at most 64 KiB of raw bytes from each output stream before lossy UTF-8
+conversion and drains the remainder to a sink (`shell.rs:703-742`). Conversion
+and stream-combining can add overhead, but this path still cannot retain tens of
+gigabytes of Cargo output.
 
 ### Timeout ownership is inconsistent
 
@@ -287,10 +327,12 @@ is 60 seconds:
 
 `ic/src/tools/tool.rs:343-348`
 
-The canonical execution wrapper applies that generic timeout around the entire
-tool future:
+Both normal chat/Engine execution and the local job worker apply that generic
+deadline around the entire tool future. The incident's `source=direct` local job
+used the worker-specific wrapper:
 
-`ic/src/tools/execute.rs:63-67`
+- `ic/src/tools/execute.rs:63-67`
+- `ic/src/worker/job.rs:611-617`
 
 When the outer 60-second timeout fires, it drops the shell future before the
 shell's internal 120-second timeout and cleanup branch necessarily run. Tokio's
@@ -355,9 +397,11 @@ There are real host-side retention risks that warrant separate work:
 
 - complete thread/event/conversation objects cached in `HybridStore`;
 - startup-only terminal-state eviction;
-- unbounded collected Python stdout outside Monty's heap limit;
-- detached Tokio tasks when pending handles are dropped;
-- checkpoint/history duplication.
+- Python stdout collected in a host `String` with no explicit byte cap; Monty's
+  duration/allocation/memory limits and the Engine iteration budget are only
+  indirect bounds;
+- spawned Tokio work that may continue when an unawaited `JoinHandle` is dropped;
+- checkpoint/history duplication without an independent aggregate byte cap.
 
 These are not dismissed. They simply do not match the direct compiler evidence
 for this incident.
@@ -365,8 +409,10 @@ for this incident.
 Key paths:
 
 - `ic/src/bridge/store_adapter.rs:71-88,117-207`
-- `ic/crates/lunarwing_engine/src/executor/orchestrator.rs`
-- `ic/crates/lunarwing_engine/src/executor/scripting.rs`
+- `ic/src/bridge/router.rs:1088-1103`
+- `ic/crates/lunarwing_engine/src/executor/orchestrator.rs:111-120,327-638,1750-1780`
+- `ic/crates/lunarwing_engine/src/executor/scripting.rs:49-55,274-379,423-756`
+- `ic/crates/lunarwing_engine/orchestrator/default.py:299-369`
 
 ### Wasmtime lifecycle
 
@@ -379,7 +425,8 @@ No evidence ties a Wasmtime store leak to the 34.8/37.6 GB peaks.
 
 Separate WASM defects were found and should be tracked independently:
 
-- a channel polling child task can detach during shutdown;
+- shutdown aborts only the stored polling supervisor handle; dropping its active
+  inner polling `JoinHandle` detaches that task;
 - running `spawn_blocking` callbacks can outlive outer async timeouts;
 - channel epoch interruption is configured without an advancing epoch ticker;
 - host allocations are outside guest linear-memory limits;
@@ -387,9 +434,11 @@ Separate WASM defects were found and should be tracked independently:
 
 Key paths:
 
-- `ic/src/tools/wasm/wrapper.rs`
-- `ic/src/channels/wasm/wrapper.rs:2278-2562,2950-2968`
-- `ic/src/tools/wasm/limits.rs`
+- `ic/src/tools/wasm/runtime.rs:153-232`
+- `ic/src/channels/wasm/runtime.rs:117-179`
+- `ic/src/tools/wasm/wrapper.rs:622-645,1204-1302,1473-1496`
+- `ic/src/channels/wasm/wrapper.rs:455-476,1153-1229,2278-2562,2950-2968`
+- `ic/src/tools/wasm/limits.rs:62-160`
 
 ## Commit `d2ff7b8`: valid but secondary
 
@@ -411,9 +460,14 @@ After `d2ff7b8`, the adapter drops the original serialized string and parses
 
 `ic/src/bridge/effect_adapter.rs:775-786`
 
-This correctly bounds newly executed outputs before they enter Engine/Monty
-state and restores redaction/policy modifications for normal-sized output. The
-new regression test passed:
+This makes Engine V2 consume the safety layer's transformed output instead of
+the original serialization. Inputs already over the configured size limit are
+truncated before they enter Engine/Monty state. Inputs at or below that limit
+also receive leak redaction and policy enforcement, plus injection sanitization
+when that check is enabled or policy-forced. Those later transformations are not
+re-capped and can change the final length. Oversized output returns immediately
+after truncation, so `d2ff7b8` does not by itself guarantee redaction of the
+retained prefix. The new regression test passed:
 
 ```text
 bridge::effect_adapter::tests::
@@ -425,7 +479,10 @@ It remains a partial boundary fix:
 - tools still construct and serialize full output before sanitization;
 - `job_events` builds its aggregate before the safety cap;
 - multiple bounded copies remain downstream;
-- historical persisted output is not migrated;
+- `d2ff7b8` performs no eager migration of persisted data. The default Engine
+  orchestrator already lazily truncates historical `ActionResult` messages to
+  8,000 characters before reuse, but source job/event rows remain unchanged
+  (`ic/crates/lunarwing_engine/orchestrator/default.py:258-274,485-501`);
 - aggregate history retention is not bounded by a per-result limit.
 
 Chronologically, `d2ff7b8` was committed after the incident. It cannot be cited
@@ -442,14 +499,16 @@ as the root-cause fix for the observed compiler-driven peak.
   size was approximately 2.91 GB during that invocation.
 - Job `775d1565` invoked Cargo tests and its shell calls timed out.
 - Cargo processes were observed after earlier tool timeouts.
-- `mode=worker` selects local execution when the sandbox manager is absent.
+- `mode=worker` deliberately selects the local scheduler when no container job
+  manager exists; its dynamic schema describes that configuration as local.
 - Direct shell execution has no dedicated process group or cgroup.
 - The generic 60-second timeout can preempt the shell's internal 120-second
   cleanup path.
-- The main tenant unit had no memory or swap ceiling.
+- The generated main tenant unit declared no memory, swap, PID, or CPU ceiling;
+  inherited ancestor-cgroup controls were not fully recorded.
 - Actual Engine/job payload sizes were orders of magnitude too small to explain
   37.6 GB directly.
-- `d2ff7b8` fixes a real output-safety bypass but not build isolation.
+- `d2ff7b8` fixes a real output-safety bypass but not local-build isolation.
 
 ### High-confidence inference
 
@@ -489,16 +548,24 @@ Monty/Wasmtime leak.
 
 ## Recommended remediation
 
-### P0: fail closed for worker isolation
+### P1: make the effective backend explicit
 
-`mode=worker` should not silently become in-process local execution when its
-sandbox is unavailable.
+`mode=worker` is an availability-dependent compatibility value: it maps to the
+Docker container manager when present and to the local scheduler otherwise. The
+dynamic schema already distinguishes these cases, so local routing is not itself
+a sandbox escape. Persisted `job_mode=worker` is also the database default for
+direct jobs, so it does not reveal which backend actually ran and complicated
+this investigation.
 
 Recommended behavior:
 
-- Return an explicit “worker sandbox unavailable” error.
-- If local execution remains supported, expose it as a distinct, explicit mode
-  such as `mode=local` with an approval boundary and clear warning.
+- Record and expose an effective backend such as `local`, `docker`, or the named
+  external worker in job status, events, and telemetry.
+- Warn clearly when the effective backend is local and lacks container/cgroup
+  isolation.
+- Let deployments that require isolation reject local execution through an
+  explicit policy; do not silently reinterpret a permitted local backend as
+  sandboxed.
 - Preserve named external workers (`opencode`, `kimi`, etc.) as separate,
   separately accounted backends.
 
@@ -541,9 +608,11 @@ Builds should run in a dedicated container or cgroup with explicit limits:
 - CPU quota or bounded Cargo parallelism;
 - wall-clock deadline.
 
-The existing native build helper detects cgroup constraints to choose Cargo job
-count, but it does not create an isolation boundary. Detection is not a
-substitute for enforcement.
+The repository's native build helper detects inherited cgroup constraints to
+choose `cargo build -j`, but it does not create an isolation boundary and the
+incident invoked `cargo test` directly rather than through that helper
+(`scripts/build-lunarwing.sh:200-371,523-562`). Detection is not a substitute
+for enforcement.
 
 ### P1: add a tenant safety ceiling
 
@@ -622,7 +691,8 @@ Sample at least once per second:
 
 ## Verification record
 
-On investigation branch `6c82e8c`:
+The original investigation used source baseline `6c82e8c`; the report was added
+in `11b673d`. Its recorded checks were:
 
 - `taskset ... cargo test --lib engine_output_honors_safety_size_limit_before_monty_conversion`: passed.
 - `taskset ... cargo check`: passed.
@@ -632,6 +702,29 @@ On investigation branch `6c82e8c`:
 - No live tenant was restarted or modified during the investigation.
 - Database inspection was read-only and limited to metadata, counts, timestamps,
   action names, commands, and byte sizes needed for attribution.
+
+Cross-verification against source baseline `1e319bf` on 2026-08-02 confirmed:
+
+- among incident-relevant source paths, the only change since tenant revision
+  `5b507966` was the Engine output-boundary fix `d2ff7b8`;
+- Docker-unavailable `mode=worker` still deliberately routes through the local
+  scheduler, and its dynamic schema describes the effective backend as local;
+- direct shell execution still lacks process-group ownership and `kill_on_drop`;
+- the generic tool deadline remains 60 seconds while the shell default remains
+  120 seconds;
+- scheduler cancellation still aborts the Tokio task after 100 ms without an OS
+  process-tree cleanup contract;
+- the generated main tenant unit still declares no memory, swap, PID, or CPU
+  ceiling (inherited slice limits and manager defaults/drop-ins remain possible);
+- `taskset -c 0-5 cargo test -j6 --lib bridge::effect_adapter::tests::engine_output_honors_safety_size_limit_before_monty_conversion -- --exact --nocapture --test-threads=6`
+  passed (`1 passed; 0 failed`);
+- the two exact `lunarwing_engine` output-history tests passed (`1 passed` each);
+- `taskset -c 0-5 cargo test -j6 -p lunarwing_safety adversarial -- --nocapture --test-threads=6`
+  passed (`98 passed; 0 failed`);
+- `scripts/tests/test-build-lunarwing.sh` passed (`37 passed; 0 failed`).
+
+No live tenant or historical incident data was accessed during this
+cross-verification.
 
 ## Research provenance
 
@@ -646,22 +739,29 @@ include:
 - `aj-codebase-study/wasm-tool-sandbox.md`
 - `aj-codebase-study/tools-infrastructure.md`
 
-All material claims in this report were rechecked against current source,
-current host state, journal records, persisted metadata, or build-artifact
-timestamps. The study notes are orientation, not authority.
+The 2026-08-02 cross-verification also consulted shared topic
+`tools-builtin-impls` (`aj-codebase-study/tools-builtin-impls.md` and
+`rares-codebase-study/tools-builtin-impls.md`) as an initial map. All current
+behavioral claims were then checked directly against source and repository
+history. Historical host, journal, database, and artifact claims retain the
+original investigation's provenance and were not independently reproduced.
 
 ## Final classification
 
-**Primary incident:** build resource isolation/accounting and process-tree
-lifecycle failure.
+**Primary incident:** a resource-unbounded local Rust build plus process-tree
+lifecycle failure. Systemd cgroup accounting correctly exposed the aggregate
+resource use.
 
-**Not established:** a Monty VM leak, Wasmtime per-call store leak, or 37.6 GB
-LunarWing main-process RSS.
+**Not established:** a sandbox escape, Monty VM leak, Wasmtime per-call store
+leak, or 37.6 GB LunarWing main-process RSS.
 
-**Valid secondary fix:** `d2ff7b8` bounds and sanitizes newly executed Engine V2
-tool results after the tool has produced them.
+**Valid secondary fix:** `d2ff7b8` feeds the safety layer's transformed output
+into Engine V2 after the tool has produced its full result. Oversized inputs are
+truncated; normal-sized inputs receive the later redaction/policy stages, whose
+output is not re-capped; oversized prefixes currently receive no redaction.
 
 The release checklist should not mark the broad “MEMLEAK” item complete solely
-because `d2ff7b8` landed. The output-boundary defect is fixed; the P0 worker
-fallback, process-group cancellation, and build resource-isolation defects
-remain to be implemented and verified.
+because `d2ff7b8` landed. The output-boundary defect is fixed; process-group
+cancellation and per-build resource controls remain open. Effective-backend
+attribution and an optional fail-closed deployment policy remain recommended
+hardening.

@@ -287,6 +287,8 @@ pub struct Agent {
         Arc<tokio::sync::RwLock<Option<Arc<lunarwing_engine::MissionManager>>>>,
     /// Reflex router for fast-path pattern matching.
     pub(super) reflex_router: Arc<crate::agent::reflex::ReflexRouter>,
+    /// Non-blocking write-behind counter for successful reflex routes.
+    pub(super) reflex_hits: Arc<crate::agent::reflex::ReflexHitAccumulator>,
 }
 
 impl Agent {
@@ -354,6 +356,7 @@ impl Agent {
                     threshold: config.reflex.fuzzy_threshold,
                     ..Default::default()
                 })
+                .with_semantic_enabled(config.reflex.semantic_enabled)
                 .with_semantic_threshold(config.reflex.semantic_threshold);
             if let Some(provider) = embedding_provider {
                 router = router.with_embedding_provider(provider);
@@ -376,6 +379,7 @@ impl Agent {
             routine_engine_slot: Arc::new(tokio::sync::RwLock::new(None)),
             mission_manager_slot: Arc::new(tokio::sync::RwLock::new(None)),
             reflex_router,
+            reflex_hits: Arc::new(crate::agent::reflex::ReflexHitAccumulator::default()),
         }
     }
 
@@ -821,7 +825,7 @@ impl Agent {
         };
 
         // Spawn reflex compiler, cache refresh, and evictor if enabled
-        let (_reflex_compiler_handle, _reflex_cache_handle, _reflex_evictor_handle) =
+        let (reflex_compiler_handle, reflex_cache_handle, reflex_evictor_handle) =
             if self.config.reflex.enabled {
                 let compiler_handle = if let (Some(store), Some(builder)) =
                     (self.store(), self.deps.builder.clone())
@@ -881,6 +885,18 @@ impl Agent {
             } else {
                 (None, None, None)
             };
+
+        let reflex_hit_flusher = if self.config.reflex.enabled {
+            self.store().map(|store| {
+                crate::agent::reflex::spawn_reflex_hit_flusher(
+                    Arc::clone(&self.reflex_hits),
+                    Arc::clone(store),
+                    crate::agent::reflex::REFLEX_HIT_FLUSH_INTERVAL,
+                )
+            })
+        } else {
+            None
+        };
 
         // Spawn routine engine if enabled
         let routine_handle = if let Some(ref rt_config) = self.routine_config {
@@ -1163,6 +1179,22 @@ impl Agent {
         if let Some((cron_handle, _)) = routine_handle {
             cron_handle.abort();
         }
+        for handle in [
+            reflex_compiler_handle,
+            reflex_cache_handle,
+            reflex_evictor_handle,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(flusher) = reflex_hit_flusher {
+            flusher
+                .shutdown(crate::agent::reflex::REFLEX_HIT_SHUTDOWN_TIMEOUT)
+                .await;
+        }
         // Flush pending coalesced coordination messages before channels go
         // away so buffered content is not lost on shutdown (ISSUE-002).
         if let Some(buffer) = &self.deps.coordination_coalesce {
@@ -1272,7 +1304,7 @@ impl Agent {
                     .unwrap_or_default(),
             );
             let channels = Arc::clone(&self.channels);
-            let msg = message.clone();
+            let msg = coalesced_reply_context(message);
             let flush: crate::channels::coalesce::FlushFn = Arc::new(move |content| {
                 let channels = Arc::clone(&channels);
                 let msg = msg.clone();
@@ -2024,6 +2056,25 @@ impl Agent {
     }
 }
 
+fn coalesced_reply_context(message: &IncomingMessage) -> IncomingMessage {
+    IncomingMessage {
+        id: message.id,
+        channel: message.channel.clone(),
+        user_id: message.user_id.clone(),
+        owner_id: message.owner_id.clone(),
+        sender_id: message.sender_id.clone(),
+        user_name: message.user_name.clone(),
+        content: String::new(),
+        thread_id: message.thread_id.clone(),
+        conversation_scope_id: message.conversation_scope_id.clone(),
+        received_at: message.received_at,
+        metadata: message.metadata.clone(),
+        timezone: message.timezone.clone(),
+        attachments: Vec::new(),
+        is_internal: message.is_internal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2034,15 +2085,46 @@ mod tests {
     #[cfg(feature = "libsql")]
     use super::Agent;
     use super::{
-        abort_and_wait, chat_tool_execution_metadata, resolve_routine_notification_user,
-        should_fallback_routine_notification, truncate_for_preview,
+        abort_and_wait, chat_tool_execution_metadata, coalesced_reply_context,
+        resolve_routine_notification_user, should_fallback_routine_notification,
+        truncate_for_preview,
     };
     #[cfg(feature = "libsql")]
     use crate::channels::ChannelManager;
-    use crate::channels::IncomingMessage;
+    use crate::channels::{AttachmentKind, IncomingAttachment, IncomingMessage};
     #[cfg(feature = "libsql")]
     use crate::config::AgentConfig;
     use crate::error::ChannelError;
+
+    #[test]
+    fn coalesced_reply_context_drops_message_payload() {
+        let mut message = IncomingMessage::new("xmpp", "owner", "large prompt");
+        message.sender_id = "sender".into();
+        message.thread_id = Some("thread-1".into());
+        message.metadata = serde_json::json!({"xmpp_jid": "room@example.test"});
+        message.attachments.push(IncomingAttachment {
+            id: "large".into(),
+            kind: AttachmentKind::Document,
+            mime_type: "application/octet-stream".into(),
+            filename: None,
+            size_bytes: Some(1024 * 1024),
+            source_url: None,
+            storage_key: None,
+            extracted_text: Some("extracted payload".into()),
+            data: vec![7; 1024 * 1024],
+            duration_secs: None,
+        });
+
+        let context = coalesced_reply_context(&message);
+
+        assert_eq!(context.id, message.id);
+        assert_eq!(context.channel, message.channel);
+        assert_eq!(context.sender_id, message.sender_id);
+        assert_eq!(context.thread_id, message.thread_id);
+        assert_eq!(context.metadata, message.metadata);
+        assert!(context.content.is_empty());
+        assert!(context.attachments.is_empty());
+    }
 
     #[cfg(feature = "libsql")]
     async fn cavepony_test_agent() -> (Agent, Arc<dyn crate::db::Database>, tempfile::TempDir) {
