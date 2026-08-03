@@ -9187,6 +9187,24 @@ recover_failed_tenant_checkout() {
   die "git checkout $target failed after repository state changed; tenant remains stopped for inspection"
 }
 
+darkirc_managed_state_exists() {
+  local state_root
+  state_root="$(tenant_state_dir "$1")/darkirc/key-exchange"
+  [[ -e "$state_root" || -L "$state_root" ]]
+}
+
+upgrade_tenant_darkirc_locked() {
+  local name="$1" scope_id
+  scope_id="$(darkirc_scope_id "$name")"
+  validate_darkirc_scope_id "$scope_id"
+  run_darkirc_key_helper "$name" migration-ready \
+    --tenant "$name" --scope-id "$scope_id" --json >/dev/null \
+    || die "DarkIRC managed state is not settled; upgrade refused"
+  # The caller retains the DarkIRC writer lock while upgrade_tenant_locked stops
+  # the tenant, closing the readiness-check/stop race.
+  upgrade_tenant_locked "$@"
+}
+
 # In-place tenant upgrade: composes the verified sequence (backup -> fetch ->
 # clean-tree gate -> stop -> checkout as the tenant user -> rebuild with WASM ->
 # re-render units -> patch env -> start). The verbs it calls dispatch
@@ -9194,12 +9212,22 @@ recover_failed_tenant_checkout() {
 # docs/ops/TENANT-RENAME-MIGRATION-1.1.9.md for the 1.1.9 rename specifics.
 upgrade_tenant() {
   local name="$1"
-  local upgrade_lock_fd
+  shift
+  name="$(sanitize_name "$name")"
+  with_tenant_lifecycle_lock "$name" _upgrade_tenant_lifecycle_locked "$name" "$@"
+}
+
+_upgrade_tenant_lifecycle_locked() {
+  local name="$1" upgrade_lock_fd
   say "acquiring tenant upgrade lock ..."
   exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
     || die "failed to open tenant upgrade lock"
   flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
-  upgrade_tenant_locked "$@"
+  if tenant_darkirc_enabled "$name" && darkirc_managed_state_exists "$name"; then
+    with_darkirc_writer_lock "$name" upgrade_tenant_darkirc_locked "$@"
+  else
+    upgrade_tenant_locked "$@"
+  fi
   flock -u "$upgrade_lock_fd" || die "failed to release tenant upgrade lock"
   exec {upgrade_lock_fd}>&-
 }
@@ -9619,7 +9647,7 @@ main() {
   case "$command_name" in
     add-tenant)
       require_root
-      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false"
+      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" darkirc_scope_override=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -9628,6 +9656,7 @@ main() {
           --no-ssh)          SSH_OPT_OUT=true; shift ;;
           --no-weechat-bootstrap) WEECHAT_BOOTSTRAP_OPT_OUT=true; shift ;;
           --enable-darkirc)  enable_darkirc="true"; shift ;;
+          --darkirc-scope-id) [[ $# -ge 2 ]] || die "--darkirc-scope-id requires a value"; darkirc_scope_override="$2"; shift 2 ;;
           --enable-proxy)    enable_proxy="true"; shift ;;
           --with-nanocode|--nanocode-model|--nanocode-base-url) die "Nanocode worker is retired; remove $1" ;;
           --with-pebble)     with_pebble="true"; shift ;;
@@ -9659,7 +9688,8 @@ main() {
       [[ -n "$name" ]] || die "usage: add-tenant <name> [--docker-group] [--xmpp-jid <jid>]"
       # Leave empty when --xmpp-jid is absent: add_tenant preserves the tenant's
       # existing JID and only defaults to <name>@xmpp.localhost on a first write.
-      add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
+      name="$(sanitize_name "$name")"
+      with_tenant_lifecycle_lock "$name" add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$darkirc_scope_override"
       ;;
 
     add-tenants)
@@ -9713,7 +9743,7 @@ main() {
         # Empty --xmpp-domain -> empty JID, so add_tenant preserves an existing one.
         local sjid=""
         if [[ -n "$xmpp_domain" ]]; then sjid="${sname}@${xmpp_domain}"; fi
-        add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
+        with_tenant_lifecycle_lock "$sname" add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
       done
       ;;
 
@@ -9732,7 +9762,8 @@ main() {
         esac
       done
       [[ -n "$name" ]] || die "usage: remove-tenant <name> [--purge]"
-      remove_tenant "$name" "$purge"
+      name="$(sanitize_name "$name")"
+      with_tenant_lifecycle_lock "$name" remove_tenant "$name" "$purge"
       ;;
 
     build-tenant)
@@ -9859,19 +9890,22 @@ main() {
     start-tenant)
       require_root
       [[ -n "${1:-}" ]] || die "usage: start-tenant <name>"
-      start_tenant "$1"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" start_tenant "$_lifecycle_name"
       ;;
 
     stop-tenant)
       require_root
       [[ -n "${1:-}" ]] || die "usage: stop-tenant <name>"
-      stop_tenant "$1"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" stop_tenant "$_lifecycle_name"
       ;;
 
     restart-tenant)
       require_root
       [[ -n "${1:-}" ]] || die "usage: restart-tenant <name>"
-      restart_tenant "$1"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" restart_tenant "$_lifecycle_name"
       ;;
 
     start-pg)
