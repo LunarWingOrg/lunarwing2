@@ -8411,6 +8411,153 @@ _set_tenant_weechat_enabled_locked() {
   weechat_lifecycle_enable_start "$name" || return 1
 }
 
+# Stop only services that can mutate a migration snapshot. PostgreSQL remains
+# running so export can take a consistent pg_dump after quiescence.
+tenant_writer_services() {
+  local name="$1"
+  printf '%s\n' "lunarwing-${name}" "xmpp-bridge-${name}"
+  tenant_proxy_enabled "$name" && printf '%s\n' "lunarwing-proxy-${name}"
+  if tenant_weechat_enabled "$name"; then
+    printf '%s\n' "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}"
+  fi
+  if tenant_darkirc_enabled "$name"; then
+    printf '%s\n' "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}"
+  fi
+  printf '%s\n' "lunarwing-vision-${name}"
+  local worker
+  for worker in pebble opencode kimi; do
+    if tenant_worker_enabled "$name" "$worker"; then
+      printf '%s\n' "lunarwing-${worker}-${name}"
+      [[ "$INIT_SYSTEM" != openrc ]] || printf '%s\n' "lunarwing-${worker}-${name}-sup"
+    fi
+  done
+}
+
+tenant_writer_containers() {
+  local name="$1" worker
+  for worker in pebble opencode kimi vision; do
+    printf 'lunarwing-%s-%s\n' "$worker" "$name"
+  done
+}
+
+container_name_list_has() {
+  local names="$1" expected="$2" current
+  while IFS= read -r current; do
+    [[ "$current" == "$expected" ]] && return 0
+  done <<<"$names"
+  return 1
+}
+
+stop_tenant_writers() {
+  local name="$1" service state rc worker container names running writer_rc
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    while IFS= read -r service; do
+      rc=0
+      state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
+      case "$state" in
+        active|activating|reloading|deactivating)
+          _systemctl_user "$name" stop "${service}.service" >/dev/null \
+            || die "failed to stop writer ${service}.service" ;;
+        inactive|dead|failed|maintenance) ;;
+        unknown) [[ "$rc" -eq 4 ]] || die "could not inspect writer ${service}.service" ;;
+        *) [[ "$rc" -eq 4 ]] || die "could not classify writer ${service}.service state '$state'" ;;
+      esac
+    done < <(tenant_writer_services "$name")
+  else
+    while IFS= read -r service; do
+      [[ -x "$OPENRC_INITD_DIR/$service" ]] || continue
+      rc-service "$service" stop >/dev/null 2>&1 \
+        || rc-service "$service" status 2>&1 | grep -Eqi 'stopped|inactive|dead' \
+        || die "failed to stop writer $service"
+    done < <(tenant_writer_services "$name")
+  fi
+
+  for worker in pebble opencode kimi; do
+    stop_worker "$name" "$worker"
+  done
+  stop_tenant_vision "$name"
+
+  ensure_container_runtime
+  names="$(_ctr "$name" ps -a --format '{{.Names}}' 2>/dev/null)" \
+    || die "could not inspect tenant container store"
+  while IFS= read -r container; do
+    container_name_list_has "$names" "$container" || continue
+    running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" \
+      || die "could not inspect writer container $container"
+    case "$running" in
+      true) _ctr "$name" stop --time 0 "$container" >/dev/null \
+        || die "failed to stop writer container $container" ;;
+      false) ;;
+      *) die "could not classify writer container $container" ;;
+    esac
+  done < <(tenant_writer_containers "$name")
+
+  writer_rc=0
+  tenant_writers_active "$name" || writer_rc=$?
+  case "$writer_rc" in
+    0) die "tenant '$name' still has active writers after stop" ;;
+    1) ;;
+    *) die "could not verify writer quiescence for tenant '$name'" ;;
+  esac
+  say "tenant writers stopped for $name (PostgreSQL left running)"
+}
+
+# Returns 0 when any writer is active, 1 when all are stopped/absent, and 2
+# when state cannot be classified safely.
+tenant_writers_active() {
+  local name="$1" service state rc container running names
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || return 2
+  ensure_init_system || return 2
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    while IFS= read -r service; do
+      rc=0
+      state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
+      case "$state" in
+        active|activating|reloading|deactivating) return 0 ;;
+        inactive|dead|failed|maintenance) ;;
+        unknown) [[ "$rc" -eq 4 ]] || return 2 ;;
+        *) [[ "$rc" -eq 4 ]] || return 2 ;;
+      esac
+    done < <(tenant_writer_services "$name")
+  else
+    while IFS= read -r service; do
+      [[ -x "$OPENRC_INITD_DIR/$service" ]] || continue
+      rc=0
+      state="$(rc-service "$service" status 2>&1)" || rc=$?
+      case "$state" in
+        *stopped*|*inactive*|*dead*) ;;
+        *started*|*running*|*active*) return 0 ;;
+        *) [[ "$rc" -eq 3 ]] || return 2 ;;
+      esac
+    done < <(tenant_writer_services "$name")
+  fi
+
+  ensure_container_runtime || return 2
+  names="$(_ctr "$name" ps -a --format '{{.Names}}' 2>/dev/null)" || return 2
+  while IFS= read -r container; do
+    container_name_list_has "$names" "$container" || continue
+    running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" \
+      || return 2
+    [[ "$running" != true ]] || return 0
+    [[ "$running" == false ]] || return 2
+  done < <(tenant_writer_containers "$name")
+  return 1
+}
+
+tenant_writers_probe_status() {
+  local rc=0
+  tenant_writers_active "$1" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 10 ;;
+    *) return 2 ;;
+  esac
+}
+
 # Diagnostic-only in Stage A. Both init-managed services and authenticated
 # adapter connectivity must be healthy; this does not activate an exchange.
 darkirc_health_strict() {
@@ -10048,6 +10195,29 @@ main() {
       [[ -n "${1:-}" ]] || die "usage: restart-tenant <name>"
       _lifecycle_name="$(sanitize_name "$1")"
       with_tenant_lifecycle_lock "$_lifecycle_name" restart_tenant "$_lifecycle_name"
+      ;;
+
+    stop-writers)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: stop-writers <name>"
+      ports_registry_init
+      _writer_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_writer_name" stop_tenant_writers "$_writer_name"
+      ;;
+
+    writers-active)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: writers-active <name>"
+      ports_registry_require_readonly
+      _writer_name="$(sanitize_name "$1")"
+      _writer_rc=0
+      with_tenant_lifecycle_lock "$_writer_name" tenant_writers_probe_status "$_writer_name" \
+        || _writer_rc=$?
+      case "$_writer_rc" in
+        0) say "active"; return 0 ;;
+        10) say "stopped"; return 1 ;;
+        *) say "could not determine tenant writer state" >&2; return 2 ;;
+      esac
       ;;
 
     start-pg)
