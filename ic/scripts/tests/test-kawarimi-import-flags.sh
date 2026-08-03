@@ -6,7 +6,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 IC_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 IMPORT_SRC="$IC_DIR/scripts/import-tenant.sh"
 EXPORT_SRC="$IC_DIR/scripts/export-tenant.sh"
-TEST_STAGE_PARENT="$IC_DIR/target"
+# Stage under HOME, not the checkout: import-tenant.sh rejects any
+# group/world-writable stage ancestor, and CI build-dir ancestors are.
+TEST_STAGE_PARENT="${HOME:?HOME must identify a secure test-stage ancestor}"
 mkdir -p "$TEST_STAGE_PARENT"
 export KAWARIMI_IMPORT_STAGE_ROOT="$TEST_STAGE_PARENT/kawarimi-import-stage.$$"
 SUDO_UID="$(id -u)"
