@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2178  # DarkIRC argument parsers use intentional array namerefs.
 set -euo pipefail
 
 # ── Production Multi-Tenant Admin ─────────────────────────────────────────────
@@ -4153,6 +4154,7 @@ _darkirc_contact_command_locked() {
 }
 
 darkirc_exchange_prepare_args() {
+  # shellcheck disable=SC2178  # args_ref is intentionally an array nameref.
   local -n args_ref="$1"
   local contact="$2" out="" expires="" json=false
   shift 2
@@ -4171,6 +4173,7 @@ darkirc_exchange_prepare_args() {
 }
 
 darkirc_exchange_respond_args() {
+  # shellcheck disable=SC2178  # args_ref is intentionally an array nameref.
   local -n args_ref="$1"
   local contact="$2" input="" out="" fingerprint="" expires="" json=false
   shift 2
@@ -4192,6 +4195,7 @@ darkirc_exchange_respond_args() {
 }
 
 darkirc_exchange_complete_args() {
+  # shellcheck disable=SC2178  # args_ref is intentionally an array nameref.
   local -n args_ref="$1"
   local contact="$2" input="" exchange_id="" fingerprint="" json=false
   shift 2
@@ -4213,6 +4217,7 @@ darkirc_exchange_complete_args() {
 }
 
 darkirc_exchange_cancel_args() {
+  # shellcheck disable=SC2178  # args_ref is intentionally an array nameref.
   local -n args_ref="$1"
   local exchange_id="" json=false
   shift
