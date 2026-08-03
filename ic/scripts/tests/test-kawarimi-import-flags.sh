@@ -170,7 +170,10 @@ SUDO
 }
 
 echo "=== import-tenant dry-run flag passthrough ==="
-tmp="$(mktemp -d)"
+# Fixture root lives under HOME, not /tmp: as root (CI), export-tenant.sh
+# rejects output paths with sticky/setuid/group/world-writable ancestors
+# (/tmp is 1777), and import-tenant.sh likewise distrusts /tmp staging.
+tmp="$(mktemp -d "${HOME:?HOME must identify a secure fixture ancestor}/kawarimi-import-flags.XXXXXX")"
 trap 'rm -rf "$tmp" "$KAWARIMI_IMPORT_STAGE_ROOT"' EXIT
 make_bundle "$tmp"
 make_test_scripts "$tmp"
