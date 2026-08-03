@@ -12,6 +12,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ADMIN_SCRIPT="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 
+# CI containers have no init-system markers (/run/systemd/system,
+# /run/openrc/softlevel) and detect_init_system() dies without one. Pin the
+# override so the renderers are deterministic everywhere. "systemd" keeps the
+# OpenRC babysitter renderer a no-op, as on any systemd host.
+export LUNARWING_SERVICE_MANAGER=systemd
+
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$ADMIN_SCRIPT"
 
@@ -55,8 +61,8 @@ chown() { :; }
 chmod() { :; }
 
 mkdir -p "$(tenant_repo t1)"
-OPENRC_INITD_DIR="$MT_FIXTURE/init.d"
-OPENRC_CONFD_DIR="$MT_FIXTURE/conf.d"
+export OPENRC_INITD_DIR="$MT_FIXTURE/init.d"
+export OPENRC_CONFD_DIR="$MT_FIXTURE/conf.d"
 
 # ── systemd unit rendering ───────────────────────────────────────────────────
 echo "== systemd unit rendering =="
@@ -74,8 +80,8 @@ assert_contains "daemon unit high"    "$unit_dir/lunarwing-t1.service" "MemoryHi
 assert_contains "daemon unit tasks"   "$unit_dir/lunarwing-t1.service" "TasksMax=512"
 
 echo "== operator overrides =="
-WORKLOAD_MEMORY_MAX=12G
-DAEMON_MEMORY_MAX=3G
+export WORKLOAD_MEMORY_MAX=12G
+export DAEMON_MEMORY_MAX=3G
 render_tenant_systemd_units t1
 assert_contains "workload cap override" "$unit_dir/lunarwing-workloads.slice" "MemoryMax=12G"
 assert_contains "daemon cap override"   "$unit_dir/lunarwing-t1.service" "MemoryMax=3G"
@@ -94,13 +100,13 @@ CAPTURE="$MT_FIXTURE/capture"
 sudo() { echo "SUDO $*" >>"$CAPTURE"; }
 
 : >"$CAPTURE"
-INIT_SYSTEM=openrc
+export INIT_SYSTEM=openrc
 _run_tenant_build t1 "cd /x && cargo build --profile release --bin lunarwing -j$BUILD_JOBS"
 assert_contains "openrc build is nice'd" "$CAPTURE" "nice -n 10"
 assert_contains "openrc build has -j"    "$CAPTURE" "-j$BUILD_JOBS"
 
 : >"$CAPTURE"
-INIT_SYSTEM=systemd
+export INIT_SYSTEM=systemd
 systemd-run() { :; } # makes command -v succeed; sudo stub captures the call
 _run_tenant_build t1 "cd /x && cargo build --profile release --bin lunarwing -j$BUILD_JOBS"
 assert_contains "systemd build scoped"   "$CAPTURE" "systemd-run --user --scope --quiet --collect"
