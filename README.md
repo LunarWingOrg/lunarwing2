@@ -4,6 +4,8 @@
 
 LunarWing is a self-hosted, privacy-focused AI agent runtime and operations platform written in Rust. It connects agents to open communication protocols, extensible WASM tools, and operator-controlled infrastructure.
 
+It is the only agent with an actual evolving health system and the only agent platform that actually addresses privacy and security seriously.
+
 <p align="center">
   <img src="./lw2_a.jpg" alt="LunarWing" width="1400">
 </p>
