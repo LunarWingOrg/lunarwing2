@@ -11,6 +11,7 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 source "$ADMIN_SCRIPT"
 
 TENANT=fixture
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 INIT_SYSTEM=systemd
 SYSTEMD_CALLS="$TMP_ROOT/systemd.calls"
 OPENRC_CALLS="$TMP_ROOT/openrc.calls"
@@ -31,10 +32,17 @@ ports_get() {
 }
 tenant_env_dir() { printf '%s\n' "$TMP_ROOT"; }
 sudo() {
+  local assignment key value
   [[ "${1:-}" == -u ]] && shift 2
   [[ "${1:-}" == env ]] && shift
   [[ "${1:-}" == -i ]] && shift
-  while [[ "${1:-}" == *=* ]]; do export "$1"; shift; done
+  while [[ "${1:-}" == *=* ]]; do
+    assignment="$1"
+    key="${assignment%%=*}"
+    value="${assignment#*=}"
+    export "$key=$value"
+    shift
+  done
   "$@"
 }
 curl() {
@@ -68,6 +76,7 @@ for unit in "lunarwing-darkirc-${TENANT}.service" "lunarwing-darkirc-adapter-${T
   }
 done
 
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 INIT_SYSTEM=openrc
 darkirc_health_strict "$TENANT" 1 true
 for service in "lunarwing-darkirc-${TENANT} status" "lunarwing-darkirc-adapter-${TENANT} status"; do
