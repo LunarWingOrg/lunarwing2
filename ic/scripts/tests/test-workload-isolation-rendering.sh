@@ -94,13 +94,13 @@ CAPTURE="$MT_FIXTURE/capture"
 sudo() { echo "SUDO $*" >>"$CAPTURE"; }
 
 : >"$CAPTURE"
-ensure_init_system() { echo openrc; }
+INIT_SYSTEM=openrc
 _run_tenant_build t1 "cd /x && cargo build --profile release --bin lunarwing -j$BUILD_JOBS"
 assert_contains "openrc build is nice'd" "$CAPTURE" "nice -n 10"
 assert_contains "openrc build has -j"    "$CAPTURE" "-j$BUILD_JOBS"
 
 : >"$CAPTURE"
-ensure_init_system() { echo systemd; }
+INIT_SYSTEM=systemd
 systemd-run() { :; } # makes command -v succeed; sudo stub captures the call
 _run_tenant_build t1 "cd /x && cargo build --profile release --bin lunarwing -j$BUILD_JOBS"
 assert_contains "systemd build scoped"   "$CAPTURE" "systemd-run --user --scope --quiet --collect"

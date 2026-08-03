@@ -892,10 +892,26 @@ controls) are addressed in this branch:
   overridable. OpenRC units gain a documented-gap comment; the portable
   tree-reaping layer still applies there.
 
-Validation so far: `cargo check` clean; new `tools::process` unit tests cover
+Validation: `cargo check` clean; new `tools::process` unit tests cover
 group kill on timeout, on future drop, and disarm safety; mt-admin render
 harness `ic/scripts/tests/test-workload-isolation-rendering.sh` (19 checks)
 covers slice rendering, daemon caps, overrides, OpenRC parity, and scoped vs
-nice'd build paths; shellcheck clean. Live tenant validation (scope creation,
-daemon-cgroup flatness during an agent-driven build) is pending a Dwarfstar
-restart.
+nice'd build paths; shellcheck and full `cargo clippy -D warnings` clean.
+
+Live validation on Dwarfstar (2026-08-03, commit `238b281` + follow-up):
+- `upgrade-tenant dwarfstar --target ds6/dwarfstar/v2.0.4.0` completed
+  cleanly (verified DB backup, stop, checkout, rebuild, re-render, start).
+- Rendered and loaded: `lunarwing-workloads.slice` (6G/8G, CPUQuota 800%,
+  TasksMax 2048), `lunarwing-build.slice` (16G/24G), daemon unit
+  `MemoryHigh=1536M MemoryMax=2G TasksMax=512`.
+- `systemd-run --user --scope` probe succeeds for the tenant user;
+  `_run_tenant_build` places commands in
+  `user@1008.service/lunarwing.slice/lunarwing-build.slice/run-*.scope`
+  (verified via `/proc/self/cgroup` from inside a scoped command).
+- One bug was found and fixed during validation: `_run_tenant_build`
+  initially consumed `ensure_init_system` as if it printed the value, but it
+  only sets the `$INIT_SYSTEM` global, so builds silently took the OpenRC
+  fallback. Fixed; harness stubs updated to match real semantics.
+- First agent-driven shell call on the daemon creates a `run-*.scope` under
+  `lunarwing-workloads.slice`; observable with
+  `systemctl --user list-units --type=scope` as the tenant.

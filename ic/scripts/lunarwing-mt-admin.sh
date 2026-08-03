@@ -2122,7 +2122,8 @@ _run_tenant_build() {
   local name="$1" build_cmd="$2"
   local uid
   uid="$(id -u "$name")"
-  if [[ "$(ensure_init_system)" == systemd* ]] && command -v systemd-run >/dev/null 2>&1 \
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd* ]] && command -v systemd-run >/dev/null 2>&1 \
     && sudo -u "$name" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user show --property=Version >/dev/null 2>&1; then
     sudo -u "$name" XDG_RUNTIME_DIR="/run/user/$uid" \
       systemd-run --user --scope --quiet --collect \
