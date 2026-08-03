@@ -114,15 +114,36 @@ pub async fn build_wasm_component(
         anyhow::bail!("cargo-component not found. Install with: cargo install cargo-component");
     }
 
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(source_dir).args(["component", "build"]);
-
+    // Compile workloads run through the workload spawner (fresh process
+    // group, kill_on_drop, systemd scope when available) with a bounded
+    // timeout, so a stuck build cannot run unbounded in the daemon's cgroup
+    // (BUG-005).
+    let mut args = vec!["component", "build"];
     if release {
-        cmd.arg("--release");
+        args.push("--release");
     }
 
-    // Use status() with inherited stdio so build output streams to the terminal.
-    let status = cmd.status().await?;
+    let spawner = crate::tools::process::workload_spawner().await;
+    let mut cmd = spawner.command("cargo", &args);
+    cmd.current_dir(source_dir);
+    if let Some(dir) = spawner.xdg_runtime_dir() {
+        cmd.env("XDG_RUNTIME_DIR", dir);
+    }
+
+    // Inherited stdio (spawn default) so build output streams to the terminal.
+    let mut child = cmd.spawn()?;
+    let mut guard = crate::tools::process::ProcessTreeGuard::new(&child);
+    const WASM_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+    let status = match tokio::time::timeout(WASM_BUILD_TIMEOUT, child.wait()).await {
+        Ok(status) => {
+            guard.disarm();
+            status?
+        }
+        Err(_) => {
+            guard.terminate(&mut child).await;
+            anyhow::bail!("cargo component build timed out after {WASM_BUILD_TIMEOUT:?}");
+        }
+    };
 
     if !status.success() {
         anyhow::bail!("Build failed (exit code: {})", status);

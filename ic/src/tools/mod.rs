@@ -14,6 +14,7 @@ mod coercion;
 pub mod execute;
 pub mod mcp;
 pub mod permissions;
+pub mod process;
 pub mod rate_limiter;
 pub mod redaction;
 pub mod schema_validator;

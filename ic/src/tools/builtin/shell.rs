@@ -42,6 +42,15 @@
 //! - Commands run directly on host with scrubbed environment
 //! - Only safe env vars (PATH, HOME, LANG, etc.) forwarded to child processes
 //! - API keys, session tokens, and credentials are NOT inherited
+//!
+//! # Workload Isolation (BUG-005)
+//!
+//! Direct execution spawns through `crate::tools::process`: the child leads
+//! its own process group with `kill_on_drop`, and a `ProcessTreeGuard` reaps
+//! the whole tree on timeout or cancellation. On systemd hosts commands are
+//! additionally placed in transient `systemd-run --user` scopes under
+//! `lunarwing-workloads.slice`, keeping build memory/CPU out of the daemon's
+//! own service cgroup.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -51,7 +60,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 use crate::context::JobContext;
 use crate::sandbox::{SandboxManager, SandboxPolicy};
@@ -663,15 +671,13 @@ impl ShellTool {
         timeout: Duration,
         extra_env: &HashMap<String, String>,
     ) -> Result<(String, i32), ToolError> {
-        // Build command
+        // Build command through the workload spawner: fresh process group +
+        // kill_on_drop always, systemd scope isolation when available (BUG-005).
+        let spawner = crate::tools::process::workload_spawner().await;
         let mut command = if cfg!(target_os = "windows") {
-            let mut c = Command::new("cmd");
-            c.args(["/C", cmd]);
-            c
+            spawner.command("cmd", &["/C", cmd])
         } else {
-            let mut c = Command::new("sh");
-            c.args(["-c", cmd]);
-            c
+            spawner.command("sh", &["-c", cmd])
         };
 
         // Scrub environment to prevent secret leakage (CWE-200).
@@ -682,6 +688,12 @@ impl ShellTool {
             if let Ok(val) = std::env::var(var) {
                 command.env(var, val);
             }
+        }
+
+        // If the spawner synthesized XDG_RUNTIME_DIR for `systemd-run --user`,
+        // re-apply it after the scrub or the user bus is unreachable.
+        if let Some(dir) = spawner.xdg_runtime_dir() {
+            command.env("XDG_RUNTIME_DIR", dir);
         }
 
         // Inject extra environment variables (e.g., credentials fetched by the
@@ -695,10 +707,12 @@ impl ShellTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Spawn process
+        // Spawn process and arm the tree guard so every exit path
+        // (success, timeout, dropped future) reaps the whole process group.
         let mut child = command
             .spawn()
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to spawn command: {}", e)))?;
+        let mut guard = crate::tools::process::ProcessTreeGuard::new(&child);
 
         // Drain stdout/stderr concurrently with wait() to prevent deadlocks.
         // If we call wait() without draining the pipes and the child's output
@@ -756,14 +770,17 @@ impl ShellTool {
         .await;
 
         match result {
-            Ok(Ok((output, code))) => Ok((truncate_output(&output), code)),
+            Ok(Ok((output, code))) => {
+                guard.disarm();
+                Ok((truncate_output(&output), code))
+            }
             Ok(Err(e)) => Err(ToolError::ExecutionFailed(format!(
                 "Command execution failed: {}",
                 e
             ))),
             Err(_) => {
-                // Timeout - try to kill the process
-                let _ = child.kill().await;
+                // Timeout - SIGTERM the whole process group, then SIGKILL.
+                guard.terminate(&mut child).await;
                 Err(ToolError::Timeout(timeout))
             }
         }
@@ -915,6 +932,15 @@ impl Tool for ShellTool {
 
     fn domain(&self) -> ToolDomain {
         ToolDomain::Container
+    }
+
+    fn execution_timeout(&self) -> Duration {
+        // The outer wrapper (execute_tool_with_safety) must not preempt the
+        // shell's own timeout handling: execute_direct has to time out first
+        // so it can reap the whole process tree (BUG-005). Add a grace margin
+        // on top of the internal timeout. Note per-call `timeout` params
+        // above self.timeout are still capped here, as before.
+        self.timeout + Duration::from_secs(5)
     }
 
     fn rate_limit_config(&self) -> Option<crate::tools::tool::ToolRateLimitConfig> {

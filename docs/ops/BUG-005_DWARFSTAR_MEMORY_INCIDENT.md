@@ -726,6 +726,124 @@ Cross-verification against source baseline `1e319bf` on 2026-08-02 confirmed:
 No live tenant or historical incident data was accessed during this
 cross-verification.
 
+### Live rebuild verification on `8c6a1da` (2026-08-03)
+
+Dwarfstar was upgraded from the incident-era checkout to
+`ds6/dwarfstar/v2.0.4.0` at commit
+`8c6a1da6113a636e7dc6af884248a2a191c7638c`. The rebuild and initial startup
+were observed read-only with one-second samples written by a detached `tmux`
+monitor.
+
+Attribution results:
+
+- The native release command was launched at `01:18:38-04:00` as
+  `cargo build --profile release --bin lunarwing` and completed at
+  `01:23:15-04:00`.
+- The launcher's journal metadata placed it in the operator's
+  `/user.slice/user-1000.slice/session-8.scope`, not
+  `lunarwing-dwarfstar.service`.
+- The tenant service was stopped during that build. Its cgroup did not exist in
+  the sampler until startup at `01:37:47-04:00`.
+- The native build command still specified no `-j`, `taskset`, `MemoryMax`, or
+  dedicated transient scope. No `CARGO_BUILD_JOBS` or `BUILD_JOBS` override was
+  present in the upgrade process environment, so Cargo could use host defaults.
+- The native stage produced 449 release artifacts with an aggregate final size
+  of about 947 MB. The final binary was 104,210,720 bytes. These are artifact
+  sizes, not write-traffic or RSS measurements.
+- The live sampler began after the native Cargo process exited, so it did not
+  capture per-`rustc` RSS for that stage. The broad operator login scope is not
+  usable as a build-memory measurement because it also contained Firefox,
+  Kimi Code, and other desktop processes.
+- Worker-image build steps were charged to separate Buildah/libpod scopes.
+  Individual observed scope peaks included approximately 4.4-4.9 GB; the
+  sampled upgrade-process tree peaked near 4.6 GiB RSS. None of this memory was
+  charged to the stopped Dwarfstar daemon service.
+- The daemon initially reached approximately 410 MiB, then rose to a stable
+  plateau: about 440 MiB for the service cgroup and 448-451 MiB `VmRSS`/`VmHWM`
+  for the main PID (`/proc` reports those fields in KiB). The cgroup carried
+  approximately 388 MiB anonymous and 49 MiB file memory, zero swap, and no
+  Cargo, `rustc`, or linker processes.
+- The plateau was stable rather than monotonic growth. A five-minute sample
+  window remained between approximately 438 and 446 MiB cgroup memory, with
+  only about 3 MiB net anonymous growth.
+- OpenCode, Kimi, PostgreSQL, and vision ran in sibling service cgroups. Their
+  observed peaks were approximately 661 MiB, 208 MiB, 113 MiB, and 60 MiB,
+  respectively.
+- No Cargo, `rustc`, or linker process remained after the upgrade completed.
+- The service was active and ready, and the tenant source and investigation
+  checkout both resolved to `8c6a1da`.
+
+The elevated daemon baseline was traced to startup high-water retention, not
+live Engine state or compiler descendants:
+
+- Dwarfstar created 32 normal Tokio runtime workers and, about 0.5 seconds later,
+  another 32 `tokio-rt-worker` threads. A later source-level recheck found that
+  thread names and timing do not prove the second group was Wasmtime-WASI's
+  process-global ambient runtime. Tokio 1.53 enters the owning runtime handle on
+  its blocking-pool threads, so metadata extraction reached through
+  `tokio::task::spawn_blocking` should not take Wasmtime-WASI's no-runtime
+  fallback. The second group could instead include Tokio blocking-pool workers,
+  or an ambient runtime initialized from another unentered thread. Historical
+  thread stacks were not captured, so exact ownership remains unknown.
+- A current-source reproduction with eight tools created eight main runtime
+  workers followed by eight same-runtime blocking-pool workers while loading
+  WASM components. This strongly supports blocking-pool ownership for the
+  historical second group, though it cannot retroactively prove thread identity
+  without the missing Dwarfstar stacks.
+- Startup loaded all installed `*.wasm` tool files concurrently. Dwarfstar had
+  15 tool components, not the eight current install names. Seven pre-rename
+  files (`gitlab.wasm`, `gotify.wasm`, `llm-context.wasm`,
+  `multica-bridge.wasm`, `ssh.wasm`, `vision-analyze.wasm`, and
+  `web-search.wasm`) survived from 2026-08-01 alongside the newly installed
+  `*-tool.wasm` files. `install_wasm_tenant()` overwrites current artifacts but
+  does not prune stale names; the loader therefore compiled and retained both
+  sets by distinct names.
+- `/proc/<pid>/smaps` showed 85 anonymous VMAs aligned to 64 MiB arena
+  boundaries, carrying about 350 MiB anonymous RSS. A read-only `malloc_stats()`
+  snapshot reported 86 glibc arenas with 463,802,368 bytes of allocator system
+  memory but only 47,936,640 bytes in use. This explains most of the elevated
+  RSS as freed startup allocations retained in per-thread arenas.
+- Wasmtime-WASI 36.0.12 and 36.0.13 have the same ambient-runtime implementation,
+  so the 36.0.13 security bump did not introduce that runtime design. Regardless
+  of second-group ownership, the larger baseline is driven by startup fan-out,
+  thread/arena count, and the stale component set rather than a per-call Wasmtime
+  store leak.
+
+A 2026-08-03 release-profile comparison used an isolated no-database process on
+an eight-CPU host with the eight current WASM tool components:
+
+- With eight async workers, sequential component loading, and Tokio's default
+  blocking-pool limit, startup reached 140,900 KiB RSS with 20 threads. Sixteen
+  threads carried the main runtime's explicit `lunarwing-tokio` name: eight
+  configured async workers followed by eight lazily-created blocking workers.
+  RSS remained 112,080 KiB after 13 minutes.
+- Capping the blocking pool at four reduced `VmRSS` and `VmHWM` to 61,812 KiB.
+  The value remained stable after 100 seconds with 12 threads: eight async
+  workers, the main thread, the WASM epoch ticker, and two support threads.
+- Main runtime defaults are now bounded at eight async workers and four blocking
+  workers, with `LUNARWING_TOKIO_WORKER_THREADS` and
+  `LUNARWING_TOKIO_MAX_BLOCKING_THREADS` overrides. Installed WASM tools and
+  channels compile sequentially, and known stale pre-rename tool artifacts are
+  ignored when their current `*-tool` replacement exists.
+
+This live rebuild supports the central accounting conclusion: an operator-run
+upgrade build is outside the tenant daemon cgroup, while a host-local shell
+started by the daemon would inherit the daemon cgroup. It does **not** validate
+shell timeout cleanup, because no in-daemon compile/cancel workload was run.
+
+Source review on `8c6a1da` also found the incident's primary lifecycle risks:
+
+- direct shell execution still has no process-group ownership or
+  `kill_on_drop` guard;
+- the generic tool timeout remains 60 seconds while the shell's internal default
+  remains 120 seconds;
+- `mode=worker` still routes to the local scheduler when the container manager
+  is unavailable;
+- `build_tenant()` still invokes bare Cargo without explicit parallelism or a
+  dedicated bounded build scope;
+- generated tenant units still declare no explicit memory, swap, PID, or CPU
+  ceiling.
+
 ## Research provenance
 
 Shared study-note topics `engine-v2`, `bridge`, `wasm-tool-sandbox`, and
@@ -765,3 +883,81 @@ because `d2ff7b8` landed. The output-boundary defect is fixed; process-group
 cancellation and per-build resource controls remain open. Effective-backend
 attribution and an optional fail-closed deployment policy remain recommended
 hardening.
+
+## 2026-08-03 postscript — cgroup isolation fix (branch `ds6/dwarfstar/v2.0.4.0`)
+
+The two open items above (process-group cancellation, per-build resource
+controls) are addressed in this branch:
+
+- **Portable tree reaping (all init systems).** New module
+  `ic/src/tools/process.rs`: every tool-spawned workload now leads its own
+  process group with `kill_on_drop`, and a `ProcessTreeGuard` SIGTERM/SIGKILLs
+  the whole group on timeout, cancellation, or drop of the execute future.
+  `ShellTool` now overrides `execution_timeout()` (internal 120 s + 5 s grace)
+  so its own reaping path runs before the generic outer timeout drops the
+  future — the failure mode that orphaned `cargo`/`rustc` during the incident.
+  Wired into `ic/src/tools/builtin/shell.rs`,
+  `ic/src/sandbox/manager.rs::execute_direct`, and the `cargo component build`
+  path in `ic/src/registry/artifacts.rs` (which also gained a 20-minute bound).
+- **systemd transient scopes.** On hosts with a reachable user manager
+  (auto-probed once, cached, graceful fallback), workloads spawn via
+  `systemd-run --user --scope --quiet --collect` under
+  `lunarwing-workloads.slice`, so build memory/CPU is accounted and capped
+  outside `lunarwing-<tenant>.service`. Env knobs:
+  `LUNARWING_WORKLOAD_ISOLATION=auto|none`, `LUNARWING_WORKLOAD_SLICE`,
+  `LUNARWING_WORKLOAD_MEMORY_MAX`.
+- **mt-admin deployment caps.** `render_tenant_systemd_units()` now renders
+  `lunarwing-workloads.slice` (default 6G/8G, CPUQuota 800%, TasksMax 2048)
+  and `lunarwing-build.slice` (16G/24G), and the daemon unit itself gets
+  `MemoryHigh=1536M MemoryMax=2G TasksMax=512` (observed daemon plateau
+  ~450 MiB). `build_tenant()` runs cargo inside the build slice with an
+  explicit `-j` (default `nproc`). All values are `LUNARWING_MT_*`
+  overridable. OpenRC units gain a documented-gap comment; the portable
+  tree-reaping layer still applies there.
+
+Validation: `cargo check` clean; new `tools::process` unit tests cover
+group kill on timeout, on future drop, and disarm safety; mt-admin render
+harness `ic/scripts/tests/test-workload-isolation-rendering.sh` (19 checks)
+covers slice rendering, daemon caps, overrides, OpenRC parity, and scoped vs
+nice'd build paths; shellcheck and full `cargo clippy -D warnings` clean.
+
+Live validation on Dwarfstar (2026-08-03, commit `238b281` + follow-up):
+- `upgrade-tenant dwarfstar --target ds6/dwarfstar/v2.0.4.0` completed
+  cleanly (verified DB backup, stop, checkout, rebuild, re-render, start).
+- Rendered and loaded: `lunarwing-workloads.slice` (6G/8G, CPUQuota 800%,
+  TasksMax 2048), `lunarwing-build.slice` (16G/24G), daemon unit
+  `MemoryHigh=1536M MemoryMax=2G TasksMax=512`.
+- `systemd-run --user --scope` probe succeeds for the tenant user;
+  `_run_tenant_build` places commands in
+  `user@1008.service/lunarwing.slice/lunarwing-build.slice/run-*.scope`
+  (verified via `/proc/self/cgroup` from inside a scoped command).
+- One bug was found and fixed during validation: `_run_tenant_build`
+  initially consumed `ensure_init_system` as if it printed the value, but it
+  only sets the `$INIT_SYSTEM` global, so builds silently took the OpenRC
+  fallback. Fixed; harness stubs updated to match real semantics.
+- First agent-driven shell call on the daemon confirmed in the user journal:
+  the one-time probe (`/usr/bin/true` scope) fired, then the agent's `sh -c`
+  command ran as `run-*.scope` under `lunarwing-workloads.slice` while the
+  daemon cgroup stayed flat and the scope was collected afterward.
+
+## 2026-08-03 postscript 2 — baseline fix merged and verified live
+
+The idle-baseline fix from `g6/g/v2.0.4.0` (`cd6a16a`: bounded Tokio worker
+and blocking pools, sequential WASM compilation, legacy-artifact shadowing)
+was merged into `ds6/dwarfstar/v2.0.4.0` as `cfa7c52`. Dwarfstar was rebuilt
+with `upgrade-tenant` on the merge commit. Measured after startup settled:
+
+- daemon main PID: **91.7 MB `VmRSS`/`VmHWM`, 12 threads** (previously
+  ~461 MB / ~70 threads) — flat over repeated samples;
+- daemon cgroup: **138 MB current / 142 MB peak**, of which only ~44 MB is
+  anonymous (previously ~390 MB anonymous retained in glibc arenas); the rest
+  is reclaimable file cache;
+- the tenant build ran inside `lunarwing-build.slice`, which accounted ~4 GB
+  peak under the 16G/24G caps instead of the operator session;
+- zero workload-isolation warnings in the daemon journal; agent status
+  endpoint healthy.
+
+The ~450 MiB idle plateau and the 37.6 GB build-accounting incident are both
+closed: baseline is back inside the historical 80–165 MB per-instance band,
+and agent/operator compiles are capped and accounted outside the daemon
+cgroup.
