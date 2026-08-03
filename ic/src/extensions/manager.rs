@@ -5737,6 +5737,20 @@ done
         .expect("MCP fixture did not exit");
     }
 
+    #[cfg(unix)]
+    async fn wait_for_mcp_tool(manager: &ExtensionManager, name: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if manager.tool_registry.has(name).await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("MCP fixture tool was not registered");
+    }
+
     fn require_eq<T>(actual: T, expected: T, label: &str) -> Result<(), String>
     where
         T: PartialEq + Debug,
@@ -6416,6 +6430,61 @@ done
             .deactivate("fixture-recovery", "test")
             .await
             .expect("stop recovered fixture");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stdio_mcp_supervisor_recovers_without_manual_poll() {
+        use crate::tools::mcp::McpServerConfig;
+
+        let (store, dir) = make_test_store().await;
+        let script_path = write_mcp_lifecycle_fixture(&dir);
+        let starts_path = dir.path().join("mcp-supervisor-starts.log");
+        let crash_path = dir.path().join("mcp-supervisor-crash-once");
+        let manager = Arc::new(make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(store),
+        ));
+        let mut config = McpServerConfig::new_stdio(
+            "fixture-supervisor",
+            script_path.to_string_lossy(),
+            vec![starts_path.to_string_lossy().into_owned()],
+            HashMap::from([(
+                "MCP_CRASH_ONCE_FILE".to_string(),
+                crash_path.to_string_lossy().into_owned(),
+            )]),
+        );
+        config.enabled = false;
+        manager
+            .install_mcp_config(config, "test")
+            .await
+            .expect("install supervisor fixture");
+        manager
+            .activate("fixture-supervisor", "test")
+            .await
+            .expect("activate supervisor fixture");
+        wait_for_mcp_exit(&manager, "fixture-supervisor").await;
+
+        manager.start_mcp_supervisor().await;
+        wait_for_mcp_start_count(&starts_path, 2).await;
+        wait_for_mcp_tool(&manager, "fixture-supervisor_ping").await;
+
+        assert!(manager.tool_registry.has("fixture-supervisor_ping").await);
+        assert!(matches!(
+            manager
+                .mcp_process_manager
+                .state("fixture-supervisor")
+                .await
+                .expect("supervisor process state"),
+            crate::tools::mcp::McpProcessState::Running
+        ));
+        manager.shutdown_mcp_supervisor().await;
+        manager
+            .deactivate("fixture-supervisor", "test")
+            .await
+            .expect("stop supervisor fixture");
     }
 
     #[cfg(unix)]
