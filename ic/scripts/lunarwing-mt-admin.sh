@@ -8859,9 +8859,11 @@ SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY
 # checks that are N/A host-globally; page only on self-heal escalation (not on
 # every non-healthy run); ignore stale reports.
 SELF_HEAL_REMEDY_LOGICAL=false
+SELF_HEAL_SYSTEMD_SCOPE=system
 HEALTH_XMPP_SERVER=
 HEALTH_MODELS_ENABLED=false
 HEALTH_OMEMO_ENABLED=false
+HEALTH_NETBIRD_ENABLED=false
 HEALTHCHECK_NOTIFY=false
 SELF_HEAL_MAX_REPORT_AGE=$(( HEALTH_INTERVAL_MIN * 60 * 4 ))
 
@@ -8870,6 +8872,11 @@ SELF_HEAL_MAX_REPORT_AGE=$(( HEALTH_INTERVAL_MIN * 60 * 4 ))
 # (single-node still falls back to http://127.0.0.1:8088). Only set the URL
 # if you intentionally force a single override target.
 # HEALTH_LUNARVISION_URL=
+
+# NetBird is operator-owned and disabled by default. To monitor readiness, set
+# HEALTH_NETBIRD_ENABLED=true. Automatic daemon restart also requires explicit
+# SELF_HEAL_NETBIRD_REMEDIATE=true; otherwise failures only escalate.
+# SELF_HEAL_NETBIRD_REMEDIATE=false
 
 # Escalation notifications (fill in to enable Gotify pushes).
 GOTIFY_URL=$HEALTH_GOTIFY_URL

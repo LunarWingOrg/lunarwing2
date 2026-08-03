@@ -107,7 +107,8 @@ E2="$(sb)"; mkdir -p "$E2/checks"; report "$E2" "$GW"
 printf '#!/usr/bin/env bash\necho %s\n' "'{\"status\":\"healthy\"}'" > "$E2/checks/health-gateway.sh"; chmod +x "$E2/checks/health-gateway.sh"
 oE2="$(run_dry "$E2" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$E2/checks")"
 assert_contains "$oE2" "SUCCESS: lunarwing healthy after restart" "E2: healthy verify clears the service"
-assert_eq "$(state_of "$E2")" '{}' "E2: state cleared after verified-healthy restart"
+assert_eq "$(state_of "$E2" '.lunarwing.retries // 0')" '0' "E2: retry state cleared after verified-healthy restart"
+assert_eq "$(state_of "$E2" '.lunarwing.restart_history | length')" '1' "E2: restart history retained after recovery"
 
 # ── F: state prune (item 4) + --prune-ttl disable ───────────────────────────
 F="$(sb)"; report "$F" '{components:[{component:"gateway",status:"healthy",metrics:{}}]}'

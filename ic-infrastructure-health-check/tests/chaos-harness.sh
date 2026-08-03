@@ -31,7 +31,8 @@ o="$(run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1)"
 assert_contains "$o" "SUCCESS: lunarwing healthy after restart" "CH1: gateway recovers after restart"
 assert_eq "$(svc_state "$c" lunarwing)"   "up" "CH1: gateway is up post-recovery"
 assert_eq "$(restarts_of "$c" lunarwing)" "1"  "CH1: exactly one restart"
-assert_eq "$(state_of "$c")" "{}"              "CH1: state cleared on recovery"
+assert_eq "$(state_of "$c" '.lunarwing.retries // 0')" "0" "CH1: retry state cleared on recovery"
+assert_eq "$(state_of "$c" '.lunarwing.restart_history | length')" "1" "CH1: restart history retained"
 assert_eq "$(restarts_of "$c" xmpp-bridge)" "0" "CH1: no collateral restart of other services"
 
 echo "=== CH2: gateway recovers, then stays bound (no churn on next healthy tick) ==="
@@ -122,7 +123,8 @@ o="$(run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_TENANTS_FILE="$c/
 assert_contains "$o" "SUCCESS: lunarwing-acme.service healthy after restart" "CH10: tenant unit recovers"
 assert_eq "$(svc_state "$c" "lunarwing-acme.service")"   "up" "CH10: tenant unit up"
 assert_eq "$(restarts_of "$c" "lunarwing-acme.service")" "1"  "CH10: tenant unit restarted once"
-assert_eq "$(state_of "$c")" "{}" "CH10: tenant state cleared on recovery"
+assert_eq "$(state_of "$c" '.["lunarwing-acme.service"].retries // 0')" "0" "CH10: tenant retry state cleared"
+assert_eq "$(state_of "$c" '.["lunarwing-acme.service"].restart_history | length')" "1" "CH10: tenant restart history retained"
 
 echo "=== CH11: one tenant down, another healthy → blast-radius isolation ==="
 c="$(sb)"; mk_mockbin "$c"
@@ -149,6 +151,22 @@ o="$(run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=fal
 assert_contains "$o" "not stable after restart (substate=auto-restart)" "CH14: verify rejects crash-looping unit"
 assert_ne "$(restarts_of "$c" "lunarwing-acme.service")" "0"  "CH14: a restart was attempted"
 assert_ne "$(state_of "$c")" "{}"                            "CH14: crash-looping unit kept in retry state (not cleared)"
+
+echo "=== CH15: fail/recover cycles retain flap history and eventually escalate ==="
+c="$(sb)"; mk_mockbin "$c"; report "$c" "$GW"
+last=""
+for _ in 1 2; do
+    svc_down "$c" lunarwing
+    run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_FLAP_MAX_RESTARTS=2 >/dev/null
+    report "$c" "$HEALTHY_GW"
+    run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_FLAP_MAX_RESTARTS=2 >/dev/null
+    report "$c" "$GW"
+done
+svc_down "$c" lunarwing
+last="$(run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_FLAP_MAX_RESTARTS=2)"
+assert_contains "$last" "FLAPPING: lunarwing" "CH15: recovery cycles do not erase flap history"
+assert_eq "$(restarts_of "$c" lunarwing)" "2" "CH15: flap threshold prevents third restart"
+assert_eq "$(state_of "$c" '.lunarwing.escalated')" "true" "CH15: repeated recovered flaps escalate"
 
 echo
 echo "Note: CH7 (DNS failure) is modeled by CH6's stuck-service escalation path."

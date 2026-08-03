@@ -12,4 +12,3 @@ bash ic/scripts/test-mt-admin-darkirc-flag.sh
 bash ic/scripts/test-mt-onboard.sh
 bash scripts/tests/test-build-lunarwing.sh
 bash ic-infrastructure-health-check/tests/run-all.sh
-bash ic-infrastructure-health-check/tests/test-health-lunarvision.sh
