@@ -258,6 +258,7 @@ function handleCancel(payload: unknown, ws: BridgeSocket): void {
 // ── Server Role ───────────────────────────────────────────────────────────────
 
 function startServer(): void {
+  if (!AGENT_AUTH_TOKEN) throw new Error("AGENT_AUTH_TOKEN is required in server mode")
   let connectionCount = 0
   let listening = false
 
@@ -280,7 +281,7 @@ function startServer(): void {
     path: WS_PATH,
     maxPayload: WS_MAX_PAYLOAD_BYTES,
     verifyClient: (info, callback) => {
-      if (!AGENT_AUTH_TOKEN || bearerTokenMatches(info.req.headers.authorization, AGENT_AUTH_TOKEN)) {
+      if (bearerTokenMatches(info.req.headers.authorization, AGENT_AUTH_TOKEN)) {
         callback(true)
       } else {
         callback(false, 401, "Unauthorized")
@@ -344,7 +345,7 @@ function startServer(): void {
     updateState()
     console.log(`[bridge] server listening on ws://${WS_BIND_HOST}:${WS_PORT}${WS_PATH}`)
     console.log(`[bridge] subprotocol: ${SUBPROTOCOL} (legacy alias accepted: ${LEGACY_SUBPROTOCOL})`)
-    console.log(`[bridge] auth: ${AGENT_AUTH_TOKEN ? "enabled" : "disabled"}`)
+    console.log("[bridge] auth: enabled")
   })
   updateState()
 }

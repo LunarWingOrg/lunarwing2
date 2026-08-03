@@ -86,11 +86,11 @@ sudo ic/scripts/lunarwing-mt-admin.sh configure-kimi <name> --model <model> --ba
 
 Default Kimi image is slim. `--with-toolchains` enables Rust 1.96.1, Go 1.24.3,
 C/C++, Python headers, native build systems, and same development libraries as
-OpenCode profile. Server mode accepts an empty `AGENT_AUTH_TOKEN`; a non-empty
-value enables bearer authentication and should be configured before exposing the
-bridge beyond a trusted network. mt-admin maps the tenant gateway token into the
-private `kimi-runtime.env`, which also keeps the Kimi API key out of process
-arguments; API key input uses file path rather than plaintext argv.
+OpenCode profile. Server mode requires `AGENT_AUTH_TOKEN`, even on loopback;
+Compose rejects a missing value before container launch. `KIMI_API_KEY` remains
+optional for OAuth-backed setups. mt-admin keeps both credentials out of process
+arguments by materializing private `kimi-runtime.env`; API key input uses file
+path rather than plaintext argv.
 
 ## OpenCode Worker (old section)
 

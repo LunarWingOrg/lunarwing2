@@ -19,8 +19,8 @@ x-worker-base: &worker-base
     - path: ${EXTRA_ENV_FILE:-.env.secrets}
       required: false
   environment: &worker-env
-    # Optional. A non-empty value enables bearer authentication.
-    AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:-}
+    # Required bridge bearer credential. KIMI_API_KEY remains optional.
+    AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:?AGENT_AUTH_TOKEN is required}
     LUNARWING_WORKER_ID: ${LUNARWING_WORKER_ID:-worker-kimi-01}
     KIMI_API_KEY: ${KIMI_API_KEY:-}
     WORKSPACE_ROOT: /workspace
@@ -48,8 +48,8 @@ services:
       WS_PORT: ${WS_PORT:-9090}
       WS_PATH: ${WS_PATH:-/ws/agent}
     ports:
-      # Loopback publication limits host exposure. Configure AGENT_AUTH_TOKEN
-      # before exposing the bridge to other hosts or untrusted container networks.
+      # Loopback publication limits exposure; bridge still requires auth because
+      # browser clients can reach loopback services.
       - "127.0.0.1:${HEALTH_PORT:-8443}:${HEALTH_PORT:-8443}"
       - "127.0.0.1:${WS_PORT:-9090}:${WS_PORT:-9090}"
     healthcheck:

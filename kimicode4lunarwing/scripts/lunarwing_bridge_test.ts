@@ -22,7 +22,7 @@ async function freePort(): Promise<number> {
   return port
 }
 
-function startBridge(port: number, token = ""): ChildProcessWithoutNullStreams {
+function startBridge(port: number, token: string): ChildProcessWithoutNullStreams {
   const stateDir = mkdtempSync(join(tmpdir(), "kimi-bridge-"))
   return spawn(process.execPath, [bridgePath], {
     env: {
@@ -48,19 +48,17 @@ async function waitForListening(child: ChildProcessWithoutNullStreams): Promise<
   })
 }
 
-async function connect(port: number, token = ""): Promise<WebSocket> {
+async function connect(port: number, token: string): Promise<WebSocket> {
   return await new Promise<WebSocket>((resolve, reject) => {
-    const headers: Record<string, string> = {}
-    if (token) headers.Authorization = `Bearer ${token}`
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/agent`, SUBPROTOCOL, {
-      headers,
+      headers: { Authorization: `Bearer ${token}` },
     })
     ws.once("open", () => resolve(ws))
     ws.once("error", reject)
   })
 }
 
-test("bridge enforces a configured token before upgrade", async () => {
+test("bridge requires token and rejects wrong bearer before upgrade", async () => {
   const port = await freePort()
   const child = startBridge(port, "correct-token")
   try {
@@ -78,19 +76,11 @@ test("bridge enforces a configured token before upgrade", async () => {
   }
 })
 
-test("bridge server mode accepts connections without an auth token", async () => {
-  const port = await freePort()
-  const child = startBridge(port)
-  try {
-    await waitForListening(child)
-    const ws = await connect(port)
-    const ready = await new Promise<Record<string, unknown>>((resolve, reject) => {
-      ws.once("message", (data) => resolve(JSON.parse(data.toString())))
-      ws.once("error", reject)
-    })
-    assert.equal(ready.type, "ready")
-    ws.close()
-  } finally {
-    child.kill("SIGTERM")
-  }
+test("bridge server mode refuses empty auth token", async () => {
+  const child = startBridge(await freePort(), "")
+  const code = await new Promise<number | null>((resolve, reject) => {
+    child.once("exit", resolve)
+    child.once("error", reject)
+  })
+  assert.notEqual(code, 0)
 })
