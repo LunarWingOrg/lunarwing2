@@ -3141,6 +3141,83 @@ _read_env_value() {  # <file> <KEY>
   printf '%s\n' "$value"
 }
 
+# Read one value without opening tenant-controlled paths as root. The tenant-side
+# process rejects unsafe ownership, permissions, symlinks, and shared hard links.
+read_tenant_env_value() {  # <tenant> <file> <KEY>
+  local name="$1" target="$2" key="$3" value
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid tenant env key"
+  darkirc_path_components_safe "$target" || die "unsafe tenant env path: $target"
+  value="$(sudo -u "$name" env -i PATH="/usr/bin:/bin" \
+    TARGET_PATH="$target" TARGET_KEY="$key" bash -c '
+      set -euo pipefail
+      target="$TARGET_PATH"
+      parent="${target%/*}"
+      uid="$(id -u)"
+      [[ -d "$parent" && ! -L "$parent" ]] || exit 73
+      parent_owner="$(stat -c %u "$parent" 2>/dev/null || printf -- -1)"
+      parent_mode="$(stat -c %a "$parent" 2>/dev/null || true)"
+      [[ "$parent_owner" == "$uid" && "$parent_mode" =~ ^[0-7]+$ ]] || exit 73
+      (( (8#$parent_mode & 077) == 0 )) || exit 73
+      [[ ! -e "$target" ]] && exit 0
+      [[ -f "$target" && ! -L "$target" ]] || exit 73
+      owner="$(stat -c %u "$target" 2>/dev/null || printf -- -1)"
+      mode="$(stat -c %a "$target" 2>/dev/null || true)"
+      links="$(stat -c %h "$target" 2>/dev/null || printf 0)"
+      [[ "$owner" == "$uid" && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] || exit 73
+      (( (8#$mode & 077) == 0 && (8#$mode & 0400) != 0 )) || exit 73
+      prefix="$TARGET_KEY="
+      value=""
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == "$prefix"* ]] && value="${line#"$prefix"}"
+      done <"$target"
+      printf "%s\n" "$value"
+    ')" || return 1
+  if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\"/\"}"
+    value="${value//\\\\/\\}"
+  elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\'/\'}"
+    value="${value//\\\\/\\}"
+  fi
+  printf '%s\n' "$value"
+}
+
+# Write stdin to a tenant-owned file through a same-directory candidate. Root
+# never opens the destination for writing and secret contents never enter argv.
+write_tenant_file_atomic() {  # <tenant> <file> [mode]
+  local name="$1" target="$2" mode="${3:-600}"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "invalid tenant file mode"
+  darkirc_path_components_safe "$target" || die "unsafe tenant file path: $target"
+  sudo -u "$name" env -i PATH="/usr/bin:/bin" \
+    TARGET_PATH="$target" TARGET_MODE="$mode" bash -c '
+      set -euo pipefail
+      target="$TARGET_PATH"
+      parent="${target%/*}"
+      base="${target##*/}"
+      uid="$(id -u)"
+      [[ -d "$parent" && ! -L "$parent" ]] || exit 73
+      parent_owner="$(stat -c %u "$parent" 2>/dev/null || printf -- -1)"
+      parent_mode="$(stat -c %a "$parent" 2>/dev/null || true)"
+      [[ "$parent_owner" == "$uid" && "$parent_mode" =~ ^[0-7]+$ ]] || exit 73
+      (( (8#$parent_mode & 077) == 0 )) || exit 73
+      [[ ! -L "$target" && ( ! -e "$target" || -f "$target" ) ]] || exit 73
+      if [[ -e "$target" ]]; then
+        owner="$(stat -c %u "$target" 2>/dev/null || printf -- -1)"
+        links="$(stat -c %h "$target" 2>/dev/null || printf 0)"
+        [[ "$owner" == "$uid" && "$links" == 1 ]] || exit 73
+      fi
+      umask 077
+      tmp="$(mktemp "$parent/.${base}.next.XXXXXX")"
+      trap '"'"'rm -f -- "$tmp"'"'"' EXIT
+      cat >"$tmp"
+      chmod "$TARGET_MODE" "$tmp"
+      mv -T -f -- "$tmp" "$target"
+      trap - EXIT
+    '
+}
+
 _quote_env_value() {  # <one-line value>
   local value="$1"
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
