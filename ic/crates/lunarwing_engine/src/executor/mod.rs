@@ -16,3 +16,6 @@ pub mod structured;
 pub mod trace;
 
 pub use loop_engine::ExecutionLoop;
+
+/// Maximum tool actions allowed in one execution step.
+pub(crate) const MAX_ACTIONS_PER_STEP: usize = 50;

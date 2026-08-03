@@ -32,7 +32,7 @@ use lunarwing_safety::SafetyLayer;
 /// Wraps the existing tool pipeline to implement the engine's `EffectExecutor`.
 ///
 /// Enforces all v1 security controls at the adapter boundary:
-/// tool approval, output sanitization, hooks, rate limiting, and call limits.
+/// tool approval, output sanitization, hooks, and rate limiting.
 pub struct EffectBridgeAdapter {
     tools: Arc<ToolRegistry>,
     safety: Arc<SafetyLayer>,
@@ -41,8 +41,6 @@ pub struct EffectBridgeAdapter {
     auto_approved: RwLock<HashSet<(String, String)>>,
     /// DB-backed settings store for persisted `tool_permissions.*` checks.
     settings_store: RwLock<Option<Arc<dyn SettingsStore + Send + Sync>>>,
-    /// Per-step tool call counter (reset externally between steps).
-    call_count: std::sync::atomic::AtomicU32,
     /// Per-user per-tool sliding window rate limiter.
     rate_limiter: RateLimiter,
     /// Mission manager for handling mission_* function calls.
@@ -66,7 +64,6 @@ impl EffectBridgeAdapter {
             hooks,
             auto_approved: RwLock::new(HashSet::new()),
             settings_store: RwLock::new(None),
-            call_count: std::sync::atomic::AtomicU32::new(0),
             rate_limiter: RateLimiter::new(),
             mission_manager: RwLock::new(None),
             auth_manager: RwLock::new(None),
@@ -484,12 +481,6 @@ impl EffectBridgeAdapter {
         })
     }
 
-    /// Reset the per-step call counter (called between threads/steps).
-    pub fn reset_call_count(&self) {
-        self.call_count
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub async fn execute_resolved_pending_action(
         &self,
         action_name: &str,
@@ -535,20 +526,6 @@ impl EffectBridgeAdapter {
 
         let resolved_name = self.tools.resolve_name(action_name).await;
         let lookup_name = resolved_name.as_deref().unwrap_or(action_name);
-
-        // ── Per-step call limit (prevent amplification loops) ──
-        const MAX_CALLS_PER_STEP: u32 = 50;
-        let count = self
-            .call_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count >= MAX_CALLS_PER_STEP {
-            return Err(EngineError::Effect {
-                reason: format!(
-                    "Tool call limit reached ({MAX_CALLS_PER_STEP} per code step). \
-                     Break your task into multiple steps."
-                ),
-            });
-        }
 
         if let Some(result) = self
             .handle_mission_call(action_name, &parameters, context)
@@ -1233,35 +1210,6 @@ mod tests {
         ] {
             assert!(parse_cadence(value).is_err(), "{value} should be rejected");
         }
-    }
-
-    /// Verify that reset_call_count resets the counter to zero,
-    /// preventing the "call limit reached" error across threads.
-    #[test]
-    fn call_count_resets_between_threads() {
-        let adapter = make_adapter();
-
-        // Simulate 50 tool calls (the limit)
-        for _ in 0..50 {
-            adapter
-                .call_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        assert_eq!(
-            adapter
-                .call_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            50
-        );
-
-        // Reset — simulates what handle_with_engine does before each thread
-        adapter.reset_call_count();
-        assert_eq!(
-            adapter
-                .call_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
     }
 
     /// Verify that auto_approve_tool adds entries and is queryable.

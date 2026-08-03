@@ -618,7 +618,6 @@ async fn execute_pending_gate_action(
         prompt_context: lunarwing_engine::prompt_context_from_thread_messages(&thread.messages),
     };
 
-    state.effect_adapter.reset_call_count();
     let event_rx = state.thread_manager.subscribe_events();
     // Register the resolving window so /interrupt can see and cancel the
     // inline action — otherwise the interrupt either reports "nothing to
@@ -2084,7 +2083,6 @@ pub async fn resolve_gate(
                     .unwrap_or_default()
             ));
 
-            state.effect_adapter.reset_call_count();
             let event_rx = state.thread_manager.subscribe_events();
             state
                 .thread_manager
@@ -2852,9 +2850,6 @@ async fn handle_with_engine_inner(
             &message.metadata,
         )
         .await;
-
-    // Reset the per-step call counter so each thread starts fresh
-    state.effect_adapter.reset_call_count();
 
     // Scope the engine conversation by (channel, user, thread). When the
     // frontend sends a thread_id (user created a new conversation), the scoped
