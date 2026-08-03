@@ -28,31 +28,7 @@
 ic/src/workspace/mod.rs:848-871 , 984-1017, 1791-1795). Large growing files can hold several complete copies. Build candidate only for prompt-visible paths and drop buffers before reindex. previous salvaged branch: rarity/kimi-11-20260802-0301 (POSSIBLE THIS WAS ALREADY FIXED BUT MUST CHECK AND MAKE SURE) — Completed 2026-08-03: bundled GitLab tools now read `config/gitlab.json` directly while other WASM prefix grants retain existing scan semantics; append paths keep combined prompt-visible validation while releasing full-document buffers before reindex. Focused WASM, append concurrency, runtime indexing, format, and compile checks passed.
 13. [x] check for issues in CI/CD and fix anything. One issue currently is shown in here docs/ops/CICD_FAILURE_INVESTIGATION_ITEM13.md
 14. [ ] MCP additions — host-local MCP lifecycle. Worker-local MCP, automatic npm/pip install, general runtime-adapter refactor, dedicated/shared MCP gateway architecture, and automatic crash restart each materially increase the security/lifecycle surface. OLD PARTIAL through 2026-08-01: reviewed `rarity/kimi-19-20260730-1801`; do not cherry-pick it wholesale. Its restart loop replaces only the process-manager transport while active clients/tools remain bound to the dead transport, reports stale-active state, and can resurrect a server after disable/shutdown. Its automatic npm/pip install executes unverified package lifecycle code as the LunarWing service user. Adapted only independently useful slices: stdio config now persists environment-variable-to-secret-name mappings, resolves values owner-scoped at activation, fails closed, keeps resolver-owned temporary values in zeroizing memory, exposes CLI/conversational/web install and update surfaces, preserves approval policy, and forces secret-bearing installs plus all conversational MCP updates through explicit approval. Stdio children now inherit only an allowlisted compatibility environment plus explicit config, and raw stderr content is suppressed when secret references are present. Removed the unused process-only restart cache because it retained resolved environment and could not restore MCP client/tool state. CLI removal now routes through the authenticated gateway and `ExtensionManager`, failing closed if live cleanup is unavailable; explicit `--offline` allows persisted-only cleanup after daemon stop. Remaining: safe ExtensionManager-level crash recovery, package provenance/sandbox policy before auto-install, worker-local placement, runtime-adapter work, and dedicated/shared gateway architecture beyond current lifecycle rounrtes. newer partial failed branch: aj/kimi-14-20260803-0602 
-15. [ ] **DarkIRC secure staged key exchange — reopened 2026-08-03 after completeness audit.**
-
-    **Current boundary:** Phase 0/1 and most Stage A are implemented. Public-only `prepare`, `respond`, deferred `complete`, `cancel`, inspection, adoption, recovery, structured migration, mandatory full-fingerprint authorization, bounded pending state, private-key reuse checks, durable tombstones, and deferred activation exist. Full automation is not complete: Stage B activation/rollback, Stage C peer verification, Stage D rotation/revocation/same-host pairing, and QR/web/trusted-channel delivery remain disabled. Rejected `dik2/v2.0.4.0` code remains reference-only. Authoritative specs: `docs/proposals/DARKIRC_SECURE_KEY_EXCHANGE.md` and `docs/proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md`. Windows work is out of scope.
-
-    **Audit findings:**
-
-    | ID | Severity | Status | Finding |
-    |---|---|---|---|
-    | H1 | High | Fixed; verified 2026-08-03 | Named artifact retries now use lock-held semantic replay before one generator invocation. Linux publication uses atomic no-replace rename, and identical output retry fsyncs and succeeds after post-rename failure. |
-    | H2 | High | Fixed; verified 2026-08-03 | Mt-admin now retains tenant lifecycle and DarkIRC writer locks across readiness, writer stop, manifest pinning, and bundle seal; deterministic contenders remain blocked until release. |
-    | H3 | High | Partially fixed | Six Stage A completion crash windows and unit-visible secret surfaces now have regressions. Real two-OS-user isolation and live `/proc`/stdout/stderr/journal leak scanning remain required. |
-    | M1 | Medium | Open | Daemon, helper, and compatibility attestation publish separately; normal failures roll back, but publication is not atomic or host-crash recoverable. |
-    | M2 | Medium | Open | Import pins bundle content but does not reject unsafe source ownership or group/world-readable mode. |
-    | M3 | Medium | Open, pre-existing | `upgrade-tenant.sh` still performs legacy WeeChat `systemctl --user` cleanup directly and lacks OpenRC parity; lifecycle belongs in mt-admin. |
-    | M4 | Medium | Open | DarkFi key generation has no process timeout while the core exchange lock is held; a hung generator can block tenant key operations. |
-    | L1 | Low | Open | `doctor` transaction-directory inspection uses ambient filesystem reads instead of capability-relative no-follow access. |
-    | L2 | Low | Partially fixed | This goal is reopened and condensed. `docs/README.md` still says Phase 0 is unimplemented, while publication docs overclaim atomicity. |
-
-    **Next steps:**
-
-    1. Complete H3 with real cross-user isolation and live-process secret-leak scans.
-    2. Make daemon/helper/attestation publication reader-coherent and crash-recoverable; correct atomicity wording meanwhile.
-    3. Enforce safe migration-bundle owner/mode checks, bound generator runtime, move wrapper lifecycle cleanup into mt-admin, and convert `doctor` to capability-relative reads.
-    4. Reconcile all DarkIRC status docs, rerun targeted Rust/shell suites, format, clippy/check, and required CI before checking this item again.
-    5. After Stage A is fully closed, implement Stage B, Stage C, Stage D, then optional delivery surfaces in that order under their promotion gates.
+15. [ ] **DarkIRC secure staged key exchange.** H1/H2 fixed and verified; H3 partially fixed, with live isolation and leak evidence still required. Full boundary, audit ledger, validation, blockers, and next steps: [`DARKIRC-KEYEXCHANGE-ITEM15-STATUS.md`](DARKIRC-KEYEXCHANGE-ITEM15-STATUS.md).
 
 16. [x] continue to work on external workers, in particular for kimicode - work on this branch seems SOLID - kimicode-toolchain-
 17. [ ] self healing capability expansion - see prev attempt for reference: aj/kimi-24-20260801-1203
