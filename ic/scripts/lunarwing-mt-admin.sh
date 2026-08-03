@@ -8616,6 +8616,7 @@ add_tenant() {
   local kimi_model="${20:-}"
   local kimi_base_url="${21:-}"
   local kimi_api_key="${22:-}"
+  local darkirc_scope_override="${23:-}"
 
   name="$(sanitize_name "$name")"
   [[ -n "$name" ]] || die "invalid tenant name"
@@ -8648,7 +8649,7 @@ add_tenant() {
   local base_port workers_json
   workers_json="$(printf '{"nanocode":false,"pebble":%s,"opencode":%s,"kimi":%s}' \
     "$with_pebble" "$with_opencode" "$with_kimi")"
-  base_port="$(ports_allocate "$name" "$enable_darkirc" "$enable_proxy" "$workers_json")"
+  base_port="$(ports_allocate "$name" "$enable_darkirc" "$enable_proxy" "$workers_json" "$darkirc_scope_override")"
   say ""
 
   create_tenant_user "$name" "$docker_group"
@@ -8671,8 +8672,14 @@ add_tenant() {
     write_tenant_proxy_env "$name" "$tensorzero_url"
   fi
   if [[ "$enable_darkirc" == "true" ]]; then
+    ensure_darkirc_scope_id "$name" >/dev/null
     write_tenant_darkirc_adapter_env "$name"
-    generate_darkirc_config "$name"
+    if darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
+        && [[ -f "$DARKIRC_COMPAT_FILE" ]]; then
+      generate_darkirc_config "$name"
+    else
+      say "DarkIRC config deferred until build-darkirc installs the attested helper"
+    fi
   fi
   write_tenant_gotify_config "$name" "$gotify_url" "$gotify_title"
   ensure_external_worker_config "$name" "pebble" "pebble_wss"
