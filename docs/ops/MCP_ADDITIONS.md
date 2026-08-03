@@ -7,6 +7,9 @@
 > sandboxing for host-local stdio, a general runtime-adapter layer, MCP-over-WASM,
 > and a dedicated shared MCP gateway are not implemented.
 
+For the concise checkpoint, remaining-validation list, and deferred-work summary,
+see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
+
 ## Implemented
 
 ### Host-local installation and activation

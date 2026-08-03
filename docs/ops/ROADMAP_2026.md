@@ -16,7 +16,7 @@ Add
 | DarkIRC key exchange automation | v2.0.4 |
 | Self-Healing Capabilities analysis of any missing pieces from all the new components. Implementation of missing pieces to follow | v2.0.4 |
 | More Crate Updates | v2.0.4 |
-| MCP Overhaul Part 1 — DONE: host-local install/lifecycle, diagnostics, owner-scoped secret references, and safe whole-runtime stdio crash recovery | v2.0.4 |
+| [MCP Overhaul Part 1](MCP_OVERALL_STATUS.md) — DONE: host-local install/lifecycle, diagnostics, owner-scoped secret references, and safe whole-runtime stdio crash recovery | v2.0.4 |
 | Reflex compiler improvements | v2.0.4 |
 | Multi-agent agent team orchestration via XMPP | v2.0.4 |
 | Per-tenant WeeChat health-glob gate (fix the flap /`render-units` footgun) | v2.0.5 |

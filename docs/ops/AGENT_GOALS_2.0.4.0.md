@@ -51,6 +51,8 @@ activation rollback, persistence-before-teardown, atomic tool replacement, fresh
 secret resolution, and deadline-bounded error-path shutdown close resurrection and
 resource-leak races. Scope remains Part 1 host-local lifecycle only; package
 installation/provenance, host OS sandboxing, worker placement, generic runtime
-adapters, MCP-over-WASM, and dedicated/shared gateway work remain deferred.
+adapters, MCP-over-WASM, and dedicated/shared gateway work remain deferred. See
+[`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md) for concise current status,
+remaining validation, and deferred work.
 
 ---
