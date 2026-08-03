@@ -1,7 +1,8 @@
 # P1 Gap Findings — v2.0.3.0
 
-> **Deliverable for item #17** in `docs/ops/AGENT_GOALS_2.0.3.0.md`.
-> Addresses P1 items (G4–G8) from `docs/ops/GOAL_GAP_SUGGESTIONS.md`.
+> **Deliverable for item #17** in the archived
+> [`AGENT_GOALS_2.0.3.0.md`](history/AGENT_GOALS_2.0.3.0.md). Addresses P1 items
+> (G4–G8) from `docs/ops/GOAL_GAP_SUGGESTIONS.md`.
 >
 > **Verified:** 2026-07-26 against branch `rarity/item-17-20260726-1501`
 > (merge-base `010987c`).
@@ -210,7 +211,7 @@ triaged separately for v2.0.4.0 fit.
 - `ic/src/db/CLAUDE.md` — recorded libSQL feature surface (new)
 - `AGENTS.md` — updated tunnel provider list to include NetBird
 - `ic/AGENTS.md` — updated tunnel provider list to include NetBird
-- `docs/ops/AGENT_GOALS_2.0.3.0.md` — checked off item #17
+- `docs/ops/history/AGENT_GOALS_2.0.3.0.md` — checked off item #17 (later archived)
 
 Item #27 subsequently changed tunnel runtime, setup, settings, migrations,
 doctor, web UI, and migration documentation as summarized in G6 above.

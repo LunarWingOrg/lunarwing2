@@ -281,14 +281,14 @@ Unit and integration coverage added or extended:
   non-Mission threads, honors `shared=True` for shared-space docs, and honors
   keyword arguments for every parameter.
 
-Commands (this machine allows 18 threads):
+Commands (run from `ic/`; this machine permits at most six threads):
 
 ```bash
-taskset -c 0-17 cargo fmt --all -- --check
-taskset -c 0-17 cargo check -j18
-taskset -c 0-17 cargo test -j18 -p lunarwing_engine --lib -- --test-threads=18
-taskset -c 0-17 cargo test -j18 --lib bridge::store_adapter::tests:: -- --test-threads=18
-taskset -c 0-17 cargo clippy -j18 --all --benches --tests --examples -- -D warnings
+taskset -c 0-5 cargo fmt --all -- --check
+taskset -c 0-5 cargo check -j6
+taskset -c 0-5 cargo test -j6 -p lunarwing_engine --lib -- --test-threads=6
+taskset -c 0-5 cargo test -j6 --lib bridge::store_adapter::tests:: -- --test-threads=6
+taskset -c 0-5 cargo clippy -j6 --all --benches --tests --examples -- -D warnings
 ```
 
 **Live validation still owed.** The check that actually proves item 41 is

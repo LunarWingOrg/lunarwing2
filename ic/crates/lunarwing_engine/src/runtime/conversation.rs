@@ -284,6 +284,13 @@ impl ConversationManager {
         }
     }
 
+    /// Untrack a thread from its known conversation without scanning others.
+    pub async fn untrack_thread(&self, conversation_id: ConversationId, thread_id: ThreadId) {
+        if let Some(conv) = self.conversations.write().await.get_mut(&conversation_id) {
+            conv.untrack_thread(thread_id);
+        }
+    }
+
     /// Record a thread's outcome in its conversation.
     pub async fn record_thread_outcome(
         &self,
@@ -924,6 +931,45 @@ mod tests {
         let conv = cm.get_conversation(conv_id).await.unwrap();
         assert!(conv.active_threads.is_empty());
         assert!(conv.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn untrack_thread_only_updates_named_conversation() {
+        let (_, cm) = make_conv_manager();
+        let first = cm.get_or_create_conversation("web", "user1").await.unwrap();
+        let second = cm
+            .get_or_create_conversation("xmpp", "user1")
+            .await
+            .unwrap();
+        let thread_id = ThreadId::new();
+        {
+            let mut conversations = cm.conversations.write().await;
+            conversations
+                .get_mut(&first)
+                .unwrap()
+                .track_thread(thread_id);
+            conversations
+                .get_mut(&second)
+                .unwrap()
+                .track_thread(thread_id);
+        }
+
+        cm.untrack_thread(first, thread_id).await;
+
+        assert!(
+            !cm.get_conversation(first)
+                .await
+                .unwrap()
+                .active_threads
+                .contains(&thread_id)
+        );
+        assert!(
+            cm.get_conversation(second)
+                .await
+                .unwrap()
+                .active_threads
+                .contains(&thread_id)
+        );
     }
 
     #[tokio::test]

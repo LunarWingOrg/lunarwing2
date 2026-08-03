@@ -10,7 +10,8 @@
     "ping_interval_ms": 20000,
     "auth": {
       "method": "bearer",
-      "token_env": "AGENT_AUTH_TOKEN"
+      "token_env": "AGENT_AUTH_TOKEN",
+      "required": true
     }
   },
 

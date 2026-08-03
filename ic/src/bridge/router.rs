@@ -927,10 +927,10 @@ async fn reconcile_pending_gate_state(
 async fn fail_threads_for_expired_gates(state: &EngineState, expired_gates: &[PendingGate]) {
     for gate in expired_gates {
         let key = gate.key();
-        // Load + state checks happen BEFORE taking the gate-store lock: a
+        // Load + state checks happen BEFORE taking the per-key reservation: a
         // replacement gate inserted while the load was in flight must win,
-        // so the presence check runs last (run_if_absent holds the lock
-        // across the finalization).
+        // so the presence check runs last. Unrelated gate keys remain unlocked
+        // across finalization and its DB I/O.
         let Some(thread) = state.store.load_thread(gate.thread_id).await.ok().flatten() else {
             continue;
         };
@@ -957,12 +957,14 @@ async fn fail_threads_for_expired_gates(state: &EngineState, expired_gates: &[Pe
                     Ok(true) => {
                         state
                             .conversation_manager
-                            .untrack_thread_everywhere(gate.thread_id)
+                            .untrack_thread(gate.conversation_id, gate.thread_id)
                             .await;
+                        true
                     }
-                    Ok(false) => {}
+                    Ok(false) => false,
                     Err(error) => {
                         debug!(thread_id = %gate.thread_id, %error, "failed to expire waiting thread");
+                        false
                     }
                 }
             })

@@ -38,7 +38,7 @@ use crate::history::{
     AgentJobRecord, AgentJobSummary, ConversationMessage, ConversationSummary, JobEventRecord,
     LlmCallRecord, SandboxJobRecord, SandboxJobSummary, SettingRow,
 };
-use crate::workspace::{MemoryChunk, MemoryDocument, WorkspaceEntry};
+use crate::workspace::{MemoryChunk, MemoryDocument, WorkspaceEntry, WorkspaceFileContent};
 use crate::workspace::{SearchConfig, SearchResult};
 
 /// Create a database backend from configuration, run migrations, and return it.
@@ -771,12 +771,29 @@ pub trait ReflexStore: Send + Sync {
     /// Disable a reflex pattern by ID.
     async fn disable_reflex_pattern(&self, id: Uuid) -> Result<bool, DatabaseError>;
 
-    /// Increment match count and update last_matched_at for a pattern.
+    /// Increment match counts and update timestamps for a batch of patterns.
+    ///
+    /// Implementations must use one backend batch/transaction and apply each
+    /// delta additively. An empty batch is a no-op.
+    async fn bump_reflex_pattern_matches(
+        &self,
+        hits: &[ReflexPatternHit],
+    ) -> Result<(), DatabaseError>;
+
+    /// Increment one pattern by one match.
     async fn bump_reflex_pattern_match(
         &self,
         user_id: &str,
         normalized_pattern: &str,
-    ) -> Result<(), DatabaseError>;
+    ) -> Result<(), DatabaseError> {
+        let hit = ReflexPatternHit {
+            user_id: user_id.to_string(),
+            normalized_pattern: normalized_pattern.to_string(),
+            count: 1,
+        };
+        self.bump_reflex_pattern_matches(std::slice::from_ref(&hit))
+            .await
+    }
 
     /// Record a failed compilation attempt for a reflex pattern.
     ///
@@ -828,6 +845,14 @@ pub trait ReflexStore: Send + Sync {
         query_embedding: &[f32],
         limit: i32,
     ) -> Result<Vec<(ReflexPatternRecord, f64)>, DatabaseError>;
+}
+
+/// Additive reflex match-count update used by write-behind batching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflexPatternHit {
+    pub user_id: String,
+    pub normalized_pattern: String,
+    pub count: u64,
 }
 
 /// A persisted reflex pattern record.
@@ -907,6 +932,16 @@ pub trait WorkspaceStore: Send + Sync {
         suffix: &str,
         limit: usize,
     ) -> Result<Vec<WorkspaceEntry>, WorkspaceError>;
+    /// Fetch bounded direct files and their content in deterministic path order.
+    async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError>;
     async fn list_all_paths(
         &self,
         user_id: &str,

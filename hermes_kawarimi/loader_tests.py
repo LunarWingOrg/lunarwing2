@@ -105,6 +105,49 @@ class RunImportSequenceTest(unittest.TestCase):
         self.assertTrue(result.ok, result.error)
         return verbs
 
+    def _run_failure_path(
+        self,
+        plan: ImportPlan,
+        *,
+        populate_error: Exception | None = None,
+        fail_on: tuple[str, int] | None = None,
+        raise_on: tuple[str, int] | None = None,
+    ) -> tuple[loader.ImportResult, list[str]]:
+        verbs: list[str] = []
+        occurrences: dict[str, int] = {}
+
+        def fake_run_command(args, **_kw):  # noqa: ANN001, ANN202
+            verb = args[1]
+            verbs.append(verb)
+            occurrences[verb] = occurrences.get(verb, 0) + 1
+            current = (verb, occurrences[verb])
+            if current == raise_on:
+                raise RuntimeError(f"{verb} crashed")
+            rc = 1 if current == fail_on else 0
+            return PhaseResult(name=verb, returncode=rc)
+
+        populate = mock.Mock(return_value={})
+        if populate_error is not None:
+            populate.side_effect = populate_error
+        env = {
+            "DATABASE_BACKEND": "postgres",
+            "DATABASE_URL": "postgres://example",
+            "SECRETS_MASTER_KEY": "key",
+            "LUNARWING_OWNER_ID": "owner",
+        }
+        with (
+            mock.patch("hermes_kawarimi.loader.ensure_mt_admin", return_value="mt"),
+            mock.patch(
+                "hermes_kawarimi.loader.run_command", side_effect=fake_run_command
+            ),
+            mock.patch.object(loader.secrets_ops, "parse_tenant_env", return_value=env),
+            mock.patch("hermes_kawarimi.loader._wait_for_schema"),
+            mock.patch("hermes_kawarimi.loader._populate", new=populate),
+            mock.patch("hermes_kawarimi.loader._insert_secrets"),
+        ):
+            result = loader.run_import(plan, MappedAgent())
+        return result, verbs
+
     def test_start_pg_between_stop_tenant_and_populate(self) -> None:
         verbs = self._run_phases(ImportPlan(tenant="t1", apply=True))
         self.assertEqual(
@@ -122,6 +165,59 @@ class RunImportSequenceTest(unittest.TestCase):
     def test_start_after_populate_when_requested(self) -> None:
         verbs = self._run_phases(ImportPlan(tenant="t1", apply=True, start=True))
         self.assertEqual(verbs[-2:], ["start-pg", "start-tenant"])
+
+    def test_populate_failure_stops_owned_postgres(self) -> None:
+        result, verbs = self._run_failure_path(
+            ImportPlan(tenant="t1", apply=True),
+            populate_error=RuntimeError("write failed"),
+        )
+
+        self.assertEqual(result.error, "populate failed: write failed")
+        self.assertEqual(verbs[-2:], ["start-pg", "stop-pg"])
+
+    def test_final_start_failure_stops_owned_postgres(self) -> None:
+        result, verbs = self._run_failure_path(
+            ImportPlan(tenant="t1", apply=True, start=True),
+            fail_on=("start-tenant", 2),
+        )
+
+        self.assertEqual(result.error, "start-tenant failed (after populate)")
+        self.assertEqual(verbs[-3:], ["start-pg", "start-tenant", "stop-pg"])
+
+    def test_start_pg_failure_does_not_stop_unowned_postgres(self) -> None:
+        result, verbs = self._run_failure_path(
+            ImportPlan(tenant="t1", apply=True),
+            fail_on=("start-pg", 1),
+        )
+
+        self.assertEqual(
+            result.error,
+            "start-pg failed (populate needs PostgreSQL up, daemon down)",
+        )
+        self.assertEqual(verbs[-2:], ["stop-tenant", "start-pg"])
+        self.assertNotIn("stop-pg", verbs)
+
+    def test_cleanup_failure_preserves_original_error(self) -> None:
+        result, verbs = self._run_failure_path(
+            ImportPlan(tenant="t1", apply=True),
+            populate_error=RuntimeError("write failed"),
+            fail_on=("stop-pg", 1),
+        )
+
+        self.assertEqual(result.error, "populate failed: write failed")
+        self.assertEqual(verbs[-1], "stop-pg")
+        self.assertTrue(any("cleanup failed" in warning for warning in result.warnings))
+
+    def test_cleanup_exception_preserves_original_error(self) -> None:
+        result, verbs = self._run_failure_path(
+            ImportPlan(tenant="t1", apply=True),
+            populate_error=RuntimeError("write failed"),
+            raise_on=("stop-pg", 1),
+        )
+
+        self.assertEqual(result.error, "populate failed: write failed")
+        self.assertEqual(verbs[-1], "stop-pg")
+        self.assertTrue(any("cleanup raised" in warning for warning in result.warnings))
 
     def test_install_wasm_failure_fails_clearly(self) -> None:
         """install-wasm is required (import-tenant.sh aborts on it via set -e).

@@ -1,13 +1,14 @@
 //! Pending gate store — atomic, channel-verified, persistent.
 //!
-//! Uses a single [`Mutex`] (not `RwLock`) because every meaningful read
-//! is followed by a mutation. This eliminates TOCTOU races by design.
+//! In-memory index mutations use one short-held mutex. Per-key reservations
+//! serialize async persistence and expiry finalization without blocking
+//! unrelated gates.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use super::pending::{PendingGate, PendingGateKey, PendingGateView};
@@ -71,14 +72,100 @@ struct StoreInner {
     by_request_id: HashMap<Uuid, PendingGateKey>,
 }
 
+struct KeyLockEntry {
+    lock: Weak<Mutex<()>>,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct KeyLockRegistry {
+    entries: StdMutex<HashMap<PendingGateKey, KeyLockEntry>>,
+}
+
+struct KeyReservation {
+    key: PendingGateKey,
+    generation: u64,
+    lock: Option<Arc<Mutex<()>>>,
+    guard: Option<OwnedMutexGuard<()>>,
+    registry: Arc<KeyLockRegistry>,
+}
+
+impl KeyLockRegistry {
+    async fn reserve(self: &Arc<Self>, key: &PendingGateKey) -> KeyReservation {
+        let (lock, generation) = {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = entries.entry(key.clone()).or_insert_with(|| KeyLockEntry {
+                lock: Weak::new(),
+                generation: 0,
+            });
+            let lock = entry.lock.upgrade().unwrap_or_else(|| {
+                let lock = Arc::new(Mutex::new(()));
+                entry.lock = Arc::downgrade(&lock);
+                lock
+            });
+            (lock, entry.generation)
+        };
+        let guard = Arc::clone(&lock).lock_owned().await;
+        KeyReservation {
+            key: key.clone(),
+            generation,
+            lock: Some(lock),
+            guard: Some(guard),
+            registry: Arc::clone(self),
+        }
+    }
+}
+
+impl KeyReservation {
+    fn is_current(&self) -> bool {
+        self.registry
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.key)
+            .is_some_and(|entry| entry.generation == self.generation)
+    }
+
+    fn invalidate_waiters(&mut self) {
+        let mut entries = self
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = entries.get_mut(&self.key) {
+            entry.generation = entry.generation.wrapping_add(1);
+            self.generation = entry.generation;
+        }
+    }
+}
+
+impl Drop for KeyReservation {
+    fn drop(&mut self) {
+        self.guard.take();
+        self.lock.take();
+        let mut entries = self
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if entries
+            .get(&self.key)
+            .is_some_and(|entry| entry.lock.strong_count() == 0)
+        {
+            entries.remove(&self.key);
+        }
+    }
+}
+
 /// Thread-safe store for pending execution gates.
 ///
-/// All mutations happen under a single [`Mutex`] lock to prevent TOCTOU
-/// races. The `take_verified` method is the **only** way to retrieve a
-/// pending gate for resolution — it atomically verifies request ID,
-/// channel authorization, and expiry before removing the gate.
+/// Index mutations remain atomic under [`Mutex`]. Per-key reservations extend
+/// serialization across async persistence and finalization where needed.
+/// `take_verified` atomically verifies request ID, channel authorization, and
+/// expiry before removing a gate.
 pub struct PendingGateStore {
     inner: Mutex<StoreInner>,
+    key_locks: Arc<KeyLockRegistry>,
     persistence: Option<Arc<dyn GatePersistence>>,
 }
 
@@ -90,6 +177,7 @@ impl PendingGateStore {
                 by_key: HashMap::new(),
                 by_request_id: HashMap::new(),
             }),
+            key_locks: Arc::new(KeyLockRegistry::default()),
             persistence,
         }
     }
@@ -103,6 +191,12 @@ impl PendingGateStore {
     /// `(user, thread)`; expired entries are replaced atomically in memory.
     pub async fn insert(&self, gate: PendingGate) -> Result<(), GateStoreError> {
         let key = gate.key();
+        let reservation = self.key_locks.reserve(&key).await;
+        // A successful expiry finalization invalidates inserts that were queued
+        // before it, preventing a new gate from appearing on a failed thread.
+        if !reservation.is_current() {
+            return Err(GateStoreError::AlreadyExists);
+        }
         {
             let mut inner = self.inner.lock().await;
             match inner
@@ -153,6 +247,7 @@ impl PendingGateStore {
         request_id: Uuid,
         responding_channel: &str,
     ) -> Result<PendingGate, GateStoreError> {
+        let _reservation = self.key_locks.reserve(key).await;
         let gate = {
             let mut inner = self.inner.lock().await;
 
@@ -243,6 +338,7 @@ impl PendingGateStore {
     ///
     /// Used for cleanup paths like conversation clears or explicit cancel flows.
     pub async fn discard(&self, key: &PendingGateKey) -> Result<(), GateStoreError> {
+        let _reservation = self.key_locks.reserve(key).await;
         let removed = {
             let mut inner = self.inner.lock().await;
             let gate = inner.by_key.remove(key).ok_or(GateStoreError::NotFound)?;
@@ -279,49 +375,61 @@ impl PendingGateStore {
 
     /// Atomically remove and return all expired gates.
     pub async fn drain_expired(&self) -> Vec<PendingGate> {
-        let mut inner = self.inner.lock().await;
-        let expired_keys: Vec<PendingGateKey> = inner
-            .by_key
-            .iter()
-            .filter(|(_, gate)| gate.is_expired())
-            .map(|(key, _)| key.clone())
-            .collect();
+        let expired_keys: Vec<PendingGateKey> = {
+            let inner = self.inner.lock().await;
+            inner
+                .by_key
+                .iter()
+                .filter(|(_, gate)| gate.is_expired())
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
         let mut expired = Vec::with_capacity(expired_keys.len());
         for key in expired_keys {
-            if let Some(gate) = inner.by_key.remove(&key) {
-                inner.by_request_id.remove(&gate.request_id);
-                expired.push(gate);
-            }
-        }
-
-        // Keep insertion blocked until stale persistence is gone. Otherwise a
-        // replacement can be saved and then deleted by this cleanup.
-        if let Some(ref persistence) = self.persistence {
-            for gate in &expired {
-                if let Err(e) = persistence.remove(&gate.key()).await {
-                    tracing::debug!(error = %e, "failed to remove expired gate from persistence");
+            let _reservation = self.key_locks.reserve(&key).await;
+            let gate = {
+                let mut inner = self.inner.lock().await;
+                let Some(gate) = inner.by_key.get(&key) else {
+                    continue;
+                };
+                if !gate.is_expired() {
+                    continue;
                 }
+                let request_id = gate.request_id;
+                let Some(gate) = inner.by_key.remove(&key) else {
+                    continue;
+                };
+                inner.by_request_id.remove(&request_id);
+                gate
+            };
+            if let Some(ref persistence) = self.persistence
+                && let Err(e) = persistence.remove(&gate.key()).await
+            {
+                tracing::debug!(error = %e, "failed to remove expired gate from persistence");
             }
+            expired.push(gate);
         }
         expired
     }
 
-    /// Run an async operation only while no gate exists for `key`.
+    /// Run an async operation under a key reservation while no gate exists.
     ///
-    /// Used by expiry reconciliation so replacement insertion cannot race a
-    /// waiting thread's transition to failed.
+    /// Successful finalization invalidates same-key inserts already waiting for
+    /// the reservation. Unrelated keys remain fully concurrent.
     pub(crate) async fn run_if_absent<F, Fut>(&self, key: &PendingGateKey, operation: F) -> bool
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = ()>,
+        Fut: std::future::Future<Output = bool>,
     {
-        let inner = self.inner.lock().await;
-        if inner.by_key.contains_key(key) {
+        let mut reservation = self.key_locks.reserve(key).await;
+        if self.inner.lock().await.by_key.contains_key(key) {
             return false;
         }
-        operation().await;
-        drop(inner);
-        true
+        let finalized = operation().await;
+        if finalized {
+            reservation.invalidate_waiters();
+        }
+        finalized
     }
 
     /// Remove all expired gates. Returns the number removed.
@@ -655,6 +763,99 @@ mod tests {
 
         assert_eq!(successes, 1, "Exactly one concurrent take must succeed");
         assert_eq!(failures, 1, "Exactly one concurrent take must fail");
+    }
+
+    #[tokio::test]
+    async fn test_blocked_finalization_does_not_block_unrelated_gate() {
+        let store = Arc::new(PendingGateStore::in_memory());
+        let blocked_key = PendingGateKey {
+            user_id: "alice".into(),
+            thread_id: ThreadId::new(),
+        };
+        let finalization_started = Arc::new(tokio::sync::Notify::new());
+        let finish_finalization = Arc::new(tokio::sync::Notify::new());
+
+        let sweep = {
+            let store = Arc::clone(&store);
+            let key = blocked_key.clone();
+            let started = Arc::clone(&finalization_started);
+            let finish = Arc::clone(&finish_finalization);
+            tokio::spawn(async move {
+                store
+                    .run_if_absent(&key, || async move {
+                        started.notify_one();
+                        finish.notified().await;
+                        true
+                    })
+                    .await
+            })
+        };
+        finalization_started.notified().await;
+
+        let unrelated = sample_gate_with("bob", ThreadId::new(), "web", 300);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.insert(unrelated.clone()),
+        )
+        .await
+        .expect("unrelated insertion must not wait for finalization")
+        .unwrap();
+        assert!(store.peek(&unrelated.key()).await.is_some());
+
+        finish_finalization.notify_one();
+        assert!(sweep.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_queued_replacement_is_invalidated_by_finalization() {
+        let store = Arc::new(PendingGateStore::in_memory());
+        let thread_id = ThreadId::new();
+        let key = PendingGateKey {
+            user_id: "alice".into(),
+            thread_id,
+        };
+        let finalization_started = Arc::new(tokio::sync::Notify::new());
+        let finish_finalization = Arc::new(tokio::sync::Notify::new());
+
+        let sweep = {
+            let store = Arc::clone(&store);
+            let key = key.clone();
+            let started = Arc::clone(&finalization_started);
+            let finish = Arc::clone(&finish_finalization);
+            tokio::spawn(async move {
+                store
+                    .run_if_absent(&key, || async move {
+                        started.notify_one();
+                        finish.notified().await;
+                        true
+                    })
+                    .await
+            })
+        };
+        finalization_started.notified().await;
+
+        let insertion_started = Arc::new(tokio::sync::Notify::new());
+        let replacement = {
+            let store = Arc::clone(&store);
+            let started = Arc::clone(&insertion_started);
+            tokio::spawn(async move {
+                started.notify_one();
+                store
+                    .insert(sample_gate_with("alice", thread_id, "web", 300))
+                    .await
+            })
+        };
+        insertion_started.notified().await;
+        tokio::task::yield_now().await;
+        assert!(!replacement.is_finished());
+
+        finish_finalization.notify_one();
+        assert!(sweep.await.unwrap());
+        assert!(matches!(
+            replacement.await.unwrap(),
+            Err(GateStoreError::AlreadyExists)
+        ));
+        assert!(store.peek(&key).await.is_none());
     }
 
     // ── Peek ─────────────────────────────────────────────────

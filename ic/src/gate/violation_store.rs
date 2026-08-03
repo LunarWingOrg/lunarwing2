@@ -9,13 +9,22 @@
 //! the same pattern as `FileGatePersistence`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::bootstrap::lunarwing_base_dir;
+
+const MAX_ACTORS: usize = 1_024;
+const MAX_RECORDS_PER_ACTOR: usize = 64;
+const MAX_RECORD_FIELD_BYTES: usize = 256;
+const MAX_ACTOR_ID_BYTES: usize = 512;
+const MAX_PERSISTED_BYTES: u64 = 64 * 1024 * 1024;
+const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Escalation status for an agent's coordination violations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,11 +61,19 @@ struct AgentViolations {
     records: Vec<ViolationRecord>,
     manual_disabled: bool,
     disabled_until_secs: Option<u64>,
+    #[serde(default)]
+    updated_at_secs: u64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ViolationFile {
     agents: HashMap<String, AgentViolations>,
+}
+
+#[derive(Debug, Default)]
+struct StoreState {
+    agents: HashMap<String, AgentViolations>,
+    generation: u64,
 }
 
 /// Tunables for violation escalation.
@@ -116,9 +133,10 @@ fn now_secs() -> u64 {
 /// coordination gate. Cheap to clone: wrap in `Arc`.
 #[derive(Debug)]
 pub struct ViolationStore {
-    path: PathBuf,
     config: ViolationStoreConfig,
-    inner: Mutex<HashMap<String, AgentViolations>>,
+    inner: Arc<Mutex<StoreState>>,
+    persist_tx: Option<SyncSender<()>>,
+    writer: Option<JoinHandle<()>>,
 }
 
 impl ViolationStore {
@@ -134,11 +152,46 @@ impl ViolationStore {
 
     /// Open (or create) the store at an explicit path, loading existing state.
     pub fn new(path: PathBuf, config: ViolationStoreConfig) -> Self {
-        let agents = load_from_disk(&path);
+        Self::new_with_debounce(path, config, PERSIST_DEBOUNCE)
+    }
+
+    fn new_with_debounce(path: PathBuf, config: ViolationStoreConfig, debounce: Duration) -> Self {
+        let mut config = config;
+        config.max_violations = config.max_violations.clamp(1, MAX_RECORDS_PER_ACTOR as u32);
+        let now = now_secs();
+        let mut agents = load_from_disk(&path);
+        prune_all(&mut agents, now, config.decay_secs);
+        for entry in agents.values_mut() {
+            cap_records(entry);
+            if entry.updated_at_secs == 0 {
+                entry.updated_at_secs = entry
+                    .records
+                    .last()
+                    .map_or(0, |record| record.timestamp_secs);
+            }
+        }
+        enforce_actor_cap(&mut agents);
+        let inner = Arc::new(Mutex::new(StoreState {
+            agents,
+            generation: 0,
+        }));
+        let (persist_tx, persist_rx) = sync_channel(1);
+        let writer_state = Arc::clone(&inner);
+        let writer = std::thread::Builder::new()
+            .name("coord-violation-writer".to_string())
+            .spawn(move || writer_loop(path, writer_state, persist_rx, debounce));
+        let (persist_tx, writer) = match writer {
+            Ok(writer) => (Some(persist_tx), Some(writer)),
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to start coordination violation writer");
+                (None, None)
+            }
+        };
         Self {
-            path,
             config,
-            inner: Mutex::new(agents),
+            inner,
+            persist_tx,
+            writer,
         }
     }
 
@@ -165,81 +218,185 @@ impl ViolationStore {
         channel: &str,
         now: u64,
     ) -> ViolationStatus {
+        if agent.len() > MAX_ACTOR_ID_BYTES {
+            tracing::warn!(
+                agent_len = agent.len(),
+                "Coordination violation actor ID too large"
+            );
+            return ViolationStatus::Disabled {
+                until_secs: now.saturating_add(self.config.disable_duration_secs),
+            };
+        }
         let mut guard = lock(&self.inner);
-        let entry = guard.entry(agent.to_string()).or_default();
-        prune_decayed(entry, now, self.config.decay_secs);
+        let pruned = prune_all(&mut guard.agents, now, self.config.decay_secs);
+        if !guard.agents.contains_key(agent)
+            && guard.agents.len() >= MAX_ACTORS
+            && !evict_oldest_non_manual(&mut guard.agents)
+        {
+            if pruned {
+                guard.generation = guard.generation.wrapping_add(1);
+            }
+            drop(guard);
+            if pruned {
+                self.schedule_persist();
+            }
+            tracing::warn!(agent, "Coordination violation actor cap reached");
+            return ViolationStatus::Disabled {
+                until_secs: now.saturating_add(self.config.disable_duration_secs),
+            };
+        }
+        let entry = guard.agents.entry(agent.to_string()).or_default();
         entry.records.push(ViolationRecord {
             timestamp_secs: now,
-            reason: reason.to_string(),
-            hook: hook.to_string(),
-            channel: channel.to_string(),
+            reason: bounded_string(reason),
+            hook: bounded_string(hook),
+            channel: bounded_string(channel),
         });
+        entry.updated_at_secs = now;
+        cap_records(entry);
         let strikes = entry.records.len() as u32;
-        if strikes >= self.config.max_violations && entry.disabled_until_secs.is_none() {
-            entry.disabled_until_secs = Some(now + self.config.disable_duration_secs);
+        let max_violations = self.config.max_violations.min(MAX_RECORDS_PER_ACTOR as u32);
+        if strikes >= max_violations && entry.disabled_until_secs.is_none() {
+            entry.disabled_until_secs = Some(now.saturating_add(self.config.disable_duration_secs));
         }
         let status = status_of(entry, now);
-        persist(&self.path, &guard);
+        guard.generation = guard.generation.wrapping_add(1);
+        drop(guard);
+        self.schedule_persist();
         status
     }
 
     /// Current status for an agent (active violations only; expired disables clear).
     pub fn status(&self, agent: &str) -> ViolationStatus {
         let now = now_secs();
-        let guard = lock(&self.inner);
-        match guard.get(agent) {
-            Some(entry) => status_of(entry, now),
-            None => ViolationStatus::Active,
+        if agent.len() > MAX_ACTOR_ID_BYTES {
+            return ViolationStatus::Disabled {
+                until_secs: now.saturating_add(self.config.disable_duration_secs),
+            };
         }
+        let mut guard = lock(&self.inner);
+        let (status, remove, mut changed) = match guard.agents.get_mut(agent) {
+            Some(entry) => {
+                let changed = prune_decayed(entry, now, self.config.decay_secs);
+                let remove = entry.records.is_empty()
+                    && !entry.manual_disabled
+                    && entry.disabled_until_secs.is_none();
+                (status_of(entry, now), remove, changed)
+            }
+            None => (ViolationStatus::Active, false, false),
+        };
+        if remove {
+            guard.agents.remove(agent);
+            changed = true;
+        }
+        if changed {
+            guard.generation = guard.generation.wrapping_add(1);
+        }
+        drop(guard);
+        if changed {
+            self.schedule_persist();
+        }
+        status
     }
 
     /// Statuses for all tracked agents (admin endpoint).
     pub fn all_statuses(&self) -> HashMap<String, ViolationStatus> {
         let now = now_secs();
-        let guard = lock(&self.inner);
-        guard
+        let mut guard = lock(&self.inner);
+        let changed = prune_all(&mut guard.agents, now, self.config.decay_secs);
+        let statuses = guard
+            .agents
             .iter()
             .map(|(agent, entry)| (agent.clone(), status_of(entry, now)))
-            .collect()
+            .collect();
+        if changed {
+            guard.generation = guard.generation.wrapping_add(1);
+        }
+        drop(guard);
+        if changed {
+            self.schedule_persist();
+        }
+        statuses
     }
 
     /// Whether the agent is currently disabled (manual or auto, unexpired).
     pub fn is_disabled(&self, agent: &str) -> bool {
         matches!(self.status(agent), ViolationStatus::Disabled { .. })
-            || lock(&self.inner)
-                .get(agent)
-                .is_some_and(|e| e.manual_disabled)
     }
 
     /// Reset all violations and re-enable the agent.
     pub fn clear(&self, agent: &str) {
         let mut guard = lock(&self.inner);
-        guard.remove(agent);
-        persist(&self.path, &guard);
+        if guard.agents.remove(agent).is_some() {
+            guard.generation = guard.generation.wrapping_add(1);
+            drop(guard);
+            self.schedule_persist();
+        }
     }
 
     /// Manually disable the agent until [`ViolationStore::manual_enable`] or
     /// [`ViolationStore::clear`].
     pub fn manual_disable(&self, agent: &str) {
+        if agent.len() > MAX_ACTOR_ID_BYTES {
+            tracing::warn!(agent_len = agent.len(), "Manual-disable actor ID too large");
+            return;
+        }
         let mut guard = lock(&self.inner);
-        guard.entry(agent.to_string()).or_default().manual_disabled = true;
-        persist(&self.path, &guard);
+        let now = now_secs();
+        prune_all(&mut guard.agents, now, self.config.decay_secs);
+        if !guard.agents.contains_key(agent)
+            && guard.agents.len() >= MAX_ACTORS
+            && !evict_oldest_non_manual(&mut guard.agents)
+        {
+            tracing::warn!("Coordination violation actor cap reached; manual disable not stored");
+            return;
+        }
+        let entry = guard.agents.entry(agent.to_string()).or_default();
+        entry.manual_disabled = true;
+        entry.updated_at_secs = now;
+        guard.generation = guard.generation.wrapping_add(1);
+        drop(guard);
+        self.schedule_persist();
     }
 
     /// Re-enable a manually disabled agent (violations are kept).
     pub fn manual_enable(&self, agent: &str) {
         let mut guard = lock(&self.inner);
-        if let Some(entry) = guard.get_mut(agent) {
+        if let Some(entry) = guard.agents.get_mut(agent) {
             entry.manual_disabled = false;
             entry.disabled_until_secs = None;
+            entry.updated_at_secs = now_secs();
+            guard.generation = guard.generation.wrapping_add(1);
+            drop(guard);
+            self.schedule_persist();
         }
-        persist(&self.path, &guard);
+    }
+
+    fn schedule_persist(&self) {
+        let Some(tx) = &self.persist_tx else {
+            return;
+        };
+        match tx.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {}
+            Err(TrySendError::Disconnected(())) => {
+                tracing::warn!("Coordination violation writer stopped unexpectedly");
+            }
+        }
     }
 }
 
-fn lock(
-    mutex: &Mutex<HashMap<String, AgentViolations>>,
-) -> std::sync::MutexGuard<'_, HashMap<String, AgentViolations>> {
+impl Drop for ViolationStore {
+    fn drop(&mut self) {
+        self.persist_tx.take();
+        if let Some(writer) = self.writer.take()
+            && writer.join().is_err()
+        {
+            tracing::warn!("Coordination violation writer panicked");
+        }
+    }
+}
+
+fn lock(mutex: &Mutex<StoreState>) -> std::sync::MutexGuard<'_, StoreState> {
     // Poisoning means another thread panicked mid-update; the in-memory map is
     // still the best available state, so recover it rather than crash.
     mutex
@@ -247,7 +404,9 @@ fn lock(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn prune_decayed(entry: &mut AgentViolations, now: u64, decay_secs: u64) {
+fn prune_decayed(entry: &mut AgentViolations, now: u64, decay_secs: u64) -> bool {
+    let before_records = entry.records.len();
+    let before_disabled_until = entry.disabled_until_secs;
     entry
         .records
         .retain(|r| now.saturating_sub(r.timestamp_secs) < decay_secs);
@@ -259,6 +418,70 @@ fn prune_decayed(entry: &mut AgentViolations, now: u64, decay_secs: u64) {
     }
     if entry.records.is_empty() && !entry.manual_disabled {
         entry.disabled_until_secs = None;
+    }
+    before_records != entry.records.len() || before_disabled_until != entry.disabled_until_secs
+}
+
+fn prune_all(agents: &mut HashMap<String, AgentViolations>, now: u64, decay_secs: u64) -> bool {
+    let before_agents = agents.len();
+    let mut changed = false;
+    for entry in agents.values_mut() {
+        changed |= prune_decayed(entry, now, decay_secs);
+    }
+    agents.retain(|_, entry| {
+        entry.manual_disabled
+            || entry.disabled_until_secs.is_some_and(|until| until > now)
+            || !entry.records.is_empty()
+    });
+    changed || before_agents != agents.len()
+}
+
+fn cap_records(entry: &mut AgentViolations) {
+    let excess = entry.records.len().saturating_sub(MAX_RECORDS_PER_ACTOR);
+    if excess > 0 {
+        entry.records.drain(..excess);
+    }
+}
+
+fn enforce_actor_cap(agents: &mut HashMap<String, AgentViolations>) {
+    while agents.len() > MAX_ACTORS {
+        if !evict_oldest_non_manual(agents) {
+            let oldest = oldest_actor(agents, false);
+            if let Some(agent) = oldest {
+                agents.remove(&agent);
+            }
+        }
+    }
+}
+
+fn evict_oldest_non_manual(agents: &mut HashMap<String, AgentViolations>) -> bool {
+    oldest_actor(agents, true).is_some_and(|agent| agents.remove(&agent).is_some())
+}
+
+fn oldest_actor(agents: &HashMap<String, AgentViolations>, exclude_manual: bool) -> Option<String> {
+    agents
+        .iter()
+        .filter(|(_, entry)| !exclude_manual || !entry.manual_disabled)
+        .min_by(|(agent_a, entry_a), (agent_b, entry_b)| {
+            entry_a
+                .updated_at_secs
+                .cmp(&entry_b.updated_at_secs)
+                .then_with(|| agent_a.cmp(agent_b))
+        })
+        .map(|(agent, _)| agent.clone())
+}
+
+fn bounded_string(value: &str) -> String {
+    let end = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= MAX_RECORD_FIELD_BYTES)
+        .last()
+        .unwrap_or(0);
+    if value.len() <= MAX_RECORD_FIELD_BYTES {
+        value.to_string()
+    } else {
+        value[..end].to_string()
     }
 }
 
@@ -280,8 +503,22 @@ fn status_of(entry: &AgentViolations, now: u64) -> ViolationStatus {
     }
 }
 
-fn load_from_disk(path: &PathBuf) -> HashMap<String, AgentViolations> {
-    match std::fs::read_to_string(path) {
+fn load_from_disk(path: &Path) -> HashMap<String, AgentViolations> {
+    let content = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > MAX_PERSISTED_BYTES => {
+            tracing::warn!(
+                path = %path.display(),
+                size = metadata.len(),
+                max = MAX_PERSISTED_BYTES,
+                "Coordination violations file exceeds size limit, starting empty"
+            );
+            return HashMap::new();
+        }
+        Ok(_) => std::fs::read_to_string(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(err) => Err(err),
+    };
+    match content {
         Ok(content) => match serde_json::from_str::<ViolationFile>(&content) {
             Ok(file) => file.agents,
             Err(err) => {
@@ -293,7 +530,6 @@ fn load_from_disk(path: &PathBuf) -> HashMap<String, AgentViolations> {
                 HashMap::new()
             }
         },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
@@ -306,31 +542,75 @@ fn load_from_disk(path: &PathBuf) -> HashMap<String, AgentViolations> {
 }
 
 /// Atomic write: serialize to a temp file in the same directory, then rename.
-fn persist(path: &PathBuf, agents: &HashMap<String, AgentViolations>) {
-    let file = ViolationFile {
-        agents: agents.clone(),
-    };
+fn writer_loop(path: PathBuf, state: Arc<Mutex<StoreState>>, rx: Receiver<()>, debounce: Duration) {
+    let mut persisted_generation = 0;
+    let mut dirty = false;
+    let mut retry_delay = debounce;
+    loop {
+        if !dirty && rx.recv().is_err() {
+            break;
+        }
+        let wait = if dirty { retry_delay } else { debounce };
+        let disconnected = debounce_notifications(&rx, wait);
+        let (generation, agents) = {
+            let guard = lock(&state);
+            (guard.generation, guard.agents.clone())
+        };
+        if generation == persisted_generation {
+            dirty = false;
+        } else if persist(&path, agents) {
+            persisted_generation = generation;
+            dirty = lock(&state).generation != persisted_generation;
+            retry_delay = debounce;
+        } else {
+            dirty = true;
+            retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+        }
+        if disconnected {
+            break;
+        }
+    }
+}
+
+fn debounce_notifications(rx: &Receiver<()>, debounce: Duration) -> bool {
+    let deadline = Instant::now() + debounce;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        match rx.recv_timeout(remaining) {
+            Ok(()) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return false,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return true,
+        }
+    }
+}
+
+fn persist(path: &Path, agents: HashMap<String, AgentViolations>) -> bool {
+    let file = ViolationFile { agents };
     let json = match serde_json::to_vec_pretty(&file) {
         Ok(json) => json,
         Err(err) => {
             tracing::warn!(error = %err, "Failed to serialize coordination violations");
-            return;
+            return false;
         }
     };
     if let Some(parent) = path.parent()
         && let Err(err) = std::fs::create_dir_all(parent)
     {
         tracing::warn!(path = %parent.display(), error = %err, "Failed to create violations dir");
-        return;
+        return false;
     }
     let tmp = path.with_extension("json.tmp");
     if let Err(err) = std::fs::write(&tmp, &json) {
         tracing::warn!(path = %tmp.display(), error = %err, "Failed to write violations temp file");
-        return;
+        return false;
     }
     if let Err(err) = std::fs::rename(&tmp, path) {
         tracing::warn!(path = %path.display(), error = %err, "Failed to rename violations file");
+        return false;
     }
+    true
 }
 
 #[cfg(test)]
@@ -354,13 +634,14 @@ mod tests {
     }
 
     fn test_store() -> ViolationStore {
-        ViolationStore::new(
+        ViolationStore::new_with_debounce(
             unique_test_dir("store").join("violations.json"),
             ViolationStoreConfig {
                 max_violations: 3,
                 disable_duration_secs: 3600,
                 decay_secs: 600,
             },
+            Duration::from_secs(60),
         )
     }
 
@@ -383,13 +664,13 @@ mod tests {
 
     #[test]
     fn test_persistence_roundtrip() {
-        let store = test_store();
-        let path = store.path.clone();
+        let path = unique_test_dir("roundtrip").join("violations.json");
         let config = ViolationStoreConfig {
             max_violations: 3,
             disable_duration_secs: 3600,
             decay_secs: 600,
         };
+        let store = ViolationStore::new(path.clone(), config.clone());
         store.record_violation("agent-b", "reason", "hook", "chan");
         drop(store);
         let reopened = ViolationStore::new(path, config);
@@ -458,5 +739,81 @@ mod tests {
         // Manual disable is independent of the expiry normalization.
         store.manual_disable("agent-g");
         assert!(store.is_disabled("agent-g"));
+    }
+
+    #[test]
+    fn test_records_and_actors_are_bounded() {
+        let store = test_store();
+        let t0 = 1_000_000;
+        for index in 0..(MAX_RECORDS_PER_ACTOR + 5) {
+            store.record_violation_at("busy", "r", "hook", "chan", t0 + index as u64);
+        }
+        for index in 0..=MAX_ACTORS {
+            store.record_violation_at(
+                &format!("agent-{index:04}"),
+                "r",
+                "hook",
+                "chan",
+                t0 + MAX_RECORDS_PER_ACTOR as u64,
+            );
+        }
+
+        let guard = lock(&store.inner);
+        assert_eq!(guard.agents.len(), MAX_ACTORS);
+        assert_eq!(guard.agents["busy"].records.len(), MAX_RECORDS_PER_ACTOR);
+        assert!(!guard.agents.contains_key("agent-0000"));
+    }
+
+    #[test]
+    fn test_oversized_actor_fails_closed_without_storage() {
+        let store = test_store();
+        let actor = "a".repeat(MAX_ACTOR_ID_BYTES + 1);
+
+        assert!(matches!(
+            store.record_violation(&actor, "reason", "hook", "channel"),
+            ViolationStatus::Disabled { .. }
+        ));
+        assert!(store.is_disabled(&actor));
+        assert!(!lock(&store.inner).agents.contains_key(&actor));
+    }
+
+    #[test]
+    fn test_recording_globally_prunes_expired_empty_actors() {
+        let store = test_store();
+        let t0 = 1_000_000;
+        store.record_violation_at("stale-a", "r", "hook", "chan", t0);
+        store.record_violation_at("stale-b", "r", "hook", "chan", t0);
+        store.record_violation_at("fresh", "r", "hook", "chan", t0 + 600);
+
+        let guard = lock(&store.inner);
+        assert_eq!(guard.agents.len(), 1);
+        assert!(guard.agents.contains_key("fresh"));
+    }
+
+    #[test]
+    fn test_write_behind_uses_immutable_snapshot_and_flushes_on_drop() {
+        let path = unique_test_dir("snapshot").join("violations.json");
+        let config = ViolationStoreConfig {
+            max_violations: 3,
+            disable_duration_secs: 3600,
+            decay_secs: 600,
+        };
+        let store = ViolationStore::new_with_debounce(
+            path.clone(),
+            config.clone(),
+            Duration::from_secs(60),
+        );
+        store.record_violation("agent", "first", "hook", "chan");
+        assert!(
+            !path.exists(),
+            "request path must not persist synchronously"
+        );
+        let snapshot = lock(&store.inner).agents.clone();
+        store.record_violation("agent", "second", "hook", "chan");
+        assert_eq!(snapshot["agent"].records.len(), 1);
+
+        drop(store);
+        let reopened = ViolationStore::new(path, config);
+        assert_eq!(reopened.status("agent"), ViolationStatus::FinalWarning);
     }
 }

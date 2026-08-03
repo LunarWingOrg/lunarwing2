@@ -14,7 +14,7 @@ use crate::db::WorkspaceStore;
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::workspace::{
     DocumentVersion, MemoryChunk, MemoryDocument, RankedResult, SearchConfig, SearchResult,
-    VersionSummary, WorkspaceEntry, fuse_results,
+    VersionSummary, WorkspaceEntry, WorkspaceFileContent, fuse_results,
 };
 
 use chrono::Utc;
@@ -683,6 +683,79 @@ impl WorkspaceStore for LibSqlBackend {
             });
         }
         Ok(entries)
+    }
+
+    async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError> {
+        let conn = self
+            .connect()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: e.to_string(),
+            })?;
+        let agent_id = agent_id.map(|id| id.to_string());
+        let directory = directory.trim_end_matches('/');
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let max_file_bytes = i64::try_from(max_file_bytes).unwrap_or(i64::MAX);
+        let mut rows = conn
+            .query(
+                r#"
+                WITH limited AS (
+                SELECT path, content, updated_at
+                FROM memory_documents
+                WHERE user_id = ?1 AND agent_id IS ?2
+                  AND (?3 = '' OR substr(path, 1, length(?3)) = ?3)
+                  AND instr(substr(path, length(?3) + 1), '/') = 0
+                  AND (?4 = '' OR lower(substr(path, -length(?4))) = lower(?4))
+                ORDER BY path
+                LIMIT ?5
+                )
+                SELECT path, content, updated_at
+                FROM limited
+                WHERE length(CAST(content AS BLOB)) <= ?6
+                ORDER BY path
+                "#,
+                params![
+                    user_id,
+                    agent_id.as_deref(),
+                    prefix,
+                    suffix,
+                    limit,
+                    max_file_bytes
+                ],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Bounded file fetch failed: {e}"),
+            })?;
+
+        let mut documents = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Bounded file fetch query failed: {e}"),
+            })?
+        {
+            documents.push(WorkspaceFileContent {
+                path: get_text(&row, 0),
+                content: get_text(&row, 1),
+                updated_at: get_ts(&row, 2),
+            });
+        }
+        Ok(documents)
     }
 
     async fn list_all_paths(
@@ -1530,6 +1603,85 @@ mod tests {
             .await
             .expect("insert chunk");
         (doc_id, chunk_id)
+    }
+
+    #[tokio::test]
+    async fn bounded_file_fetch_returns_content_ordered_and_scope_isolated() {
+        let (backend, _dir) = setup_backend().await;
+        let conn = backend.connect().await.expect("connect");
+        for (user, path, content) in [
+            ("primary", "lorebooks/b.json", "b"),
+            ("primary", "lorebooks/a.json", "a"),
+            ("primary", "lorebooks/nested/c.json", "nested"),
+            ("secondary", "lorebooks/other.json", "other"),
+        ] {
+            conn.execute(
+                "INSERT INTO memory_documents (id, user_id, path, content, metadata) VALUES (?1, ?2, ?3, ?4, '{}')",
+                params![Uuid::new_v4().to_string(), user, path, content],
+            )
+            .await
+            .expect("insert document");
+        }
+
+        let documents = WorkspaceStore::get_files_limited(
+            &backend,
+            "primary",
+            None,
+            "lorebooks",
+            ".json",
+            1,
+            1024,
+        )
+        .await
+        .expect("bounded fetch");
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].path, "lorebooks/a.json");
+        assert_eq!(documents[0].content, "a");
+    }
+
+    #[tokio::test]
+    async fn bounded_file_fetch_applies_path_limit_before_size_filter() {
+        let (backend, _dir) = setup_backend().await;
+        let conn = backend.connect().await.expect("connect");
+        for (path, content) in [
+            ("lorebooks/a.json", "oversized"),
+            ("lorebooks/b.json", "ok"),
+        ] {
+            conn.execute(
+                "INSERT INTO memory_documents (id, user_id, path, content, metadata) VALUES (?1, 'primary', ?2, ?3, '{}')",
+                params![Uuid::new_v4().to_string(), path, content],
+            )
+            .await
+            .expect("insert document");
+        }
+
+        let first = WorkspaceStore::get_files_limited(
+            &backend,
+            "primary",
+            None,
+            "lorebooks",
+            ".json",
+            1,
+            4,
+        )
+        .await
+        .expect("bounded fetch");
+        assert!(first.is_empty(), "oversized first file must consume limit");
+
+        let both = WorkspaceStore::get_files_limited(
+            &backend,
+            "primary",
+            None,
+            "lorebooks",
+            ".json",
+            2,
+            4,
+        )
+        .await
+        .expect("bounded fetch");
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].path, "lorebooks/b.json");
     }
 
     #[tokio::test]

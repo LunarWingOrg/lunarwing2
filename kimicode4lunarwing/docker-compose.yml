@@ -19,7 +19,8 @@ x-worker-base: &worker-base
     - path: ${EXTRA_ENV_FILE:-.env.secrets}
       required: false
   environment: &worker-env
-    AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:-}
+    # Required bridge bearer credential. KIMI_API_KEY remains optional.
+    AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:?AGENT_AUTH_TOKEN is required}
     LUNARWING_WORKER_ID: ${LUNARWING_WORKER_ID:-worker-kimi-01}
     KIMI_API_KEY: ${KIMI_API_KEY:-}
     WORKSPACE_ROOT: /workspace

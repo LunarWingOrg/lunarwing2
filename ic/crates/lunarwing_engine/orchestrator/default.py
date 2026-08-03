@@ -204,22 +204,31 @@ def is_simple_goal(goal):
     return False
 
 
-def looks_like_final_answer(text):
-    """Reject short roleplay or retry commentary while allowing real prose."""
+def signals_leaked_roleplay_or_meta(text):
+    """Detect strong roleplay or retry/meta leakage in a text response."""
     cleaned = strip_stage_directions(text)
-    if len(cleaned) < 20:
-        return False
-
     lower = cleaned.lower()
     meta_patterns = [
-        "oops", "let me fix", "let me try", "i tried to",
-        "that's not", "that is not", "wrong", "mistake",
+        "oops", "let me fix", "let me try again", "i need to retry",
+        "i should retry", "my mistake", "i made a mistake",
     ]
+    normalized = lower
+    for punctuation in [".", ",", "!", "?", ";", ":", "-"]:
+        normalized = normalized.replace(punctuation, " ")
+    padded = " " + " ".join(normalized.split()) + " "
     for pattern in meta_patterns:
-        if pattern in lower:
-            return False
+        if " " + pattern + " " in padded:
+            return True
 
-    return len(cleaned) >= 80
+    if cleaned:
+        return False
+
+    lower_text = text.lower()
+    roleplay_patterns = [
+        "chortle", "flicks tail", "tail flick", "smirks", "grins",
+        "nods", "sighs", "laughs", "giggles", "purrs", "growls",
+    ]
+    return any(pattern in lower_text for pattern in roleplay_patterns)
 
 
 def format_output(result, max_chars=8000):
@@ -659,17 +668,17 @@ def run_loop(context, goal, actions, state, config):
                 )
                 continue
 
-            # A task response that is only short prose, roleplay, or retry
-            # commentary usually means the model slipped out of CodeAct mode.
+            # Strong roleplay or retry/meta leakage means the model slipped out
+            # of CodeAct mode. Concise plain-text answers are valid completions.
             if (nudge_enabled
                     and consecutive_nudges < max_nudges
                     and not is_simple_goal(goal)
-                    and not looks_like_final_answer(text)):
+                    and signals_leaked_roleplay_or_meta(text)):
                 consecutive_nudges += 1
                 append_message(
                     working_messages,
                     "User",
-                    "Your last response was plain text and did not complete this task.\n"
+                    "Your last response contained roleplay or retry commentary and did not complete this task.\n"
                     "Respond with a ```repl code block containing tool calls or FINAL().\n"
                     "Do not respond with plain text only.",
                 )

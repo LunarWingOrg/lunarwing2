@@ -1,6 +1,7 @@
 # Test Scripts Status Report
 
 **Generated**: 2026-07-08 (v1.1.9 `Kiyome きよめ` pre-release, item #3)
+**Rechecked**: 2026-08-02 (paths, command interfaces, and current worker matrix)
 **Author**: Rarity
 
 This report catalogs every automated testing script in the LunarWing repo, its
@@ -100,10 +101,10 @@ current status, what was fixed, and what remains untested or broken.
 
 | Field | Value |
 |-------|-------|
-| **Status** | ⚠️ Exists but not reviewed in this task (separate test tier) |
+| **Status** | ⚠️ Separate test tier; current scenarios and setup are documented in its README |
 | **Language** | Python (Playwright) |
 | **Purpose** | Browser-based E2E tests against a live instance with a mock LLM |
-| **Docs** | `ic/tests/e2e/CLAUDE.md` |
+| **Docs** | `ic/tests/e2e/README.md` |
 
 ---
 
@@ -111,7 +112,7 @@ current status, what was fixed, and what remains untested or broken.
 
 1. **Chaos scenarios not defined in tests.yaml** — The runner supports `chaos: true` scenarios (run only in `--mode full`), but no chaos scenarios are currently defined. Adding invalid-auth, timeout, and rate-limit chaos scenarios is a future improvement.
 
-2. **No automated CI integration** — The worker test harness (`tests/runner.py`) and release-test.sh are designed for CI but no CI pipeline configuration exists in the repo to run them automatically.
+2. **No automated GitLab CI integration** — The worker test harness (`tests/runner.py`) and `release-test.sh` are designed for CI, but the current `.gitlab/` pipeline does not run either one.
 
 3. **No performance/load testing** — Referenced in TESTING_GUIDE.md but no k6/locust scripts exist.
 
@@ -124,7 +125,7 @@ current status, what was fixed, and what remains untested or broken.
 ## Recommendations for Future Work
 
 - Add chaos scenarios (invalid auth, timeout, resource exhaustion) to `tests.yaml`
-- Set up CI (GitHub Actions) to run `python runner.py --mode smoke` on PRs
+- Add a GitLab CI job to run `python runner.py --mode smoke` on merge requests
 - Add performance/load test scripts (k6 or Locust)
 - Validate the worker harness end-to-end once Docker is available
 - Consider adding a `Makefile` target or `justfile` recipe that runs the full test suite (cargo test + runner.py + release-test.sh + check-boundaries.sh) in one command
