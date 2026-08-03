@@ -8,22 +8,21 @@ rollback. This is the recommended cross-host path for important tenants.
 **Tools:** `ic/scripts/export-tenant.sh` (old host) and `ic/scripts/import-tenant.sh`
 (new host).
 
-**Cross-init:** both scripts work for **systemd and OpenRC**. Export only needs to
-stop two per-tenant units (auto-detecting the init); import delegates all
-init/runtime-specific work to `lunarwing-mt-admin.sh`, which auto-detects systemd vs
-OpenRC and rootless-podman vs rootful-docker. The new host's init system need not
-match the old host's.
+**Cross-init:** both scripts work for **systemd-user and OpenRC**. Export
+delegates complete writer quiescence to mt-admin's `stop-writers` /
+`writers-active` contract; PostgreSQL remains available only for `pg_dump`.
+Import delegates all init/runtime-specific work to mt-admin. The new host's init
+system need not match the old host's.
 
 > **PostgreSQL only.** Machine migration supports the postgres backend; both scripts
 > refuse a libSQL tenant rather than risk a silent empty import (migrate a libSQL DB
 > file by hand if needed).
 
 > **Export is the start of cutover, not a read-only snapshot.** To capture a
-> consistent *and final* picture, `export-tenant.sh` **stops the tenant's daemon +
-> xmpp-bridge** before dumping (PostgreSQL stays up just for `pg_dump`). The agent is
-> down from export until you start it on the new host — plan a per-tenant maintenance
-> window. This is deliberate: it prevents a torn OMEMO store and prevents losing
-> anything written between snapshot and cutover.
+> consistent final picture, `export-tenant.sh` asks mt-admin to stop every writer:
+> daemon, bridges/adapters, optional proxy/WeeChat/DarkIRC/vision services, and
+> selected worker containers. PostgreSQL stays up only for `pg_dump`. Export then
+> verifies all writers are quiesced. Plan a per-tenant maintenance window.
 
 > **Validation status.** A historical plaintext path was live-validated in 2026.
 > The current encrypted path has automated production-script coverage for export,
@@ -39,8 +38,10 @@ match the old host's.
 |------|----------------|----------|
 | Conversations, memory, routines, reflexes, settings, **encrypted secret rows** | PostgreSQL | **Yes** — `db.dump` (`pg_dump -Fc` → `pg_restore`) |
 | **`SECRETS_MASTER_KEY`** | env | **Yes (must match)** — the AES-256-GCM key; without it every encrypted secret row is unrecoverable. Injected + verified verbatim before the daemon starts. |
-| **OMEMO store** (encrypted-XMPP device identity/sessions) | `state/xmpp/` on disk | **Yes** — `state.tar.gz`, snapshotted with the bridge stopped (consistent) |
-| Workspace identity/memory files, WASM tool storage | `state/` on disk | **Yes** — `state.tar.gz` |
+| **OMEMO store** (encrypted-XMPP device identity/sessions) | `state/xmpp/` on disk | **Yes** — `state.tar.gz`, snapshotted after all writers stop |
+| Workspace identity/memory files, WASM tool storage | `state/` on disk | **Yes** — `state.tar.gz`, except the complete `state/darkirc` subtree |
+| Settled DarkIRC contacts, scope ID, ledger/tombstones, compatibility metadata | `state/darkirc/` + `ports.json` | **Yes, same-tenant stopped-source move only** — typed `darkirc-contacts-v1.json` inside the encrypted credential bundle; target ports are freshly rendered |
+| DarkIRC pending secrets, candidates, journals, rollback state, interrupted manifest candidates | `state/darkirc/key-exchange/` | **No** — export fails before quiescence until this state is resolved |
 | `XMPP_JID` + `XMPP_PASSWORD` | env | **Yes** — same account login |
 | XMPP rooms / allowlist / encrypted-rooms / plaintext-fallback, OMEMO device id, `LLM_API_KEY`/`MODEL` | env (+ bridge `*_JSON`) | **Yes** — operator config |
 | `LLM_BASE_URL`, `OPENCODE_BASE_URL`, `KIMI_BASE_URL` | env | **Only when non-loopback/custom** — obsolete host-local proxy URLs are not carried |
@@ -111,9 +112,17 @@ validation.
 
 A current v2 host: PostgreSQL via rootless Podman or rootful Docker, reachability to the
 configured LLM endpoint and the same XMPP server, Gotify when used for escalation, and a
-current `lunarwing-mt-admin.sh` with `restore-tenant` and owner-scope inspection. See
-`docs/ops/MULTITENANCY-PRODUCTION.md` and `docs/guides/MT-ADMIN-QUICKSTART.md`. Ensure
-`jq`, `tar`, `7z`/p7zip, and the container runtime are present on both hosts.
+current `lunarwing-mt-admin.sh` with `restore-tenant`, owner-scope inspection,
+and structured DarkIRC migration. See `docs/ops/MULTITENANCY-PRODUCTION.md` and
+`docs/guides/MT-ADMIN-QUICKSTART.md`. Ensure `jq`, `tar`, `7z`/p7zip, and the
+container runtime are present on both hosts. A DarkIRC migration additionally
+requires the trusted helper and compatibility attestation produced by
+`build-darkirc` on the target.
+
+Import copies/decrypts credentials only under the owner-controlled non-`/tmp`
+`/var/lib/lunarwing-import-stage` directory (override with
+`KAWARIMI_IMPORT_STAGE_ROOT` only to another absolute, symlink-free,
+owner-controlled `0700` path with non-writable ancestors).
 
 > **Rootless-podman + docker-CLI gotcha.** `mt-admin` selects the container runtime by which
 > binary is present: if the `docker` CLI is installed — **even with no running docker
@@ -137,12 +146,15 @@ current `lunarwing-mt-admin.sh` with `restore-tenant` and owner-scope inspection
 ```bash
 sudo ic/scripts/export-tenant.sh <tenant> --dry-run  # preview; no passphrase needed
 sudo ic/scripts/export-tenant.sh <tenant>            # prompts before stopping services
-# stops the tenant's daemon + bridge, dumps the DB, snapshots state, writes
-# /var/lib/lunarwing-migrate/<tenant>-migrate-<stamp>.7z  (AES-256, 0600, root)
+# stops every tenant writer through mt-admin, dumps the DB, snapshots generic
+# state, optionally adds settled darkirc-contacts-v1.json, then writes
+# /var/lib/lunarwing-migrate/<tenant>-migrate-<stamp>.7z (AES-256, 0600, root)
 ```
-The tenant is now stopped on the old host (PostgreSQL left up for the dump; you may
-stop it too). Use `--no-quiesce` only if you've already stopped the daemon+bridge
-yourself.
+The tenant is now stopped on the old host (PostgreSQL remains up for the dump;
+you may stop it too). Use `--no-quiesce` only if `mt-admin writers-active
+<tenant>` already reports stopped. DarkIRC export refuses pending, candidate,
+journal, rollback, interrupted-manifest, or unresolved ledger state before any
+lifecycle mutation.
 
 ### 2. Transfer the bundle securely
 ```bash
@@ -158,11 +170,12 @@ sudo ic/scripts/import-tenant.sh /var/lib/lunarwing-migrate/<tenant>-migrate-<st
      [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] \
      [--with-vision] [--docker-group]   # --dry-run first
 ```
-Runs `add-tenant --no-health` → `build-tenant` → injects the carried secrets (incl.
-`SECRETS_MASTER_KEY`, verified verbatim) → `restore-tenant` (DB) → restores `state/`
-(OMEMO) → `install-wasm` → runs the read-only WeeChat migration preflight → starts the
-daemon. Supported worker flags and `--with-toolchains` are passed through to
-`build-tenant`. `--with-vision` builds the LunarVision sidecar image before start; if
+Runs typed bundle validation → `add-tenant --no-health` → `build-tenant` →
+injects carried secrets (including verbatim-verified `SECRETS_MASTER_KEY`) →
+`restore-tenant` and owner-scope reconciliation → structured DarkIRC
+stage/import when present → restores generic `state/` (never `state/darkirc`) →
+`install-wasm` → WeeChat preflight → optional start. Supported worker flags and
+`--with-toolchains` are passed through to `build-tenant`. `--with-vision` builds the LunarVision sidecar image before start; if
 the bundle contains `manifest-vision.env`, import injects the carried `VL_URL`,
 `VL_MODEL` into the target `vision.env`. Import deliberately ignores auth tokens
 from older bundles so the target-generated `LUNARWING_AUTH_TOKEN` and daemon
@@ -171,6 +184,13 @@ group membership is a target-host choice and is not exported from the source hos
 `--old-stopped` confirms the old side is down (export already stopped it);
 omit `--start` to **stage** without starting, or omit `--old-stopped` to be prompted
 interactively. The double-login confirmation is **not** satisfied by `--yes` alone.
+
+A bundle with structured DarkIRC contacts must keep the exact source tenant name,
+requires `--old-stopped` before provisioning, rejects `--force`, and preserves
+the source `darkirc_scope_id` only when no target registry entry owns it. The
+target helper validates the manifest against its measured DarkIRC binary before
+staging. Import remains stopped by default. If `--start` is explicit, strict
+DarkIRC daemon/adapter health must pass; otherwise import stops the target again.
 
 The WeeChat preflight checks the restored tenant env against the target port
 registry and installed capabilities before cutover. A preflight FAIL blocks import
