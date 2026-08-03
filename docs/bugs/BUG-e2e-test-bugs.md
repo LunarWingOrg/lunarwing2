@@ -1,7 +1,7 @@
 # E2E test bugs and retired fixtures
 
 > **Overall status: PARTIALLY-FIXED / one item UNVERIFIED (verified against
-> current source on 2026-07-28).** The tool-execution failure is resolved in
+> current source on 2026-08-03).** The tool-execution failure is resolved in
 > the current test/code paths. The old Gmail OAuth fixture was retired. The
 > bootstrap greeting production path is fixed, but both E2E assertions are
 > currently `#[ignore]`'d due to a harness timing race. The clipboard test
@@ -34,15 +34,15 @@ race; the current explicit gateway broadcast resolves that divergence.
 ### Current path and evidence
 
 - `Agent::run` takes `Arc<Self>` and persists the greeting before channel start
-  (`ic/src/agent/agent_loop.rs:520-548`).
+  (`ic/src/agent/agent_loop.rs:550-579`).
 - After startup it registers the gateway thread, constructs an
   `OutgoingResponse`, sets `thread_id`, and broadcasts to the gateway
-  (`ic/src/agent/agent_loop.rs:968-990`).
+  (`ic/src/agent/agent_loop.rs:1032-1054`).
 - `TestRigBuilder::with_bootstrap()` preserves the pending flag and installs a
   gateway-named test channel
-  (`ic/tests/support/test_rig.rs:552-553,717-720,910-912`).
+  (`ic/tests/support/test_rig.rs:559-563,726-730,920-927`).
 - The two tests remain at `ic/tests/e2e_advanced_traces.rs:760-786` and
-  `:804-870`, but both carry `#[ignore = "known-deferred: bootstrap greeting
+  `:804-969`, but both carry `#[ignore = "known-deferred: bootstrap greeting
   broadcast races with test channel readiness; see
   docs/proposals/CARGO_TESTS_FIX.md"]` (`:761`, `:805`). The greeting text
   source is `ic/src/workspace/seeds/GREETING.md`.
@@ -63,7 +63,8 @@ event with an in-memory `clipboardData` object
 (`test_chat.py:95-109`); it does not call `navigator.clipboard` or request
 browser clipboard permissions. The production handler only requires a selected
 chat range and event clipboard data, then writes `text/plain`
-(`ic/src/channels/web/static/app.js:832-846`).
+(`ic/src/channels/web/static/app.js:972-986`; it also validates that both
+selection endpoints lie inside `#chat-messages`).
 
 Consequently, the old claim that setup fails because headless Chromium lacks
 clipboard permissions is not supported by the current source. No skip marker or
@@ -105,8 +106,8 @@ Current OAuth coverage uses mock/MCP and UI fixtures instead:
   exchange into the relevant server fixtures.
 - `ic/tests/e2e/scenarios/test_mcp_auth_flow.py` covers the current mocked auth
   flow.
-- `ic/tests/e2e/scenarios/test_extensions.py:633-663,743-750,1189-1215`
-  covers UI OAuth cards and rejects unsafe URL schemes.
+- `ic/tests/e2e/scenarios/test_extensions.py:561-596,747-780,1180-1201`
+  covers UI OAuth cards/popups, and `:1303-1331` rejects unsafe URL schemes.
 
 The historical proxy/download failure and missing `wasm-tools` explanation is
 preserved here for provenance, but there is no current `test_oauth_url_parameters.py`
@@ -162,5 +163,7 @@ current chat/MCP/extension/tool scenarios. The current Python environment has
 neither importable `pytest` nor `playwright`, so collection did not begin and no
 test body, browser, daemon, build, or Cargo command ran. The clipboard status
 remains unverified because this environment does not provide the E2E runtime.
-Re-verified on 2026-07-28; the bootstrap tests' `#[ignore]` markers were
-confirmed against `ic/tests/e2e_advanced_traces.rs`.
+Re-verified on 2026-08-03; the bootstrap tests' `#[ignore]` markers were
+re-confirmed against `ic/tests/e2e_advanced_traces.rs`, and line references
+were refreshed after post-2026-07-28 churn in `agent_loop.rs`, `app.js`, and
+`test_rig.rs`.
