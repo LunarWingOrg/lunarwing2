@@ -537,6 +537,7 @@ Commands:
 
   start-tenant <name>             Start all services for a tenant
   stop-tenant <name>              Stop all services for a tenant
+  stop-tenant-for-upgrade <name>  Verify settled DarkIRC state and stop atomically
   restart-tenant <name>           Stop then start
   start-pg <name>                 Start only the tenant's PostgreSQL (daemon stays down)
   stop-pg <name>                  Stop only the tenant's PostgreSQL
@@ -9386,6 +9387,32 @@ stop_tenant() {
     || die "tenant '$name' stopped, but legacy Nanocode retirement failed"
 }
 
+# External upgrade wrappers use this boundary so migration readiness cannot race
+# another DarkIRC writer between the check and the completed tenant stop.
+stop_tenant_for_upgrade() {
+  local name="$1" scope_id result=0 writer_lock_owned=false
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+
+  if tenant_darkirc_enabled "$name"; then
+    if [[ "$DARKIRC_WRITER_LOCK_HELD" != true ]]; then
+      darkirc_writer_lock "$name"
+      writer_lock_owned=true
+    fi
+    scope_id="$(darkirc_scope_id "$name")"
+    validate_darkirc_scope_id "$scope_id"
+    run_darkirc_key_helper "$name" migration-ready \
+      --tenant "$name" --scope-id "$scope_id" --json >/dev/null \
+      || die "DarkIRC migration state is not settled; refusing upgrade"
+  fi
+
+  stop_tenant "$name" || result=$?
+  if [[ "$writer_lock_owned" == true ]]; then
+    darkirc_writer_unlock
+  fi
+  return "$result"
+}
+
 restart_tenant() {
   local name="$1"
   stop_tenant "$name"
@@ -10268,6 +10295,14 @@ main() {
       [[ -n "${1:-}" ]] || die "usage: stop-tenant <name>"
       _lifecycle_name="$(sanitize_name "$1")"
       with_tenant_lifecycle_lock "$_lifecycle_name" stop_tenant "$_lifecycle_name"
+      ;;
+
+    stop-tenant-for-upgrade)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: stop-tenant-for-upgrade <name>"
+      ports_registry_init
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" stop_tenant_for_upgrade "$_lifecycle_name"
       ;;
 
     restart-tenant)
