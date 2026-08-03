@@ -142,7 +142,7 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 | Diagnostics | `lunarwing doctor` validates config and reports transport, enabled state, and stdio command availability. |
 | Protocol surface | Tool discovery and tool calls are implemented. General MCP resources, prompts, subscriptions, sampling, elicitation, and WebSocket transport are not implemented. |
 | Runtime placement | Host-local and remote MCP are implemented. Generic worker-local MCP, MCP-over-WASM, and a dedicated shared MCP gateway are not implemented. |
-| Reliability | Explicit activate/deactivate/update/remove cleanup is implemented. Automatic child crash recovery and per-server lifecycle timeout controls are not implemented. |
+| Reliability | Explicit activate/deactivate/update/remove cleanup and whole-runtime host-local stdio crash recovery are implemented. Per-server lifecycle timeout controls are not implemented. |
 
 #### Host-local stdio MCP servers
 
@@ -191,6 +191,15 @@ values remain visible to the trusted child and potentially to other processes wi
 the same OS privileges; use WASM tools when host-side credential injection is
 required. When `env_secrets` is non-empty, LunarWing suppresses raw MCP child
 stderr content to avoid copying an accidentally printed secret into daemon logs.
+
+If an active managed stdio child exits unexpectedly, `ExtensionManager` removes its
+dead wrappers, re-reads the owner's enabled config, resolves secret references again,
+starts and initializes a fresh client, rediscovers tools, and atomically registers the
+replacement wrappers. Failed recovery retries with bounded exponential backoff and is
+reported as recovering, not active. Disable, update, remove, and application shutdown
+serialize with recovery so they cannot resurrect the old runtime. This supervision
+does not install missing commands or packages; initial activation still fails
+explicitly when the configured executable or required secret is unavailable.
 
 MCP servers can be deactivated without uninstalling them. Deactivation unloads
 only that server's registered tools, closes its transport and session, stops a
