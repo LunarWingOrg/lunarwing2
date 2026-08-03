@@ -1,0 +1,11 @@
+# Keep normal development and test artifacts small while retaining line-number backtraces.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+# Opt into full variable-level debug information only when an interactive debugger needs it.
+[profile.full-debug]
+inherits = "dev"
+debug = "full"

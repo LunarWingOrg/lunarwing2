@@ -89,8 +89,6 @@ BUILD_PROFILE="${LUNARWING_MT_PROFILE:-release}"  # release | debug
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-LUNARWING_ROOT="$(cd -- "${REPO_ROOT}/.." && pwd)"
 MT_ADMIN="${SCRIPT_DIR}/lunarwing-mt-admin.sh"
 ENV_FILE="${HOME}/.lunarwing-mt.env"
 HEALTH_ENV="/etc/lunarwing/health.env"
@@ -183,6 +181,8 @@ EOF
 
 # Run mt-admin with all env vars preserved.
 mt() {
+  # Runtime-generated exports configure mt-admin; no static source path exists.
+  # shellcheck disable=SC1090
   source "$ENV_FILE"
   sudo -E "$MT_ADMIN" "$@"
 }
@@ -192,6 +192,8 @@ mt() {
 mt_tmux() {
   local session="$1"; shift
   local log="${LOG_DIR}/${session}.log"
+  # Runtime-generated exports configure tmux commands; no static source path exists.
+  # shellcheck disable=SC1090
   source "$ENV_FILE"
   tmux kill-session -t "$session" 2>/dev/null || true
   tmux new-session -d -s "$session" \
@@ -270,6 +272,8 @@ phase_1() {
 phase_2() {
   say "══ Phase 2: Build binaries, workers, darkirc, vision, WASM ══"
 
+  # Runtime-generated exports configure this phase; no static source path exists.
+  # shellcheck disable=SC1090
   source "$ENV_FILE"
 
   local -a build_flags=()

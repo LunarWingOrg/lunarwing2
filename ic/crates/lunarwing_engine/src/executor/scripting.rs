@@ -830,43 +830,26 @@ pub async fn execute_code_with_skills(
 /// CodeAct work abort-on-drop so every early return and outer cancellation
 /// stops child tool/LLM work instead of leaving side effects running.
 struct AbortOnDropJoinHandle<T> {
-    handle: Option<tokio::task::JoinHandle<T>>,
+    handle: tokio::task::JoinHandle<T>,
 }
 
 impl<T> AbortOnDropJoinHandle<T> {
     fn new(handle: tokio::task::JoinHandle<T>) -> Self {
-        Self {
-            handle: Some(handle),
-        }
+        Self { handle }
     }
 
     fn abort_handle(&self) -> tokio::task::AbortHandle {
-        // SAFETY: the handle is cleared only after `join` has completed, which
-        // consumes this wrapper and prevents any later call to this method.
-        self.handle
-            .as_ref()
-            .expect("abort-on-drop handle is present until join completes")
-            .abort_handle()
+        self.handle.abort_handle()
     }
 
     async fn join(mut self) -> Result<T, tokio::task::JoinError> {
-        // SAFETY: every wrapper is constructed with one handle, and `join`
-        // consumes the wrapper, so no earlier operation can clear it.
-        let result = self
-            .handle
-            .as_mut()
-            .expect("abort-on-drop handle is present until join completes")
-            .await;
-        self.handle = None;
-        result
+        (&mut self.handle).await
     }
 }
 
 impl<T> Drop for AbortOnDropJoinHandle<T> {
     fn drop(&mut self) {
-        if let Some(handle) = &self.handle {
-            handle.abort();
-        }
+        self.handle.abort();
     }
 }
 

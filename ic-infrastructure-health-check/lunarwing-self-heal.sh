@@ -95,7 +95,8 @@ REPORT_FILE=""
 timestamp() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
 log_action() {
-    local line="$(timestamp) $*"
+    local line
+    line="$(timestamp) $*"
     mkdir -p "$(dirname "$SELF_HEAL_LOG")"
     printf '%s\n' "$line" >> "$SELF_HEAL_LOG"
     printf '%s\n' "$line" >&2

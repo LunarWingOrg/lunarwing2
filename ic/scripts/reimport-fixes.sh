@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-#change these obviously
-LIBSQL_DB="/home/cmc/kageho_old/.ironclaw/ironclaw.db"
-EXPORT_DIR="/tmp/kageho-export"
+# change these obviously
 PG_PORT=10023
 PG_USER=lunarwing
 PG_DB=lunarwing

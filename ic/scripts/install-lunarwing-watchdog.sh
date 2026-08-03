@@ -22,7 +22,6 @@ LAUNCHD_SUPPORT_DIR="${HOME}/Library/Application Support/lunarwing"
 LAUNCHD_WATCHDOG_LABEL="com.lunarwing.watchdog"
 LAUNCHD_WRAPPER="${LAUNCHD_SUPPORT_DIR}/lunarwing-watchdog-launchd"
 LAUNCHD_PLIST="${LAUNCHD_AGENTS_DIR}/${LAUNCHD_WATCHDOG_LABEL}.plist"
-LAUNCHD_WATCHDOG_LOG="${HOME}/Library/Logs/lunarwing-watchdog.log"
 LAUNCHD_WATCHDOG_CONFD="${LAUNCHD_SUPPORT_DIR}/watchdog.conf"
 
 say() {
@@ -509,4 +508,3 @@ case "$detected_manager" in
     die "unsupported service manager"
     ;;
 esac
-

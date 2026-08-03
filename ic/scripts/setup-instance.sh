@@ -192,7 +192,8 @@ copy_workspace_template() {
 
   local source_file
   for source_file in "$TEMPLATE_DIR"/*.md; do
-    local target_file="$target_dir/$(basename "$source_file")"
+    local target_file
+    target_file="$target_dir/$(basename "$source_file")"
     if [[ "$FORCE" -eq 1 || ! -f "$target_file" ]]; then
       install -m 0644 "$source_file" "$target_file"
     fi

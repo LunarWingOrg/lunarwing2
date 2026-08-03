@@ -35,9 +35,6 @@ HTTP_PORT="${LUNARWING_TEST_HTTP_PORT:-9098}"
 # XMPP bridge
 BRIDGE_BIND="${LUNARWING_TEST_BRIDGE_BIND:-127.0.0.1:8787}"
 
-# Weechat relay (future)
-WEECHAT_PORT="${LUNARWING_TEST_WEECHAT_PORT:-9001}"
-
 # Gotify
 GOTIFY_URL="${LUNARWING_TEST_GOTIFY_URL:-https://gotify.darkc.sobe.world}"
 GOTIFY_TITLE="${LUNARWING_TEST_GOTIFY_TITLE:-}"
@@ -2647,4 +2644,3 @@ main() {
 }
 
 main "$@"
-

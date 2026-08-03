@@ -33,7 +33,8 @@ check_provider() {
     local last_error=""
     local exit_code=0
     
-    local start=$(date +%s%N)
+    local start
+    start=$(date +%s%N)
     
     case $provider in
         "openrouter")
@@ -109,7 +110,8 @@ check_provider() {
             ;;
     esac
     
-    local end=$(date +%s%N)
+    local end
+    end=$(date +%s%N)
     latency_ms=$(( (end - start) / 1000000 ))
     
     # Check latency thresholds
@@ -141,8 +143,6 @@ for provider_spec in \
 do
     IFS='|' read -r pname pendpoint pkey <<< "$provider_spec"
     result=$(check_provider "$pname" "$pendpoint" "$pkey") || true
-    rc=${PIPESTATUS[0]:-0}
-    
     # Extract exit_code from the JSON result
     prov_exit=$(echo "$result" | jq -r '.exit_code // 0' 2>/dev/null || echo 0)
     
