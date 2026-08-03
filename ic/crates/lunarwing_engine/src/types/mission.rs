@@ -52,7 +52,7 @@ pub enum MissionStatus {
 ///
 /// The engine owns cron scheduling and manual fire behavior. The bridge/host
 /// connects external webhook and event sources to the matching mission.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MissionCadence {
     /// Spawn on a cron schedule (e.g., "0 */6 * * *" for every 6 hours).
     Cron {

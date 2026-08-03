@@ -132,6 +132,9 @@ Key characteristics:
 - **Resource limits**: user CodeAct blocks default to a 30s timeout, 64MB memory,
   and 1M allocations. The orchestrator VM has a separate 600s/128MB/5M budget.
   Monty execution is wrapped in `catch_unwind` for panic safety.
+- **Action limit**: each model step can attempt at most 50 tool actions. The cap
+  applies independently to structured batches, CodeAct blocks, and the combined
+  single/parallel action host calls made by the Python orchestrator.
 
 ### Python Orchestrator
 
@@ -246,6 +249,10 @@ boundaries.
 `MissionManager::ensure_learning_missions()` provisions three baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, two additional skill-improvement
 missions. They are event-driven; not every mission runs after thread completion.
+These system-managed missions are recurring: one successful event run cannot
+mark them complete. Startup reconciliation repairs older terminal records and
+refreshes their compiled prompt, cadence, success criteria, and daily budget
+while preserving operator pauses and mission history.
 Event payloads are seeded into the mission thread's initial persisted state as
 `state["trigger_payload"]` before execution. Terminal thread events are published
 after final thread persistence so listeners can load complete source state.
@@ -256,13 +263,17 @@ another user's mission.
 
 ### Error Diagnosis (`self-improvement`)
 
-- **Trigger**: fires when a thread completes with trace issues
+- **Trigger**: fires when a thread completes with actionable Warning/Error trace
+  issues. Info observations remain trace telemetry and do not consume mission
+  budget.
 - **Action**: diagnoses root cause and applies prompt overlays or orchestrator patches
 
 ### Skill Extraction (`skill-extraction`)
 
 - **Trigger**: fires when a thread succeeds with 5+ steps and 3+ tool actions
-- **Action**: extracts reusable skills with activation metadata, CodeAct code snippets, and domain tags
+- **Action**: extracts reusable skills with activation metadata, evidence-backed
+  optional CodeAct snippets, and domain tags. The bounded trigger summary cannot
+  be expanded into invented commands, arguments, outputs, regexes, or snippets.
 - **Output**: stored as `DocType::Skill` MemoryDoc
 
 ### Conversation Insights (`conversation-insights`)
@@ -278,8 +289,8 @@ another user's mission.
 
 ### Skill Maintenance (`skill-maintenance`, feature-gated)
 
-- **Trigger**: `thread_completed_with_issues` events when
-  `SKILL_SELF_IMPROVEMENT=true`
+- **Trigger**: dedicated `skill_maintenance_due` events, emitted only when at
+  least one prune candidate exists and `SKILL_SELF_IMPROVEMENT=true`
 - **Action**: identifies confidently dead or quarantined skills and stages
   user-approved prune/archive proposals
 

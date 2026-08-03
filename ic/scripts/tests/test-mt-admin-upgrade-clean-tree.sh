@@ -126,6 +126,7 @@ export BUILD_LOCK="$fixture/build.lock"
 move_ref_on_stop=false
 tenant_lw_root() { printf '%s\n' "$fixture_repo"; }
 tenant_repo() { printf '%s/ic\n' "$fixture_repo"; }
+with_tenant_lifecycle_lock() { shift; "$@"; }
 tenant_worker_enabled() { [[ "$1" == "fixture" && ( "$2" == "opencode" || "$2" == "kimi" ) ]]; }
 stop_tenant() {
   : >"$stopped_marker"

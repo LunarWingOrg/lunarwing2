@@ -54,6 +54,7 @@ AUTO_YES=false
 FORCE=false
 PRUNE_OLD_ROOT=false
 TENANT=""
+ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -90,7 +91,7 @@ $SKIP_BUILD && ! $DRY_RUN && die "--skip-build is unsafe for live upgrades; fres
 command -v jq >/dev/null 2>&1 || die "jq required"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-MT="$SCRIPT_DIR/lunarwing-mt-admin.sh"
+MT="${LUNARWING_MT_ADMIN:-$SCRIPT_DIR/lunarwing-mt-admin.sh}"
 PF="$SCRIPT_DIR/upgrade-preflight.sh"
 PORTS_REGISTRY="${LUNARWING_PORTS_REGISTRY:-/etc/lunarwing/ports.json}"
 BACKUP_DIR="${LUNARWING_MT_BACKUP_DIR:-/var/lib/lunarwing-backups}"
@@ -201,6 +202,13 @@ if $PRUNE_OLD_ROOT; then
   exit 0
 fi
 
+# Re-enter through mt-admin so one upgrade, lifecycle, and DarkIRC writer lock
+# spans backup, stop, rebuild, reprovision, restore, and final start.
+if [[ "${LUNARWING_MT_UPGRADE_BOUNDARY_TENANT:-}" != "$TENANT" ]]; then
+  exec "$MT" upgrade-wrapper-boundary "$TENANT" "${ORIGINAL_ARGS[@]}"
+fi
+"$MT" validate-upgrade-wrapper-boundary "$TENANT"
+
 MODE="rootless-adopt"; $KEEP_ROOTFUL && MODE="keep-rootful"
 # This tool backs up the root-store DB (step 1) and restores into the fresh
 # rootless DB (step 5), so the rootless flip is intended: acknowledge mt-admin's
@@ -264,7 +272,7 @@ note "prior clone rev recorded for rollback: $PRIOR_REV"
 
 # ---- 2. STOP the OLD model (daemon + old PG); old container/volume preserved --
 banner "2/8  Stop tenant (old model)"
-run mt_rootful stop-tenant "$TENANT"
+run mt_rootful stop-tenant-for-upgrade "$TENANT"
 
 # ---- 3. UPDATE the tenant clone + REBUILD (mt-admin does NOT auto-update) -----
 banner "3/8  Update clone + build"
@@ -343,7 +351,7 @@ fi
 
 # ---- 8. VERIFY ---------------------------------------------------------------
 banner "8/8  Verify"
-run mt status-tenant "$TENANT"
+run mt status "$TENANT"
 if [[ "$KEEP_ROOTFUL" == false ]] && ! $DRY_RUN; then
   vrows="$(rootless_data_rows "$TENANT")"   # row count, not table count (schema exists regardless of restore)
   if [[ "${vrows:-0}" -gt 0 ]]; then note "rootless DB holds $vrows conversation rows — restored data is present."

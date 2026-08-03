@@ -3164,11 +3164,28 @@ function renderMcpServerCard(entry, installedExt) {
     card.appendChild(endpoint);
   }
 
+  if (installedExt && installedExt.activation_error) {
+    var errorDiv = document.createElement('div');
+    errorDiv.className = 'ext-error';
+    errorDiv.textContent = installedExt.activation_error;
+    card.appendChild(errorDiv);
+  }
+
   var actions = document.createElement('div');
   actions.className = 'ext-actions';
 
   if (installedExt) {
-    if (!installedExt.active) {
+    if (installedExt.recovering) {
+      var recoveringLabel = document.createElement('span');
+      recoveringLabel.className = 'ext-active-label inactive';
+      recoveringLabel.textContent = I18n.t('ext.recovering');
+      actions.appendChild(recoveringLabel);
+      var recoveringDeactivateBtn = document.createElement('button');
+      recoveringDeactivateBtn.className = 'btn-ext deactivate';
+      recoveringDeactivateBtn.textContent = I18n.t('common.deactivate');
+      recoveringDeactivateBtn.addEventListener('click', function() { deactivateExtension(installedExt.name); });
+      actions.appendChild(recoveringDeactivateBtn);
+    } else if (!installedExt.active) {
       var inactiveLabel = document.createElement('span');
       inactiveLabel.className = 'ext-active-label inactive';
       inactiveLabel.textContent = installedExt.enabled === false
@@ -3316,8 +3333,8 @@ function renderExtensionCard(ext) {
     card.appendChild(tools);
   }
 
-  // Show activation error for WASM channels
-  if (ext.kind === 'wasm_channel' && ext.activation_error) {
+  // Show terminal activation/recovery errors.
+  if ((ext.kind === 'wasm_channel' || ext.kind === 'mcp_server') && ext.activation_error) {
     const errorDiv = document.createElement('div');
     errorDiv.className = 'ext-error';
     errorDiv.textContent = ext.activation_error;
@@ -3357,16 +3374,18 @@ function renderExtensionCard(ext) {
     // WASM tools / MCP servers
     const activeLabel = document.createElement('span');
     activeLabel.className = 'ext-active-label';
-    activeLabel.textContent = ext.active
-      ? I18n.t('ext.active')
-      : (ext.kind === 'mcp_server' && ext.enabled === false
-        ? I18n.t('ext.inactive')
-        : I18n.t('status.installed'));
+    activeLabel.textContent = ext.recovering
+      ? I18n.t('ext.recovering')
+      : (ext.active
+        ? I18n.t('ext.active')
+        : (ext.kind === 'mcp_server' && ext.enabled === false
+          ? I18n.t('ext.inactive')
+          : I18n.t('status.installed')));
     if (!ext.active) activeLabel.classList.add('inactive');
     actions.appendChild(activeLabel);
 
     // MCP servers and channel-relay extensions may be installed but inactive — show Activate button
-    if ((ext.kind === 'mcp_server' || ext.kind === 'channel_relay') && !ext.active) {
+    if ((ext.kind === 'mcp_server' || ext.kind === 'channel_relay') && !ext.active && !ext.recovering) {
       const activateBtn = document.createElement('button');
       activateBtn.className = 'btn-ext activate';
       activateBtn.textContent = I18n.t('common.activate');
@@ -3374,7 +3393,7 @@ function renderExtensionCard(ext) {
       actions.appendChild(activateBtn);
     }
 
-    if (ext.kind === 'mcp_server' && ext.active) {
+    if (ext.kind === 'mcp_server' && (ext.active || ext.recovering)) {
       const deactivateBtn = document.createElement('button');
       deactivateBtn.className = 'btn-ext deactivate';
       deactivateBtn.textContent = I18n.t('common.deactivate');

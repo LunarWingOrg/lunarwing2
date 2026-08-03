@@ -31,7 +31,7 @@ impl Tool for SkillListTool {
     }
 
     fn description(&self) -> &str {
-        "List all loaded skills with their trust level, source, and activation keywords."
+        "List registry-loaded skills with their trust level, source, and activation keywords. Engine V2 extracted skills are stored and selected separately as MemoryDocs."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -101,6 +101,8 @@ impl Tool for SkillListTool {
         let output = serde_json::json!({
             "skills": skills,
             "count": skills.len(),
+            "scope": "skill_registry",
+            "engine_v2_note": "This count excludes Engine V2 extracted skills stored as MemoryDocs.",
         });
 
         Ok(ToolOutput::success(output, start.elapsed()))

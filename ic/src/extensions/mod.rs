@@ -510,6 +510,9 @@ pub struct InstalledExtension {
     pub command: Option<String>,
     pub authenticated: bool,
     pub active: bool,
+    /// MCP runtime is rebuilding or waiting for an automatic retry.
+    #[serde(default)]
+    pub recovering: bool,
     /// Desired startup state for MCP servers. `None` for other extension kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -525,7 +528,7 @@ pub struct InstalledExtension {
     /// Whether this extension is installed locally (false = available in registry but not installed).
     #[serde(default = "default_true")]
     pub installed: bool,
-    /// Last activation error for WASM channels.
+    /// Last activation or terminal recovery error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activation_error: Option<String>,
     /// Extension version from capabilities file (semver).
@@ -975,6 +978,7 @@ mod tests {
             command: None,
             authenticated: true,
             active: true,
+            recovering: false,
             enabled: None,
             tools: vec!["send_email".to_string(), "read_inbox".to_string()],
             needs_setup: true,

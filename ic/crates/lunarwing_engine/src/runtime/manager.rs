@@ -349,6 +349,18 @@ impl ThreadManager {
             thread.capability_leases.push(lease.id);
         }
 
+        // Tool registries can gain actions after engine construction (notably
+        // recovered MCP servers). Lease every action the executor advertises
+        // now, so model-visible actions are executable by this new thread.
+        if let Err(error) = self.refresh_live_action_leases(&mut thread).await {
+            self.revoke_lease_ids(
+                &thread.capability_leases,
+                "thread spawn failed while refreshing live tool leases",
+            )
+            .await;
+            return Err(error);
+        }
+
         // Add conversation history from prior threads (for context continuity)
         for msg in initial_messages {
             thread.messages.push(msg);
@@ -495,6 +507,13 @@ impl ThreadManager {
         &self,
         thread: &mut Thread,
     ) -> Result<Vec<LeaseId>, EngineError> {
+        self.refresh_live_action_leases(thread).await
+    }
+
+    async fn refresh_live_action_leases(
+        &self,
+        thread: &mut Thread,
+    ) -> Result<Vec<LeaseId>, EngineError> {
         let active_leases = self.leases.active_for_thread(thread.id).await;
         let available_actions = self.effects.available_actions(&active_leases).await?;
         let mut missing_actions = Vec::new();
@@ -514,8 +533,8 @@ impl ThreadManager {
 
         let mut resumed_capabilities = CapabilityRegistry::new();
         resumed_capabilities.register(Capability {
-            name: "resumed_tools".into(),
-            description: "Tools activated while the thread was waiting".into(),
+            name: "live_tools".into(),
+            description: "Tools activated after engine initialization".into(),
             actions: missing_actions,
             knowledge: Vec::new(),
             policies: Vec::new(),
@@ -1600,6 +1619,51 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, ThreadState::Done);
+    }
+
+    #[tokio::test]
+    async fn spawn_leases_live_executor_actions_missing_from_registry() {
+        let store = Arc::new(MockStore::new());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let manager = ThreadManager::new(
+            Arc::new(ControlledLlm {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            Arc::new(ListingEffects),
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        );
+
+        let thread_id = manager
+            .spawn_thread(
+                "use recovered tool",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("thread should start");
+
+        let lease = manager
+            .leases
+            .find_lease_for_action(thread_id, "resumed_tool")
+            .await;
+        assert!(
+            lease.is_some(),
+            "model-advertised live tool must be leaseable"
+        );
+
+        release.notify_one();
+        manager.join_thread(thread_id).await.unwrap();
     }
 
     #[tokio::test]

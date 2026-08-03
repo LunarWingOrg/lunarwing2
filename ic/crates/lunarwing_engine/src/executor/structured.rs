@@ -78,6 +78,34 @@ pub async fn execute_action_calls(
     // the entire batch immediately. Denied/no-lease calls become error results.
 
     for (idx, call) in calls.iter().enumerate() {
+        if idx >= super::MAX_ACTIONS_PER_STEP {
+            let error = format!(
+                "Tool call limit reached ({} per step). Break your task into multiple steps.",
+                super::MAX_ACTIONS_PER_STEP
+            );
+            preflight_results.push(PreflightOutcome::Error {
+                index: idx,
+                result: ActionResult {
+                    call_id: call.id.clone(),
+                    action_name: call.action_name.clone(),
+                    output: serde_json::json!({"error": &error}),
+                    is_error: true,
+                    duration: std::time::Duration::ZERO,
+                },
+                event: EventKind::ActionFailed {
+                    step_id: context.step_id,
+                    action_name: call.action_name.clone(),
+                    call_id: call.id.clone(),
+                    error,
+                    params_summary: crate::types::event::summarize_params(
+                        &call.action_name,
+                        &call.parameters,
+                    ),
+                },
+            });
+            continue;
+        }
+
         // 1. Find the lease for this action (read-only lookup for policy check)
         let lease = match leases
             .find_lease_for_action(thread.id, &call.action_name)
@@ -620,6 +648,60 @@ mod tests {
     }
 
     // ── call_id propagation tests ────────────────────────────
+
+    #[tokio::test]
+    async fn structured_step_limits_calls_after_first_fifty() {
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let effects: Arc<dyn EffectExecutor> =
+            Arc::new(MockEffects::new(vec![test_action("echo")], vec![]));
+        let leases = LeaseManager::new();
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, None)
+            .await
+            .unwrap();
+        let calls: Vec<ActionCall> = (0..=crate::executor::MAX_ACTIONS_PER_STEP)
+            .map(|index| ActionCall {
+                id: format!("call_{index}"),
+                action_name: "echo".into(),
+                parameters: serde_json::json!({}),
+            })
+            .collect();
+
+        let result = execute_action_calls(
+            &calls,
+            &thread,
+            &effects,
+            &leases,
+            &PolicyEngine::new(),
+            &make_exec_context(&thread),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.results.len(), calls.len());
+        assert_eq!(
+            result
+                .results
+                .iter()
+                .filter(|result| !result.is_error)
+                .count(),
+            crate::executor::MAX_ACTIONS_PER_STEP
+        );
+        assert!(result.results.last().is_some_and(|result| {
+            result.is_error
+                && result
+                    .output
+                    .to_string()
+                    .contains("Tool call limit reached")
+        }));
+    }
 
     #[tokio::test]
     async fn call_id_preserved_on_successful_execution() {

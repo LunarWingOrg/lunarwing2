@@ -211,6 +211,57 @@ impl ToolRegistry {
         is_same
     }
 
+    /// Atomically replace one runtime's exact tool instances.
+    ///
+    /// The replacement is rejected without changing the registry when a new name
+    /// is duplicated, protected, or currently owned by an unrelated tool. Old
+    /// entries that another runtime already replaced are left untouched.
+    pub async fn replace_runtime_tools(
+        &self,
+        old: &[Arc<dyn Tool>],
+        replacements: Vec<Arc<dyn Tool>>,
+    ) -> Result<(), Vec<String>> {
+        let old_by_name: HashMap<&str, &Arc<dyn Tool>> =
+            old.iter().map(|tool| (tool.name(), tool)).collect();
+        let builtin_names = self.builtin_names.read().await.clone();
+        let mut replacement_names = std::collections::HashSet::new();
+        let mut tools = self.tools.write().await;
+        let mut conflicts = Vec::new();
+
+        for replacement in &replacements {
+            let name = replacement.name();
+            if !replacement_names.insert(name.to_string())
+                || PROTECTED_TOOL_NAMES.contains(&name) && builtin_names.contains(name)
+                || tools.get(name).is_some_and(|registered| {
+                    old_by_name
+                        .get(name)
+                        .is_none_or(|expected| !Arc::ptr_eq(registered, expected))
+                })
+            {
+                conflicts.push(name.to_string());
+            }
+        }
+
+        if !conflicts.is_empty() {
+            conflicts.sort_unstable();
+            conflicts.dedup();
+            return Err(conflicts);
+        }
+
+        for old_tool in old {
+            if tools
+                .get(old_tool.name())
+                .is_some_and(|registered| Arc::ptr_eq(registered, old_tool))
+            {
+                tools.remove(old_tool.name());
+            }
+        }
+        for replacement in replacements {
+            tools.insert(replacement.name().to_string(), replacement);
+        }
+        Ok(())
+    }
+
     /// Resolve a tool name, accepting legacy and provider-safe aliases.
     ///
     /// Returns the name actually stored in the registry.
@@ -846,8 +897,14 @@ impl ToolRegistry {
         }
         wrapper = wrapper.with_ssh_bridge(reg.ssh_bridge);
 
-        // Register the tool
-        self.register(Arc::new(wrapper)).await;
+        // Dynamic runtimes never replace another runtime's tool implicitly.
+        // Updates must first remove their own exact prior registration.
+        if !self.register_if_vacant(Arc::new(wrapper)).await {
+            return Err(WasmError::ConfigError(format!(
+                "tool name '{}' is already registered",
+                reg.name
+            )));
+        }
 
         // Add credential mappings to the shared registry (for HTTP tool injection)
         if let Some(cr) = &self.credential_registry
@@ -1073,6 +1130,52 @@ mod tests {
             .await
             .expect("replacement remains registered");
         assert!(Arc::ptr_eq(&registered, &replacement));
+    }
+
+    #[tokio::test]
+    async fn replace_runtime_tools_swaps_all_entries_atomically() {
+        let registry = ToolRegistry::new();
+        let old_a: Arc<dyn Tool> = Arc::new(NamedTool("runtime_a"));
+        let old_b: Arc<dyn Tool> = Arc::new(NamedTool("runtime_b"));
+        let new_a: Arc<dyn Tool> = Arc::new(NamedTool("runtime_a"));
+        let new_c: Arc<dyn Tool> = Arc::new(NamedTool("runtime_c"));
+        registry.register(Arc::clone(&old_a)).await;
+        registry.register(Arc::clone(&old_b)).await;
+
+        registry
+            .replace_runtime_tools(
+                &[Arc::clone(&old_a), Arc::clone(&old_b)],
+                vec![Arc::clone(&new_a), Arc::clone(&new_c)],
+            )
+            .await
+            .expect("replace runtime tools");
+
+        let registered_a = registry.get("runtime_a").await.expect("new a");
+        assert!(Arc::ptr_eq(&registered_a, &new_a));
+        assert!(!registry.has("runtime_b").await);
+        let registered_c = registry.get("runtime_c").await.expect("new c");
+        assert!(Arc::ptr_eq(&registered_c, &new_c));
+    }
+
+    #[tokio::test]
+    async fn replace_runtime_tools_rejects_conflict_without_partial_change() {
+        let registry = ToolRegistry::new();
+        let old: Arc<dyn Tool> = Arc::new(NamedTool("runtime_old"));
+        let unrelated: Arc<dyn Tool> = Arc::new(NamedTool("shared"));
+        let replacement: Arc<dyn Tool> = Arc::new(NamedTool("shared"));
+        registry.register(Arc::clone(&old)).await;
+        registry.register(Arc::clone(&unrelated)).await;
+
+        let conflicts = registry
+            .replace_runtime_tools(&[Arc::clone(&old)], vec![replacement])
+            .await
+            .expect_err("unrelated registration must conflict");
+
+        assert_eq!(conflicts, ["shared"]);
+        let registered_old = registry.get("runtime_old").await.expect("old remains");
+        assert!(Arc::ptr_eq(&registered_old, &old));
+        let registered_shared = registry.get("shared").await.expect("shared remains");
+        assert!(Arc::ptr_eq(&registered_shared, &unrelated));
     }
 
     #[tokio::test]
