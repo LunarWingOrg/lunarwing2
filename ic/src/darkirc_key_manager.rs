@@ -2772,6 +2772,14 @@ struct PendingInventory {
 
 fn pending_inventory(workspace: &Workspace, scope_id: &str) -> Result<PendingInventory> {
     let names = secure_directory_files(workspace, PENDING_DIR)?;
+    pending_inventory_from_names(workspace, scope_id, names)
+}
+
+fn pending_inventory_from_names(
+    workspace: &Workspace,
+    scope_id: &str,
+    names: Vec<String>,
+) -> Result<PendingInventory> {
     if names.len() > MAX_PENDING_EXCHANGES {
         return Err(KeyManagerError::PendingLimit);
     }
@@ -2798,12 +2806,20 @@ fn pending_inventory(workspace: &Workspace, scope_id: &str) -> Result<PendingInv
         validate_pending_secret(&secret, offer_id, scope_id)?;
         entries.push(PendingEntry { secret });
     }
+    validate_pending_entries(&entries)?;
+    Ok(PendingInventory {
+        entries,
+        total_bytes,
+    })
+}
+
+fn validate_pending_entries(entries: &[PendingEntry]) -> Result<()> {
     let equality_key = private_equality_key();
     let mut contact_names = HashSet::new();
     let mut contact_ids = HashSet::new();
     let mut exchange_ids = HashSet::new();
     let mut private_tags = HashSet::new();
-    for entry in &entries {
+    for entry in entries {
         if !contact_names.insert(entry.secret.contact_name.to_lowercase())
             || !contact_ids.insert(entry.secret.contact_id.clone())
             || !exchange_ids.insert(entry.secret.offer_id.clone())
@@ -2825,10 +2841,7 @@ fn pending_inventory(workspace: &Workspace, scope_id: &str) -> Result<PendingInv
             return Err(KeyManagerError::OfferConflict);
         }
     }
-    Ok(PendingInventory {
-        entries,
-        total_bytes,
-    })
+    Ok(())
 }
 
 fn read_pending_secret(
@@ -2864,6 +2877,7 @@ fn write_new_pending_secret(
     inventory: &PendingInventory,
 ) -> Result<()> {
     let path = offer_id_path(workspace, &secret.offer_id)?;
+    let candidate = format!("{path}.next");
     let bytes = pending_secret_bytes(secret)?;
     let projected_bytes = inventory
         .total_bytes
@@ -2873,7 +2887,11 @@ fn write_new_pending_secret(
     {
         return Err(KeyManagerError::PendingLimit);
     }
-    workspace.write_new(&path, &bytes)
+    if workspace.read_optional(&candidate)?.is_some() {
+        return Err(KeyManagerError::RecoveryRequired);
+    }
+    workspace.write_new(&candidate, &bytes)?;
+    workspace.rename(&candidate, &path)
 }
 
 fn replace_pending_secret(workspace: &Workspace, secret: &SecretExchange) -> Result<()> {
@@ -2887,12 +2905,21 @@ fn remove_pending(workspace: &Workspace, offer_id: &str) -> Result<()> {
     workspace.remove_if_present(&path)
 }
 
+fn validate_active_config(workspace: &Workspace) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    let Some(config) = workspace.read_optional(CONFIG_FILE)? else {
+        return Ok(None);
+    };
+    let document = parse_document(&config)?;
+    validate_document(&document.table)?;
+    validate_contact_uniqueness(&config)?;
+    Ok(Some(config))
+}
+
 fn contact_occupied(workspace: &Workspace, contact_name: &str, ledger: &Ledger) -> Result<bool> {
     let normalized = contact_name.to_lowercase();
-    let config_match = match workspace.read_optional(CONFIG_FILE)? {
-        Some(bytes) => {
-            let document = parse_document(&bytes)?;
-            validate_document(&document.table)?;
+    let config_match = match validate_active_config(workspace)? {
+        Some(config) => {
+            let document = parse_document(&config)?;
             document
                 .table
                 .get("contact")
@@ -4366,42 +4393,166 @@ fn recover_locked(workspace: &Workspace, scope_id: &str) -> Result<()> {
     reconcile_installed_pending(workspace, scope_id)
 }
 
-// A crash between the fsynced pending replacement and its atomic rename leaves
-// `<offer>.json.next`. The existing record remains authoritative, so recovery
-// may discard only a canonical candidate whose filename, offer, and scope all
-// agree; malformed or foreign candidates remain for operator repair.
+struct PendingCandidate {
+    candidate_path: String,
+    final_path: String,
+    entry: PendingEntry,
+    bytes_len: usize,
+}
+
+// A crash between a fsynced pending candidate and its atomic rename leaves
+// `<offer>.json.next`. An existing record remains authoritative. A first-create
+// candidate is promoted only after every candidate passes scope, capacity,
+// active-config, replay, contact, and private-key-reuse validation as one set.
 fn recover_pending_candidates(workspace: &Workspace, scope_id: &str) -> Result<()> {
-    let pending_names = secure_directory_files(workspace, PENDING_DIR)?;
-    for name in pending_names {
-        let Some(base) = name.strip_suffix(".next") else {
-            continue;
-        };
-        let offer_id = base
-            .strip_suffix(".json")
-            .ok_or(KeyManagerError::RecoveryRequired)?;
-        validate_offer_id(offer_id).map_err(|_| KeyManagerError::RecoveryRequired)?;
-        let path = format!("{PENDING_DIR}/{name}");
-        let current = read_pending_secret(workspace, offer_id, scope_id)
-            .map_err(|_| KeyManagerError::RecoveryRequired)?;
-        let bytes = workspace.read_required(&path)?;
-        if bytes.len() > MAX_PENDING_BYTES {
-            return Err(KeyManagerError::RecoveryRequired);
-        }
-        let candidate: SecretExchange =
-            serde_json::from_slice(&bytes).map_err(|_| KeyManagerError::RecoveryRequired)?;
-        validate_pending_secret(&candidate, offer_id, scope_id)
-            .map_err(|_| KeyManagerError::RecoveryRequired)?;
-        if candidate.offer_id != current.offer_id
-            || candidate.contact_id != current.contact_id
-            || candidate.contact_name != current.contact_name
-            || candidate.local_public != current.local_public
-            || candidate.local_private.expose_secret() != current.local_private.expose_secret()
+    let names = secure_directory_files(workspace, PENDING_DIR)?;
+    let (final_names, candidate_names) = classify_pending_names(names)?;
+    let inventory = pending_inventory_from_names(workspace, scope_id, final_names)?;
+    let mut discard = Vec::new();
+    let mut promote = Vec::new();
+    for name in candidate_names {
+        let candidate = read_pending_candidate(workspace, scope_id, &name)?;
+        match inventory
+            .entries
+            .iter()
+            .find(|entry| entry.secret.offer_id == candidate.entry.secret.offer_id)
         {
-            return Err(KeyManagerError::RecoveryRequired);
+            Some(current) if same_pending_identity(&current.secret, &candidate.entry.secret) => {
+                discard.push(candidate.candidate_path);
+            }
+            Some(_) => return Err(KeyManagerError::RecoveryRequired),
+            None => promote.push(candidate),
         }
+    }
+    validate_pending_promotions(workspace, scope_id, &inventory, &promote)?;
+    for path in discard {
         workspace.remove_if_present(&path)?;
     }
+    for candidate in promote {
+        workspace.rename(&candidate.candidate_path, &candidate.final_path)?;
+    }
     Ok(())
+}
+
+fn classify_pending_names(names: Vec<String>) -> Result<(Vec<String>, Vec<String>)> {
+    let mut finals = Vec::new();
+    let mut candidates = Vec::new();
+    for name in names {
+        if let Some(base) = name.strip_suffix(".json.next") {
+            validate_offer_id(base).map_err(|_| KeyManagerError::RecoveryRequired)?;
+            candidates.push(name);
+        } else if let Some(base) = name.strip_suffix(".json") {
+            validate_offer_id(base).map_err(|_| KeyManagerError::RecoveryRequired)?;
+            finals.push(name);
+        } else {
+            return Err(KeyManagerError::RecoveryRequired);
+        }
+    }
+    Ok((finals, candidates))
+}
+
+fn read_pending_candidate(
+    workspace: &Workspace,
+    scope_id: &str,
+    name: &str,
+) -> Result<PendingCandidate> {
+    let offer_id = name
+        .strip_suffix(".json.next")
+        .ok_or(KeyManagerError::RecoveryRequired)?;
+    let candidate_path = format!("{PENDING_DIR}/{name}");
+    let bytes = workspace.read_required(&candidate_path)?;
+    if bytes.len() > MAX_PENDING_BYTES {
+        return Err(KeyManagerError::RecoveryRequired);
+    }
+    let secret: SecretExchange =
+        serde_json::from_slice(&bytes).map_err(|_| KeyManagerError::RecoveryRequired)?;
+    validate_pending_secret(&secret, offer_id, scope_id)
+        .map_err(|_| KeyManagerError::RecoveryRequired)?;
+    Ok(PendingCandidate {
+        candidate_path,
+        final_path: format!("{PENDING_DIR}/{offer_id}.json"),
+        entry: PendingEntry { secret },
+        bytes_len: bytes.len(),
+    })
+}
+
+fn same_pending_identity(current: &SecretExchange, candidate: &SecretExchange) -> bool {
+    current.offer_id == candidate.offer_id
+        && current.contact_id == candidate.contact_id
+        && current.contact_name == candidate.contact_name
+        && current.local_public == candidate.local_public
+        && current.local_private.expose_secret() == candidate.local_private.expose_secret()
+}
+
+fn validate_pending_promotions(
+    workspace: &Workspace,
+    scope_id: &str,
+    inventory: &PendingInventory,
+    candidates: &[PendingCandidate],
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    validate_active_config(workspace)?;
+    let ledger_bytes = workspace.read_optional(LEDGER_FILE)?;
+    let ledger = match ledger_bytes.as_deref() {
+        Some(bytes) => parse_ledger(bytes, scope_id)?,
+        None => empty_ledger(scope_id),
+    };
+    let added_bytes = candidates.iter().try_fold(0_usize, |total, candidate| {
+        total
+            .checked_add(candidate.bytes_len)
+            .ok_or(KeyManagerError::PendingLimit)
+    })?;
+    if inventory.entries.len().saturating_add(candidates.len()) > MAX_PENDING_EXCHANGES
+        || inventory.total_bytes.saturating_add(added_bytes) > MAX_PENDING_TOTAL_BYTES
+    {
+        return Err(KeyManagerError::PendingLimit);
+    }
+    let mut combined = inventory
+        .entries
+        .iter()
+        .map(|entry| PendingEntry {
+            secret: entry.secret.clone(),
+        })
+        .collect::<Vec<_>>();
+    combined.extend(candidates.iter().map(|candidate| PendingEntry {
+        secret: candidate.entry.secret.clone(),
+    }));
+    validate_pending_entries(&combined)?;
+    for candidate in candidates {
+        validate_pending_promotion(workspace, inventory, &ledger, &candidate.entry.secret)?;
+    }
+    Ok(())
+}
+
+fn validate_pending_promotion(
+    workspace: &Workspace,
+    inventory: &PendingInventory,
+    ledger: &Ledger,
+    secret: &SecretExchange,
+) -> Result<()> {
+    if secret.state != ExchangeState::Prepared.as_str()
+        || ledger.consumed_exchange_ids.contains_key(&secret.offer_id)
+        || pending_peer_offer_id(secret)?
+            .is_some_and(|offer_id| ledger.consumed_exchange_ids.contains_key(&offer_id))
+        || contact_occupied(workspace, &secret.contact_name, ledger)?
+    {
+        return Err(KeyManagerError::RecoveryRequired);
+    }
+    reject_pending_reservation(
+        inventory,
+        &secret.contact_name,
+        &secret.contact_id,
+        &secret.offer_id,
+    )?;
+    reject_local_private_reuse(
+        workspace,
+        inventory,
+        ledger,
+        &secret.local_public,
+        secret.local_private.expose_secret(),
+    )
 }
 
 fn recovery_scope_preflight(workspace: &Workspace, scope_id: &str) -> Result<()> {
@@ -7303,6 +7454,41 @@ my_dm_chacha_secret = "{bob_private}"
             },
         )
         .expect("complete responder while both artifacts are live");
+    }
+
+    #[test]
+    fn recovery_promotes_valid_first_create_pending_candidate() {
+        let (_temp, paths) = fixture();
+        let attestation = exchange_attestation();
+        let public = valid_public(47);
+        let private = valid_private(48);
+        let request = exchange_request(
+            &attestation,
+            "bob",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &public,
+            &private,
+        );
+        prepare_exchange(&paths, SCOPE, &request).expect("prepare");
+        let workspace = Workspace::open(paths.clone()).expect("workspace");
+        let final_path = format!("{PENDING_DIR}/{}.json", request.offer_id);
+        let candidate_path = format!("{final_path}.next");
+        workspace
+            .rename(&final_path, &candidate_path)
+            .expect("simulate crash before pending promotion");
+
+        assert!(matches!(
+            pending_inventory(&workspace, SCOPE),
+            Err(KeyManagerError::RecoveryRequired)
+        ));
+        recover_locked(&workspace, SCOPE).expect("promote pending candidate");
+
+        assert!(paths.darkirc_dir().join(&final_path).exists());
+        assert!(!paths.darkirc_dir().join(&candidate_path).exists());
+        let inventory = pending_inventory(&workspace, SCOPE).expect("settled inventory");
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.entries[0].secret.offer_id, request.offer_id);
     }
 
     #[test]
