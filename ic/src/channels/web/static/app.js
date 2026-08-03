@@ -163,6 +163,9 @@ let _slashMatches = [];
 let _activeGroup = null;
 let _activeToolCards = {};
 let _activityThinking = null;
+let _activityReasoning = null;
+let _activityReasoningDecisions = new Map();
+const LIVE_WORK_MAX_CHARS = 12000;
 
 // --- Auth ---
 
@@ -564,10 +567,9 @@ function connectSSE() {
       return;
     }
 
+    finishStreamingWork(data.thread_id);
     finalizeActivityGroup();
-    if (!finalizeStreamingMessage(data.thread_id, data.content)) {
-      addMessage('assistant', data.content);
-    }
+    addMessage('assistant', data.content);
     enableChatInput();
     // Refresh thread list so new titles appear after first message
     debouncedLoadThreads();
@@ -586,6 +588,12 @@ function connectSSE() {
     }
     clearSuggestionChips();
     showActivityThinking(data.message);
+  });
+
+  eventSource.addEventListener('reasoning_update', (e) => {
+    const data = JSON.parse(e.data);
+    if (!isCurrentThread(data.thread_id)) return;
+    showActivityReasoning(data.narrative, data.decisions || []);
   });
 
   eventSource.addEventListener('suggestions', (e) => {
@@ -622,7 +630,6 @@ function connectSSE() {
   eventSource.addEventListener('stream_chunk', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
-    finalizeActivityGroup();
     getOrCreateStreamingMessage(data.thread_id);
     _streamBuffer += data.content || '';
     scheduleStreamRender();
@@ -642,6 +649,7 @@ function connectSSE() {
     // the response SSE event is empty or lost.
     // Status text is not displayed — inline activity cards handle visual feedback.
     if (data.message === 'Done' || data.message === 'Awaiting approval') {
+      finishStreamingWork(data.thread_id);
       finalizeActivityGroup();
       enableChatInput();
     }
@@ -695,7 +703,7 @@ function connectSSE() {
         clearStreamingSnapshot(data.thread_id);
         return;
       }
-      clearStreamingSnapshot(data.thread_id);
+      finishStreamingWork(data.thread_id);
       finalizeActivityGroup();
       addMessage('system', 'Error: ' + data.message);
       enableChatInput();
@@ -1246,7 +1254,11 @@ function hasActiveStreamForThread(threadId) {
 
 function stashStreamingState() {
   if (_streamingThreadId) {
-    _streamSnapshots.set(_streamingThreadId, currentStreamingText());
+    let text = currentStreamingText();
+    if (text.length > LIVE_WORK_MAX_CHARS) {
+      text = '... earlier live work omitted ...\n' + text.slice(-LIVE_WORK_MAX_CHARS);
+    }
+    _streamSnapshots.set(_streamingThreadId, text);
   }
   resetStreamingState();
 }
@@ -1267,11 +1279,32 @@ function getOrCreateStreamingMessage(threadId) {
 
   const initialText = _streamSnapshots.get(threadId) || '';
   _streamSnapshots.delete(threadId);
-  const container = document.getElementById('chat-messages');
-  maybeInsertTimeSeparator(container);
-  const message = createMessageElement('assistant', initialText, { plainText: true, streaming: true });
+  const group = getOrCreateActivityGroup();
+  const message = document.createElement('div');
+  message.className = 'activity-live-work';
   message.setAttribute('data-streaming', 'true');
-  container.appendChild(message);
+
+  const header = document.createElement('button');
+  header.type = 'button';
+  header.className = 'activity-detail-header expanded';
+  header.setAttribute('aria-expanded', 'true');
+  header.innerHTML = '<span class="activity-detail-chevron">&#9656;</span>'
+    + '<span class="activity-detail-label">Live work</span>';
+
+  const body = document.createElement('div');
+  body.className = 'activity-live-work-body expanded';
+  const output = document.createElement('pre');
+  output.className = 'activity-live-work-output';
+  output.textContent = initialText;
+  body.appendChild(output);
+  header.addEventListener('click', () => {
+    const expanded = body.classList.toggle('expanded');
+    header.classList.toggle('expanded', expanded);
+    header.setAttribute('aria-expanded', String(expanded));
+  });
+  message.appendChild(header);
+  message.appendChild(body);
+  group.appendChild(message);
   _streamParts = initialText ? [initialText] : [];
   _streamingMessage = message;
   _streamingThreadId = threadId;
@@ -1284,11 +1317,14 @@ function flushStreamBuffer() {
   const chunk = _streamBuffer;
   _streamBuffer = '';
   _streamParts.push(chunk);
-  const content = _streamingMessage.querySelector('.message-content');
-  if (content?.firstChild) {
-    content.firstChild.appendData(chunk);
-  } else if (content) {
-    content.appendChild(document.createTextNode(chunk));
+  let text = _streamParts.join('');
+  if (text.length > LIVE_WORK_MAX_CHARS) {
+    text = '... earlier live work omitted ...\n' + text.slice(-LIVE_WORK_MAX_CHARS);
+    _streamParts = [text];
+  }
+  const content = _streamingMessage.querySelector('.activity-live-work-output');
+  if (content) {
+    content.textContent = text;
   }
   scheduleChatScrollToBottom();
 }
@@ -1301,38 +1337,23 @@ function scheduleStreamRender() {
   });
 }
 
-function finalizeStreamingMessage(threadId, content) {
+function finishStreamingWork(threadId) {
   _streamSnapshots.delete(threadId);
-  if (!_streamingMessage?.isConnected || _streamingThreadId !== threadId) {
-    return false;
+  if (_streamingThreadId === threadId) {
+    if (_streamRenderFrame !== null) {
+      cancelAnimationFrame(_streamRenderFrame);
+      _streamRenderFrame = null;
+    }
+    flushStreamBuffer();
+    resetStreamingState();
   }
-
-  if (_streamRenderFrame !== null) cancelAnimationFrame(_streamRenderFrame);
-  const message = _streamingMessage;
-  const streamedText = currentStreamingText();
-  const finalText = typeof content === 'string' ? content : streamedText;
-  _streamRenderFrame = null;
-  _streamBuffer = '';
-  _streamParts = [];
-  _streamingMessage = null;
-  _streamingThreadId = null;
-
-  message.removeAttribute('data-streaming');
-  message.setAttribute('data-raw', finalText);
-  message.removeAttribute('data-copy-text');
-  const contentElement = message.querySelector('.message-content');
-  if (contentElement) {
-    contentElement.innerHTML = renderMarkdown(finalText);
-    scheduleCodeHighlight(contentElement);
-  }
-  scheduleChatScrollToBottom();
-  return true;
 }
 
 // --- Inline Tool Activity Cards ---
 
 function getOrCreateActivityGroup() {
-  if (_activeGroup) return _activeGroup;
+  if (_activeGroup?.isConnected) return _activeGroup;
+  resetActivityState();
   const container = document.getElementById('chat-messages');
   const group = document.createElement('div');
   group.className = 'activity-group';
@@ -1340,7 +1361,20 @@ function getOrCreateActivityGroup() {
   scheduleChatScrollToBottom();
   _activeGroup = group;
   _activeToolCards = {};
+  _activityReasoning = null;
+  _activityReasoningDecisions = new Map();
   return group;
+}
+
+function resetActivityState() {
+  for (const name in _activeToolCards) {
+    for (const entry of _activeToolCards[name]) clearInterval(entry.timer);
+  }
+  _activeGroup = null;
+  _activeToolCards = {};
+  _activityThinking = null;
+  _activityReasoning = null;
+  _activityReasoningDecisions = new Map();
 }
 
 function showActivityThinking(message) {
@@ -1370,6 +1404,35 @@ function removeActivityThinking() {
     _activityThinking.remove();
     _activityThinking = null;
   }
+}
+
+function showActivityReasoning(narrative, decisions) {
+  const group = getOrCreateActivityGroup();
+  for (const decision of decisions) {
+    if (decision?.tool_name) {
+      _activityReasoningDecisions.set(decision.tool_name, decision.rationale || '');
+    }
+  }
+  const decisionCount = _activityReasoningDecisions.size;
+  const generatedNarrative = /^Selected \d+ tools? based on task requirements and available context\.$/.test(narrative || '');
+  const toolWord = decisionCount === 1 ? 'tool' : 'tools';
+  const reasoning = {
+    narrative: generatedNarrative
+      ? 'Selected ' + decisionCount + ' ' + toolWord + ' based on task requirements and available context.'
+      : (narrative || 'Selected tools based on task requirements and available context.'),
+    decisions: Array.from(_activityReasoningDecisions, ([tool_name, rationale]) => ({
+      tool_name,
+      rationale,
+    })),
+  };
+  if (!_activityReasoning) {
+    _activityReasoning = createReasoningSummaryElement(reasoning, true);
+    _activityReasoning.classList.add('activity-reasoning');
+    group.appendChild(_activityReasoning);
+  } else {
+    renderReasoningSummary(_activityReasoning, reasoning);
+  }
+  scheduleChatScrollToBottom();
 }
 
 function addToolCard(name) {
@@ -1529,32 +1592,35 @@ function finalizeActivityGroup() {
     }
   }
 
-  if (toolCount === 0) {
-    // No tools were used — remove the empty group
+  const detailNodes = Array.from(_activeGroup.children);
+  if (detailNodes.length === 0) {
     _activeGroup.remove();
     _activeGroup = null;
     _activeToolCards = {};
+    _activityReasoning = null;
+    _activityReasoningDecisions = new Map();
     return;
   }
 
-  // Wrap existing cards into a hidden container
+  // Keep live work, reasoning, and tools together under one durable work-log rail.
   const cardsContainer = document.createElement('div');
   cardsContainer.className = 'activity-cards-container';
   cardsContainer.style.display = 'none';
 
-  const cards = _activeGroup.querySelectorAll('.activity-tool-card');
-  for (let k = 0; k < cards.length; k++) {
-    cardsContainer.appendChild(cards[k]);
+  for (const node of detailNodes) {
+    cardsContainer.appendChild(node);
   }
 
   // Build summary line
   const durationStr = totalDuration < 10 ? totalDuration.toFixed(1) + 's' : Math.floor(totalDuration) + 's';
   const toolWord = toolCount === 1 ? 'tool' : 'tools';
+  const summaryText = toolCount > 0 ? 'Work log - Used ' + toolCount + ' ' + toolWord : 'Work log';
   const summary = document.createElement('div');
   summary.className = 'activity-summary';
   summary.innerHTML = '<span class="activity-summary-chevron">&#9656;</span>'
-    + '<span class="activity-summary-text">Used ' + toolCount + ' ' + toolWord + '</span>'
-    + '<span class="activity-summary-duration">(' + durationStr + ')</span>';
+    + '<span class="activity-summary-text"></span>'
+    + (toolCount > 0 ? '<span class="activity-summary-duration">(' + durationStr + ')</span>' : '');
+  summary.querySelector('.activity-summary-text').textContent = summaryText;
 
   summary.addEventListener('click', () => {
     const isOpen = cardsContainer.style.display !== 'none';
@@ -1570,6 +1636,8 @@ function finalizeActivityGroup() {
 
   _activeGroup = null;
   _activeToolCards = {};
+  _activityReasoning = null;
+  _activityReasoningDecisions = new Map();
 }
 
 function humanizeToolName(rawName) {
@@ -1985,6 +2053,9 @@ function loadHistory(before) {
           maybeInsertTimeSeparator(fragment);
           fragment.appendChild(createMessageElement('user', turn.user_input));
         }
+        if (turn.reasoning) {
+          fragment.appendChild(createReasoningSummaryElement(turn.reasoning, false));
+        }
         if (turn.tool_calls && turn.tool_calls.length > 0) {
           fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
         }
@@ -1993,6 +2064,7 @@ function loadHistory(before) {
           fragment.appendChild(createMessageElement('assistant', turn.response));
         }
       }
+      resetActivityState();
       container.replaceChildren(fragment);
       // Show welcome card when history is empty
       if (data.turns.length === 0) {
@@ -2025,6 +2097,9 @@ function loadHistory(before) {
         if (turn.user_input) {
           const userDiv = createMessageElement('user', turn.user_input);
           fragment.appendChild(userDiv);
+        }
+        if (turn.reasoning) {
+          fragment.appendChild(createReasoningSummaryElement(turn.reasoning, false));
         }
         if (turn.tool_calls && turn.tool_calls.length > 0) {
           fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
@@ -2099,6 +2174,62 @@ function addToolCallsSummary(toolCalls) {
   const container = document.getElementById('chat-messages');
   container.appendChild(createToolCallsSummaryElement(toolCalls));
   scheduleChatScrollToBottom();
+}
+
+function createReasoningSummaryElement(reasoning, expanded) {
+  const div = document.createElement('div');
+  div.className = 'reasoning-summary';
+
+  const header = document.createElement('button');
+  header.type = 'button';
+  header.className = 'reasoning-summary-header';
+  header.setAttribute('aria-expanded', String(!!expanded));
+  header.innerHTML = '<span class="reasoning-summary-chevron">&#9656;</span>'
+    + '<span>Reasoning summary</span>';
+
+  const body = document.createElement('div');
+  body.className = 'reasoning-summary-body';
+  if (expanded) {
+    header.classList.add('expanded');
+    body.classList.add('expanded');
+  }
+  header.addEventListener('click', () => {
+    const isExpanded = body.classList.toggle('expanded');
+    header.classList.toggle('expanded', isExpanded);
+    header.setAttribute('aria-expanded', String(isExpanded));
+  });
+
+  const narrative = document.createElement('div');
+  narrative.className = 'reasoning-summary-narrative';
+  const decisions = document.createElement('div');
+  decisions.className = 'reasoning-summary-decisions';
+  body.appendChild(narrative);
+  body.appendChild(decisions);
+  div.appendChild(header);
+  div.appendChild(body);
+  renderReasoningSummary(div, reasoning);
+  return div;
+}
+
+function renderReasoningSummary(element, reasoning) {
+  const narrative = element.querySelector('.reasoning-summary-narrative');
+  const decisions = element.querySelector('.reasoning-summary-decisions');
+  if (narrative) narrative.textContent = reasoning?.narrative || '';
+  if (!decisions) return;
+  decisions.replaceChildren();
+  for (const decision of reasoning?.decisions || []) {
+    const row = document.createElement('div');
+    row.className = 'reasoning-decision';
+    const tool = document.createElement('span');
+    tool.className = 'reasoning-decision-tool';
+    tool.textContent = decision.tool_name;
+    const rationale = document.createElement('span');
+    rationale.className = 'reasoning-decision-rationale';
+    rationale.textContent = decision.rationale;
+    row.appendChild(tool);
+    row.appendChild(rationale);
+    decisions.appendChild(row);
+  }
 }
 
 function createToolCallsSummaryElement(toolCalls) {

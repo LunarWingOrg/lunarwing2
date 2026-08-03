@@ -9,8 +9,9 @@ EXPORT_SRC="$IC_DIR/scripts/export-tenant.sh"
 TEST_STAGE_PARENT="$IC_DIR/target"
 mkdir -p "$TEST_STAGE_PARENT"
 export KAWARIMI_IMPORT_STAGE_ROOT="$TEST_STAGE_PARENT/kawarimi-import-stage.$$"
-export SUDO_UID="$(id -u)"
-export SUDO_USER="$(id -un)"
+SUDO_UID="$(id -u)"
+SUDO_USER="$(id -un)"
+export SUDO_UID SUDO_USER
 
 failures=0
 

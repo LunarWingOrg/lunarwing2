@@ -276,7 +276,12 @@ assert_import_rejected_before_mutation \
   "$tmp/invalid-manifest.tar" "$tmp/invalid-manifest.out"
 
 echo "=== export excludes generic DarkIRC state and blocks unsettled state ==="
-export_tmp="$(mktemp -d)"
+# Root export validation intentionally rejects /tmp as a writable ancestor.
+if [[ "$EUID" -eq 0 ]]; then
+  export_tmp="$(mktemp -d /run/lunarwing-darkirc-export-test.XXXXXX)"
+else
+  export_tmp="$(mktemp -d)"
+fi
 mkdir -p "$export_tmp/bin" "$export_tmp/scripts" \
   "$export_tmp/home/alpha/lunarwing/env" \
   "$export_tmp/home/alpha/lunarwing/state/darkirc" \

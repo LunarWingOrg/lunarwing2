@@ -544,6 +544,15 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 tool_calls.clone(),
             ));
 
+        let tool_names: Vec<String> = tool_calls.iter().map(|call| call.name.clone()).collect();
+        if let Some(reasoning) = StatusUpdate::reasoning_for_tools(&tool_names) {
+            let _ = self
+                .agent
+                .channels
+                .send_status(&self.message.channel, reasoning, &self.message.metadata)
+                .await;
+        }
+
         // Execute tools and add results to context
         let _ = self
             .agent

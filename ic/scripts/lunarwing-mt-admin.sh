@@ -4692,7 +4692,7 @@ _remove_nanocode_supervision() {
     "$(_hash_dir "$name")/${container}.hash"
   if [[ "$INIT_SYSTEM" == "systemd" ]] && id -u "$name" >/dev/null 2>&1; then
     _systemctl_user "$name" daemon-reload >/dev/null 2>&1 \
-      || { say "failed to reload tenant user manager after Nanocode retirement" >&2; return 1; }
+      || { say "WARNING: could not reload tenant user manager after Nanocode retirement (non-fatal)" >&2; true; }
   fi
 
   for svc in "${container}-sup" "$container"; do
