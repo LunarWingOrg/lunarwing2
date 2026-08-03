@@ -79,6 +79,7 @@ FORCE=false
 MAX_BUNDLE_BYTES="${KAWARIMI_MAX_BUNDLE_BYTES:-107374182400}"
 MAX_STATE_BYTES="${KAWARIMI_MAX_STATE_BYTES:-107374182400}"
 MAX_STATE_ENTRIES="${KAWARIMI_MAX_STATE_ENTRIES:-1000000}"
+IMPORT_STAGE_ROOT="${KAWARIMI_IMPORT_STAGE_ROOT:-/var/lib/lunarwing-import-stage}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -359,6 +360,40 @@ path_components_no_symlink() {
       [[ -d "$current" ]] || return 1
     fi
   done
+}
+
+prepare_import_stage_root() {
+  local path="$IMPORT_STAGE_ROOT" rest component current=/ owner mode expected_uid="$EUID"
+  [[ "$path" == /* && "$path" != / && "$path" != /tmp && "$path" != /tmp/* ]] \
+    || die "Kawarimi import stage must be an absolute non-/tmp path"
+  rest="${path#/}"
+  while [[ -n "$rest" ]]; do
+    component="${rest%%/*}"
+    if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] \
+      || die "unsafe Kawarimi import stage component"
+    current="${current%/}/$component"
+    [[ ! -L "$current" ]] || die "Kawarimi import stage path contains a symlink"
+    [[ -e "$current" ]] || break
+    [[ -d "$current" ]] || die "Kawarimi import stage ancestor is not a directory"
+    owner="$(stat -c '%u' "$current" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$current" 2>/dev/null || true)"
+    [[ ( "$owner" == 0 || "$owner" == "$expected_uid" ) && "$mode" =~ ^[0-7]+$ ]] \
+      || die "Kawarimi import stage ancestor has an untrusted owner"
+    (( (8#$mode & 0022) == 0 )) \
+      || die "Kawarimi import stage ancestor is group/world writable"
+  done
+  if [[ ! -e "$path" ]]; then
+    (umask 077; mkdir -- "$path") || die "could not create Kawarimi import stage root"
+  fi
+  path_components_no_symlink "$path" \
+    || die "unsafe Kawarimi import stage root: $path"
+  [[ -d "$path" && ! -L "$path" ]] \
+    || die "Kawarimi import stage root is not a regular directory"
+  owner="$(stat -c '%u' "$path" 2>/dev/null || true)"
+  mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+  [[ "$owner" == "$expected_uid" && "$mode" == 700 ]] \
+    || die "Kawarimi import stage root must be owner-controlled mode 0700"
 }
 
 validate_dotenv_manifest() {  # <manifest> <allowed-key> ...
@@ -678,11 +713,13 @@ PORTS_REGISTRY="${LUNARWING_PORTS_REGISTRY:-/etc/lunarwing/ports.json}"
 grep -qE '^\s*restore-tenant)' "$MT" || die "mt-admin at $MT predates restore-tenant (need a v1.1.4-class host)"
 grep -qE '^\s*owner-scopes)' "$MT" || die "mt-admin at $MT predates owner-scopes (need current Kawarimi owner-scope checks)"
 
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+prepare_import_stage_root
+WORK="$(mktemp -d "$IMPORT_STAGE_ROOT/import.XXXXXX")"
 chmod 0700 "$WORK"
-# Pin the caller-supplied credential bundle before any validation.  Validation
-# and every later extraction then operate on the same private copy, so a
-# writable source directory cannot swap archive contents between the checks.
+trap 'rm -rf "$WORK"' EXIT
+# Pin the caller-supplied credential bundle before any validation. Validation
+# and every later extraction then operate on the same owner-only non-/tmp copy,
+# so a writable source directory cannot swap archive contents between checks.
 BUNDLE_SOURCE="$BUNDLE"
 bundle_links="$(stat -c '%h' "$BUNDLE_SOURCE" 2>/dev/null || true)"
 [[ "$bundle_links" == 1 ]] || die "bundle must be a single-link regular file"
