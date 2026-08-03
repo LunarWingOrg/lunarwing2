@@ -912,6 +912,7 @@ Live validation on Dwarfstar (2026-08-03, commit `238b281` + follow-up):
   initially consumed `ensure_init_system` as if it printed the value, but it
   only sets the `$INIT_SYSTEM` global, so builds silently took the OpenRC
   fallback. Fixed; harness stubs updated to match real semantics.
-- First agent-driven shell call on the daemon creates a `run-*.scope` under
-  `lunarwing-workloads.slice`; observable with
-  `systemctl --user list-units --type=scope` as the tenant.
+- First agent-driven shell call on the daemon confirmed in the user journal:
+  the one-time probe (`/usr/bin/true` scope) fired, then the agent's `sh -c`
+  command ran as `run-*.scope` under `lunarwing-workloads.slice` while the
+  daemon cgroup stayed flat and the scope was collected afterward.
