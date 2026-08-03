@@ -81,7 +81,7 @@ Created --> Running --> Waiting --> Running (resume)
                    --> Failed
 ```
 
-All transitions are validated by `ThreadState::can_transition_to()`. Terminal states: `Done`, `Failed`. Invalid transitions return `ThreadError::InvalidTransition`.
+All transitions are validated by `ThreadState::can_transition_to()`. Terminal states: `Done`, `Failed`. Invalid transitions return `EngineError::InvalidTransition`.
 `Created`, `Running`, `Waiting`, `Suspended`, and `Completed` can transition to
 `Failed`; the last case closes failures during final persistence.
 
@@ -127,7 +127,7 @@ Key characteristics:
 - **Context as variables**: thread messages injected as `context` Python variable, thread goal as `goal`, step index as `step_number`, prior action results as `previous_results` dict
 - **Tool dispatch**: unknown function calls suspend the VM, go through lease check + policy check + `EffectExecutor`, then result returns to Python
 - **Recursive LLM calls**: `llm_query(prompt, context)` suspends the VM, spawns a single-shot LLM call, returns text as a Python string. Results stay as variables (symbolic composition), not injected into the parent's attention window
-- **Compact output metadata**: between code steps, only a summary is added to chat context (e.g. `"[code output] stdout (4532 chars): The results show..."`) to prevent context bloat
+- **Compact output metadata**: between code steps, only a summary is added to chat context (`[FULL OUTPUT: N chars]`, `[TRUNCATED: last 8000 of N chars shown]`, a short return-value preview, or `[code executed, no output]`) to prevent context bloat
 - **Explicit termination**: `FINAL(answer)` or `FINAL_VAR(name)` for output
 - **Resource limits**: user CodeAct blocks default to a 30s timeout, 64MB memory,
   and 1M allocations. The orchestrator VM has a separate 600s/128MB/5M budget.
@@ -155,7 +155,7 @@ The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execut
   goals, with a default two-attempt cap; substantive prose and short conversational
   goals remain valid terminal responses. Syntax-invalid `repl` blocks use the same
   bounded correction before terminal delivery through shared channels such as XMPP.
-- Async dispatch of tool calls with `asyncio.gather()` for parallel execution
+- Parallel dispatch of tool calls via the `__execute_actions_parallel__` batch host function (Rust executes the batch concurrently with a JoinSet)
 - Default orchestrator source: `ic/crates/lunarwing_engine/orchestrator/default.py`
 
 ## Capability Leases
@@ -177,7 +177,7 @@ CapabilityLease {
 
 1. **Grant**: `LeaseManager::grant()` creates a lease for a thread
 2. **Check**: `LeaseManager::check()` verifies the lease is valid (not expired, not revoked, uses remaining)
-3. **Consume**: `LeaseManager::consume()` decrements the use counter
+3. **Consume**: `LeaseManager::consume_use()` decrements the use counter
 4. **Revoke**: `LeaseManager::revoke()` permanently disables the lease
 5. **Expire**: `LeaseManager::expire_stale()` cleans up time-expired leases
 
@@ -345,7 +345,10 @@ Confidence: `1.0` if no recorded outcomes (benefit of the doubt), else `success_
 
 ## Bridge Adapters
 
-The daemon integrates the engine via three adapters in `ic/src/bridge/`:
+The daemon integrates the engine via three adapters in `ic/src/bridge/`
+(the directory also hosts the SSH subsystem — `ssh.rs`, `ssh_agent.rs`,
+`ssh_api.rs`, `ssh_client.rs`, `ssh_hostkeys.rs`, `ssh_secrets.rs` — plus
+`auth_manager.rs` and `skill_migration.rs`, which are not engine adapters):
 
 ### LlmBridgeAdapter (`ic/src/bridge/llm_adapter.rs`)
 
