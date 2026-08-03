@@ -3545,6 +3545,13 @@ async fn forward_event_to_channel(
             result_preview,
             ..
         } => {
+            if let Some(reasoning) =
+                StatusUpdate::reasoning_for_tools(std::slice::from_ref(action_name))
+            {
+                let _ = channels
+                    .send_status(channel_name, reasoning, metadata)
+                    .await;
+            }
             let display_name = format_action_display_name(action_name, params_summary);
             let _ = channels
                 .send_status(
@@ -3586,6 +3593,13 @@ async fn forward_event_to_channel(
             params_summary,
             ..
         } => {
+            if let Some(reasoning) =
+                StatusUpdate::reasoning_for_tools(std::slice::from_ref(action_name))
+            {
+                let _ = channels
+                    .send_status(channel_name, reasoning, metadata)
+                    .await;
+            }
             let display_name = format_action_display_name(action_name, params_summary);
             let _ = channels
                 .send_status(
@@ -6492,14 +6506,15 @@ mod tests {
 
         for (name, statuses) in [("gateway", &gateway_statuses), ("xmpp", &xmpp_statuses)] {
             let captured = statuses.lock().expect("poisoned");
-            assert_eq!(captured.len(), 3, "{name} should receive three statuses");
-            assert!(matches!(captured[0], StatusUpdate::ToolStarted { .. }));
+            assert_eq!(captured.len(), 4, "{name} should receive four statuses");
+            assert!(matches!(captured[0], StatusUpdate::ReasoningUpdate { .. }));
+            assert!(matches!(captured[1], StatusUpdate::ToolStarted { .. }));
             assert!(matches!(
-                &captured[1],
+                &captured[2],
                 StatusUpdate::ToolResult { preview, .. } if preview == "file.txt"
             ));
             assert!(matches!(
-                captured[2],
+                captured[3],
                 StatusUpdate::ToolCompleted { success: true, .. }
             ));
         }
@@ -6531,10 +6546,11 @@ mod tests {
         forward_event_to_channel(&event, &manager, "gateway", &serde_json::json!({})).await;
 
         let captured = statuses.lock().expect("poisoned");
-        assert_eq!(captured.len(), 2);
-        assert!(matches!(captured[0], StatusUpdate::ToolStarted { .. }));
+        assert_eq!(captured.len(), 3);
+        assert!(matches!(captured[0], StatusUpdate::ReasoningUpdate { .. }));
+        assert!(matches!(captured[1], StatusUpdate::ToolStarted { .. }));
         assert!(matches!(
-            captured[1],
+            captured[2],
             StatusUpdate::ToolCompleted { success: true, .. }
         ));
     }
@@ -6605,6 +6621,15 @@ mod tests {
         );
         assert_eq!(turns[0].tool_calls[1].name, "http");
         assert_eq!(turns[0].tool_calls[1].error.as_deref(), Some("timeout"));
+        assert_eq!(
+            turns[0]
+                .reasoning
+                .as_ref()
+                .expect("reasoning summary")
+                .decisions
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

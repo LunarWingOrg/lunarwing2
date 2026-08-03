@@ -1,6 +1,28 @@
 //! Shared utility functions for the web gateway.
 
-use crate::channels::web::types::{ToolCallInfo, TurnInfo};
+use crate::channels::StatusUpdate;
+use crate::channels::web::types::{ReasoningSummary, ToolCallInfo, ToolDecisionDto, TurnInfo};
+
+pub fn reasoning_summary(tool_calls: &[ToolCallInfo]) -> Option<ReasoningSummary> {
+    let names: Vec<String> = tool_calls.iter().map(|call| call.name.clone()).collect();
+    let StatusUpdate::ReasoningUpdate {
+        narrative,
+        decisions,
+    } = StatusUpdate::reasoning_for_tools(&names)?
+    else {
+        return None;
+    };
+    Some(ReasoningSummary {
+        narrative,
+        decisions: decisions
+            .into_iter()
+            .map(|decision| ToolDecisionDto {
+                tool_name: decision.tool_name,
+                rationale: decision.rationale,
+            })
+            .collect(),
+    })
+}
 
 /// Truncate a string to at most `max_bytes` bytes at a char boundary, appending "...".
 ///
@@ -49,6 +71,7 @@ pub fn build_turns_from_db_messages(
                 started_at: msg.created_at.to_rfc3339(),
                 completed_at: None,
                 tool_calls: Vec::new(),
+                reasoning: None,
             };
 
             // Check if next message is a tool_calls record
@@ -92,6 +115,8 @@ pub fn build_turns_from_db_messages(
                 turn.state = "Failed".to_string();
             }
 
+            turn.reasoning = reasoning_summary(&turn.tool_calls);
+
             turns.push(turn);
             turn_number += 1;
         } else if msg.role == "assistant" {
@@ -105,6 +130,7 @@ pub fn build_turns_from_db_messages(
                 started_at: msg.created_at.to_rfc3339(),
                 completed_at: Some(msg.created_at.to_rfc3339()),
                 tool_calls: Vec::new(),
+                reasoning: None,
             });
             turn_number += 1;
         }
@@ -256,6 +282,10 @@ mod tests {
         assert_eq!(turns[0].tool_calls[1].name, "http");
         assert!(turns[0].tool_calls[1].has_error);
         assert_eq!(turns[0].response.as_deref(), Some("Done"));
+        let reasoning = turns[0].reasoning.as_ref().expect("reasoning summary");
+        assert_eq!(reasoning.decisions.len(), 2);
+        assert_eq!(reasoning.decisions[0].tool_name, "shell");
+        assert!(reasoning.decisions[0].rationale.contains("environment"));
     }
 
     #[test]
@@ -303,6 +333,7 @@ mod tests {
         let turns = build_turns_from_db_messages(&messages);
         assert_eq!(turns.len(), 1);
         assert!(turns[0].tool_calls.is_empty());
+        assert!(turns[0].reasoning.is_none());
         assert_eq!(turns[0].state, "Completed");
     }
 }

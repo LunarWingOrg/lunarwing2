@@ -234,7 +234,7 @@ pub enum AppEvent {
         message: Option<String>,
     },
 
-    /// Agent reasoning update (why it chose specific tools).
+    /// Safe reasoning summary for selected tools.
     #[serde(rename = "reasoning_update")]
     ReasoningUpdate {
         narrative: String,
