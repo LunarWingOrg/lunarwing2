@@ -261,7 +261,13 @@ CLI_ENABLED=false                        # Disable interactive CLI (daemon mode)
 HEARTBEAT_ENABLED=false                  # Disable periodic background execution
 ONBOARD_COMPLETED=true                   # Skip setup wizard
 RUST_LOG=lunarwing=info                  # Log verbosity
+LUNARWING_TOKIO_WORKER_THREADS=8         # Optional; default is min(host CPUs, 8)
+LUNARWING_TOKIO_MAX_BLOCKING_THREADS=4   # Optional; default is min(host CPUs, 4)
 ```
+
+Tokio's worker and blocking-pool caps keep idle memory stable on large hosts.
+Increase them only after measuring sustained runtime saturation; they do not
+limit Cargo or other subprocess parallelism.
 
 ### Enabling heartbeat
 

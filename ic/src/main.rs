@@ -67,7 +67,14 @@ fn main() -> anyhow::Result<()> {
     #[cfg(any(feature = "postgres", feature = "libsql"))]
     lunarwing::setup::maybe_seed_default_instance_assets();
 
+    let worker_threads =
+        lunarwing::bootstrap::tokio_worker_threads().map_err(anyhow::Error::msg)?;
+    let max_blocking_threads =
+        lunarwing::bootstrap::tokio_max_blocking_threads().map_err(anyhow::Error::msg)?;
     let result = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(max_blocking_threads)
+        .thread_name("lunarwing-tokio")
         .enable_all()
         .build()?
         .block_on(async_main());

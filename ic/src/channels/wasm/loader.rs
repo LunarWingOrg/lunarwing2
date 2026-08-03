@@ -204,7 +204,7 @@ impl WasmChannelLoader {
 
         let mut results = LoadResults::default();
 
-        // Collect all .wasm entries first, then load in parallel
+        // Collect all .wasm entries first.
         let mut channel_entries = Vec::new();
         // Handle TOCTOU: if read_dir fails with NotFound, treat as empty
         let mut entries = match fs::read_dir(dir).await {
@@ -238,14 +238,14 @@ impl WasmChannelLoader {
             channel_entries.push((name, path, if has_cap { Some(cap_path) } else { None }));
         }
 
-        // Load all channels in parallel (file I/O + WASM compilation)
-        let load_futures = channel_entries
-            .iter()
-            .map(|(name, path, cap_path)| self.load_from_files(name, path, cap_path.as_deref()));
+        channel_entries.sort_by(|left, right| left.0.cmp(&right.0));
 
-        let load_results = futures::future::join_all(load_futures).await;
-
-        for ((name, path, _), result) in channel_entries.into_iter().zip(load_results) {
+        // Keep cold-start compilation bounded. Channel components are retained
+        // after preparation, so parallel compilation only raises transient RSS.
+        for (name, path, cap_path) in channel_entries {
+            let result = self
+                .load_from_files(&name, &path, cap_path.as_deref())
+                .await;
             match result {
                 Ok(loaded) => {
                     results.loaded.push(loaded);

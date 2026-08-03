@@ -777,11 +777,19 @@ The elevated daemon baseline was traced to startup high-water retention, not
 live Engine state or compiler descendants:
 
 - Dwarfstar created 32 normal Tokio runtime workers and, about 0.5 seconds later,
-  another 32 `tokio-rt-worker` threads. The second group is Wasmtime-WASI
-  36.0.13's process-global ambient runtime, a `LazyLock` multi-threaded Tokio
-  runtime used when synchronous WASI host bindings execute outside an entered
-  Tokio context. It was initialized while WASM metadata extraction ran in
-  `spawn_blocking`.
+  another 32 `tokio-rt-worker` threads. A later source-level recheck found that
+  thread names and timing do not prove the second group was Wasmtime-WASI's
+  process-global ambient runtime. Tokio 1.53 enters the owning runtime handle on
+  its blocking-pool threads, so metadata extraction reached through
+  `tokio::task::spawn_blocking` should not take Wasmtime-WASI's no-runtime
+  fallback. The second group could instead include Tokio blocking-pool workers,
+  or an ambient runtime initialized from another unentered thread. Historical
+  thread stacks were not captured, so exact ownership remains unknown.
+- A current-source reproduction with eight tools created eight main runtime
+  workers followed by eight same-runtime blocking-pool workers while loading
+  WASM components. This strongly supports blocking-pool ownership for the
+  historical second group, though it cannot retroactively prove thread identity
+  without the missing Dwarfstar stacks.
 - Startup loaded all installed `*.wasm` tool files concurrently. Dwarfstar had
   15 tool components, not the eight current install names. Seven pre-rename
   files (`gitlab.wasm`, `gotify.wasm`, `llm-context.wasm`,
@@ -796,17 +804,34 @@ live Engine state or compiler descendants:
   memory but only 47,936,640 bytes in use. This explains most of the elevated
   RSS as freed startup allocations retained in per-thread arenas.
 - Wasmtime-WASI 36.0.12 and 36.0.13 have the same ambient-runtime implementation,
-  so the 36.0.13 security bump did not introduce that runtime design. The larger
-  baseline is driven by parallel startup work, thread/arena count, and the stale
-  component set rather than a per-call Wasmtime store leak.
+  so the 36.0.13 security bump did not introduce that runtime design. Regardless
+  of second-group ownership, the larger baseline is driven by startup fan-out,
+  thread/arena count, and the stale component set rather than a per-call Wasmtime
+  store leak.
+
+A 2026-08-03 release-profile comparison used an isolated no-database process on
+an eight-CPU host with the eight current WASM tool components:
+
+- With eight async workers, sequential component loading, and Tokio's default
+  blocking-pool limit, startup reached 140,900 KiB RSS with 20 threads. Sixteen
+  threads carried the main runtime's explicit `lunarwing-tokio` name: eight
+  configured async workers followed by eight lazily-created blocking workers.
+  RSS remained 112,080 KiB after 13 minutes.
+- Capping the blocking pool at four reduced `VmRSS` and `VmHWM` to 61,812 KiB.
+  The value remained stable after 100 seconds with 12 threads: eight async
+  workers, the main thread, the WASM epoch ticker, and two support threads.
+- Main runtime defaults are now bounded at eight async workers and four blocking
+  workers, with `LUNARWING_TOKIO_WORKER_THREADS` and
+  `LUNARWING_TOKIO_MAX_BLOCKING_THREADS` overrides. Installed WASM tools and
+  channels compile sequentially, and known stale pre-rename tool artifacts are
+  ignored when their current `*-tool` replacement exists.
 
 This live rebuild supports the central accounting conclusion: an operator-run
 upgrade build is outside the tenant daemon cgroup, while a host-local shell
 started by the daemon would inherit the daemon cgroup. It does **not** validate
 shell timeout cleanup, because no in-daemon compile/cancel workload was run.
 
-Current-source review on `8c6a1da` also found the incident's primary lifecycle
-risks unchanged:
+Source review on `8c6a1da` also found the incident's primary lifecycle risks:
 
 - direct shell execution still has no process-group ownership or
   `kill_on_drop` guard;
@@ -817,9 +842,7 @@ risks unchanged:
 - `build_tenant()` still invokes bare Cargo without explicit parallelism or a
   dedicated bounded build scope;
 - generated tenant units still declare no explicit memory, swap, PID, or CPU
-  ceiling;
-- WASM tool startup remains fully parallel and installation does not remove
-  obsolete artifact names, amplifying allocator high-water retention.
+  ceiling.
 
 ## Research provenance
 
