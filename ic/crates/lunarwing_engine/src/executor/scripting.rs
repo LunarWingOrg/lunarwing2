@@ -381,11 +381,28 @@ pub async fn execute_code_with_skills(
     // the JoinHandle here. When ResolveFutures yields, we await them.
     let mut pending_futures: HashMap<u32, PendingFuture> = HashMap::new();
 
+    macro_rules! settle_pending {
+        () => {
+            abort_and_settle_pending_futures(
+                &mut pending_futures,
+                PendingResolutionState {
+                    leases,
+                    context,
+                    action_results: &mut action_results,
+                    events: &mut events,
+                    recursive_tokens: &mut recursive_tokens,
+                },
+            )
+            .await
+        };
+    }
+
     // Drive the execution loop
     let mut call_counter = 0u32;
     loop {
         match progress {
             RunProgress::Complete(obj) => {
+                settle_pending!();
                 return Ok(CodeExecutionResult {
                     return_value: monty_to_json(&obj),
                     stdout,
@@ -430,9 +447,9 @@ pub async fn execute_code_with_skills(
                         let args = call.args.clone();
                         let kwargs = call.kwargs.clone();
                         let llm = llm.clone();
-                        let handle = tokio::spawn(async move {
+                        let handle = AbortOnDropJoinHandle::new(tokio::spawn(async move {
                             handle_llm_query_standalone(&args, &kwargs, &llm).await
-                        });
+                        }));
                         pending_futures.insert(monty_call_id, PendingFuture::Llm { handle });
                         None // handled as async below
                     }
@@ -440,9 +457,9 @@ pub async fn execute_code_with_skills(
                         let args = call.args.clone();
                         let kwargs = call.kwargs.clone();
                         let llm = llm.clone();
-                        let handle = tokio::spawn(async move {
+                        let handle = AbortOnDropJoinHandle::new(tokio::spawn(async move {
                             handle_llm_query_batched_standalone(&args, &kwargs, &llm).await
-                        });
+                        }));
                         pending_futures.insert(monty_call_id, PendingFuture::Llm { handle });
                         None
                     }
@@ -486,6 +503,7 @@ pub async fn execute_code_with_skills(
                         Ok(Err(e)) => {
                             stdout.push_str(&format!("\nError: {e}"));
                             had_error = true;
+                            settle_pending!();
                             return Ok(CodeExecutionResult {
                                 return_value: serde_json::Value::Null,
                                 stdout,
@@ -498,6 +516,7 @@ pub async fn execute_code_with_skills(
                             });
                         }
                         Err(_) => {
+                            settle_pending!();
                             return Err(EngineError::Effect {
                                 reason: "Monty VM panicked during resume".into(),
                             });
@@ -516,6 +535,7 @@ pub async fn execute_code_with_skills(
                         Ok(Err(e)) => {
                             stdout.push_str(&format!("\nError: {e}"));
                             had_error = true;
+                            settle_pending!();
                             return Ok(CodeExecutionResult {
                                 return_value: serde_json::Value::Null,
                                 stdout,
@@ -528,6 +548,7 @@ pub async fn execute_code_with_skills(
                             });
                         }
                         Err(_) => {
+                            settle_pending!();
                             return Err(EngineError::Effect {
                                 reason: "Monty VM panicked during resume_pending".into(),
                             });
@@ -566,11 +587,11 @@ pub async fn execute_code_with_skills(
                         ctx.current_call_id = Some(str_call_id.clone());
                         let ps = crate::types::event::summarize_params(&name, &params);
 
-                        let handle = tokio::spawn(async move {
+                        let handle = AbortOnDropJoinHandle::new(tokio::spawn(async move {
                             effects
                                 .execute_action(&name, params_clone, &lease_clone, &ctx)
                                 .await
-                        });
+                        }));
 
                         pending_futures.insert(
                             monty_call_id,
@@ -591,6 +612,7 @@ pub async fn execute_code_with_skills(
                             Ok(Err(e)) => {
                                 stdout.push_str(&format!("\nError: {e}"));
                                 had_error = true;
+                                settle_pending!();
                                 return Ok(CodeExecutionResult {
                                     return_value: serde_json::Value::Null,
                                     stdout,
@@ -603,6 +625,7 @@ pub async fn execute_code_with_skills(
                                 });
                             }
                             Err(_) => {
+                                settle_pending!();
                                 return Err(EngineError::Effect {
                                     reason: "Monty VM panicked during resume_pending".into(),
                                 });
@@ -618,6 +641,7 @@ pub async fn execute_code_with_skills(
                             Ok(Err(e)) => {
                                 stdout.push_str(&format!("\nError: {e}"));
                                 had_error = true;
+                                settle_pending!();
                                 return Ok(CodeExecutionResult {
                                     return_value: serde_json::Value::Null,
                                     stdout,
@@ -630,6 +654,7 @@ pub async fn execute_code_with_skills(
                                 });
                             }
                             Err(_) => {
+                                settle_pending!();
                                 return Err(EngineError::Effect {
                                     reason: "Monty VM panicked during resume".into(),
                                 });
@@ -637,6 +662,7 @@ pub async fn execute_code_with_skills(
                         }
                     }
                     PreflightResult::GatePaused(outcome) => {
+                        settle_pending!();
                         return Ok(CodeExecutionResult {
                             return_value: serde_json::Value::Null,
                             stdout,
@@ -673,6 +699,7 @@ pub async fn execute_code_with_skills(
                 .await;
 
                 if let Some(outcome) = resolution.interrupt {
+                    settle_pending!();
                     return Ok(CodeExecutionResult {
                         return_value: serde_json::Value::Null,
                         stdout,
@@ -692,6 +719,7 @@ pub async fn execute_code_with_skills(
                     Ok(Err(e)) => {
                         stdout.push_str(&format!("\nError: {e}"));
                         had_error = true;
+                        settle_pending!();
                         return Ok(CodeExecutionResult {
                             return_value: serde_json::Value::Null,
                             stdout,
@@ -704,6 +732,7 @@ pub async fn execute_code_with_skills(
                         });
                     }
                     Err(_) => {
+                        settle_pending!();
                         return Err(EngineError::Effect {
                             reason: "Monty VM panicked during ResolveFutures resume".into(),
                         });
@@ -737,6 +766,7 @@ pub async fn execute_code_with_skills(
                     Ok(Err(e)) => {
                         stdout.push_str(&format!("\nNameError: {e}"));
                         had_error = true;
+                        settle_pending!();
                         return Ok(CodeExecutionResult {
                             return_value: serde_json::Value::Null,
                             stdout,
@@ -749,6 +779,7 @@ pub async fn execute_code_with_skills(
                         });
                     }
                     Err(_) => {
+                        settle_pending!();
                         return Err(EngineError::Effect {
                             reason: "Monty VM panicked during name lookup".into(),
                         });
@@ -769,6 +800,7 @@ pub async fn execute_code_with_skills(
                     Ok(Err(e)) => {
                         stdout.push_str(&format!("\nOSError: {e}"));
                         had_error = true;
+                        settle_pending!();
                         return Ok(CodeExecutionResult {
                             return_value: serde_json::Value::Null,
                             stdout,
@@ -781,6 +813,7 @@ pub async fn execute_code_with_skills(
                         });
                     }
                     Err(_) => {
+                        settle_pending!();
                         return Err(EngineError::Effect {
                             reason: "Monty VM panicked during OS call".into(),
                         });
@@ -793,12 +826,56 @@ pub async fn execute_code_with_skills(
 
 // ── Pending future tracking ─────────────────────────────────
 
+/// Tokio detaches a task when its raw `JoinHandle` is dropped. Keep spawned
+/// CodeAct work abort-on-drop so every early return and outer cancellation
+/// stops child tool/LLM work instead of leaving side effects running.
+struct AbortOnDropJoinHandle<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn abort_handle(&self) -> tokio::task::AbortHandle {
+        // SAFETY: the handle is cleared only after `join` has completed, which
+        // consumes this wrapper and prevents any later call to this method.
+        self.handle
+            .as_ref()
+            .expect("abort-on-drop handle is present until join completes")
+            .abort_handle()
+    }
+
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        // SAFETY: every wrapper is constructed with one handle, and `join`
+        // consumes the wrapper, so no earlier operation can clear it.
+        let result = self
+            .handle
+            .as_mut()
+            .expect("abort-on-drop handle is present until join completes")
+            .await;
+        self.handle = None;
+        result
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
 /// A deferred computation spawned as a tokio task, pending resolution
 /// via `ResolveFutures`. Can be a tool execution or an LLM call.
 enum PendingFuture {
     /// Tool action execution.
     Tool {
-        handle: tokio::task::JoinHandle<Result<ActionResult, EngineError>>,
+        handle: AbortOnDropJoinHandle<Result<ActionResult, EngineError>>,
         action_name: String,
         call_id: String,
         lease_id: crate::types::capability::LeaseId,
@@ -806,7 +883,7 @@ enum PendingFuture {
     },
     /// LLM call (llm_query / llm_query_batched).
     Llm {
-        handle: tokio::task::JoinHandle<(ExtFunctionResult, TokenUsage)>,
+        handle: AbortOnDropJoinHandle<(ExtFunctionResult, TokenUsage)>,
     },
 }
 
@@ -847,7 +924,7 @@ impl PendingFuture {
                 let completion = async move {
                     PendingFutureCompletion::Tool {
                         monty_call_id,
-                        result: handle.await,
+                        result: handle.join().await,
                         action_name,
                         call_id,
                         lease_id,
@@ -862,7 +939,7 @@ impl PendingFuture {
                 let completion = async move {
                     PendingFutureCompletion::Llm {
                         monty_call_id,
-                        result: handle.await,
+                        result: handle.join().await,
                     }
                 }
                 .boxed();
@@ -886,6 +963,23 @@ impl PendingFutureCompletion {
                 result: Ok(Err(EngineError::ExecutionStopped)),
                 ..
             }
+        )
+    }
+
+    fn needs_refund_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Tool {
+                result: Ok(Err(EngineError::ExecutionStopped))
+                    | Ok(Err(EngineError::GatePaused {
+                        resume_output: None,
+                        ..
+                    })),
+                ..
+            }
+        ) || matches!(
+            self,
+            Self::Tool { result: Err(error), .. } if error.is_cancelled()
         )
     }
 }
@@ -958,6 +1052,26 @@ async fn collect_pending_futures(
         completions,
         direct_results,
         execution_stopped,
+    }
+}
+
+async fn abort_and_settle_pending_futures(
+    pending_futures: &mut HashMap<u32, PendingFuture>,
+    mut state: PendingResolutionState<'_>,
+) {
+    let mut completions: FuturesUnordered<BoxFuture<'static, PendingFutureCompletion>> =
+        FuturesUnordered::new();
+    for (monty_call_id, pending) in pending_futures.drain() {
+        let (abort_handle, completion) = pending.into_completion(monty_call_id);
+        abort_handle.abort();
+        completions.push(completion);
+    }
+    while let Some(completion) = completions.next().await {
+        if completion.needs_refund_only() {
+            settle_completion_after_stop(completion, state.leases, state.recursive_tokens).await;
+        } else {
+            let _ = resolve_pending_completion(completion, &mut state).await;
+        }
     }
 }
 
@@ -1576,9 +1690,24 @@ async fn resolve_tool_completion(
         }
         Err(e) => {
             debug!("async tool task panicked: {e}");
+            let error = format!("tool execution panicked: {e}");
+            events.push(EventKind::ActionFailed {
+                step_id: context.step_id,
+                action_name: action_name.into(),
+                call_id: call_id.into(),
+                error: error.clone(),
+                params_summary,
+            });
+            action_results.push(ActionResult {
+                call_id: call_id.into(),
+                action_name: action_name.into(),
+                output: serde_json::json!({"error": &error}),
+                is_error: true,
+                duration: Duration::ZERO,
+            });
             ToolFutureResolution::Monty(ExtFunctionResult::Error(MontyException::new(
                 ExcType::RuntimeError,
-                Some(format!("tool execution panicked: {e}")),
+                Some(error),
             )))
         }
     }
@@ -1898,6 +2027,11 @@ mod tests {
         started: Arc<tokio::sync::Barrier>,
     }
 
+    struct PreflightGateAfterHangEffects {
+        started: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
     struct HangingLlm {
         started: Arc<tokio::sync::Barrier>,
         dropped: Arc<AtomicBool>,
@@ -1988,6 +2122,38 @@ mod tests {
             _leases: &[CapabilityLease],
         ) -> Result<Vec<ActionDef>, EngineError> {
             Ok(vec![test_action("stop_tool")])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for PreflightGateAfterHangEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _params: serde_json::Value,
+            _lease: &CapabilityLease,
+            _ctx: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            if action_name == "hang_tool" {
+                self.started.store(true, Ordering::SeqCst);
+                let _drop_flag = DropFlag(Arc::clone(&self.dropped));
+                std::future::pending().await
+            } else {
+                panic!("approval-gated action must not execute")
+            }
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![
+                test_action("hang_tool"),
+                ActionDef {
+                    requires_approval: true,
+                    ..test_action("approval_tool")
+                },
+            ])
         }
     }
 
@@ -2553,6 +2719,49 @@ FINAL("must not reach")
         assert_eq!(
             leases.check(lease.id).await.unwrap().uses_remaining,
             Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_gate_aborts_pending_tool_and_refunds_lease() {
+        let thread = make_test_thread();
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let effects: Arc<dyn EffectExecutor> = Arc::new(PreflightGateAfterHangEffects {
+            started: Arc::clone(&started),
+            dropped: Arc::clone(&dropped),
+        });
+        let leases = LeaseManager::new();
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(2))
+            .await
+            .unwrap();
+        let code = r#"
+import asyncio
+await asyncio.gather(hang_tool(), approval_tool())
+FINAL("must not reach")
+"#;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_code_with_leases(code, effects, &thread, &leases),
+        )
+        .await
+        .expect("approval gate should abort and drain pending siblings")
+        .unwrap();
+
+        assert!(matches!(
+            result.need_approval,
+            Some(crate::runtime::messaging::ThreadOutcome::GatePaused { .. })
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !started.load(Ordering::SeqCst) || dropped.load(Ordering::SeqCst),
+            "pending tool remained detached after approval gate returned"
+        );
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(2)
         );
     }
 

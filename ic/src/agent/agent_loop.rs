@@ -825,7 +825,7 @@ impl Agent {
         };
 
         // Spawn reflex compiler, cache refresh, and evictor if enabled
-        let (_reflex_compiler_handle, _reflex_cache_handle, _reflex_evictor_handle) =
+        let (reflex_compiler_handle, reflex_cache_handle, reflex_evictor_handle) =
             if self.config.reflex.enabled {
                 let compiler_handle = if let (Some(store), Some(builder)) =
                     (self.store(), self.deps.builder.clone())
@@ -1178,6 +1178,17 @@ impl Agent {
         }
         if let Some((cron_handle, _)) = routine_handle {
             cron_handle.abort();
+        }
+        for handle in [
+            reflex_compiler_handle,
+            reflex_cache_handle,
+            reflex_evictor_handle,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            handle.abort();
+            let _ = handle.await;
         }
         if let Some(flusher) = reflex_hit_flusher {
             flusher

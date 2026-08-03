@@ -1061,7 +1061,27 @@ async fn handle_execute_action(
 
     // 3. Consume a lease use
     if let Err(e) = leases.consume_use(lease.id).await {
-        debug!(error = %e, "lease consumption failed (non-fatal)");
+        let error = format!("lease unavailable: {e}");
+        let output = serde_json::json!({"error": &error});
+        emit_and_record(
+            thread,
+            event_tx,
+            EventKind::ActionFailed {
+                step_id: exec_ctx.step_id,
+                action_name: name.clone(),
+                call_id: call_id.clone(),
+                error,
+                params_summary: summarize_params(&name, &params),
+            },
+            &call_id,
+            &name,
+            &output,
+        );
+        let result = serde_json::json!({
+            "output": output,
+            "is_error": true,
+        });
+        return Ok(ExtFunctionResult::Return(json_to_monty(&result)));
     }
 
     // 4. Execute
@@ -1325,7 +1345,11 @@ async fn handle_execute_actions_parallel(
                                 thread.events.push(ev);
                                 results_json.push(result_json);
                             }
-                            Some(PfOutcome::Runnable { .. }) | None => {
+                            Some(PfOutcome::Runnable { lease }) => {
+                                let _ = leases.refund_use(lease.id).await;
+                                results_json.push(serde_json::json!(null));
+                            }
+                            None => {
                                 results_json.push(serde_json::json!(null));
                             }
                         }
@@ -1370,7 +1394,23 @@ async fn handle_execute_actions_parallel(
 
         // Consume lease
         if let Err(e) = leases.consume_use(lease.id).await {
-            debug!(error = %e, "lease consumption failed (non-fatal)");
+            let error = format!("lease unavailable: {e}");
+            let output = serde_json::json!({"error": &error});
+            preflight.push(Some(PfOutcome::Error {
+                result_json: serde_json::json!({
+                    "output": &output,
+                    "is_error": true,
+                }),
+                event: EventKind::ActionFailed {
+                    step_id,
+                    action_name: pc.name.clone(),
+                    call_id: pc.call_id.clone(),
+                    error,
+                    params_summary: summarize_params(&pc.name, &pc.params),
+                },
+                output,
+            }));
+            continue;
         }
 
         preflight.push(Some(PfOutcome::Runnable { lease }));
@@ -2471,6 +2511,7 @@ mod tests {
     use crate::types::step::ActionResult;
     use crate::types::thread::{ThreadConfig, ThreadType};
     use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     // ── Python helper unit tests via Monty ──────────────────────
@@ -3227,11 +3268,76 @@ mod tests {
         started: tokio::sync::Barrier,
     }
 
+    struct CountingEffects {
+        actions: Vec<ActionDef>,
+        executions: AtomicUsize,
+    }
+
+    struct ExhaustLeaseEffects {
+        leases: Arc<LeaseManager>,
+        executions: AtomicUsize,
+    }
+
     impl StopAndHangEffects {
         fn new() -> Self {
             Self {
                 started: tokio::sync::Barrier::new(2),
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for CountingEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ActionResult {
+                call_id: String::new(),
+                action_name: action_name.to_string(),
+                output: serde_json::json!({"ok": true}),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(self.actions.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for ExhaustLeaseEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ActionResult {
+                call_id: String::new(),
+                action_name: action_name.to_string(),
+                output: serde_json::json!({"ok": true}),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            self.leases.consume_use(leases[0].id).await?;
+            Ok(vec![test_action_def("echo")])
         }
     }
 
@@ -3323,6 +3429,104 @@ mod tests {
             effects: vec![EffectType::ReadLocal],
             requires_approval: false,
         }
+    }
+
+    fn approval_action_def(name: &str) -> ActionDef {
+        ActionDef {
+            requires_approval: true,
+            ..test_action_def(name)
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_preflight_approval_refunds_earlier_lease_reservations() {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        let effects = Arc::new(CountingEffects {
+            actions: vec![
+                test_action_def("echo"),
+                approval_action_def("approval_tool"),
+            ],
+            executions: AtomicUsize::new(0),
+        });
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let leases = Arc::new(LeaseManager::new());
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(2))
+            .await
+            .unwrap();
+        let args = vec![json_to_monty(&serde_json::json!([
+            {"name": "echo", "params": {}, "call_id": "echo"},
+            {"name": "approval_tool", "params": {}, "call_id": "approval"}
+        ]))];
+
+        handle_execute_actions_parallel(
+            &args,
+            &mut thread,
+            &effects_dyn,
+            &leases,
+            &Arc::new(PolicyEngine::new()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn single_action_does_not_execute_after_lease_consumption_failure() {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(1))
+            .await
+            .unwrap();
+        let effects = Arc::new(ExhaustLeaseEffects {
+            leases: Arc::clone(&leases),
+            executions: AtomicUsize::new(0),
+        });
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let args = vec![
+            MontyObject::String("echo".into()),
+            json_to_monty(&serde_json::json!({})),
+        ];
+        let kwargs = vec![(
+            MontyObject::String("call_id".into()),
+            MontyObject::String("echo-call".into()),
+        )];
+
+        handle_execute_action(
+            &args,
+            &kwargs,
+            &mut thread,
+            &effects_dyn,
+            &leases,
+            &Arc::new(PolicyEngine::new()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 0);
+        assert!(thread.events.iter().any(|event| {
+            matches!(event.kind, EventKind::ActionFailed { ref call_id, .. } if call_id == "echo-call")
+        }));
     }
 
     #[tokio::test]

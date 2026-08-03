@@ -246,7 +246,8 @@ impl ReflexStore for LibSqlBackend {
                 UPDATE reflex_patterns
                 SET match_count = MIN(CAST(match_count AS INTEGER) + ?3, 2147483647),
                     last_matched_at = ?4,
-                    updated_at = ?4
+                    updated_at = ?4,
+                    status = CASE WHEN status = 'evicted' THEN 'active' ELSE status END
                 WHERE user_id = ?1 AND normalized_pattern = ?2
                 "#,
             )
@@ -323,7 +324,7 @@ impl ReflexStore for LibSqlBackend {
             SELECT_COLS
         );
         let mut rows = conn
-            .query(&sql, params![cutoff])
+            .query(&sql, params![cutoff.clone()])
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
@@ -338,18 +339,26 @@ impl ReflexStore for LibSqlBackend {
 
         if !dry_run && !stale.is_empty() {
             let updated_at = fmt_ts(&now);
-            for record in &mut stale {
-                conn.execute(
-                    "UPDATE reflex_patterns SET status = 'evicted', updated_at = ?2 WHERE id = ?1",
-                    params![record.id.to_string(), updated_at.clone()],
-                )
-                .await
-                .map_err(|e| DatabaseError::Query(e.to_string()))?;
-                // Reflect the eviction in the returned records so callers see the
-                // post-update status (matches the PostgreSQL backend, which re-queries).
-                record.status = "evicted".to_string();
-                record.updated_at = now;
+            let mut evicted = Vec::with_capacity(stale.len());
+            for mut record in stale {
+                let updated = conn
+                    .execute(
+                        "UPDATE reflex_patterns \
+                     SET status = 'evicted', updated_at = ?2 \
+                     WHERE id = ?1 \
+                       AND status = 'active' \
+                       AND COALESCE(last_matched_at, created_at) < ?3",
+                        params![record.id.to_string(), updated_at.clone(), cutoff.clone()],
+                    )
+                    .await
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?;
+                if updated > 0 {
+                    record.status = "evicted".to_string();
+                    record.updated_at = now;
+                    evicted.push(record);
+                }
             }
+            stale = evicted;
         }
 
         Ok(stale)

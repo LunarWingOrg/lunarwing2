@@ -2085,6 +2085,19 @@ mod tests {
             .unwrap();
         assert_eq!(stale.status, "evicted");
         assert_eq!(fresh.status, "active");
+
+        // A hit buffered before the eviction transaction may land afterward.
+        // Such a hit proves the cached pattern was live and must reactivate it.
+        backend
+            .bump_reflex_pattern_match("test-user", "stale pattern")
+            .await
+            .unwrap();
+        let patterns = backend.list_reflex_patterns("test-user").await.unwrap();
+        let stale = patterns
+            .iter()
+            .find(|pattern| pattern.normalized_pattern == "stale pattern")
+            .unwrap();
+        assert_eq!(stale.status, "active");
     }
 
     #[tokio::test]

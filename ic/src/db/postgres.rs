@@ -1410,7 +1410,8 @@ impl ReflexStore for PgBackend {
         conn.execute(
             "UPDATE reflex_patterns AS pattern \
              SET match_count = LEAST(pattern.match_count::bigint + hit.count, 2147483647)::integer, \
-                 last_matched_at = NOW(), updated_at = NOW() \
+                 last_matched_at = NOW(), updated_at = NOW(), \
+                 status = CASE WHEN pattern.status = 'evicted' THEN 'active' ELSE pattern.status END \
              FROM UNNEST($1::text[], $2::text[], $3::bigint[]) \
                   AS hit(user_id, normalized_pattern, count) \
              WHERE pattern.user_id = hit.user_id \
@@ -1478,24 +1479,25 @@ impl ReflexStore for PgBackend {
         let mut stale: Vec<ReflexPatternRecord> = rows.iter().map(row_to_reflex_pattern).collect();
 
         if !dry_run && !stale.is_empty() {
-            let ids: Vec<String> = stale.iter().map(|r| r.id.to_string()).collect();
-            conn.execute(
-                "UPDATE reflex_patterns \
-                 SET status = 'evicted', updated_at = NOW() \
-                 WHERE id = ANY($1)",
-                &[&ids.as_slice()],
-            )
-            .await?;
-            // Refresh rows to reflect updated status
+            let ids: Vec<Uuid> = stale.iter().map(|record| record.id).collect();
             let rows = conn
                 .query(
-                    "SELECT id, user_id, normalized_pattern, original_pattern, tool_name, \
-                     match_count, last_matched_at, created_at, updated_at, status, compilation_attempts, \
-                     embedding, embedding_model \
-                     FROM reflex_patterns \
-                     WHERE id = ANY($1) \
+                    "WITH evicted AS (\
+                         UPDATE reflex_patterns \
+                         SET status = 'evicted', updated_at = NOW() \
+                         WHERE id = ANY($1::uuid[]) \
+                           AND status = 'active' \
+                           AND COALESCE(last_matched_at, created_at) < $2 \
+                         RETURNING id, user_id, normalized_pattern, original_pattern, tool_name, \
+                                   match_count, last_matched_at, created_at, updated_at, status, \
+                                   compilation_attempts, embedding, embedding_model\
+                     ) \
+                     SELECT id, user_id, normalized_pattern, original_pattern, tool_name, \
+                            match_count, last_matched_at, created_at, updated_at, status, \
+                            compilation_attempts, embedding, embedding_model \
+                     FROM evicted \
                      ORDER BY COALESCE(last_matched_at, created_at) ASC",
-                    &[&ids.as_slice()],
+                    &[&ids.as_slice(), &cutoff],
                 )
                 .await?;
             stale = rows.iter().map(row_to_reflex_pattern).collect();
