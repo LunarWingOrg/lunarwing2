@@ -17,9 +17,7 @@ CONFIG_DIR="$STATE_ROOT/darkirc"
 mkdir -p "$CONFIG_DIR" "$CONFIG_ROOT/logs"
 chmod 0700 "$CONFIG_DIR"
 
-DARKIRC_WRITER_LOCK_DIR="$TMP_ROOT/writer-locks"
 DARKIRC_WRITER_LOCK_HELD="false"
-DARKIRC_WRITER_SCOPE=""
 REGISTRY_LOCKED=false
 PORTS_LOCK_HELD=false
 CONFIG_DIR_CHOWNED=false
@@ -45,13 +43,11 @@ darkirc_writer_lock() {
   [[ "$PORTS_LOCK_HELD" == false ]] \
     || fail "writer lock acquired while registry lock held"
   DARKIRC_WRITER_LOCK_HELD=true
-  DARKIRC_WRITER_SCOPE="00112233445566778899aabbccddeeff"
 }
 darkirc_writer_unlock() {
   [[ "$REGISTRY_LOCKED" == false ]] \
     || fail "writer lock released before registry lock"
   DARKIRC_WRITER_LOCK_HELD=false
-  DARKIRC_WRITER_SCOPE=""
 }
 ports_get() {
   [[ "$REGISTRY_LOCKED" == true ]] \
