@@ -202,6 +202,16 @@ impl StdioMcpTransport {
             child: Arc::new(Mutex::new(child)),
         })
     }
+
+    /// Return the child exit status without waiting for a running process.
+    pub async fn exit_status(&self) -> Result<Option<std::process::ExitStatus>, ToolError> {
+        self.child.lock().await.try_wait().map_err(|error| {
+            ToolError::ExternalService(format!(
+                "[{}] Failed to query MCP server status: {error}",
+                self.server_name
+            ))
+        })
+    }
 }
 
 #[async_trait]
