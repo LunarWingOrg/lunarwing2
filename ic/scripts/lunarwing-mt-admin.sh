@@ -651,21 +651,22 @@ EOF
 render_template() {
   local template="$1" out="$2"
   shift 2
+  render_template_content "$template" "$@" >"$out"
+}
 
+render_template_content() {
+  local template="$1"
+  shift
   [[ "$template" = /* ]] || template="$TEMPLATES_DIR/$template"
   [[ -f "$template" ]] || die "template not found: $template"
-
-  local content
+  local content pair var val
   content="$(<"$template")"
-
-  local pair var val
   for pair; do
     var="${pair%%=*}"
     val="${pair#*=}"
     content="${content//__${var}__/${val}}"
   done
-
-  printf '%s\n' "$content" > "$out"
+  printf '%s\n' "$content"
 }
 # ── Root check ────────────────────────────────────────────────────────────────
 
