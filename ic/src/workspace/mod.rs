@@ -854,21 +854,34 @@ impl Workspace {
             });
         }
         validate_prompt_write(&path, content)?;
-        let doc = self
-            .storage
-            .get_or_create_document_by_path(&self.user_id, self.agent_id, &path)
-            .await?;
+        let prompt_visible = is_system_prompt_file(&path);
+        let document_id = {
+            let doc = self
+                .storage
+                .get_or_create_document_by_path(&self.user_id, self.agent_id, &path)
+                .await?;
 
-        let candidate = appended_content(&doc.content, content, "\n");
-        validate_prompt_write(&path, &candidate)?;
+            if prompt_visible {
+                let candidate = appended_content(&doc.content, content, "\n");
+                validate_prompt_write(&path, &candidate)?;
+            }
+            doc.id
+        };
 
-        let new_content = self.storage.append_document(doc.id, content, "\n").await?;
+        {
+            let new_content = self
+                .storage
+                .append_document(document_id, content, "\n")
+                .await?;
 
-        // Scan the combined content so that injection patterns split
-        // across multiple appends are caught.
-        validate_prompt_write(&path, &new_content)?;
+            // Scan the combined content so that injection patterns split
+            // across multiple appends are caught.
+            if prompt_visible {
+                validate_prompt_write(&path, &new_content)?;
+            }
+        }
 
-        self.reindex_document(doc.id).await?;
+        self.reindex_document(document_id).await?;
         Ok(())
     }
 
@@ -998,19 +1011,29 @@ impl Workspace {
             });
         }
         validate_prompt_write(&path, content)?;
-        let doc = self
-            .storage
-            .get_or_create_document_by_path(&scope, self.agent_id, &path)
-            .await?;
-        let candidate = appended_content(&doc.content, content, "\n\n");
-        validate_prompt_write(&path, &candidate)?;
-        let new_content = self
-            .storage
-            .append_document(doc.id, content, "\n\n")
-            .await?;
-        validate_prompt_write(&path, &new_content)?;
-        self.reindex_document(doc.id).await?;
-        let document = self.storage.get_document_by_id(doc.id).await?;
+        let prompt_visible = is_system_prompt_file(&path);
+        let document_id = {
+            let doc = self
+                .storage
+                .get_or_create_document_by_path(&scope, self.agent_id, &path)
+                .await?;
+            if prompt_visible {
+                let candidate = appended_content(&doc.content, content, "\n\n");
+                validate_prompt_write(&path, &candidate)?;
+            }
+            doc.id
+        };
+        {
+            let new_content = self
+                .storage
+                .append_document(document_id, content, "\n\n")
+                .await?;
+            if prompt_visible {
+                validate_prompt_write(&path, &new_content)?;
+            }
+        }
+        self.reindex_document(document_id).await?;
+        let document = self.storage.get_document_by_id(document_id).await?;
         Ok(WriteResult {
             document,
             redirected,
