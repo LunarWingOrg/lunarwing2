@@ -18,7 +18,8 @@ PORT_RANGE_START=10000
 PORT_RANGE_END=19999
 PORT_BLOCK_SIZE=10
 BUILD_LOCK="/var/lock/lunarwing-build.lock"
-TENANT_LIFECYCLE_LOCK_DIR="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/var/lock/lunarwing-tenants}"
+TENANT_LIFECYCLE_LOCK_DIR="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}"
+unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
 PORTS_LOCK_HELD="false"
 PROFILE="${LUNARWING_MT_PROFILE:-release}"
 # ── BUG-005 resource bounding ────────────────────────────────────────────────
@@ -43,11 +44,22 @@ DAEMON_TASKS_MAX="${LUNARWING_MT_DAEMON_TASKS_MAX:-512}"
 SOURCE_REPO="${LUNARWING_MT_SOURCE_REPO:-$LUNARWING_ROOT}"
 DARKIRC_SOURCE="${LUNARWING_MT_DARKIRC_SOURCE:-}"
 DARKIRC_BIN="${LUNARWING_MT_DARKIRC_BIN:-/usr/local/bin/darkirc}"
-# darkfi source for build-darkirc auto-clone. The source is cloned + built as the
-# tenant (or invoking) user, never root, so there are no root-owned artifacts and
-# the user's own rust toolchain is used. Override for a pinned rev or local mirror.
+# Managed exchange accepts only this pinned, root-attested DarkFi profile. Build
+# recipes execute in a disposable tree as a dedicated unprivileged account.
 DARKIRC_REPO="${LUNARWING_MT_DARKIRC_REPO:-https://github.com/darkrenaissance/darkfi}"
-DARKIRC_REV="${LUNARWING_MT_DARKIRC_REV:-a05956d412a091e8b54c1cd4f4264c33b941203d}"
+DARKIRC_APPROVED_REV="a05956d412a091e8b54c1cd4f4264c33b941203d"
+DARKIRC_REV="${LUNARWING_MT_DARKIRC_REV:-$DARKIRC_APPROVED_REV}"
+DARKIRC_BUILD_USER="${LUNARWING_MT_DARKIRC_BUILD_USER:-lunarwing-build}"
+DARKIRC_BUILD_HOME="${LUNARWING_MT_DARKIRC_BUILD_HOME:-/var/cache/lunarwing/build-home}"
+DARKIRC_BUILD_ROOT="${LUNARWING_MT_DARKIRC_BUILD_ROOT:-/var/cache/lunarwing/darkirc-builds}"
+DARKIRC_COMPAT_FILE="${LUNARWING_MT_DARKIRC_COMPAT_FILE:-/etc/lunarwing/darkirc-compat.json}"
+DARKIRC_KEY_HELPER="${LUNARWING_MT_DARKIRC_KEY_HELPER:-/usr/local/libexec/lunarwing-darkirc-key-helper}"
+DARKIRC_KEY_HELPER_BUILD_ROOT="${LUNARWING_MT_DARKIRC_KEY_HELPER_BUILD_ROOT:-/var/cache/lunarwing/darkirc-key-helper-target}"
+DARKIRC_WRITER_LOCK_DIR="${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-/run/lock/lunarwing-darkirc}"
+DARKIRC_WRITER_LOCK_HELD="false"
+DARKIRC_WRITER_LOCK_FD=""
+DARKIRC_WRITER_SCOPE=""
+DARKIRC_WRITER_LOCK_INHERITED="false"
 OPENRC_ENV_EXEC_SRC="$SCRIPT_DIR/lunarwing-openrc-env-exec.sh"
 OPENRC_ENV_EXEC="/usr/local/libexec/lunarwing-openrc-env-exec"
 OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}"
