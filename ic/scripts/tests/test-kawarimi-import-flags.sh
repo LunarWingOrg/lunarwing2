@@ -470,10 +470,37 @@ SECRETS_MASTER_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ENV
 chmod 0600 "$tmp/export-home/alpha/lunarwing/env/lunarwing.env"
 printf '{"tenants":{"alpha":{"enable_darkirc":false}}}\n' >"$tmp/export-ports.json"
+cp "$EXPORT_SRC" "$tmp/export-tenant.sh"
+chmod +x "$tmp/export-tenant.sh"
 cat >"$tmp/export-mt-admin.sh" <<'MT'
 #!/usr/bin/env bash
 # Dispatch markers required by export-tenant compatibility checks.
+validate_boundary() {
+  tenant="$1"
+  fd="${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD:-}"
+  lock_file="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:?}/${tenant}.lock"
+  [[ "$fd" =~ ^[0-9]+$ && -e "/proc/self/fd/$fd" \
+    && "$(stat -Lc '%d:%i' "/proc/self/fd/$fd")" == "$(stat -c '%d:%i' "$lock_file")" ]] \
+    || exit 90
+  exec 8>"$lock_file"
+  ! flock -x -n 8 || exit 91
+}
 case "${1:-}" in
+  migration-export-boundary)
+    tenant="$2"
+    shift 2
+    [[ ! -v KAWARIMI_PASS ]] || : >"${KAWARIMI_TEST_WORK:?}/passphrase-env-leak"
+    lock_dir="$(dirname "$0")/export-lifecycle-locks"
+    mkdir -p "$lock_dir"
+    exec 9>"$lock_dir/${tenant}.lock"
+    flock -x 9
+    exec env LUNARWING_MT_EXPORT_BOUNDARY_TENANT="$tenant" \
+      LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD=9 \
+      LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT="$tenant" \
+      LUNARWING_MT_LIFECYCLE_LOCK_DIR="$lock_dir" \
+      "$(dirname "$0")/export-tenant.sh" "$tenant" "$@"
+    ;;
+  validate-migration-export-boundary) validate_boundary "$2"; exit 0 ;;
   stop-writers)
     : >"${KAWARIMI_TEST_WORK:?}/systemctl-called"
     exit 0
@@ -596,12 +623,11 @@ KIMI_API_KEY=encrypted-roundtrip-kimi-secret
 ENV
 chmod 0600 "$tmp/export-home/alpha/lunarwing/env/lunarwing.env"
 full_export_output="$(
-  exec 8<"$tmp/full-passphrase"
   PATH="$tmp/export-bin:$PATH" \
   KAWARIMI_TEST_WORK="$tmp" \
   LUNARWING_MT_ADMIN="$tmp/export-mt-admin.sh" \
   LUNARWING_PORTS_REGISTRY="$tmp/export-ports.json" \
-  KAWARIMI_PASS_FD=8 \
+  KAWARIMI_PASS="$full_passphrase" \
   bash "$EXPORT_SRC" alpha --out-dir "$tmp/export-out" 2>&1
 )" || {
   status=$?
@@ -614,6 +640,11 @@ if [[ -f "$exported_bundle" && "$(stat -c '%a' "$exported_bundle")" == "600" ]];
   pass "production export writes a mode-0600 .7z bundle"
 else
   fail "production export writes a mode-0600 .7z bundle"
+fi
+if [[ -e "$tmp/passphrase-env-leak" ]]; then
+  fail "legacy KAWARIMI_PASS is removed before mt-admin boundary"
+else
+  pass "legacy KAWARIMI_PASS is removed before mt-admin boundary"
 fi
 
 roundtrip_output="$(

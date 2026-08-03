@@ -502,8 +502,11 @@ pub struct MigrationValidation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CrashPoint {
+    AfterCandidates,
     AfterJournal,
+    AfterLedgerRename,
     AfterLedger,
+    AfterConfigRename,
     AfterConfig,
     AfterLedgerCommit,
     AfterActivationStart,
@@ -3477,24 +3480,29 @@ fn prepared_result_from_secret(
 
 fn replay_prepared_exchange(
     inventory: &PendingInventory,
-    request: &PrepareExchange<'_>,
+    contact_name: &str,
+    intended_peer_contact_id: Option<&str>,
+    intended_peer_fingerprint: Option<&str>,
+    label: Option<&str>,
+    previous_fingerprint: Option<&str>,
+    attestation: &CompatibilityAttestation,
 ) -> Result<Option<PreparedResult>> {
     let mut replay = None;
     for entry in &inventory.entries {
-        if entry.secret.contact_name.to_lowercase() != request.contact_name.to_lowercase() {
+        if entry.secret.contact_name.to_lowercase() != contact_name.to_lowercase() {
             continue;
         }
-        if entry.secret.contact_name != request.contact_name
+        if entry.secret.contact_name != contact_name
             || entry.secret.role != ExchangeRole::InitiatorOffer.as_str()
         {
             return Err(KeyManagerError::ContactConflict);
         }
         let artifact: PreparedExchange = serde_json::from_str(&entry.secret.public_artifact)
             .map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
-        if artifact.intended_peer_contact_id.as_deref() != request.intended_peer_contact_id
-            || artifact.intended_peer_fingerprint.as_deref() != request.intended_peer_fingerprint
-            || artifact.label.as_deref() != request.label
-            || artifact.previous_fingerprint.as_deref() != request.previous_fingerprint
+        if artifact.intended_peer_contact_id.as_deref() != intended_peer_contact_id
+            || artifact.intended_peer_fingerprint.as_deref() != intended_peer_fingerprint
+            || artifact.label.as_deref() != label
+            || artifact.previous_fingerprint.as_deref() != previous_fingerprint
         {
             return Err(KeyManagerError::ContactConflict);
         }
@@ -3504,7 +3512,7 @@ fn replay_prepared_exchange(
         replay = Some(prepared_result_from_secret(
             &entry.secret,
             ExchangeRole::InitiatorOffer,
-            request.attestation,
+            attestation,
         )?);
     }
     Ok(replay)
@@ -3512,7 +3520,9 @@ fn replay_prepared_exchange(
 
 fn replay_responded_exchange(
     inventory: &PendingInventory,
-    request: &RespondExchange<'_>,
+    contact_name: &str,
+    label: Option<&str>,
+    attestation: &CompatibilityAttestation,
     initiator: &ValidatedPublicArtifact,
 ) -> Result<Option<PreparedResult>> {
     let mut replay = None;
@@ -3520,11 +3530,17 @@ fn replay_responded_exchange(
         let peer_offer_id = pending_peer_offer_id(&entry.secret)?;
         if peer_offer_id.as_deref() == Some(initiator.offer_id.as_str()) {
             if entry.secret.role != ExchangeRole::ResponderResponse.as_str()
-                || entry.secret.contact_name != request.contact_name
+                || entry.secret.contact_name != contact_name
                 || entry.secret.peer_artifact.as_deref()
                     != std::str::from_utf8(&initiator.canonical).ok()
             {
                 return Err(KeyManagerError::OfferConflict);
+            }
+            let artifact: ResponderExchange =
+                serde_json::from_str(&entry.secret.public_artifact)
+                    .map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
+            if artifact.label.as_deref() != label {
+                return Err(KeyManagerError::ContactConflict);
             }
             if replay.is_some() {
                 return Err(KeyManagerError::RecoveryRequired);
@@ -3532,14 +3548,14 @@ fn replay_responded_exchange(
             replay = Some(prepared_result_from_secret(
                 &entry.secret,
                 ExchangeRole::ResponderResponse,
-                request.attestation,
+                attestation,
             )?);
             continue;
         }
         if entry.secret.offer_id == initiator.offer_id {
             return Err(KeyManagerError::OfferConflict);
         }
-        if entry.secret.contact_name.to_lowercase() == request.contact_name.to_lowercase() {
+        if entry.secret.contact_name.to_lowercase() == contact_name.to_lowercase() {
             return Err(KeyManagerError::ContactConflict);
         }
     }
@@ -3620,6 +3636,7 @@ fn exchange_journal(
         &config_hash,
         &ledger_hash,
     )?;
+    inject_crash(request.crash_point, CrashPoint::AfterCandidates)?;
     let mut journal = JournalFile {
         schema: "lunarwing.darkirc-transaction/v1".to_owned(),
         transaction_id: transaction_id.clone(),
@@ -3654,11 +3671,13 @@ fn exchange_journal(
     write_journal(workspace, &journal_path, &journal)?;
     inject_crash(request.crash_point, CrashPoint::AfterJournal)?;
     workspace.rename(&ledger_candidate, LEDGER_FILE)?;
+    inject_crash(request.crash_point, CrashPoint::AfterLedgerRename)?;
     journal.phase = JournalPhase::LedgerCommitted.as_str().to_owned();
     replace_journal(workspace, &journal_path, &journal)?;
     inject_crash(request.crash_point, CrashPoint::AfterLedgerCommit)?;
     inject_crash(request.crash_point, CrashPoint::AfterLedger)?;
     workspace.rename(&config_candidate, CONFIG_FILE)?;
+    inject_crash(request.crash_point, CrashPoint::AfterConfigRename)?;
     journal.phase = JournalPhase::ConfigCommitted.as_str().to_owned();
     replace_journal(workspace, &journal_path, &journal)?;
     inject_crash(request.crash_point, CrashPoint::AfterConfig)?;
@@ -3690,11 +3709,99 @@ pub struct PrepareExchange<'a> {
     pub attestation: &'a CompatibilityAttestation,
 }
 
+pub struct GeneratedExchangeMaterial {
+    pub offer_id: String,
+    pub contact_id: String,
+    pub local_public: String,
+    pub local_private: SecretString,
+}
+
+pub struct PrepareExchangeOperation<'a> {
+    pub contact_name: &'a str,
+    pub intended_peer_contact_id: Option<&'a str>,
+    pub intended_peer_fingerprint: Option<&'a str>,
+    pub label: Option<&'a str>,
+    pub previous_fingerprint: Option<&'a str>,
+    pub generation: u64,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub now: i64,
+    pub attestation: &'a CompatibilityAttestation,
+}
+
 pub fn prepare_exchange(
     paths: &TenantPaths,
     scope_id: &str,
     request: &PrepareExchange<'_>,
 ) -> Result<PreparedResult> {
+    validate_prepare_request(scope_id, request)?;
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    recover_locked(&workspace, scope_id)?;
+    expire_pending_locked(&workspace, scope_id, request.now)?;
+    prepare_exchange_locked(&workspace, scope_id, request)
+}
+
+pub fn prepare_exchange_with_generator<F>(
+    paths: &TenantPaths,
+    scope_id: &str,
+    operation: &PrepareExchangeOperation<'_>,
+    generator: F,
+) -> Result<PreparedResult>
+where
+    F: FnOnce() -> Result<GeneratedExchangeMaterial>,
+{
+    validate_scope_id(scope_id)?;
+    validate_contact_name(operation.contact_name)?;
+    validate_exchange_times(operation.created_at, operation.expires_at, operation.now)?;
+    require_live_exchange(operation.expires_at, operation.now)?;
+    if operation.generation != INITIAL_EXCHANGE_GENERATION {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    if let Some(peer_contact_id) = operation.intended_peer_contact_id {
+        validate_offer_id(peer_contact_id)?;
+    }
+    if let Some(peer_f) = operation.intended_peer_fingerprint {
+        PublicFingerprint::parse(peer_f)?;
+    }
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    recover_locked(&workspace, scope_id)?;
+    expire_pending_locked(&workspace, scope_id, operation.now)?;
+    let inventory = pending_inventory(&workspace, scope_id)?;
+    if let Some(existing) = replay_prepared_exchange(
+        &inventory,
+        operation.contact_name,
+        operation.intended_peer_contact_id,
+        operation.intended_peer_fingerprint,
+        operation.label,
+        operation.previous_fingerprint,
+        operation.attestation,
+    )? {
+        return Ok(existing);
+    }
+    let material = generator()?;
+    let request = PrepareExchange {
+        contact_name: operation.contact_name,
+        offer_id: &material.offer_id,
+        contact_id: &material.contact_id,
+        local_public: &material.local_public,
+        local_private: material.local_private.expose_secret(),
+        intended_peer_contact_id: operation.intended_peer_contact_id,
+        intended_peer_fingerprint: operation.intended_peer_fingerprint,
+        label: operation.label,
+        previous_fingerprint: operation.previous_fingerprint,
+        generation: operation.generation,
+        created_at: operation.created_at,
+        expires_at: operation.expires_at,
+        now: operation.now,
+        attestation: operation.attestation,
+    };
+    validate_prepare_request(scope_id, &request)?;
+    prepare_exchange_locked(&workspace, scope_id, &request)
+}
+
+fn validate_prepare_request(scope_id: &str, request: &PrepareExchange<'_>) -> Result<()> {
     validate_scope_id(scope_id)?;
     validate_contact_name(request.contact_name)?;
     validate_offer_id(request.offer_id)?;
@@ -3707,28 +3814,41 @@ pub fn prepare_exchange(
     if let Some(peer_contact_id) = request.intended_peer_contact_id {
         validate_offer_id(peer_contact_id)?;
     }
-    let local_fingerprint = public_fingerprint(request.local_public)?;
-    let _ = private_key_bytes(request.local_private)?;
-    if let Some(peer_f) = request.intended_peer_fingerprint {
-        PublicFingerprint::parse(peer_f)?;
+    public_fingerprint(request.local_public)?;
+    private_key_bytes(request.local_private)?;
+    if let Some(peer_fingerprint) = request.intended_peer_fingerprint {
+        PublicFingerprint::parse(peer_fingerprint)?;
     }
-    let workspace = Workspace::open(paths.clone())?;
-    let _lock = workspace.lock()?;
-    recover_locked(&workspace, scope_id)?;
-    expire_pending_locked(&workspace, scope_id, request.now)?;
+    Ok(())
+}
+
+fn prepare_exchange_locked(
+    workspace: &Workspace,
+    scope_id: &str,
+    request: &PrepareExchange<'_>,
+) -> Result<PreparedResult> {
+    let local_fingerprint = public_fingerprint(request.local_public)?;
     let old_ledger = workspace.read_optional(LEDGER_FILE)?;
     let ledger = match old_ledger.as_ref().map(|b| b.as_slice()) {
         Some(bytes) => parse_ledger(bytes, scope_id)?,
         None => empty_ledger(scope_id),
     };
-    let inventory = pending_inventory(&workspace, scope_id)?;
-    if let Some(existing) = replay_prepared_exchange(&inventory, request)? {
+    let inventory = pending_inventory(workspace, scope_id)?;
+    if let Some(existing) = replay_prepared_exchange(
+        &inventory,
+        request.contact_name,
+        request.intended_peer_contact_id,
+        request.intended_peer_fingerprint,
+        request.label,
+        request.previous_fingerprint,
+        request.attestation,
+    )? {
         return Ok(existing);
     }
     if ledger.consumed_exchange_ids.contains_key(request.offer_id) {
         return Err(KeyManagerError::OfferConflict);
     }
-    if contact_occupied(&workspace, request.contact_name, &ledger)? {
+    if contact_occupied(workspace, request.contact_name, &ledger)? {
         return Err(KeyManagerError::ContactConflict);
     }
     reject_pending_reservation(
@@ -3738,7 +3858,7 @@ pub fn prepare_exchange(
         request.offer_id,
     )?;
     reject_local_private_reuse(
-        &workspace,
+        workspace,
         &inventory,
         &ledger,
         request.local_public,
@@ -3757,7 +3877,7 @@ pub fn prepare_exchange(
         .map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
     let mut secret = secret;
     secret.public_artifact.clone_from(&public_artifact);
-    write_new_pending_secret(&workspace, &secret, &inventory)?;
+    write_new_pending_secret(workspace, &secret, &inventory)?;
     Ok(PreparedResult {
         offer_id: request.offer_id.to_owned(),
         contact_id: request.contact_id.to_owned(),
@@ -3783,12 +3903,95 @@ pub struct RespondExchange<'a> {
     pub attestation: &'a CompatibilityAttestation,
 }
 
+pub struct RespondExchangeOperation<'a> {
+    pub contact_name: &'a str,
+    pub expected_initiator_fingerprint: &'a PublicFingerprint,
+    pub label: Option<&'a str>,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub now: i64,
+    pub attestation: &'a CompatibilityAttestation,
+}
+
 pub fn respond_exchange(
     paths: &TenantPaths,
     scope_id: &str,
     offer_bytes: &[u8],
     request: &RespondExchange<'_>,
 ) -> Result<PreparedResult> {
+    let initiator = validate_respond_request(scope_id, offer_bytes, request)?;
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    recover_locked(&workspace, scope_id)?;
+    expire_pending_locked(&workspace, scope_id, request.now)?;
+    respond_exchange_locked(&workspace, scope_id, request, &initiator)
+}
+
+pub fn respond_exchange_with_generator<F>(
+    paths: &TenantPaths,
+    scope_id: &str,
+    offer_bytes: &[u8],
+    operation: &RespondExchangeOperation<'_>,
+    generator: F,
+) -> Result<PreparedResult>
+where
+    F: FnOnce() -> Result<GeneratedExchangeMaterial>,
+{
+    validate_scope_id(scope_id)?;
+    validate_contact_name(operation.contact_name)?;
+    validate_exchange_times(operation.created_at, operation.expires_at, operation.now)?;
+    require_live_exchange(operation.expires_at, operation.now)?;
+    let initiator = validate_public_exchange_at(
+        offer_bytes,
+        ExchangeRole::InitiatorOffer,
+        operation.attestation,
+        operation.now,
+    )?;
+    require_live_exchange(initiator.expires_at, operation.now)?;
+    if initiator.generation != INITIAL_EXCHANGE_GENERATION {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    }
+    if initiator.public_fingerprint != *operation.expected_initiator_fingerprint {
+        return Err(KeyManagerError::FingerprintMismatch);
+    }
+    let workspace = Workspace::open(paths.clone())?;
+    let _lock = workspace.lock()?;
+    recover_locked(&workspace, scope_id)?;
+    expire_pending_locked(&workspace, scope_id, operation.now)?;
+    let inventory = pending_inventory(&workspace, scope_id)?;
+    if let Some(existing) = replay_responded_exchange(
+        &inventory,
+        operation.contact_name,
+        operation.label,
+        operation.attestation,
+        &initiator,
+    )? {
+        return Ok(existing);
+    }
+    let material = generator()?;
+    let request = RespondExchange {
+        contact_name: operation.contact_name,
+        offer_id: &material.offer_id,
+        contact_id: &material.contact_id,
+        local_public: &material.local_public,
+        local_private: material.local_private.expose_secret(),
+        initiator_offer_id: &initiator.offer_id,
+        expected_initiator_fingerprint: operation.expected_initiator_fingerprint,
+        label: operation.label,
+        created_at: operation.created_at,
+        expires_at: operation.expires_at,
+        now: operation.now,
+        attestation: operation.attestation,
+    };
+    let validated_initiator = validate_respond_request(scope_id, offer_bytes, &request)?;
+    respond_exchange_locked(&workspace, scope_id, &request, &validated_initiator)
+}
+
+fn validate_respond_request(
+    scope_id: &str,
+    offer_bytes: &[u8],
+    request: &RespondExchange<'_>,
+) -> Result<ValidatedPublicArtifact> {
     validate_scope_id(scope_id)?;
     validate_contact_name(request.contact_name)?;
     validate_offer_id(request.offer_id)?;
@@ -3796,8 +3999,8 @@ pub fn respond_exchange(
     validate_offer_id(request.initiator_offer_id)?;
     validate_exchange_times(request.created_at, request.expires_at, request.now)?;
     require_live_exchange(request.expires_at, request.now)?;
-    let local_fingerprint = public_fingerprint(request.local_public)?;
-    let _ = private_key_bytes(request.local_private)?;
+    public_fingerprint(request.local_public)?;
+    private_key_bytes(request.local_private)?;
     let initiator = validate_public_exchange_at(
         offer_bytes,
         ExchangeRole::InitiatorOffer,
@@ -3816,17 +4019,29 @@ pub fn respond_exchange(
     if initiator.public_fingerprint != *request.expected_initiator_fingerprint {
         return Err(KeyManagerError::FingerprintMismatch);
     }
-    let workspace = Workspace::open(paths.clone())?;
-    let _lock = workspace.lock()?;
-    recover_locked(&workspace, scope_id)?;
-    expire_pending_locked(&workspace, scope_id, request.now)?;
+    Ok(initiator)
+}
+
+fn respond_exchange_locked(
+    workspace: &Workspace,
+    scope_id: &str,
+    request: &RespondExchange<'_>,
+    initiator: &ValidatedPublicArtifact,
+) -> Result<PreparedResult> {
+    let local_fingerprint = public_fingerprint(request.local_public)?;
     let old_ledger = workspace.read_optional(LEDGER_FILE)?;
     let ledger = match old_ledger.as_ref().map(|b| b.as_slice()) {
         Some(bytes) => parse_ledger(bytes, scope_id)?,
         None => empty_ledger(scope_id),
     };
-    let inventory = pending_inventory(&workspace, scope_id)?;
-    if let Some(existing) = replay_responded_exchange(&inventory, request, &initiator)? {
+    let inventory = pending_inventory(workspace, scope_id)?;
+    if let Some(existing) = replay_responded_exchange(
+        &inventory,
+        request.contact_name,
+        request.label,
+        request.attestation,
+        initiator,
+    )? {
         return Ok(existing);
     }
     if initiator
@@ -3848,7 +4063,7 @@ pub fn respond_exchange(
     {
         return Err(KeyManagerError::OfferConflict);
     }
-    if contact_occupied(&workspace, request.contact_name, &ledger)? {
+    if contact_occupied(workspace, request.contact_name, &ledger)? {
         return Err(KeyManagerError::ContactConflict);
     }
     reject_pending_reservation(
@@ -3858,13 +4073,13 @@ pub fn respond_exchange(
         request.offer_id,
     )?;
     reject_local_private_reuse(
-        &workspace,
+        workspace,
         &inventory,
         &ledger,
         request.local_public,
         request.local_private,
     )?;
-    let secret = make_responder_secret(scope_id, &initiator, request)?;
+    let secret = make_responder_secret(scope_id, initiator, request)?;
     let artifact = make_responder_artifact(
         &secret,
         &initiator.offer_id,
@@ -3878,7 +4093,7 @@ pub fn respond_exchange(
         .map_err(|_| KeyManagerError::InvalidExchangeArtifact)?;
     let mut secret = secret;
     secret.public_artifact.clone_from(&public_artifact);
-    write_new_pending_secret(&workspace, &secret, &inventory)?;
+    write_new_pending_secret(workspace, &secret, &inventory)?;
     Ok(PreparedResult {
         offer_id: request.offer_id.to_owned(),
         contact_id: request.contact_id.to_owned(),
@@ -4855,6 +5070,10 @@ fn hash_optional(bytes: Option<&[u8]>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use tempfile::TempDir;
 
@@ -5193,7 +5412,7 @@ my_dm_chacha_secret = "{private}"
             Some(CrashPoint::AfterLedger),
         )
         .expect_err("inject crash after ledger");
-        assert!(matches!(error, KeyManagerError::CrashInjected));
+        assert!(matches!(&error, KeyManagerError::CrashInjected));
         let before = fs::read_to_string(paths.darkirc_dir().join(CONFIG_FILE))
             .expect("read pre-recovery config");
         assert!(before.contains("21001"));
@@ -6519,6 +6738,138 @@ my_dm_chacha_secret = "{bob_private}"
     }
 
     #[test]
+    fn concurrent_semantic_prepare_retries_invoke_generator_once() {
+        let (_temp, paths) = fixture();
+        let barrier = Arc::new(Barrier::new(3));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for index in 0..2_u8 {
+            let paths = paths.clone();
+            let barrier = Arc::clone(&barrier);
+            let invocations = Arc::clone(&invocations);
+            threads.push(std::thread::spawn(move || {
+                let attestation = exchange_attestation();
+                let operation = PrepareExchangeOperation {
+                    contact_name: "bob",
+                    intended_peer_contact_id: None,
+                    intended_peer_fingerprint: None,
+                    label: None,
+                    previous_fingerprint: None,
+                    generation: INITIAL_EXCHANGE_GENERATION,
+                    created_at: EXCHANGE_NOW,
+                    expires_at: EXCHANGE_NOW + DEFAULT_OFFER_TTL_SECONDS,
+                    now: EXCHANGE_NOW,
+                    attestation: &attestation,
+                };
+                barrier.wait();
+                prepare_exchange_with_generator(&paths, SCOPE, &operation, || {
+                    invocations.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(100));
+                    Ok(GeneratedExchangeMaterial {
+                        offer_id: format!("{:032x}", u128::from(index) + 1),
+                        contact_id: format!("{:032x}", u128::from(index) + 3),
+                        local_public: valid_public(60 + index),
+                        local_private: SecretString::from(valid_private(70 + index)),
+                    })
+                })
+                .expect("concurrent semantic prepare")
+            }));
+        }
+        barrier.wait();
+        let first = threads.remove(0).join().expect("first prepare thread");
+        let second = threads.remove(0).join().expect("second prepare thread");
+
+        assert_eq!(first, second);
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(!first.public_artifact.contains(&valid_private(70)));
+        assert!(!first.public_artifact.contains(&valid_private(71)));
+        let workspace = Workspace::open(paths).expect("workspace");
+        assert_eq!(
+            pending_inventory(&workspace, SCOPE)
+                .expect("pending inventory")
+                .entries
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_semantic_respond_retries_invoke_generator_once() {
+        let (_initiator_temp, initiator) = fixture();
+        let (_responder_temp, responder) = fixture();
+        let attestation = exchange_attestation();
+        let initiator_public = valid_public(80);
+        let initiator_private = valid_private(81);
+        let prepare = exchange_request(
+            &attestation,
+            "bob",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &initiator_public,
+            &initiator_private,
+        );
+        let offer = prepare_exchange(&initiator, SCOPE, &prepare).expect("prepare offer");
+        let initiator_fingerprint =
+            PublicFingerprint::from_encoded_public_key(&initiator_public).expect("fingerprint");
+        let barrier = Arc::new(Barrier::new(3));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for index in 0..2_u8 {
+            let responder = responder.clone();
+            let offer = offer.public_artifact.clone();
+            let initiator_fingerprint = initiator_fingerprint.clone();
+            let barrier = Arc::clone(&barrier);
+            let invocations = Arc::clone(&invocations);
+            threads.push(std::thread::spawn(move || {
+                let attestation = exchange_attestation();
+                let operation = RespondExchangeOperation {
+                    contact_name: "alice",
+                    expected_initiator_fingerprint: &initiator_fingerprint,
+                    label: None,
+                    created_at: EXCHANGE_NOW + 1,
+                    expires_at: EXCHANGE_NOW + DEFAULT_OFFER_TTL_SECONDS,
+                    now: EXCHANGE_NOW + 1,
+                    attestation: &attestation,
+                };
+                barrier.wait();
+                respond_exchange_with_generator(
+                    &responder,
+                    SCOPE,
+                    offer.as_bytes(),
+                    &operation,
+                    || {
+                        invocations.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(100));
+                        Ok(GeneratedExchangeMaterial {
+                            offer_id: format!("{:032x}", u128::from(index) + 3),
+                            contact_id: format!("{:032x}", u128::from(index) + 5),
+                            local_public: valid_public(82 + index),
+                            local_private: SecretString::from(valid_private(84 + index)),
+                        })
+                    },
+                )
+                .expect("concurrent semantic respond")
+            }));
+        }
+        barrier.wait();
+        let first = threads.remove(0).join().expect("first respond thread");
+        let second = threads.remove(0).join().expect("second respond thread");
+
+        assert_eq!(first, second);
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(!first.public_artifact.contains(&valid_private(84)));
+        assert!(!first.public_artifact.contains(&valid_private(85)));
+        let workspace = Workspace::open(responder).expect("workspace");
+        assert_eq!(
+            pending_inventory(&workspace, SCOPE)
+                .expect("pending inventory")
+                .entries
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn contact_toml_serialization_quotes_hostile_names() {
         let public = valid_public(11);
         let private = valid_private(12);
@@ -7100,6 +7451,301 @@ my_dm_chacha_secret = "{bob_private}"
                 .expect("transaction directory")
                 .is_empty()
         );
+    }
+
+    fn assert_bytes_exclude_secrets(bytes: &[u8], secrets: &[&str], surface: &str) {
+        for secret in secrets {
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "{surface} exposed private key material"
+            );
+        }
+    }
+
+    fn assert_completed_initiator_state(pair: &PairFixture, status: &ExchangeStatus) {
+        let workspace = Workspace::open(pair.initiator.clone()).expect("workspace");
+        let pending = read_pending_secret(&workspace, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", SCOPE)
+            .expect("installed pending exchange");
+        let responder_fingerprint =
+            public_fingerprint(&pair.responder_public).expect("responder fingerprint");
+        let initiator_fingerprint =
+            public_fingerprint(&pair.initiator_public).expect("initiator fingerprint");
+        assert_eq!(status.state, ExchangeState::Installed.as_str());
+        assert_eq!(status.offer_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(status.contact_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(status.peer_fingerprint, responder_fingerprint);
+        assert_eq!(pending.state, ExchangeState::Installed.as_str());
+        assert_eq!(
+            pending.peer_public.as_deref(),
+            Some(pair.responder_public.as_str())
+        );
+        assert_eq!(
+            pending.peer_fingerprint.as_deref(),
+            Some(responder_fingerprint.as_str())
+        );
+        assert_eq!(
+            pending.peer_contact_id.as_deref(),
+            Some("dddddddddddddddddddddddddddddddd")
+        );
+        assert_eq!(
+            pending.peer_artifact.as_deref(),
+            Some(pair.response.public_artifact.as_str())
+        );
+        let transcript = pending.transcript.as_deref().expect("installed transcript");
+        assert!(valid_hash(transcript));
+
+        let config = fs::read(pair.initiator.darkirc_dir().join(CONFIG_FILE)).expect("config");
+        assert_contact_field(&config, "bob", "dm_chacha_public", &pair.responder_public);
+        assert_contact_field(
+            &config,
+            "bob",
+            "my_dm_chacha_secret",
+            &pair.initiator_private,
+        );
+        let ledger = read_ledger(&pair.initiator, SCOPE).expect("ledger");
+        let contact = &ledger.contacts["bob"];
+        assert_eq!(contact.state, ExchangeState::Installed.as_str());
+        assert_eq!(contact.contact_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(contact.peer_fingerprint, responder_fingerprint);
+        assert_eq!(contact.local_fingerprint, initiator_fingerprint);
+        assert_eq!(contact.generation, INITIAL_EXCHANGE_GENERATION);
+        for exchange_id in [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "cccccccccccccccccccccccccccccccc",
+        ] {
+            let tombstone = &ledger.consumed_exchange_ids[exchange_id];
+            assert_eq!(tombstone.state, ExchangeState::Installed.as_str());
+            assert_eq!(tombstone.contact_name, "bob");
+            assert_eq!(tombstone.contact_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            assert_eq!(tombstone.peer_fingerprint, responder_fingerprint);
+            assert_eq!(tombstone.local_fingerprint, initiator_fingerprint);
+            assert_eq!(tombstone.local_offer_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            assert_eq!(tombstone.peer_offer_id, "cccccccccccccccccccccccccccccccc");
+            assert_eq!(
+                tombstone.peer_contact_id,
+                "dddddddddddddddddddddddddddddddd"
+            );
+            assert_eq!(tombstone.transcript, transcript);
+        }
+        let secrets = [&pair.initiator_private[..], &pair.responder_private[..]];
+        assert_bytes_exclude_secrets(
+            &ledger_bytes(&ledger).expect("ledger bytes"),
+            &secrets,
+            "ledger",
+        );
+        assert_bytes_exclude_secrets(
+            &serde_json::to_vec(status).expect("status JSON"),
+            &secrets,
+            "status",
+        );
+        assert!(
+            secure_directory_files(&workspace, CANDIDATES_DIR)
+                .expect("candidate directory")
+                .is_empty()
+        );
+        assert!(
+            secure_directory_files(&workspace, TRANSACTIONS_DIR)
+                .expect("transaction directory")
+                .is_empty()
+        );
+    }
+
+    fn exercise_completion_crash_boundary(crash_point: CrashPoint) {
+        let pair = prepared_pair();
+        let responder_fingerprint =
+            PublicFingerprint::from_encoded_public_key(&pair.responder_public)
+                .expect("responder fingerprint");
+        let request = CompleteExchange {
+            exchange_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            contact_name: "bob",
+            expected_peer_fingerprint: &responder_fingerprint,
+            defer_apply: true,
+            now: EXCHANGE_NOW + 2,
+            attestation: &pair.attestation,
+        };
+        let error = complete_exchange_with_crash(
+            &pair.initiator,
+            SCOPE,
+            pair.response.public_artifact.as_bytes(),
+            &request,
+            Some(crash_point),
+        )
+        .expect_err("completion crash boundary");
+        assert!(matches!(&error, KeyManagerError::CrashInjected));
+
+        let secrets = [&pair.initiator_private[..], &pair.responder_private[..]];
+        assert_bytes_exclude_secrets(pair.offer.public_artifact.as_bytes(), &secrets, "offer");
+        assert_bytes_exclude_secrets(
+            pair.response.public_artifact.as_bytes(),
+            &secrets,
+            "response",
+        );
+        for artifact in [
+            pair.offer.public_artifact.as_bytes(),
+            pair.response.public_artifact.as_bytes(),
+        ] {
+            assert!(
+                !artifact
+                    .windows(b"local_private".len())
+                    .any(|window| { window == b"local_private" })
+            );
+            assert!(
+                !artifact
+                    .windows(b"my_dm_chacha_secret".len())
+                    .any(|window| window == b"my_dm_chacha_secret")
+            );
+        }
+        assert_bytes_exclude_secrets(error.to_string().as_bytes(), &secrets, "error display");
+        assert_bytes_exclude_secrets(format!("{error:?}").as_bytes(), &secrets, "error debug");
+
+        let workspace = Workspace::open(pair.initiator.clone()).expect("crashed workspace");
+        let (journal_phase, candidate_count, rolls_back, ledger_exists, config_exists) =
+            match crash_point {
+                CrashPoint::AfterCandidates => (None, 2, true, false, false),
+                CrashPoint::AfterJournal => (Some(JournalPhase::Prepared), 2, true, false, false),
+                CrashPoint::AfterLedgerRename => {
+                    (Some(JournalPhase::Prepared), 1, false, true, false)
+                }
+                CrashPoint::AfterLedgerCommit => {
+                    (Some(JournalPhase::LedgerCommitted), 1, false, true, false)
+                }
+                CrashPoint::AfterConfigRename => {
+                    (Some(JournalPhase::LedgerCommitted), 0, false, true, true)
+                }
+                CrashPoint::AfterConfig => {
+                    (Some(JournalPhase::ConfigCommitted), 0, false, true, true)
+                }
+                _ => panic!("unsupported completion crash boundary"),
+            };
+        let candidates = secure_directory_files(&workspace, CANDIDATES_DIR)
+            .expect("crashed candidate directory");
+        assert_eq!(candidates.len(), candidate_count);
+        for name in &candidates {
+            if name.ends_with(".ledger.json") {
+                let candidate = workspace
+                    .read_required(&format!("{CANDIDATES_DIR}/{name}"))
+                    .expect("candidate ledger");
+                assert_bytes_exclude_secrets(&candidate, &secrets, "candidate ledger");
+            }
+        }
+        assert_eq!(
+            pair.initiator.darkirc_dir().join(LEDGER_FILE).exists(),
+            ledger_exists
+        );
+        assert_eq!(
+            pair.initiator.darkirc_dir().join(CONFIG_FILE).exists(),
+            config_exists
+        );
+        let transactions = secure_directory_files(&workspace, TRANSACTIONS_DIR)
+            .expect("crashed transaction directory");
+        if let Some(expected_phase) = journal_phase {
+            assert_eq!(transactions.len(), 1);
+            let journal_path = format!("{TRANSACTIONS_DIR}/{}", transactions[0]);
+            let journal_data = workspace
+                .read_required(&journal_path)
+                .expect("crash journal");
+            assert_bytes_exclude_secrets(&journal_data, &secrets, "journal");
+            let journal = parse_journal_file(&journal_data, &journal_path, SCOPE).expect("journal");
+            assert_eq!(journal.operation_kind, "exchange-complete");
+            assert_eq!(journal.peer_artifact, pair.response.public_artifact);
+            assert_eq!(journal.phase().expect("journal phase"), expected_phase);
+            assert!(
+                !journal_data
+                    .windows(b"local_private".len())
+                    .any(|window| { window == b"local_private" })
+            );
+            assert!(
+                !journal_data
+                    .windows(b"my_dm_chacha_secret".len())
+                    .any(|window| window == b"my_dm_chacha_secret")
+            );
+        } else {
+            assert!(transactions.is_empty());
+        }
+        if let Some(ledger) = workspace
+            .read_optional(LEDGER_FILE)
+            .expect("crashed ledger")
+        {
+            assert_bytes_exclude_secrets(&ledger, &secrets, "crash ledger");
+        }
+
+        {
+            let _lock = workspace.lock().expect("recovery lock");
+            recover_locked(&workspace, SCOPE).expect("recover completion crash");
+        }
+        assert!(
+            secure_directory_files(&workspace, CANDIDATES_DIR)
+                .expect("recovered candidate directory")
+                .is_empty()
+        );
+        assert!(
+            secure_directory_files(&workspace, TRANSACTIONS_DIR)
+                .expect("recovered transaction directory")
+                .is_empty()
+        );
+        if rolls_back {
+            assert!(!pair.initiator.darkirc_dir().join(CONFIG_FILE).exists());
+            assert!(!pair.initiator.darkirc_dir().join(LEDGER_FILE).exists());
+            let pending =
+                read_pending_secret(&workspace, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", SCOPE)
+                    .expect("rolled-back pending exchange");
+            assert_eq!(pending.state, ExchangeState::Prepared.as_str());
+        } else {
+            assert!(pair.initiator.darkirc_dir().join(CONFIG_FILE).exists());
+            assert!(pair.initiator.darkirc_dir().join(LEDGER_FILE).exists());
+            let pending =
+                read_pending_secret(&workspace, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", SCOPE)
+                    .expect("recovered installed pending exchange");
+            assert_eq!(pending.state, ExchangeState::Installed.as_str());
+        }
+        let first = complete_exchange(
+            &pair.initiator,
+            SCOPE,
+            pair.response.public_artifact.as_bytes(),
+            &request,
+        )
+        .expect("retry recovered completion");
+        let replay = complete_exchange(
+            &pair.initiator,
+            SCOPE,
+            pair.response.public_artifact.as_bytes(),
+            &request,
+        )
+        .expect("idempotent completion replay");
+        assert_eq!(first, replay);
+        assert_completed_initiator_state(&pair, &first);
+    }
+
+    #[test]
+    fn completion_recovers_after_candidates_then_retry_installs_deterministically() {
+        exercise_completion_crash_boundary(CrashPoint::AfterCandidates);
+    }
+
+    #[test]
+    fn completion_recovers_after_journal_then_retry_installs_deterministically() {
+        exercise_completion_crash_boundary(CrashPoint::AfterJournal);
+    }
+
+    #[test]
+    fn completion_recovers_after_ledger_rename_then_retry_is_installed() {
+        exercise_completion_crash_boundary(CrashPoint::AfterLedgerRename);
+    }
+
+    #[test]
+    fn completion_recovers_after_ledger_commit_then_retry_is_installed() {
+        exercise_completion_crash_boundary(CrashPoint::AfterLedgerCommit);
+    }
+
+    #[test]
+    fn completion_recovers_after_config_rename_then_retry_is_installed() {
+        exercise_completion_crash_boundary(CrashPoint::AfterConfigRename);
+    }
+
+    #[test]
+    fn completion_recovers_after_config_phase_then_retry_is_installed() {
+        exercise_completion_crash_boundary(CrashPoint::AfterConfig);
     }
 
     #[test]

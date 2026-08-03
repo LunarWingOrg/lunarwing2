@@ -159,6 +159,27 @@ release_ports_lock() {
   PORTS_LOCK_HELD="false"
 }
 
+# Check identity and held state without converting an unlocked forged descriptor
+# into a valid boundary. A separate open-file description must remain blocked.
+inherited_lock_fd_is_held() {
+  local lock_fd="$1" lock_file="$2" probe_fd
+  [[ "$lock_fd" =~ ^[0-9]+$ && -e "/proc/self/fd/$lock_fd" \
+    && -f "$lock_file" && ! -L "$lock_file" \
+    && "$(stat -Lc '%d:%i' "/proc/self/fd/$lock_fd" 2>/dev/null)" \
+      == "$(stat -c '%d:%i' "$lock_file" 2>/dev/null)" ]] || return 1
+  exec {probe_fd}>"$lock_file" || return 1
+  if flock -x -n "$probe_fd"; then
+    flock -u "$probe_fd" || true
+    exec {probe_fd}>&-
+    return 1
+  fi
+  exec {probe_fd}>&-
+  # Probe proved some open-file description holds this inode. This succeeds
+  # without changing lock ownership only when inherited FD is that description;
+  # an unlocked same-inode FD remains blocked by holder and must fail.
+  flock -x -n "$lock_fd"
+}
+
 with_tenant_lifecycle_lock() {
   local name="$1"
   shift
@@ -172,25 +193,17 @@ with_tenant_lifecycle_lock() {
   local lock_fd result
   if [[ -n "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD:-}" ]]; then
     lock_fd="$LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD"
-    [[ "$lock_fd" =~ ^[0-9]+$ \
-      && "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT:-}" == "$name" \
-      && -e "/proc/self/fd/$lock_fd" \
-      && "$(stat -c '%d:%i' "/proc/self/fd/$lock_fd" 2>/dev/null)" \
-        == "$(stat -c '%d:%i' "$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" 2>/dev/null)" ]] \
+    [[ "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT:-}" == "$name" ]] \
+      && inherited_lock_fd_is_held "$lock_fd" "$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" \
       || die "invalid active tenant lifecycle lock"
-    flock -x -n "$lock_fd" || die "active tenant lifecycle lock is not held"
     "$@"
     return
   fi
   if [[ -n "${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD:-}" ]]; then
     lock_fd="$LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD"
-    [[ "$lock_fd" =~ ^[0-9]+$ \
-      && "${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT:-}" == "$name" \
-      && -e "/proc/self/fd/$lock_fd" \
-      && "$(stat -c '%d:%i' "/proc/self/fd/$lock_fd" 2>/dev/null)" \
-        == "$(stat -c '%d:%i' "$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" 2>/dev/null)" ]] \
+    [[ "${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT:-}" == "$name" ]] \
+      && inherited_lock_fd_is_held "$lock_fd" "$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" \
       || die "invalid inherited tenant lifecycle lock"
-    flock -x -n "$lock_fd" || die "inherited tenant lifecycle lock is not held"
     LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
     LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
     "$@" || result=$?
@@ -539,6 +552,8 @@ Commands:
   start-tenant <name>             Start all services for a tenant
   stop-tenant <name>              Stop all services for a tenant
   stop-tenant-for-upgrade <name>  Verify settled DarkIRC state and stop atomically
+  migration-export-boundary <name> [export options]
+                                  Run export under retained lifecycle/DarkIRC locks
   restart-tenant <name>           Stop then start
   start-pg <name>                 Start only the tenant's PostgreSQL (daemon stays down)
   stop-pg <name>                  Stop only the tenant's PostgreSQL
@@ -3934,13 +3949,10 @@ darkirc_writer_lock() {
   if [[ -n "${LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD:-}" ]]; then
     local inherited_fd="$LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD"
     local inherited_scope="${LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE:-}"
-    [[ "$inherited_fd" =~ ^[0-9]+$ && "$inherited_scope" == "$scope_id" \
-      && -e "/proc/self/fd/$inherited_fd" ]] \
+    [[ "$inherited_scope" == "$scope_id" ]] \
       || die "invalid inherited DarkIRC writer lock"
-    [[ "$(stat -c '%d:%i' "/proc/self/fd/$inherited_fd" 2>/dev/null)" \
-      == "$(stat -c '%d:%i' "$lock_file" 2>/dev/null)" ]] \
+    inherited_lock_fd_is_held "$inherited_fd" "$lock_file" \
       || die "inherited DarkIRC writer lock does not match tenant scope"
-    flock -x -n "$inherited_fd" || die "inherited DarkIRC writer lock is not held"
     DARKIRC_WRITER_LOCK_FD="$inherited_fd"
     DARKIRC_WRITER_LOCK_INHERITED="true"
   else
@@ -9418,6 +9430,74 @@ stop_tenant_for_upgrade() {
   return "$result"
 }
 
+# Machine export runs as a child so its existing passphrase and archive handling
+# stay in export-tenant.sh. Both inherited lock descriptors remain open until that
+# child has validated readiness, stopped/verified writers, pinned DarkIRC state,
+# and sealed the final bundle.
+migration_export_child() {
+  local name="$1"
+  shift
+  local -a inherited_env=(
+    "LUNARWING_MT_EXPORT_BOUNDARY_TENANT=$name"
+    "LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD=$LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD"
+    "LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT=$name"
+  )
+  if [[ "$DARKIRC_WRITER_LOCK_HELD" == true ]]; then
+    inherited_env+=(
+      "LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD=$DARKIRC_WRITER_LOCK_FD"
+      "LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE=$DARKIRC_WRITER_SCOPE"
+    )
+  fi
+  env "${inherited_env[@]}" "$SCRIPT_DIR/export-tenant.sh" "$name" "$@"
+}
+
+migration_export_darkirc_locked() {
+  local name="$1" scope_id
+  shift
+  scope_id="$(darkirc_scope_id "$name")"
+  validate_darkirc_scope_id "$scope_id"
+  run_darkirc_key_helper "$name" migration-ready \
+    --tenant "$name" --scope-id "$scope_id" --json >/dev/null \
+    || die "DarkIRC migration state is not settled; refusing export"
+  migration_export_child "$name" "$@"
+}
+
+migration_export_boundary_locked() {
+  local name="$1"
+  shift
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  if tenant_darkirc_enabled "$name"; then
+    with_darkirc_writer_lock "$name" migration_export_darkirc_locked "$name" "$@"
+  else
+    migration_export_child "$name" "$@"
+  fi
+}
+
+migration_export_boundary() {
+  local name="$1"
+  shift
+  name="$(sanitize_name "$name")"
+  with_tenant_lifecycle_lock "$name" migration_export_boundary_locked "$name" "$@"
+}
+
+validate_migration_export_boundary_locked() {
+  local name="$1"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  if tenant_darkirc_enabled "$name"; then
+    with_darkirc_writer_lock "$name" true
+  elif [[ -n "${LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD:-}${LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE:-}" ]]; then
+    die "unexpected inherited DarkIRC writer lock for disabled tenant '$name'"
+  fi
+}
+
+validate_migration_export_boundary() {
+  local name="$1"
+  name="$(sanitize_name "$name")"
+  [[ "${LUNARWING_MT_EXPORT_BOUNDARY_TENANT:-}" == "$name" ]] \
+    || die "migration export boundary tenant marker mismatch"
+  with_tenant_lifecycle_lock "$name" validate_migration_export_boundary_locked "$name"
+}
+
 restart_tenant() {
   local name="$1"
   stop_tenant "$name"
@@ -10308,6 +10388,22 @@ main() {
       ports_registry_init
       _lifecycle_name="$(sanitize_name "$1")"
       with_tenant_lifecycle_lock "$_lifecycle_name" stop_tenant_for_upgrade "$_lifecycle_name"
+      ;;
+
+    migration-export-boundary)
+      require_root
+      [[ $# -ge 1 ]] || die "usage: migration-export-boundary <name> [export options]"
+      ports_registry_init
+      _lifecycle_name="$(sanitize_name "$1")"
+      shift
+      migration_export_boundary "$_lifecycle_name" "$@"
+      ;;
+
+    validate-migration-export-boundary)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: validate-migration-export-boundary <name>"
+      ports_registry_require_readonly
+      validate_migration_export_boundary "$1"
       ;;
 
     restart-tenant)

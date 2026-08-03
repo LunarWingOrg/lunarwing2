@@ -9,8 +9,10 @@ rollback. This is the recommended cross-host path for important tenants.
 (new host).
 
 **Cross-init:** both scripts work for **systemd-user and OpenRC**. Export
-delegates complete writer quiescence to mt-admin's `stop-writers` /
-`writers-active` contract; PostgreSQL remains available only for `pg_dump`.
+delegates complete writer quiescence to mt-admin's retained
+`migration-export-boundary` contract. One tenant lifecycle + DarkIRC writer lock
+covers migration readiness, writer stop/verification, manifest pinning, and final
+bundle seal; PostgreSQL remains available only for `pg_dump`.
 Import delegates all init/runtime-specific work to mt-admin. The new host's init
 system need not match the old host's.
 
@@ -156,6 +158,11 @@ you may stop it too). Use `--no-quiesce` only if `mt-admin writers-active
 journal, rollback, interrupted-manifest, or unresolved ledger state before any
 lifecycle mutation.
 
+If migration-relevant DarkIRC contacts/state exist while `enable_darkirc=false`,
+export fails before entering mt-admin's lifecycle boundary. Explicitly enable and
+adopt those contacts first; export never drops the legacy subtree into generic
+state and never stops writers before reporting this condition.
+
 ### 2. Transfer the bundle securely
 ```bash
 rsync -av -e ssh old-host:/var/lib/lunarwing-migrate/<tenant>-migrate-<stamp>.7z /var/lib/lunarwing-migrate/
@@ -300,8 +307,10 @@ chat decrypts (may take a few messages after first start).
 - The encrypted bundle and both manifests are mode `0600`, root-owned, in a `0700`
   directory. Secrets (`SECRETS_MASTER_KEY`, XMPP password, bundle passphrase) never
   enter command argv or logs. The scripts feed `7z` through stdin and log key names
-  only. For unattended use, prefer a root-owned mode-`0600` `KAWARIMI_PASS_FILE`;
-  the browser console instead uses an anonymous per-job descriptor.
+  only. Export collects or validates its passphrase before taking tenant locks,
+  then hands it across mt-admin through an anonymous descriptor, never argv or a
+  new environment value. For unattended use, prefer a root-owned mode-`0600`
+  `KAWARIMI_PASS_FILE`; the browser console also uses an anonymous per-job descriptor.
 - Import inspects member paths, types, counts, and declared sizes before extraction;
   rejects links and special files; and defaults to 100 GiB unpacked limits for both
   the outer bundle and nested state. Override deliberately with

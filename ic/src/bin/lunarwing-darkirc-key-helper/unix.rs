@@ -4,6 +4,8 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path};
 use std::process::{Command, ExitCode, Stdio};
@@ -16,15 +18,16 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use lunarwing::darkirc_key_manager::{
     CompatibilityAttestation, CompleteExchange, ContactSummary, DEFAULT_OFFER_TTL_SECONDS,
-    ExchangeRole, ExchangeStatus, KeyManagerError, MAX_BASELINE_BYTES, MAX_MIGRATION_BYTES,
-    MAX_PENDING_BYTES, PrepareExchange, PublicFingerprint, RespondExchange, Result, TenantPaths,
-    adopt_contacts, cancel_exchange, complete_exchange, doctor_contacts, export_migration,
-    import_migration, inspect_contacts, inspect_exchanges, migration_ready, prepare_exchange,
-    read_ledger, recover, respond_exchange, stage_migration, update_baseline, validate_migration,
-    validate_migration_unbound, validate_public_exchange_at,
+    ExchangeStatus, GeneratedExchangeMaterial, KeyManagerError, MAX_BASELINE_BYTES,
+    MAX_MIGRATION_BYTES, MAX_PENDING_BYTES, PrepareExchangeOperation, PublicFingerprint,
+    RespondExchangeOperation, Result, TenantPaths, adopt_contacts, cancel_exchange,
+    complete_exchange, doctor_contacts, export_migration, import_migration, inspect_contacts,
+    inspect_exchanges, migration_ready, prepare_exchange_with_generator, read_ledger, recover,
+    respond_exchange_with_generator, stage_migration, update_baseline, validate_migration,
+    validate_migration_unbound,
 };
 use rand::RngCore;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -245,31 +248,27 @@ fn run() -> Result<()> {
             let attested = attestation
                 .as_ref()
                 .ok_or(KeyManagerError::InvalidCompatibility)?;
-            preflight_artifact_output(&options)?;
+            validate_artifact_output(&options)?;
             let now = unix_now()?;
             let ttl = validated_ttl(options.expires_seconds)?;
             let expires_at = exchange_deadline(now, ttl)?;
-            let keypair = generate_keypair()?;
-            let offer_id = random_exchange_id();
-            let contact_id = random_exchange_id();
-            let request = PrepareExchange {
-                contact_name: &contact,
-                offer_id: &offer_id,
-                contact_id: &contact_id,
-                local_public: &keypair.public_key,
-                local_private: keypair.secret_key.expose_secret(),
-                intended_peer_contact_id: None,
-                intended_peer_fingerprint: None,
-                label: None,
-                previous_fingerprint: None,
-                generation: 1,
-                created_at: now,
-                expires_at,
-                now,
-                attestation: attested,
-            };
-            let _ = attested;
-            let result = prepare_exchange(&paths, &scope, &request)?;
+            let result = prepare_exchange_with_generator(
+                &paths,
+                &scope,
+                &PrepareExchangeOperation {
+                    contact_name: &contact,
+                    intended_peer_contact_id: None,
+                    intended_peer_fingerprint: None,
+                    label: None,
+                    previous_fingerprint: None,
+                    generation: 1,
+                    created_at: now,
+                    expires_at,
+                    now,
+                    attestation: attested,
+                },
+                || generated_exchange_material(&options),
+            )?;
             write_committed_artifact(&options, &result.public_artifact, &result)
         }
         "respond" => {
@@ -286,42 +285,31 @@ fn run() -> Result<()> {
                 .as_deref()
                 .ok_or(KeyManagerError::FingerprintMismatch)?;
             let expected_fp = PublicFingerprint::parse(expected_fp)?;
-            preflight_artifact_output(&options)?;
+            validate_artifact_output(&options)?;
             let offer_bytes = read_artifact_input(&options)?;
             let now = unix_now()?;
-            let initiator = validate_public_exchange_at(
-                &offer_bytes,
-                ExchangeRole::InitiatorOffer,
-                attestation
-                    .as_ref()
-                    .ok_or(KeyManagerError::InvalidCompatibility)?,
-                now,
-            )?;
             let ttl = validated_ttl(options.expires_seconds)?;
             // The response has its own bounded lifetime. Do not shorten it to the
             // initiator's remaining lifetime: delayed delivery may leave little
             // overlap even though the initiator offer is still valid now.
             let expires_at = exchange_deadline(now, ttl)?;
-            let keypair = generate_keypair()?;
-            let offer_id = random_exchange_id();
-            let contact_id = random_exchange_id();
-            let request = RespondExchange {
-                contact_name: &contact,
-                offer_id: &offer_id,
-                contact_id: &contact_id,
-                local_public: &keypair.public_key,
-                local_private: keypair.secret_key.expose_secret(),
-                initiator_offer_id: &initiator.offer_id,
-                expected_initiator_fingerprint: &expected_fp,
-                label: None,
-                created_at: now,
-                expires_at,
-                now,
-                attestation: attestation
-                    .as_ref()
-                    .ok_or(KeyManagerError::InvalidCompatibility)?,
-            };
-            let result = respond_exchange(&paths, &scope, &offer_bytes, &request)?;
+            let result = respond_exchange_with_generator(
+                &paths,
+                &scope,
+                &offer_bytes,
+                &RespondExchangeOperation {
+                    contact_name: &contact,
+                    expected_initiator_fingerprint: &expected_fp,
+                    label: None,
+                    created_at: now,
+                    expires_at,
+                    now,
+                    attestation: attestation
+                        .as_ref()
+                        .ok_or(KeyManagerError::InvalidCompatibility)?,
+                },
+                || generated_exchange_material(&options),
+            )?;
             write_committed_artifact(&options, &result.public_artifact, &result)
         }
         "complete" => {
@@ -538,6 +526,17 @@ fn generate_keypair() -> Result<KeypairOutput> {
     )
 }
 
+fn generated_exchange_material(options: &Options) -> Result<GeneratedExchangeMaterial> {
+    require_unused_artifact_output(options)?;
+    let keypair = generate_keypair()?;
+    Ok(GeneratedExchangeMaterial {
+        offer_id: random_exchange_id(),
+        contact_id: random_exchange_id(),
+        local_public: keypair.public_key,
+        local_private: keypair.secret_key,
+    })
+}
+
 fn parse_generator_output(
     stdout: &mut Vec<u8>,
     stderr: &mut Vec<u8>,
@@ -687,27 +686,33 @@ fn resolve_artifact_path(path: &Path) -> Result<ArtifactPath> {
     Ok(ArtifactPath { parent, name })
 }
 
-fn preflight_new_artifact(path: &Path) -> Result<()> {
-    let artifact = resolve_artifact_path(path)?;
-    match artifact.parent.symlink_metadata(&artifact.name) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(KeyManagerError::Io(error)),
-        Ok(_) => Err(KeyManagerError::Io(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "artifact output already exists",
-        ))),
-    }
-}
-
-fn preflight_artifact_output(options: &Options) -> Result<()> {
+fn validate_artifact_output(options: &Options) -> Result<()> {
     match options.out_path.as_deref() {
         Some("-") if options.json => Err(KeyManagerError::InvalidExchangeArtifact),
         Some("-") => Ok(()),
         Some(path) => {
             validate_relative_path(path)?;
-            preflight_new_artifact(Path::new(path))
+            resolve_artifact_path(Path::new(path)).map(|_| ())
         }
         None => Err(KeyManagerError::InvalidExchangeArtifact),
+    }
+}
+
+fn require_unused_artifact_output(options: &Options) -> Result<()> {
+    let Some(path) = options.out_path.as_deref() else {
+        return Err(KeyManagerError::InvalidExchangeArtifact);
+    };
+    if path == "-" {
+        return Ok(());
+    }
+    let artifact = resolve_artifact_path(Path::new(path))?;
+    match artifact.parent.symlink_metadata(&artifact.name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(KeyManagerError::Io(error)),
+        Ok(_) => Err(KeyManagerError::Io(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "artifact output already exists without committed replay",
+        ))),
     }
 }
 
@@ -749,15 +754,45 @@ fn write_committed_artifact(
 }
 
 fn write_new_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_new_artifact_with_sync(path, bytes, sync_artifact_directory)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArtifactWriteCrashPoint {
+    AfterFinalRename,
+}
+
+fn sync_artifact_directory(directory: &Dir) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    directory
+        .open_with(".", &options)
+        .map_err(KeyManagerError::Io)?
+        .into_std()
+        .sync_all()
+        .map_err(KeyManagerError::Io)
+}
+
+fn write_new_artifact_with_sync(
+    path: &Path,
+    bytes: &[u8],
+    sync_directory: impl FnOnce(&Dir) -> Result<()>,
+) -> Result<()> {
+    write_new_artifact_inner(path, bytes, None, sync_directory)
+}
+
+fn write_new_artifact_inner(
+    path: &Path,
+    bytes: &[u8],
+    crash_point: Option<ArtifactWriteCrashPoint>,
+    sync_directory: impl FnOnce(&Dir) -> Result<()>,
+) -> Result<()> {
     let artifact = resolve_artifact_path(path)?;
     match artifact.parent.symlink_metadata(&artifact.name) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(KeyManagerError::Io(error)),
-        Ok(_) => {
-            return Err(KeyManagerError::Io(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "artifact output already exists",
-            )));
+        Ok(metadata) => {
+            return validate_existing_artifact(&artifact, &metadata, bytes, sync_directory);
         }
     }
     let temporary = format!(".{}.{}.tmp", artifact.name, random_exchange_id());
@@ -768,7 +803,7 @@ fn write_new_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
         .mode(0o600)
         .follow(FollowSymlinks::No)
         .sync(true);
-    let write_result = (|| {
+    let publish_result = (|| {
         let mut file = artifact
             .parent
             .open_with(&temporary, &options)
@@ -776,22 +811,84 @@ fn write_new_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
             .into_std();
         file.write_all(bytes).map_err(KeyManagerError::Io)?;
         file.sync_all().map_err(KeyManagerError::Io)?;
-        artifact
-            .parent
-            .hard_link(&temporary, &artifact.parent, &artifact.name)
-            .map_err(KeyManagerError::Io)?;
-        let mut directory_options = OpenOptions::new();
-        directory_options.read(true).follow(FollowSymlinks::No);
-        artifact
-            .parent
-            .open_with(".", &directory_options)
-            .map_err(KeyManagerError::Io)?
-            .into_std()
-            .sync_all()
-            .map_err(KeyManagerError::Io)
+        publish_artifact_no_replace(&artifact.parent, &temporary, &artifact.name)
     })();
-    let _ = artifact.parent.remove_file(&temporary);
-    write_result
+    if let Err(error) = publish_result {
+        let _ = artifact.parent.remove_file(&temporary);
+        return Err(error);
+    }
+    if crash_point == Some(ArtifactWriteCrashPoint::AfterFinalRename) {
+        return Err(KeyManagerError::CrashInjected);
+    }
+    sync_directory(&artifact.parent)
+}
+
+#[cfg(target_os = "linux")]
+fn publish_artifact_no_replace(parent: &Dir, temporary: &str, final_name: &str) -> Result<()> {
+    nix::fcntl::renameat2(
+        parent.as_fd(),
+        temporary,
+        parent.as_fd(),
+        final_name,
+        nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+    )
+    .map_err(|error| KeyManagerError::Io(io::Error::from_raw_os_error(error as i32)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn publish_artifact_no_replace(parent: &Dir, temporary: &str, final_name: &str) -> Result<()> {
+    parent
+        .hard_link(temporary, parent, final_name)
+        .map_err(KeyManagerError::Io)?;
+    parent.remove_file(temporary).map_err(KeyManagerError::Io)
+}
+
+fn validate_existing_artifact(
+    artifact: &ArtifactPath,
+    metadata: &cap_std::fs::Metadata,
+    expected: &[u8],
+    sync_directory: impl FnOnce(&Dir) -> Result<()>,
+) -> Result<()> {
+    if !metadata.is_file() || cap_fs_ext::MetadataExt::nlink(metadata) != 1 {
+        return Err(KeyManagerError::UnsafePath);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = artifact
+        .parent
+        .open_with(&artifact.name, &options)
+        .map_err(KeyManagerError::Io)?
+        .into_std();
+    let opened = file.metadata().map_err(KeyManagerError::Io)?;
+    if !opened.is_file()
+        || opened.nlink() != 1
+        || opened.uid() != nix::unistd::geteuid().as_raw()
+        || opened.permissions().mode() & 0o7777 != 0o600
+        || opened.dev() != cap_std::fs::MetadataExt::dev(metadata)
+        || opened.ino() != cap_std::fs::MetadataExt::ino(metadata)
+    {
+        return Err(KeyManagerError::UnsafePath);
+    }
+    let existing = read_bounded_artifact(&mut file)?;
+    let current = artifact
+        .parent
+        .symlink_metadata(&artifact.name)
+        .map_err(KeyManagerError::Io)?;
+    if !current.is_file()
+        || cap_fs_ext::MetadataExt::nlink(&current) != 1
+        || cap_std::fs::MetadataExt::dev(&current) != opened.dev()
+        || cap_std::fs::MetadataExt::ino(&current) != opened.ino()
+    {
+        return Err(KeyManagerError::UnsafePath);
+    }
+    if existing.as_slice() != expected {
+        return Err(KeyManagerError::Io(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "artifact output already exists with different content",
+        )));
+    }
+    sync_directory(&artifact.parent)?;
+    Ok(())
 }
 
 fn select_status_contact(contacts: Vec<ContactSummary>, name: &str) -> Result<StatusOutput> {
@@ -848,6 +945,7 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::io::{self, Cursor};
 
@@ -936,13 +1034,13 @@ mod tests {
             ..Options::default()
         };
         assert!(matches!(
-            preflight_artifact_output(&options),
+            validate_artifact_output(&options),
             Err(KeyManagerError::InvalidExchangeArtifact)
         ));
     }
 
     #[test]
-    fn artifact_paths_reject_tenant_state_and_existing_outputs() {
+    fn artifact_retry_accepts_only_safe_identical_existing_output() {
         assert!(matches!(
             validate_relative_path("lunarwing/state/darkirc/darkirc_config.toml"),
             Err(KeyManagerError::UnsafePath)
@@ -950,9 +1048,29 @@ mod tests {
         let temp = tempdir().expect("artifact directory");
         let output = temp.path().join("offer.json");
         write_new_artifact(&output, b"first").expect("first artifact write");
+        write_new_artifact(&output, b"first").expect("identical retry");
         let error = write_new_artifact(&output, b"second").expect_err("must not overwrite");
         assert!(matches!(error, KeyManagerError::Io(_)));
-        assert_eq!(fs::read(output).expect("read artifact"), b"first");
+        assert_eq!(fs::read(&output).expect("read artifact"), b"first");
+
+        let hardlink = temp
+            .path()
+            .join(".offer.json.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.tmp");
+        fs::hard_link(&output, &hardlink).expect("hard link artifact");
+        assert!(matches!(
+            write_new_artifact(&output, b"first"),
+            Err(KeyManagerError::UnsafePath)
+        ));
+        assert_eq!(fs::metadata(&output).expect("hardlinked output").nlink(), 2);
+        assert_eq!(fs::read(&hardlink).expect("arbitrary hardlink"), b"first");
+        fs::remove_file(&hardlink).expect("remove hard link");
+
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o644))
+            .expect("make artifact unsafe");
+        assert!(matches!(
+            write_new_artifact(&output, b"first"),
+            Err(KeyManagerError::UnsafePath)
+        ));
 
         let real_parent = temp.path().join("real-parent");
         fs::create_dir(&real_parent).expect("real artifact parent");
@@ -962,6 +1080,90 @@ mod tests {
             write_new_artifact(&linked_parent.join("offer.json"), b"blocked"),
             Err(KeyManagerError::Io(_)) | Err(KeyManagerError::UnsafePath)
         ));
+
+        let symlink_output = temp.path().join("symlink.json");
+        std::os::unix::fs::symlink(&output, &symlink_output).expect("artifact symlink");
+        assert!(matches!(
+            write_new_artifact(&symlink_output, b"first"),
+            Err(KeyManagerError::UnsafePath)
+        ));
+    }
+
+    #[test]
+    fn artifact_retry_recovers_after_final_rename_precedes_sync_failure() {
+        let temp = tempdir().expect("artifact directory");
+        let output = temp.path().join("offer.json");
+        let error = write_new_artifact_with_sync(&output, b"committed", |_| {
+            Err(KeyManagerError::Io(io::Error::other(
+                "injected directory sync failure",
+            )))
+        })
+        .expect_err("sync failure reported after final rename");
+        assert!(matches!(error, KeyManagerError::Io(_)));
+        assert_eq!(fs::read(&output).expect("linked artifact"), b"committed");
+
+        let sync_calls = Cell::new(0);
+        write_new_artifact_with_sync(&output, b"committed", |directory| {
+            sync_artifact_directory(directory)?;
+            sync_calls.set(sync_calls.get() + 1);
+            Ok(())
+        })
+        .expect("retry accepts and syncs committed artifact");
+        assert_eq!(sync_calls.get(), 1);
+    }
+
+    #[test]
+    fn artifact_retry_recovers_after_final_rename_precedes_directory_sync() {
+        let temp = tempdir().expect("artifact directory");
+        let output = temp.path().join("offer.json");
+        let error = write_new_artifact_inner(
+            &output,
+            b"committed",
+            Some(ArtifactWriteCrashPoint::AfterFinalRename),
+            sync_artifact_directory,
+        )
+        .expect_err("crash after final rename");
+        assert!(matches!(error, KeyManagerError::CrashInjected));
+        assert_eq!(fs::metadata(&output).expect("renamed artifact").nlink(), 1);
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .expect("artifact directory")
+                .count(),
+            1
+        );
+
+        let sync_calls = Cell::new(0);
+        write_new_artifact_with_sync(&output, b"committed", |directory| {
+            sync_artifact_directory(directory)?;
+            sync_calls.set(sync_calls.get() + 1);
+            Ok(())
+        })
+        .expect("retry syncs renamed artifact");
+
+        assert_eq!(fs::read(&output).expect("recovered artifact"), b"committed");
+        assert_eq!(
+            fs::metadata(&output).expect("recovered metadata").nlink(),
+            1
+        );
+        assert_eq!(sync_calls.get(), 1);
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .expect("artifact directory")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_artifact_fallback_publishes_single_link_without_overwrite() {
+        let temp = tempdir().expect("artifact directory");
+        let output = temp.path().join("offer.json");
+
+        write_new_artifact(&output, b"first").expect("fallback publication");
+        assert_eq!(fs::metadata(&output).expect("artifact metadata").nlink(), 1);
+        assert!(write_new_artifact(&output, b"different").is_err());
+        assert_eq!(fs::read(&output).expect("artifact bytes"), b"first");
     }
 
     #[test]

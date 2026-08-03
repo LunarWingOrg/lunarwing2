@@ -59,6 +59,12 @@ assert_file_contains \
   "export uses mt-admin writer quiesce contract" \
   "$EXPORT_SRC" "stop-writers"
 assert_file_contains \
+  "export enters retained mt-admin migration boundary" \
+  "$EXPORT_SRC" "migration-export-boundary"
+assert_file_contains \
+  "mt-admin passes inherited lifecycle lock descriptor" \
+  "$IC_DIR/scripts/lunarwing-mt-admin.sh" "LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD"
+assert_file_contains \
   "export excludes DarkIRC from generic state archive" \
   "$EXPORT_SRC" "state/darkirc"
 assert_file_contains \
@@ -272,7 +278,32 @@ chmod +x "$export_tmp/scripts/export-tenant.sh"
 
 cat >"$export_tmp/scripts/lunarwing-mt-admin.sh" <<'MT'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >>"$(dirname "$0")/../mt.log"
+validate_boundary() {
+  tenant="$1"
+  fd="${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD:-}"
+  lock_file="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:?}/${tenant}.lock"
+  [[ "$fd" =~ ^[0-9]+$ && -e "/proc/self/fd/$fd" \
+    && "$(stat -Lc '%d:%i' "/proc/self/fd/$fd")" == "$(stat -c '%d:%i' "$lock_file")" ]] \
+    || exit 90
+  exec 8>"$lock_file"
+  ! flock -x -n 8 || exit 91
+}
 case "${1:-}" in
+  migration-export-boundary)
+    tenant="$2"
+    shift 2
+    lock_dir="$(dirname "$0")/lifecycle-locks"
+    mkdir -p "$lock_dir"
+    exec 9>"$lock_dir/${tenant}.lock"
+    flock -x 9
+    exec env LUNARWING_MT_EXPORT_BOUNDARY_TENANT="$tenant" \
+      LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD=9 \
+      LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT="$tenant" \
+      LUNARWING_MT_LIFECYCLE_LOCK_DIR="$lock_dir" \
+      "$(dirname "$0")/export-tenant.sh" "$tenant" "$@"
+    ;;
+  validate-migration-export-boundary) validate_boundary "$2"; exit 0 ;;
   stop-writers) exit 0 ;;
   writers-active) exit 1 ;;
   *) exit 0 ;;
@@ -361,9 +392,11 @@ if PATH="$export_tmp/bin:$PATH" \
    LUNARWING_PORTS_REGISTRY="$export_tmp/ports.json" \
    LUNARWING_CONTAINER_RUNTIME=podman \
    LUNARWING_MIGRATE_DIR="$export_out" \
-   bash "$export_tmp/scripts/export-tenant.sh" alpha --no-quiesce \
-     >"$export_tmp/export-output-symlink.out" 2>&1; then
+   bash "$export_tmp/scripts/export-tenant.sh" alpha --no-quiesce --no-encrypt \
+      >"$export_tmp/export-output-symlink.out" 2>&1; then
   fail "export rejects a symlinked output directory"
+elif ! grep -Fq 'unsafe export output path' "$export_tmp/export-output-symlink.out"; then
+  fail "export rejects a symlinked output directory with the expected guard"
 else
   pass "export rejects a symlinked output directory"
 fi
@@ -390,6 +423,61 @@ else
   fail "export fixture completed"
   cat "$export_tmp/export.out"
 fi
+
+cat >"$export_tmp/bin/7z" <<'SEVENZIP'
+#!/usr/bin/env bash
+bundle=""
+for arg in "$@"; do
+  [[ "$arg" == *.7z ]] && bundle="$arg"
+done
+[[ -n "$bundle" ]] || exit 92
+: >"$bundle"
+stat -c '%a' "$bundle" >"${DARKIRC_EXPORT_TEST_WORK:?}/partial-bundle.mode"
+exit 93
+SEVENZIP
+chmod +x "$export_tmp/bin/7z"
+rm -f "$export_tmp/partial-bundle.mode" "$export_tmp/mt.log"
+if PATH="$export_tmp/bin:$PATH" \
+   DARKIRC_EXPORT_TEST_WORK="$export_tmp" \
+   LUNARWING_PORTS_REGISTRY="$export_tmp/ports.json" \
+   LUNARWING_CONTAINER_RUNTIME=podman \
+   LUNARWING_MIGRATE_DIR="$export_out" \
+   KAWARIMI_PASS='partial-archive-test-passphrase' \
+   bash "$export_tmp/scripts/export-tenant.sh" alpha --no-quiesce \
+     >"$export_tmp/export-partial.out" 2>&1; then
+  fail "failed 7z export returns failure"
+elif compgen -G "$export_out/alpha-migrate-*.7z" >/dev/null; then
+  fail "failed 7z export removes partial final archive"
+elif [[ "$(cat "$export_tmp/partial-bundle.mode" 2>/dev/null)" != 600 ]]; then
+  fail "partial final archive starts owner-only"
+else
+  pass "failed 7z export removes owner-only partial final archive"
+fi
+rm -f "$export_tmp/bin/7z"
+
+printf '[contact."legacy-peer"]\ndm_chacha_public = "public"\nmy_dm_chacha_secret = "private"\n' \
+  >"$export_tmp/home/alpha/lunarwing/state/darkirc/darkirc_config.toml"
+rm -f "$export_tmp/mt.log"
+if PATH="$export_tmp/bin:$PATH" \
+   LUNARWING_PORTS_REGISTRY="$export_tmp/ports.json" \
+   LUNARWING_CONTAINER_RUNTIME=podman \
+   LUNARWING_MIGRATE_DIR="$export_out" \
+   bash "$export_tmp/scripts/export-tenant.sh" alpha --no-quiesce --no-encrypt \
+     >"$export_tmp/export-legacy-disabled.out" 2>&1; then
+  fail "disabled legacy DarkIRC contacts fail closed"
+elif ! grep -Fq 'enable and explicitly adopt contacts before export' \
+    "$export_tmp/export-legacy-disabled.out"; then
+  fail "disabled legacy DarkIRC contacts report adoption requirement"
+elif [[ -e "$export_tmp/mt.log" ]]; then
+  fail "disabled legacy DarkIRC rejection occurs before lifecycle mutation"
+elif ! grep -Fq 'my_dm_chacha_secret = "private"' \
+    "$export_tmp/home/alpha/lunarwing/state/darkirc/darkirc_config.toml"; then
+  fail "disabled legacy DarkIRC rejection preserves contacts"
+else
+  pass "disabled legacy DarkIRC contacts fail before lifecycle mutation"
+  pass "disabled legacy DarkIRC rejection preserves contacts"
+fi
+rm -f "$export_tmp/home/alpha/lunarwing/state/darkirc/darkirc_config.toml"
 
 # Recreate the export fixture with a pending transaction. The preflight must
 # abort before invoking stop-writers or creating an output bundle.

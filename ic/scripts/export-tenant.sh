@@ -4,8 +4,8 @@
 # MACHINE MIGRATION to a fresh LunarWing host (see docs/ops/MT-MACHINE-MIGRATION.md).
 #
 # Runs on the OLD (source) host. Init-specific lifecycle work is delegated to the
-# source mt-admin's `stop-writers`/`writers-active` contract; the script also needs
-# the container runtime, jq, and tar.
+# source mt-admin's retained `migration-export-boundary` contract; the script also
+# needs the container runtime, jq, and tar.
 #
 # IMPORTANT — this is the START OF CUTOVER, not a read-only snapshot. To capture a
 # CONSISTENT and FINAL picture (so nothing is written after the snapshot and the
@@ -48,6 +48,7 @@
 # KAWARIMI_PASS, KAWARIMI_PASS_FILE. Interactive use prompts and confirms before
 # any tenant service is stopped. The passphrase is fed to 7z over stdin.
 set -euo pipefail
+umask 077
 
 OUT_DIR="${LUNARWING_MIGRATE_DIR:-/var/lib/lunarwing-migrate}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -305,6 +306,10 @@ grep -qE '^\s*stop-writers\)' "$MT" \
   || die "mt-admin at $MT lacks stop-writers (required for migration quiesce)"
 grep -qE '^\s*writers-active\)' "$MT" \
   || die "mt-admin at $MT lacks writers-active (required for migration safety checks)"
+grep -qE '^\s*migration-export-boundary\)' "$MT" \
+  || die "mt-admin at $MT lacks migration-export-boundary (required for atomic export)"
+grep -qE '^\s*validate-migration-export-boundary\)' "$MT" \
+  || die "mt-admin at $MT lacks validate-migration-export-boundary (required for inherited lock validation)"
 
 id "$TENANT" >/dev/null 2>&1 || die "OS user '$TENANT' not found"
 HOME_T="$(getent passwd "$TENANT" | cut -d: -f6)"
@@ -418,6 +423,8 @@ if darkirc_ledger_unresolved; then
   die "DarkIRC ledger has an unresolved or invalid state; complete/cancel it before export"
 fi
 if darkirc_manifest_required; then
+  $DARKIRC_ENABLED \
+    || die "legacy DarkIRC contacts/state found while DarkIRC is disabled; enable and explicitly adopt contacts before export (source unchanged, writers not stopped)"
   mt_has_darkirc_migration \
     || die "mt-admin lacks darkirc-contact export-migration; refusing to export contact secrets generically"
 fi
@@ -477,6 +484,39 @@ pick_runtime() {
 RUNTIME="$(pick_runtime || true)"
 [[ -n "$RUNTIME" ]] || die "could not find container '$PG' in podman or docker — is the tenant's PostgreSQL container present on this host? (set LUNARWING_CONTAINER_RUNTIME to force)"
 
+# Re-enter through mt-admin before lifecycle mutation or snapshot writes.
+# mt-admin owns both locks and validates their inherited descriptors in this child.
+EXPORT_BOUNDARY_HELD=false
+if [[ -n "${LUNARWING_MT_EXPORT_BOUNDARY_TENANT:-}" ]]; then
+  [[ "$LUNARWING_MT_EXPORT_BOUNDARY_TENANT" == "$TENANT" \
+    && "${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT:-}" == "$TENANT" \
+    && "${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD:-}" =~ ^[0-9]+$ \
+    && -e "/proc/self/fd/$LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD" ]] \
+    || die "invalid inherited migration export boundary"
+  "$MT" validate-migration-export-boundary "$TENANT" >/dev/null \
+    || die "inherited migration export locks failed authoritative validation"
+  EXPORT_BOUNDARY_HELD=true
+fi
+if ! $DRY_RUN && ! $EXPORT_BOUNDARY_HELD; then
+  # Collect before locking. Repackage any supported source, including legacy
+  # KAWARIMI_PASS, into an anonymous pipe; only its descriptor number crosses
+  # mt-admin. Passphrase never enters child argv/environment or disk staging.
+  if ! $NO_ENCRYPT; then
+    acquire_export_passphrase
+    exec {EXPORT_PASS_FD}< <(printf '%s\n' "$KAWARIMI_ARCHIVE_PASS")
+    unset KAWARIMI_ARCHIVE_PASS
+  fi
+  boundary_args=(--out-dir "$OUT_DIR")
+  $NO_QUIESCE && boundary_args+=(--no-quiesce)
+  $NO_ENCRYPT && boundary_args+=(--no-encrypt)
+  if $NO_ENCRYPT; then
+    exec "$MT" migration-export-boundary "$TENANT" "${boundary_args[@]}"
+  else
+    exec env KAWARIMI_PASS_FD="$EXPORT_PASS_FD" \
+      "$MT" migration-export-boundary "$TENANT" "${boundary_args[@]}"
+  fi
+fi
+
 # Refuse a missing or malformed passphrase before stopping any tenant service.
 if ! $DRY_RUN && ! $NO_ENCRYPT; then
   acquire_export_passphrase
@@ -500,7 +540,8 @@ else
   WORK="$(mktemp -d "$OUT_DIR/.${TENANT}-bundle-stage.XXXXXX")"
 fi
 DARKIRC_PIN_DIR=""
-trap 'rm -rf "$WORK" "${DARKIRC_PIN_DIR:-}"' EXIT
+PARTIAL_BUNDLE=""
+trap 'rm -rf "$WORK" "${DARKIRC_PIN_DIR:-}"; [[ -z "${PARTIAL_BUNDLE:-}" ]] || rm -f -- "$PARTIAL_BUNDLE"' EXIT
 chmod 0700 "$WORK"
 
 # ---- 1. quiesce the writers (consistent + final snapshot) --------------------
@@ -726,16 +767,22 @@ fi
 
 if $NO_ENCRYPT; then
   BUNDLE="$OUT_DIR/${TENANT}-migrate-${STAMP}.tar"
+  [[ ! -e "$BUNDLE" && ! -L "$BUNDLE" ]] || die "refusing to overwrite existing migration bundle: $BUNDLE"
+  PARTIAL_BUNDLE="$BUNDLE"
   ( umask 077; tar cf "$BUNDLE" -C "$WORK" . )
   chmod 0600 "$BUNDLE"
+  PARTIAL_BUNDLE=""
   say "  WARNING: bundle is UNENCRYPTED (--no-encrypt)" >&2
 else
   BUNDLE="$OUT_DIR/${TENANT}-migrate-${STAMP}.7z"
+  [[ ! -e "$BUNDLE" && ! -L "$BUNDLE" ]] || die "refusing to overwrite existing migration bundle: $BUNDLE"
+  PARTIAL_BUNDLE="$BUNDLE"
   # Bare -p reads the password from stdin and keeps it out of process argv.
   { printf '%s\n%s\n' "$KAWARIMI_ARCHIVE_PASS" "$KAWARIMI_ARCHIVE_PASS"; } | 7z a -t7z \
     -mhe=on -p -mx=5 "$BUNDLE" "$WORK"/* \
     >/dev/null 2>&1 || die "7z encryption failed"
   chmod 0600 "$BUNDLE"
+  PARTIAL_BUNDLE=""
   unset KAWARIMI_ARCHIVE_PASS
 fi
 

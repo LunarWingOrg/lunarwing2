@@ -13,7 +13,17 @@ INIT_SYSTEM=systemd
 TEST_ROOT="$(mktemp -d)"
 SYSTEMD_CALLS="$TEST_ROOT/systemd.calls"
 OPENRC_CALLS="$TEST_ROOT/openrc.calls"
-trap 'rm -rf "$TEST_ROOT"' EXIT
+boundary_pid=""
+lifecycle_writer_pid=""
+writer_pid=""
+cleanup() {
+  local pid
+  for pid in "$boundary_pid" "$lifecycle_writer_pid" "$writer_pid"; do
+    [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true
+  done
+  rm -rf "$TEST_ROOT"
+}
+trap cleanup EXIT
 
 tenant_exists_in_registry() { [[ "$1" == "$TENANT" ]]; }
 tenant_darkirc_enabled() { return 0; }
@@ -124,5 +134,113 @@ stop_tenant_for_upgrade "$TENANT"
   printf 'upgrade readiness lock was not retained through tenant stop\n' >&2
   exit 1
 }
+
+# Real flock regression with bounded waits. Child validates inherited descriptors
+# using production helper. Lifecycle-path and direct writer-lock contenders must
+# both remain blocked until seal child exits and holder descriptors close.
+LIFECYCLE_LOCK="$TEST_ROOT/fixture.lifecycle.lock"
+WRITER_LOCK="$TEST_ROOT/fixture.writer.lock"
+BOUNDARY_ENTERED="$TEST_ROOT/boundary-entered"
+BOUNDARY_RELEASE="$TEST_ROOT/boundary-release"
+LIFECYCLE_ATTEMPTED="$TEST_ROOT/lifecycle-attempted"
+LIFECYCLE_COMPLETED="$TEST_ROOT/lifecycle-completed"
+WRITER_ATTEMPTED="$TEST_ROOT/writer-attempted"
+WRITER_COMPLETED="$TEST_ROOT/writer-completed"
+
+wait_for_file() {
+  local path="$1" pid="$2" label="$3"
+  for _ in {1..500}; do
+    [[ -e "$path" ]] && return 0
+    kill -0 "$pid" 2>/dev/null || {
+      printf '%s exited before signaling\n' "$label" >&2
+      return 1
+    }
+    sleep 0.01
+  done
+  printf 'timed out waiting for %s\n' "$label" >&2
+  return 1
+}
+
+exec {unlocked_fd}>"$LIFECYCLE_LOCK"
+if inherited_lock_fd_is_held "$unlocked_fd" "$LIFECYCLE_LOCK"; then
+  printf 'unlocked lifecycle descriptor passed held-state validation\n' >&2
+  exit 1
+fi
+exec {wrong_fd}>"$TEST_ROOT/wrong.lock"
+flock -x "$wrong_fd"
+if inherited_lock_fd_is_held "$wrong_fd" "$LIFECYCLE_LOCK"; then
+  printf 'wrong-inode lifecycle descriptor passed validation\n' >&2
+  exit 1
+fi
+exec {locked_fd}>"$LIFECYCLE_LOCK"
+flock -x "$locked_fd"
+exec {same_inode_unlocked_fd}>"$LIFECYCLE_LOCK"
+if inherited_lock_fd_is_held "$same_inode_unlocked_fd" "$LIFECYCLE_LOCK"; then
+  printf 'unlocked same-inode descriptor passed while different FD held lock\n' >&2
+  exit 1
+fi
+inherited_lock_fd_is_held "$locked_fd" "$LIFECYCLE_LOCK" || {
+  printf 'owning same-inode descriptor failed held-state validation\n' >&2
+  exit 1
+}
+exec {unlocked_fd}>&-
+flock -u "$wrong_fd"
+exec {wrong_fd}>&-
+exec {same_inode_unlocked_fd}>&-
+flock -u "$locked_fd"
+exec {locked_fd}>&-
+
+(
+  exec {lifecycle_fd}>"$LIFECYCLE_LOCK"
+  flock -x "$lifecycle_fd"
+  exec {writer_fd}>"$WRITER_LOCK"
+  flock -x "$writer_fd"
+  bash -c '
+    set -euo pipefail
+    source "$1"
+    inherited_lock_fd_is_held "$2" "$3"
+    inherited_lock_fd_is_held "$4" "$5"
+    : >"$6"
+    for _attempt in {1..500}; do
+      [[ -e "$7" ]] && exit 0
+      sleep 0.01
+    done
+    printf "seal child timed out waiting for release\n" >&2
+    exit 1
+  ' _ "$ADMIN_SCRIPT" "$lifecycle_fd" "$LIFECYCLE_LOCK" \
+    "$writer_fd" "$WRITER_LOCK" "$BOUNDARY_ENTERED" "$BOUNDARY_RELEASE"
+) &
+boundary_pid=$!
+wait_for_file "$BOUNDARY_ENTERED" "$boundary_pid" "seal child"
+
+(
+  : >"$LIFECYCLE_ATTEMPTED"
+  exec {fd}>"$LIFECYCLE_LOCK"
+  flock -x -w 5 "$fd"
+  exec {dark_fd}>"$WRITER_LOCK"
+  flock -x -w 5 "$dark_fd"
+  : >"$LIFECYCLE_COMPLETED"
+) &
+lifecycle_writer_pid=$!
+(
+  : >"$WRITER_ATTEMPTED"
+  exec {fd}>"$WRITER_LOCK"
+  flock -x -w 5 "$fd"
+  : >"$WRITER_COMPLETED"
+) &
+writer_pid=$!
+wait_for_file "$LIFECYCLE_ATTEMPTED" "$lifecycle_writer_pid" "lifecycle writer"
+wait_for_file "$WRITER_ATTEMPTED" "$writer_pid" "DarkIRC writer"
+[[ ! -e "$LIFECYCLE_COMPLETED" && ! -e "$WRITER_COMPLETED" ]] || {
+  printf 'concurrent writer crossed retained export boundary\n' >&2
+  exit 1
+}
+
+: >"$BOUNDARY_RELEASE"
+wait "$boundary_pid"
+wait_for_file "$LIFECYCLE_COMPLETED" "$lifecycle_writer_pid" "released lifecycle writer"
+wait_for_file "$WRITER_COMPLETED" "$writer_pid" "released DarkIRC writer"
+wait "$lifecycle_writer_pid"
+wait "$writer_pid"
 
 printf 'ALL TESTS PASSED\n'
