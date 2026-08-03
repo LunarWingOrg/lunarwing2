@@ -13,10 +13,12 @@ ROOT_CONFIG = ROOT / ".gitlab-ci.yml"
 README = ROOT / ".gitlab" / "README.md"
 TOOLCHAIN = ROOT / "ic" / "rust-toolchain.toml"
 WORKSPACE_MANIFEST = ROOT / "ic" / "Cargo.toml"
+CARGO_CONFIG = ROOT / ".cargo" / "config.toml"
 DEFAULTS = ROOT / ".gitlab" / "ci" / "defaults.yml"
 OPENCODE_DOCKERFILE = ROOT / "opencode4lunarwing" / "Dockerfile"
 KIMI_DOCKERFILE = ROOT / "kimicode4lunarwing" / "Dockerfile"
 EXPECTED_RUST_VERSION = "1.96.1"
+EXPECTED_NORMAL_DEBUG = "line-tables-only"
 EXPECTED_INCLUDES = [
     "/.gitlab/ci/workflow.yml",
     "/.gitlab/ci/defaults.yml",
@@ -89,6 +91,34 @@ def extract_rust_image(
     return match.group(1), match.group(2)
 
 
+def validate_cargo_profiles(defaults: dict, errors: list[str]) -> None:
+    if not CARGO_CONFIG.is_file():
+        errors.append(".cargo/config.toml missing")
+        return
+
+    with CARGO_CONFIG.open("rb") as stream:
+        cargo_config = tomllib.load(stream)
+    profiles = cargo_config.get("profile", {})
+    for profile_name in ("dev", "test"):
+        debug = profiles.get(profile_name, {}).get("debug")
+        if debug != EXPECTED_NORMAL_DEBUG:
+            errors.append(
+                f".cargo/config.toml profile.{profile_name}.debug {debug!r} != "
+                f"expected {EXPECTED_NORMAL_DEBUG!r}"
+            )
+
+    full_debug = profiles.get("full-debug", {})
+    if full_debug.get("inherits") != "dev" or full_debug.get("debug") != "full":
+        errors.append(".cargo/config.toml profile.full-debug must inherit dev with full debug")
+
+    ci_test_debug = defaults.get("variables", {}).get("CARGO_PROFILE_TEST_DEBUG")
+    if ci_test_debug != EXPECTED_NORMAL_DEBUG:
+        errors.append(
+            f"defaults.yml CARGO_PROFILE_TEST_DEBUG {ci_test_debug!r} != "
+            f"expected {EXPECTED_NORMAL_DEBUG!r}"
+        )
+
+
 def main() -> int:
     errors: list[str] = []
     root = load_yaml(ROOT_CONFIG)
@@ -153,6 +183,7 @@ def main() -> int:
 
     defaults_path = ROOT / ".gitlab" / "ci" / "defaults.yml"
     defaults = load_yaml(defaults_path)
+    validate_cargo_profiles(defaults, errors)
     rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
     msrv_image = extract_rust_image(defaults, ".rust-msrv-job", merged_variables)
     if rust_image is None:

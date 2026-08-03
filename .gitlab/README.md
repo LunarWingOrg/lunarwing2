@@ -131,7 +131,8 @@ registry paths to the allowlist when adopting option 2.
   CPUs 0-5 with no in-pipeline guard.
 - CI parallelism is intentional: `-j2` (libSQL `-j1`) caps peak memory within
   the 16 GB runner for four-way check jobs; `-j6` in AGENTS.md is the local-dev
-  budget. Lower debug info for libSQL link jobs avoids OOM near 16 GB.
+  budget. Normal test jobs retain line tables only; libSQL test jobs omit debug
+  info entirely to avoid OOM near 16 GB.
 
 Known false-positive Gitleaks findings are listed by exact fingerprint in
 `/.gitleaksignore`. Broad path or rule exclusions are forbidden.
