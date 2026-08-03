@@ -726,6 +726,101 @@ Cross-verification against source baseline `1e319bf` on 2026-08-02 confirmed:
 No live tenant or historical incident data was accessed during this
 cross-verification.
 
+### Live rebuild verification on `8c6a1da` (2026-08-03)
+
+Dwarfstar was upgraded from the incident-era checkout to
+`ds6/dwarfstar/v2.0.4.0` at commit
+`8c6a1da6113a636e7dc6af884248a2a191c7638c`. The rebuild and initial startup
+were observed read-only with one-second samples written by a detached `tmux`
+monitor.
+
+Attribution results:
+
+- The native release command was launched at `01:18:38-04:00` as
+  `cargo build --profile release --bin lunarwing` and completed at
+  `01:23:15-04:00`.
+- The launcher's journal metadata placed it in the operator's
+  `/user.slice/user-1000.slice/session-8.scope`, not
+  `lunarwing-dwarfstar.service`.
+- The tenant service was stopped during that build. Its cgroup did not exist in
+  the sampler until startup at `01:37:47-04:00`.
+- The native build command still specified no `-j`, `taskset`, `MemoryMax`, or
+  dedicated transient scope. No `CARGO_BUILD_JOBS` or `BUILD_JOBS` override was
+  present in the upgrade process environment, so Cargo could use host defaults.
+- The native stage produced 449 release artifacts with an aggregate final size
+  of about 947 MB. The final binary was 104,210,720 bytes. These are artifact
+  sizes, not write-traffic or RSS measurements.
+- The live sampler began after the native Cargo process exited, so it did not
+  capture per-`rustc` RSS for that stage. The broad operator login scope is not
+  usable as a build-memory measurement because it also contained Firefox,
+  Kimi Code, and other desktop processes.
+- Worker-image build steps were charged to separate Buildah/libpod scopes.
+  Individual observed scope peaks included approximately 4.4-4.9 GB; the
+  sampled upgrade-process tree peaked near 4.6 GiB RSS. None of this memory was
+  charged to the stopped Dwarfstar daemon service.
+- The daemon initially reached approximately 410 MiB, then rose to a stable
+  plateau: about 440 MiB for the service cgroup and 448-451 MiB `VmRSS`/`VmHWM`
+  for the main PID (`/proc` reports those fields in KiB). The cgroup carried
+  approximately 388 MiB anonymous and 49 MiB file memory, zero swap, and no
+  Cargo, `rustc`, or linker processes.
+- The plateau was stable rather than monotonic growth. A five-minute sample
+  window remained between approximately 438 and 446 MiB cgroup memory, with
+  only about 3 MiB net anonymous growth.
+- OpenCode, Kimi, PostgreSQL, and vision ran in sibling service cgroups. Their
+  observed peaks were approximately 661 MiB, 208 MiB, 113 MiB, and 60 MiB,
+  respectively.
+- No Cargo, `rustc`, or linker process remained after the upgrade completed.
+- The service was active and ready, and the tenant source and investigation
+  checkout both resolved to `8c6a1da`.
+
+The elevated daemon baseline was traced to startup high-water retention, not
+live Engine state or compiler descendants:
+
+- Dwarfstar created 32 normal Tokio runtime workers and, about 0.5 seconds later,
+  another 32 `tokio-rt-worker` threads. The second group is Wasmtime-WASI
+  36.0.13's process-global ambient runtime, a `LazyLock` multi-threaded Tokio
+  runtime used when synchronous WASI host bindings execute outside an entered
+  Tokio context. It was initialized while WASM metadata extraction ran in
+  `spawn_blocking`.
+- Startup loaded all installed `*.wasm` tool files concurrently. Dwarfstar had
+  15 tool components, not the eight current install names. Seven pre-rename
+  files (`gitlab.wasm`, `gotify.wasm`, `llm-context.wasm`,
+  `multica-bridge.wasm`, `ssh.wasm`, `vision-analyze.wasm`, and
+  `web-search.wasm`) survived from 2026-08-01 alongside the newly installed
+  `*-tool.wasm` files. `install_wasm_tenant()` overwrites current artifacts but
+  does not prune stale names; the loader therefore compiled and retained both
+  sets by distinct names.
+- `/proc/<pid>/smaps` showed 85 anonymous VMAs aligned to 64 MiB arena
+  boundaries, carrying about 350 MiB anonymous RSS. A read-only `malloc_stats()`
+  snapshot reported 86 glibc arenas with 463,802,368 bytes of allocator system
+  memory but only 47,936,640 bytes in use. This explains most of the elevated
+  RSS as freed startup allocations retained in per-thread arenas.
+- Wasmtime-WASI 36.0.12 and 36.0.13 have the same ambient-runtime implementation,
+  so the 36.0.13 security bump did not introduce that runtime design. The larger
+  baseline is driven by parallel startup work, thread/arena count, and the stale
+  component set rather than a per-call Wasmtime store leak.
+
+This live rebuild supports the central accounting conclusion: an operator-run
+upgrade build is outside the tenant daemon cgroup, while a host-local shell
+started by the daemon would inherit the daemon cgroup. It does **not** validate
+shell timeout cleanup, because no in-daemon compile/cancel workload was run.
+
+Current-source review on `8c6a1da` also found the incident's primary lifecycle
+risks unchanged:
+
+- direct shell execution still has no process-group ownership or
+  `kill_on_drop` guard;
+- the generic tool timeout remains 60 seconds while the shell's internal default
+  remains 120 seconds;
+- `mode=worker` still routes to the local scheduler when the container manager
+  is unavailable;
+- `build_tenant()` still invokes bare Cargo without explicit parallelism or a
+  dedicated bounded build scope;
+- generated tenant units still declare no explicit memory, swap, PID, or CPU
+  ceiling;
+- WASM tool startup remains fully parallel and installation does not remove
+  obsolete artifact names, amplifying allocator high-water retention.
+
 ## Research provenance
 
 Shared study-note topics `engine-v2`, `bridge`, `wasm-tool-sandbox`, and
