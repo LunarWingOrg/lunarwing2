@@ -1307,6 +1307,51 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         store_dyn.clone(),
         Arc::clone(&thread_manager),
     ));
+
+    // Wire every mission consumer before recovery or background work can run.
+    // Recovered threads may immediately call mission_* or emit an outcome.
+    effect_adapter
+        .set_mission_manager(Arc::clone(&mission_manager))
+        .await;
+    agent
+        .set_mission_manager(Arc::clone(&mission_manager))
+        .await;
+
+    // Subscribe before resuming persisted work so fast outcomes are not lost.
+    let mut notification_rx = mission_manager.subscribe_notifications();
+    let notification_cancel = mission_manager.cancellation_token();
+    let channels = Arc::clone(&agent.channels);
+    let hooks = Arc::clone(agent.hooks());
+    let sse_ref = agent.deps.sse_tx.clone();
+    let db_ref = agent.deps.store.clone();
+    let notification_task = tokio::spawn(async move {
+        loop {
+            let received = tokio::select! {
+                _ = notification_cancel.cancelled() => break,
+                received = notification_rx.recv() => received,
+            };
+            match received {
+                Ok(notif) => {
+                    handle_mission_notification(
+                        &notif,
+                        &channels,
+                        &hooks,
+                        sse_ref.as_ref(),
+                        db_ref.as_ref(),
+                    )
+                    .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    debug!("mission notification receiver lagged by {n}");
+                }
+            }
+        }
+    });
+    mission_manager
+        .track_notification_task(notification_task)
+        .await;
+
     if let Err(e) = thread_manager.recover_project_threads(project_id).await {
         debug!("engine v2: recover_project_threads failed: {e}");
     }
@@ -1315,6 +1360,14 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     }
     if let Err(e) = mission_manager.bootstrap_all_projects().await {
         debug!("engine v2: bootstrap_all_projects failed: {e}");
+    }
+    // Reconcile feature-gated missions before recovered threads or listeners
+    // can emit events into persisted self-improvement missions.
+    if let Err(e) = mission_manager
+        .ensure_learning_missions(project_id, owner_id)
+        .await
+    {
+        debug!("engine v2: failed to create learning missions: {e}");
     }
     if let Err(e) = mission_manager.resume_recoverable_threads().await {
         debug!("engine v2: resume_recoverable_threads failed: {e}");
@@ -1327,45 +1380,12 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     if let Err(e) = thread_manager.resume_background_threads(project_id).await {
         debug!("engine v2: resume_background_threads failed: {e}");
     }
-    mission_manager.start_cron_ticker(agent.deps.owner_id.clone());
-    mission_manager.start_event_listener(agent.deps.owner_id.clone());
-
-    // Subscribe to mission outcome notifications and route results to channels.
-    {
-        let mut notification_rx = mission_manager.subscribe_notifications();
-        let channels = Arc::clone(&agent.channels);
-        let hooks = Arc::clone(agent.hooks());
-        let sse_ref = agent.deps.sse_tx.clone();
-        let db_ref = agent.deps.store.clone();
-        tokio::spawn(async move {
-            loop {
-                match notification_rx.recv().await {
-                    Ok(notif) => {
-                        handle_mission_notification(
-                            &notif,
-                            &channels,
-                            &hooks,
-                            sse_ref.as_ref(),
-                            db_ref.as_ref(),
-                        )
-                        .await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        debug!("mission notification receiver lagged by {n}");
-                    }
-                }
-            }
-        });
-    }
-
-    // Ensure per-user learning missions exist for the owner
-    if let Err(e) = mission_manager
-        .ensure_learning_missions(project_id, owner_id)
-        .await
-    {
-        debug!("engine v2: failed to create learning missions: {e}");
-    }
+    mission_manager
+        .start_cron_ticker(agent.deps.owner_id.clone())
+        .await;
+    mission_manager
+        .start_event_listener(agent.deps.owner_id.clone())
+        .await;
 
     // Migrate v1 skills to v2 MemoryDocs (skill selection happens in the
     // Python orchestrator at runtime via __list_skills__).
@@ -1398,16 +1418,6 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
             }
         }
     }
-
-    // Wire mission manager into effect adapter for mission_* function calls
-    effect_adapter
-        .set_mission_manager(Arc::clone(&mission_manager))
-        .await;
-
-    // Wire mission manager into agent for /expected command
-    agent
-        .set_mission_manager(Arc::clone(&mission_manager))
-        .await;
 
     let pending_gates = Arc::new(crate::gate::store::PendingGateStore::new(Some(Arc::new(
         crate::gate::persistence::FileGatePersistence::with_default_path(),
@@ -5086,12 +5096,33 @@ pub async fn resume_engine_mission(
         .map_err(|e| engine_err("resume mission", e))
 }
 
+/// Stop mission ticker, listener, notification routing, and outcome watchers.
+/// Must run before MCP processes are torn down because mission threads can use
+/// MCP-backed tools while their outcomes are being finalized.
+pub async fn shutdown_engine() {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return;
+    };
+    let adapter = {
+        let guard = lock.read().await;
+        let Some(state) = guard.as_ref() else {
+            return;
+        };
+        Arc::clone(&state.effect_adapter)
+    };
+    let manager = adapter.mission_manager().await;
+    if let Some(manager) = manager {
+        manager.shutdown().await;
+    }
+}
+
 /// Reset the global engine state so a fresh engine can be initialized.
 ///
 /// Used by the test rig to isolate engine v2 tests — each test gets a clean
 /// engine state instead of inheriting the prior test's `OnceLock` singleton.
 #[cfg(feature = "libsql")]
 pub async fn reset_engine_state() {
+    shutdown_engine().await;
     if let Some(lock) = ENGINE_STATE.get() {
         *lock.write().await = None;
     }

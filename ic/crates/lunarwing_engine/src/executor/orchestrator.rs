@@ -48,7 +48,9 @@ use crate::types::step::{ActionCall, LlmResponse, StepId, TokenUsage};
 use crate::types::thread::{Thread, ThreadState};
 
 use super::llm_stream::collect_llm_stream;
-use super::scripting::{execute_code, json_to_monty, monty_to_json, monty_to_string};
+use super::scripting::{
+    execute_code_with_action_limit, json_to_monty, monty_to_json, monty_to_string,
+};
 
 /// The compiled-in default orchestrator (v0).
 pub(crate) const DEFAULT_ORCHESTRATOR: &str = include_str!("../../orchestrator/default.py");
@@ -471,7 +473,16 @@ pub async fn execute_orchestrator(
                     // __execute_code_step__(code, state)
                     "__execute_code_step__" => {
                         match handle_execute_code_step(
-                            args, kwargs, thread, llm, effects, leases, policy, event_tx, store,
+                            args,
+                            kwargs,
+                            thread,
+                            llm,
+                            effects,
+                            leases,
+                            policy,
+                            &mut actions_this_step,
+                            event_tx,
+                            store,
                         )
                         .await
                         {
@@ -808,6 +819,7 @@ async fn handle_execute_code_step(
     effects: &Arc<dyn EffectExecutor>,
     leases: &Arc<LeaseManager>,
     policy: &Arc<PolicyEngine>,
+    actions_this_step: &mut usize,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
     store: Option<&Arc<dyn Store>>,
 ) -> Result<ExtFunctionResult, EngineError> {
@@ -840,7 +852,8 @@ async fn handle_execute_code_step(
     };
 
     // Run user code in a nested Monty VM (same pattern as rlm_query)
-    match Box::pin(execute_code(
+    let remaining_actions = super::MAX_ACTIONS_PER_STEP.saturating_sub(*actions_this_step);
+    match Box::pin(execute_code_with_action_limit(
         &code,
         thread,
         llm,
@@ -851,10 +864,12 @@ async fn handle_execute_code_step(
         &[],
         &state,
         store,
+        remaining_actions,
     ))
     .await
     {
         Ok(result) => {
+            *actions_this_step = (*actions_this_step).saturating_add(result.action_calls_attempted);
             if matches!(&result.need_approval, Some(ThreadOutcome::Stopped)) {
                 return Err(EngineError::ExecutionStopped);
             }
@@ -3682,6 +3697,61 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_action_limit_spans_repeated_code_steps() {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        let effects = Arc::new(CountingEffects {
+            actions: vec![test_action_def("echo")],
+            executions: AtomicUsize::new(0),
+        });
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let llm: Arc<dyn LlmBackend> = Arc::new(PendingStreamLlm);
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, None)
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let args = [
+            MontyObject::String("echo()".into()),
+            json_to_monty(&serde_json::json!({})),
+        ];
+        let mut actions_this_step = super::super::MAX_ACTIONS_PER_STEP - 1;
+
+        for _ in 0..2 {
+            handle_execute_code_step(
+                &args,
+                &[],
+                &mut thread,
+                &llm,
+                &effects_dyn,
+                &leases,
+                &policy,
+                &mut actions_this_step,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 1);
+        assert_eq!(actions_this_step, super::super::MAX_ACTIONS_PER_STEP + 1);
+        assert!(thread.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::ActionFailed { error, .. }
+                    if error.contains("Tool call limit reached")
+            )
+        }));
     }
 
     #[tokio::test]

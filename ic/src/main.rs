@@ -1325,6 +1325,8 @@ async fn async_main() -> anyhow::Result<()> {
         mgr.drain_pool().await;
     }
 
+    lunarwing::bridge::router::shutdown_engine().await;
+
     if let Some(manager) = extension_manager_for_shutdown {
         manager.shutdown_mcp_supervisor().await;
     }

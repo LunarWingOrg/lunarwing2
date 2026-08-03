@@ -77,6 +77,8 @@ pub struct CodeExecutionResult {
     pub final_answer: Option<String>,
     /// Whether the code execution hit an error (traceback included in stdout).
     pub had_error: bool,
+    /// Tool calls attempted, including denied and gate-paused calls.
+    pub action_calls_attempted: usize,
 }
 
 /// Build a compact output summary for inclusion in LLM context between steps.
@@ -253,7 +255,37 @@ pub async fn execute_code(
     persisted_state: &serde_json::Value,
     store: Option<&Arc<dyn crate::traits::store::Store>>,
 ) -> Result<CodeExecutionResult, EngineError> {
-    execute_code_with_skills(
+    execute_code_with_action_limit(
+        code,
+        thread,
+        llm,
+        effects,
+        leases,
+        policy,
+        context,
+        capability_policies,
+        persisted_state,
+        store,
+        super::MAX_ACTIONS_PER_STEP,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_code_with_action_limit(
+    code: &str,
+    thread: &Thread,
+    llm: &Arc<dyn LlmBackend>,
+    effects: &Arc<dyn EffectExecutor>,
+    leases: &LeaseManager,
+    policy: &PolicyEngine,
+    context: &ThreadExecutionContext,
+    capability_policies: &[crate::types::capability::PolicyRule],
+    persisted_state: &serde_json::Value,
+    store: Option<&Arc<dyn crate::traits::store::Store>>,
+    action_limit: usize,
+) -> Result<CodeExecutionResult, EngineError> {
+    execute_code_with_skills_and_action_limit(
         code,
         thread,
         llm,
@@ -265,6 +297,7 @@ pub async fn execute_code(
         persisted_state,
         &[],
         store,
+        action_limit,
     )
     .await
 }
@@ -287,12 +320,45 @@ pub async fn execute_code_with_skills(
     skill_snippet_names: &[String],
     store: Option<&Arc<dyn crate::traits::store::Store>>,
 ) -> Result<CodeExecutionResult, EngineError> {
+    execute_code_with_skills_and_action_limit(
+        code,
+        thread,
+        llm,
+        effects,
+        leases,
+        policy,
+        context,
+        capability_policies,
+        persisted_state,
+        skill_snippet_names,
+        store,
+        super::MAX_ACTIONS_PER_STEP,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_code_with_skills_and_action_limit(
+    code: &str,
+    thread: &Thread,
+    llm: &Arc<dyn LlmBackend>,
+    effects: &Arc<dyn EffectExecutor>,
+    leases: &LeaseManager,
+    policy: &PolicyEngine,
+    context: &ThreadExecutionContext,
+    capability_policies: &[crate::types::capability::PolicyRule],
+    persisted_state: &serde_json::Value,
+    skill_snippet_names: &[String],
+    store: Option<&Arc<dyn crate::traits::store::Store>>,
+    action_limit: usize,
+) -> Result<CodeExecutionResult, EngineError> {
     let mut stdout = String::new();
     let mut action_results = Vec::new();
     let mut events = Vec::new();
     let mut recursive_tokens = TokenUsage::default();
     let mut final_answer: Option<String> = None;
     let mut had_error = false;
+    let mut tool_call_count = 0usize;
 
     // Build context variables including persisted state from prior steps
     let (input_names, input_values) = build_context_inputs(thread, persisted_state);
@@ -338,6 +404,7 @@ pub async fn execute_code_with_skills(
                 recursive_tokens,
                 final_answer: None,
                 had_error: true,
+                action_calls_attempted: tool_call_count,
             });
         }
         Err(_) => {
@@ -367,6 +434,7 @@ pub async fn execute_code_with_skills(
                 recursive_tokens,
                 final_answer: None,
                 had_error: true,
+                action_calls_attempted: tool_call_count,
             });
         }
         Err(_) => {
@@ -399,7 +467,6 @@ pub async fn execute_code_with_skills(
 
     // Drive the execution loop
     let mut call_counter = 0u32;
-    let mut tool_call_count = 0usize;
     loop {
         match progress {
             RunProgress::Complete(obj) => {
@@ -413,6 +480,7 @@ pub async fn execute_code_with_skills(
                     recursive_tokens,
                     final_answer,
                     had_error,
+                    action_calls_attempted: tool_call_count,
                 });
             }
 
@@ -521,6 +589,7 @@ pub async fn execute_code_with_skills(
                                 recursive_tokens,
                                 final_answer,
                                 had_error,
+                                action_calls_attempted: tool_call_count,
                             });
                         }
                         Err(_) => {
@@ -553,6 +622,7 @@ pub async fn execute_code_with_skills(
                                 recursive_tokens,
                                 final_answer,
                                 had_error,
+                                action_calls_attempted: tool_call_count,
                             });
                         }
                         Err(_) => {
@@ -571,7 +641,7 @@ pub async fn execute_code_with_skills(
                 // If approved, spawn tokio task and resume_pending().
 
                 tool_call_count += 1;
-                let preflight = if tool_call_count > super::MAX_ACTIONS_PER_STEP {
+                let preflight = if tool_call_count > action_limit {
                     let error = format!(
                         "Tool call limit reached ({} per code step). Break your task into multiple steps.",
                         super::MAX_ACTIONS_PER_STEP
@@ -652,6 +722,7 @@ pub async fn execute_code_with_skills(
                                     recursive_tokens,
                                     final_answer,
                                     had_error,
+                                    action_calls_attempted: tool_call_count,
                                 });
                             }
                             Err(_) => {
@@ -681,6 +752,7 @@ pub async fn execute_code_with_skills(
                                     recursive_tokens,
                                     final_answer,
                                     had_error,
+                                    action_calls_attempted: tool_call_count,
                                 });
                             }
                             Err(_) => {
@@ -702,6 +774,7 @@ pub async fn execute_code_with_skills(
                             recursive_tokens,
                             final_answer: None,
                             had_error,
+                            action_calls_attempted: tool_call_count,
                         });
                     }
                 }
@@ -739,6 +812,7 @@ pub async fn execute_code_with_skills(
                         recursive_tokens,
                         final_answer: None,
                         had_error,
+                        action_calls_attempted: tool_call_count,
                     });
                 }
 
@@ -759,6 +833,7 @@ pub async fn execute_code_with_skills(
                             recursive_tokens,
                             final_answer,
                             had_error,
+                            action_calls_attempted: tool_call_count,
                         });
                     }
                     Err(_) => {
@@ -806,6 +881,7 @@ pub async fn execute_code_with_skills(
                             recursive_tokens,
                             final_answer,
                             had_error,
+                            action_calls_attempted: tool_call_count,
                         });
                     }
                     Err(_) => {
@@ -840,6 +916,7 @@ pub async fn execute_code_with_skills(
                             recursive_tokens,
                             final_answer,
                             had_error,
+                            action_calls_attempted: tool_call_count,
                         });
                     }
                     Err(_) => {

@@ -12,6 +12,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::memory::RetrievalEngine;
@@ -126,6 +128,9 @@ pub struct MissionManager {
     notification_tx: tokio::sync::broadcast::Sender<MissionNotification>,
     /// Host-provided prompt guidance keyed by channel name.
     channel_contexts: RwLock<HashMap<String, String>>,
+    /// Cancellation and handles for ticker, listener, and outcome watchers.
+    task_cancel: CancellationToken,
+    task_handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 fn normalize_cron_expression(expression: &str) -> String {
@@ -206,6 +211,50 @@ impl MissionManager {
             fire_locks: Arc::new(Mutex::new(HashMap::new())),
             notification_tx,
             channel_contexts: RwLock::new(HashMap::new()),
+            task_cancel: CancellationToken::new(),
+            task_handles: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Token host-owned notification tasks can use for coordinated shutdown.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.task_cancel.clone()
+    }
+
+    async fn track_task(&self, handle: JoinHandle<()>) {
+        let mut handles = self.task_handles.lock().await;
+        handles.retain(|task| !task.is_finished());
+        if self.task_cancel.is_cancelled() {
+            handle.abort();
+            return;
+        }
+        handles.push(handle);
+    }
+
+    /// Track host notification routing with mission-owned background work.
+    pub async fn track_notification_task(&self, handle: JoinHandle<()>) {
+        self.track_task(handle).await;
+    }
+
+    /// Stop mission background work and wait for each task to settle.
+    pub async fn shutdown(&self) {
+        self.task_cancel.cancel();
+        let handles = std::mem::take(&mut *self.task_handles.lock().await);
+        let abort_handles = handles
+            .iter()
+            .map(JoinHandle::abort_handle)
+            .collect::<Vec<_>>();
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures::future::join_all(handles),
+        )
+        .await
+        .is_err()
+        {
+            warn!("mission background tasks did not stop before timeout; aborting them");
+            for handle in abort_handles {
+                handle.abort();
+            }
         }
     }
 
@@ -427,6 +476,11 @@ impl MissionManager {
                 entity: format!("mission {id}"),
             });
         }
+        if is_self_improvement_mission(&mission) && !crate::skill_self_improvement_enabled() {
+            return Err(EngineError::Effect {
+                reason: "self-improvement is disabled".into(),
+            });
+        }
         mission.status = MissionStatus::Active;
         mission.updated_at = Utc::now();
         refresh_next_fire_at(&mut mission, Utc::now())?;
@@ -530,6 +584,9 @@ impl MissionManager {
         trigger_payload: Option<serde_json::Value>,
         advance_schedule: bool,
     ) -> Result<Option<ThreadId>, EngineError> {
+        if self.task_cancel.is_cancelled() {
+            return Ok(None);
+        }
         let fire_lock = mission_lock(&self.fire_locks, id).await;
         let _fire_guard = fire_lock.lock().await;
         let mission = self.store.load_mission(id).await?;
@@ -558,6 +615,10 @@ impl MissionManager {
         }
         if mission.status == MissionStatus::Paused {
             debug!(mission_id = %id, "cannot fire paused mission");
+            return Ok(None);
+        }
+        if is_self_improvement_mission(&mission) && !crate::skill_self_improvement_enabled() {
+            debug!(mission_id = %id, "self-improvement disabled; mission suppressed");
             return Ok(None);
         }
 
@@ -645,7 +706,7 @@ impl MissionManager {
         }
 
         debug!(mission_id = %id, thread_id = %thread_id, "mission fired");
-        self.spawn_mission_outcome_watcher(id, thread_id);
+        self.spawn_mission_outcome_watcher(id, thread_id).await;
 
         Ok(Some(thread_id))
     }
@@ -690,7 +751,8 @@ impl MissionManager {
                     warn!(%mission_id, %thread_id, %error, "failed to resume mission thread");
                     continue;
                 }
-                self.spawn_mission_outcome_watcher(mission_id, thread_id);
+                self.spawn_mission_outcome_watcher(mission_id, thread_id)
+                    .await;
                 resumed.push(thread_id);
             }
         }
@@ -699,12 +761,16 @@ impl MissionManager {
     }
 
     /// Start a background cron ticker that fires due missions every 60 seconds.
-    pub fn start_cron_ticker(self: &Arc<Self>, user_id: String) {
+    pub async fn start_cron_ticker(self: &Arc<Self>, user_id: String) {
         let mgr = Arc::clone(self);
-        tokio::spawn(async move {
+        let cancel = self.task_cancel.clone();
+        let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
                 match mgr.tick(&user_id).await {
                     Ok(spawned) if !spawned.is_empty() => {
                         debug!(count = spawned.len(), "cron ticker spawned mission threads");
@@ -716,6 +782,7 @@ impl MissionManager {
                 }
             }
         });
+        self.track_task(handle).await;
     }
 
     /// List all missions in a project for a given user.
@@ -929,9 +996,10 @@ impl MissionManager {
     ///    fires `thread_completed_with_learnings`
     /// 3. **Conversation insights** — after every N threads in a conversation,
     ///    fires `conversation_insights_due`
-    pub fn start_event_listener(self: &Arc<Self>, _owner_id: String) {
+    pub async fn start_event_listener(self: &Arc<Self>, _owner_id: String) {
         let mgr = Arc::clone(self);
         let mut rx = mgr.thread_manager.subscribe_events();
+        let cancel = self.task_cancel.clone();
 
         /// Minimum steps for a thread to be a skill extraction candidate.
         const SKILL_EXTRACTION_MIN_STEPS: usize = 5;
@@ -940,13 +1008,17 @@ impl MissionManager {
         /// Completed thread interval for conversation insights.
         const CONVERSATION_INSIGHTS_INTERVAL: u32 = 5;
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // Track completed thread count per conversation for insights trigger.
             let mut conv_thread_counts: std::collections::HashMap<String, u32> =
                 std::collections::HashMap::new();
 
             loop {
-                match rx.recv().await {
+                let received = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    received = rx.recv() => received,
+                };
+                match received {
                     Ok(event) => {
                         let terminal_state = match event.kind {
                             crate::types::event::EventKind::StateChanged {
@@ -1205,6 +1277,7 @@ impl MissionManager {
                 }
             }
         });
+        self.track_task(handle).await;
     }
 
     /// Ensure a self-improvement mission exists for the given project.
@@ -1288,6 +1361,9 @@ impl MissionManager {
         if self_improvement_on {
             self.ensure_self_improvement_mission(project_id, user_id)
                 .await?;
+        } else {
+            self.deactivate_self_improvement_missions(project_id, user_id)
+                .await?;
         }
 
         // 2. Skill extraction (formerly playbook extraction)
@@ -1358,6 +1434,29 @@ impl MissionManager {
             .await?;
         }
 
+        Ok(())
+    }
+
+    async fn deactivate_self_improvement_missions(
+        &self,
+        project_id: ProjectId,
+        user_id: &str,
+    ) -> Result<(), EngineError> {
+        let missions = self
+            .store
+            .list_missions_with_shared(project_id, user_id)
+            .await?;
+        for mission in missions
+            .into_iter()
+            .filter(|mission| mission.is_owned_by(user_id) && is_self_improvement_mission(mission))
+        {
+            if mission.status == MissionStatus::Active {
+                self.store
+                    .update_mission_status(mission.id, MissionStatus::Paused)
+                    .await?;
+            }
+            self.active.write().await.retain(|id| *id != mission.id);
+        }
         Ok(())
     }
 
@@ -1548,13 +1647,21 @@ impl MissionManager {
         Ok(spawned)
     }
 
-    fn spawn_mission_outcome_watcher(&self, mission_id: MissionId, thread_id: ThreadId) {
+    async fn spawn_mission_outcome_watcher(&self, mission_id: MissionId, thread_id: ThreadId) {
         let tm = Arc::clone(&self.thread_manager);
         let store = Arc::clone(&self.store);
         let fire_locks = Arc::clone(&self.fire_locks);
         let notification_tx = self.notification_tx.clone();
-        tokio::spawn(async move {
-            match tm.join_thread(thread_id).await {
+        let cancel = self.task_cancel.clone();
+        let handle = tokio::spawn(async move {
+            let outcome = tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = tm.stop_thread_system(thread_id).await;
+                    tm.join_thread(thread_id).await
+                },
+                outcome = tm.join_thread(thread_id) => outcome,
+            };
+            match outcome {
                 Ok(outcome) => {
                     let lock = mission_lock(&fire_locks, mission_id).await;
                     let _guard = lock.lock().await;
@@ -1575,6 +1682,7 @@ impl MissionManager {
                 }
             }
         });
+        self.track_task(handle).await;
     }
 }
 
@@ -3858,6 +3966,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_self_improvement_pauses_persisted_mission_and_suppresses_events() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let mission_id = mgr
+            .ensure_self_improvement_mission(project_id, "test-user")
+            .await
+            .unwrap();
+
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", false)
+            .await
+            .unwrap();
+
+        let mission = store.load_mission(mission_id).await.unwrap().unwrap();
+        assert_eq!(mission.status, MissionStatus::Paused);
+        let spawned = mgr
+            .fire_on_system_event(
+                "engine",
+                "thread_completed_with_issues",
+                "test-user",
+                Some(serde_json::json!({"issue": "boom"})),
+            )
+            .await
+            .unwrap();
+        assert!(spawned.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_and_joins_mission_background_tasks() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+
+        mgr.start_cron_ticker("test-user".into()).await;
+        mgr.start_event_listener("test-user".into()).await;
+        assert_eq!(mgr.task_handles.lock().await.len(), 2);
+
+        mgr.shutdown().await;
+
+        assert!(mgr.task_cancel.is_cancelled());
+        assert!(mgr.task_handles.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn ensure_learning_missions_repairs_and_refreshes_managed_mission() {
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
@@ -4427,7 +4578,7 @@ mod tests {
             .find(is_self_improvement_mission)
             .expect("self-improvement mission should exist")
             .id;
-        mgr.start_event_listener("test-user".into());
+        mgr.start_event_listener("test-user".into()).await;
 
         let thread_id = mgr
             .thread_manager
@@ -4475,7 +4626,7 @@ mod tests {
             )
             .await
             .unwrap();
-        mgr.start_event_listener("test-user".into());
+        mgr.start_event_listener("test-user".into()).await;
 
         for index in 0..4 {
             let thread_id = mgr
