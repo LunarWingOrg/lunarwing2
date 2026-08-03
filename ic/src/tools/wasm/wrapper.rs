@@ -176,25 +176,24 @@ impl crate::tools::wasm::WorkspaceReader for PreloadedWorkspaceReader {
     }
 }
 
-fn direct_workspace_preload_path(prefixes: &[String]) -> Option<&str> {
-    match prefixes {
-        [path] if path == GITLAB_CONFIG_PATH => Some(path),
-        _ => None,
-    }
+fn uses_direct_gitlab_config_preload(tool_name: &str, prefixes: &[String]) -> bool {
+    matches!(tool_name, "gitlab" | "gitlab-tool")
+        && matches!(prefixes, [path] if path == GITLAB_CONFIG_PATH)
 }
 
 /// Pre-load workspace documents matching the given prefixes into a sync reader.
 async fn preload_workspace_reader(
     workspace: &crate::workspace::Workspace,
+    tool_name: &str,
     prefixes: &[String],
 ) -> PreloadedWorkspaceReader {
     let mut data = HashMap::new();
 
     // GitLab grants access to one exact config file. Avoid recursively listing
     // every workspace/read scope on every tool call just to find that path.
-    // Other grants retain prefix semantics and therefore still require listing.
-    let matching = if let Some(path) = direct_workspace_preload_path(prefixes) {
-        vec![path.to_string()]
+    // Other tools and grants retain prefix semantics and still require listing.
+    let matching = if uses_direct_gitlab_config_preload(tool_name, prefixes) {
+        vec![GITLAB_CONFIG_PATH.to_string()]
     } else {
         let paths = match workspace.list_all().await {
             Ok(paths) => paths,
@@ -1470,7 +1469,7 @@ impl Tool for WasmToolWrapper {
         let mut capabilities = self.capabilities.clone();
         if let (Some(ws), Some(ws_cap)) = (&self.workspace, &capabilities.workspace_read) {
             let prefixes = ws_cap.allowed_prefixes.clone();
-            let reader = preload_workspace_reader(ws, &prefixes).await;
+            let reader = preload_workspace_reader(ws, self.name(), &prefixes).await;
             if let Some(ref mut cap) = capabilities.workspace_read {
                 cap.reader = Some(Arc::new(reader));
             }
@@ -3762,22 +3761,28 @@ mod tests {
 
     #[test]
     fn test_gitlab_config_uses_direct_workspace_preload() {
-        assert_eq!(
-            super::direct_workspace_preload_path(&[super::GITLAB_CONFIG_PATH.to_string()]),
-            Some(super::GITLAB_CONFIG_PATH)
-        );
-        assert_eq!(
-            super::direct_workspace_preload_path(&["config/".to_string()]),
-            None
-        );
-        assert_eq!(
-            super::direct_workspace_preload_path(&[
-                super::GITLAB_CONFIG_PATH.to_string(),
-                "notes/".to_string(),
-            ]),
-            None
-        );
-        assert_eq!(super::direct_workspace_preload_path(&[]), None);
+        let config_path = [super::GITLAB_CONFIG_PATH.to_string()];
+        assert!(super::uses_direct_gitlab_config_preload(
+            "gitlab",
+            &config_path
+        ));
+        assert!(super::uses_direct_gitlab_config_preload(
+            "gitlab-tool",
+            &config_path
+        ));
+        assert!(!super::uses_direct_gitlab_config_preload(
+            "another-tool",
+            &config_path
+        ));
+        assert!(!super::uses_direct_gitlab_config_preload(
+            "gitlab",
+            &["config/".to_string()]
+        ));
+        assert!(!super::uses_direct_gitlab_config_preload(
+            "gitlab",
+            &[super::GITLAB_CONFIG_PATH.to_string(), "notes/".to_string(),]
+        ));
+        assert!(!super::uses_direct_gitlab_config_preload("gitlab", &[]));
     }
 
     #[test]
