@@ -133,6 +133,8 @@ pub struct ReflexConfig {
     pub max_patterns_per_run: usize,
     /// Fuzzy matching threshold (Jaro-Winkler similarity, default: 0.85).
     pub fuzzy_threshold: f64,
+    /// Whether semantic matching may call the embedding provider (default: false).
+    pub semantic_enabled: bool,
     /// Semantic matching threshold (cosine similarity, default: 0.75).
     pub semantic_threshold: f64,
     /// How often the evictor checks for stale patterns (default: 24 hours).
@@ -151,6 +153,7 @@ impl Default for ReflexConfig {
             min_match_count: 3,
             max_patterns_per_run: 5,
             fuzzy_threshold: 0.85,
+            semantic_enabled: false,
             semantic_threshold: 0.75,
             eviction_check_interval: Duration::from_secs(86400),
             eviction_stale_days: 30,
@@ -268,6 +271,7 @@ impl AgentConfig {
                 min_match_count: parse_optional_env("REFLEX_MIN_MATCH_COUNT", 3u32)?,
                 max_patterns_per_run: parse_optional_env("REFLEX_MAX_PATTERNS_PER_RUN", 5usize)?,
                 fuzzy_threshold: parse_optional_env("REFLEX_FUZZY_THRESHOLD", 0.85f64)?,
+                semantic_enabled: parse_bool_env("REFLEX_SEMANTIC_ENABLED", false)?,
                 semantic_threshold: parse_optional_env("REFLEX_SEMANTIC_THRESHOLD", 0.75f64)?,
                 eviction_check_interval: Duration::from_secs(parse_optional_env(
                     "REFLEX_EVICTION_INTERVAL_SECS",
@@ -298,6 +302,11 @@ mod tests {
         let settings = Settings::default(); // default is "UTC"
         let config = AgentConfig::resolve(&settings).expect("resolve");
         assert_eq!(config.default_timezone, "UTC");
+    }
+
+    #[test]
+    fn reflex_semantic_matching_defaults_off() {
+        assert!(!ReflexConfig::default().semantic_enabled);
     }
 
     #[test]

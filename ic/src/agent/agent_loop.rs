@@ -287,6 +287,8 @@ pub struct Agent {
         Arc<tokio::sync::RwLock<Option<Arc<lunarwing_engine::MissionManager>>>>,
     /// Reflex router for fast-path pattern matching.
     pub(super) reflex_router: Arc<crate::agent::reflex::ReflexRouter>,
+    /// Non-blocking write-behind counter for successful reflex routes.
+    pub(super) reflex_hits: Arc<crate::agent::reflex::ReflexHitAccumulator>,
 }
 
 impl Agent {
@@ -354,6 +356,7 @@ impl Agent {
                     threshold: config.reflex.fuzzy_threshold,
                     ..Default::default()
                 })
+                .with_semantic_enabled(config.reflex.semantic_enabled)
                 .with_semantic_threshold(config.reflex.semantic_threshold);
             if let Some(provider) = embedding_provider {
                 router = router.with_embedding_provider(provider);
@@ -376,6 +379,7 @@ impl Agent {
             routine_engine_slot: Arc::new(tokio::sync::RwLock::new(None)),
             mission_manager_slot: Arc::new(tokio::sync::RwLock::new(None)),
             reflex_router,
+            reflex_hits: Arc::new(crate::agent::reflex::ReflexHitAccumulator::default()),
         }
     }
 
@@ -882,6 +886,18 @@ impl Agent {
                 (None, None, None)
             };
 
+        let reflex_hit_flusher = if self.config.reflex.enabled {
+            self.store().map(|store| {
+                crate::agent::reflex::spawn_reflex_hit_flusher(
+                    Arc::clone(&self.reflex_hits),
+                    Arc::clone(store),
+                    crate::agent::reflex::REFLEX_HIT_FLUSH_INTERVAL,
+                )
+            })
+        } else {
+            None
+        };
+
         // Spawn routine engine if enabled
         let routine_handle = if let Some(ref rt_config) = self.routine_config {
             if rt_config.enabled {
@@ -1162,6 +1178,11 @@ impl Agent {
         }
         if let Some((cron_handle, _)) = routine_handle {
             cron_handle.abort();
+        }
+        if let Some(flusher) = reflex_hit_flusher {
+            flusher
+                .shutdown(crate::agent::reflex::REFLEX_HIT_SHUTDOWN_TIMEOUT)
+                .await;
         }
         // Flush pending coalesced coordination messages before channels go
         // away so buffered content is not lost on shutdown (ISSUE-002).
