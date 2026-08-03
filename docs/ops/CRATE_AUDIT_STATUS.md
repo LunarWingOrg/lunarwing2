@@ -1,11 +1,15 @@
 # Crate Audit Status Report
 
+> **Status: superseded.** This v2.0.2.0 snapshot is retained for historical
+> context. Use [`CRATE_AUDIT_v2.0.4.0.md`](CRATE_AUDIT_v2.0.4.0.md) for the
+> current dependency, workspace-version, and Rust 1.96.1 toolchain audit.
+
 **Date:** 2026-07-21
 **Scope:** LunarWing v2.0.2.0 — `ic/` workspace and satellite crates
 **Replaces:** `_OUTDATED_CRATE_AUDIT_STATUS.md` (2026-07-12, v2.0.0.0)
 
 ---
-# new one needed for 2.0.4.0
+
 ## Purpose
 
 Verify the accuracy of the crate-audit info dump attached to

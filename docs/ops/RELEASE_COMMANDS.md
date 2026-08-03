@@ -7,15 +7,9 @@ https://git.lunarwing.org/LunarWing/LunarWing_v2
 ```
 
 Self-hosted GitLab CE (v19.2.0). Replace `<version>` (e.g. `1.1.9`) and
-`<codename>` with the target release values. Branching strategy
-(`master` → `release/v<version>`) is documented in the root `CLAUDE.md` where
-applicable.
-
-> **Sibling docs:**
-> - [`RELEASE-COMMANDS.md`](RELEASE-COMMANDS.md) — original GitHub / `gh` variant
-> - [`RELEASE-COMMANDS-CODEBERG.md`](RELEASE-COMMANDS-CODEBERG.md) — historical Codeberg/Forgejo variant, now archived
->
-> Prefer **this** file for the GitLab origin used by `LunarWing_v2` going forward.
+`<codename>` with the target release values. This guide uses the current
+`master` → `release/v<version>` branching flow and the GitLab origin used by
+`LunarWing_v2`.
 
 ---
 
@@ -239,7 +233,5 @@ with others, or release notes.
 
 ## Related
 
-- [`RELEASE-COMMANDS.md`](RELEASE-COMMANDS.md) — original GitHub / `gh` variant
-- [`RELEASE-COMMANDS-CODEBERG.md`](RELEASE-COMMANDS-CODEBERG.md) — archived Codeberg/Forgejo variant
 - [`RELEASE_CADENCE.md`](RELEASE_CADENCE.md) — odd/even cadence notes
-- `docs/releases/` — archived release notes (where present)
+- [`../releases/`](../releases/) — archived release notes

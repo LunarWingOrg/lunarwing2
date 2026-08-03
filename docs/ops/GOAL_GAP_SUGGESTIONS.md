@@ -1,11 +1,12 @@
 # Goal List Gap Suggestions — v2.0.3.0
 
-> **Purpose:** Deliverable for item #3 in `docs/ops/AGENT_GOALS_2.0.3.0.md`.
-> Surfaces release-track work that is **not** represented in the current v2.0.3.0
-> goals list but is verifiable against the repo on 2026-07-25. Each suggestion
-> cites the evidence so a human can triage add/defer in one pass.
+> **Purpose:** Deliverable for item #3 in the archived
+> [`AGENT_GOALS_2.0.3.0.md`](history/AGENT_GOALS_2.0.3.0.md). Surfaces
+> release-track work that was **not** represented in the v2.0.3.0 goals list but
+> was verifiable against the repo on 2026-07-25. Each suggestion cites the
+> evidence so a human can triage add/defer in one pass.
 >
-> **Method:** compared the 29 items in `AGENT_GOALS_2.0.3.0.md` against
+> **Method:** compared the 29 items in that goals file against
 > `docs/ops/ROADMAP_2026.md`, `docs/bugs/` (23 open BUG-* files), the
 > `docs/proposals/` catalog (~60 entries), the CI/CD and crate-audit reviews
 > already produced for items #2 and #8, and the module list under `ic/src/`.

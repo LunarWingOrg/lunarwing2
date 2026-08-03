@@ -87,9 +87,9 @@ Deployment, operations, multitenancy, and production guides.
 | [`WEECHAT-SERVICES.md`](ops/WEECHAT-SERVICES.md) | WeeChat services, ports, env vars, day-to-day ops |
 | [`XMPP_KNOWN_ISSUES.md`](ops/XMPP_KNOWN_ISSUES.md) | XMPP/OMEMO known issues |
 | [`XMPP_TRANSFERS.md`](ops/XMPP_TRANSFERS.md) | XMPP file-transfer methods quick-reference |
-| [`RELEASE_COMMANDS.md`](ops/RELEASE_COMMANDS.md) | Release git/GitHub command template |
+| [`RELEASE_COMMANDS.md`](ops/RELEASE_COMMANDS.md) | GitLab release commands and asset-publishing workflow |
 | [`RELEASE_CADENCE.md`](ops/RELEASE_CADENCE.md) | Release cadence policy |
-| [`PRE-RELEASE-TESTING.md`](ops/PRE-RELEASE-TESTING.md) | Pre-release test status + test landscape |
+| [`PRE-RELEASE-TESTING.md`](ops/PRE-RELEASE-TESTING.md) | Current resource-bounded pre-release test checklist |
 | [`MT-MACHINE-MIGRATION.md`](ops/MT-MACHINE-MIGRATION.md) | Migrating a multi-tenant host to a new machine |
 | [`MT-GENTOO-SETUP-AND-CHANGES-MADE.md`](ops/MT-GENTOO-SETUP-AND-CHANGES-MADE.md) | Gentoo/OpenRC multi-tenant setup notes |
 | [`guide-for-spin-up-gentoo-tenants.md`](ops/guide-for-spin-up-gentoo-tenants.md) | Step-by-step guide for spinning up a Gentoo/OpenRC tenant |
@@ -100,16 +100,18 @@ Deployment, operations, multitenancy, and production guides.
 | [`GITLAB_CONTAINER_REGISTRY.md`](ops/GITLAB_CONTAINER_REGISTRY.md) | Enabling GitLab's built-in container registry and building/pulling worker images from CI |
 | [`IMPORT_EXPORT_EXAMPLE.txt`](ops/IMPORT_EXPORT_EXAMPLE.txt) | Worker import/export example |
 | [`KUMOGAKURE_INSTRUCT.md`](ops/KUMOGAKURE_INSTRUCT.md) | Pointer to the external Notes vault |
-| [`AGENT_GOALS_2.0.3.0.md`](ops/AGENT_GOALS_2.0.3.0.md) | Agent-assigned pre-release checklist for LunarWing v2.0.3.0 |
+| [`AGENT_GOALS_2.0.4.0.md`](ops/AGENT_GOALS_2.0.4.0.md) | Current agent-assigned pre-release checklist for LunarWing v2.0.4.0 |
+| [`history/AGENT_GOALS_2.0.3.0.md`](ops/history/AGENT_GOALS_2.0.3.0.md) | Archived v2.0.3.0 pre-release checklist |
 | [`CICD_LOGIC_REVIEW.md`](ops/CICD_LOGIC_REVIEW.md) | GitLab CI/CD logic review, resolved priority findings, and remaining hardening suggestions |
 | [`CODENAME_IDEAS_v2.0.3.0.md`](ops/CODENAME_IDEAS_v2.0.3.0.md) | Release codename candidates for v2.0.3.0 with English context and top picks |
-| [`CRATE_AUDIT_STATUS.md`](ops/CRATE_AUDIT_STATUS.md) | v2.0.2.0 workspace and satellite-crate dependency audit status |
+| [`CRATE_AUDIT_v2.0.4.0.md`](ops/CRATE_AUDIT_v2.0.4.0.md) | Current v2.0.4.0 dependency, workspace-version, and toolchain audit |
+| [`CRATE_AUDIT_STATUS.md`](ops/CRATE_AUDIT_STATUS.md) | Superseded v2.0.2.0 crate-audit snapshot retained for history |
 | [`CRATE_AUDIT_v2.0.3.0.md`](ops/CRATE_AUDIT_v2.0.3.0.md) | v2.0.3.0 dependency audit, applied updates, and deferred major-version upgrades |
 | [`CRL.MD`](ops/CRL.MD) | CRL 4.1.1.6 reference stub |
 | [`DARKIRC-KEYEXCHANGE.md`](ops/DARKIRC-KEYEXCHANGE.md) | Task note for secure DarkIRC key-exchange automation and follow-up work |
 | [`GOAL_GAP_SUGGESTIONS.md`](ops/GOAL_GAP_SUGGESTIONS.md) | Source-verified release work missing from the v2.0.3.0 goals checklist |
 | [`HUMAN_GOALS_2.0.1.0.md`](ops/HUMAN_GOALS_2.0.1.0.md) | Human pre-release checklist for v2.0.1.0, including Kawarimi encryption work |
-| [`ISSUE_STATUS_REPORT.md`](ops/ISSUE_STATUS_REPORT.md) | GitHub issue status review with closure and follow-up recommendations |
+| [`ISSUE_STATUS_REPORT.md`](ops/ISSUE_STATUS_REPORT.md) | Historical 2026-07-09 GitHub issue-status snapshot; not the current GitLab tracker |
 | [`UI_FIX_SUGGESTIONS.md`](ops/UI_FIX_SUGGESTIONS.md) | Web gateway UI fix suggestions: source-verified findings with priorities and implementation order |
 | [`KUMOGAKURE_RECENT_REV_T.md`](ops/KUMOGAKURE_RECENT_REV_T.md) | v2 branch sentinel with Hermes adapter and mt-admin decomposition review notes |
 | [`MCP_ADDITIONS.md`](ops/MCP_ADDITIONS.md) | Current MCP implementation matrix, host-local lifecycle and secret handling, deferred package/worker/runtime work, and security rationale |

@@ -425,7 +425,11 @@ These environment variables change the defaults used by `lunarwing-mt-admin.sh` 
 
 ### Port allocation
 
-Each tenant gets a 10-port block from `/etc/lunarwing/ports.json` (range 10000-19999), plus a mirrored extended block in 20000-29999 (`extended_base = base_port + 10000`) holding worker health, DarkIRC, and vision sidecar ports:
+Each tenant gets a 10-port primary block from `/etc/lunarwing/ports.json`
+(range 10000-19999), a mirrored 10-port extended block in 20000-29999
+(`extended_base = base_port + 10000`), and a two-port Kimi block in
+30000-39999 (`kimi_base = base_port + 20000`). The current registry schema is
+v13.
 
 Primary block:
 
@@ -442,11 +446,24 @@ Primary block:
 | +8 | Pebble WSS |
 | +9 | WeeChat adapter |
 
-Extended block (registry v6+; opencode_wss/health added in v11):
+Extended block:
 
 | Offset | Service |
 |--------|---------|
-| ebase+3 | Reserved legacy `nanocode_health` slot |
-| ebase+4 | pebble_health |
-| ebase+7 | opencode_wss |
-| ebase+8 | opencode_health |
+| ebase+0 | DarkIRC adapter |
+| ebase+1 | DarkIRC IRC |
+| ebase+2 | DarkIRC RPC |
+| ebase+3 | Reserved legacy Nanocode health slot |
+| ebase+4 | Pebble health |
+| ebase+5 | LunarVision service |
+| ebase+6 | LunarVision health |
+| ebase+7 | OpenCode WSS |
+| ebase+8 | OpenCode health |
+| ebase+9 | Coordination admin API |
+
+Kimi block:
+
+| Offset | Service |
+|--------|---------|
+| kbase+0 | Kimi WSS |
+| kbase+1 | Kimi health |

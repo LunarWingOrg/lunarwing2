@@ -426,7 +426,7 @@ Each tenant gets its own Docker/Podman container named `lunarwing-pg-<name>`, bo
 The container is created with `--restart unless-stopped` so it survives host reboots when using Docker. Podman has no daemon to honor that policy, so each tenant's container gets a first-class **supervised unit** instead:
 
 - **OpenRC** — a dedicated `/etc/init.d/lunarwing-pg-<name>` service (which the main daemon `need`s) `podman start`s the container and waits for `pg_isready`; supported workers get `/etc/init.d/lunarwing-{pebble,opencode,kimi}-<name>` the same way. See [`MT-GENTOO-SETUP-AND-CHANGES-MADE.md`](MT-GENTOO-SETUP-AND-CHANGES-MADE.md).
-- **Podman + systemd (rootless)** — a per-tenant **Quadlet** `.container` at `~/.config/containers/systemd/lunarwing-pg-<name>.container` (`Restart=on-failure`, `HealthCmd=pg_isready`), which the podman user-generator turns into `lunarwing-pg-<name>.service` at `daemon-reload`. This supersedes the older `podman generate systemd` approach. See [`../proposals/MT_SYSTEMD_PARITY.md`](../proposals/MT_SYSTEMD_PARITY.md).
+- **Podman + systemd (rootless)** — a per-tenant **Quadlet** `.container` at `~/.config/containers/systemd/lunarwing-pg-<name>.container` (`Restart=on-failure`, `HealthCmd=pg_isready`), which the podman user-generator turns into `lunarwing-pg-<name>.service` at `daemon-reload`. This supersedes the older `podman generate systemd` approach. See the archived [`MT_SYSTEMD_PARITY.md`](../internal/history/proposals/MT_SYSTEMD_PARITY.md) implementation plan.
 
 ## Container Runtime
 
@@ -478,11 +478,15 @@ sudo scripts/lunarwing-mt-admin.sh build-kimi-worker
 |----------|---------|-------------|
 | `LUNARWING_SERVICE_MANAGER` | auto-detect | Force `systemd` or `openrc` |
 | `LUNARWING_CONTAINER_RUNTIME` | saved choice, else auto-detect | Force `docker` or `podman` — persisted to /etc/lunarwing/container-runtime on first explicit use (set once) |
-| `LUNARWING_MT_PROFILE` | `release` | Build profile (`release` or `debug`) |
+| `LUNARWING_MT_PROFILE` | `release` | Build profile. Keep `release` on production and this dev VM; full debug builds are not supported for routine verification. |
 | `LUNARWING_MT_SOURCE_REPO` | parent of script | Path to source repo to clone from |
-| `LUNARWING_MT_TENSORZERO_URL` | `http://192.168.1.157:3000` | Default upstream TensorZero URL |
+| `LUNARWING_MT_TENSORZERO_URL` | `http://192.168.1.157:3000/openai/v1` | Default upstream TensorZero URL |
 
 ## Command Reference
+
+This is a compact operator reference, not the parser's exhaustive help. Run
+`sudo ic/scripts/lunarwing-mt-admin.sh help` for every current flag and worker,
+backup, migration, and configuration subcommand.
 
 ```
 add-tenant <name> [options]      Create user, allocate ports, clone repo,
@@ -553,18 +557,23 @@ doctor                           System dependency and health checks
 
 ## Relationship to Test Harness
 
-The test harness (`ic/scripts/lunarwing-xmpp-test-env.sh`) provides `mt-init`, `mt-up`, `mt-verify`, `mt-down` commands for ephemeral multi-tenancy testing in `/tmp/`. It runs everything under the current user with direct process management.
+The test harness (`ic/scripts/lunarwing-xmpp-test-env.sh`) provides `mt-init`,
+`mt-up`, `mt-verify`, and `mt-down` for ephemeral multi-tenancy testing under
+`${LUNARWING_MT_ROOT:-/tmp/lunarwing-mt}-{a,b}`. It runs both tenants as the
+current user. `mt-up` uses user systemd on systemd hosts, launchd on macOS, and
+direct PID management on OpenRC or unknown init systems; it does **not** test
+production OpenRC units.
 
 The production admin script (`lunarwing-mt-admin.sh`) is for persistent deployments with proper OS-level isolation. Key differences:
 
 | Aspect | Test harness | Production admin |
 |--------|-------------|-----------------|
 | Users | Current user only | Dedicated OS user per tenant |
-| State | `/tmp/lunarwing-mt-*` | `/home/<tenant>/lunarwing/` |
-| Services | Direct processes or user systemd | User systemd with linger or system OpenRC |
-| Ports | Hardcoded offsets | Registry-allocated blocks |
+| State | `${LUNARWING_MT_ROOT}-{a,b}` | `/home/<tenant>/lunarwing/` |
+| Services | User systemd, launchd, or direct fallback | User systemd with linger or system OpenRC |
+| Ports | Fixed A/B offsets | Registry-allocated blocks |
 | Build | Shared build artifacts | Per-user builds, flock-serialized |
-| PostgreSQL | Shared or per-tenant containers | Per-tenant containers |
+| PostgreSQL | One isolated container per harness tenant | Per-tenant containers |
 | Lifecycle | Ephemeral (test and discard) | Persistent (survives reboot) |
 
 ## Health Checks
@@ -603,9 +612,9 @@ These mechanisms prevent a single failed routine from permanently blocking itsel
 
 ### Build fails with OOM
 
-- The flock on `/var/lock/lunarwing-build.lock` ensures only one build at a time
-- If still OOMing, increase swap or use `LUNARWING_MT_PROFILE=debug` (faster but larger binaries)
-- Check `CARGO_BUILD_JOBS` to limit parallel rustc instances
+- The flock on `/var/lock/lunarwing-build.lock` ensures only one tenant build at a time.
+- Keep `LUNARWING_MT_PROFILE=release`; do not switch to a full debug build.
+- Set `CARGO_BUILD_JOBS=6` or lower to cap parallel rustc instances, and increase swap if the host still runs out of memory.
 
 ### Tenant user can't access Docker
 

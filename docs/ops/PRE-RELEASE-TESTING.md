@@ -1,50 +1,111 @@
 # Pre-Release Testing
 
-## Current `cargo test` status (reconciled 2026-06-07)
+> Last reconciled with the repository on 2026-08-02. Do not carry historical
+> pass counts forward: record the tested commit and fresh results for each
+> release candidate.
 
-- The default `cargo test` suite **compiles and runs** again — a stale `Agent::run()` call in
-  `tests/e2e_telegram_message_routing.rs` (missing the `self: Arc<Self>` wrap) had been breaking the
-  whole test build; now fixed.
-- **Lib unit suite: green — 3921 passed / 0 failed / 3 ignored.** The previously-failing
-  `test_context_length_recovery_via_compaction_and_retry` is fixed (stub returned an empty success,
-  tripping the empty-response retry → an extra LLM call).
-- **E2E test status (reconciled against `docs/bugs/README.md` on 2026-07-26):**
-  - `e2e_advanced_traces::bootstrap_greeting_fires` / `…::bootstrap_onboarding_clears_bootstrap` —
-    **`#[ignore]`'d.** Production bootstrap broadcast is verified sound; the race is a test-harness
-    timing issue (greeting broadcast races with test-channel readiness). See
-    `docs/bugs/BUG-e2e-test-bugs.md` §1. Not a release blocker.
-  - `e2e_*` clipboard test — **UNVERIFIED.** The synthetic event path does not exercise browser
-    clipboard permissions; no failure has been reproduced. Deferred until a Playwright run confirms.
-    See `docs/bugs/BUG-e2e-test-bugs.md` §2.
-  - OAuth-URL parameter tests — **FIXED/RETIRED.** The Gmail fixture was removed; current OAuth
-    coverage uses mock/MCP fixtures. See `docs/bugs/BUG-e2e-test-bugs.md` §3.
-  - Tool execution timeout — **FIXED.** The pending-approval leak was the root cause and is resolved.
-    See `docs/bugs/BUG-e2e-test-bugs.md` §4.
-- The `--features integration` tier still needs a running PostgreSQL and has not been run here.
+Use the full manual checklist in [`../guides/TESTING_GUIDE.md`](../guides/TESTING_GUIDE.md)
+in addition to the automated tiers below.
 
----
+Run all test and compilation tiers inside tmux so disconnects cannot orphan or
+silently interrupt release verification:
 
-[ ] need a full extensive test using my testing_guide and other testing scripts. can also try docs/guides/TESTING_GUIDE.md and ic/scripts/release-test.sh
-[ ] additional testing scripts to help test multiple things very quickly:
-* Here's the rest of the test landscape:
-Script	What It Tests
-ic/scripts/release-test.sh ✅	Gateway API, WebSocket, core subsystems
-ic/scripts/lunarwing-xmpp-test-env.sh	Full stack: Postgres, TensorZero proxy, XMPP bridge, daemon, WASM tools
-tests/runner.py	Supported worker types in Docker isolation
-ic/tests/e2e/	Playwright browser tests against live instance
-cargo test	Rust unit + integration tests
-ic/scripts/check-boundaries.sh	Architecture boundary violations (no direct DB driver usage outside src/db/, etc.)
-ic/scripts/coverage.sh	Generates HTML coverage report via cargo-llvm-cov
-If you want "60%+ of everything" in one shot:
-# 1. Full integration harness (XMPP + daemon + WASM)
-ic/scripts/lunarwing-xmpp-test-env.sh up
+```bash
+tmux new-session -s lunarwing-release-tests
+```
 
-# 2. Supported worker matrix
-cd tests && python runner.py --mode smoke
+## 1. Rust checks
 
-# 3. Rust core
-cd ic && cargo test --all-features
+Run Cargo commands from `ic/` in that tmux session, limited to six CPUs and six
+jobs:
 
-# 4. Gateway smoke (you already have this)
-ic/scripts/release-test.sh
-The lunarwing-xmpp-test-env.sh is the big one — it spins up the whole stack. That + release-test.sh + cargo test gives you the widest net before a release.
+```bash
+cd ic
+
+taskset -c 0-5 cargo fmt --all -- --check
+taskset -c 0-5 cargo check -j6
+taskset -c 0-5 cargo check -j6 --all-features
+taskset -c 0-5 cargo test -j6 -- --test-threads=6
+taskset -c 0-5 cargo clippy -j6 --all --benches --tests --examples \
+  --all-features -- -D warnings
+```
+
+The opt-in `integration` feature enables especially heavy test targets. Run it
+only in the environment required by those targets, and record any unavailable
+external dependency rather than reporting the tier as passed:
+
+```bash
+taskset -c 0-5 cargo test -j6 --features integration -- --test-threads=6
+```
+
+Current deferred E2E details live in
+[`../bugs/BUG-e2e-test-bugs.md`](../bugs/BUG-e2e-test-bugs.md): the two
+bootstrap-greeting assertions are ignored because of a harness race, and the
+browser clipboard scenario still needs a supported Playwright run. The retired
+Telegram and Gmail fixture paths are not current test files.
+
+## 2. Full-stack harness
+
+The harness requires runnable daemon, bridge, and REPL binaries; its `build`
+command performs those builds and `--with-wasm` also installs the WASM
+artifacts. `up` does not build missing binaries.
+
+```bash
+cd ic
+export LUNARWING_TEST_PROFILE=release
+export CARGO_BUILD_JOBS=6
+scripts/lunarwing-xmpp-test-env.sh init
+taskset -c 0-5 scripts/lunarwing-xmpp-test-env.sh build --with-wasm
+scripts/lunarwing-xmpp-test-env.sh up
+scripts/lunarwing-xmpp-test-env.sh verify
+scripts/lunarwing-xmpp-test-env.sh down
+```
+
+Always run `down` after the test, including after a failed `verify`. If only the
+TensorZero proxy check fails, inspect the configured upstream
+`LUNARWING_TEST_TENSORZERO_URL` before diagnosing the local install.
+
+See [`HARNESS-SINGLE-TENANT.md`](HARNESS-SINGLE-TENANT.md) and
+[`MULTITENANCY-HARNESS.md`](MULTITENANCY-HARNESS.md) for platform-specific and
+two-tenant flows.
+
+## 3. Gateway smoke tests
+
+With a harness or staging gateway already running, execute:
+
+```bash
+GATEWAY_URL=http://127.0.0.1:8765 \
+GATEWAY_AUTH_TOKEN='<token>' \
+  ./ic/scripts/release-test.sh
+```
+
+Keep the bearer token out of shell history and captured logs. The script checks
+gateway APIs and core subsystems; its header lists the channel, worker,
+provider, rollback, and monitoring checks that remain manual.
+
+## 4. External-worker matrix
+
+This tier requires Docker Compose and the Python dependencies in
+`tests/requirements.txt`:
+
+```bash
+python3 -m venv tests/.venv
+. tests/.venv/bin/activate
+python -m pip install -r tests/requirements.txt
+cd tests
+python runner.py --mode smoke
+```
+
+Use `python runner.py --mode full` for configured chaos scenarios and
+`--worker <name>` to isolate one worker. See [`../../tests/README.md`](../../tests/README.md).
+
+## 5. Browser E2E and supplemental checks
+
+- `ic/tests/e2e/` contains the Python/Playwright browser suite; follow
+  [`../../ic/tests/e2e/README.md`](../../ic/tests/e2e/README.md).
+- `ic/scripts/check-boundaries.sh` checks architecture boundaries.
+- `ic/scripts/coverage.sh` generates coverage through `cargo-llvm-cov`; coverage
+  is evidence, not a substitute for the release tiers above.
+
+A release candidate is not fully verified unless every required tier has a
+fresh result or an explicit, reviewed deferral.
