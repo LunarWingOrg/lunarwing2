@@ -1,7 +1,7 @@
 # SSH Git ref handling and bare-remote HEAD diagnostics
 
 > **Overall status: PARTIALLY-FIXED (verified against current source on
-> 2026-07-28).** Null-like `ref` values are normalized. A bare repository whose
+> 2026-08-03).** Null-like `ref` values are normalized. A bare repository whose
 > remote HEAD points at a missing branch still produces an empty/unborn checkout
 > that `ssh_git` marks successful, with only Git's raw stderr warning.
 
@@ -20,9 +20,10 @@ tool for serializing JSON null itself.
 Current normalization is centralized in
 `ic/src/tools/builtin/ssh_git.rs:68-74`: it trims the value and drops missing,
 JSON-null, empty, whitespace-only, and case-insensitive `"null"`. The execute
-path uses that result (`:138-157`), and argv construction adds `--branch` only
-when a real ref is present (`:363-375`). Regression cases and preservation of
-`main` are covered at `:640-661`.
+path uses that result (`:140`, with option-injection validation at `:156-158`),
+and argv construction adds `--branch` only when a real ref is present
+(`:363-376`). Regression cases and preservation of
+`main` are covered at `:639-661`.
 
 The fix commit `c8b277d` is contained in `HEAD` (`merge-base --is-ancestor`
 passed; the branch tip is an ancestor). The historical repro and workaround are
@@ -55,11 +56,11 @@ this exact Git sequence returned exit 0 with that warning.
 
 `ref` remains optional in the tool schema
 (`ic/src/tools/builtin/ssh_git.rs:111-122`). With no ref, argv is ordinary
-`git clone` (`:363-375`), and result handling reports the process exit/stderr
+`git clone` (`:363-376`), and result handling reports the process exit/stderr
 without checking whether the remote HEAD resolved to an actual branch
 (`:246-258`). The raw Git warning is returned in `stderr`, but `success` remains
-`true`; no regression test or structured warning detector for this state was
-found.
+`true` (it is `code == 0` at `:255`, and Git exits 0 on this warning); no
+regression test or structured warning detector for this state was found.
 
 ### Workarounds and follow-up
 
