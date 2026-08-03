@@ -184,7 +184,10 @@ fn ensure_xdg_runtime_dir() -> Option<String> {
             return Some(dir);
         }
         let dir = format!("/run/user/{}", nix::unistd::geteuid());
-        std::path::Path::new(&dir).join("bus").exists().then_some(dir)
+        std::path::Path::new(&dir)
+            .join("bus")
+            .exists()
+            .then_some(dir)
     }
 }
 
@@ -193,7 +196,14 @@ fn ensure_xdg_runtime_dir() -> Option<String> {
 #[cfg(target_os = "linux")]
 async fn probe_systemd_scopes() -> Result<(), String> {
     let mut probe = Command::new("systemd-run");
-    probe.args(["--user", "--scope", "--quiet", "--collect", "--", "/usr/bin/true"]);
+    probe.args([
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        "--",
+        "/usr/bin/true",
+    ]);
     if let Some(dir) = ensure_xdg_runtime_dir() {
         probe.env("XDG_RUNTIME_DIR", dir);
     } else {
@@ -395,7 +405,10 @@ mod tests {
         let pgid = child.id().expect("child pid") as i32;
         guard.terminate(&mut child).await;
         let remaining = wait_group_empty(pgid).await;
-        assert!(remaining.is_empty(), "survivors after terminate: {remaining:?}");
+        assert!(
+            remaining.is_empty(),
+            "survivors after terminate: {remaining:?}"
+        );
     }
 
     #[tokio::test]
@@ -408,16 +421,16 @@ mod tests {
         drop(guard);
         drop(child); // kill_on_drop reaps the direct child
         let remaining = wait_group_empty(pgid).await;
-        assert!(remaining.is_empty(), "survivors after guard drop: {remaining:?}");
+        assert!(
+            remaining.is_empty(),
+            "survivors after guard drop: {remaining:?}"
+        );
     }
 
     #[tokio::test]
     async fn disarm_prevents_late_signal() {
         let spawner = WorkloadSpawner::direct();
-        let mut child = spawner
-            .command("true", &[])
-            .spawn()
-            .expect("spawn true");
+        let mut child = spawner.command("true", &[]).spawn().expect("spawn true");
         let mut guard = ProcessTreeGuard::new(&child);
         let pgid = child.id().expect("child pid") as i32;
         let status = child.wait().await.expect("wait");
