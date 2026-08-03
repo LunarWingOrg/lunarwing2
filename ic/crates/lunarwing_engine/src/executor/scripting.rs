@@ -399,6 +399,7 @@ pub async fn execute_code_with_skills(
 
     // Drive the execution loop
     let mut call_counter = 0u32;
+    let mut tool_call_count = 0usize;
     loop {
         match progress {
             RunProgress::Complete(obj) => {
@@ -491,6 +492,13 @@ pub async fn execute_code_with_skills(
                             .collect();
                         Some(ExtFunctionResult::Return(MontyObject::Dict(entries.into())))
                     }
+                    "__import__" => Some(ExtFunctionResult::Error(MontyException::new(
+                        ExcType::ImportError,
+                        Some(
+                            "dynamic imports via __import__() are not supported; use an import statement"
+                                .into(),
+                        ),
+                    ))),
                     _ => None, // tool call — handled async below
                 };
 
@@ -562,19 +570,41 @@ pub async fn execute_code_with_skills(
                 // needs approval, resume with error immediately.
                 // If approved, spawn tokio task and resume_pending().
 
-                let preflight = preflight_action(
-                    &action_name,
-                    &params,
-                    thread,
-                    effects,
-                    leases,
-                    policy,
-                    context,
-                    capability_policies,
-                    &str_call_id,
-                    &mut events,
-                )
-                .await;
+                tool_call_count += 1;
+                let preflight = if tool_call_count > super::MAX_ACTIONS_PER_STEP {
+                    let error = format!(
+                        "Tool call limit reached ({} per code step). Break your task into multiple steps.",
+                        super::MAX_ACTIONS_PER_STEP
+                    );
+                    events.push(EventKind::ActionFailed {
+                        step_id: context.step_id,
+                        action_name: action_name.clone(),
+                        call_id: str_call_id.clone(),
+                        error: error.clone(),
+                        params_summary: crate::types::event::summarize_params(
+                            &action_name,
+                            &params,
+                        ),
+                    });
+                    PreflightResult::Denied(ExtFunctionResult::Error(MontyException::new(
+                        ExcType::RuntimeError,
+                        Some(error),
+                    )))
+                } else {
+                    preflight_action(
+                        &action_name,
+                        &params,
+                        thread,
+                        effects,
+                        leases,
+                        policy,
+                        context,
+                        capability_policies,
+                        &str_call_id,
+                        &mut events,
+                    )
+                    .await
+                };
 
                 match preflight {
                     PreflightResult::Approved(lease) => {
@@ -3190,6 +3220,80 @@ FINAL(str(results[0]))
     }
 
     // ── Sandbox security negative tests ────────────────────────
+
+    #[tokio::test]
+    async fn tool_call_limit_is_scoped_to_each_code_step() {
+        let effects = Arc::new(MockEffects::new(vec![test_action("echo")], vec![]));
+        let thread = make_test_thread();
+        let mut lines: Vec<String> = (0..crate::executor::MAX_ACTIONS_PER_STEP)
+            .map(|index| format!("result_{index} = await echo()"))
+            .collect();
+        lines.push("FINAL('done')".to_string());
+        let code = lines.join("\n");
+
+        for _ in 0..2 {
+            let result = run_code(code.as_str(), effects.clone(), &thread)
+                .await
+                .unwrap();
+            assert!(!result.had_error, "stdout: {}", result.stdout);
+            assert_eq!(
+                result.action_results.len(),
+                crate::executor::MAX_ACTIONS_PER_STEP
+            );
+        }
+        assert_eq!(
+            effects.calls_snapshot().len(),
+            crate::executor::MAX_ACTIONS_PER_STEP * 2
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_limit_blocks_only_calls_beyond_step_budget() {
+        let effects = Arc::new(MockEffects::new(vec![test_action("echo")], vec![]));
+        let thread = make_test_thread();
+        let code = (0..=crate::executor::MAX_ACTIONS_PER_STEP)
+            .map(|index| format!("result_{index} = await echo()"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let result = run_code(code.as_str(), effects.clone(), &thread)
+            .await
+            .unwrap();
+        assert!(result.had_error);
+        assert!(result.stdout.contains("Tool call limit reached"));
+        assert_eq!(
+            effects.calls_snapshot().len(),
+            crate::executor::MAX_ACTIONS_PER_STEP
+        );
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            EventKind::ActionFailed { error, .. } if error.contains("Tool call limit reached")
+        )));
+    }
+
+    #[tokio::test]
+    async fn dynamic_import_reports_import_error_without_tool_dispatch() {
+        let effects = Arc::new(MockEffects::new(vec![], vec![]));
+        let thread = make_test_thread();
+        let code = r#"
+try:
+    __import__("os")
+    FINAL("unexpected success")
+except Exception as e:
+    FINAL("blocked: " + type(e).__name__ + ": " + str(e))
+"#;
+
+        let result = run_code(code, effects.clone(), &thread).await.unwrap();
+        let answer = result.final_answer.as_deref().unwrap_or_default();
+        assert!(answer.starts_with("blocked: ImportError"), "{answer}");
+        assert!(answer.contains("__import__"), "{answer}");
+        assert!(!answer.contains("no lease"), "{answer}");
+        assert!(effects.calls_snapshot().is_empty());
+        assert!(!result.events.iter().any(|event| matches!(
+            event,
+            EventKind::ActionFailed { action_name, .. } if action_name == "__import__"
+        )));
+    }
 
     /// OS-level operations must be denied or restricted by the Monty VM.
     #[tokio::test]

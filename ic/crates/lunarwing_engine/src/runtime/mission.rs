@@ -29,6 +29,60 @@ use crate::types::thread::{ThreadConfig, ThreadId, ThreadType};
 type MissionExecutionLock = Mutex<()>;
 type MissionLockRegistry = Mutex<HashMap<MissionId, Weak<MissionExecutionLock>>>;
 
+const MANAGED_RECURRING_METADATA_KEY: &str = "managed_recurring";
+const MANAGED_DEFINITION_VERSION_KEY: &str = "managed_definition_version";
+const MANAGED_DEFINITION_VERSION: u64 = 1;
+const SKILL_MAINTENANCE_EVENT: &str = "skill_maintenance_due";
+const RECURRING_LEARNING_MISSION_KEYS: &[&str] = &[
+    "self_improvement",
+    "skill_extraction",
+    "conversation_insights",
+    "expected_behavior",
+    "skill_maintenance",
+];
+
+fn is_recurring_learning_mission(mission: &Mission) -> bool {
+    mission
+        .metadata
+        .get(MANAGED_RECURRING_METADATA_KEY)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || RECURRING_LEARNING_MISSION_KEYS.iter().any(|key| {
+            mission
+                .metadata
+                .get(*key)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+}
+
+fn mark_managed_recurring(mission: &mut Mission, metadata_key: &str) -> bool {
+    if !mission.metadata.is_object() {
+        mission.metadata = serde_json::json!({});
+    }
+    let Some(metadata) = mission.metadata.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, value) in [
+        (metadata_key, serde_json::Value::Bool(true)),
+        (
+            MANAGED_RECURRING_METADATA_KEY,
+            serde_json::Value::Bool(true),
+        ),
+        (
+            MANAGED_DEFINITION_VERSION_KEY,
+            serde_json::Value::from(MANAGED_DEFINITION_VERSION),
+        ),
+    ] {
+        if metadata.get(key) != Some(&value) {
+            metadata.insert(key.to_string(), value);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Notification emitted when a mission thread completes.
 ///
 /// The bridge subscribes to these and routes the response text to
@@ -917,9 +971,13 @@ impl MissionManager {
 
                         // ── Trigger 1: Error diagnosis ──────────────────
                         let trace = crate::executor::trace::build_trace(&thread);
-                        if !trace.issues.is_empty() {
-                            let issues: Vec<serde_json::Value> = trace
-                                .issues
+                        let actionable_issues: Vec<&crate::executor::trace::TraceIssue> = trace
+                            .issues
+                            .iter()
+                            .filter(|issue| issue.severity.is_actionable())
+                            .collect();
+                        if !actionable_issues.is_empty() {
+                            let issues: Vec<serde_json::Value> = actionable_issues
                                 .iter()
                                 .map(|i| {
                                     serde_json::json!({
@@ -927,6 +985,19 @@ impl MissionManager {
                                         "category": i.category,
                                         "description": i.description,
                                         "step": i.step,
+                                    })
+                                })
+                                .collect();
+                            let observations: Vec<serde_json::Value> = trace
+                                .issues
+                                .iter()
+                                .filter(|issue| !issue.severity.is_actionable())
+                                .map(|issue| {
+                                    serde_json::json!({
+                                        "severity": format!("{:?}", issue.severity),
+                                        "category": issue.category,
+                                        "description": issue.description,
+                                        "step": issue.step,
                                     })
                                 })
                                 .collect();
@@ -957,26 +1028,13 @@ impl MissionManager {
                                 Vec::new()
                             };
 
-                            let prune_candidates = if self_improvement_on {
-                                collect_prune_candidate_skills(
-                                    mgr.store.as_ref(),
-                                    thread.project_id,
-                                    &thread.user_id,
-                                    &chrono::Utc::now(),
-                                    crate::skill_prune_quarantine_period(),
-                                )
-                                .await
-                            } else {
-                                Vec::new()
-                            };
-
                             let payload = serde_json::json!({
                                 "source_thread_id": event.thread_id.0.to_string(),
                                 "goal": thread.goal,
                                 "issues": issues,
+                                "observations": observations,
                                 "error_messages": error_messages,
                                 "active_skills": active_skills,
-                                "candidates": prune_candidates,
                             });
 
                             if let Err(e) = mgr
@@ -992,13 +1050,46 @@ impl MissionManager {
                             }
                         }
 
+                        // ── Trigger 2: Skill maintenance ────────────────
+                        // Maintenance has its own event so informational trace
+                        // observations and unrelated failures do not consume its
+                        // daily budget. Fire only when work exists.
+                        if crate::skill_self_improvement_enabled() {
+                            let candidates = collect_prune_candidate_skills(
+                                mgr.store.as_ref(),
+                                thread.project_id,
+                                &thread.user_id,
+                                &chrono::Utc::now(),
+                                crate::skill_prune_quarantine_period(),
+                            )
+                            .await;
+                            if !candidates.is_empty() {
+                                let payload = serde_json::json!({
+                                    "source_thread_id": event.thread_id.0.to_string(),
+                                    "goal": thread.goal,
+                                    "candidates": candidates,
+                                });
+                                if let Err(e) = mgr
+                                    .fire_on_system_event(
+                                        "engine",
+                                        SKILL_MAINTENANCE_EVENT,
+                                        &thread.user_id,
+                                        Some(payload),
+                                    )
+                                    .await
+                                {
+                                    debug!("event listener: failed to fire skill maintenance: {e}");
+                                }
+                            }
+                        }
+
                         // Failed threads feed diagnosis only. Extraction and
                         // conversation insights require successful completion.
                         if terminal_state != crate::types::thread::ThreadState::Done {
                             continue;
                         }
 
-                        // ── Trigger 2: Skill extraction ──────────────────
+                        // ── Trigger 3: Skill extraction ──────────────────
                         let action_count = thread
                             .events
                             .iter()
@@ -1056,7 +1147,7 @@ impl MissionManager {
                             }
                         }
 
-                        // ── Trigger 3: Conversation insights ────────────
+                        // ── Trigger 4: Conversation insights ────────────
                         // Use the thread's project_id as a proxy for conversation scope.
                         let conv_key = format!("{}:{}", thread.project_id.0, thread.user_id);
                         let count = conv_thread_counts.entry(conv_key.clone()).or_insert(0);
@@ -1128,40 +1219,23 @@ impl MissionManager {
         project_id: ProjectId,
         user_id: &str,
     ) -> Result<MissionId, EngineError> {
-        // Check if this user already has a self-improvement mission.
-        let missions = self.store.list_missions(project_id, user_id).await?;
-        if let Some(existing) = missions.iter().find(|m| is_self_improvement_mission(m)) {
-            debug!(mission_id = %existing.id, "self-improvement mission already exists");
-            // Make sure it's in the active list
-            let mut active = self.active.write().await;
-            if !active.contains(&existing.id) {
-                active.push(existing.id);
-            }
-            return Ok(existing.id);
-        }
+        let id = self
+            .ensure_mission_by_metadata(
+                project_id,
+                user_id,
+                "self_improvement",
+                "self-improvement",
+                SELF_IMPROVEMENT_GOAL,
+                MissionCadence::OnSystemEvent {
+                    source: "engine".into(),
+                    event_type: "thread_completed_with_issues".into(),
+                },
+                "Continuously improve system prompts and fix patterns based on execution traces",
+                5,
+            )
+            .await?;
 
-        // Create per-user self-improvement mission
-        let mut mission = Mission::new(
-            project_id,
-            user_id,
-            "self-improvement",
-            SELF_IMPROVEMENT_GOAL,
-            MissionCadence::OnSystemEvent {
-                source: "engine".into(),
-                event_type: "thread_completed_with_issues".into(),
-            },
-        );
-        mission.success_criteria = Some(
-            "Continuously improve system prompts and fix patterns based on execution traces".into(),
-        );
-        mission.metadata = serde_json::json!({"self_improvement": true});
-        mission.max_threads_per_day = 5;
-
-        let id = mission.id;
-        self.store.save_mission(&mission).await?;
-        self.active.write().await.push(id);
-
-        // Seed the fix pattern database if it doesn't exist
+        // Seed the fix pattern database if it doesn't exist.
         let docs = self.store.list_shared_memory_docs(project_id).await?;
         let has_patterns = docs.iter().any(|d| {
             d.title == FIX_PATTERN_DB_TITLE && d.tags.contains(&FIX_PATTERN_DB_TAG.to_string())
@@ -1180,7 +1254,6 @@ impl MissionManager {
             debug!("seeded fix pattern database");
         }
 
-        debug!(mission_id = %id, "created self-improvement mission");
         Ok(id)
     }
 
@@ -1265,12 +1338,9 @@ impl MissionManager {
         )
         .await?;
 
-        // 5. Skill maintenance (B-2 prune sweep) — fires on the same
-        // thread-completed-with-issues event as self-improvement. The sweep
-        // stages prune proposals for confidently-dead skills or automatically
-        // demoted skills whose quarantine has elapsed; the user approves
-        // archival via the proposals surface. Inline demotion (in record_usage)
-        // handles the immediate below-floor case.
+        // 5. Skill maintenance (B-2 prune sweep). Candidate detection emits a
+        // dedicated event only when work exists, so empty sweeps do not consume
+        // the mission's daily budget.
         if self_improvement_on {
             self.ensure_mission_by_metadata(
                 project_id,
@@ -1280,7 +1350,7 @@ impl MissionManager {
                 SKILL_MAINTENANCE_GOAL,
                 MissionCadence::OnSystemEvent {
                     source: "engine".into(),
-                    event_type: "thread_completed_with_issues".into(),
+                    event_type: SKILL_MAINTENANCE_EVENT.into(),
                 },
                 "Scan for dead skills and stage user-approved prune (archive) proposals",
                 1, // max 1/day — sweep is cheap, catches what inline demotion misses
@@ -1354,22 +1424,63 @@ impl MissionManager {
         success_criteria: &str,
         max_per_day: u32,
     ) -> Result<MissionId, EngineError> {
-        // Check if this user already has a mission with this metadata key.
+        // Reconcile system-managed mission definitions on every startup. This
+        // repairs terminal missions created by older prompts and refreshes
+        // compiled goals/cadences without discarding operational history.
         let missions = self.store.list_missions(project_id, user_id).await?;
         if let Some(existing) = missions
             .iter()
             .find(|m| m.metadata.get(metadata_key).is_some())
         {
-            let mut active = self.active.write().await;
-            if !active.contains(&existing.id) {
-                active.push(existing.id);
+            let mut mission = existing.clone();
+            let mut changed = false;
+            if mission.name != name {
+                mission.name = name.to_string();
+                changed = true;
             }
-            return Ok(existing.id);
+            if mission.goal != goal {
+                mission.goal = goal.to_string();
+                changed = true;
+            }
+            if mission.cadence != cadence {
+                mission.cadence = cadence;
+                changed = true;
+            }
+            if mission.success_criteria.as_deref() != Some(success_criteria) {
+                mission.success_criteria = Some(success_criteria.to_string());
+                changed = true;
+            }
+            if mission.max_threads_per_day != max_per_day {
+                mission.max_threads_per_day = max_per_day;
+                changed = true;
+            }
+            if matches!(
+                mission.status,
+                MissionStatus::Completed | MissionStatus::Failed
+            ) {
+                mission.status = MissionStatus::Active;
+                changed = true;
+            }
+            changed |= mark_managed_recurring(&mut mission, metadata_key);
+
+            if changed {
+                mission.updated_at = Utc::now();
+                self.store.save_mission(&mission).await?;
+                debug!(mission_id = %mission.id, name, "reconciled learning mission");
+            }
+
+            if mission.status == MissionStatus::Active {
+                let mut active = self.active.write().await;
+                if !active.contains(&mission.id) {
+                    active.push(mission.id);
+                }
+            }
+            return Ok(mission.id);
         }
 
         let mut mission = Mission::new(project_id, user_id, name, goal, cadence);
         mission.success_criteria = Some(success_criteria.into());
-        mission.metadata = serde_json::json!({metadata_key: true});
+        mark_managed_recurring(&mut mission, metadata_key);
         mission.max_threads_per_day = max_per_day;
 
         let id = mission.id;
@@ -1690,16 +1801,21 @@ fn build_meta_prompt(
         mission.thread_history.len() + 1
     ));
 
-    // Instructions
-    parts.push(
+    // Instructions. System-managed learning missions are recurring workers;
+    // completing one event must not imply that the mission itself is terminal.
+    let completion_instruction = if is_recurring_learning_mission(mission) {
+        "3. Whether this event/run was handled successfully (yes/no)"
+    } else {
+        "3. Whether the goal has been achieved (yes/no)"
+    };
+    parts.push(format!(
         "\n## Instructions\nBased on the above context, take the next step toward the goal. \
 Use tools to gather information, analyze data, or take actions. \
 When done, call FINAL() with your response. Include:\n\
 1. What you accomplished in this step\n\
 2. What the next focus should be (for the next thread)\n\
-3. Whether the goal has been achieved (yes/no)"
-            .into(),
-    );
+{completion_instruction}"
+    ));
 
     parts.join("\n")
 }
@@ -1745,9 +1861,10 @@ async fn process_mission_outcome_and_notify(
             let lower = text.to_lowercase();
 
             // Check if goal achieved
-            if lower.contains("goal has been achieved: yes")
-                || lower.contains("goal achieved: yes")
-                || lower.contains("mission complete")
+            if !is_recurring_learning_mission(&mission)
+                && (lower.contains("goal has been achieved: yes")
+                    || lower.contains("goal achieved: yes")
+                    || lower.contains("mission complete"))
             {
                 debug!(mission_id = %mission_id, "goal achieved — completing mission");
                 mission.status = MissionStatus::Completed;
@@ -3342,6 +3459,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recurring_learning_mission_does_not_complete_from_response_text() {
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let mut mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "skill-extraction",
+            "extract reusable skills",
+            MissionCadence::OnSystemEvent {
+                source: "engine".into(),
+                event_type: "thread_completed_with_learnings".into(),
+            },
+        );
+        mark_managed_recurring(&mut mission, "skill_extraction");
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        let outcome = ThreadOutcome::Completed {
+            response: Some("Mission complete. Goal achieved: yes".into()),
+        };
+        process_mission_outcome(&store, id, ThreadId::new(), &outcome)
+            .await
+            .unwrap();
+
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.status, MissionStatus::Active);
+        assert_eq!(mission.approach_history.len(), 1);
+    }
+
+    #[tokio::test]
     async fn mission_evolves_via_direct_outcome_processing() {
         // Test the outcome processing directly without relying on
         // background task timing.
@@ -3709,6 +3855,75 @@ mod tests {
         // Should only have one mission
         let missions = store.list_missions(project_id, "test-user").await.unwrap();
         assert_eq!(missions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_learning_missions_repairs_and_refreshes_managed_mission() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "old-name",
+            "stale prompt",
+            MissionCadence::OnSystemEvent {
+                source: "engine".into(),
+                event_type: "old-event".into(),
+            },
+        );
+        mission.metadata = serde_json::json!({"skill_extraction": true});
+        mission.status = MissionStatus::Completed;
+        mission.max_threads_per_day = 99;
+        mission.approach_history.push("preserve me".into());
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", true)
+            .await
+            .unwrap();
+
+        let repaired = store.load_mission(id).await.unwrap().unwrap();
+        assert_eq!(repaired.status, MissionStatus::Active);
+        assert_eq!(repaired.name, "skill-extraction");
+        assert_eq!(repaired.goal, SKILL_EXTRACTION_GOAL);
+        assert_eq!(repaired.max_threads_per_day, 3);
+        assert_eq!(repaired.approach_history, ["preserve me"]);
+        assert!(is_recurring_learning_mission(&repaired));
+        assert!(matches!(
+            repaired.cadence,
+            MissionCadence::OnSystemEvent { ref source, ref event_type }
+                if source == "engine" && event_type == "thread_completed_with_learnings"
+        ));
+    }
+
+    #[tokio::test]
+    async fn ensure_learning_missions_preserves_operator_pause() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "conversation-insights",
+            CONVERSATION_INSIGHTS_GOAL,
+            MissionCadence::OnSystemEvent {
+                source: "engine".into(),
+                event_type: "conversation_insights_due".into(),
+            },
+        );
+        mission.metadata = serde_json::json!({"conversation_insights": true});
+        mission.status = MissionStatus::Paused;
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", true)
+            .await
+            .unwrap();
+
+        let repaired = store.load_mission(id).await.unwrap().unwrap();
+        assert_eq!(repaired.status, MissionStatus::Paused);
+        assert!(is_recurring_learning_mission(&repaired));
     }
 
     #[tokio::test]
@@ -4194,6 +4409,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn info_only_trace_does_not_consume_self_improvement_budget() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager_with_response(
+            Arc::clone(&store) as Arc<dyn Store>,
+            "hello",
+        ));
+        let project_id = ProjectId::new();
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", true)
+            .await
+            .unwrap();
+        let self_improvement_id = store
+            .list_missions(project_id, "test-user")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(is_self_improvement_mission)
+            .expect("self-improvement mission should exist")
+            .id;
+        mgr.start_event_listener("test-user".into());
+
+        let thread_id = mgr
+            .thread_manager
+            .spawn_thread(
+                "hello",
+                ThreadType::Foreground,
+                project_id,
+                ThreadConfig::default(),
+                None,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        mgr.thread_manager.join_thread(thread_id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mission = store
+            .load_mission(self_improvement_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(mission.thread_history.is_empty());
+        assert_eq!(mission.threads_today, 0);
+    }
+
+    #[tokio::test]
     async fn terminal_events_fire_learning_missions() {
         let store = Arc::new(TestStore::new());
         let mgr = Arc::new(make_mission_manager_with_response(
@@ -4311,6 +4571,15 @@ mod tests {
             self_imp_count, 1,
             "should not duplicate self-improvement mission"
         );
+        let maintenance = alice_missions
+            .iter()
+            .find(|mission| mission.metadata.get("skill_maintenance").is_some())
+            .expect("skill-maintenance mission should exist");
+        assert!(matches!(
+            maintenance.cadence,
+            MissionCadence::OnSystemEvent { ref source, ref event_type }
+                if source == "engine" && event_type == SKILL_MAINTENANCE_EVENT
+        ));
     }
 
     // ── B-1: active-skill attribution for the failure payload ────────

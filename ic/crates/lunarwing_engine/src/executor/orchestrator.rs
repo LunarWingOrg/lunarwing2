@@ -392,6 +392,7 @@ pub async fn execute_orchestrator(
     // Drive the orchestrator dispatch loop
     let mut final_result: Option<serde_json::Value> = None;
     let mut active_vm_duration = std::time::Duration::ZERO;
+    let mut actions_this_step = 0usize;
 
     loop {
         match progress {
@@ -431,6 +432,7 @@ pub async fn execute_orchestrator(
 
                     // __llm_complete__(messages, actions, config)
                     "__llm_complete__" => {
+                        actions_this_step = 0;
                         match handle_llm_complete(
                             args,
                             thread,
@@ -484,7 +486,13 @@ pub async fn execute_orchestrator(
                     // __execute_action__(name, params, call_id=...)
                     "__execute_action__" => {
                         match handle_execute_action(
-                            args, kwargs, thread, effects, leases, policy, event_tx,
+                            HostCallArguments { args, kwargs },
+                            thread,
+                            effects,
+                            leases,
+                            policy,
+                            &mut actions_this_step,
+                            event_tx,
                         )
                         .await
                         {
@@ -499,7 +507,13 @@ pub async fn execute_orchestrator(
                     // __execute_actions_parallel__(calls)
                     "__execute_actions_parallel__" => {
                         match handle_execute_actions_parallel(
-                            args, thread, effects, leases, policy, event_tx,
+                            args,
+                            thread,
+                            effects,
+                            leases,
+                            policy,
+                            &mut actions_this_step,
+                            event_tx,
                         )
                         .await
                         {
@@ -911,16 +925,21 @@ async fn handle_execute_code_step(
 ///
 /// Python owns the working transcript and decides how tool outputs are
 /// represented in internal message history.
+struct HostCallArguments<'a> {
+    args: &'a [MontyObject],
+    kwargs: &'a [(MontyObject, MontyObject)],
+}
+
 async fn handle_execute_action(
-    args: &[MontyObject],
-    kwargs: &[(MontyObject, MontyObject)],
+    call: HostCallArguments<'_>,
     thread: &mut Thread,
     effects: &Arc<dyn EffectExecutor>,
     leases: &Arc<LeaseManager>,
     policy: &Arc<PolicyEngine>,
+    actions_this_step: &mut usize,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
 ) -> Result<ExtFunctionResult, EngineError> {
-    let name = match extract_string_arg(args, kwargs, "name", 0) {
+    let name = match extract_string_arg(call.args, call.kwargs, "name", 0) {
         Some(n) => n,
         None => {
             return Ok(ExtFunctionResult::Error(monty::MontyException::new(
@@ -930,12 +949,13 @@ async fn handle_execute_action(
         }
     };
 
-    let params = args
+    let params = call
+        .args
         .get(1)
         .map(monty_to_json)
         .unwrap_or(serde_json::json!({}));
 
-    let call_id = extract_string_kwarg(kwargs, "call_id").unwrap_or_default();
+    let call_id = extract_string_kwarg(call.kwargs, "call_id").unwrap_or_default();
 
     let exec_ctx = ThreadExecutionContext {
         thread_id: thread.id,
@@ -964,6 +984,34 @@ async fn handle_execute_action(
         thread.events.push(event);
         thread.updated_at = chrono::Utc::now();
     };
+
+    let action_index = *actions_this_step;
+    *actions_this_step = (*actions_this_step).saturating_add(1);
+    if action_index >= super::MAX_ACTIONS_PER_STEP {
+        let error = format!(
+            "Tool call limit reached ({} per step). Break your task into multiple steps.",
+            super::MAX_ACTIONS_PER_STEP
+        );
+        let output = serde_json::json!({"error": &error});
+        let params_summary = summarize_params(&name, &params);
+        emit_and_record(
+            thread,
+            event_tx,
+            EventKind::ActionFailed {
+                step_id: exec_ctx.step_id,
+                action_name: name,
+                call_id,
+                error,
+                params_summary,
+            },
+            "",
+            "",
+            &output,
+        );
+        return Ok(ExtFunctionResult::Return(json_to_monty(
+            &serde_json::json!({"output": output, "is_error": true}),
+        )));
+    }
 
     // 1. Find lease for this action
     let lease = match leases.find_lease_for_action(thread.id, &name).await {
@@ -1204,6 +1252,7 @@ async fn handle_execute_actions_parallel(
     effects: &Arc<dyn EffectExecutor>,
     leases: &Arc<LeaseManager>,
     policy: &Arc<PolicyEngine>,
+    actions_this_step: &mut usize,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
 ) -> Result<ExtFunctionResult, EngineError> {
     // Parse the calls list from the first argument (list of dicts)
@@ -1226,6 +1275,9 @@ async fn handle_execute_actions_parallel(
             &serde_json::json!([]),
         )));
     }
+
+    let first_action_index = *actions_this_step;
+    *actions_this_step = (*actions_this_step).saturating_add(calls_array.len());
 
     // Parse each call dict into (name, params, call_id)
     struct ParsedCall {
@@ -1272,7 +1324,30 @@ async fn handle_execute_actions_parallel(
 
     let mut preflight: Vec<Option<PfOutcome>> = Vec::with_capacity(parsed.len());
 
-    for pc in &parsed {
+    for (idx, pc) in parsed.iter().enumerate() {
+        if first_action_index.saturating_add(idx) >= super::MAX_ACTIONS_PER_STEP {
+            let error = format!(
+                "Tool call limit reached ({} per step). Break your task into multiple steps.",
+                super::MAX_ACTIONS_PER_STEP
+            );
+            let output = serde_json::json!({"error": &error});
+            preflight.push(Some(PfOutcome::Error {
+                result_json: serde_json::json!({
+                    "output": &output,
+                    "is_error": true,
+                }),
+                event: EventKind::ActionFailed {
+                    step_id,
+                    action_name: pc.name.clone(),
+                    call_id: pc.call_id.clone(),
+                    error,
+                    params_summary: summarize_params(&pc.name, &pc.params),
+                },
+                output,
+            }));
+            continue;
+        }
+
         // Find lease
         let lease = match leases.find_lease_for_action(thread.id, &pc.name).await {
             Some(l) => l,
@@ -3465,12 +3540,14 @@ mod tests {
             {"name": "approval_tool", "params": {}, "call_id": "approval"}
         ]))];
 
+        let mut actions_this_step = 0;
         handle_execute_actions_parallel(
             &args,
             &mut thread,
             &effects_dyn,
             &leases,
             &Arc::new(PolicyEngine::new()),
+            &mut actions_this_step,
             None,
         )
         .await
@@ -3511,13 +3588,17 @@ mod tests {
             MontyObject::String("echo-call".into()),
         )];
 
+        let mut actions_this_step = 0;
         handle_execute_action(
-            &args,
-            &kwargs,
+            HostCallArguments {
+                args: &args,
+                kwargs: &kwargs,
+            },
             &mut thread,
             &effects_dyn,
             &leases,
             &Arc::new(PolicyEngine::new()),
+            &mut actions_this_step,
             None,
         )
         .await
@@ -3527,6 +3608,80 @@ mod tests {
         assert!(thread.events.iter().any(|event| {
             matches!(event.kind, EventKind::ActionFailed { ref call_id, .. } if call_id == "echo-call")
         }));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_action_limit_spans_single_and_parallel_host_calls() {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        let effects = Arc::new(CountingEffects {
+            actions: vec![test_action_def("echo")],
+            executions: AtomicUsize::new(0),
+        });
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(3))
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let mut actions_this_step = super::super::MAX_ACTIONS_PER_STEP - 1;
+
+        handle_execute_action(
+            HostCallArguments {
+                args: &[
+                    MontyObject::String("echo".into()),
+                    json_to_monty(&serde_json::json!({})),
+                ],
+                kwargs: &[(
+                    MontyObject::String("call_id".into()),
+                    MontyObject::String("single".into()),
+                )],
+            },
+            &mut thread,
+            &effects_dyn,
+            &leases,
+            &policy,
+            &mut actions_this_step,
+            None,
+        )
+        .await
+        .unwrap();
+
+        handle_execute_actions_parallel(
+            &[json_to_monty(&serde_json::json!([
+                {"name": "echo", "params": {}, "call_id": "parallel-1"},
+                {"name": "echo", "params": {}, "call_id": "parallel-2"}
+            ]))],
+            &mut thread,
+            &effects_dyn,
+            &leases,
+            &policy,
+            &mut actions_this_step,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 1);
+        assert_eq!(actions_this_step, super::super::MAX_ACTIONS_PER_STEP + 2);
+        assert_eq!(
+            thread
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    EventKind::ActionFailed { error, .. }
+                        if error.contains("Tool call limit reached")
+                ))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
