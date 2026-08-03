@@ -385,6 +385,7 @@ I18n.register('en', {
   // Extensions
   'ext.active': 'Active',
   'ext.inactive': 'Inactive',
+  'ext.recovering': 'Recovering',
   'ext.builtin': 'Built-in',
   'ext.remove': 'Remove',
   'ext.install': 'Install',

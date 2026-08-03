@@ -597,7 +597,10 @@ Runtime adapters would own their specific resources:
   lifecycle now performs correct whole-runtime stdio recovery: it revalidates
   owner-scoped persisted intent, recreates and initializes the client, rediscovers
   tools, atomically replaces registered wrappers, and uses generation checks to
-  prevent resurrection. Restarting only the child remains invalid.
+  prevent resurrection. Per-server cancellable tasks isolate failures; five attempts,
+  jittered capped backoff, a 30-second stability window, and circuit-open state bound
+  crash loops. Recovery and child teardown have internal deadlines. Restarting only
+  the child remains invalid.
 - WASM adapter: compile cache, instances/actors, fuel, memory, and host functions.
 - Worker adapter: image/package availability, task routing, health, and cancellation.
 - Remote adapter: sessions, OAuth, HTTP policy, and retries.
@@ -619,7 +622,8 @@ If broader V2 work proceeds, the least-regret order is:
 - Subsequent hardening added diagnostics, exact tool ownership,
   activate/deactivate/update/remove, owner-scoped `env_secrets`, restricted child
   environment inheritance, explicit runtime cleanup, and manager-level stdio crash
-  recovery with bounded retry and generation-safe atomic tool replacement.
+  recovery with per-server cancellation, bounded retry, crash-loop circuit breaking,
+  generation-safe atomic tool replacement, and deadline-bounded shutdown.
 
 ### Phase 1: Package and policy vocabulary
 

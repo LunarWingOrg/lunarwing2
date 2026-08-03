@@ -1314,7 +1314,7 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
-    Arc::new(agent).run().await?;
+    let agent_result = Arc::new(agent).run().await;
 
     // ── Shutdown ────────────────────────────────────────────────────────
 
@@ -1360,6 +1360,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     tracing::debug!("Agent shutdown complete");
 
+    agent_result?;
     Ok(())
 }
 

@@ -81,11 +81,12 @@ impl McpProcessManager {
             map.drain().collect()
         };
 
-        for (name, transport) in transports {
+        futures::future::join_all(transports.into_iter().map(|(name, transport)| async move {
             if let Err(e) = transport.shutdown().await {
                 tracing::warn!("Failed to shut down MCP stdio server '{}': {}", name, e);
             }
-        }
+        }))
+        .await;
     }
 
     /// Shut down a specific transport by name.

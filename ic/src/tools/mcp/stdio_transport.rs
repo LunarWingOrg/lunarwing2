@@ -38,6 +38,7 @@ const SAFE_INHERITED_ENV: &[&str] = &[
     "XDG_DATA_HOME",
     "XDG_RUNTIME_DIR",
 ];
+const MCP_CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(windows)]
 const SAFE_INHERITED_ENV_WINDOWS: &[&str] = &[
@@ -232,13 +233,13 @@ impl McpTransport for StdioMcpTransport {
     }
 
     async fn shutdown(&self) -> Result<(), ToolError> {
-        // Kill the child process.
-        {
+        let kill_timed_out = tokio::time::timeout(MCP_CHILD_SHUTDOWN_TIMEOUT, async {
             let mut child = self.child.lock().await;
             let _ = child.kill().await;
-        }
+        })
+        .await
+        .is_err();
 
-        // Abort the reader tasks.
         if let Some(handle) = self.reader_handle.lock().await.take() {
             handle.abort();
         }
@@ -254,7 +255,14 @@ impl McpTransport for StdioMcpTransport {
         }
 
         tracing::debug!("[{}] Stdio transport shut down", self.server_name);
-        Ok(())
+        if kill_timed_out {
+            Err(ToolError::ExternalService(format!(
+                "[{}] Timed out stopping MCP server process",
+                self.server_name
+            )))
+        } else {
+            Ok(())
+        }
     }
 
     fn supports_http_features(&self) -> bool {

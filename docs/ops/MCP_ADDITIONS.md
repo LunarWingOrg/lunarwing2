@@ -29,7 +29,8 @@
 - Web and conversational update/remove operations route through
   `ExtensionManager`. Active conversational or authenticated API updates stop and
   attempt to reactivate the server with new config. Config remains updated when
-  reactivation fails, so callers must inspect returned message and active status.
+  reactivation fails, but unchanged persisted intent is disabled until explicit
+  activation, so callers must inspect returned message and active status.
 - CLI `mcp update` changes persisted configuration only. CLI toggle uses the live
   gateway when available, automatically saves desired state for next startup when
   unavailable, and accepts `--offline` to request persisted-only behavior.
@@ -42,11 +43,24 @@
   resolves secret references again, starts and initializes a fresh client,
   rediscovers tools, and atomically installs the replacement wrappers.
 - Recovery is serialized with activate, update, deactivate, remove, and OAuth
-  lifecycle work for the same server. Monotonic runtime generations reject stale
-  recovery attempts, so a disabled, removed, updated, or shutting-down server is not
-  resurrected. Failed recovery uses bounded exponential backoff and reports
-  `recovering` rather than stale `active` status. Application shutdown cooperatively
-  stops the supervisor before child teardown.
+  lifecycle work for the same server. Each server uses its own cancellable recovery
+  task, so a hung server does not block recovery of another server. Monotonic runtime
+  generations reject stale work, so a disabled, removed, updated, or shutting-down
+  server is not resurrected.
+- Recovery permits five automatic restart attempts, with jittered exponential backoff
+  capped at 60 seconds. A runtime healthy for 30 seconds starts a new attempt window.
+  Repeated failure opens the circuit: dead wrappers remain absent, status reports a
+  failure, and automatic restart stops until explicit activation retries the server.
+- Recovery and child-cleanup stages have internal deadlines. Application shutdown
+  cancels and bounds all per-server tasks before concurrently stopping managed
+  children. Cleanup therefore still runs when the agent loop returns an error.
+- Activation failure rolls desired `enabled` state back to false when persisted intent
+  is unchanged. Update and removal persist new intent before runtime teardown, closing
+  crash windows that could otherwise restore stale configuration.
+- Startup, manual activation, and recovery use the same all-or-none tool registration
+  rule. Any collision rejects and cleans up the whole MCP runtime rather than exposing
+  a partial tool set that cannot recover consistently. Startup conflicts also disable
+  unchanged persisted intent so status does not remain enabled without supervision.
 
 ### Owner-scoped secret environment references
 
@@ -93,6 +107,10 @@ larger V2 architecture as implemented:
   its owner. Missing, disabled, removed, or non-stdio configuration cancels recovery.
   Secret-name references are resolved afresh; decrypted values are not cached as
   restart descriptors.
+- **Crash loops fail closed:** five unstable restart attempts are allowed. The next
+  failed health check opens the circuit and requires explicit activation. A manual
+  lifecycle operation cancels in-flight recovery before taking the server lifecycle
+  lock.
 - **No automatic npm/pip execution:** the rejected implementation's `npm install`
   and `pip install` behavior is intentionally absent. A package manager must not run
   publisher lifecycle code as the LunarWing service user until immutable identity,
@@ -183,6 +201,6 @@ resolved secret values are never retained as restart configuration.
 - 2026-08-01: CLI removal routed through live `ExtensionManager` cleanup with
   explicit `--offline` behavior.
 - 2026-08-03: manager-level stdio crash recovery added with fresh secret resolution,
-  full client initialization, atomic tool replacement, bounded retry, generation
-  checks, accurate recovering status, and shutdown ordering that prevents
-  resurrection.
+  full client initialization, atomic tool replacement, per-server cancellable tasks,
+  bounded jittered retry, crash-loop circuit breaking, generation checks, accurate
+  status, and deadline-bounded shutdown ordering that prevents resurrection.
