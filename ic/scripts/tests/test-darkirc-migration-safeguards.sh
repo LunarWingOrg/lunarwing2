@@ -6,11 +6,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 IC_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 EXPORT_SRC="$IC_DIR/scripts/export-tenant.sh"
 IMPORT_SRC="$IC_DIR/scripts/import-tenant.sh"
-TEST_STAGE_PARENT="$IC_DIR/target"
-mkdir -p "$TEST_STAGE_PARENT"
-export KAWARIMI_IMPORT_STAGE_ROOT="$TEST_STAGE_PARENT/darkirc-import-stage.$$"
-export SUDO_UID="$(id -u)"
-export SUDO_USER="$(id -un)"
+TEST_STAGE_PARENT="${HOME:?HOME must identify a secure test-stage ancestor}"
+export KAWARIMI_IMPORT_STAGE_ROOT="$TEST_STAGE_PARENT/.lunarwing-darkirc-import-stage.$$"
+SUDO_UID="$(id -u)"
+SUDO_USER="$(id -un)"
+export SUDO_UID SUDO_USER
 
 failures=0
 
@@ -573,7 +573,8 @@ rm -rf "$export_tmp"
 
 echo "=== structured DarkIRC import is contact-only and same-scope ==="
 structured_tmp="$(mktemp -d)"
-export STRUCTURED_FIXTURE_UID="$(id -u)"
+STRUCTURED_FIXTURE_UID="$(id -u)"
+export STRUCTURED_FIXTURE_UID
 mkdir -p "$structured_tmp/scripts" "$structured_tmp/bin" \
   "$structured_tmp/home/alpha/lunarwing/env" \
   "$structured_tmp/home/alpha/lunarwing/state"
