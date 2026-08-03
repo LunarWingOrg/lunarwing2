@@ -34,7 +34,7 @@ ic/src/workspace/mod.rs:848-871 , 984-1017, 1791-1795). Large growing files can 
 18. [ ] come up with proper plan for testing coordination stuff added since 2.0.3.0
 19. [x] (S) sweetielist
 20. [ ] Suggest additional UI fixes a new document in docs/ops — update`docs/ops/UI_FIX_SUGGESTIONS.md` with any additional findings
-21 [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs - prev attempt that may be referenced as it was fairly accurate at time of creation: rarity/kimi-31-20260801-0601
+21. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs - prev attempt that may be referenced as it was fairly accurate at time of creation: rarity/kimi-31-20260801-0601
 22. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
 23. [ ] update README.md at repo root
 24. [x] come up with codename ideas for release. put into new doc - decided Odoshi (威し)
