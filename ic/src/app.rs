@@ -909,6 +909,7 @@ impl AppBuilder {
                         .await;
                 }
             }
+            manager.start_mcp_supervisor().await;
 
             Some(manager)
         };
