@@ -6,6 +6,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 IC_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 EXPORT_SRC="$IC_DIR/scripts/export-tenant.sh"
 IMPORT_SRC="$IC_DIR/scripts/import-tenant.sh"
+TEST_STAGE_PARENT="$IC_DIR/target"
+mkdir -p "$TEST_STAGE_PARENT"
+export KAWARIMI_IMPORT_STAGE_ROOT="$TEST_STAGE_PARENT/darkirc-import-stage.$$"
 
 failures=0
 
@@ -85,7 +88,7 @@ assert_file_contains \
 
 echo "=== unsafe archive rejection happens before mt-admin mutation ==="
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp" "$KAWARIMI_IMPORT_STAGE_ROOT"' EXIT
 mkdir -p "$tmp/scripts" "$tmp/bin" "$tmp/bundle/state/darkirc"
 cp "$IMPORT_SRC" "$tmp/scripts/import-tenant.sh"
 chmod +x "$tmp/scripts/import-tenant.sh"
@@ -137,6 +140,19 @@ ENV
 printf 'secret contact material\n' >"$tmp/bundle/state/darkirc/darkirc_config.toml"
 tar cf "$tmp/unsafe.tar" -C "$tmp/bundle" .
 printf '{"tenants":{}}\n' >"$tmp/ports.json"
+
+if PATH="$tmp/bin:$PATH" \
+   KAWARIMI_IMPORT_STAGE_ROOT="$tmp/forbidden-stage" \
+   LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
+   DARKIRC_IMPORT_TEST_WORK="$tmp" \
+   bash "$tmp/scripts/import-tenant.sh" "$tmp/unsafe.tar" --yes \
+     >"$tmp/tmp-stage.out" 2>&1; then
+  fail "import rejects secret-bearing staging under /tmp"
+elif ! grep -Fq 'absolute non-/tmp path' "$tmp/tmp-stage.out"; then
+  fail "import rejects secret-bearing staging under /tmp"
+else
+  pass "import rejects secret-bearing staging under /tmp"
+fi
 
 if PATH="$tmp/bin:$PATH" \
    LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
