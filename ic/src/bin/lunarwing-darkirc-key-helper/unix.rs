@@ -515,6 +515,8 @@ struct KeypairOutput {
     secret_key: SecretString,
 }
 
+type CapturedGeneratorOutput = (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>, bool);
+
 struct ArtifactPath {
     parent: Dir,
     name: String,
@@ -535,7 +537,7 @@ fn capture_generator_output(
     mut command: Command,
     timeout: Duration,
     output_limit: usize,
-) -> Result<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>, bool)> {
+) -> Result<CapturedGeneratorOutput> {
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
