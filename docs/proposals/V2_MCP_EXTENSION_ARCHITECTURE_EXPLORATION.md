@@ -1,14 +1,16 @@
 # V2 MCP and Extension Runtime Architecture Exploration
 
-> **Current status (2026-08-01): PARTIAL / EXPLORATORY.** Host-local stdio
-> installation, owner-scoped secret environment references, diagnostics, and
-> explicit activate/deactivate/update/remove lifecycle are implemented. The
-> runtime-neutral package model, adapter boundary, generic worker-local MCP,
-> marketplace provenance, automatic package installation, safe crash recovery,
-> dedicated MCP gateway, and MCP-over-WASM phases remain unimplemented design work.
+> **Current status (2026-08-03): PARTIAL / EXPLORATORY.** Host-local stdio
+> installation, owner-scoped secret environment references, diagnostics, explicit
+> activate/deactivate/update/remove lifecycle, and safe whole-runtime stdio crash
+> recovery are implemented. The runtime-neutral package model, general adapter
+> boundary, generic worker-local MCP, marketplace provenance, automatic package
+> installation, dedicated MCP gateway, and MCP-over-WASM phases remain
+> unimplemented design work.
 
 **Status:** Exploratory V2 architecture; host-local stdio installation landed on
-2026-07-09 and later lifecycle/secret hardening is reflected through 2026-08-01.
+2026-07-09 and lifecycle, secret, and crash-recovery hardening is reflected through
+2026-08-03.
 **Date:** 2026-07-09  
 **Scope:** Possible V2 extension packaging, MCP compatibility, execution placement,
 and tenant policy
@@ -591,9 +593,14 @@ The package lifecycle should remain consistent even when runtime behavior differ
 
 Runtime adapters would own their specific resources:
 
-- Process adapter: child lifecycle, stdio framing, and shutdown. Correct crash
-  recovery must recreate and initialize the MCP client, rediscover tools, and
-  atomically replace registered wrappers; restarting only the child is invalid.
+- Process adapter: child lifecycle, stdio framing, and shutdown. The current MCP
+  lifecycle now performs correct whole-runtime stdio recovery: it revalidates
+  owner-scoped persisted intent, recreates and initializes the client, rediscovers
+  tools, atomically replaces registered wrappers, and uses generation checks to
+  prevent resurrection. Per-server cancellable tasks isolate failures; five attempts,
+  jittered capped backoff, a 30-second stability window, and circuit-open state bound
+  crash loops. Recovery and child teardown have internal deadlines. Restarting only
+  the child remains invalid.
 - WASM adapter: compile cache, instances/actors, fuel, memory, and host functions.
 - Worker adapter: image/package availability, task routing, health, and cancellation.
 - Remote adapter: sessions, OAuth, HTTP policy, and retries.
@@ -614,7 +621,9 @@ If broader V2 work proceeds, the least-regret order is:
 - Do not add runtime package downloads or worker placement in this phase.
 - Subsequent hardening added diagnostics, exact tool ownership,
   activate/deactivate/update/remove, owner-scoped `env_secrets`, restricted child
-  environment inheritance, and explicit runtime cleanup.
+  environment inheritance, explicit runtime cleanup, and manager-level stdio crash
+  recovery with per-server cancellation, bounded retry, crash-loop circuit breaking,
+  generation-safe atomic tool replacement, and deadline-bounded shutdown.
 
 ### Phase 1: Package and policy vocabulary
 
@@ -719,8 +728,9 @@ Use native WASM tools for small integrations, worker placement for workspace-loc
 or native servers, dedicated workers for stateful/heavy services, and gateways for
 shared remote control-plane concerns.
 
-The host-local stdio installation and explicit lifecycle work is complete.
-Worker-local MCP is the next placement option to evaluate when a concrete
+The host-local stdio installation, explicit lifecycle, and safe whole-runtime crash
+recovery work is complete. Worker-local MCP is the next placement option to evaluate
+when a concrete
 workspace-coupled server justifies additional lifecycle and credential-policy
 plumbing. Start with preinstalled or verified packages; do not combine the first
 placement prototype with arbitrary npm/pip installation.

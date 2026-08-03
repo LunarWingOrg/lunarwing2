@@ -385,6 +385,7 @@ I18n.register('zh-CN', {
   // 扩展
   'ext.active': '已激活',
   'ext.inactive': '未激活',
+  'ext.recovering': '正在恢复',
   'ext.builtin': '内置',
   'ext.remove': '移除',
   'ext.install': '安装',

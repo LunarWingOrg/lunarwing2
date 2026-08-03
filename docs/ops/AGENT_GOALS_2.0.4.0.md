@@ -44,4 +44,16 @@ ic/src/workspace/mod.rs:848-871 , 984-1017, 1791-1795). Large growing files can 
 27. [ ] update anything outdated in docs/guides - there are a ton of guides in here which have not been updated since v1. many are no longer relevant. they can be placed into archive: docs/guides/history
 28. [ ] review release notes draft and update anything inaccurate or changed since time of writing first draft (referencing item #21)
 
+Item 14 completion hardening (2026-08-03): host-local stdio recovery now runs one
+cancellable task per server, permits five unstable restart attempts with jittered
+bounded backoff, resets attempts after 30 healthy seconds, and opens a visible
+circuit instead of restart-storming. Manual lifecycle work cancels stale recovery;
+activation rollback, persistence-before-teardown, atomic tool replacement, fresh
+secret resolution, and deadline-bounded error-path shutdown close resurrection and
+resource-leak races. Scope remains Part 1 host-local lifecycle only; package
+installation/provenance, host OS sandboxing, worker placement, generic runtime
+adapters, MCP-over-WASM, and dedicated/shared gateway work remain deferred. See
+[`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md) for concise current status,
+remaining validation, and deferred work.
+
 ---
