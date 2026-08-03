@@ -1,7 +1,7 @@
 """Browser regressions for Web UI hot paths."""
 
 
-async def test_stream_chunks_stay_out_of_dom_attributes_until_final(page):
+async def test_stream_chunks_stay_in_live_work_until_final(page):
     result = await page.evaluate(
         """
         () => {
@@ -23,11 +23,13 @@ async def test_stream_chunks_stay_out_of_dom_attributes_until_final(page):
             copy: message.getAttribute('data-copy-text'),
             text: currentStreamingText(),
           };
-          finalizeStreamingMessage(currentThreadId);
+          finishStreamingWork(currentThreadId);
           return {
             streaming,
             finalRaw: message.getAttribute('data-raw'),
             finalCopy: message.getAttribute('data-copy-text'),
+            finalText: message.querySelector('.activity-live-work-output').textContent,
+            stillStreaming: message.hasAttribute('data-streaming'),
           };
         }
         """
@@ -38,8 +40,10 @@ async def test_stream_chunks_stay_out_of_dom_attributes_until_final(page):
         "copy": None,
         "text": "first second",
     }
-    assert result["finalRaw"] == "first second"
+    assert result["finalRaw"] is None
     assert result["finalCopy"] is None
+    assert result["finalText"] == "first second"
+    assert result["stillStreaming"] is False
 
 
 async def test_stream_snapshot_keeps_unflushed_chunk_across_thread_switch(page):
@@ -64,7 +68,7 @@ async def test_stream_snapshot_keeps_unflushed_chunk_across_thread_switch(page):
           currentThreadId = 'thread-a';
           const restored = getOrCreateStreamingMessage(currentThreadId);
           return {
-            text: restored.querySelector('.message-content').textContent,
+            text: restored.querySelector('.activity-live-work-output').textContent,
             streamText: currentStreamingText(),
             snapshotStillStored: _streamSnapshots.has(currentThreadId),
           };

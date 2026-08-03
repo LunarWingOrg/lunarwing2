@@ -53,7 +53,9 @@ use crate::channels::web::handlers::skills::{
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
-use crate::channels::web::util::{build_turns_from_db_messages, truncate_preview};
+use crate::channels::web::util::{
+    build_turns_from_db_messages, reasoning_summary, truncate_preview,
+};
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -1725,14 +1727,8 @@ async fn chat_history_handler(
         let turns: Vec<TurnInfo> = thread
             .turns
             .iter()
-            .map(|t| TurnInfo {
-                turn_number: t.turn_number,
-                user_input: t.user_input.clone(),
-                response: t.response.clone(),
-                state: format!("{:?}", t.state),
-                started_at: t.started_at.to_rfc3339(),
-                completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
-                tool_calls: t
+            .map(|t| {
+                let tool_calls = t
                     .tool_calls
                     .iter()
                     .map(|tc| ToolCallInfo {
@@ -1748,7 +1744,18 @@ async fn chat_history_handler(
                         }),
                         error: tc.error.clone(),
                     })
-                    .collect(),
+                    .collect::<Vec<_>>();
+                let reasoning = reasoning_summary(&tool_calls);
+                TurnInfo {
+                    turn_number: t.turn_number,
+                    user_input: t.user_input.clone(),
+                    response: t.response.clone(),
+                    state: format!("{:?}", t.state),
+                    started_at: t.started_at.to_rfc3339(),
+                    completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
+                    tool_calls,
+                    reasoning,
+                }
             })
             .collect();
 
@@ -3298,6 +3305,16 @@ mod tests {
         ] {
             assert!(app_js.contains(key), "missing networking setting: {key}");
         }
+    }
+
+    #[test]
+    fn chat_ui_separates_live_work_reasoning_and_final_response() {
+        let app_js = include_str!("static/app.js");
+        assert!(app_js.contains("addEventListener('reasoning_update'"));
+        assert!(app_js.contains("activity-live-work-output"));
+        assert!(app_js.contains("createReasoningSummaryElement(turn.reasoning, false)"));
+        assert!(app_js.contains("finishStreamingWork(data.thread_id)"));
+        assert!(!app_js.contains("finalizeStreamingMessage(data.thread_id, data.content)"));
     }
 
     /// Build a test router with just the OAuth callback route.
