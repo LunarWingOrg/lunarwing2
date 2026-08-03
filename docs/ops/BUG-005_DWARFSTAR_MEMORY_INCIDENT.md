@@ -939,3 +939,25 @@ Live validation on Dwarfstar (2026-08-03, commit `238b281` + follow-up):
   the one-time probe (`/usr/bin/true` scope) fired, then the agent's `sh -c`
   command ran as `run-*.scope` under `lunarwing-workloads.slice` while the
   daemon cgroup stayed flat and the scope was collected afterward.
+
+## 2026-08-03 postscript 2 — baseline fix merged and verified live
+
+The idle-baseline fix from `g6/g/v2.0.4.0` (`cd6a16a`: bounded Tokio worker
+and blocking pools, sequential WASM compilation, legacy-artifact shadowing)
+was merged into `ds6/dwarfstar/v2.0.4.0` as `cfa7c52`. Dwarfstar was rebuilt
+with `upgrade-tenant` on the merge commit. Measured after startup settled:
+
+- daemon main PID: **91.7 MB `VmRSS`/`VmHWM`, 12 threads** (previously
+  ~461 MB / ~70 threads) — flat over repeated samples;
+- daemon cgroup: **138 MB current / 142 MB peak**, of which only ~44 MB is
+  anonymous (previously ~390 MB anonymous retained in glibc arenas); the rest
+  is reclaimable file cache;
+- the tenant build ran inside `lunarwing-build.slice`, which accounted ~4 GB
+  peak under the 16G/24G caps instead of the operator session;
+- zero workload-isolation warnings in the daemon journal; agent status
+  endpoint healthy.
+
+The ~450 MiB idle plateau and the 37.6 GB build-accounting incident are both
+closed: baseline is back inside the historical 80–165 MB per-instance band,
+and agent/operator compiles are capped and accounted outside the daemon
+cgroup.
