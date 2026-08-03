@@ -84,6 +84,8 @@ else
   fail 'rootless Kimi workspace mode is not 2770'
 fi
 
+# Override consumed by sourced workspace preparation.
+# shellcheck disable=SC2034
 MT_ROOTLESS=false
 CHOWN_CALL=''
 prepare_worker_workspace root kimi >/dev/null
@@ -119,10 +121,14 @@ else
 fi
 
 mkdir -p "$fixture/target/kimicode4lunarwing"
+# Override consumed by sourced worker builder.
+# shellcheck disable=SC2034
 CONTAINER_RT=docker
 ensure_container_runtime() { :; }
 docker() { BUILD_CALL="$*"; }
 BUILD_CALL=''
+# Function comes from sourced mt-admin later in ShellCheck's composed parse.
+# shellcheck disable=SC2218
 build_kimi_worker false true 9.9.9 "$fixture/target" >/dev/null
 if [[ "$BUILD_CALL" == *'--build-arg WITH_TOOLCHAINS=true'* \
   && "$BUILD_CALL" == *'--build-arg KIMI_CODE_VERSION=9.9.9'* \

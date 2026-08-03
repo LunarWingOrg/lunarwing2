@@ -156,6 +156,8 @@ cat >"$PORTS_REGISTRY" <<'JSON'
 JSON
 acquire_ports_lock() { :; }
 release_ports_lock() { :; }
+# Function comes from sourced mt-admin later in ShellCheck's composed parse.
+# shellcheck disable=SC2218
 ports_retire_nanocode fixture
 assert_eq "registry marks Nanocode retired" \
   "$(jq -r '.tenants.fixture.workers.nanocode' "$PORTS_REGISTRY")" "false"

@@ -47,7 +47,12 @@ assert_before() {
 sanitize_name() { printf '%s' "$1"; }
 tenant_exists_in_registry() { return 0; }
 tenant_worker_enabled() { return 0; }
-ensure_container_runtime() { CONTAINER_RT="podman"; MT_ROOTLESS="${MT_ROOTLESS:-true}"; }
+ensure_container_runtime() {
+  # Globals consumed by sourced lifecycle helpers.
+  # shellcheck disable=SC2034
+  CONTAINER_RT="podman"
+  MT_ROOTLESS="${MT_ROOTLESS:-true}"
+}
 ensure_init_system() { :; }
 podman_supports_quadlet() { return 0; }
 say() { :; }
@@ -77,6 +82,8 @@ assert_before \
   "ctr:alice stop --time 0 lunarwing-opencode-alice" \
   "systemctl:alice stop lunarwing-opencode-alice.service"
 
+# Override consumed by sourced stop_tenant dispatcher.
+# shellcheck disable=SC2034
 INIT_SYSTEM="openrc"
 CALLS=()
 stop_worker alice opencode
@@ -220,6 +227,8 @@ assert_before "stop-opencode:alice" "retire-nanocode:alice"
 assert_before "stop-kimi:alice" "retire-nanocode:alice"
 assert_before "stop-postgres:alice" "retire-nanocode:alice"
 
+# Override consumed by sourced stop_tenant dispatcher.
+# shellcheck disable=SC2034
 INIT_SYSTEM="openrc"
 RETIRE_FAILURE="true"
 CALLS=()

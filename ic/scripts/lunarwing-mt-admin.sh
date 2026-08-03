@@ -4925,7 +4925,8 @@ start_tenant_opencode() {
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
     local opencode_service="lunarwing-opencode-${name}.service"
-    local quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-opencode-${name}.container"
+    local quadlet_file
+    quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-opencode-${name}.container"
     render_worker_quadlet "$name" opencode 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if _container_config_changed "$name" "lunarwing-opencode-${name}" "$quadlet_file"; then
@@ -5032,7 +5033,8 @@ start_tenant_opencode() {
     local host_health_port
     host_health_port="$(ports_get "$name" opencode_health)" || true
     [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
-    local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+    local ssh_agent_socket
+    ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
     local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
@@ -5212,7 +5214,8 @@ start_tenant_kimi() {
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
     local kimi_service="lunarwing-kimi-${name}.service"
-    local quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-kimi-${name}.container"
+    local quadlet_file
+    quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-kimi-${name}.container"
     render_worker_quadlet "$name" kimi 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if _container_config_changed "$name" "lunarwing-kimi-${name}" "$quadlet_file"; then
@@ -5277,7 +5280,8 @@ start_tenant_kimi() {
     local host_health_port
     host_health_port="$(ports_get "$name" kimi_health)" || true
     [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
-    local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+    local ssh_agent_socket
+    ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
     local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
@@ -5347,7 +5351,8 @@ start_tenant_pebble() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
-    local quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-pebble-${name}.container"
+    local quadlet_file
+    quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-pebble-${name}.container"
     render_worker_quadlet "$name" pebble 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if _container_config_changed "$name" "lunarwing-pebble-${name}" "$quadlet_file"; then
@@ -5423,7 +5428,8 @@ start_tenant_pebble() {
     # SSH agent socket (always included — daemon creates it at startup).
     # :z label for SELinux (Enforcing on Fedora).
     local -a ssh_mount=()
-    local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+    local ssh_agent_socket
+    ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
     ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
@@ -5540,7 +5546,8 @@ start_tenant_vision() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
-    local quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-vision-${name}.container"
+    local quadlet_file
+    quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-vision-${name}.container"
     render_vision_quadlet "$name"
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if _container_config_changed "$name" "lunarwing-vision-${name}" "$quadlet_file"; then
@@ -6182,7 +6189,8 @@ render_worker_quadlet() {
   # create_job with SSH commands is invoked, well after startup). If SSH is
   # not configured for the tenant, the socket simply won't exist and SSH
   # commands from the worker will fail with a clear "no agent" error.
-  local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+  local ssh_agent_socket
+  ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
   local study_notes_home="" study_notes_state_home="" study_notes_allow_write=""
   if [[ "$worker" == "opencode" ]]; then
     study_notes_home="$(tenant_study_notes_home "$name")"

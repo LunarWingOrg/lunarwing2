@@ -49,11 +49,14 @@ assert_fails() {
 FIXTURE="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE"' EXIT
 TENANT="lifecycle-test"
+# Overrides consumed by sourced lifecycle/rendering helpers.
+# shellcheck disable=SC2034
 TENANT_LIFECYCLE_LOCK_DIR="$FIXTURE/locks"
 PORTS_REGISTRY="$FIXTURE/ports.json"
 OPENRC_INITD_DIR="$FIXTURE/openrc/init.d"
 OPENRC_CONFD_DIR="$FIXTURE/openrc/conf.d"
 OPENRC_RUNLEVELS_DIR="$FIXTURE/openrc/runlevels"
+# shellcheck disable=SC2034
 OPENRC_ENV_EXEC="$FIXTURE/openrc/lunarwing-openrc-env-exec"
 
 mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR" "$OPENRC_RUNLEVELS_DIR/default"
@@ -86,7 +89,13 @@ tenant_darkirc_enabled() { return 1; }
 podman_supports_quadlet() { return 1; }
 install_openrc_env_exec() { :; }
 render_container_babysitter_unit() { :; }
-ensure_container_runtime() { CONTAINER_RT="/bin/true"; MT_ROOTLESS=false; }
+ensure_container_runtime() {
+  # Globals consumed by sourced renderers.
+  # shellcheck disable=SC2034
+  CONTAINER_RT="/bin/true"
+  # shellcheck disable=SC2034
+  MT_ROOTLESS=false
+}
 chown() { :; }
 
 # Existing helper-specific tests cover command content. These replacements keep
@@ -102,6 +111,8 @@ _render_weechat_openrc_unit() {
 
 echo "=== systemd rendering and dependency gating ==="
 write_weechat_flag true
+# Function comes from sourced mt-admin later in ShellCheck's composed parse.
+# shellcheck disable=SC2218
 render_tenant_systemd_units "$TENANT" >/dev/null
 
 SYSTEMD_DIR="$(tenant_home "$TENANT")/.config/systemd/user"
@@ -119,6 +130,8 @@ ln -s "$SYSTEMD_BACKEND" "$SYSTEMD_DIR/default.target.wants/lunarwing-weechat-${
 ln -s "$SYSTEMD_ADAPTER" "$SYSTEMD_DIR/default.target.wants/lunarwing-weechat-adapter-${TENANT}.service"
 
 write_weechat_flag false
+# Function comes from sourced mt-admin later in ShellCheck's composed parse.
+# shellcheck disable=SC2218
 render_tenant_systemd_units "$TENANT" >/dev/null
 
 assert_no_file "disabled systemd backend removed" "$SYSTEMD_BACKEND"
@@ -158,6 +171,8 @@ assert_not_contains "disabled OpenRC main drops backend need" "$OPENRC_MAIN_CONF
 
 echo "=== strict systemd lifecycle ==="
 write_weechat_flag true
+# Function comes from sourced mt-admin later in ShellCheck's composed parse.
+# shellcheck disable=SC2218
 render_tenant_systemd_units "$TENANT" >/dev/null
 
 id() {
@@ -175,6 +190,8 @@ _systemctl_user() {
   return 0
 }
 
+# Override consumed by sourced reconciliation helper.
+# shellcheck disable=SC2034
 INIT_SYSTEM=systemd
 : >"$SYSTEMCTL_LOG"
 assert_ok "systemd disable succeeds when stop/disable succeed" weechat_lifecycle_stop_disable "$TENANT"
@@ -255,6 +272,8 @@ assert_ok "OpenRC disable is idempotent when scripts are absent" weechat_lifecyc
 assert_fails "OpenRC enable fails when rendered scripts are absent" weechat_lifecycle_enable_start "$TENANT"
 
 echo "=== renderer exit containment ==="
+# Override consumed by sourced reconciliation helper.
+# shellcheck disable=SC2034
 INIT_SYSTEM=systemd
 render_tenant_systemd_units() { exit 1; }
 assert_fails "reconcile converts renderer exit into catchable failure" weechat_reconcile_units "$TENANT"

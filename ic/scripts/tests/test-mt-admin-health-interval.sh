@@ -34,6 +34,8 @@ fcrontab() {
 }
 _ensure_cron_runlevel() { :; }
 
+# Override consumed by sourced health scheduler.
+# shellcheck disable=SC2034
 HEALTH_LAUNCHER="/usr/local/sbin/lunarwing-mt-health"
 _install_health_cron >/dev/null
 if grep -qF '*/5 * * * * /usr/local/sbin/lunarwing-mt-health' <<<"$FCRON_TAB"; then
@@ -43,6 +45,8 @@ else
   failures=$((failures + 1))
 fi
 
+# Override consumed by sourced init detection.
+# shellcheck disable=SC2034
 INIT_SYSTEM="systemd"
 HEALTH_INTERVAL_MIN=""
 ensure_init_system

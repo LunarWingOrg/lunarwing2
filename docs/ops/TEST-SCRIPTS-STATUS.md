@@ -75,7 +75,7 @@ current status, what was fixed, and what remains untested or broken.
 | **Language** | Bash |
 | **Purpose** | 6 checks: direct DB driver usage outside `src/db/`, `.unwrap()`/`.expect()` in production code, direct `env::var` reads outside config, integration test feature gating, silent test-skip patterns, LLM module isolation |
 | **Run** | `cd ic && bash scripts/check-boundaries.sh` |
-| **Exit** | Non-zero if hard violations found (warnings don't fail) |
+| **Exit** | Non-zero for new hard violations relative to the MR/push/default-branch base; existing full-tree debt remains visible as warnings |
 
 ### 6. `ic/scripts/coverage.sh` — Coverage Report Generator
 

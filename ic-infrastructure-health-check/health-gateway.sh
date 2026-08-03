@@ -71,7 +71,8 @@ check_oversized_sessions() {
         # Sessions over 500KB are likely to cause issues
         while IFS= read -r jsonl; do
             oversized=$((oversized + 1))
-            local size=$(du -h "$jsonl" | cut -f1)
+            local size
+            size=$(du -h "$jsonl" | cut -f1)
             issues+=("Oversized session: $jsonl ($size)")
         done < <(find "$SESSIONS_DIR" -name "*.jsonl" -size +500k -type f 2>/dev/null)
     fi

@@ -58,7 +58,8 @@ run_check() {
 
     log "Running $component health check..."
 
-    local start=$(date +%s)
+    local start
+    start=$(date +%s)
     local output
     local exit_code=0
 
@@ -69,7 +70,8 @@ run_check() {
     # Append any stderr from the check to the log
     [ -s "$stderr_file" ] && cat "$stderr_file" >> "$LOG_FILE"
     rm -f "$stderr_file"
-    local end=$(date +%s)
+    local end
+    end=$(date +%s)
     local duration=$((end - start))
 
     if [ $exit_code -eq 124 ]; then

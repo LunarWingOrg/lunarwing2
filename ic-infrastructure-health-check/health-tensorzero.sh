@@ -28,7 +28,7 @@ query_clickhouse() {
     
     if command -v clickhouse-client &>/dev/null; then
         # Query for recent TensorZero metrics
-        query_result=$(clickhouse-client --format JSONEachRow <<'EOF'
+        query_result=$(clickhouse-client --format JSONEachRow 2>/dev/null <<'EOF'
 SELECT 
     quantile(0.5)(response_time_ms) as p50_ms,
     quantile(0.95)(response_time_ms) as p95_ms,
@@ -38,7 +38,7 @@ SELECT
 FROM tensorzero_requests 
 WHERE timestamp >= now() - INTERVAL 15 MINUTE
 EOF
-2>/dev/null) || query_result=""
+) || query_result=""
     fi
     
     echo "$query_result"

@@ -47,9 +47,11 @@ measure_latency() {
     if [ "$connected" = "true" ]; then
         # Placeholder - would send test message and measure roundtrip
         # For now, simulate with a ping-like test
-        local start=$(date +%s%N)
+        local start
+        start=$(date +%s%N)
         timeout 5 bash -c "echo >/dev/tcp/$XMPP_SERVER/$XMPP_PORT" 2>/dev/null || true
-        local end=$(date +%s%N)
+        local end
+        end=$(date +%s%N)
         latency=$(( (end - start) / 1000000 ))
     fi
 

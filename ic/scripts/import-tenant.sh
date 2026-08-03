@@ -473,7 +473,6 @@ OPENCODE_MODEL="$(manifest_value OPENCODE_MODEL)"
 OPENCODE_BASE_URL="$(manifest_value OPENCODE_BASE_URL)"
 KIMI_MODEL="$(manifest_value KIMI_MODEL)"
 KIMI_BASE_URL="$(manifest_value KIMI_BASE_URL)"
-KIMI_API_KEY="$(manifest_value KIMI_API_KEY)"
 GOTIFY_URL="$(manifest_value GOTIFY_URL)"
 
 confirm "Stage tenant '$TENANT' on THIS host from the bundle?" || die "aborted by user"

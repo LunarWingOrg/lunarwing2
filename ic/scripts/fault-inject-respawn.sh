@@ -32,8 +32,8 @@
 
 set -euo pipefail
 
-readonly VERSION="1.0.0"
-readonly SCRIPT_NAME="$(basename "$0")"
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 

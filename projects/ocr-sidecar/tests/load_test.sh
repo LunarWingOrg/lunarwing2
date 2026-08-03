@@ -30,7 +30,7 @@ echo "Running $CONCURRENT concurrent requests to $ENDPOINT/ocr..."
 
 START_TIME=$(date +%s%N)
 
-for i in $(seq 1 $CONCURRENT); do
+for _ in $(seq 1 $CONCURRENT); do
     if [[ -n "$AUTH_HEADER" ]]; then
         curl -s -X POST \
             -H "Content-Type: application/json" \

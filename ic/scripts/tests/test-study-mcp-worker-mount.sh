@@ -264,8 +264,14 @@ fi
 # A rebuilt image must escape any StartLimitBurst lockout left by old failures.
 container_image_user="$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID"
 CONTAINER_RT="podman"
+# Override consumed by sourced worker startup.
+# shellcheck disable=SC2034
 MT_ROOTLESS="true"
-ensure_init_system() { INIT_SYSTEM="systemd"; }
+ensure_init_system() {
+  # Global consumed by sourced worker startup.
+  # shellcheck disable=SC2034
+  INIT_SYSTEM="systemd"
+}
 podman_supports_quadlet() { return 0; }
 _wait_user_manager() { :; }
 systemctl_calls=()
@@ -307,6 +313,8 @@ if grep -Eq -- 'image prune|--no-cache|--layers=false' "$build_calls"; then
 fi
 
 docker() { printf '%s\n' "$*" >>"$build_calls"; }
+# Override consumed by sourced worker builder.
+# shellcheck disable=SC2034
 CONTAINER_RT="docker"
 : >"$build_calls"
 build_opencode_worker true true

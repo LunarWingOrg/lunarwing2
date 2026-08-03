@@ -54,7 +54,7 @@ pub(super) struct LorebookCache {
 
 impl LorebookCache {
     fn new(capacity: usize) -> Self {
-        let capacity = NonZeroUsize::new(capacity.max(1)).expect("capacity clamped to one");
+        let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
         Self {
             scopes: Mutex::new(LruCache::new(capacity)),
         }
@@ -155,6 +155,18 @@ mod tests {
 
         cache.invalidate(&key);
         assert!(cache.get_recent_empty(&key).is_none());
+    }
+
+    #[test]
+    fn zero_capacity_is_clamped_to_one() {
+        let cache = LorebookCache::new(0);
+        let first = ScopeKey::new("first", None);
+        let second = ScopeKey::new("second", None);
+        cache.insert(first.clone(), Vec::new(), Arc::from([]));
+        cache.insert(second.clone(), Vec::new(), Arc::from([]));
+
+        assert!(cache.get_recent_empty(&first).is_none());
+        assert!(cache.get_recent_empty(&second).is_some());
     }
 
     #[test]
