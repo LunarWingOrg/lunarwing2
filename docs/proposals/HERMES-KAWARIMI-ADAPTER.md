@@ -1,12 +1,17 @@
 # Hermes → LunarWing Kawarimi Adapter — Proposal & Implementation
 
-**Status:** Phase 1 + review hardening (v0.2.0) · **Package:** `hermes_kawarimi/` ·
-**Date:** 2026-07-22
+**Status:** Phase 1 implemented, live-validated, and hardened · **Package:**
+`hermes_kawarimi/` · **Date:** 2026-07-22 · **Reverified:** 2026-08-04
 
 > A Kawarimi adapter that imports a Hermes agent into a LunarWing tenant.
-> Read-only path (`inspect`, dry-run `import`) is implemented, unit-tested, and
-> smoke-tested. The live `--apply` path is implemented and awaits rehearsal on a
-> LunarWing host (root + container runtime), mirroring the KAWARIMI validation.
+> Read-only and live `--apply` paths are implemented and tested. A real Hermes
+> home was imported on 2026-07-30 (4 memory docs, 85 conversations, 5,409
+> messages, 10 secrets, and 2 settings); owner-scoped row counts, byte-identical
+> secret decryption, tenant startup, and gateway health were verified before the
+> throwaway tenant was removed. The rehearsal exposed that `stop-tenant` also
+> stops PostgreSQL; the loader now uses an explicit `start-pg` populate window
+> and cleans up owned PostgreSQL on later failures. The current seven-module
+> suite passes 48 tests.
 
 ---
 
@@ -38,8 +43,9 @@ MappedAgent   (owner-agnostic LunarWing rows)
    │  loader.py     (--apply only)
    ▼
 mt-admin add-tenant + build-tenant + install-wasm   (empty tenant)
-   → start-tenant (daemon runs migrations = SCHEMA) → stop-tenant (PG stays up)
-   → populate live DB + encrypt secrets → start-tenant (if --start) else STAGED
+   → start-tenant (daemon runs migrations = SCHEMA) → stop-tenant (PG stops too)
+   → start-pg → populate live DB + encrypt secrets
+   → start-tenant (if --start) else leave STAGED with PostgreSQL running
 ```
 
 **Rejected alternative — "Kawarimi bundle producer"** (emit a `meta.txt` +
@@ -53,8 +59,11 @@ live schema.
 the daemon's refinery runner at first boot (`ic/src/app.rs` `run_migrations` +
 auto-onboard). `V1__initial.sql` uses bare `CREATE TABLE` (not `IF NOT EXISTS`),
 so hand-applying the SQL would collide with refinery's own run. The loader boots
-the tenant once (schema created), stops the daemon (PostgreSQL container stays up,
-per the export model), then populates with no daemon racing.
+the tenant once (schema created), stops the tenant, then brings PostgreSQL back
+alone with `start-pg` and populates with no daemon racing. A successful staged
+import deliberately leaves that PostgreSQL-only window running, matching
+`import-tenant.sh`; a later import failure triggers best-effort `stop-pg`
+cleanup.
 
 **Key safety win over the bundle path:** the entire
 `KAWARIMI-OWNER-SCOPE-CONTINUITY` silent-empty hazard comes from `pg_restore`
@@ -118,14 +127,16 @@ runtime), `lunarwing_mt_onboard.provisioner` (mt-admin wrappers, `PhaseResult`),
 ## 6. Verification
 
 - **Unit (no root/DB) — passing:**
-  `python3 -m unittest hermes_kawarimi.model_tests hermes_kawarimi.extract_tests hermes_kawarimi.mapper_tests hermes_kawarimi.config_tests hermes_kawarimi.loader_tests`
-  (30 tests; the config test skips when pyyaml is absent).
+  `python3 -m unittest hermes_kawarimi.model_tests hermes_kawarimi.extract_tests hermes_kawarimi.mapper_tests hermes_kawarimi.config_tests hermes_kawarimi.loader_tests hermes_kawarimi.loader_populate_tests hermes_kawarimi.cli_tests`
+  (48 tests on 2026-08-04).
 - **Dry-run — smoke-tested:** `inspect` and `import` (without `--apply`) render a
   correct migration report against a synthetic `$HERMES_HOME` and write nothing.
-- **End-to-end (pending rehearsal on a LunarWing host, root + throwaway tenant):**
-  `sudo python3 -m hermes_kawarimi import --source <hermes_home> --tenant testimport --apply`;
-  confirm rows exist under `LUNARWING_OWNER_ID` and a stored secret decrypts.
-  Rollback: `sudo lunarwing-mt-admin.sh remove-tenant testimport`.
+- **End-to-end — passed on 2026-07-30:** imported a real running Hermes home into
+  throwaway tenant `hermes`; verified all mapped row counts under
+  `LUNARWING_OWNER_ID`, byte-identical decryption of one imported secret, tenant
+  startup, and HTTP agent status. The tenant was then stopped and later removed.
+  Repeat rehearsals should still use a throwaway tenant and the normal
+  `remove-tenant` rollback path.
 
 ## 7. Phasing
 

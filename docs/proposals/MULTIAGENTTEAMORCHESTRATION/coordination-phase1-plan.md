@@ -1,7 +1,12 @@
 # Coordination Pipeline — Phase 1: Declarative Hooks
 
-## Status: READY FOR DEPLOYMENT
+## Status: IMPLEMENTED FOR v2.0.4.0 — HISTORICAL DESIGN RECORD
 ## Date: 2026-07-24
+
+Phase 1 shipped as `ic/config/hooks/coordination.hook.json`. The current,
+source-verified deployment contract is documented in [`DEPLOYMENT.md`](DEPLOYMENT.md);
+this plan preserves the pre-implementation design and should not be used as an
+operator runbook.
 
 ---
 

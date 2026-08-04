@@ -1,9 +1,11 @@
 # External Worker System Upgrades
 
-> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** All eleven plan
-> tasks landed for the surviving workers. The unchecked acceptance boxes below
-> are preserved as the original execution plan, not current incomplete work;
-> Codex was removed in v1.1.9.
+> **Current status (updated 2026-08-04): IMPLEMENTED / HISTORICAL PLAN.** All
+> eleven original tasks landed. The unchecked acceptance boxes below preserve
+> the execution plan, not current incomplete work. Codex was removed in v1.1.9
+> and Nanocode was retired in v2.0.4.0; references to either worker are
+> historical. Supported persistent workers are now Pebble, OpenCode, and Kimi
+> Code, all using the shared orchestrator protocol described here.
 > 
 > **Note (2026-07-28):** Line number references throughout this document were
 > verified at the time of writing (2026-06-22) and may have shifted as the
@@ -23,7 +25,8 @@
 > - Multi-instance `ExternalWorkerConfig` with round-robin load balancing
 > - `ExternalTaskStatus` enum replacing stringly-typed status
 > - Worker container updates (codex, nanocode, pebble) to accept extended context
->   *(Note: codex worker removed in v1.1.9; nanocode/pebble remain)*
+>   *(Historical worker set: Codex was removed in v1.1.9 and Nanocode was retired
+>   in v2.0.4.0; the shared protocol now serves Pebble, OpenCode, and Kimi Code.)*
 >
 > **Estimated Effort**: Large
 > **Parallel Execution**: YES - 4 waves
@@ -858,7 +861,8 @@ Max Concurrent: 3 (Waves 1, 2, 4)
 
   > **Note**: The Codex worker (`codex4lunarwing/`) was removed in v1.1.9. The following task
   > description is retained for historical reference. The orchestrator-side context passing
-  > (Tasks 1–8) applies to all remaining workers (nanocode, pebble, opencode).
+  > (Tasks 1–8) is shared by the current Pebble, OpenCode, and Kimi Code workers;
+  > Nanocode support documented later in this plan is also historical.
 
   **What to do**:
   - Update `codex4lunarwing/agent_comm_protocol.json` to document extended `context` fields:
