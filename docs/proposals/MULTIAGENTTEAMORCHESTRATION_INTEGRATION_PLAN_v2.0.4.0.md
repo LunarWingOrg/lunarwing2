@@ -200,15 +200,16 @@ Environment variables (loaded by `CoordinationHookConfig::from_env()`):
 |----------|---------|-------------|
 | `COORD_ENABLED` | `false` | Enable coordination hooks |
 | `COORD_AGENT_ID` | (required) | This agent's unique identifier |
-| `COORD_AGENT_ALIASES` | (required) | Comma-separated @mentions |
-| `COORD_CHANNELS` | (required) | Comma-separated coordination channel JIDs |
-| `COORD_MAX_MESSAGES` | `2` | Max messages per hour per agent |
-| `COORD_COALESCE_MS` | `2000` | First-responder coalesce window (ms) |
+| `COORD_AGENT_ALIASES` | (empty) | Comma-separated @mentions targeting this agent |
+| `COORD_CHANNELS` | (required) | Comma-separated coordination policy scopes |
+| `COORD_MAX_MESSAGES` | `2` | Max messages per rate window per agent |
+| `COORD_RATE_WINDOW_SECS` | `3600` | Sliding rate-window duration |
+| `COORD_COALESCE_MS` | `2000` | First-responder claim TTL (ms) |
 | `COORD_ENTROPY_THRESHOLD` | `4.8` | Shannon entropy threshold |
 | `COORD_MIN_SECRET_LENGTH` | `32` | Min token length for entropy check |
 | `COORD_ADMIN_USERS` | (empty) | Comma-separated admin user IDs |
 
-### Concerns to Resolve Before Phase 2
+### Historical Concerns and Resolutions
 
 #### C1: EngagementPolicyHook + Router Integration
 
@@ -224,19 +225,16 @@ exits with no output. Token waste is minimal (system prompt load only).
 **Future (2.0.5.0+):** Option A — modify the router to respect BeforeInbound
 rejections for thread spawning decisions.
 
-#### C2: TransformResponse Has No Channel Field
+#### C2: ResponseTransform Originally Had No Destination Scope
 
-**Problem:** `HookEvent::ResponseTransform { user_id, thread_id, response }`
-has no `channel` field. TagSchemaHook cannot know if a transform is destined
-for a coordination channel.
+**Original problem:** `HookEvent::ResponseTransform { user_id, thread_id,
+response }` could not identify whether a transform targeted a coordination
+channel.
 
-**Resolution for 2.0.4.0:** Add an optional `channel: Option<String>` to the
-`ResponseTransform` variant. This is an additive change — existing match arms
-use `..` or named fields, so they won't break. The field is `None` for
-non-channel-scoped transforms.
-
-**Files affected:** `ic/src/hooks/hook.rs` (enum variant), all match sites on
-`ResponseTransform` (grep for `ResponseTransform` in `ic/src/`).
+**Implemented resolution:** `ResponseTransform` now carries optional `channel`
+and canonical `policy_scope` fields. Policy prefers `policy_scope`, falls back
+to `channel`, and remains a no-op when neither destination is known. Match sites
+were updated and regression-tested.
 
 #### C3: High-Entropy False Positives
 
@@ -275,15 +273,16 @@ supplementary.
 
 ### Components
 
-1. **ViolationStore** — persistent per-agent violation tracking.
-   - File: `$LUNARWING_BASE_DIR/coordination-violations.json` (atomic write:
-     temp + rename, same pattern as `PendingGateStore`)
-   - Single `Mutex`, same pattern as existing gate stores
+1. **ViolationStore** — bounded persistent per-agent violation tracking.
+   - File: `$LUNARWING_BASE_DIR/coordination-violations.json`; a bounded,
+     debounced writer persists immutable snapshots via atomic temp + rename.
+   - In-memory state is protected by one mutex; the writer uses a capacity-one
+     notification channel and retries failed persistence without blocking hooks.
    - `ViolationStatus`: `Active(0)` → `Warning(1)` → `FinalWarning(2)` →
      `Disabled(3+, 24h)`
    - `ViolationRecord`: timestamp, reason, hook, channel
-   - Methods: `record_violation`, `get_status`, `clear_violations`,
-     `manual_disable`, `manual_enable`, `expire_check`
+   - Public operations: `record_violation`, `status`, `all_statuses`,
+     `is_disabled`, `clear`, `manual_disable`, and `manual_enable`
    - Violation decay: 7 days (configurable via `COORD_VIOLATION_DECAY`)
 
 2. **CoordinationGate** — `ExecutionGate` impl at priority 5 (above LeaseGate
@@ -303,23 +302,19 @@ supplementary.
    - Strike 2: structured `tracing::warn!` ops alert for log-based alerting
    - Strike 3: auto-disable set by store; `CoordinationGate` blocks tool side effects
 
-### Concern to Resolve Before Phase 3
+### Historical Concern and Resolution
 
-#### C4: GateDecision::Deny Silent Field
+#### C4: Silent Gate Denial
 
-**Problem:** Phase 3 wants silent denies for disabled agents (no channel
-message, no error surfaced). Current `GateDecision::Deny { reason: String }`
-has no `silent` field. Adding one touches every match arm.
+**Original problem:** Phase 3 needed disabled agents to stop without surfacing a
+reason to the model or channel, while `GateDecision::Deny` carried only a reason
+string.
 
-**Resolution for 2.0.4.0:** Use a convention prefix `"[SILENT] "` in the reason
-string. The gate pipeline and bridge already handle `Deny` by surfacing the
-reason — we add a check: if reason starts with `"[SILENT] "`, suppress the
-channel message and log at `debug` level only. This avoids an enum change that
-would touch all match sites.
-
-**Alternative (if clean enough):** Add `silent: bool` to `Deny` with a default
-of `false` via a constructor method. Audit all match sites (grep
-`GateDecision::Deny` in `ic/`). If the count is small (<20), this is cleaner.
+**Implemented resolution:** `CoordinationGate` prefixes its reason with
+`"[SILENT] "`. The Engine V2 effect adapter recognizes that marker before any
+tool side effect and returns typed `ExecutionStopped` control flow. Executor
+paths refund pre-execution lease use, emit no action failure, stop the thread,
+and log only at debug level.
 
 ### Configuration
 
@@ -341,7 +336,7 @@ of `false` via a constructor method. Audit all match sites (grep
 
 ---
 
-## Phase 4: Coalesce Window (Stretch)
+## Phase 4: Coalesce Window
 
 ### Implemented Files
 
@@ -395,10 +390,10 @@ to native and WASM channels rather than requiring adapter-specific wiring.
 
 | Dependency | Status | Notes |
 |-----------|--------|-------|
-| HookRegistry and Hook system | Ready | `ic/src/hooks/` — verified |
-| GatePipeline and ExecutionGate | Ready | `ic/crates/lunarwing_engine/src/gate/` — verified |
-| HookBundleConfig (workspace hooks) | Ready | `ic/src/hooks/bundled.rs`, `bootstrap.rs` — verified |
-| XMPP channel adapter | Ready | Needed for Phase 4 coalesce |
+| HookRegistry and Hook system | Shipped | `ic/src/hooks/` |
+| GatePipeline and ExecutionGate | Shipped | Engine trait in `ic/crates/lunarwing_engine/src/gate/`; application gate in `ic/src/gate/` |
+| HookBundleConfig (workspace hooks) | Shipped | `ic/src/hooks/bundled.rs`, `bootstrap.rs` |
+| Agent outbound boundary | Shipped | `ic/src/agent/agent_loop.rs` applies hooks then transport-independent coalescing |
 | Router thread-spawn integration | Deferred | Phase 2 uses Option B (non-invasive) |
 
 ---
