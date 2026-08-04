@@ -1,9 +1,11 @@
 # External Worker System Upgrades
 
-> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** All eleven plan
-> tasks landed for the surviving workers. The unchecked acceptance boxes below
-> are preserved as the original execution plan, not current incomplete work;
-> Codex was removed in v1.1.9.
+> **Current status (updated 2026-08-04): IMPLEMENTED / HISTORICAL PLAN.** All
+> eleven original tasks landed. The unchecked acceptance boxes below preserve
+> the execution plan, not current incomplete work. Codex was removed in v1.1.9
+> and Nanocode was retired in v2.0.4.0; references to either worker are
+> historical. Supported persistent workers are now Pebble, OpenCode, and Kimi
+> Code, all using the shared orchestrator protocol described here.
 > 
 > **Note (2026-07-28):** Line number references throughout this document were
 > verified at the time of writing (2026-06-22) and may have shifted as the
