@@ -1,9 +1,16 @@
 # Coordination Pipeline Implementation Plan — Engine V2
 
-## Status: DRAFT (pending sun approval)
+## Status: IMPLEMENTED FOR v2.0.4.0 — SUPERSEDED DESIGN DRAFT
 ## Date: 2026-07-24
 ## Author: Captain Ruffles
 ## Based on: `projects/openclaw/AgentFramework.md` + verified engine V2 source
+
+The four-phase implementation now lives in `ic/src/hooks/coordination.rs`,
+`ic/src/gate/coordination.rs`, `ic/src/gate/violation_store.rs`, and
+`ic/src/channels/coalesce.rs`. Use [`DEPLOYMENT.md`](DEPLOYMENT.md) for the
+current configuration and operational contract. Names, priorities, and example
+APIs below record the original design and are not authoritative for current
+source.
 
 ---
 
