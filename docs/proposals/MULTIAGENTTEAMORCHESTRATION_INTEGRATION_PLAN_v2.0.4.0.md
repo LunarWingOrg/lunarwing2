@@ -42,15 +42,18 @@ designated coordination channels:
   `COORD`, `ANNOUNCE`, `QUERY`), be single-line, and ≤420 characters.
 - **Secret detection:** inbound and outbound messages are scanned for API keys,
   private keys, JWTs, and high-entropy strings.
-- **Rate limiting:** 2 messages per hour per agent in coordination channels.
-- **Engagement policy:** agents only respond to @mentions, direct replies, or
-  DMs — not to every message in the channel.
-- **First-responder correlation:** prevents duplicate responses when multiple
-  agents could answer.
+- **Rate limiting:** 2 messages per agent per configured window by default
+  (`COORD_RATE_WINDOW_SECS=3600`).
+- **Engagement policy:** within configured coordination scopes, messages pass
+  when sent by the local agent/admin or when their text contains a configured
+  `COORD_AGENT_ALIASES` value. Direct-reply metadata is not inspected; DMs are
+  unaffected unless explicitly listed in `COORD_CHANNELS`.
+- **First-responder correlation:** opportunistically suppresses duplicate claims
+  among hooks sharing one daemon; separate tenant daemons can still both respond.
 - **Three-strike enforcement:** repeated violations auto-disable an agent for
   24 hours.
-- **Coalesce window:** 1.5–3 second pre-send buffer to merge rapid-fire
-  messages from the same agent.
+- **Coalesce window:** a 2-second pre-send buffer by default
+  (`COALESCE_WINDOW_SEC`) merges rapid-fire messages from the same agent.
 
 ### Existing Design Documents
 
@@ -103,8 +106,9 @@ covering native and installable channels uniformly.
 
 ### What Does NOT Ship in 2.0.4.0
 
-- **Cross-host first-responder store** (Redis/NFS-based): per-host is
-  sufficient for 2.0.4.0. Cross-host coordination deferred to 2.0.5.0+.
+- **Shared first-responder store** (host-local broker/file CAS or remote broker):
+  current claims are process-local, so separate tenant daemons on the same host
+  or different hosts can both respond. Shared coordination is deferred.
 - **Router-level engagement gating** (Option A from verification doc): the
   router refactor to respect BeforeInbound rejections for thread spawning is
   invasive and deferred. 2.0.4.0 uses Option B (thread spawns but agent
@@ -286,8 +290,9 @@ supplementary.
    - Violation decay: 7 days (configurable via `COORD_VIOLATION_DECAY`)
 
 2. **CoordinationGate** — `ExecutionGate` impl at priority 5 (above LeaseGate
-   at 10). Denies all tool execution when agent is auto-disabled. Auto-clears
-   when disable period expires.
+   at 10). The production Engine V2 effect adapter checks it before tool side
+   effects. Legacy tool-dispatch paths do not currently evaluate this gate.
+   Expired automatic disables clear when status is evaluated.
 
 3. **Admin HTTP endpoints** (localhost-only, bound to `127.0.0.1`):
    - `GET /coord/status` — all agents
@@ -300,7 +305,7 @@ supplementary.
    `Arc<ViolationStore>`. Hooks call `record_violation` on detection.
    - Strike 1: silent halt (hook already rejects)
    - Strike 2: structured `tracing::warn!` ops alert for log-based alerting
-   - Strike 3: auto-disable set by store; `CoordinationGate` blocks tool side effects
+   - Strike 3: auto-disable set by store; `CoordinationGate` blocks Engine V2 tool side effects
 
 ### Historical Concern and Resolution
 
@@ -329,7 +334,7 @@ and log only at debug level.
 
 - [x] ViolationStore persists to disk and survives restarts
 - [x] Three-strike escalation: 1st silent halt, 2nd ops alert, 3rd auto-disable
-- [x] CoordinationGate denies all tool execution for disabled agents
+- [x] CoordinationGate denies Engine V2 tool execution for disabled agents before side effects
 - [x] Auto-disable expires after configurable duration
 - [x] Admin HTTP endpoints work from localhost only
 - [x] `COORD_PERMISSIVE=true` disables the gate for testing
