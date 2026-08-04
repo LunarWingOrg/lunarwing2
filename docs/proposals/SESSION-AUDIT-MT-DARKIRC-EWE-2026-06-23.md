@@ -1,8 +1,11 @@
 # Session Audit — MT Admin, DarkIRC, External Worker Enhancements (2026-06-23)
 
 > **Current status (rechecked 2026-08-04): HISTORICAL AUDIT WITH OPEN ITEMS.**
-> H1-H3, M3-M9, T1/T2/T4/T5/T7, and the worker-health port work landed.
-> M1/M2, L2/L4-L8, T3, and T6 remain open as marked below. Worker names,
+> H1-H3, M3-M8, T1/T2/T4/T5/T6/T7, and the worker-health port work landed.
+> M9 is partial: connection-failure failover works for both strategies, but
+> protocol errors and timeouts are not retried. M1/M2, L2/L5-L8, and T3 remain
+> open; L4 is partial because the guide was corrected but the legacy
+> `BRIDGE_SOCKET` line remains. Worker names,
 > line numbers, and v8 port examples capture the June baseline: Codex was removed
 > and Nanocode was later retired; supported persistent workers are now Pebble,
 > OpenCode, and Kimi Code. Current DarkIRC Stage A security work is documented in
@@ -46,7 +49,7 @@ Status legend: `TODO` · `IN PROGRESS` · `DONE` · `WONTFIX` · `DEFERRED`
 | M6 | Non-constant-time bearer comparison in adapter | DarkIRC | `darkirc_adapter.py` | DONE |
 | M7 | `auth_token` stored as plain `Option<String>`, not `SecretString` | EWE | `config/sandbox.rs:191,209` | DONE |
 | M8 | No graceful `pool.drain()` on shutdown; no background `evict_stale()` | EWE | `main.rs`, `external_worker.rs` | DONE |
-| M9 | Failover is connection-only — no retry on `ProtocolError`/timeout | EWE | `external_worker.rs` | DONE |
+| M9 | Connection-failure failover landed for both strategies; `ProtocolError`/timeout still stop without trying another endpoint | EWE | `external_worker.rs` | PARTIAL |
 
 ### Low priority / quality
 
@@ -55,7 +58,7 @@ Status legend: `TODO` · `IN PROGRESS` · `DONE` · `WONTFIX` · `DEFERRED`
 | L1 | Hardcoded health port `8443` (acknowledged unfinished in commit `175d2686`) | MT admin | resolved by v8 ports schema (dedicated `nanocode_health`/`pebble_health`) | DONE |
 | L2 | Hardcoded `DEFAULT_TENSORZERO_URL=http://192.168.1.157:3000/...` | MT admin | `lunarwing-mt-admin.sh:31` | TODO |
 | L3 | ~~Duplicated byte-identical DarkIRC source trees~~ **Non-issue** — `ic/channels-src/darkirc` is a symlink to `darkirc_channel_for_ironclaw/darkirc` (same inode); single source of truth | DarkIRC | WONTFIX |
-| L4 | Stale DarkIRC docs (`aiohttp` claim, `darkirc_keypair.yaml`, Unix-socket line) | DarkIRC | `DARKIRC_MT_ADAPTER.md:95`, `darkirc.env:17-18` | TODO |
+| L4 | Guide now documents stdlib HTTP and inline contact keys; legacy `darkirc.env` still carries an unused Unix-socket comment/value | DarkIRC | `DARKIRC_MT_ADAPTER.md`, `darkirc.env:17-18` | PARTIAL |
 | L5 | `LoadBalancer::new` `assert!` + `lb.unwrap()` are production panics | EWE | `external_worker.rs:433,265` | TODO |
 | L6 | No backpressure / concurrency cap on external worker tasks | EWE | `external_worker.rs` (max_idle_per_endpoint bounds only idle) | TODO |
 | L7 | `ws://` cleartext default; no enforcement/warning for remote workers | EWE | `config/sandbox.rs:564-568` | TODO |
@@ -70,7 +73,7 @@ Status legend: `TODO` · `IN PROGRESS` · `DONE` · `WONTFIX` · `DEFERRED`
 | T3 | Add real-pool eviction test (current tests only touch empty pool) | EWE | TODO |
 | T4 | Add DarkIRC adapter integration test (mock IRC server: registration/PING/queue/poll/send/503/auth/oversize) | DarkIRC | DONE |
 | T5 | Add regression test for H2 (enable-darkirc flag flip on existing tenant) | MT admin | DONE |
-| T6 | Fill/remove empty bug stubs (`BUG-external-worker-loadbalancer-failover-problem.md`, `BUG-external-worker-test.md`) | EWE | TODO |
+| T6 | Remove empty external-worker bug stubs | EWE | DONE |
 | T7 | Add `shellcheck` gate for `lunarwing-mt-admin.sh` | MT admin | DONE |
 
 ---
@@ -152,7 +155,7 @@ Byte-index slice at 397 panics if that byte isn't a char boundary — any emoji/
 - **M5 / No body-size limit** — ~~`reader.readexactly(content_length)` trusts the header~~ **RESOLVED**: `MAX_BODY_BYTES=64KiB` cap; oversize → 413, malformed CL → 400. See Group A below.
 - **M6 / Non-constant-time comparison** — ~~use `hmac.compare_digest`~~ **RESOLVED**: replaced `!=` with `hmac.compare_digest`. See Group A below.
 - **L3 / Duplicated source trees** — `darkirc_channel_for_ironclaw/darkirc/` and `ic/channels-src/darkirc/` are byte-identical. Host builds from `ic/channels-src/`; the root copy risks staleness.
-- **L4 / Stale docs** — `aiohttp` dependency claim (adapter is stdlib-only); `darkirc_keypair.yaml` claim (no such file is generated); Unix-socket line in `darkirc.env`.
+- **L4 / Stale docs — PARTIAL:** the maintained guide now states that the adapter is stdlib-only and contact keys live inline in TOML. The legacy `darkirc.env` still carries an unused Unix-socket comment and `BRIDGE_SOCKET` value.
 - **Minor** — pairing codes logged at Info (`lib.rs:422`); nick-collision loop unbounded (`darkirc_adapter.py:282`); partial-success treated as full success (`lib.rs:546`).
 
 ### Test coverage
@@ -183,7 +186,7 @@ EWE is an 11-task plan (see `EXTERNAL-WORKER-PLAN-UPGRADES.md` + `EXTERNAL-WORKE
 
 ### Other findings
 - **M8 / No shutdown drain** — ~~`main.rs` sends a shutdown broadcast but never wires it to `pool.drain()`~~ **RESOLVED (M8)**: `drain()` now sends WS Close frames (bounded 2s/conn); `spawn_eviction_task` runs `evict_stale` every 60s (shutdown-cancelled); both wired into `main.rs` shutdown. See Group B below.
-- **M9 / Failover is connection-only** — ~~retries only on `ExternalWorkerConnectionFailed`, RoundRobin-only~~ **RESOLVED (M9)**: RoundRobin-only gate removed (both strategies now failover); `acquire_excluding` circuit-breaker tracks `failed_urls` and skips them on retry. See Group B below.
+- **M9 / Failover is connection-only — PARTIAL:** the RoundRobin-only gate was removed, so both strategies retry `ExternalWorkerConnectionFailed` on another endpoint and `acquire_excluding` skips failed URLs. `ExternalWorkerProtocolError` and `ExternalWorkerTimeout` still return immediately without endpoint failover. See Group B below.
 - **M7 / `auth_token` plain `Option<String>`** — ~~violates the secrecy rule~~ **RESOLVED (M7)**: wrapped in `secrecy::SecretString` at every layer. See M7 note below.
 - **L5 / Production panics** — `LoadBalancer::new` `assert!` (`:433`) and `lb.unwrap()` (`:265`); currently guarded but brittle.
 - **L6 / No backpressure** — `max_idle_per_endpoint` bounds only idle conns; a burst of `create_job` calls opens unbounded WS connections. No semaphore.
@@ -210,9 +213,9 @@ The external-worker bearer token is now `Option<SecretString>` at every layer (`
 - **Boundary stays clean**: the secret is exposed to `&str` only at the single use site (`format!("Bearer {token}")` in `connect_and_handshake`); `run_external_task`/`connect_and_handshake` keep their `Option<&str>` signatures.
 - **Verification**: compile-clean; 22 external-worker + 23 config unit tests pass; the T1 integration suite gained two end-to-end auth tests (`auth_correct_token_succeeds`, `auth_wrong_token_rejected`) proving config → `SecretString` → `expose_secret()` → Bearer header → worker validates (accepts correct, rejects wrong) — 10/10 deterministic across repeated runs; clippy/fmt clean on all four changed files.
 
-### Group B — EWE pool + failover (DONE, 2026-06-23)
-- **M8** (`external_worker.rs` + `main.rs`): `drain()` now sends WS Close frames to each pooled connection (bounded 2s per conn) before clearing — a graceful shutdown handshake instead of an abrupt TCP drop. `spawn_eviction_task()` runs `evict_stale()` every 60s as a background task, cancelled by the shutdown broadcast — so idle tenants free stale connections promptly instead of waiting for the next `execute_task`. Both wired into `main.rs`: the eviction task is spawned after `shutdown_tx` is created, and `drain_pool()` is called in the shutdown block (after the broadcast, alongside MCP/webhook shutdown). Verified: 22 tests pass (incl. `pool_drain_empties_all`).
-- **M9** (`external_worker.rs`): the failover retry loop no longer gates on `RoundRobin` only — both `RoundRobin` and `LeastConnections` now get `max_attempts = endpoint_count` when >1 endpoint. Added `acquire_excluding(excluded_urls)` to `LoadBalancer` — on retry, the loop tracks `failed_urls` and calls `acquire_excluding` to skip endpoints that just failed (circuit-breaker). For `LeastConnections`, this picks the least-loaded non-excluded endpoint; for `RoundRobin`, the natural rotation handles it. Falls back to round-robin if all are excluded (no deadlock). Verified: 22 tests pass (incl. `load_balancer_strategies_diverge`, `load_balancer_least_connections_picks_least_loaded`).
+### Group B — EWE pool + connection-failure failover (M8 done, M9 partial)
+- **M8** (`external_worker.rs` + `main.rs`): `drain()` sends WS Close frames (bounded 2s/connection) before clearing, and `spawn_eviction_task()` runs `evict_stale` every 60 seconds until shutdown. Both are wired into the daemon lifecycle.
+- **M9 partial** (`external_worker.rs`): both `RoundRobin` and `LeastConnections` get `max_attempts = endpoint_count` when multiple endpoints exist. After `ExternalWorkerConnectionFailed`, the retry loop records the URL and uses `acquire_excluding` to select another endpoint. Protocol errors and task timeouts are outside the current retry predicate and remain open.
 
 ### Group C — shellcheck gate (DONE, 2026-06-23)
 - **T7**: fixed 3 existing shellcheck warnings on `lunarwing-mt-admin.sh` (SC2120 `require_root` references `$*` with no args; SC2155 `local x=$(...)` masking return; SC2034 unused `repo_dir`). Added `ic/scripts/.shellcheckrc` (configures shellcheck for the scripts dir) + `ic/scripts/check-mt-admin.sh` (gate script: `shellcheck -S warning`, exits 0/1/2). Gate passes clean (0 warnings).
