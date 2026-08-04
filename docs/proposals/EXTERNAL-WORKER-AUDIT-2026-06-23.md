@@ -1,8 +1,9 @@
 # External Worker Security Audit (2026-06-23)
 
 > **Current status (updated 2026-08-04): IMPLEMENTED / HISTORICAL RECORD.**
-> Task context population, credential cleanup, load-balancer failover,
-> graceful pool draining, and integration coverage have landed. Bounded,
+> Task context population, credential cleanup, connection-failure load-balancer
+> failover, graceful pool draining, and integration coverage have landed. Protocol
+> errors and task timeouts still do not fail over to another endpoint. Bounded,
 > opt-in conversation history plumbing also landed after this audit. Codex was
 > removed and Nanocode was later retired; their sections below are historical.
 > The shared orchestrator fixes apply to supported Pebble, OpenCode, and Kimi
@@ -31,50 +32,30 @@ Despite `JobContext` having:
 - `conversation_id: Option<Uuid>` (could fetch actual history)
 - `metadata: serde_json::Value` (populated by agent loop)
 
-### Fix Implemented
-**Location**: `ic/src/tools/builtin/job.rs` lines 777–808
+### Current Fix (supersedes the audit-era `conv_*` bridge)
 
-```rust
-let metadata = if ctx.metadata.is_object() {
-    ctx.metadata.as_object().map(|map| {
-        map.iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect()
-    }).unwrap_or_default()
-} else {
-    HashMap::new()
-};
+`JobContext` now carries a typed transient `prompt_context`. Legacy chat derives
+it from already-scoped `initial_messages`; Engine V2 forwards the thread's typed
+context through `ThreadExecutionContext`. `create_job` defaults
+`context_scope` to `none`; `recent` selects only user/assistant messages, newest
+first within limits, then restores chronological order. Defaults are 12 messages,
+2,000 characters per message, and 12,000 total characters, clamped to hard
+ceilings of 50 / 10,000 / 50,000.
 
-let conversation_history: Vec<ConversationMessage> = metadata
-    .iter()
-    .filter_map(|(k, v)| {
-        k.strip_prefix("conv_").map(|_| ConversationMessage {
-            role: "context".to_string(),
-            content: v.clone(),
-        })
-    })
-    .collect();
+`CreateJobTool::execute_external` sends the selected messages in
+`TaskContext.conversation_history` and deliberately sends an empty
+`TaskContext.metadata` map. Worker prompt builders for Pebble, OpenCode, and
+Kimi Code consume only that bounded history as JSON-labeled untrusted reference
+data; environment and operational metadata stay outside model prompts. See
+`EXTERNAL-WORKER-PROMPT-CONTEXT.md` for the current contract and tests.
 
-let task_context = build_task_context(
-    &ctx.user_id,
-    project_dir.as_deref(),
-    environment,
-    conversation_history,
-    metadata,
-);
-```
+### Remaining Limitations
 
-### Limitations
-- **Conversation history**: Limited to `conv_` prefixed metadata keys as pass-through mechanism
-  - `CreateJobTool` lacks access to agent session/thread history
-  - Full threading requires plumbing through `SessionHandle`
-- **Metadata**: Only string values extracted (matches `TaskContext.metadata: HashMap<String, String>`)
-  - Numbers/booleans/null values ignored
-
-### Verification
-- ✅ `cargo check` – zero errors/warnings
-- ✅ Targeted tests – 18/18 external_worker tests pass
-- ✅ `build_task_context_populates_fields` test validates populated fields
+- Context is opt-in and scoped to the messages already supplied to the active
+  legacy chat or Engine V2 thread; there is no global transcript lookup.
+- Unknown/system/tool roles are filtered before `JobContext.prompt_context`.
+- `TaskContext.metadata` remains wire-level transport metadata and is empty on
+  this path rather than a prompt-context channel.
 
 ## Problem #3 – Credential Environment Cleanup Audit
 
@@ -181,15 +162,18 @@ for (key, value) in &request.context.environment {
 4. Consider minimal LB failover (problem #4) – retry to next endpoint on connection error
 
 ### Future
-1. **Thread history plumbing**: Pass actual conversation history via `SessionHandle` or `ContextManager`
-2. **Health checks**: Connection-failure failover/circuit breaking landed; proactive endpoint health monitoring remains optional future work
-3. **Defensive cleanup**: ~~Add explicit env var deletion to Codex worker~~ *(N/A — Codex worker removed in v1.1.9)*
-4. **Integration tests**: Add chaos tests for credential cleanup scenarios
+1. **Endpoint health:** proactive health monitoring remains optional future work.
+2. **Retry classification:** protocol errors and task timeouts currently do not
+   fail over; define idempotency and retry safety before broadening the predicate.
+3. **Defensive cleanup:** ~~Add explicit env var deletion to Codex worker~~ *(N/A — Codex worker removed in v1.1.9)*.
+4. **Integration tests:** add chaos tests for credential cleanup scenarios.
 
 ## Conclusion
 
-Problems #2 and #3 are **adequately addressed**:
-- **#2**: TaskContext now populated with available metadata/conversation history
-- **#3**: Credential cleanup mechanisms are functionally adequate with low risk
+Problems #2 and #3 are addressed:
+- **#2:** bounded, opt-in, typed conversation history now reaches supported
+  worker prompts without operational metadata.
+- **#3:** credential cleanup mechanisms are functionally adequate with low risk.
 
-Remaining work: full conversation history threading (requires architectural change). Connection-failure load-balancer failover has landed.
+Connection-failure load-balancer failover has landed; proactive health and safe
+protocol/timeout failover remain open.
