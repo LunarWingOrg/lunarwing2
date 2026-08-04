@@ -2,21 +2,16 @@
 
 **Release Date:** TBD
 
-> **First-draft notice:** These notes describe the repository state from the
-> `v2.0.3.0` tag through commit `be798a9` (2026-08-04). They are a pre-release
-> draft, not a declaration that the final release gate, live deployment checks,
-> packaging, or item #11's final release-note review has completed.
-
-> *Odoshi* (威し) evokes warning and deterrence. LunarWing v2.0.4.0 strengthens
-> the boundaries around coordinated agents, external processes, extension
-> runtimes, inbound files, tenant operations, and staged DarkIRC key exchange,
-> while making those protections visible and recoverable for operators.
+> *Odoshi* (威し) evokes intimidation. LunarWing v2.0.4.0 strengthens
+the boundaries around coordinated agents, external processes, extension
+runtimes, inbound files, tenant operations, and staged DarkIRC key exchange,
+while making those protections visible and recoverable for operators.
 
 ## Overview
 
 LunarWing v2.0.4.0 is a security, runtime-lifecycle, multi-agent coordination,
 and operations release built on v2.0.3.0. It adds an opt-in coordination
-pipeline for designated XMPP and IRC rooms, bounded SillyTavern-style lorebooks,
+pipeline for designated XMPP and IRC rooms, bounded lorebooks,
 safer and faster reflex routing, managed MCP stdio crash recovery, a sandboxed
 GitLab tool, and the first public-only stage of DarkIRC's secure key-exchange
 workflow.
