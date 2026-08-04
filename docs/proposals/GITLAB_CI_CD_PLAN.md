@@ -1,10 +1,15 @@
 # GitLab CI/CD Plan for LunarWing
 
-> **Current status (2026-07-23): PHASE 1 IMPLEMENTED - GitLab activation pending.**
-> This document completes item #12 in
+> **Current status (reverified 2026-08-04): PHASE 1 IMPLEMENTED — GitLab
+> activation pending.** This document completes item #12 in
 > `docs/ops/AGENT_GOALS_2.0.2.0.md`. Item #13 added the root pipeline and
-> `.gitlab/` implementation. Phases 2-4 remain gated by the prerequisites below.
-> GitLab project and runner activation instructions live in `.gitlab/README.md`.
+> `.gitlab/` implementation. Later work added release-version validation, strict
+> WASM test artifacts, Cavepony WASM coverage, and manual Kaniko builds for the
+> Pebble, OpenCode, and Kimi worker images. Those additions do not satisfy the
+> full Phase 2 exit criteria: PostgreSQL service tests, browser tests,
+> standalone-crate coverage, and measured coverage remain absent. Package,
+> release, and deployment automation (Phases 3–4) also remain absent. GitLab
+> project and runner activation instructions live in `.gitlab/README.md`.
 
 **Repository audited:** `lunarwing/lunarwing2`
 **Primary project:** `ic/`
@@ -59,9 +64,9 @@ not the artifact tested by CI.
 ### 2.2 Build and test constraints
 
 - Core workspace is rooted at `ic/Cargo.toml`, uses Rust 2024, and declares
-  MSRV 1.92.
-- Core manifests, Docker builders, root README, and `ic/rust-toolchain.toml`
-  now use Rust 1.92/1.92.0. Historical release notes still record their
+  MSRV 1.96.1.
+- Core manifests, Docker builders, root README, `ic/rust-toolchain.toml`, and CI
+  images are reconciled on Rust 1.96.1. Historical release notes retain their
   original toolchain claims.
 - Every Cargo command must run with CPU affinity `taskset -c 0-5`; compile,
   test, and Clippy commands must use at most `-j6`, and tests must use at most
@@ -75,8 +80,10 @@ not the artifact tested by CI.
 - `ic/Cargo.toml` has explicit heavy targets behind the `integration` feature.
 - `ic/tests/workspace_integration.rs` currently gates PostgreSQL behavior only
   on `postgres`, conflicting with the intended `postgres + integration` rule.
-- `ic/scripts/build-wasm-extensions.sh` reports a missing source directory as
-  `SKIP` and still succeeds. CI needs strict manifest-to-source validation.
+- `ic/scripts/build-wasm-extensions.sh --strict` now fails on missing manifest
+  fields, capabilities, source directories, build failures, and expected output.
+  CI currently builds only the XMPP and WeeChat WASM test artifacts directly;
+  a full registry-driven strict build/reuse job remains Phase 2 work.
 - Browser fixtures can trigger their own full debug build. CI must accept one
   prebuilt executable artifact instead of rebuilding inside each test job.
 - Standalone Rust projects outside the core workspace need path-triggered jobs;
@@ -341,10 +348,10 @@ with conservative triggers; optimize only after observing real runtimes.
 
 ### 8.6 WASM
 
-Before making WASM blocking:
+Before making the full registry-driven WASM suite blocking:
 
-1. Add strict mode to `ic/scripts/build-wasm-extensions.sh` so missing source,
-   missing manifest fields, missing output, or missing capability files fail.
+1. **Done:** `ic/scripts/build-wasm-extensions.sh --strict` fails on missing
+   source, manifest fields, output, capability files, and build failures.
 2. Pin `cargo-component`, `wasm-tools`, and `wasm32-wasip2` toolchain setup in
    the CI image.
 3. Limit child Cargo builds with inherited CPU affinity and
@@ -793,13 +800,13 @@ Required before blocking CI:
    and provision an isolated protected release cache/sccache namespace.
 4. Inventory native x86_64, native aarch64, systemd-user, OpenRC, and ephemeral
    Docker runners.
-5. Pin one supported Rust toolchain and reconcile 1.92 versus 1.96 docs/builds.
+5. **Done:** pin and reconcile Rust 1.96.1 across manifests, toolchain, CI images, and current docs.
 6. Fix `quality_gate_strict.sh` working directory and CPU limits.
 7. Make version checks forge-neutral and use `$CI_DEFAULT_BRANCH` mappings.
 8. Make architecture-boundary baseline green.
 9. Fix PostgreSQL feature gates and fail dedicated DB jobs on missing DB.
 10. Scope/fix ShellCheck and maintained Python syntax baselines.
-11. Add strict WASM registry/source/output validation.
+11. **Partially done:** strict registry/source/output validation exists in `build-wasm-extensions.sh`; full CI invocation and artifact reuse remain.
 12. Resolve stale `.gitmodules` behavior.
 13. Correct stale GitLab repository paths in release docs.
 
