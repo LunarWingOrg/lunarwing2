@@ -17,8 +17,9 @@ Workspace hook files are loaded from `hooks/hooks.json` or `hooks/*.hook.json`.
 - `priority` — lower runs first (default 100)
 - `failure_mode` — fail_open or fail_closed (default fail_open)
 - `timeout_ms` — 1-30000ms
-- `when_regex` — guard; if set and matches, action fires; if doesn't match, no-op
-- `reject_reason` — if set with matching guard, Reject event
+- `when_regex` — content guard; if set and matches, action fires; otherwise no-op
+- `when_channel_regex` — optional destination/policy-scope guard
+- `reject_reason` — if set with matching guards, Reject event
 - `replacements` — array of {pattern, replacement} regex substitutions
 - `prepend` — text prepended to content
 - `append` — text appended to content
@@ -38,11 +39,11 @@ Tag enforcement needs Phase 2 (Rust hooks) for this reason.
 ## Phase 1 Scope (Declarative Only)
 
 What Phase 1 CAN enforce:
-1. ✅ Secret detection + rejection (inbound + outbound)
-2. ✅ Newline stripping on inbound (regex replacement)
-3. ✅ Newline rejection on outbound
-4. ✅ 420-char limit rejection on outbound
-5. ✅ Webhook notifications for violation tracking
+1. ✅ Exact coordination-scope guards derived from `COORD_CHANNELS`
+2. ✅ Secret detection + rejection (inbound + outbound)
+3. ✅ Newline stripping on inbound (regex replacement)
+4. ✅ Newline rejection on outbound
+5. ✅ 420-char limit rejection on outbound
 
 What Phase 1 CANNOT enforce (needs Phase 2):
 1. ❌ Tag schema enforcement (needs negative match)
