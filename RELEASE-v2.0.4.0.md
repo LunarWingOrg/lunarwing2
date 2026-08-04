@@ -156,8 +156,11 @@ for older releases.
 
 ### Multi-Agent Coordination
 
-The four-phase coordination pipeline is implemented and disabled by default.
-It is intended for designated pager/operations rooms rather than all traffic.
+The four-phase coordination pipeline is implemented and inactive under the
+default empty configuration. Hooks, gates, and administration require
+`COORD_ENABLED=true`; the coalescer is separately activated by a nonempty
+`COORD_CHANNELS` list unless `COALESCE_ENABLED=false`. It is intended for
+designated pager/operations rooms rather than all traffic.
 
 - Hook policy uses canonical destination scope (`xmpp_room`, `xmpp_target`, or
   equivalent metadata), keeping transport name separate from room identity.
@@ -496,8 +499,10 @@ package, create a release artifact, or deploy a tenant.
 7. **Review systemd resource ceilings.** Defaults fit the tested development host
    but may need `LUNARWING_MT_*` overrides for larger tenants. OpenRC receives
    process-tree cleanup but not equivalent hard resource controls.
-8. **Audit coordination before enabling it.** It is off by default. Configure a
-   unique agent ID, exact room scopes, aliases, and admin token. First-responder
+8. **Audit coordination before enabling it.** The default empty configuration is
+   inactive. Configure a unique agent ID, exact room scopes, aliases, and admin
+   token. A nonempty `COORD_CHANNELS` also enables coalescing unless
+   `COALESCE_ENABLED=false`, even when `COORD_ENABLED=false`. First-responder
    coordination is process-local, so do not rely on it for cross-daemon mutual
    exclusion.
 9. **Review lorebook content.** Lorebooks are enabled for primary-scope files by
@@ -529,12 +534,12 @@ package, create a release artifact, or deploy a tenant.
 
 | Setting | Default | Effect |
 |---|---:|---|
-| `COORD_ENABLED` | `false` | Enables the designated-room coordination pipeline |
+| `COORD_ENABLED` | `false` | Enables coordination hooks, gate, and administration for designated rooms |
 | `COORD_AGENT_ID` | required when enabled | Local coordination actor identity |
-| `COORD_CHANNELS` | required when enabled | Exact room/destination policy scopes |
+| `COORD_CHANNELS` | empty | Exact room/destination scopes; a nonempty list also activates coalescing independently of `COORD_ENABLED` |
 | `COORD_ADMIN_TOKEN` | required for admin API | Enables the loopback coordination administration service |
 | `COORD_ADMIN_PORT` | `18777` single-node | Loopback administration port; multi-tenant provisioning assigns a tenant port |
-| `COALESCE_ENABLED` | `true` | Enables the outbound coalescer once coordination is active |
+| `COALESCE_ENABLED` | `true` | Enables coalescing for a nonempty `COORD_CHANNELS` list; set false to suppress it |
 | `LOREBOOK_ENABLED` | `true` | Loads primary-scope `lorebooks/*.json` |
 | `LOREBOOK_ALLOW_GROUP_CHATS` | `false` | Allows participant-controlled lorebook triggers in group rooms |
 | `LOREBOOK_SCAN_DEPTH` | `10` | Messages scanned per entry; hard maximum 100 |
@@ -650,6 +655,10 @@ older v2.0.3.0 wording.
   publication is not one reader-atomic host-crash transaction.
 - **Coordination first-responder state is process-local.** Multiple daemons can
   still respond to the same room event.
+- **`COORD_ENABLED` does not gate the coalescer.** A nonempty `COORD_CHANNELS`
+  list constructs the coalescer whenever `COALESCE_ENABLED` retains its `true`
+  default. Set `COALESCE_ENABLED=false` when room scopes must be configured
+  without coalescing.
 - **Lorebook scanning is lexical and conservative.** Benign instruction-like
   prose can be rejected, and the implemented import subset does not provide full
   SillyTavern semantics.
