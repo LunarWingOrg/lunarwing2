@@ -18,7 +18,7 @@
 3. [ ] Suggest additional UI fixes in a new document in docs/ops — update`docs/ops/UI_FIX_SUGGESTIONS.md` with any additional findings
 4. [x] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs - prev attempt that may be referenced as it was fairly accurate at time of creation: rarity/kimi-31-20260801-0601
 5. [x] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
-6. [ ] update README.md at repo root with any missing feature information and other necessary information. remove unnecessary technical information
+6. [x] update README.md at repo root with any missing feature information and other necessary information. remove unnecessary technical information — completed 2026-08-04: added source-verified v2 feature coverage, simplified setup and development guidance, removed stale placeholders and redundant links, and validated local links plus the bounded Rust compile check.
 7. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.4.0 explaining all relevant changes since v2.0.3.0 as well as revising and including an ACCURATE VERSION OF`known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is:`Odoshi (威し)` — The file you write will be`RELEASE-v2.0.4.0.md` and should be written to the ROOT of the repo. When complete with draft, move on to another task, which is: Improve accuracy of the first draft of release notes (from previous task) -`RELEASE-v2.0.4.0.md`
 8. [ ] update anything outdated in docs/proposals
 9. [ ] update anything outdated that is in docs/ops
