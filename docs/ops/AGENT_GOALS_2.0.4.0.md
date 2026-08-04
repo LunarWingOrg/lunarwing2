@@ -15,7 +15,7 @@
 
 1. [x] (S) DarkIRC secure staged key exchange. H1/H2 fixed and verified; H3 partially fixed, with live isolation and leak evidence still required. Full boundary, audit ledger, validation, blockers, and next steps: [`DARKIRC-KEYEXCHANGE-ITEM15-STATUS.md`](DARKIRC-KEYEXCHANGE-ITEM15-STATUS.md). Reference branch: darkirckeyexch8/cmc/v2.0.4.0
 2. [x] (S) self healing capability expansion - see prev attempt for reference: shexpansion/cmc/v2.0.4.0
-3. [ ] Suggest additional UI fixes in a new document in docs/ops — update`docs/ops/UI_FIX_SUGGESTIONS.md` with any additional findings
+3. [x] Suggest additional UI fixes in a new document in docs/ops — updated `docs/ops/UI_FIX_SUGGESTIONS.md` with additional findings
 4. [x] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs - prev attempt that may be referenced as it was fairly accurate at time of creation: rarity/kimi-31-20260801-0601
 5. [x] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
 6. [ ] update README.md at repo root with any missing feature information and other necessary information. remove unnecessary technical information
