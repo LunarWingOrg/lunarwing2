@@ -45,7 +45,7 @@ MappedAgent   (owner-agnostic LunarWing rows)
 mt-admin add-tenant + build-tenant + install-wasm   (empty tenant)
    → start-tenant (daemon runs migrations = SCHEMA) → stop-tenant (PG stops too)
    → start-pg → populate live DB + encrypt secrets
-   → start-tenant (if --start) else stop-pg and leave STAGED
+   → start-tenant (if --start) else leave STAGED with PostgreSQL running
 ```
 
 **Rejected alternative — "Kawarimi bundle producer"** (emit a `meta.txt` +
@@ -60,9 +60,10 @@ the daemon's refinery runner at first boot (`ic/src/app.rs` `run_migrations` +
 auto-onboard). `V1__initial.sql` uses bare `CREATE TABLE` (not `IF NOT EXISTS`),
 so hand-applying the SQL would collide with refinery's own run. The loader boots
 the tenant once (schema created), stops the tenant, then brings PostgreSQL back
-alone with `start-pg` and populates with no daemon racing. It relinquishes that
-owned PostgreSQL window with `stop-pg` when leaving the tenant staged or when a
-later import phase fails.
+alone with `start-pg` and populates with no daemon racing. A successful staged
+import deliberately leaves that PostgreSQL-only window running, matching
+`import-tenant.sh`; a later import failure triggers best-effort `stop-pg`
+cleanup.
 
 **Key safety win over the bundle path:** the entire
 `KAWARIMI-OWNER-SCOPE-CONTINUITY` silent-empty hazard comes from `pg_restore`
