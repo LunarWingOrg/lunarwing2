@@ -1,9 +1,12 @@
 # Podman Wait Babysitter Pattern
 
-> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** The helper,
-> OpenRC unit renderer, register/deregister lifecycle, worker and PostgreSQL
-> wiring, and `pg_isready` status check are in current source. Helper ownership
-> now belongs to mt-admin rather than the watchdog installer.
+> **Current status (updated 2026-08-04): IMPLEMENTED.** The helper, OpenRC
+> unit renderer, register/deregister lifecycle, worker and PostgreSQL wiring, and
+> `pg_isready` status check are in current source. Supported worker babysitters
+> are Pebble, OpenCode, and Kimi Code; Nanocode references below are historical.
+> Helper ownership belongs to mt-admin rather than the watchdog installer. See
+> [`../specs/podman-wait-babysitter.md`](../specs/podman-wait-babysitter.md) for
+> the current as-built contract.
 
 ## Overview
 
