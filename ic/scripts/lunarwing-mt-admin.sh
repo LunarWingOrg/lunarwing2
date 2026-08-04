@@ -44,7 +44,6 @@ DAEMON_MEMORY_MAX="${LUNARWING_MT_DAEMON_MEMORY_MAX:-2G}"
 DAEMON_TASKS_MAX="${LUNARWING_MT_DAEMON_TASKS_MAX:-512}"
 SOURCE_REPO="${LUNARWING_MT_SOURCE_REPO:-$LUNARWING_ROOT}"
 DARKIRC_SOURCE="${LUNARWING_MT_DARKIRC_SOURCE:-}"
-DARKIRC_BIN="${LUNARWING_MT_DARKIRC_BIN:-/usr/local/bin/darkirc}"
 # Managed exchange accepts only this pinned, root-attested DarkFi profile. Build
 # recipes execute in a disposable tree as a dedicated unprivileged account.
 DARKIRC_REPO="${LUNARWING_MT_DARKIRC_REPO:-https://github.com/darkrenaissance/darkfi}"
@@ -53,9 +52,11 @@ DARKIRC_REV="${LUNARWING_MT_DARKIRC_REV:-$DARKIRC_APPROVED_REV}"
 DARKIRC_BUILD_USER="${LUNARWING_MT_DARKIRC_BUILD_USER:-lunarwing-build}"
 DARKIRC_BUILD_HOME="${LUNARWING_MT_DARKIRC_BUILD_HOME:-/var/cache/lunarwing/build-home}"
 DARKIRC_BUILD_ROOT="${LUNARWING_MT_DARKIRC_BUILD_ROOT:-/var/cache/lunarwing/darkirc-builds}"
-DARKIRC_COMPAT_FILE="${LUNARWING_MT_DARKIRC_COMPAT_FILE:-/etc/lunarwing/darkirc-compat.json}"
-DARKIRC_KEY_HELPER="${LUNARWING_MT_DARKIRC_KEY_HELPER:-/usr/local/libexec/lunarwing-darkirc-key-helper}"
 DARKIRC_KEY_HELPER_BUILD_ROOT="${LUNARWING_MT_DARKIRC_KEY_HELPER_BUILD_ROOT:-/var/cache/lunarwing/darkirc-key-helper-target}"
+DARKIRC_RELEASE_ROOT="${LUNARWING_MT_DARKIRC_RELEASE_ROOT:-/usr/local/lib/lunarwing/darkirc}"
+DARKIRC_RELEASES_DIR="$DARKIRC_RELEASE_ROOT/releases"
+DARKIRC_RELEASE_SELECTOR="$DARKIRC_RELEASE_ROOT/current"
+DARKIRC_RELEASE_DAEMON="$DARKIRC_RELEASE_SELECTOR/darkirc"
 DARKIRC_WRITER_LOCK_DIR="${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-/run/lock/lunarwing-darkirc}"
 DARKIRC_WRITER_LOCK_HELD="false"
 DARKIRC_WRITER_LOCK_FD=""
@@ -544,6 +545,7 @@ Commands:
   build-vision-sidecar             Build the LunarVision OCR sidecar Docker image
 
   build-darkirc                   Build darkirc daemon from external source
+  ensure-darkirc-release <name>   Build the atomic release set when required
                                    (shared binary, not per-tenant)
 
   install-wasm <name>             Install built WASM tools/channels into tenant state dir
@@ -551,6 +553,8 @@ Commands:
 
   start-tenant <name>             Start all services for a tenant
   stop-tenant <name>              Stop all services for a tenant
+  cleanup-legacy-weechat <name>   Remove obsolete weechat-<name> service
+  restart-weechat-adapter <name>  Restart adapter through detected init system
   stop-tenant-for-upgrade <name>  Verify settled DarkIRC state and stop atomically
   migration-export-boundary <name> [export options]
                                   Run export under retained lifecycle/DarkIRC locks
@@ -2545,12 +2549,16 @@ darkirc_validate_root_executable() {
 }
 
 install_darkirc_key_helper() {
-  local archive_root cargo_home artifact
+  local archive_root cargo_home artifact source_revision
   require_cmd cargo
   require_cmd taskset
   require_cmd tar
   darkirc_validate_clean_root_checkout "$LUNARWING_ROOT" \
     || die "trusted LunarWing admin checkout must be root-owned, non-writable, and clean"
+  source_revision="$(git -C "$LUNARWING_ROOT" rev-parse HEAD 2>/dev/null)" \
+    || die "could not attest LunarWing helper source revision"
+  [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]] \
+    || die "invalid LunarWing helper source revision"
   ensure_darkirc_build_user
   [[ "$DARKIRC_KEY_HELPER_BUILD_ROOT" == /var/cache/lunarwing/* \
     && "$DARKIRC_KEY_HELPER_BUILD_ROOT" != *'/../'* \
@@ -2580,49 +2588,147 @@ install_darkirc_key_helper() {
   artifact="$DARKIRC_KEY_HELPER_BUILD_ROOT/release/lunarwing-darkirc-key-helper"
   darkirc_validate_build_artifact "$artifact" \
     || die "DarkIRC key helper artifact failed ownership validation"
-  install -d -o root -g root -m 0755 "$(dirname "$DARKIRC_KEY_HELPER")"
-  install -o root -g root -m 0755 "$artifact" "$DARKIRC_KEY_HELPER"
-  darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
-    || die "installed DarkIRC key helper failed ownership validation"
+  DARKIRC_HELPER_ARTIFACT="$artifact"
+  DARKIRC_HELPER_SOURCE_REVISION="$source_revision"
 }
 
 write_darkirc_compatibility() {
-  local source_revision="$1" test_user="$2" digest tmp
+  local release_dir="$1" release_id="$2" source_revision="$3" test_user="$4"
+  local daemon_digest="$5" helper_digest="$6" helper_source_revision="$7"
+  local tmp="$release_dir/attestation.json"
   require_cmd jq
-  require_cmd sha256sum
-  [[ "$DARKIRC_BIN" == "/usr/local/bin/darkirc" ]] \
-    || die "managed DarkIRC config requires binary path /usr/local/bin/darkirc"
   [[ "$source_revision" == "$DARKIRC_APPROVED_REV" ]] \
     || die "DarkIRC source revision is not approved for managed config"
-  digest="$(sha256sum "$DARKIRC_BIN")"
-  digest="sha256:${digest%% *}"
-  darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
-    || die "DarkIRC key helper is missing or unsafe"
+  [[ "$helper_source_revision" =~ ^[0-9a-f]{40}$ ]] \
+    || die "LunarWing helper source revision is invalid"
+  darkirc_validate_root_executable "$release_dir/darkirc" \
+    || die "staged DarkIRC daemon is unsafe"
+  darkirc_validate_root_executable "$release_dir/lunarwing-darkirc-key-helper" \
+    || die "staged DarkIRC key helper is unsafe"
   id "$test_user" >/dev/null 2>&1 || die "DarkIRC self-test user '$test_user' does not exist"
-  sudo -u "$test_user" env -i HOME="$(getent passwd "$test_user" | cut -d: -f6)" PATH="/usr/bin:/bin" \
-    "$DARKIRC_KEY_HELPER" self-test-generator \
-    --generator-profile darkfi-a05956d41-chacha-v1 \
-    --binary-sha256 "$digest" --binary-path "$DARKIRC_BIN" \
-    --key-format darkfi-chacha-base58-32 --source-revision "$source_revision" >/dev/null \
-    || die "installed DarkIRC generator failed compatibility self-test"
-  install -d -o root -g root -m 0755 "$(dirname "$DARKIRC_COMPAT_FILE")"
-  tmp="$(mktemp "$DARKIRC_COMPAT_FILE.tmp.XXXXXX")"
-  jq -n --arg digest "$digest" --arg revision "$source_revision" \
-    '{schema:"lunarwing.darkirc-compat/v1",profile_id:"darkfi-a05956d41-chacha-v1",binary_sha256:$digest,key_format:"darkfi-chacha-base58-32",source_revision:$revision}' \
-    >"$tmp" || { rm -f "$tmp"; die "failed to create DarkIRC compatibility attestation"; }
-  chmod 0600 "$tmp"
+  jq -n --arg release "$release_id" --arg daemon "$daemon_digest" \
+    --arg helper "$helper_digest" --arg revision "$source_revision" \
+    --arg helper_revision "$helper_source_revision" \
+    '{schema:"lunarwing.darkirc-compat/v2",release_id:$release,profile_id:"darkfi-a05956d41-chacha-v1",daemon_sha256:$daemon,helper_sha256:$helper,helper_source_revision:$helper_revision,key_format:"darkfi-chacha-base58-32",source_revision:$revision}' \
+    >"$tmp" || die "failed to create DarkIRC compatibility attestation"
+  chmod 0444 "$tmp"
   chown root:root "$tmp"
-  mv "$tmp" "$DARKIRC_COMPAT_FILE"
-  darkirc_load_compatibility
+  sudo -u "$test_user" env -i HOME="$(getent passwd "$test_user" | cut -d: -f6)" PATH="/usr/bin:/bin" \
+    "$release_dir/lunarwing-darkirc-key-helper" self-test-generator \
+    --generator-profile darkfi-a05956d41-chacha-v1 \
+    --binary-sha256 "$daemon_digest" --binary-path "$release_dir/darkirc" \
+    --helper-sha256 "$helper_digest" --release-id "$release_id" \
+    --key-format darkfi-chacha-base58-32 --source-revision "$source_revision" >/dev/null \
+    || die "staged DarkIRC generator failed compatibility self-test"
+}
+
+darkirc_fsync_path() {
+  sync -f -- "$1" || die "could not durably sync DarkIRC release path: $1"
+}
+
+darkirc_sync_release_durability() {
+  local release_dir="$1"
+  darkirc_fsync_path "$release_dir/darkirc" || return 1
+  darkirc_fsync_path "$release_dir/lunarwing-darkirc-key-helper" || return 1
+  darkirc_fsync_path "$release_dir/attestation.json" || return 1
+  darkirc_fsync_path "$release_dir" || return 1
+  darkirc_fsync_path "$DARKIRC_RELEASES_DIR" || return 1
+  darkirc_fsync_path "$DARKIRC_RELEASE_ROOT" || return 1
+  darkirc_fsync_path "$(dirname "$DARKIRC_RELEASE_ROOT")" || return 1
+}
+
+reject_legacy_darkirc_path_overrides() {
+  local variable
+  for variable in LUNARWING_MT_DARKIRC_BIN LUNARWING_MT_DARKIRC_COMPAT_FILE \
+                  LUNARWING_MT_DARKIRC_KEY_HELPER; do
+    [[ -z "${!variable:-}" ]] \
+      || die "$variable is unsupported with atomic DarkIRC releases; use LUNARWING_MT_DARKIRC_RELEASE_ROOT"
+  done
+}
+
+darkirc_validate_release_id() {
+  [[ "$1" =~ ^[a-f0-9]{40}-[a-f0-9]{16}-[a-f0-9]{16}-[a-f0-9]{16}$ ]]
+}
+
+darkirc_validate_release_directory() {
+  local release_dir="$1" expected_id="${2:-}" mode owner links
+  [[ "$release_dir" == "$DARKIRC_RELEASES_DIR/"* ]] || return 1
+  local release_id="${release_dir##*/}"
+  darkirc_validate_release_id "$release_id" || return 1
+  [[ -z "$expected_id" || "$release_id" == "$expected_id" ]] || return 1
+  darkirc_validate_root_owned_directory "$release_dir" || return 1
+  mode="$(stat -c '%a' "$release_dir" 2>/dev/null || true)"
+  owner="$(stat -c '%u' "$release_dir" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$release_dir" 2>/dev/null || true)"
+  [[ "$mode" == 555 && "$owner" == 0 && "$links" == 2 ]] || return 1
+  darkirc_validate_root_executable "$release_dir/darkirc" || return 1
+  darkirc_validate_root_executable "$release_dir/lunarwing-darkirc-key-helper" || return 1
+  [[ "$(stat -c '%u:%a:%h' "$release_dir/darkirc" 2>/dev/null)" == "0:555:1" ]] || return 1
+  [[ "$(stat -c '%u:%a:%h' "$release_dir/lunarwing-darkirc-key-helper" 2>/dev/null)" == "0:555:1" ]] || return 1
+  [[ -f "$release_dir/attestation.json" && ! -L "$release_dir/attestation.json" ]] || return 1
+  [[ "$(stat -c '%u:%a:%h' "$release_dir/attestation.json" 2>/dev/null)" == "0:444:1" ]] || return 1
+  [[ "$(find "$release_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')" \
+    == "attestation.json darkirc lunarwing-darkirc-key-helper " ]]
+}
+
+darkirc_validate_release_contents() {
+  local release_dir="$1" release_id="$2" daemon_digest="$3" helper_digest="$4"
+  local helper_source_revision="$5"
+  local attestation="$release_dir/attestation.json"
+  darkirc_validate_release_directory "$release_dir" "$release_id" || return 1
+  [[ "sha256:$(sha256sum "$release_dir/darkirc" | cut -d' ' -f1)" == "$daemon_digest" ]] \
+    || return 1
+  [[ "sha256:$(sha256sum "$release_dir/lunarwing-darkirc-key-helper" | cut -d' ' -f1)" == "$helper_digest" ]] \
+    || return 1
+  jq -e --arg release "$release_id" --arg daemon "$daemon_digest" \
+    --arg helper "$helper_digest" --arg revision "$DARKIRC_APPROVED_REV" \
+    --arg helper_revision "$helper_source_revision" \
+    'type == "object" and
+     (keys == ["daemon_sha256","helper_sha256","helper_source_revision","key_format","profile_id","release_id","schema","source_revision"]) and
+     .schema == "lunarwing.darkirc-compat/v2" and .release_id == $release and
+     .profile_id == "darkfi-a05956d41-chacha-v1" and .daemon_sha256 == $daemon and
+     .helper_sha256 == $helper and .helper_source_revision == $helper_revision and
+     .key_format == "darkfi-chacha-base58-32" and
+     .source_revision == $revision' "$attestation" >/dev/null 2>&1
+}
+
+darkirc_resolve_release() {
+  local target release_id selector_owner selector_links
+  reject_legacy_darkirc_path_overrides
+  darkirc_path_components_safe "$DARKIRC_RELEASE_ROOT" || return 1
+  darkirc_validate_root_owned_directory "$DARKIRC_RELEASE_ROOT" || return 1
+  [[ -L "$DARKIRC_RELEASE_SELECTOR" ]] || return 1
+  selector_owner="$(stat -c '%u' "$DARKIRC_RELEASE_SELECTOR" 2>/dev/null || true)"
+  selector_links="$(stat -c '%h' "$DARKIRC_RELEASE_SELECTOR" 2>/dev/null || true)"
+  [[ "$selector_owner" == 0 && "$selector_links" == 1 ]] || return 1
+  target="$(readlink -- "$DARKIRC_RELEASE_SELECTOR")" || return 1
+  [[ "$target" == releases/* && "$target" != */*/* ]] || return 1
+  release_id="${target#releases/}"
+  darkirc_validate_release_id "$release_id" || return 1
+  DARKIRC_PINNED_RELEASE="$DARKIRC_RELEASES_DIR/$release_id"
+  darkirc_validate_release_directory "$DARKIRC_PINNED_RELEASE" "$release_id"
+}
+
+darkirc_publish_selector() {
+  local release_id="$1" selector_tmp
+  selector_tmp="$DARKIRC_RELEASE_ROOT/.current.$$.tmp"
+  rm -f -- "$selector_tmp"
+  ln -s -- "releases/$release_id" "$selector_tmp" || return 1
+  chown -h root:root "$selector_tmp"
+  if ! mv -Tf -- "$selector_tmp" "$DARKIRC_RELEASE_SELECTOR"; then
+    rm -f -- "$selector_tmp"
+    return 1
+  fi
+  darkirc_fsync_path "$DARKIRC_RELEASE_ROOT"
 }
 
 build_darkirc() {
   local tenant_name="${1:-}" darkirc_src test_user build_tree built_bin source_revision cargo_home
-  local previous_binary="" previous_compatibility="" previous_helper=""
-  local publish_pending=false helper_publish_pending=false binary_candidate=""
+  local staging_root="" staging_dir="" release_dir release_id daemon_digest helper_digest
   darkirc_src="${DARKIRC_SOURCE:-/var/cache/lunarwing/darkfi-source}"
   test_user="${tenant_name:-${SUDO_USER:-nobody}}"
   [[ "$test_user" != root ]] || test_user=nobody
+  reject_legacy_darkirc_path_overrides
 
   say "acquiring build lock for darkirc ..."
   (
@@ -2649,17 +2755,7 @@ build_darkirc() {
     install -d -o root -g root -m 0711 "$DARKIRC_BUILD_ROOT"
     build_tree="$(mktemp -d "$DARKIRC_BUILD_ROOT/build.XXXXXX")"
     cleanup_darkirc_build() {
-      if [[ "$publish_pending" == true ]]; then
-        if [[ -n "$previous_binary" ]]; then mv -f -- "$previous_binary" "$DARKIRC_BIN"; previous_binary=""; else rm -f -- "$DARKIRC_BIN"; fi
-        if [[ -n "$previous_compatibility" ]]; then mv -f -- "$previous_compatibility" "$DARKIRC_COMPAT_FILE"; previous_compatibility=""; else rm -f -- "$DARKIRC_COMPAT_FILE"; fi
-      fi
-      if [[ "$helper_publish_pending" == true ]]; then
-        if [[ -n "$previous_helper" ]]; then mv -f -- "$previous_helper" "$DARKIRC_KEY_HELPER"; previous_helper=""; else rm -f -- "$DARKIRC_KEY_HELPER"; fi
-      fi
-      [[ -z "$previous_binary" ]] || rm -f -- "$previous_binary"
-      [[ -z "$previous_compatibility" ]] || rm -f -- "$previous_compatibility"
-      [[ -z "$previous_helper" ]] || rm -f -- "$previous_helper"
-      [[ -z "$binary_candidate" ]] || rm -f -- "$binary_candidate"
+      [[ -z "$staging_root" ]] || rm -rf -- "$staging_root"
       [[ -z "${build_tree:-}" ]] || rm -rf -- "$build_tree"
       [[ -z "${cargo_home:-}" ]] || rm -rf -- "$cargo_home"
     }
@@ -2685,46 +2781,75 @@ build_darkirc() {
     [[ "$source_revision" == "$DARKIRC_APPROVED_REV" ]] \
       || die "DarkIRC checkout is at unapproved revision $source_revision"
 
-    if [[ -e "$DARKIRC_KEY_HELPER" ]]; then
-      darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
-        || die "installed DarkIRC key helper is unsafe; refusing transactional replacement"
-      previous_helper="$(mktemp "$(dirname "$DARKIRC_KEY_HELPER")/.helper.rollback.XXXXXX")"
-      install -o root -g root -m 0755 "$DARKIRC_KEY_HELPER" "$previous_helper"
-    fi
-    helper_publish_pending=true
     install_darkirc_key_helper
-    say "installing darkirc to $DARKIRC_BIN ..."
-    install -d -o root -g root -m 0755 "$(dirname "$DARKIRC_BIN")"
-    binary_candidate="$(mktemp "$(dirname "$DARKIRC_BIN")/.darkirc.XXXXXX")"
-    install -o root -g root -m 0755 "$built_bin" "$binary_candidate"
-    if [[ -e "$DARKIRC_BIN" ]]; then
-      darkirc_validate_root_executable "$DARKIRC_BIN" \
-        || die "installed DarkIRC binary is unsafe; refusing transactional replacement"
-      previous_binary="$(mktemp "$(dirname "$DARKIRC_BIN")/.darkirc.rollback.XXXXXX")"
-      install -o root -g root -m 0755 "$DARKIRC_BIN" "$previous_binary"
+    daemon_digest="sha256:$(sha256sum "$built_bin" | cut -d' ' -f1)"
+    helper_digest="sha256:$(sha256sum "$DARKIRC_HELPER_ARTIFACT" | cut -d' ' -f1)"
+    release_id="${source_revision}-${DARKIRC_HELPER_SOURCE_REVISION:0:16}-${daemon_digest:7:16}-${helper_digest:7:16}"
+    local release_parent
+    release_parent="$(dirname "$DARKIRC_RELEASE_ROOT")"
+    install -d -o root -g root -m 0755 "$release_parent"
+    darkirc_fsync_path "$release_parent"
+    darkirc_fsync_path "$(dirname "$release_parent")"
+    install -d -o root -g root -m 0755 "$DARKIRC_RELEASE_ROOT" "$DARKIRC_RELEASES_DIR"
+    staging_root="$(mktemp -d "$DARKIRC_RELEASES_DIR/.staging.XXXXXX")"
+    chown root:root "$staging_root"
+    chmod 0755 "$staging_root"
+    staging_dir="$staging_root/$release_id"
+    install -d -o root -g root -m 0755 "$staging_dir"
+    install -o root -g root -m 0555 "$built_bin" "$staging_dir/darkirc"
+    install -o root -g root -m 0555 "$DARKIRC_HELPER_ARTIFACT" "$staging_dir/lunarwing-darkirc-key-helper"
+    write_darkirc_compatibility "$staging_dir" "$release_id" "$source_revision" "$test_user" \
+      "$daemon_digest" "$helper_digest" "$DARKIRC_HELPER_SOURCE_REVISION"
+    darkirc_fsync_path "$staging_dir/darkirc"
+    darkirc_fsync_path "$staging_dir/lunarwing-darkirc-key-helper"
+    darkirc_fsync_path "$staging_dir/attestation.json"
+    chmod 0555 "$staging_dir"
+    darkirc_fsync_path "$staging_dir"
+    release_dir="$DARKIRC_RELEASES_DIR/$release_id"
+    if [[ -e "$release_dir" || -L "$release_dir" ]]; then
+      darkirc_validate_release_contents "$release_dir" "$release_id" \
+        "$daemon_digest" "$helper_digest" "$DARKIRC_HELPER_SOURCE_REVISION" \
+        || die "existing immutable DarkIRC release conflicts with build: $release_id"
+      rm -rf -- "$staging_root"
+      staging_root=""; staging_dir=""
+    else
+      mv -- "$staging_dir" "$release_dir"
+      staging_dir=""
+      rmdir -- "$staging_root"
+      staging_root=""
+      darkirc_fsync_path "$DARKIRC_RELEASES_DIR"
     fi
-    install -d -o root -g root -m 0755 "$(dirname "$DARKIRC_COMPAT_FILE")"
-    if [[ -e "$DARKIRC_COMPAT_FILE" ]]; then
-      [[ -f "$DARKIRC_COMPAT_FILE" && ! -L "$DARKIRC_COMPAT_FILE" \
-        && "$(stat -c '%u:%a' "$DARKIRC_COMPAT_FILE" 2>/dev/null)" == "0:600" ]] \
-        || die "installed DarkIRC compatibility attestation is unsafe"
-      previous_compatibility="$(mktemp "$(dirname "$DARKIRC_COMPAT_FILE")/.compat.rollback.XXXXXX")"
-      install -o root -g root -m 0600 "$DARKIRC_COMPAT_FILE" "$previous_compatibility"
-    fi
-    publish_pending=true
-    mv "$binary_candidate" "$DARKIRC_BIN"
-    binary_candidate=""
+    darkirc_validate_release_contents "$release_dir" "$release_id" \
+      "$daemon_digest" "$helper_digest" "$DARKIRC_HELPER_SOURCE_REVISION" \
+      || die "published DarkIRC release failed validation"
+    darkirc_sync_release_durability "$release_dir" \
+      || die "published DarkIRC release could not be made durable"
+    darkirc_publish_selector "$release_id"
+    darkirc_resolve_release || die "published DarkIRC selector failed validation"
     rm -rf -- "$build_tree" "$cargo_home"
     build_tree=""; cargo_home=""
-    write_darkirc_compatibility "$source_revision" "$test_user"
-    publish_pending=false
-    helper_publish_pending=false
-    rm -f -- "$previous_binary" "$previous_compatibility" "$previous_helper"
-    previous_binary=""; previous_compatibility=""; previous_helper=""
-    say "darkirc build complete: $DARKIRC_BIN"
-    sudo -u "$test_user" "$DARKIRC_BIN" --version \
+    say "darkirc build complete: $release_dir"
+    sudo -u "$test_user" "$DARKIRC_RELEASE_DAEMON" --version \
       || say "(darkirc --version not supported, skipping)"
   ) 200>"$BUILD_LOCK"
+}
+
+ensure_darkirc_release() {
+  local name="$1"
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  if ! tenant_darkirc_enabled "$name"; then
+    say "DarkIRC is disabled for $name; no shared release required"
+    return 0
+  fi
+  if (darkirc_load_compatibility >/dev/null 2>&1); then
+    say "atomic DarkIRC release already ready for $name"
+    return 0
+  fi
+  say "atomic DarkIRC release missing or invalid; rebuilding before unit activation"
+  build_darkirc "$name"
+  darkirc_load_compatibility >/dev/null \
+    || die "DarkIRC release remained invalid after rebuild"
 }
 
 shared_worker_source_root() {  # <names> <with-opencode> <with-kimi>
@@ -3994,38 +4119,51 @@ with_darkirc_writer_lock() {
 darkirc_load_compatibility() {
   require_cmd jq
   require_cmd sha256sum
-  darkirc_path_components_safe "$DARKIRC_COMPAT_FILE" \
-    || die "unsafe DarkIRC compatibility attestation path"
-  darkirc_validate_root_owned_directory "$(dirname "$DARKIRC_COMPAT_FILE")" \
-    || die "unsafe DarkIRC compatibility attestation parent"
-  [[ -f "$DARKIRC_COMPAT_FILE" && ! -L "$DARKIRC_COMPAT_FILE" ]] \
-    || die "DarkIRC compatibility attestation is missing: $DARKIRC_COMPAT_FILE"
-  local mode owner links schema profile digest key_format source_revision actual
-  mode="$(stat -c '%a' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
-  owner="$(stat -c '%u' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
-  links="$(stat -c '%h' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
-  [[ "$mode" == 600 && "$owner" == 0 && "$links" == 1 ]] \
-    || die "DarkIRC compatibility attestation must be root-owned, single-link mode 0600"
-  schema="$(jq -r '.schema // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
-  profile="$(jq -r '.profile_id // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
-  digest="$(jq -r '.binary_sha256 // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
-  key_format="$(jq -r '.key_format // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
-  source_revision="$(jq -r '.source_revision // empty' "$DARKIRC_COMPAT_FILE" 2>/dev/null || true)"
-  [[ "$schema" == "lunarwing.darkirc-compat/v1" \
+  darkirc_resolve_release || die "DarkIRC release selector is missing or unsafe"
+  darkirc_sync_release_durability "$DARKIRC_PINNED_RELEASE" \
+    || die "DarkIRC release durability repair failed"
+  darkirc_fsync_path "$DARKIRC_RELEASE_ROOT" \
+    || die "DarkIRC selector durability repair failed"
+  local attestation="$DARKIRC_PINNED_RELEASE/attestation.json"
+  local shape schema release_id profile digest helper_digest helper_source_revision
+  local expected_helper_source_revision key_format source_revision actual helper_actual
+  shape="$(jq -r 'if type == "object" and
+    (keys == ["daemon_sha256","helper_sha256","helper_source_revision","key_format","profile_id","release_id","schema","source_revision"])
+    then "valid" else empty end' "$attestation" 2>/dev/null || true)"
+  schema="$(jq -r '.schema // empty' "$attestation" 2>/dev/null || true)"
+  release_id="$(jq -r '.release_id // empty' "$attestation" 2>/dev/null || true)"
+  profile="$(jq -r '.profile_id // empty' "$attestation" 2>/dev/null || true)"
+  digest="$(jq -r '.daemon_sha256 // empty' "$attestation" 2>/dev/null || true)"
+  helper_digest="$(jq -r '.helper_sha256 // empty' "$attestation" 2>/dev/null || true)"
+  helper_source_revision="$(jq -r '.helper_source_revision // empty' "$attestation" 2>/dev/null || true)"
+  expected_helper_source_revision="$(git -C "$LUNARWING_ROOT" rev-parse HEAD 2>/dev/null || true)"
+  key_format="$(jq -r '.key_format // empty' "$attestation" 2>/dev/null || true)"
+  source_revision="$(jq -r '.source_revision // empty' "$attestation" 2>/dev/null || true)"
+  [[ "$shape" == valid \
+    && "$schema" == "lunarwing.darkirc-compat/v2" \
+    && "$release_id" == "${DARKIRC_PINNED_RELEASE##*/}" \
     && "$profile" == "darkfi-a05956d41-chacha-v1" \
     && "$key_format" == "darkfi-chacha-base58-32" \
     && "$source_revision" == "$DARKIRC_APPROVED_REV" \
-    && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    && "$expected_helper_source_revision" =~ ^[0-9a-f]{40}$ \
+    && "$helper_source_revision" == "$expected_helper_source_revision" \
+    && "$digest" =~ ^sha256:[0-9a-f]{64}$ \
+    && "$helper_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
     || die "unsupported DarkIRC compatibility attestation"
-  darkirc_validate_root_executable "$DARKIRC_BIN" \
-    || die "attested DarkIRC binary is missing or unsafe: $DARKIRC_BIN"
-  actual="$(sha256sum "$DARKIRC_BIN")"
+  actual="$(sha256sum "$DARKIRC_PINNED_RELEASE/darkirc")"
   actual="sha256:${actual%% *}"
   [[ "$actual" == "$digest" ]] || die "DarkIRC binary digest does not match attestation"
+  helper_actual="$(sha256sum "$DARKIRC_PINNED_RELEASE/lunarwing-darkirc-key-helper")"
+  helper_actual="sha256:${helper_actual%% *}"
+  [[ "$helper_actual" == "$helper_digest" ]] \
+    || die "DarkIRC helper digest does not match attestation"
+  DARKIRC_PINNED_HELPER="$DARKIRC_PINNED_RELEASE/lunarwing-darkirc-key-helper"
   DARKIRC_COMPAT_ARGS=(
     --generator-profile "$profile"
     --binary-sha256 "$digest"
-    --binary-path "$DARKIRC_BIN"
+    --binary-path "$DARKIRC_PINNED_RELEASE/darkirc"
+    --helper-sha256 "$helper_digest"
+    --release-id "$release_id"
     --key-format "$key_format"
     --source-revision "$source_revision"
   )
@@ -4033,21 +4171,17 @@ darkirc_load_compatibility() {
 
 run_darkirc_manifest_validator() {
   local unbound="${1:-false}"
-  darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
-    || die "trusted DarkIRC key helper is missing; run build-darkirc before machine import"
+  darkirc_load_compatibility
   if [[ "$unbound" == "true" ]]; then
-    "$DARKIRC_KEY_HELPER" validate-migration --json --unbound
+    "$DARKIRC_PINNED_HELPER" validate-migration --json --unbound
   else
-    darkirc_load_compatibility
-    "$DARKIRC_KEY_HELPER" validate-migration --json "${DARKIRC_COMPAT_ARGS[@]}"
+    "$DARKIRC_PINNED_HELPER" validate-migration --json "${DARKIRC_COMPAT_ARGS[@]}"
   fi
 }
 
 run_darkirc_key_helper() {
   local name="$1"
   shift
-  darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
-    || die "DarkIRC key helper is missing or unsafe: $DARKIRC_KEY_HELPER"
   darkirc_load_compatibility
   local uid gid home
   uid="$(id -u "$name")" || die "cannot resolve uid for tenant '$name'"
@@ -4056,7 +4190,7 @@ run_darkirc_key_helper() {
   (
     cd "$home"
     exec sudo -u "$name" env -i HOME="$home" PATH="/usr/bin:/bin" \
-      "$DARKIRC_KEY_HELPER" "$@" "${DARKIRC_COMPAT_ARGS[@]}" \
+      "$DARKIRC_PINNED_HELPER" "$@" "${DARKIRC_COMPAT_ARGS[@]}" \
       --expected-uid "$uid" --expected-gid "$gid"
   )
 }
@@ -7378,7 +7512,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$DARKIRC_BIN --config $(tenant_state_dir "$name")/darkirc/darkirc_config.toml
+ExecStart=$DARKIRC_RELEASE_DAEMON --config $(tenant_state_dir "$name")/darkirc/darkirc_config.toml
 Restart=always
 RestartSec=10
 NoNewPrivileges=true
@@ -7528,6 +7662,10 @@ _wait_user_manager() {
 start_tenant_systemd() {
   local name="$1"
   _systemctl_user "$name" daemon-reload
+  if tenant_darkirc_enabled "$name"; then
+    darkirc_service_uses_release_selector "$name" \
+      || die "effective DarkIRC systemd unit is stale or overridden; run render-units $name"
+  fi
   # Quadlet-generated units (pg, supported workers, vision) are NOT in the
   # enable_list: `systemctl enable` fails on generated/transient units with
   # "Failed to enable unit: ... is transient or generated", and under
@@ -7987,7 +8125,7 @@ INITEOF
 
 description="LunarWing DarkIRC daemon ($name)"
 
-: "\${darkirc_command:=$DARKIRC_BIN}"
+darkirc_command="$DARKIRC_RELEASE_DAEMON"
 : "\${darkirc_args:=--config $state_dir/darkirc/darkirc_config.toml}"
 : "\${darkirc_user:=$name}"
 : "\${darkirc_group:=$name}"
@@ -8372,6 +8510,134 @@ stop_tenant_openrc() {
   rc-service "lunarwing-pg-${name}-sup" stop 2>/dev/null || true
   rc-service "lunarwing-pg-${name}" stop 2>/dev/null || true
   say "OpenRC services stopped for $name"
+}
+
+cleanup_legacy_weechat_systemd() {
+  local name="$1" unit unit_dir unit_path link load_state known=false
+  local changed=false
+  unit="weechat-${name}.service"
+  unit_dir="$(tenant_home "$name")/.config/systemd/user"
+  unit_path="$unit_dir/$unit"
+
+  load_state="$(_systemctl_user "$name" show --value -p LoadState "$unit" 2>/dev/null)" \
+    || return 1
+  [[ "$load_state" == not-found ]] || known=true
+  if [[ -e "$unit_path" || -L "$unit_path" ]]; then
+    [[ -f "$unit_path" && ! -L "$unit_path" ]] \
+      || die "refusing to operate on non-regular legacy unit: $unit_path"
+    known=true
+  fi
+  if [[ "$known" == true ]]; then
+    _systemctl_user "$name" disable --now "$unit" || return 1
+    changed=true
+  fi
+  if [[ -e "$unit_path" || -L "$unit_path" ]]; then
+    sudo -u "$name" -- rm -- "$unit_path" || return 1
+  fi
+
+  for link in "$unit_dir"/*.wants/"$unit" "$unit_dir"/*.requires/"$unit"; do
+    [[ -e "$link" || -L "$link" ]] || continue
+    [[ -L "$link" ]] || die "refusing to remove non-symlink legacy enablement: $link"
+    sudo -u "$name" -- rm -- "$link" || return 1
+    changed=true
+  done
+
+  if [[ "$changed" == true ]]; then
+    _systemctl_user "$name" daemon-reload || return 1
+    say "removed legacy systemd user unit $unit for $name"
+  else
+    say "legacy systemd user unit $unit absent for $name"
+  fi
+}
+
+cleanup_legacy_weechat_openrc() {
+  local name="$1" service init_path conf_path link runlevel
+  local changed=false
+  service="weechat-${name}"
+  init_path="$OPENRC_INITD_DIR/$service"
+  conf_path="$OPENRC_CONFD_DIR/$service"
+
+  if [[ -e "$init_path" || -L "$init_path" ]]; then
+    [[ -f "$init_path" && ! -L "$init_path" ]] \
+      || die "refusing to operate on non-regular legacy OpenRC service: $init_path"
+    rc-service "$service" stop || return 1
+  fi
+
+  for link in "$OPENRC_RUNLEVELS_DIR"/*/"$service"; do
+    [[ -e "$link" || -L "$link" ]] || continue
+    [[ -L "$link" ]] || die "refusing to remove non-symlink legacy runlevel entry: $link"
+    runlevel="$(basename "$(dirname "$link")")"
+    rc-update del "$service" "$runlevel" || return 1
+    if [[ -e "$link" || -L "$link" ]]; then
+      rm -- "$link" || return 1
+    fi
+    changed=true
+  done
+
+  for link in "$init_path" "$conf_path"; do
+    [[ -e "$link" || -L "$link" ]] || continue
+    [[ -f "$link" && ! -L "$link" ]] \
+      || die "refusing to remove non-regular legacy OpenRC path: $link"
+    rm -- "$link" || return 1
+    changed=true
+  done
+
+  if [[ "$changed" == true ]]; then
+    say "removed legacy OpenRC service $service for $name"
+  else
+    say "legacy OpenRC service $service absent for $name"
+  fi
+}
+
+cleanup_legacy_weechat() {
+  local name="$1"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_init_system
+  case "$INIT_SYSTEM" in
+    systemd) cleanup_legacy_weechat_systemd "$name" ;;
+    openrc) cleanup_legacy_weechat_openrc "$name" ;;
+    *) die "unsupported init system: $INIT_SYSTEM" ;;
+  esac
+}
+
+restart_weechat_adapter() {
+  local name="$1"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_init_system
+  case "$INIT_SYSTEM" in
+    systemd)
+      _systemctl_user "$name" restart "lunarwing-weechat-adapter-${name}.service"
+      ;;
+    openrc)
+      rc-service "lunarwing-weechat-adapter-${name}" restart
+      ;;
+    *) die "unsupported init system: $INIT_SYSTEM" ;;
+  esac
+}
+
+darkirc_service_uses_release_selector() {
+  local name="$1" service_path expected command_prefix fragment drop_ins
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    service_path="$(tenant_home "$name")/.config/systemd/user/lunarwing-darkirc-${name}.service"
+    expected="ExecStart=$DARKIRC_RELEASE_DAEMON --config $(tenant_state_dir "$name")/darkirc/darkirc_config.toml"
+    command_prefix='ExecStart='
+  else
+    service_path="$OPENRC_INITD_DIR/lunarwing-darkirc-${name}"
+    expected="darkirc_command=\"$DARKIRC_RELEASE_DAEMON\""
+    command_prefix='darkirc_command='
+  fi
+  [[ -f "$service_path" && ! -L "$service_path" ]] || return 1
+  [[ "$(grep -Fxc -- "$expected" "$service_path")" -eq 1 \
+    && "$(grep -Fc -- "$command_prefix" "$service_path")" -eq 1 ]] || return 1
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _systemctl_user "$name" daemon-reload >/dev/null || return 1
+    fragment="$(_systemctl_user "$name" show --value -p FragmentPath \
+      "lunarwing-darkirc-${name}.service" 2>/dev/null)" || return 1
+    drop_ins="$(_systemctl_user "$name" show --value -p DropInPaths \
+      "lunarwing-darkirc-${name}.service" 2>/dev/null)" || return 1
+    [[ "$fragment" == "$service_path" && -z "$drop_ins" ]]
+  fi
 }
 
 # ISSUE-006: enable_weechat is authoritative for lifecycle, not just health
@@ -9042,8 +9308,7 @@ add_tenant() {
   if [[ "$enable_darkirc" == "true" ]]; then
     ensure_darkirc_scope_id "$name" >/dev/null
     write_tenant_darkirc_adapter_env "$name"
-    if darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
-        && [[ -f "$DARKIRC_COMPAT_FILE" ]]; then
+    if darkirc_resolve_release; then
       generate_darkirc_config "$name"
     else
       say "DarkIRC config deferred until build-darkirc installs the attested helper"
@@ -9302,13 +9567,15 @@ start_tenant() {
 
   local darkirc_config
   darkirc_config="$(tenant_state_dir "$name")/darkirc/darkirc_config.toml"
-  if tenant_darkirc_enabled "$name" \
-      && [[ ! -f "$darkirc_config" || -L "$darkirc_config" ]]; then
-    darkirc_validate_root_executable "$DARKIRC_KEY_HELPER" \
-      && [[ -f "$DARKIRC_COMPAT_FILE" ]] \
-      || die "DarkIRC config is missing and attested helper is unavailable; run build-darkirc"
-    say "finalizing deferred DarkIRC config before start ..."
-    generate_darkirc_config "$name"
+  if tenant_darkirc_enabled "$name"; then
+    darkirc_load_compatibility \
+      || die "attested DarkIRC release is unavailable; run ensure-darkirc-release $name"
+    darkirc_service_uses_release_selector "$name" \
+      || die "DarkIRC service unit is stale or unsafe; run render-units $name"
+    if [[ ! -f "$darkirc_config" || -L "$darkirc_config" ]]; then
+      say "finalizing deferred DarkIRC config before start ..."
+      generate_darkirc_config "$name"
+    fi
   fi
 
   retire_tenant_nanocode "$name" \
@@ -10385,6 +10652,13 @@ main() {
       build_darkirc "$darkirc_tenant"
       ;;
 
+    ensure-darkirc-release)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: ensure-darkirc-release <name>"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" ensure_darkirc_release "$_lifecycle_name"
+      ;;
+
     build-nanocode-worker)
       die "Nanocode worker is retired; build-nanocode-worker is unavailable"
       ;;
@@ -10462,6 +10736,20 @@ main() {
       [[ -n "${1:-}" ]] || die "usage: stop-tenant <name>"
       _lifecycle_name="$(sanitize_name "$1")"
       with_tenant_lifecycle_lock "$_lifecycle_name" stop_tenant "$_lifecycle_name"
+      ;;
+
+    cleanup-legacy-weechat)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: cleanup-legacy-weechat <name>"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" cleanup_legacy_weechat "$_lifecycle_name"
+      ;;
+
+    restart-weechat-adapter)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: restart-weechat-adapter <name>"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" restart_weechat_adapter "$_lifecycle_name"
       ;;
 
     stop-tenant-for-upgrade)

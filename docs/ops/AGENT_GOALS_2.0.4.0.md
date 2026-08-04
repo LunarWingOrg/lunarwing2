@@ -13,7 +13,7 @@
 
 ---
 
-1. [ ] **DarkIRC secure staged key exchange.** H1/H2 fixed and verified; H3 partially fixed, with live isolation and leak evidence still required. Full boundary, audit ledger, validation, blockers, and next steps: [`DARKIRC-KEYEXCHANGE-ITEM15-STATUS.md`](DARKIRC-KEYEXCHANGE-ITEM15-STATUS.md).
+1. [ ] **DarkIRC secure staged key exchange (Phase 0/1 and Stage A acceptance).** All source-audit findings are fixed; final acceptance still requires the dedicated H3 harness to pass on real systemd-user and OpenRC hosts, then final release CI. Stages B-D and delivery remain separately gated. Full ledger, validation, blocker, and runbook: [`DARKIRC-KEYEXCHANGE-GOAL1-STATUS.md`](DARKIRC-KEYEXCHANGE-GOAL1-STATUS.md).
 2. [ ] self healing capability expansion - see prev attempt for reference: aj/kimi-24-20260801-1203
 3. [ ] Suggest additional UI fixes in a new document in docs/ops — update`docs/ops/UI_FIX_SUGGESTIONS.md` with any additional findings
 4. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs - prev attempt that may be referenced as it was fairly accurate at time of creation: rarity/kimi-31-20260801-0601

@@ -1,6 +1,7 @@
 # DarkIRC Key Exchange Next Stages
 
-**Status (2026-08-03):** Phase 0/1 and Stage A implemented. Later stages remain disabled.
+**Status (2026-08-04):** Phase 0/1 and Stage A implemented. Stage A live-host
+acceptance remains pending; later stages remain disabled.
 
 This document is the sequencing boundary for
 [`DARKIRC_SECURE_KEY_EXCHANGE.md`](DARKIRC_SECURE_KEY_EXCHANGE.md). A later stage
@@ -12,9 +13,9 @@ exist.
 Phase 0/1 and Stage A provide:
 
 - Contact-preserving, semantic, journaled baseline and ledger updates.
-- Root-attested DarkIRC/helper compatibility with a pinned source revision,
-  measured binary digest, generator parser self-test, and unprivileged
-  disposable builds.
+- Root-attested immutable DarkIRC/helper releases with a pinned source revision,
+  both executable digests, one atomic durable selector, generator parser
+  self-test, and unprivileged disposable builds.
 - Stable random tenant scope IDs and mt-admin lifecycle serialization for
   systemd-user and OpenRC.
 - Fingerprint-only `list`, `status`, `doctor`, and metadata-only `adopt`.
@@ -29,6 +30,8 @@ Phase 0/1 and Stage A provide:
 - Capability-relative no-follow file access with tenant owner/group, exact
   `0700` directories, exact `0600` single-link files, bounded reads, directory
   fsync, and atomic same-directory replacement.
+- Mt-admin-owned legacy lifecycle cleanup and adapter restart parity for
+  systemd-user and OpenRC; wrappers contain no direct init lifecycle path.
 - Strict `darkirc-health <tenant> --strict [--json]` diagnostics covering both
   init systems and authenticated adapter connectivity without putting the
   bearer in argv.
@@ -41,6 +44,10 @@ Public artifact delivery may fail after pending state is durable. The error
 returns only the committed offer ID; repeating the same semantic operation
 returns the stored byte-identical public artifact instead of generating another
 private key.
+
+The non-destructive test suite covers code and fixture acceptance. Final Stage A
+promotion still requires `ic/scripts/live-tests/darkirc-stage-a-h3.sh` to pass
+on dedicated real systemd-user and OpenRC hosts.
 
 ## Stage B: Local Activation — Disabled
 

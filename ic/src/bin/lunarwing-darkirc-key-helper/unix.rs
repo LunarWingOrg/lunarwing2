@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path};
@@ -40,7 +41,8 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
-const ATTESTED_DARKIRC_PATH: &str = "/usr/local/bin/darkirc";
+const RELEASE_DAEMON_NAME: &str = "darkirc";
+const RELEASE_HELPER_NAME: &str = "lunarwing-darkirc-key-helper";
 const GENERATOR_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_GENERATOR_OUTPUT_BYTES: usize = 8 * 1024;
 const GENERATOR_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -55,6 +57,8 @@ struct Options {
     generator_profile: Option<String>,
     binary_sha256: Option<String>,
     binary_path: Option<String>,
+    helper_sha256: Option<String>,
+    release_id: Option<String>,
     key_format: Option<String>,
     source_revision: Option<String>,
     unbound_validation: bool,
@@ -104,6 +108,8 @@ fn run() -> Result<()> {
             "--generator-profile" => options.generator_profile = Some(next_value(&mut args)?),
             "--binary-sha256" => options.binary_sha256 = Some(next_value(&mut args)?),
             "--binary-path" => options.binary_path = Some(next_value(&mut args)?),
+            "--helper-sha256" => options.helper_sha256 = Some(next_value(&mut args)?),
+            "--release-id" => options.release_id = Some(next_value(&mut args)?),
             "--key-format" => options.key_format = Some(next_value(&mut args)?),
             "--source-revision" => options.source_revision = Some(next_value(&mut args)?),
             "--unbound" => options.unbound_validation = true,
@@ -121,14 +127,19 @@ fn run() -> Result<()> {
         }
     }
 
-    let attestation = if command == "validate-migration" && options.unbound_validation {
+    let validated = if command == "validate-migration" && options.unbound_validation {
         None
     } else {
         Some(compatibility_attestation(&options)?)
     };
+    let attestation = validated.as_ref().map(|value| &value.attestation);
 
     if command == "self-test-generator" {
-        let keypair = generate_keypair()?;
+        let keypair = generate_keypair(
+            validated
+                .as_ref()
+                .ok_or(KeyManagerError::InvalidCompatibility)?,
+        )?;
         drop(keypair);
         return print_json(&MigrationStatus {
             status: "generator-compatible",
@@ -143,9 +154,7 @@ fn run() -> Result<()> {
         } else {
             validate_migration(
                 &manifest,
-                attestation
-                    .as_ref()
-                    .ok_or(KeyManagerError::InvalidCompatibility)?,
+                attestation.ok_or(KeyManagerError::InvalidCompatibility)?,
             )?
         };
         return print_json(&MigrationStatus {
@@ -172,9 +181,7 @@ fn run() -> Result<()> {
             export_migration(
                 &paths,
                 &scope,
-                attestation
-                    .as_ref()
-                    .ok_or(KeyManagerError::InvalidCompatibility)?,
+                attestation.ok_or(KeyManagerError::InvalidCompatibility)?,
             )?;
             print_json(&MigrationStatus {
                 status: "exported",
@@ -188,9 +195,7 @@ fn run() -> Result<()> {
                 &paths,
                 &scope,
                 &manifest,
-                attestation
-                    .as_ref()
-                    .ok_or(KeyManagerError::InvalidCompatibility)?,
+                attestation.ok_or(KeyManagerError::InvalidCompatibility)?,
             )?;
             print_json(&MigrationStatus {
                 status: "staged",
@@ -202,9 +207,7 @@ fn run() -> Result<()> {
             import_migration(
                 &paths,
                 &scope,
-                attestation
-                    .as_ref()
-                    .ok_or(KeyManagerError::InvalidCompatibility)?,
+                attestation.ok_or(KeyManagerError::InvalidCompatibility)?,
             )?;
             print_json(&MigrationStatus {
                 status: "imported",
@@ -255,9 +258,7 @@ fn run() -> Result<()> {
                 .contact
                 .take()
                 .ok_or(KeyManagerError::InvalidContact)?;
-            let attested = attestation
-                .as_ref()
-                .ok_or(KeyManagerError::InvalidCompatibility)?;
+            let attested = attestation.ok_or(KeyManagerError::InvalidCompatibility)?;
             validate_artifact_output(&options)?;
             let now = unix_now()?;
             let ttl = validated_ttl(options.expires_seconds)?;
@@ -277,7 +278,14 @@ fn run() -> Result<()> {
                     now,
                     attestation: attested,
                 },
-                || generated_exchange_material(&options),
+                || {
+                    generated_exchange_material(
+                        &options,
+                        validated
+                            .as_ref()
+                            .ok_or(KeyManagerError::InvalidCompatibility)?,
+                    )
+                },
             )?;
             write_committed_artifact(&options, &result.public_artifact, &result)
         }
@@ -314,11 +322,16 @@ fn run() -> Result<()> {
                     created_at: now,
                     expires_at,
                     now,
-                    attestation: attestation
-                        .as_ref()
-                        .ok_or(KeyManagerError::InvalidCompatibility)?,
+                    attestation: attestation.ok_or(KeyManagerError::InvalidCompatibility)?,
                 },
-                || generated_exchange_material(&options),
+                || {
+                    generated_exchange_material(
+                        &options,
+                        validated
+                            .as_ref()
+                            .ok_or(KeyManagerError::InvalidCompatibility)?,
+                    )
+                },
             )?;
             write_committed_artifact(&options, &result.public_artifact, &result)
         }
@@ -350,9 +363,7 @@ fn run() -> Result<()> {
                 expected_peer_fingerprint: &expected_fp,
                 defer_apply: options.defer_apply,
                 now: unix_now()?,
-                attestation: attestation
-                    .as_ref()
-                    .ok_or(KeyManagerError::InvalidCompatibility)?,
+                attestation: attestation.ok_or(KeyManagerError::InvalidCompatibility)?,
             };
             let status = complete_exchange(&paths, &scope, &peer_bytes, &request)?;
             print_json(&status)
@@ -375,7 +386,13 @@ fn run() -> Result<()> {
     }
 }
 
-fn compatibility_attestation(options: &Options) -> Result<CompatibilityAttestation> {
+#[derive(Debug)]
+struct ValidatedCompatibility {
+    attestation: CompatibilityAttestation,
+    daemon: fs::File,
+}
+
+fn compatibility_attestation(options: &Options) -> Result<ValidatedCompatibility> {
     let attestation = CompatibilityAttestation::new(
         options
             .generator_profile
@@ -398,10 +415,22 @@ fn compatibility_attestation(options: &Options) -> Result<CompatibilityAttestati
         .binary_path
         .as_deref()
         .ok_or(KeyManagerError::InvalidCompatibility)?;
-    if binary_path != ATTESTED_DARKIRC_PATH {
+    let binary_path = Path::new(binary_path);
+    let release_dir = binary_path
+        .parent()
+        .ok_or(KeyManagerError::InvalidCompatibility)?;
+    let release_id = options
+        .release_id
+        .as_deref()
+        .filter(|value| valid_release_id(value))
+        .ok_or(KeyManagerError::InvalidCompatibility)?;
+    if binary_path.file_name().and_then(|value| value.to_str()) != Some(RELEASE_DAEMON_NAME)
+        || release_dir.file_name().and_then(|value| value.to_str()) != Some(release_id)
+    {
         return Err(KeyManagerError::InvalidCompatibility);
     }
-    validate_attested_binary_parents(Path::new(binary_path))?;
+    validate_attested_binary_parents(binary_path)?;
+    validate_helper_binding(release_dir, options)?;
     let metadata = fs::symlink_metadata(binary_path).map_err(KeyManagerError::Io)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(KeyManagerError::InvalidCompatibility);
@@ -441,7 +470,85 @@ fn compatibility_attestation(options: &Options) -> Result<CompatibilityAttestati
     if measured != attestation.binary_sha256() {
         return Err(KeyManagerError::InvalidCompatibility);
     }
-    Ok(attestation)
+    Ok(ValidatedCompatibility {
+        attestation,
+        daemon: file,
+    })
+}
+
+fn valid_release_id(value: &str) -> bool {
+    let parts = value.split('-').collect::<Vec<_>>();
+    parts.len() == 4
+        && [40, 16, 16, 16]
+            .into_iter()
+            .zip(parts)
+            .all(|(length, part)| {
+                part.len() == length
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+}
+
+fn validate_helper_binding(release_dir: &Path, options: &Options) -> Result<()> {
+    let helper_path = release_dir.join(RELEASE_HELPER_NAME);
+    let current_exe = std::env::current_exe().map_err(KeyManagerError::Io)?;
+    if current_exe != helper_path {
+        return Err(KeyManagerError::InvalidCompatibility);
+    }
+    let expected = options
+        .helper_sha256
+        .as_deref()
+        .ok_or(KeyManagerError::InvalidCompatibility)?;
+    let mut helper = open_validated_release_executable(&helper_path)?;
+    verify_sha256(&mut helper, expected)
+}
+
+fn open_validated_release_executable(path: &Path) -> Result<fs::File> {
+    let metadata = fs::symlink_metadata(path).map_err(KeyManagerError::Io)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.nlink() != 1
+        || !attested_binary_mode(metadata.permissions().mode())
+    {
+        return Err(KeyManagerError::InvalidCompatibility);
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(KeyManagerError::Io)?;
+    let opened = file.metadata().map_err(KeyManagerError::Io)?;
+    if opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.uid() != 0
+        || opened.nlink() != 1
+        || !attested_binary_mode(opened.permissions().mode())
+    {
+        return Err(KeyManagerError::InvalidCompatibility);
+    }
+    Ok(file)
+}
+
+fn sha256_file(file: &mut fs::File) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(KeyManagerError::Io)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn verify_sha256(file: &mut fs::File, expected: &str) -> Result<()> {
+    if sha256_file(file)? != expected {
+        return Err(KeyManagerError::InvalidCompatibility);
+    }
+    Ok(())
 }
 
 fn validate_attested_binary_parents(path: &Path) -> Result<()> {
@@ -522,8 +629,12 @@ struct ArtifactPath {
     name: String,
 }
 
-fn generate_keypair() -> Result<KeypairOutput> {
-    let mut command = Command::new(ATTESTED_DARKIRC_PATH);
+fn generate_keypair(validated: &ValidatedCompatibility) -> Result<KeypairOutput> {
+    #[cfg(target_os = "linux")]
+    let executable = format!("/proc/self/fd/{}", validated.daemon.as_raw_fd());
+    #[cfg(not(target_os = "linux"))]
+    let executable = format!("/dev/fd/{}", validated.daemon.as_raw_fd());
+    let mut command = Command::new(executable);
     command
         .arg("--gen-chacha-keypair")
         .env_clear()
@@ -649,9 +760,12 @@ fn join_output_reader(
         .map_err(KeyManagerError::Io)
 }
 
-fn generated_exchange_material(options: &Options) -> Result<GeneratedExchangeMaterial> {
+fn generated_exchange_material(
+    options: &Options,
+    validated: &ValidatedCompatibility,
+) -> Result<GeneratedExchangeMaterial> {
     require_unused_artifact_output(options)?;
-    let keypair = generate_keypair()?;
+    let keypair = generate_keypair(validated)?;
     Ok(GeneratedExchangeMaterial {
         offer_id: random_exchange_id(),
         contact_id: random_exchange_id(),
@@ -1466,5 +1580,52 @@ mod tests {
         assert!(!attested_binary_mode(0o2755));
         assert!(!attested_binary_mode(0o1755));
         assert!(attested_binary_mode(0o755));
+    }
+
+    #[test]
+    fn release_id_and_helper_digest_bindings_fail_closed() {
+        let valid = format!(
+            "{}-{}-{}-{}",
+            "a".repeat(40),
+            "b".repeat(16),
+            "c".repeat(16),
+            "d".repeat(16)
+        );
+        assert!(valid_release_id(&valid));
+        for invalid in ["../release", "A", "abc/def", "a-b-c"] {
+            assert!(!valid_release_id(invalid));
+        }
+
+        let temp = tempdir().expect("helper digest fixture");
+        let path = temp.path().join("helper");
+        fs::write(&path, b"helper-generation-one").expect("write helper fixture");
+        let mut file = fs::File::open(&path).expect("open helper fixture");
+        let wrong = format!("sha256:{}", "0".repeat(64));
+        assert!(matches!(
+            verify_sha256(&mut file, &wrong),
+            Err(KeyManagerError::InvalidCompatibility)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_daemon_fd_executes_measured_inode_after_path_replacement() {
+        let temp = tempdir().expect("pinned daemon fixture");
+        let daemon = temp.path().join("darkirc");
+        let replacement = temp.path().join("replacement");
+        fs::copy("/bin/true", &daemon).expect("copy measured executable");
+        fs::copy("/bin/false", &replacement).expect("copy replacement executable");
+        let opened = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(&daemon)
+            .expect("open measured executable");
+        fs::rename(&replacement, &daemon).expect("replace executable path");
+
+        let status = Command::new(format!("/proc/self/fd/{}", opened.as_raw_fd()))
+            .status()
+            .expect("execute pinned descriptor");
+
+        assert!(status.success());
     }
 }

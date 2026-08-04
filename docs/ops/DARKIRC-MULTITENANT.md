@@ -115,10 +115,22 @@ sudo LUNARWING_MT_DARKIRC_REPO=https://mirror.example/darkfi \
   ic/scripts/lunarwing-mt-admin.sh build-darkirc --tenant <TENANT>
 ```
 
-After publication, mt-admin writes `/etc/lunarwing/darkirc-compat.json` as a
-root-owned, single-link `0600` file. It binds the approved generator profile,
-source revision, key format, and SHA-256 digest of `/usr/local/bin/darkirc`.
-The typed helper remeasures the binary before every managed operation.
+Publication creates an immutable root-owned release under
+`/usr/local/lib/lunarwing/darkirc/releases/<release-id>/`. Each release contains
+the daemon, typed helper, and a mode-`0444` compatibility attestation binding
+the release ID, approved profile/revision/key format, helper source revision,
+and both executable digests. Mt-admin publishes one `current` selector with
+same-directory atomic rename and directory fsync. Readers resolve that selector
+once, pin one release, and the helper executes the same daemon descriptor it
+measured. Publication retry re-syncs all release files and parent directories
+before selection. `start-tenant` rejects missing, symlinked, stale,
+multiply-defined, or systemd-drop-in-overridden DarkIRC daemon commands; run
+`render-units <TENANT>` after upgrading old units.
+
+Legacy `LUNARWING_MT_DARKIRC_BIN`, `LUNARWING_MT_DARKIRC_COMPAT_FILE`, and
+`LUNARWING_MT_DARKIRC_KEY_HELPER` overrides now fail closed. Controlled
+installations may relocate the complete release root with
+`LUNARWING_MT_DARKIRC_RELEASE_ROOT`.
 
 ## Provision or Backfill a Tenant
 
@@ -147,8 +159,8 @@ active TOML.
 
 ## Build DarkIRC
 
-Build and transactionally publish the shared daemon, compatibility attestation,
-and typed helper:
+Build and atomically select an immutable shared daemon/helper/attestation
+release:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-darkirc --tenant <TENANT>
@@ -162,9 +174,15 @@ self-test; it does not select tenant-controlled source. Mt-admin:
 - builds DarkIRC and the helper as the dedicated locked `lunarwing-build` user
   under `setpriv --clear-groups --no-new-privs`, `env -i`, and bounded CPU/jobs;
 - validates artifact owner, mode, link count, and executable type;
-- self-tests the installed generator output and public/private relationship;
-- atomically publishes the daemon, helper, and attestation, restoring the
-  previous set if validation fails.
+- self-tests the staged generator output and public/private relationship;
+- fsyncs every release file and directory before publication;
+- atomically switches one selector only after the complete release validates;
+- retains prior complete releases, so interruption leaves either the old or new
+  coherent generation selected.
+
+Upgrade wrappers call `ensure-darkirc-release <TENANT>` before rendering or
+starting DarkIRC units. `start-tenant` independently validates the selected
+release even when the tenant config already exists.
 
 DarkFi's first build also compiles `zkas` and proof circuits, so run this
 long-lived operation inside `tmux`.
@@ -198,8 +216,8 @@ For tenant `<TENANT>`, the admin script manages:
 | `/home/<TENANT>/lunarwing/state/darkirc/darkirc_config.toml` | Tenant-owned `0600` active daemon config, updated semantically and journaled |
 | `/home/<TENANT>/lunarwing/state/darkirc/key-exchange/` | Tenant-owned `0700` Stage A pending, ledger, candidate, transaction, rollback-reserved, and lock subtree; files are exact `0600` single-link |
 | `/home/<TENANT>/lunarwing/state/channels/darkirc.capabilities.json` | WASM channel capabilities installed by `install-wasm` |
-| `/etc/lunarwing/darkirc-compat.json` | Root-owned `0600` shared compatibility attestation for the measured daemon |
-| `/usr/local/libexec/lunarwing-darkirc-key-helper` | Root-owned shared typed key helper |
+| `/usr/local/lib/lunarwing/darkirc/releases/<release-id>/` | Immutable root-owned daemon, typed helper, and compatibility attestation generation |
+| `/usr/local/lib/lunarwing/darkirc/current` | Atomically replaced root-owned selector for the complete active generation |
 | `/home/<TENANT>/lunarwing/logs/` | Tenant daemon, adapter, and service logs; private/public raw exchange values are not logged |
 
 The template placeholders use `__UPPERCASE__` form, not shell `${VAR}` form. Secrets are generated at runtime and are not stored in templates.
@@ -454,7 +472,7 @@ Common failures are fail-closed compatibility or source-custody checks:
   shell profile.
 - **Generator self-test failed.** Unknown output, stderr output, malformed or
   mismatched X25519 keys, digest mismatch, or unsupported profile prevents
-  publication. The previous daemon/helper/attestation set is restored.
+  selector publication. The previous complete release remains selected.
 - **Controlled mirror unavailable.** If `LUNARWING_MT_DARKIRC_REPO` points to a
   mirror, it must still provide the approved revision; changing
   `LUNARWING_MT_DARKIRC_REV` is rejected.
@@ -478,7 +496,8 @@ typed helper.
 
 ### Adapter `/health` returns `{"error": "unauthorized"}`
 
-`/health` requires the adapter bearer secret — pass `Authorization: Bearer <ADAPTER_SECRET>` (see [Check Adapter Health](#3-check-adapter-health)).
+`/health` requires the adapter bearer secret. Do not expose it manually; use
+mt-admin strict health diagnostics (see [Check Strict DarkIRC Health](#3-check-strict-darkirc-health)).
 
 ### `darkirc_irc` or `darkirc_rpc` is missing
 
@@ -613,8 +632,8 @@ For each production tenant:
 - [ ] `darkirc_adapter`, `darkirc_irc`, and `darkirc_rpc` exist under `.extended_ports`.
 - [ ] The root-owned DarkFi checkout is clean, non-writable, symlink-free, and at the approved revision.
 - [ ] The locked `lunarwing-build` account and host `cargo`/`make`/`taskset`/`setpriv` toolchain are available.
-- [ ] `build-darkirc --tenant <TENANT>` completed and `/etc/lunarwing/darkirc-compat.json` matches the installed daemon digest.
-- [ ] `/usr/local/libexec/lunarwing-darkirc-key-helper` is root-owned, single-link, non-special, and executable.
+- [ ] `ensure-darkirc-release <TENANT>` reports one valid selected immutable release.
+- [ ] Selected daemon/helper files are root-owned mode `0555`, single-link, and match the release attestation digests.
 - [ ] The registry entry has unique `darkirc_scope_id` plus `darkirc_adapter`, `darkirc_irc`, and `darkirc_rpc` ports.
 - [ ] `build-tenant <TENANT> --with-wasm` and `install-wasm <TENANT>` completed.
 - [ ] `darkirc_config.toml`, `darkirc-adapter.env`, and the key-exchange subtree have exact tenant ownership and `0600`/`0700` modes.

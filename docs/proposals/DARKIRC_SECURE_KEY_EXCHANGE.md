@@ -1,7 +1,7 @@
 # Secure Automated DarkIRC Key Exchange
 
-> **Current status (2026-08-03): Phase 0/1 and Stage A implemented on the
-> item-15 release branch.** Contact-preserving config regeneration, measured
+> **Current status (2026-08-04): Phase 0/1 and the Stage A command surface are
+> implemented; acceptance awaits dedicated live-host evidence.** Contact-preserving config regeneration, measured
 > compatibility attestation, stable tenant scopes, metadata-only adoption,
 > structured migration, bounded pending state, durable replay/expiry
 > tombstones, and public-only `prepare` / `respond` / deferred `complete` /
@@ -12,9 +12,14 @@
 > diagnostic only. Activation, rollback, round-trip confirmation, rotation,
 > revocation, same-host pairing, QR/web delivery, and trusted-channel
 > automation remain disabled pending separate threat-model and recovery review.
+> Source-audit findings are closed, including atomic immutable release
+> publication, capability-relative diagnostics, and init-agnostic legacy
+> lifecycle cleanup. Real two-user `/proc`/output/log scans must still pass on
+> both systemd-user and OpenRC hosts.
 > See [DarkIRC Key Exchange Next Stages](DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md).
 
-**Status:** Phase 0/1 and Stage A implemented; Stage B and later are deferred.
+**Status:** Phase 0/1 and Stage A implemented; Stage A live acceptance pending;
+Stage B and later deferred.
 
 **Scope:** LunarWing multi-tenant DarkIRC deployments managed through
 `ic/scripts/lunarwing-mt-admin.sh`.
@@ -109,13 +114,16 @@ required assignment in the current checked-in template. The peer public half
 and local private half are placed inline in the contact table. A separate YAML
 file is not daemon input.
 
-Mt-admin accepts only the pinned approved DarkFi revision, builds it from a
-root-owned clean checkout in a disposable unprivileged build tree, measures the
-installed `/usr/local/bin/darkirc`, and writes a root-owned `0600`
-compatibility attestation. The helper remeasures that exact binary and validates
-the generator output and X25519 public/private relationship before committing
-pending state. Unknown digest, profile, key format, source revision, generator
-output, or config schema fails closed.
+Mt-admin accepts only the pinned approved DarkFi revision and builds it from a
+root-owned clean checkout in a disposable unprivileged build tree. It stages an
+immutable release containing the daemon, helper, and an attestation that binds
+their digests, release ID, and LunarWing helper source revision, then durably
+switches one selector after syncing release and parent directories. Managed
+readers pin one complete release. The helper remeasures opened executable
+descriptors and executes the same daemon inode before committing pending state.
+Unknown release, digest, profile, key format, source revision, helper revision,
+generator output, or config schema fails closed. Managed start also rejects
+stale unit commands and systemd drop-in overrides.
 
 The checked-in template and current daemon contact schema contain only
 `dm_chacha_public` and `my_dm_chacha_secret`; no YAML keypair file or third
@@ -587,17 +595,16 @@ web process, or key helper may call bare `systemctl` or `rc-service`. A HUP path
 must not become the default until it is verified for the attested daemon and
 both init layouts.
 
-Current mt-admin start behavior is not a strict DarkIRC activation check: the
-main tenant can be healthy while an optional DarkIRC service failed. Before
-managed writes ship, mt-admin needs the proposed `darkirc-health <tenant>
---strict` contract. It must use the internal init abstraction to require both
+Mt-admin now provides `darkirc-health <tenant> --strict` through its internal
+init abstraction. Stage A uses it for diagnostics only; Stage B activation must
+use the same contract as a promotion gate. It requires both
 the tenant DarkIRC daemon and adapter service to be running, then call the
 authenticated adapter `/health` internally and require `status=ok` and
 `irc_connected=true`. It must never print the adapter bearer secret. The same
 contract and result categories apply on systemd user units and OpenRC, with a
 bounded reconnect wait and timeout rather than an unbounded poll.
 
-`apply` advances to `LocallyActivated` only after that strict check. This still
+Stage B `apply` advances to `LocallyActivated` only after that strict check. This still
 does not prove that the peer installed the matching keys. If activation fails,
 the transaction journal
 drives restoration of the protected previous TOML, advances the ledger to
@@ -821,7 +828,7 @@ available without any key-exchange write command enabled.
 unsafe state, and migrate a settled contact set without stale ports or
 transactional files before enabling exchange writes.
 
-### Stage A: Managed Out-of-Band Installation — Complete
+### Stage A: Managed Out-of-Band Installation — Implemented; Live Acceptance Pending
 
 - Freeze Public Exchange V1 canonicalization, role binding, transcript order,
   decoded-key fingerprints, compatibility fields, and bounded lifetimes.
@@ -836,7 +843,9 @@ transactional files before enabling exchange writes.
 **Exit condition:** two isolated tenant fixtures exchange role-bound artifacts,
 install distinct contact keys transactionally, replay identical operations
 idempotently, reject conflicting or expired artifacts, and recover every Stage A
-journal/pending boundary without exposing private material.
+journal/pending boundary without exposing private material. Code and fixture
+coverage pass; final acceptance additionally requires the dedicated H3 harness
+on real systemd-user and OpenRC hosts.
 
 ### Stage B/C/D: Activation And Lifecycle — Deferred
 
