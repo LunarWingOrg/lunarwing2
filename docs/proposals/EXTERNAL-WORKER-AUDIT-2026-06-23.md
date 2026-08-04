@@ -1,14 +1,15 @@
 # External Worker Security Audit (2026-06-23)
 
-> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED / HISTORICAL RECORD.**
+> **Current status (updated 2026-08-04): IMPLEMENTED / HISTORICAL RECORD.**
 > Task context population, credential cleanup, load-balancer failover,
-> graceful pool draining, and integration coverage have landed. Full session
-> history plumbing remains separate future work.
+> graceful pool draining, and integration coverage have landed. Bounded,
+> opt-in conversation history plumbing also landed after this audit. Codex was
+> removed and Nanocode was later retired; their sections below are historical.
+> The shared orchestrator fixes apply to supported Pebble, OpenCode, and Kimi
+> Code workers.
 
-> **Last updated: 2026-07-09 (v1.1.9).** The Codex worker (`codex4lunarwing/`) was removed
-> in v1.1.9; this audit is retained for historical reference. The orchestrator-side fixes
-> (TaskContext population, credential cleanup audit) apply to the remaining workers
-> (nanocode, pebble, opencode).
+> **Audit baseline: 2026-07-09 (v1.1.9).** This document retains the worker set
+> and findings as reviewed at that time.
 
 ## Context
 External worker enhancement implementation revealed four problems:
