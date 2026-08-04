@@ -2,8 +2,17 @@
 
 **Created:** 2026-07-28
 **Author:** Rarity
-**Status:** Proposal — scoped for v2.0.4.0
+**Status:** Implemented for v2.0.4.0; retained as the release-scoped design record
 **Source material:** `docs/proposals/MULTIAGENTTEAMORCHESTRATION/` (6 files)
+
+All four phases shipped on 2026-07-30, with ISSUE-001…014 review fixes applied
+on 2026-07-31. Use
+[`MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md`](MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md)
+for the current configuration and operational contract. Important final design
+differences are recorded alongside the acceptance criteria below: tag validation
+runs once at `transformResponse`, the gate is owned by `ic/src/gate/`, coalescing
+is transport-independent, strike-two alerting is a structured warning log, and
+first-responder claims remain process-local.
 
 ---
 
