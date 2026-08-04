@@ -1,8 +1,12 @@
 # Session Audit — MT Admin, DarkIRC, External Worker Enhancements (2026-06-23)
 
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** H1-H3, M3-M9,
-> T1/T2/T4/T5/T7, and the worker-health port work landed. M1/M2, L2/L4-L8,
-> T3, and T6 remain open as marked in the tracker below.
+> **Current status (rechecked 2026-08-04): HISTORICAL AUDIT WITH OPEN ITEMS.**
+> H1-H3, M3-M9, T1/T2/T4/T5/T7, and the worker-health port work landed.
+> M1/M2, L2/L4-L8, T3, and T6 remain open as marked below. Worker names,
+> line numbers, and v8 port examples capture the June baseline: Codex was removed
+> and Nanocode was later retired; supported persistent workers are now Pebble,
+> OpenCode, and Kimi Code. Current DarkIRC Stage A security work is documented in
+> `DARKIRC_SECURE_KEY_EXCHANGE.md`, not in this session record.
 
 > Tracking document for the dev session on branch `1.1.6-OCS-A-4DIRCandEWE`.
 > Covers three in-development feature areas. Use the Work Tracker below to record
