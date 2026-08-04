@@ -1,15 +1,18 @@
 # External Worker Prompt Context Propagation
 
-> **Status:** Implemented on `fixextworkers28/meta4/v2.0.3.0`.
+> **Status:** Implemented on `fixextworkers28/meta4/v2.0.3.0`; current worker
+> parity reverified 2026-08-04.
 >
 > **Source review:** `rarity/item-21-20260727-0001`, reviewed against
-> `fixextworkers28/meta4/v2.0.3.0` at `777de3e` on 2026-07-27.
+> `fixextworkers28/meta4/v2.0.3.0` at `777de3e` on 2026-07-27. Nanocode was
+> subsequently retired. Its references below remain implementation history;
+> supported persistent workers are now Pebble, OpenCode, and Kimi Code.
 
 ## Summary
 
 External-worker requests carry typed, bounded `conversation_history` when
 `create_job` explicitly requests `context_scope = "recent"`. Legacy chat and
-Engine V2 populate transient scoped context; OpenCode, Nanocode, and Pebble
+Engine V2 populate transient scoped context; OpenCode, Pebble, and Kimi Code
 consume it through equivalent untrusted-reference prompt wrappers.
 
 Implementation guarantees:
@@ -21,7 +24,7 @@ Implementation guarantees:
 4. Pass only user and assistant messages from the current scoped thread.
 5. Keep operational metadata and credential values out of model prompts.
 6. Add tests that capture the exact worker prompt.
-7. Keep OpenCode, Nanocode, and Pebble behavior aligned to the same contract.
+7. Keep Pebble, OpenCode, and Kimi Code behavior aligned to the same contract.
 
 ## Verified Current State
 
@@ -31,7 +34,7 @@ Implementation guarantees:
 | Legacy chat tool context | `JobContext.prompt_context` receives hard-bounded visible messages from current scoped `initial_messages`. |
 | Engine V2 tool context | `ThreadExecutionContext.prompt_context` receives hard-bounded visible messages from current thread. |
 | `CreateJobTool` | Defaults to no context. `recent` applies configured worker limits and sends empty prompt metadata. |
-| OpenCode, Nanocode, Pebble | Ignore metadata and environment when composing prompts; consume bounded history as escaped JSON reference data. |
+| Pebble, OpenCode, Kimi Code | Ignore metadata and environment when composing prompts; consume bounded history as escaped JSON reference data. |
 | Worker tests | Exact prompt composition, hard bounds, role filtering, metadata isolation, and adversarial delimiters are covered. |
 
 Relevant code:
@@ -44,8 +47,8 @@ Relevant code:
 - `ic/src/bridge/effect_adapter.rs`: Engine V2 `JobContext` construction.
 - `ic/src/tools/builtin/job.rs`: `execute_external()` context construction.
 - `opencode4lunarwing/scripts/opencode_task_executor.ts`.
-- `lunarcode4lunarwing/scripts/nanocode_task_executor.ts`.
 - `pebble4lunarwing/src/executor.rs`.
+- `kimicode4lunarwing/scripts/lunarwing_runtime.ts`.
 
 ## Why Reviewed Patch Is Not Reusable
 

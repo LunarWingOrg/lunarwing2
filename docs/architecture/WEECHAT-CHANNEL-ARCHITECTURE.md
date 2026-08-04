@@ -222,7 +222,7 @@ still paces callbacks at a minimum 30s interval.
 ```bash
 sudo -u <tenant> XDG_RUNTIME_DIR=/run/user/$(id -u <tenant>) \
   journalctl --user -u lunarwing-<tenant>.service -f \
-  | grep --line-buffered "Polling .* buffers via"
+  | grep --line-buffered "Polling .* buffers"
 ```
 
 The gap between consecutive lines is the actual cadence. To measure how long a single cycle

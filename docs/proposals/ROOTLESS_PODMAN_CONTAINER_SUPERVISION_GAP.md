@@ -1,9 +1,12 @@
 # Proposal: Close the rootless-podman container *supervision* gap (OpenRC leg)
 
-> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED / SUPERSEDED.**
-> Option 1 (`podman wait` babysitters) and Option 4 (`pg_isready` status) landed
-> for OpenRC/rootless. Quadlet supervision covers systemd/rootless, so the gap is
-> closed on both supported init paths.
+> **Current status (updated 2026-08-04): IMPLEMENTED / SUPERSEDED.** Option 1
+> (`podman wait` babysitters) and Option 4 (`pg_isready` status) landed for
+> OpenRC/rootless. Quadlet supervision covers systemd/rootless, so the gap is
+> closed on both supported init paths. The problem statement below preserves the
+> June pre-fix unit set; current worker babysitters cover Pebble, OpenCode, and
+> Kimi Code, while Nanocode is retired. See
+> [`../specs/podman-wait-babysitter.md`](../specs/podman-wait-babysitter.md).
 
 *Drafted 2026-06-16, on the experimental rootless-podman + OpenRC multi-tenant
 leg (the `eris` deploy). Companion to

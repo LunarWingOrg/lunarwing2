@@ -1,11 +1,14 @@
 # Multi-Tenant Upgrade: v1.1.0 → v1.1.4 ("Phoenix") on systemd
 
-> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED TOOLING / VERIFICATION-PENDING.**
-> The preflight, upgrade, fleet-health enablement, and
-> rootless-flip guard shipped. This frozen v1.1.4 runbook was never live-validated
-> for the exact rootful-to-rootless production flip; current ports schema is v11.
+> **Current status (reverified 2026-08-04): IMPLEMENTED TOOLING / HISTORICAL,
+> VERIFICATION-PENDING RUNBOOK.** The preflight, upgrade, fleet-health
+> enablement, and rootless-flip guard shipped. This frozen v1.1.4 runbook was
+> never live-validated for the exact rootful-to-rootless production flip; current
+> mt-admin migrates the ports registry through schema v14. Commands below target
+> the v1.1.4-era tool. In particular, current v2.0.4.0 rejects the retired
+> `--with-nanocode` option; supported workers are Pebble, OpenCode, and Kimi Code.
 
-**Status:** Proposal / runbook for the **rootless-adopt v1.1.0 → v1.1.4 flip** — still **pending operator go-ahead / not yet live-validated**. (Separately, the *same-host* v1.0.9 → v1.1.2 upgrade via `ic/scripts/upgrade-tenant-version.sh` has been **live-validated on a production tenant** — that is a different mechanism from the rootful → rootless flip this proposal covers.) *(Note: as of v1.1.9, the port schema has advanced to v11; the v5→v6 migration described here was the state at v1.1.4.)*
+**Status:** Proposal / runbook for the **rootless-adopt v1.1.0 → v1.1.4 flip** — still **pending operator go-ahead / not yet live-validated**. (Separately, the *same-host* v1.0.9 → v1.1.2 upgrade via `ic/scripts/upgrade-tenant-version.sh` has been **live-validated on a production tenant** — that is a different mechanism from the rootful → rootless flip this proposal covers.) *(The v5→v6 migration described here was the state at v1.1.4; current mt-admin advances registries through v14.)*
 **Date:** 2026-06-18
 **Source version:** `v1.1.0` (`17d0feb1`)
 **Target version:** `v1.1.4` (`700406d9`, = `release/v1.1.4`; contained in `staging`)

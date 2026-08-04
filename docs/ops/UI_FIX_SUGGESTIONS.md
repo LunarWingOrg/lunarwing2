@@ -1,8 +1,8 @@
-# Web Gateway UI — Fix Suggestions (v2.0.3.0)
+# Web Gateway UI — Fix Suggestions (v2.0.4.0)
 
-Date: 2026-07-29 (first pass); updated 2026-07-29 (second pass, item #25 — added M5–M9, L5–L9, and a CSP cross-reference under H1).
+Date: 2026-07-29 (first pass); updated 2026-07-29 (second pass, item #25 — added M5–M9, L5–L9, and a CSP cross-reference under H1); updated 2026-08-04 (third pass, item #3 — added H3, M10–M13, and L10).
 Scope: browser UI of the web gateway — `ic/src/channels/web/static/` (`index.html`, `app.js`, `style.css`, `i18n/`).
-Method: static audit of the shipped assets; every finding below cites the exact file:line it was verified against. This document is suggestions only — no code was changed.
+Method: static audit of the shipped assets; every finding below cites the exact file:line it was verified against. Third-pass findings were verified against source commit `b400f25`. This document is suggestions only — no code was changed.
 
 Priorities: **High** = user-visible breakage in supported environments. **Medium** = degraded UX or inconsistency. **Low** = polish / hardening.
 
@@ -25,6 +25,12 @@ Suggested fix: vendor both libraries into `ic/src/channels/web/static/vendor/` (
 At `style.css:5559-5600` the mobile bottom tab bar hides `.status-logs-btn`, `.status`, the language switcher, and the theme toggle. The hidden Logs button (`index.html:117`) is the **only** entry point to the Logs tab, so mobile users cannot open Logs at all; and with `.status` hidden they also lose the SSE connected/reconnecting indicator entirely — a reconnect loop looks identical to a healthy session.
 
 Suggested fix: keep the five primary tabs in the bottom bar but add an overflow ("More") affordance that exposes Logs, language, and theme; retain a compact status dot (even icon-only) on mobile so connection state is always visible.
+
+### H3. Memory reads can pair one file's content with another file's path
+
+`readMemoryFile(path)` immediately replaces `currentMemoryPath`, updates the breadcrumb, exposes Edit, and exits edit mode (`app.js:2810-2817`), but it leaves the previous `currentMemoryContent` and viewer in place until the asynchronous read completes (`app.js:2819-2829`). After selecting file B while file A is displayed, clicking Edit before B loads copies A's content into the editor (`app.js:2836-2843`) while Save posts to the now-current path B (`app.js:2851-2857`). There is a second race: if A's request completes after B's, its unguarded callback replaces B's content in the viewer. Either path can lead to accidentally overwriting B with A's content.
+
+Suggested fix: cancel the prior read with `AbortController` or guard both success and failure callbacks with a monotonically increasing request ID. Clear `currentMemoryContent`, show a loading state, and disable Edit while a read is pending; capture the path associated with the editor and refuse to save if it no longer matches the selected file.
 
 ---
 
@@ -101,6 +107,30 @@ A value containing `"` breaks out of the attribute and injects arbitrary ones. T
 
 Suggested fix: add an `escapeAttr()` helper that also replaces `"` and `'`, use it for every attribute interpolation, or build these rows with DOM APIs (`setAttribute`/`dataset`) like the extension cards already do.
 
+### M10. Retrying a failed message silently drops its image attachments
+
+`sendMessage()` captures the text, renders the optimistic user message, and clears the input (`app.js:837-844`). It then copies staged images into the request and clears `stagedImages` before the request succeeds (`app.js:846-850`). On failure, the Retry link restores only `content` and calls `sendMessage()` again (`app.js:856-881`): a mixed text/image message retries as text-only, while an image-only message retries as nothing because the empty-payload guard returns immediately (`app.js:838`).
+
+Suggested fix: keep the complete failed request payload (including images) with the optimistic message and have Retry resubmit that payload directly. Do not discard the attachment previews/payload until the server accepts the send, or explicitly restore them on failure.
+
+### M11. Multi-file selection can exceed the five-image attachment limit
+
+`handleImageFiles()` loops over every selected file and checks `stagedImages.length` before starting a `FileReader` (`app.js:928-939`), but images are not pushed until each asynchronous `onload` callback runs (`app.js:940-947`). If several files are selected together, every iteration can observe the same pre-read length and pass the limit check, after which all callbacks append; the UI's stated `MAX_STAGED_IMAGES = 5` limit (`app.js:925-926`) is therefore not enforced.
+
+Suggested fix: compute available slots once, validate and slice the selected files synchronously, then start readers only for the accepted subset. Show one translated notice for rejected overflow rather than one dialog per file; alternatively include in-flight readers in a reserved-slot counter.
+
+### M12. Selecting another memory file silently discards unsaved edits
+
+Every file selection immediately changes `currentMemoryPath` and calls `cancelMemoryEdit()` (`app.js:2810-2817`), which hides the editor without checking whether its textarea differs from the loaded content (`app.js:2846-2849`). The editor wiring only handles explicit Edit, Save, and Cancel clicks (`app.js:6662-6664`); there is no dirty-state tracking or navigation warning. A stray click in the tree or breadcrumb can therefore lose an entire edit with no recovery path.
+
+Suggested fix: track the editor's baseline and dirty state. Before changing files, show the existing confirmation modal with Save/Discard/Stay choices (or prevent selection until the user saves/cancels), and apply the same guard to any action that leaves the editor.
+
+### M13. Toast notifications are not exposed to assistive technology
+
+The toast host is a plain `<div id="toasts">` (`index.html:445`), and `showToast()` appends plain `<div>`/`<span>` nodes before removing them four seconds later (`app.js:6430-6461`). Neither the container nor each toast has `aria-live`, `role="status"`, or `role="alert"`, so screen-reader users can miss send failures, save errors, install results, and other state changes that are communicated only through toasts.
+
+Suggested fix: make the toast host a polite live region for normal updates and give urgent error toasts `role="alert"`; mark decorative icons `aria-hidden="true"`. Keep messages in the accessibility tree long enough to be announced, and test successive queued toasts rather than replacing live-region content too quickly.
+
 ---
 
 ## Low
@@ -157,21 +187,29 @@ Suggested fix: add `rel="noopener noreferrer"` at the three sites.
 
 `publishSkill()` collects slug and version through two blocking `window.prompt()` dialogs (`app.js:5041-5043`) — the M2 call-site list covers `alert`/`confirm` but not these. Fold them into the same modal-consolidation pass (a small two-field dialog, or extend `#confirm-modal` with optional inputs).
 
+### L10. The tab ARIA roles do not implement keyboard tab navigation
+
+`applyAriaAttributes()` adds `tablist`, `tab`, `tabpanel`, `aria-selected`, and `aria-hidden` (`app.js:6617-6629`), but it does not connect tabs to panels with `aria-controls`/`aria-labelledby` or implement roving `tabindex`. All six tab buttons remain in the normal Tab sequence, and their only navigation handler is click (`app.js:2628-2633`), so arrow keys, Home, and End do not move among tabs as keyboard and screen-reader users expect.
+
+Suggested fix: give each tab a stable ID and `aria-controls`, point each panel back with `aria-labelledby`, keep only the active tab at `tabindex="0"`, and handle Left/Right (or Up/Down where appropriate), Home, and End while moving focus and selection together.
+
 ---
 
 ## Suggested implementation order
 
-1. **H1** (vendor DOMPurify/marked + non-empty fallback + tighten CSP `script-src`) — small diff, fixes total message loss offline.
-2. **M5** (jobs table header) — one-line `index.html` fix plus a small `loadJobs()` rebuild cleanup; visible on every Jobs view.
-3. **M7** (auth-expiry path) — small, prevents a stuck-forever reconnect loop after token rotation.
-4. **M4** (logs stick-to-top) — few lines, big daily-usability win.
-5. **M2 + M3 + L9** (modal/toast consolidation + i18n keys, incl. `window.prompt`) — one sweep, mostly mechanical.
-6. **M6** (history timestamps) — localized change, high polish value for long-lived threads.
-7. **M8** (restart-loader watchdog) — small, prevents a dead-end modal on failed restarts.
-8. **H2** (mobile "More" menu + status dot), **M1** (table scroll wrappers), **L6** (popover triggers) — mobile/touch pass, bundle together.
-9. **M9** (`escapeAttr`) + **L8** (`noopener`) — small hardening sweep.
-10. **L1–L3**, **L5** (hljs dead code), **L7** (visibility-gated polling) — opportunistic cleanups.
-11. **L4** — only alongside planned gateway auth work.
+1. **H3 + M12** (memory read race + unsaved-edit guard) — first because the current UI can overwrite one file with another file's content.
+2. **H1** (vendor DOMPurify/marked + non-empty fallback + tighten CSP `script-src`) — small diff, fixes total message loss offline.
+3. **M10 + M11** (attachment retry payload + synchronous slot reservation) — one image-upload reliability pass.
+4. **M5** (jobs table header) — one-line `index.html` fix plus a small `loadJobs()` rebuild cleanup; visible on every Jobs view.
+5. **M7** (auth-expiry path) — small, prevents a stuck-forever reconnect loop after token rotation.
+6. **M4** (logs stick-to-top) — few lines, big daily-usability win.
+7. **M2 + M3 + M13 + L9** (modal/toast consolidation, live-region semantics, and i18n keys, including `window.prompt`) — one mostly mechanical sweep.
+8. **M6** (history timestamps) — localized change, high polish value for long-lived threads.
+9. **M8** (restart-loader watchdog) — small, prevents a dead-end modal on failed restarts.
+10. **H2** (mobile "More" menu + status dot), **M1** (table scroll wrappers), **L6 + L10** (accessible popovers and tab keyboard behavior) — mobile/accessibility pass.
+11. **M9** (`escapeAttr`) + **L8** (`noopener`) — small hardening sweep.
+12. **L1–L3**, **L5** (hljs dead code), **L7** (visibility-gated polling) — opportunistic cleanups.
+13. **L4** — only alongside planned gateway auth work.
 
 ## Out of scope / intentionally not suggested
 

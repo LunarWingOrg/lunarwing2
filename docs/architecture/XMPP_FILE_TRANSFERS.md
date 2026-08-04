@@ -69,7 +69,7 @@ All inbound logic lives in `ic/src/channels/xmpp/mod.rs`.
 
 ### URL extraction (`extract_inbound_attachments`)
 
-1. `collect_oob_urls(payloads, MAX_OOB_ATTACHMENTS)` — parses `<x xmlns='jabber:x:oob'>` elements (via `Oob::try_from`), capped at 10 per stanza.
+1. `collect_oob_urls(payloads, MAX_OOB_ATTACHMENTS + 1)` — parses `<x xmlns='jabber:x:oob'>` elements (via `Oob::try_from`). The effective cap is all-or-nothing: a stanza with more than 10 URLs has its body cleared and **no** downloads attempted.
 2. `collect_aesgcm_urls(body, …)` — scans the **decrypted body** for `aesgcm://` URLs and adds any not already present (deduped, same cap). This covers encrypted files whose client omits the cleartext OOB element. Plain `https://` links in a body are intentionally **not** auto-downloaded.
 3. Downloads run with **bounded concurrency** (`buffered`, ≤4 at once) so one slow URL can't serialize the batch and stall the single client event loop. Results stay in stanza order; per-URL failures are logged and skipped.
 
@@ -89,7 +89,7 @@ The last URL path segment is used, with any query/fragment stripped. A missing e
 
 ### Body deduplication / empty-body handling
 
-- When the message body exactly equals an attachment's `source_url` (the common client pattern, and the `aesgcm://`-only-in-body case), the body is cleared so the agent doesn't see a redundant raw URL alongside the structured attachment.
+- Every recognized attachment URL (downloaded or not) is stripped from the message body before it reaches the model, even when embedded mid-sentence; the body ends up empty only when nothing else remains. Whole-body clearing applies when the URL count exceeds the cap.
 - Messages with no text body but a valid attachment URL are accepted rather than dropped.
 
 ### Bridge transport
@@ -108,6 +108,8 @@ The WASM XMPP channel (`ic/channels-src/xmpp/src/lib.rs`) decodes inbound attach
 | Concurrent inbound downloads | 4 (`MAX_CONCURRENT_OOB_DOWNLOADS`) | XmppChannel |
 | Per-file download size (enforced while streaming) | 20 MB (`OOB_MAX_FILE_SIZE`) | XmppChannel |
 | Download timeout | 30 seconds | XmppChannel (reqwest client) |
+| Download DNS resolution timeout | 5 seconds (`OOB_DNS_TIMEOUT_SECS`) | XmppChannel (egress guard) |
+| Attachment extraction timeout | 60 seconds (`OOB_EXTRACTION_TIMEOUT_SECS`) | XmppChannel |
 | Per-attachment store | 20 MB | WASM host (`store_attachment_data`) |
 | Total attachment store per callback | 50 MB | WASM host |
 | Decoded image size for LunarVision enrichment | 10 MB | VisionEnrichmentMiddleware + OCR sidecar |
@@ -166,7 +168,7 @@ Encrypted file shares are handled end-to-end:
 
 ## Security Notes
 
-- Inbound downloads fetch sender-supplied URLs. There is currently **no SSRF guard** on this path: private, loopback, link-local, and metadata addresses are not blocked, and `ALLOW_PRIVATE_IPS` does not change that because the downloader never calls the config URL validator. Deployments must enforce outbound network controls. A future phase can reuse `config/helpers.rs::validate_base_url`, whose strict mode rejects internal addresses and whose `ALLOW_PRIVATE_IPS=1` mode permits parseable HTTP(S) URLs; its blocking DNS resolution must run through `spawn_blocking` if called from this async hot path.
+- Inbound downloads fetch sender-supplied URLs through an egress guard (`policy_checked_download_client`): https-only by default (plain http only when `ALLOW_PRIVATE_IPS=1`), embedded credentials rejected, DNS resolved up front with non-public addresses (private/loopback/link-local/CGNAT/ULA/unspecified/broadcast/multicast) blocked unless `ALLOW_PRIVATE_IPS=1` opts out, the client pinned to the validated addresses (anti-rebind), and redirects plus environment proxies disabled. Both download paths (`download_oob_file`, `download_aesgcm_file`) use it.
 - Size limits are enforced during streaming, and the per-stanza URL count and download concurrency are bounded, so a crafted stanza cannot exhaust memory or stall the connection.
 - The local bridge HTTP surface rejects non-loopback clients. When `XMPP_BRIDGE_TOKEN` is configured, it also requires Bearer authentication before configure, poll, and send operations.
 - Automatic LunarVision requests accept only `http://localhost` or loopback-IP base URLs, disable redirects and environment proxies, inject configured `VISION_AUTH_TOKEN` from `SecretString`, and cap both sidecar response and model-visible extraction sizes. An incompatible URL disables this automatic path without aborting daemon startup. The accepted message's text is never forwarded to the sidecar; a fixed prompt drives analysis. Enrichment runs inside normal message timeout supervision after inbound hooks.
@@ -175,7 +177,7 @@ Encrypted file shares are handled end-to-end:
 
 ## Implementation Status
 
-Implemented and unit-tested (`cargo test channels::xmpp`); the standalone `xmpp-bridge` builds in release. Delivered in four phases:
+Implemented and unit-tested (`cargo test channels::xmpp`); the standalone `xmpp-bridge` builds in release. Delivered in five phases:
 
 1. **Capability advertisement** — `disco#info` responder, ping, `service-unavailable` for other IQs, XEP-0115 caps in presence.
 2. **Download hardening** — bounded concurrency, per-stanza URL cap, streaming size enforcement.
@@ -183,4 +185,4 @@ Implemented and unit-tested (`cargo test channels::xmpp`); the standalone `xmpp-
 4. **Filename robustness** — `filename_from_url` (no longer drops extensionless/opaque names).
 5. **Automatic LunarVision enrichment** — bounded OCR/VL preprocessing with optional host-side Bearer auth, shared by legacy and Engine V2 while preserving original multimodal image input.
 
-**Remaining:** live end-to-end validation against a real server (e.g. Conversations/Gajim → agent over a working XEP-0363 host); an inbound-download SSRF guard. These remain file-transfer hardening work, not gaps in LunarVision routing.
+**Remaining:** live end-to-end validation against a real server (e.g. Conversations/Gajim → agent over a working XEP-0363 host). This remains file-transfer hardening work, not a gap in LunarVision routing.

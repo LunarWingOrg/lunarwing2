@@ -2,17 +2,15 @@
 
 > Claws are overrated. Grow your wings and fly.
 
-LunarWing is a self-hosted, privacy-focused AI agent runtime and operations platform written in Rust. It connects agents to open communication protocols, extensible WASM tools, and operator-controlled infrastructure.
-
-It is the only agent with an actual evolving health system and the only agent platform that actually addresses privacy and security seriously.
+LunarWing is a self-hosted, privacy-focused AI agent runtime and operations platform written in Rust. It connects agents to open communication protocols, extensible tools, persistent memory, and operator-controlled infrastructure. Security boundaries, approvals, secret handling, health monitoring, and recoverable service operation are part of the platform rather than optional deployment afterthoughts.
 
 <p align="center">
   <img src="./lw2_a.jpg" alt="LunarWing" width="1400">
 </p>
 
-## v2
+## LunarWing v2
 
-The v2 line introduces a new execution engine (Engine V2), a browser-based multi-tenant onboarding console, richer gateway interactions, a refreshed foundation for skills, memory, workers, and tools, and much more.
+The v2 line combines a channel-neutral execution engine, an interactive browser gateway, production multi-tenancy, persistent memory, extensible tools and channels, and guided onboarding and migration workflows.
 
 ## Quick links
 
@@ -21,7 +19,7 @@ The v2 line introduces a new execution engine (Engine V2), a browser-based multi
 - [Documentation index](docs/README.md)
 - [Community guide](COMMUNITY.md)
 - [Project manifesto](MANIFESTO.md)
-- [Canonical source on Gitlab](https://git.lunarwing.org/lunarwing/lunarwing2)
+- [Canonical source on GitLab](https://git.lunarwing.org/lunarwing/lunarwing2)
 - [IRC: #lunarwing on Libera.Chat](https://web.libera.chat/?channel=#lunarwing)
 - [AGPL-3.0-or-later license](LICENSE)
 
@@ -29,7 +27,7 @@ The v2 line introduces a new execution engine (Engine V2), a browser-based multi
 
 - **Operator controlled** — run the agent, database, providers, workers, and communication bridges on infrastructure you control.
 - **Open communication** — prioritize XMPP, IRC through WeeChat, DarkIRC, and other open or self-hostable paths.
-- **Extensible by design** — add sandboxed WASM tools and channel adapters without folding every integration into the core daemon.
+- **Extensible by design** — add sandboxed WASM tools, channel adapters, and external MCP servers without folding every integration into the core daemon.
 - **Secret-aware operations** — encrypted secret storage and tenant-scoped operational tooling are built into the deployment model.
 - **Production multi-tenancy** — isolate tenants with separate OS users, services, databases, ports, configuration, and optional workers.
 - **Reliable automation** — scheduled routines, retry and backoff, health checks, and self-healing tooling support unattended operation.
@@ -39,44 +37,43 @@ The v2 line introduces a new execution engine (Engine V2), a browser-based multi
 
 ### Engine V2 and the gateway
 
-Engine V2 provides the channel-neutral execution path used by the v2 gateway, including streaming events, interrupts, stop handling, approval gates, and richer tool-result presentation. New multi-tenant configurations enable Engine V2 by default; direct single-instance configurations must opt in explicitly.
+Engine V2 provides the channel-neutral thread, capability, and CodeAct execution path used by the v2 gateway. It supports streamed events, interrupts, stop handling, approval gates, and rich tool results. New multi-tenant configurations enable Engine V2 by default; direct single-instance configurations must opt in.
 
 The gateway receives the full interactive experience. XMPP, DarkIRC, and WeeChat can opt in through `ENGINE_V2_CHANNELS`; other channels remain on the legacy path. Opted-in WASM channels currently receive terminal responses and status updates rather than live token edits. Validate channel-specific behavior before enabling Engine V2 for group channels.
 
 Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 
-### Channels and interfaces
+### Channels, tools, and workers
 
 - Browser gateway, CLI, and HTTP interfaces
 - WASM channels for XMPP, WeeChat, DarkIRC, and Multica
 - XMPP file attachments via XEP-0363 HTTP File Upload
 - WeeChat buffer restoration across service restarts and clean reboots
-- HTTP/HTTPS plus host-local stdio and Unix MCP with validated install, lifecycle
-  controls, safe stdio crash recovery, live updates/removal, diagnostics, and
-  owner-scoped secrets
+- HTTP/HTTPS plus host-local stdio and Unix MCP with validated lifecycle controls, safe stdio crash recovery, live updates and removal, diagnostics, and owner-scoped secrets
 - Optional Gotify notifications, SSH tooling, NetBird tunnels, and LunarVision OCR integration
+- Persistent Pebble, OpenCode, and Kimi Code worker containers
 
-DarkIRC is opt-in. It is neither rendered nor built for a new tenant unless the operator enables it during tenant creation and builds its supporting service.
+DarkIRC is opt-in. It is not rendered or built for a new tenant unless the operator enables it and builds its supporting service. External-worker choice is stored when a tenant is created; build flags prepare the matching shared image but do not change an existing tenant's selection.
 
-### External workers
+### Memory, lorebooks, and learning
 
-LunarWing can attach persistent Pebble, OpenCode, or Kimi Code worker containers. Worker choice is stored when the tenant is created. Matching `build-tenant --with-*` flags build the shared image; they do not change the worker selected for an existing tenant.
+LunarWing workspace memory provides durable file-like documents and hybrid full-text and vector search on PostgreSQL and libSQL. Vector search activates when an embedding provider is configured; keyword search remains available without one. See [Semantic memory search](docs/architecture/SEMANTIC-MEMORY-SEARCH.md).
 
-### Skills and self-improvement
+Bounded [lorebooks](docs/proposals/LOREBOOKS.md) load a supported subset of SillyTavern World Info JSON and inject only entries activated by the current conversation. Prompt-injection checks run when lorebooks are written and loaded, and activation in group chats is disabled by default.
 
-Skills extend the agent with reusable prompt-driven capabilities. When
-`SKILL_SELF_IMPROVEMENT` is enabled, learning missions can extract reusable
-Skill documents from completed threads: terminal thread events fire the
-missions with their trigger payload, and the results persist into workspace
-memory. Skill patches and prunes remain propose-only until explicit user
-approval.
+Skills add reusable prompt-driven capabilities. Optional self-improvement missions can extract reusable skill documents from completed threads, while skill patches and removals remain proposals until a user approves them.
+
+### Automation, coordination, and health
+
+The optional reflex compiler detects recurring prompts and compiles them into WASM fast paths that can bypass repeated LLM work. Exact and fuzzy matching stay local; semantic matching is a separate opt-in because its embedding provider may be remote.
+
+An opt-in [multi-agent coordination pipeline](docs/proposals/MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md) adds tagged-message policy, secret detection, engagement and first-responder controls, rate limiting, violation-based disabling, and outbound coalescing for designated XMPP or IRC rooms. It is disabled unless explicitly configured.
+
+The included [infrastructure health system](ic-infrastructure-health-check/README.md) aggregates service and dependency checks and can remediate unhealthy services with grace periods, exponential backoff, flapping protection, and post-restart verification. Its multi-tenant service and port discovery supports both systemd and OpenRC.
 
 ### Model providers
 
-| Provider path | Intended use |
-| --- | --- |
-| `openai_compatible` | OpenAI-compatible endpoints, including compatible routing gateways such as Tensorzero|
-| `ollama` | Local Ollama deployments |
+The built-in registry supports local Ollama and OpenAI-compatible endpoints, including compatible routing gateways such as TensorZero. Operators can add or override declarative provider definitions without changing Rust code.
 
 ## Get started with the onboarding GUI
 
@@ -96,7 +93,7 @@ Demo mode does not create tenants or modify host services. The launcher still cr
 
 The supported production path assumes Python 3.10 or newer with `venv` and pip, a Linux host using systemd or OpenRC, root or sudo access, Docker or Podman, `jq`, `git`, download access on first launch, and adequate time and disk space for builds.
 
-For distro-specific prerequisites, see: docs/guides/
+Review the [distribution-specific prerequisites](docs/guides/) before provisioning, then run the host doctor:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh doctor
@@ -185,22 +182,13 @@ Kawarimi supports PostgreSQL tenants; libSQL bundles are refused. A real export 
 
 ## Development and testing
 
-The Rust workspace lives under `ic/` and uses Rust 1.96.1 (edition 2024, rust-version 1.96.1).
+The Rust workspace lives under `ic/` and uses Rust 1.96.1 with edition 2024. On a resource-constrained development host, limit Cargo to six CPUs and prefer `cargo check` over a full debug build:
 
 ```bash
 cd ic
-cargo fmt --all -- --check
-cargo check -j6
-cargo test -j6 -- --test-threads=6
-```
-
-Normal development and test profiles retain line tables for useful backtraces without full
-variable-level debug information. Use the explicit full-debug profile only when an interactive
-debugger needs complete symbols:
-
-```bash
-cargo build --profile full-debug
-cargo test --profile full-debug
+taskset -c 0-5 cargo fmt --all -- --check
+taskset -c 0-5 cargo check -j6
+taskset -c 0-5 cargo test -j6 -- --test-threads=6
 ```
 
 Additional test surfaces:
@@ -220,17 +208,12 @@ Additional test surfaces:
 | Production operations | [docs/ops/](docs/ops/) |
 | Known bugs and status | [docs/bugs/README.md](docs/bugs/README.md) |
 | Project blog | [https://blog.lunarwing.org/](https://blog.lunarwing.org/) |
-| Canonical source (Gitlab) | [https://git.lunarwing.org/lunarwing/lunarwing2](https://git.lunarwing.org/lunarwing/lunarwing2) |
-
-#### In order to help us expand documentation, we now have a knowledge MCP server (which will be integrated into LunarWing2 itself) - Please see: [pending]
+| Canonical source (GitLab) | [https://git.lunarwing.org/lunarwing/lunarwing2](https://git.lunarwing.org/lunarwing/lunarwing2) |
 
 ## Project and community
 
 LunarWing focuses on user freedom, self-hostable infrastructure, and open communication protocols. Read the [manifesto](MANIFESTO.md) for the project philosophy and the [community guide](COMMUNITY.md) for participation details.
 
 [![Chat on IRC](https://img.shields.io/badge/IRC-%23lunarwing-00b0aa?style=for-the-badge&labelColor=000000)](https://web.libera.chat/?channel=#lunarwing)
-
-- [Project blog](https://blog.lunarwing.org/)
-- [Gitlab development repository](https://git.lunarwing.org/lunarwing/lunarwing2)
 
 LunarWing is self-funded and maintained by volunteers. The project is licensed under [AGPL-3.0-or-later](LICENSE).
