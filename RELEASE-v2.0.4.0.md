@@ -532,6 +532,7 @@ package, create a release artifact, or deploy a tenant.
 | `COORD_ENABLED` | `false` | Enables coordination hooks, gate, and administration for designated rooms |
 | `COORD_AGENT_ID` | required when enabled | Local coordination actor identity |
 | `COORD_CHANNELS` | empty | Exact room/destination scopes; a nonempty list also activates coalescing independently of `COORD_ENABLED` |
+| `COORD_XMPP_STATUS_UPDATES` | `false` | Allows transient thinking/tool/reasoning status chatter in configured XMPP coordination rooms |
 | `COORD_ADMIN_TOKEN` | required for admin API | Enables the loopback coordination administration service |
 | `COORD_ADMIN_PORT` | `18777` single-node | Loopback administration port; multi-tenant provisioning assigns a tenant port |
 | `COALESCE_ENABLED` | `true` | Enables coalescing for a nonempty `COORD_CHANNELS` list; set false to suppress it |

@@ -6,8 +6,81 @@ use std::sync::Arc;
 use futures::stream;
 use tokio::sync::{RwLock, mpsc};
 
-use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
+use crate::channels::{
+    Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate,
+    routing_target_from_metadata,
+};
 use crate::error::ChannelError;
+
+const COORD_ENABLED_ENV: &str = "COORD_ENABLED";
+const COORD_CHANNELS_ENV: &str = "COORD_CHANNELS";
+const COORD_XMPP_STATUS_UPDATES_ENV: &str = "COORD_XMPP_STATUS_UPDATES";
+
+#[derive(Debug, Clone, Default)]
+struct CoordinationStatusPolicy {
+    enabled: bool,
+    xmpp_status_updates: bool,
+    coordination_channels: Vec<String>,
+}
+
+impl CoordinationStatusPolicy {
+    fn from_env() -> Self {
+        Self {
+            enabled: env_flag(COORD_ENABLED_ENV),
+            xmpp_status_updates: env_flag(COORD_XMPP_STATUS_UPDATES_ENV),
+            coordination_channels: std::env::var(COORD_CHANNELS_ENV)
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn suppresses(
+        &self,
+        channel_name: &str,
+        status: &StatusUpdate,
+        metadata: &serde_json::Value,
+    ) -> bool {
+        if !self.enabled
+            || self.xmpp_status_updates
+            || !channel_name.eq_ignore_ascii_case("xmpp")
+            || !is_transient_progress(status)
+        {
+            return false;
+        }
+
+        let Some(scope) = routing_target_from_metadata(metadata) else {
+            return false;
+        };
+        self.coordination_channels
+            .iter()
+            .any(|configured| configured.eq_ignore_ascii_case(&scope))
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn is_transient_progress(status: &StatusUpdate) -> bool {
+    matches!(
+        status,
+        StatusUpdate::Thinking(_)
+            | StatusUpdate::ToolStarted { .. }
+            | StatusUpdate::ToolCompleted { .. }
+            | StatusUpdate::ToolResult { .. }
+            | StatusUpdate::StreamChunk(_)
+            | StatusUpdate::ReasoningUpdate { .. }
+    )
+}
 
 /// Manages multiple input channels and merges their message streams.
 ///
@@ -18,16 +91,24 @@ pub struct ChannelManager {
     inject_tx: mpsc::Sender<IncomingMessage>,
     /// Taken once in `start_all()` and merged into the stream.
     inject_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingMessage>>>,
+    coordination_status_policy: CoordinationStatusPolicy,
 }
 
 impl ChannelManager {
     /// Create a new channel manager.
     pub fn new() -> Self {
+        Self::with_coordination_status_policy(CoordinationStatusPolicy::from_env())
+    }
+
+    fn with_coordination_status_policy(
+        coordination_status_policy: CoordinationStatusPolicy,
+    ) -> Self {
         let (inject_tx, inject_rx) = mpsc::channel(64);
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
             inject_tx,
             inject_rx: tokio::sync::Mutex::new(Some(inject_rx)),
+            coordination_status_policy,
         }
     }
 
@@ -159,6 +240,18 @@ impl ChannelManager {
         status: StatusUpdate,
         metadata: &serde_json::Value,
     ) -> Result<(), ChannelError> {
+        if self
+            .coordination_status_policy
+            .suppresses(channel_name, &status, metadata)
+        {
+            tracing::debug!(
+                channel = channel_name,
+                scope = ?routing_target_from_metadata(metadata),
+                "Suppressed transient status in coordination channel"
+            );
+            return Ok(());
+        }
+
         let channels = self.channels.read().await;
         if let Some(channel) = channels.get(channel_name) {
             channel.send_status(status, metadata).await
@@ -258,6 +351,63 @@ mod tests {
     use crate::channels::IncomingMessage;
     use crate::testing::StubChannel;
     use futures::StreamExt;
+
+    fn coordination_policy(xmpp_status_updates: bool) -> CoordinationStatusPolicy {
+        CoordinationStatusPolicy {
+            enabled: true,
+            xmpp_status_updates,
+            coordination_channels: vec!["ops@conference.example".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn coordination_xmpp_suppresses_transient_status_only_in_configured_room() {
+        let manager = ChannelManager::with_coordination_status_policy(coordination_policy(false));
+        let (stub, _) = StubChannel::new("xmpp");
+        let statuses = stub.captured_statuses_handle();
+        manager.add(Box::new(stub)).await;
+
+        let coord_metadata = serde_json::json!({
+            "xmpp_target": "OPS@conference.example",
+            "xmpp_type": "groupchat"
+        });
+        let other_metadata = serde_json::json!({
+            "xmpp_target": "general@conference.example",
+            "xmpp_type": "groupchat"
+        });
+        let reasoning = StatusUpdate::reasoning_for_tools(&["memory_read".to_string()])
+            .expect("reasoning status");
+
+        manager
+            .send_status("xmpp", reasoning.clone(), &coord_metadata)
+            .await
+            .expect("coordination status suppression");
+        manager
+            .send_status("xmpp", reasoning, &other_metadata)
+            .await
+            .expect("normal room status delivery");
+        manager
+            .send_status(
+                "xmpp",
+                StatusUpdate::Status("service warning".to_string()),
+                &coord_metadata,
+            )
+            .await
+            .expect("non-transient coordination status delivery");
+
+        let captured = statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 2);
+        assert!(matches!(captured[0], StatusUpdate::ReasoningUpdate { .. }));
+        assert!(matches!(captured[1], StatusUpdate::Status(_)));
+    }
+
+    #[test]
+    fn coordination_xmpp_status_override_restores_progress() {
+        let policy = coordination_policy(true);
+        let metadata = serde_json::json!({ "xmpp_target": "ops@conference.example" });
+        let status = StatusUpdate::Thinking("working".to_string());
+        assert!(!policy.suppresses("xmpp", &status, &metadata));
+    }
 
     #[tokio::test]
     async fn test_add_and_start_all() {
