@@ -128,7 +128,7 @@ Common changes include:
 sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-wasm
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <tenant>
 sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
-sudo ic/scripts/lunarwing-mt-admin.sh doctor <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh doctor
 ```
 
 On first start, LunarWing applies every pending migration in the current `ic/migrations/` chain. Do not check only for the historical V18 routine migration; compare the highest applied version with the migration files in the deployed commit and inspect logs for failures.
