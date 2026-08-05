@@ -259,6 +259,9 @@ pub struct AgentDeps {
     /// the engine v2 effect adapter blocks tool execution for disabled
     /// agents (ISSUE-003).
     pub coordination_gate: Option<Arc<crate::gate::coordination::CoordinationGate>>,
+    /// Host-authored response-format instruction for configured coordination
+    /// destinations. Keeps persona/style prompts from causing schema strikes.
+    pub coordination_prompt_policy: Option<crate::hooks::CoordinationPromptPolicy>,
     /// Shared outbound coalesce buffer for coordination channels (Phase 4,
     /// ISSUE-002). Transport-independent: lives at the agent's outbound
     /// boundary so native and installable WASM channels coalesce alike.
@@ -1586,6 +1589,7 @@ impl Agent {
         if let Submission::UserInput { ref content } = submission {
             let event = crate::hooks::HookEvent::Inbound {
                 user_id: message.user_id.clone(),
+                sender_id: Some(message.sender_id.clone()),
                 channel: message.channel.clone(),
                 content: content.clone(),
                 thread_id: message.thread_id.clone(),

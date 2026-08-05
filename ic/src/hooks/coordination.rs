@@ -8,7 +8,7 @@
 //! - [`SecretEntropyHook`] (priority 5) — Shannon-entropy secret detection
 //! - [`EngagementPolicyHook`] (priority 15) — only respond when targeted
 //! - [`FirstResponderHook`] (priority 16) — one agent claims a message
-//! - [`TagSchemaHook`] (priority 20) — messages must start with an allowed tag
+//! - [`TagSchemaHook`] (priority 14) — messages must start with an allowed tag
 //! - [`RateLimitHook`] (priority 25) — 2 messages/hour per agent
 //!
 //! All hooks are no-ops outside the configured coordination channels, and
@@ -145,6 +145,43 @@ impl CoordinationHookConfig {
         self.enabled
             && valid_coordination_agent_id(&self.agent_id)
             && !self.coordination_channels.is_empty()
+    }
+}
+
+/// Per-turn system instruction for model responses in coordination channels.
+#[derive(Debug, Clone)]
+pub struct CoordinationPromptPolicy {
+    channel_matcher: regex::Regex,
+    instruction: Arc<str>,
+}
+
+impl CoordinationPromptPolicy {
+    /// Build a prompt policy when coordination hooks are actionable.
+    pub fn from_config(config: &CoordinationHookConfig) -> Option<Self> {
+        if !config.is_actionable() {
+            return None;
+        }
+        let channel_matcher =
+            regex::Regex::new(&coordination_channel_guard(&config.coordination_channels)).ok()?;
+        let instruction = format!(
+            "Coordination-channel protocol overrides persona and style instructions for this turn. \
+             Final user-visible response (inside <final> when required) must be one line, at most {} \
+             characters, and begin immediately with one of these tags followed by a colon: {}. \
+             Put no preamble before the tag. Use concise operational prose only; no markdown or roleplay.",
+            config.max_message_length,
+            config.allowed_tags.join(", ")
+        );
+        Some(Self {
+            channel_matcher,
+            instruction: instruction.into(),
+        })
+    }
+
+    /// Return model instruction only for an exact configured destination.
+    pub fn instruction_for_scope(&self, scope: &str) -> Option<&str> {
+        self.channel_matcher
+            .is_match(scope)
+            .then_some(self.instruction.as_ref())
     }
 }
 
@@ -362,8 +399,16 @@ fn event_content(event: &HookEvent) -> Option<(&str, &str, &str, bool)> {
     let scope = event.policy_scope()?;
     match event {
         HookEvent::Inbound {
-            user_id, content, ..
-        } => Some((user_id, scope, content, false)),
+            user_id,
+            sender_id,
+            content,
+            ..
+        } => Some((
+            sender_id.as_deref().unwrap_or(user_id),
+            scope,
+            content,
+            false,
+        )),
         HookEvent::Outbound {
             user_id, content, ..
         } => Some((user_id, scope, content, true)),
@@ -491,7 +536,10 @@ impl Hook for EngagementPolicyHook {
         _ctx: &HookContext,
     ) -> Result<HookOutcome, HookError> {
         let HookEvent::Inbound {
-            user_id, content, ..
+            user_id,
+            sender_id,
+            content,
+            ..
         } = event
         else {
             return Ok(HookOutcome::ok());
@@ -502,8 +550,9 @@ impl Hook for EngagementPolicyHook {
         if !self.state.is_coordination_channel(scope).await {
             return Ok(HookOutcome::ok());
         }
+        let actor = sender_id.as_deref().unwrap_or(user_id);
         // Messages from this agent or from admins always pass.
-        if *user_id == self.agent_id || self.state.is_admin(user_id) {
+        if actor == self.agent_id || self.state.is_admin(actor) {
             return Ok(HookOutcome::ok());
         }
         if !self.is_targeted(content) {
@@ -599,7 +648,7 @@ impl Hook for FirstResponderHook {
     }
 }
 
-/// Priority 20 — messages in coordination channels must start with an
+/// Priority 14 — messages in coordination channels must start with an
 /// allowed tag, be single-line, and fit the length cap.
 pub struct TagSchemaHook {
     state: CoordinationState,
@@ -624,14 +673,25 @@ impl TagSchemaHook {
         }
     }
 
-    /// Event policy-scope/content for outbound-side events.
-    /// `ResponseTransform` events only participate when they carry a
-    /// channel or scope.
-    fn outbound_parts<'a>(&self, event: &'a HookEvent) -> Option<(&'a str, &'a str)> {
+    /// Actor, policy scope, and content for schema-scoped events.
+    /// Response transforms are attributed to the local emitting agent.
+    fn event_parts<'a>(&'a self, event: &'a HookEvent) -> Option<(&'a str, &'a str, &'a str)> {
         match event {
-            HookEvent::Outbound { content, .. } => Some((event.policy_scope()?, content)),
+            HookEvent::Inbound {
+                user_id,
+                sender_id,
+                content,
+                ..
+            } => Some((
+                sender_id.as_deref().unwrap_or(user_id),
+                event.policy_scope()?,
+                content,
+            )),
+            HookEvent::Outbound { content, .. } => {
+                Some((&self.agent_id, event.policy_scope()?, content))
+            }
             HookEvent::ResponseTransform { response, .. } => {
-                Some((event.policy_scope()?, response))
+                Some((&self.agent_id, event.policy_scope()?, response))
             }
             _ => None,
         }
@@ -660,12 +720,12 @@ impl Hook for TagSchemaHook {
     }
 
     fn hook_points(&self) -> &[HookPoint] {
-        // Single enforcement point (ISSUE-004): every model response passes
-        // TransformResponse exactly once per turn, including drain-loop
-        // intermediate responses that bypass BeforeOutbound. Registering
-        // both stages made one malformed response consume two strikes — the
-        // rejection replacement text reached BeforeOutbound untagged.
-        &[HookPoint::TransformResponse]
+        // Inbound validation prevents malformed room traffic from waking the
+        // model. Outbound validation stays at one point: every model response
+        // passes TransformResponse exactly once per turn. Registering both
+        // TransformResponse and BeforeOutbound made one malformed response
+        // consume two local-agent strikes (ISSUE-004).
+        &[HookPoint::BeforeInbound, HookPoint::TransformResponse]
     }
 
     fn failure_mode(&self) -> HookFailureMode {
@@ -677,25 +737,23 @@ impl Hook for TagSchemaHook {
         event: &HookEvent,
         _ctx: &HookContext,
     ) -> Result<HookOutcome, HookError> {
-        let Some((channel, content)) = self.outbound_parts(event) else {
+        let Some((agent, channel, content)) = self.event_parts(event) else {
             return Ok(HookOutcome::ok());
         };
         if !self.state.is_coordination_channel(channel).await {
             return Ok(HookOutcome::ok());
         }
         if content.contains('\n') || content.contains('\r') {
-            let agent = self.agent_id.clone();
             self.state
-                .record_violation(&agent, "multi-line message", self.name(), channel)
+                .record_violation(agent, "multi-line message", self.name(), channel)
                 .await;
             return Ok(HookOutcome::reject(
                 "coord: messages in coordination channels must be single-line",
             ));
         }
         if content.chars().count() > self.max_message_length {
-            let agent = self.agent_id.clone();
             self.state
-                .record_violation(&agent, "message too long", self.name(), channel)
+                .record_violation(agent, "message too long", self.name(), channel)
                 .await;
             return Ok(HookOutcome::reject(format!(
                 "coord: messages in coordination channels must not exceed {} characters",
@@ -703,9 +761,8 @@ impl Hook for TagSchemaHook {
             )));
         }
         if !self.starts_with_tag(content) {
-            let agent = self.agent_id.clone();
             self.state
-                .record_violation(&agent, "missing tag", self.name(), channel)
+                .record_violation(agent, "missing tag", self.name(), channel)
                 .await;
             return Ok(HookOutcome::reject(format!(
                 "coord: messages in coordination channels must start with one of: {}",
@@ -862,7 +919,7 @@ pub async fn register_coordination_hooks(
                 config.allowed_tags.clone(),
                 config.max_message_length,
             )),
-            20,
+            14,
         ),
         (
             Arc::new(RateLimitHook::new(
@@ -934,9 +991,20 @@ mod tests {
     fn inbound(user: &str, channel: &str, content: &str) -> HookEvent {
         HookEvent::Inbound {
             user_id: user.to_string(),
+            sender_id: Some(user.to_string()),
             channel: channel.to_string(),
             content: content.to_string(),
             thread_id: None,
+            policy_scope: None,
+        }
+    }
+
+    fn transformed(channel: &str, content: &str) -> HookEvent {
+        HookEvent::ResponseTransform {
+            user_id: "remote-peer".to_string(),
+            thread_id: "t-1".to_string(),
+            response: content.to_string(),
+            channel: Some(channel.to_string()),
             policy_scope: None,
         }
     }
@@ -1004,6 +1072,22 @@ mod tests {
         );
         assert!(state.is_admin("sun"));
         assert!(!state.is_admin("agent-2"));
+    }
+
+    #[test]
+    fn coordination_prompt_policy_is_exactly_channel_scoped() {
+        let policy = CoordinationPromptPolicy::from_config(&test_config())
+            .expect("actionable coordination config");
+        let instruction = policy
+            .instruction_for_scope("COORD@conference.example")
+            .expect("case-insensitive coordination channel match");
+        assert!(instruction.contains("STATUS, ALERT, COORD, ANNOUNCE, QUERY"));
+        assert!(instruction.contains("420 characters"));
+        assert!(
+            policy
+                .instruction_for_scope("other@conference.example")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1100,6 +1184,7 @@ mod tests {
             EngagementPolicyHook::new(test_state(), config.agent_id.clone(), config.agent_aliases);
         let scoped_inbound = |scope: &str| HookEvent::Inbound {
             user_id: "agent-2".to_string(),
+            sender_id: Some("agent-2".to_string()),
             channel: "xmpp".to_string(),
             content: "untargeted room chatter".to_string(),
             thread_id: None,
@@ -1185,9 +1270,9 @@ mod tests {
     }
 
     #[test]
-    fn test_tag_schema_enforces_at_transform_only() {
-        // ISSUE-004 regression: single enforcement point — one malformed
-        // response must cost exactly one strike.
+    fn test_tag_schema_enforces_inbound_and_once_outbound() {
+        // Inbound structure is checked before generation. Model output keeps
+        // one enforcement point so one malformed response costs one strike.
         let config = test_config();
         let hook = TagSchemaHook::new(
             test_state(),
@@ -1195,7 +1280,10 @@ mod tests {
             config.allowed_tags,
             config.max_message_length,
         );
-        assert_eq!(hook.hook_points(), &[HookPoint::TransformResponse]);
+        assert_eq!(
+            hook.hook_points(),
+            &[HookPoint::BeforeInbound, HookPoint::TransformResponse]
+        );
     }
 
     #[tokio::test]
@@ -1228,8 +1316,15 @@ mod tests {
     async fn test_engagement_allows_admin_and_casual_channels() {
         let config = test_config();
         let hook = EngagementPolicyHook::new(test_state(), config.agent_id, config.agent_aliases);
-        // Admin sender passes even untargeted.
-        let admin_event = inbound("sun", "coord@conference.example", "STATUS: hello room");
+        // Admin actor passes even when storage scope belongs to the owner.
+        let admin_event = HookEvent::Inbound {
+            user_id: "workspace-owner".to_string(),
+            sender_id: Some("sun".to_string()),
+            channel: "xmpp".to_string(),
+            content: "STATUS: hello room".to_string(),
+            thread_id: None,
+            policy_scope: Some("coord@conference.example".to_string()),
+        };
         assert!(matches!(
             hook.execute(&admin_event, &ctx()).await,
             Ok(HookOutcome::Continue { .. })
@@ -1251,13 +1346,70 @@ mod tests {
             config.allowed_tags,
             config.max_message_length,
         );
-        let event = outbound(
-            "agent-1",
+        let event = inbound(
+            "agent-2",
             "coord@conference.example",
             "just a plain message",
         );
         let outcome = hook.execute(&event, &ctx()).await;
         assert!(matches!(outcome, Ok(HookOutcome::Reject { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_tag_schema_inbound_strikes_sender_not_local_agent() {
+        let dir = std::env::temp_dir().join(format!(
+            "coord-tag-inbound-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let store = Arc::new(ViolationStore::new(
+            dir.join("violations.json"),
+            crate::gate::violation_store::ViolationStoreConfig {
+                max_violations: 3,
+                disable_duration_secs: 3600,
+                decay_secs: 600,
+            },
+        ));
+        let config = test_config();
+        let state = CoordinationState::new(
+            config.coordination_channels,
+            config.admin_users,
+            Some(Arc::clone(&store)),
+        );
+        let hook = TagSchemaHook::new(
+            state,
+            config.agent_id.clone(),
+            config.allowed_tags,
+            config.max_message_length,
+        );
+        let event = HookEvent::Inbound {
+            user_id: "workspace-owner".to_string(),
+            sender_id: Some("coord@conference.example/cmc".to_string()),
+            channel: "xmpp".to_string(),
+            content: "hello!".to_string(),
+            thread_id: None,
+            policy_scope: Some("coord@conference.example".to_string()),
+        };
+
+        assert!(matches!(
+            hook.execute(&event, &ctx()).await,
+            Ok(HookOutcome::Reject { .. })
+        ));
+        assert_eq!(
+            store.status("coord@conference.example/cmc"),
+            crate::gate::violation_store::ViolationStatus::Warning
+        );
+        assert_eq!(
+            store.status(&config.agent_id),
+            crate::gate::violation_store::ViolationStatus::Active
+        );
+        assert_eq!(
+            store.status("workspace-owner"),
+            crate::gate::violation_store::ViolationStatus::Active
+        );
     }
 
     #[tokio::test]
@@ -1269,7 +1421,7 @@ mod tests {
             config.allowed_tags,
             config.max_message_length,
         );
-        let event = outbound("agent-1", "general", "just a plain message");
+        let event = inbound("agent-2", "general", "just a plain message");
         let outcome = hook.execute(&event, &ctx()).await;
         assert!(matches!(outcome, Ok(HookOutcome::Continue { .. })));
     }
@@ -1283,8 +1435,8 @@ mod tests {
             config.allowed_tags,
             config.max_message_length,
         );
-        let ok_event = outbound(
-            "agent-1",
+        let ok_event = inbound(
+            "agent-2",
             "coord@conference.example",
             "STATUS: deploy complete",
         );
@@ -1323,13 +1475,12 @@ mod tests {
         let config = test_config();
         let max = config.max_message_length;
         let hook = TagSchemaHook::new(test_state(), config.agent_id, config.allowed_tags, max);
-        let multiline = outbound("agent-1", "coord@conference.example", "STATUS: one\ntwo");
+        let multiline = transformed("coord@conference.example", "STATUS: one\ntwo");
         assert!(matches!(
             hook.execute(&multiline, &ctx()).await,
             Ok(HookOutcome::Reject { .. })
         ));
-        let long = outbound(
-            "agent-1",
+        let long = transformed(
             "coord@conference.example",
             &format!("STATUS: {}", "x".repeat(max + 1)),
         );
@@ -1357,7 +1508,7 @@ mod tests {
                 format!("{tag} "),
                 String::new(),
             ] {
-                let event = outbound("agent-1", "coord@conference.example", &content);
+                let event = transformed("coord@conference.example", &content);
                 let outcome = hook.execute(&event, &ctx()).await;
                 assert!(
                     matches!(outcome, Ok(HookOutcome::Reject { .. })),
@@ -1365,11 +1516,7 @@ mod tests {
                 );
             }
             // Tag plus colon (with body) is well-formed and passes.
-            let ok = outbound(
-                "agent-1",
-                "coord@conference.example",
-                &format!("{tag}: body"),
-            );
+            let ok = transformed("coord@conference.example", &format!("{tag}: body"));
             assert!(matches!(
                 hook.execute(&ok, &ctx()).await,
                 Ok(HookOutcome::Continue { .. })

@@ -990,6 +990,7 @@ mod tests {
     fn inbound_event(content: &str) -> HookEvent {
         HookEvent::Inbound {
             user_id: "user-1".to_string(),
+            sender_id: Some("user-1".to_string()),
             channel: "test".to_string(),
             content: content.to_string(),
             thread_id: None,
