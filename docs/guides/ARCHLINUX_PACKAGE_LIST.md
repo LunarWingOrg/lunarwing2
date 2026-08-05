@@ -101,15 +101,15 @@ sudo pacman -S --needed weechat tmux python-aiohttp
 
 ## 6. Python packages (ops tooling)
 
-The host-side Python tooling (multi-tenant onboard CLIs/web UI, Hermes importer, `ic_sm` secret
-scripts) needs these third-party modules. Arch's system Python is PEP-668 managed, so either
+The supported host-side Python tooling (multi-tenant onboard CLIs/web UI and Hermes importer)
+needs these third-party modules. Arch's system Python is PEP-668 managed, so either
 pacman-install the `python-*` packages **or** install the pinned requirements into a venv
 (`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`) — each tool ships one.
 
 | Package | Consumers |
 |---------|-----------|
-| `python-cryptography` | `ic_sm/scripts_4_db/*.py`, `lunarwing_mt_onboard/secrets_ops.py`, `hermes_kawarimi` (secrets crypto) |
-| `python-psycopg2` | Live tenant DB writes from the same secret tooling (`pip` equivalent: `psycopg2-binary`) |
+| `python-cryptography` | `lunarwing_mt_onboard/secrets_ops.py`, `hermes_kawarimi` (secrets crypto) |
+| `python-psycopg2` | Onboarding secret writes to tenant PostgreSQL (`pip` equivalent: `psycopg2-binary`) |
 | `python-rich` | `lunarwing_mt_onboard` CLI, `hermes_kawarimi` |
 | `python-questionary` | `lunarwing_mt_onboard` interactive CLI, `hermes_kawarimi` |
 | `python-yaml` | `hermes_kawarimi` (`config.yaml` parsing), `.gitlab/scripts/validate_config.py` (PyYAML) |

@@ -18,7 +18,7 @@ WASM channel (poll) ──GET──► ws_adapter.py (port base+9)
 WASM channel (send) ──POST──► WeeChat relay (direct)
 ```
 
-Three components per tenant:
+Three components participate when WeeChat is enabled (the default):
 
 | Component | Process | Description |
 |-----------|---------|-------------|
@@ -30,11 +30,17 @@ The adapter script lives at `lunarwing_weechat_wss/weechat_relay/ws_adapter.py` 
 
 ## Service Dependency Chain
 
-```
-lunarwing-weechat-<name> → lunarwing-weechat-adapter-<name> → lunarwing-<name>
+```text
+lunarwing-weechat-<name> → lunarwing-weechat-adapter-<name>
+                                      ↓
+                              lunarwing-<name>
 ```
 
-WeeChat must be running before the adapter starts. The adapter must be running before the main daemon starts. The MT admin script wires this automatically via `Requires=`/`After=` (systemd) or `need`/`before` (OpenRC).
+The adapter has a hard dependency on the WeeChat backend. The main daemon is
+ordered after and wants both services when `enable_weechat=true`, but they remain
+optional sidecars: a failed WeeChat start does not become a hard daemon
+requirement. mt-admin renders the corresponding systemd `Requires=`/`After=` or
+OpenRC `need`/`before` relationships.
 
 ## Port Allocation
 
@@ -192,11 +198,15 @@ depend() {
 }
 ```
 
-**Conf.d for the main daemon** (`/etc/conf.d/lunarwing-<name>`) includes:
+**Conf.d for the main daemon** (`/etc/conf.d/lunarwing-<name>`) always includes
+the XMPP bridge and conditionally includes enabled sidecars:
 
+```text
+lunarwing_rc_need="xmpp-bridge-<name> [proxy when enabled] [weechat + adapter when enabled] [darkirc adapter when enabled]"
 ```
-lunarwing_rc_need="xmpp-bridge-<name> lunarwing-proxy-<name> lunarwing-weechat-<name> lunarwing-weechat-adapter-<name>"
-```
+
+The generated value contains real unit names, not the bracketed annotations
+above.
 
 ## WeeChat Relay Setup
 
@@ -222,7 +232,7 @@ Key properties of the automatic bootstrap:
 - **Non-fatal:** If the automatic bootstrap fails for any reason, base tenant provisioning continues. A prominent warning is printed showing the exact recovery command.
 - **Dedicated minimal env:** The WeeChat process receives only `RELAY_PASSWORD` through a dedicated, tenant-owned `env/weechat.env` file (mode `0600`). The full tenant `lunarwing.env` is never loaded into the WeeChat process, preventing unrelated DB, LLM, XMPP, and gateway secrets from being exposed.
 
-No manual interaction is required for a fresh tenant to receive a working relay.
+When bootstrap succeeds, a fresh tenant receives a working relay without manual interaction; otherwise use the printed recovery command.
 
 ### Disabling relay bootstrap: `--no-weechat-bootstrap`
 
@@ -249,6 +259,30 @@ The `add-tenant` summary line reports one of three WeeChat relay states:
 | `weechat relay:    disabled (--no-weechat-bootstrap)` | Opt-out succeeded. `weechat.env` written, no relay config generated. Run `configure-weechat-relay` to add a relay later. |
 
 If the minimal credential env could not be written (for example, `RELAY_PASSWORD` is absent from `lunarwing.env`), the summary shows `disabled (credential env setup failed)` and a warning is printed.
+
+### Disabling or re-enabling the WeeChat services
+
+`--no-weechat-bootstrap` does **not** disable WeeChat lifecycle. To turn the
+backend and adapter off intentionally, use the init-agnostic lifecycle command:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh disable-weechat <name>
+```
+
+The command first stops both units and removes their boot persistence, then sets
+`enable_weechat=false` in `/etc/lunarwing/ports.json` and re-renders the tenant
+without WeeChat dependencies. `start-tenant` leaves them off, and host health
+reports the intentionally disabled roles as `skipped` instead of restarting
+them. It fails without masking health if stop/disable or reconciliation fails.
+
+Restore the units, boot persistence, and processes with:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh enable-weechat <name>
+```
+
+The absent registry flag defaults to enabled for tenants created before this
+gate.
 
 #### Recovering an opted-out tenant
 

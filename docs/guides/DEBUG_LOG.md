@@ -1,91 +1,54 @@
-# debug and info
+# LunarWing Logging and Diagnostics
 
-  debug! (only visible with RUST_LOG=lunarwing=debug)                                                                                                                                               
-                                                                                                                                                                                                    
-  ┌─────────────────────────┬───────────────────────────────────────────────────────────────────────┐                                                                                               
-  │          File           │                                 What                                  │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ session.rs:341          │ start_turn: state transition (prev_state, turn_number, pending count) │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ thread_ops.rs:167       │ Hydrated thread from DB                                               │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ thread_ops.rs:184       │ Processing user input (message_id, thread_id, content_len)            │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ thread_ops.rs:203       │ process_user_input: initial thread state                              │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ thread_ops.rs:212       │ Checked thread state                                                  │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ thread_ops.rs:449,462   │ Drain loop / agentic loop dispatch details                            │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ thread_ops.rs:997       │ Ignoring stale approval (wrong state)                                 │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ thread_ops.rs:1005      │ process_approval: entering with AwaitingApproval                      │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ thread_ops.rs:1019      │ Ignoring stale approval (no pending found)                            │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ thread_ops.rs:1580      │ process_approval: rejection branch entered                            │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ thread_ops.rs:1598      │ process_approval: rejection state transitions                         │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ thread_ops.rs:1626      │ process_approval: rejection final state before respond                │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ agent_loop.rs:951       │ HARD TIMEOUT: thread not in Processing, no action taken               │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ agent_loop.rs:364,389   │ Self-repair cycle timing                                              │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ agent_loop.rs:771       │ Routine cron tick                                                     │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ agent_loop.rs:1048      │ Empty response suppressed                                             │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ agent_loop.rs:1165,1179 │ handle_message entry / drain loop                                     │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ agent_loop.rs:1296+     │ Agentic loop internals                                                │                                                                                               
-  ├─────────────────────────┼───────────────────────────────────────────────────────────────────────┤                                                                                               
-  │ agent_loop.rs:1539      │ Suppressing silent reply token                                        │                                                                                               
-  └─────────────────────────┴───────────────────────────────────────────────────────────────────────┘
+LunarWing emits structured events through `tracing`. Do not rely on source line numbers when diagnosing a release; log locations move as the runtime changes.
 
-   info! (visible with RUST_LOG=lunarwing=info)                                                                                                                                                      
+## Choose a Log Level
 
-  ┌───────────────────────┬────────────────────────────────────────────────┐
-  │         File          │                      What                      │
-  ├───────────────────────┼────────────────────────────────────────────────┤
-  │ agent_loop.rs:814     │ Agent ready and listening                      │
-  ├───────────────────────┼────────────────────────────────────────────────┤
-  │ agent_loop.rs:832     │ Ctrl+C received                                │
-  ├───────────────────────┼────────────────────────────────────────────────┤
-  │ agent_loop.rs:1056    │ Shutdown command received                      │
-  ├───────────────────────┼────────────────────────────────────────────────┤
-  │ agent_loop.rs:1077    │ Agent shutting down                            │
-  ├───────────────────────┼────────────────────────────────────────────────┤
-  │ agent_loop.rs:444     │ Attempting to repair stuck job                 │
-  ├───────────────────────┼────────────────────────────────────────────────┤
-  │ agent_loop.rs:459     │ Repair succeeded                               │
-  ├───────────────────────┼────────────────────────────────────────────────┤
-  │ agent_loop.rs:513,535 │ Tool repair attempts/results                   │
-  ├───────────────────────┼────────────────────────────────────────────────┤
-  │ agent_loop.rs:1142    │ Routine notification                           │
-  ├───────────────────────┼────────────────────────────────────────────────┤
-  │ thread_ops.rs:386     │ Auto-compaction triggered (context % capacity) │
-  ├───────────────────────┼────────────────────────────────────────────────┤
-  │ thread_ops.rs:1046    │ Approval matched / resumed                     │
-  ├───────────────────────┼────────────────────────────────────────────────┤
-  │ thread_ops.rs:1726    │ (other info-level event)                       │
-  └───────────────────────┴────────────────────────────────────────────────┘
+The web gateway initializes the filter from `RUST_LOG`. Its default is:
 
+```text
+lunarwing=info,tower_http=warn
+```
 
- warn! (always visible — the sentinel logs)
+Useful temporary filters include:
 
-  Key ones from the baud-fix instrumentation:
-  - thread_ops.rs:275 — MESSAGE QUEUED: thread still in Processing state
-  - agent_loop.rs:903 — SOFT TIMEOUT: thread state snapshot
-  - agent_loop.rs:944 — HARD TIMEOUT: reset stuck thread from Processing to Idle
+```bash
+RUST_LOG=lunarwing=debug,tower_http=warn
+RUST_LOG=lunarwing=trace,tower_http=warn
+```
 
-  Plus all the pre-existing warns (persistence failures, hook blocks, routine errors, etc.).
+`trace` can be noisy and may expose more operational metadata than normal. Capture only the shortest interval needed, review logs before sharing them, and never publish secrets or tenant data.
 
-  error! (always visible)
+The authenticated web Logs view can change the LunarWing level at runtime to `trace`, `debug`, `info`, `warn`, or `error`. This updates the in-process filter only; it does not rewrite the service environment or survive a restart. The same authenticated API is exposed at `GET/PUT /api/logs/level`, with live events at `/api/logs/events` and a bounded download at `/api/logs/download`.
 
-  - thread_ops.rs:1614 — process_approval: rejection branch — thread missing when applying state!
-  - agent_loop.rs:890 — handle_message error
-  - agent_loop.rs:965 — JoinHandle panic recovery
-  - Plus pre-existing errors (repair failures, deferred task panics, etc.)
+## Read Service Logs
 
+For a single-node systemd user service:
+
+```bash
+systemctl --user status lunarwing.service
+journalctl --user -u lunarwing.service --since "15 minutes ago"
+journalctl --user -u lunarwing.service -f
+```
+
+For a multi-tenant installation, start with the init-agnostic admin command:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh doctor
+```
+
+Tenant units run under the tenant account's systemd user manager on systemd hosts and as OpenRC services on Gentoo. Do not diagnose a tenant with bare system-bus `systemctl`; it can report an inactive unit while the tenant is healthy.
+
+## What to Capture
+
+When reporting a problem, include:
+
+- the LunarWing commit or release version;
+- the active backend and init system, without credentials;
+- the failing command or request and timestamp;
+- a short log window covering the failure;
+- the MT admin `status` or `doctor` result for multi-tenant hosts;
+- reproduction steps and whether the issue survives a clean service restart.
+
+Prefer stable event messages and structured fields such as session, thread, turn, job, or tool identifiers. Exact source file line numbers are not a durable troubleshooting interface.

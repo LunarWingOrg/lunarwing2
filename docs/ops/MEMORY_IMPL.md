@@ -1,1 +1,7 @@
-17. [ ] memory_impl: implement third party memory cleaning, de-duping, correction routines into project. I've created several advanced memory de-duplication routines on my own which are being used across three production agents (on 1.1.2). My goal is to either integrate these routines into LunarWing directly, or make it easy for new users to import them. I'll look into adding more to this idea in this issue at some point. kind of just a stub for the timebeing. ** For this task I want you to help plan it out. Write up a doc in docs/proposals **
+# Memory Maintenance Planning Stub
+
+The requested design now lives in
+[`../proposals/MEMORY_MAINTENANCE_ROUTINES.md`](../proposals/MEMORY_MAINTENANCE_ROUTINES.md).
+It remains planned rather than implemented: current source does not provide the
+proposed routine-pack importer, maintenance proposal store, reviewed apply path,
+or bundled cleaning/de-duplication/correction routines.
