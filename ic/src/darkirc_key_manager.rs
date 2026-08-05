@@ -740,6 +740,37 @@ impl Workspace {
         Ok(directory)
     }
 
+    fn optional_directory_is_nonempty(&self, relative: &str) -> Result<Option<bool>> {
+        let parent = match self.open_relative_dir(parent_relative(relative)) {
+            Ok(directory) => directory,
+            Err(KeyManagerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let name = file_name(relative)?;
+        let metadata = match parent.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(KeyManagerError::Io(error)),
+        };
+        if !metadata.is_dir() {
+            return Err(KeyManagerError::UnsafePath);
+        }
+        let directory = parent
+            .open_dir_nofollow(name)
+            .map_err(KeyManagerError::Io)?;
+        validate_open_directory(&directory, self.paths.expected_uid, self.paths.expected_gid)?;
+        let nonempty = directory
+            .read_dir(".")
+            .map_err(KeyManagerError::Io)?
+            .next()
+            .transpose()
+            .map_err(KeyManagerError::Io)?
+            .is_some();
+        Ok(Some(nonempty))
+    }
+
     fn lock(&self) -> Result<FileLock> {
         let parent_lock = reopen_dir(&self.dir)?;
         lock_with_timeout(&parent_lock, true)?;
@@ -1462,25 +1493,11 @@ pub fn doctor_contacts(
     }
 
     for relative in [CANDIDATES_DIR, TRANSACTIONS_DIR, PENDING_DIR, ROLLBACK_DIR] {
-        let path = paths.darkirc_dir.join(relative);
-        if let Ok(metadata) = fs::symlink_metadata(&path) {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                issues.push(DoctorIssue {
-                    code: "unsafe-transaction-path".to_owned(),
-                    contacts: vec![relative.to_owned()],
-                });
-            } else if fs::read_dir(&path)
-                .map_err(KeyManagerError::Io)?
-                .next()
-                .transpose()
-                .map_err(KeyManagerError::Io)?
-                .is_some()
-            {
-                issues.push(DoctorIssue {
-                    code: "transactional-state-present".to_owned(),
-                    contacts: vec![relative.to_owned()],
-                });
-            }
+        if workspace.optional_directory_is_nonempty(relative)? == Some(true) {
+            issues.push(DoctorIssue {
+                code: "transactional-state-present".to_owned(),
+                contacts: vec![relative.to_owned()],
+            });
         }
     }
     issues.sort_by(|left, right| left.code.cmp(&right.code));
@@ -5129,6 +5146,18 @@ mod tests {
             .expect("secure config fixture");
     }
 
+    fn create_state_directory(paths: &TenantPaths, relative: &str) {
+        let mut path = paths.darkirc_dir().to_path_buf();
+        for component in relative.split('/') {
+            path.push(component);
+            if !path.exists() {
+                fs::create_dir(&path).expect("create state directory");
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("secure state directory");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_only_open_rejects_non_exact_directory_mode() {
@@ -5841,6 +5870,110 @@ my_dm_chacha_secret = "{bob_private}"
         assert!(codes.contains("unknown-contact-fields"));
         assert!(codes.contains("ledger-missing"));
         assert!(!paths.darkirc_dir().join(LEDGER_FILE).exists());
+    }
+
+    #[test]
+    fn doctor_allows_missing_transaction_directories() {
+        let (_temp, paths) = fixture();
+        write_config(&paths, "irc_listen = \"tcp://127.0.0.1:21001\"\n");
+
+        let report = doctor_contacts(&paths, None).expect("doctor missing directories");
+
+        assert!(report.issues.is_empty());
+        assert!(!paths.darkirc_dir().join(KEY_EXCHANGE_DIR).exists());
+    }
+
+    #[test]
+    fn doctor_ignores_empty_transaction_directory() {
+        let (_temp, paths) = fixture();
+        write_config(&paths, "irc_listen = \"tcp://127.0.0.1:21001\"\n");
+        create_state_directory(&paths, PENDING_DIR);
+
+        let report = doctor_contacts(&paths, None).expect("doctor empty directory");
+
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn doctor_reports_nonempty_transaction_directory() {
+        let (_temp, paths) = fixture();
+        write_config(&paths, "irc_listen = \"tcp://127.0.0.1:21001\"\n");
+        create_state_directory(&paths, PENDING_DIR);
+        fs::write(
+            paths.darkirc_dir().join(PENDING_DIR).join("pending.json"),
+            b"pending",
+        )
+        .expect("write pending marker");
+
+        let report = doctor_contacts(&paths, None).expect("doctor nonempty directory");
+
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == "transactional-state-present" && issue.contacts == [PENDING_DIR]
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_rejects_symlink_transaction_directory() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, paths) = fixture();
+        write_config(&paths, "irc_listen = \"tcp://127.0.0.1:21001\"\n");
+        create_state_directory(&paths, KEY_EXCHANGE_DIR);
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).expect("create symlink target");
+        symlink(&outside, paths.darkirc_dir().join(PENDING_DIR)).expect("create state symlink");
+
+        let error = doctor_contacts(&paths, None).expect_err("symlink must fail closed");
+
+        assert!(matches!(error, KeyManagerError::UnsafePath));
+    }
+
+    #[test]
+    fn doctor_rejects_non_directory_transaction_path() {
+        let (_temp, paths) = fixture();
+        write_config(&paths, "irc_listen = \"tcp://127.0.0.1:21001\"\n");
+        create_state_directory(&paths, KEY_EXCHANGE_DIR);
+        fs::write(paths.darkirc_dir().join(PENDING_DIR), b"not a directory")
+            .expect("write transaction path");
+
+        let error = doctor_contacts(&paths, None).expect_err("file must fail closed");
+
+        assert!(matches!(error, KeyManagerError::UnsafePath));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_rejects_bad_transaction_directory_mode() {
+        let (_temp, paths) = fixture();
+        write_config(&paths, "irc_listen = \"tcp://127.0.0.1:21001\"\n");
+        create_state_directory(&paths, PENDING_DIR);
+        fs::set_permissions(
+            paths.darkirc_dir().join(PENDING_DIR),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("weaken transaction directory mode");
+
+        let error = doctor_contacts(&paths, None).expect_err("bad mode must fail closed");
+
+        assert!(matches!(error, KeyManagerError::UnsafePath));
+    }
+
+    #[test]
+    fn doctor_transaction_inspection_is_read_only() {
+        let (_temp, paths) = fixture();
+        write_config(&paths, "irc_listen = \"tcp://127.0.0.1:21001\"\n");
+        create_state_directory(&paths, PENDING_DIR);
+        let marker = paths.darkirc_dir().join(PENDING_DIR).join("pending.json");
+        fs::write(&marker, b"unchanged").expect("write pending marker");
+
+        doctor_contacts(&paths, None).expect("read-only doctor");
+
+        assert_eq!(fs::read(marker).expect("read pending marker"), b"unchanged");
+        assert!(!paths.darkirc_dir().join(LEDGER_FILE).exists());
+        assert!(!paths.darkirc_dir().join(CANDIDATES_DIR).exists());
+        assert!(!paths.darkirc_dir().join(TRANSACTIONS_DIR).exists());
+        assert!(!paths.darkirc_dir().join(ROLLBACK_DIR).exists());
     }
 
     #[test]

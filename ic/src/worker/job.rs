@@ -505,8 +505,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         // Check approval: use context-aware check if available, else block all non-Never tools
         let requirement = tool.requires_approval(&normalized_params);
-        let blocked =
-            ApprovalContext::is_blocked_or_default(&deps.approval_context, tool_name, requirement);
+        let blocked = !tool.allows_autonomous_execution()
+            || ApprovalContext::is_blocked_or_default(
+                &deps.approval_context,
+                tool_name,
+                requirement,
+            );
         if blocked {
             return Err(autonomous_unavailable_error(tool_name, &job_ctx.user_id).into());
         }

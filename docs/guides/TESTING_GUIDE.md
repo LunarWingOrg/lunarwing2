@@ -46,7 +46,7 @@ For each enabled channel, test inbound and outbound delivery, sender identity, a
 - [ ] Create a fresh thread and continue an existing thread.
 - [ ] Switch threads while one has a pending approval; confirm the pending card is restored.
 - [ ] Approve once, deny, and use **Always** on a configurable tool.
-- [ ] Confirm intrinsically always-gated tools cannot be persisted as `always_allow`.
+- [ ] Confirm intrinsically always-gated tools cannot be persisted as `always_allow`, except built-in `ssh` after explicit user selection.
 - [ ] Enable supervised mode and confirm every tool action is gated, including normally auto-approved tools.
 - [ ] Trigger context compaction and verify the conversation remains usable.
 - [ ] Exercise a model/provider failure and verify bounded retry/failover behavior.

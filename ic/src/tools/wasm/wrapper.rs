@@ -1569,6 +1569,12 @@ impl Tool for WasmToolWrapper {
         approval_requirement_for(&self.capabilities)
     }
 
+    fn allows_autonomous_execution(&self) -> bool {
+        // A WASM tool granted the SSH capability can run remote commands —
+        // exclude it from autonomous jobs/routines, matching ssh/ssh_git.
+        self.capabilities.ssh.is_none()
+    }
+
     fn requires_sanitization(&self) -> bool {
         // WASM tools always require sanitization, they're untrusted by definition
         true

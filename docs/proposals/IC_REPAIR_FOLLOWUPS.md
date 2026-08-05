@@ -1,9 +1,8 @@
 # Self-Heal Repair Followups (triaged)
 
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** Notifier timeout,
-> truncated-state recovery, and systemd timer installation/removal have landed.
-> Escalation cooldown (6a) remains open; per-tenant application-level health
-> (10) remains deferred.
+> **Current status (2026-08-03): PARTIAL.** Notifier timeout, truncated-state
+> recovery, systemd timer installation/removal, and escalation cooldown have
+> landed. Per-tenant application-level health (10) remains deferred.
 
 Followups for the host-global health-check + self-heal pipeline
 (`ic-infrastructure-health-check/`: `infrastructure-health-check.sh` → `lunarwing-self-heal.sh`,
@@ -22,7 +21,7 @@ each item is directly actionable.
 | 6c | Notifier timeout | ✅ | trivial | **FIXED** `2b462f95` |
 | 6b | Truncated-state recovery | ✅ | easy | **FIXED** |
 | 2 | systemd `.timer/.service` scheduling | ✅ | moderate | **FIXED** |
-| 6a | Escalation cooldown / rate-limit | ✅ | moderate | do now (one design choice) |
+| 6a | Escalation cooldown / rate-limit | ✅ | moderate | **FIXED** |
 | 10 | Per-tenant app-level health (Pattern C) | ✅ | involved | **defer** (own design pass) |
 | 1 | Propagate 4 fixes to staging/prod | ❌ ops | n/a | mostly done — redeploy only |
 | 3 | Version bump 1.1.3→1.1.4 + test sweep | ❌ release | n/a | release prep |
@@ -63,17 +62,17 @@ Recovery already half-exists: `load_state` falls back to `{}` on parse failure a
   preserved for forensics while being last-wins / bounded — it cannot accumulate across recurring
   corruption. (An earlier draft used `.corrupt.<ts>`, which the "won't accumulate" comment contradicted.)
 - **Tests:** Section O in `test-self-heal-matrix.sh`, rewritten to actually exercise the path —
-  O1: non-empty truncated state → detect + rename + recover + complete; O2: a 0-byte file is valid,
-  not flagged; O3: single-slot rename leaves exactly one `.corrupt` after repeated corruption. Seeds
+  O1: non-empty truncated state → detect + rename + recover + complete; O2: a 0-byte file is corrupt,
+  quarantined, and replaced with `{}`; O3: single-slot rename leaves exactly one `.corrupt` after repeated corruption. Seeds
   corrupt bytes directly (not via `seed_state`, whose `jq -n` rejects malformed JSON to an empty file).
-  Full self-heal suite green: **188 passed / 0 failed** (regression 28, matrix 124, chaos 36).
+  Dry-run reports the quarantine action but preserves the original file; live recovery performs it.
 
 #### 2. Wire systemd `.timer/.service` scheduling — ✅ FIXED
 
 The implementation steps below are retained as the historical design record.
-`ensure_health_pipeline()` is OpenRC-only, so the prod systemd leg gets the hardened scripts but no
-auto-scheduling (G1/G2 stay open there). The launcher (`/usr/local/sbin/lunarwing-mt-health`) and all
-pipeline scripts are **already init-agnostic** — only the scheduling layer needs a systemd branch.
+`ensure_health_pipeline()` now installs either OpenRC scheduling or a systemd
+service/timer. The launcher (`/usr/local/sbin/lunarwing-mt-health`) and pipeline
+scripts remain shared and init-agnostic.
 All edits are in `ic/scripts/lunarwing-mt-admin.sh`:
 
 1. Delete the hard non-OpenRC skip at `:2235-2238`. Steps 1–4 (sync scripts, mkdir report dir, write
@@ -101,23 +100,18 @@ All edits are in `ic/scripts/lunarwing-mt-admin.sh`:
 
 ### Needs one design choice — do now
 
-#### 6a. Escalation cooldown / rate-limit — *moderate (~12–16 lines)*
-No cooldown exists today: `escalatedAt` is written at `:413` but never read, and escalate fires
-unconditionally at `:550` (flapping) and `:557` (max retries). A flap→recover→reflap loop can flood
-Gotify.
+#### 6a. Escalation cooldown / rate-limit — ✅ FIXED
 
-- **Change:** add `SELF_HEAL_ESCALATE_COOLDOWN="${SELF_HEAL_ESCALATE_COOLDOWN:-3600}"` near the
-  `FLAP_*` config block (~`:49`). Gate the page in `_send_notification` (`:464-478`): read a persisted
-  last-page epoch, and if `now - last < COOLDOWN`, skip the notifier (still keep `escalated=true` /
-  still write the escalation report) and log to stderr; on a sent page, write `now`.
-- **Design decision — must use a sidecar file, not a state.json field:** store the timestamp in
-  `$SELF_HEAL_STATE_DIR/.last_escalation_page`. A per-service cooldown in `state.json` would be erased
-  by `clear_service_state` (`:418`) and `prune_state` (`:449`) — which is exactly the flap cycle this
-  targets. `SELF_HEAL_STATE_DIR` is already per-tenant, so the sidecar is MT-isolated for free.
-- Keep all logic on stderr (the `:474` stdout-is-state-JSON hazard again).
-- *Alternative to weigh:* a purely-global cooldown can suppress a legitimately-distinct second
-  service's first page in the same outage — consider per-run aggregation into a single page instead.
-  Spec the sidecar approach first; it's still small enough to land with 6b/6c.
+Implemented as collision-resistant per-service sidecars under self-heal state.
+Cooldown starts only after notifier confirms delivery; missing Gotify token,
+notifier failure, timeout, or cooldown deferral leaves escalation pending for a
+later tick instead of setting the permanent `escalated` gate. Flap history now
+survives recovery, so repeated fail/recover cycles reach flap guard correctly.
+
+- Sidecars are named `.last_escalation_page.<safe-prefix>.<sha256>` so distinct
+  service names cannot collide after filename sanitization.
+- Sidecar state stays outside `state.json`, where recovery/pruning would erase it.
+- Notification and cooldown logs remain on stderr; stdout remains state JSON.
 
 ### Defer — needs its own design pass
 

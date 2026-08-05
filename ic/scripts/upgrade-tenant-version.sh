@@ -211,7 +211,7 @@ kick_weechat_adapter() {
   if [[ -n "$adapter_url" ]]; then
     say "  letting weechat settle, then restarting the adapter (so it doesn't race the relay)"
     sleep 8
-    as_user systemctl --user restart "lunarwing-weechat-adapter-$TENANT.service" 2>/dev/null || warn "could not restart adapter unit"
+    "$MT" restart-weechat-adapter "$TENANT" 2>/dev/null || warn "could not restart adapter service"
     local ws=""
     for _ in $(seq 1 15); do
       ws="$(curl -s --max-time 4 "${adapter_url%/}/api/health" 2>/dev/null | grep -o '"ws_connected":[a-z]*' | cut -d: -f2 || true)"
@@ -226,7 +226,7 @@ kick_weechat_adapter() {
       say  "    Check:  curl -s ${adapter_url%/}/api/health   (look at ws_error)"
       say  "    Fix:    set RELAY_PASSWORD in $ENV_FILE to weechat's relay password (grep it from"
       say  "            /home/$TENANT/.config/weechat/relay.conf), then:"
-      say  "            sudo -u $TENANT XDG_RUNTIME_DIR=/run/user/\$(id -u $TENANT) systemctl --user restart lunarwing-weechat-adapter-$TENANT.service"
+      say  "            sudo $MT restart-weechat-adapter $TENANT"
       say  "    Or go passwordless on loopback: /set relay.network.password \"\" + /save in the weechat tmux, then restart the adapter."
     fi
   else
@@ -344,6 +344,7 @@ backup_tenant() {
 apply_core_steps() {
   banner "2/10  stop-tenant"
   "$MT" stop-tenant "$TENANT"
+  "$MT" cleanup-legacy-weechat "$TENANT"
 
   banner "3/10  fetch tags + checkout $TARGET (as $TENANT)"
   sudo -u "$TENANT" git -c safe.directory="$HOME_DIR" -C "$HOME_DIR" fetch --tags --prune origin || die "git fetch failed"
@@ -353,20 +354,14 @@ apply_core_steps() {
 
   banner "4/10  build-tenant --with-wasm --require-wasm"
   "$MT" build-tenant "$TENANT" --with-wasm --require-wasm
+  "$MT" ensure-darkirc-release "$TENANT"
 
   banner "5/10  install-wasm"
   "$MT" install-wasm "$TENANT"
 
   banner "6/10  render-units"
-  if "$MT" render-units "$TENANT" 2>/dev/null; then
-    say "  ok: render-units completed via mt-admin"
-  else
-    say "  render-units not available in mt-admin — attempting via modern mt-admin from repo checkout"
-    # shellcheck disable=SC1091
-    ( source "$SCRIPT_DIR/lunarwing-mt-admin.sh" --source-only 2>/dev/null && render_tenant_systemd_units "$TENANT" ) \
-      || die "render-units failed. Ensure the modern lunarwing-mt-admin.sh is available in the repo checkout."
-    say "  ok: render-units completed via sourced modern mt-admin"
-  fi
+  "$MT" render-units "$TENANT" \
+    || die "render-units failed through mt-admin"
 
   banner "7/10  patch-env"
   "$MT" patch-env "$TENANT"
@@ -374,18 +369,7 @@ apply_core_steps() {
   banner "8/10  start-tenant"
   "$MT" start-tenant "$TENANT"
 
-  banner "9/10  remove stale pre-1.1.0 weechat unit orphan (if present)"
-  local old_unit="/home/$TENANT/.config/systemd/user/weechat-$TENANT.service"
-  if [[ -f "$old_unit" ]]; then
-    as_user systemctl --user disable --now "weechat-$TENANT.service" 2>/dev/null || true
-    rm -f "$old_unit"
-    as_user systemctl --user daemon-reload 2>/dev/null || true
-    say "  removed $old_unit (replaced by lunarwing-weechat-$TENANT.service)"
-  else
-    say "  no stale weechat-$TENANT.service unit (ok)"
-  fi
-
-  banner "10/10  weechat adapter: kick LAST"
+  banner "9/10  weechat adapter: kick LAST"
   kick_weechat_adapter
 }
 

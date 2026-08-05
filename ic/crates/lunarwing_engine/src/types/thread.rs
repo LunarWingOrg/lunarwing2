@@ -140,6 +140,10 @@ pub struct ThreadConfig {
     /// Auto-expires after `supervised_timeout_secs` on no response.
     #[serde(default)]
     pub supervised_mode: bool,
+    /// Whether multiple channel actors share this conversation scope. Approval-
+    /// requiring effects must not use per-user grants in this context.
+    #[serde(default)]
+    pub shared_conversation: bool,
     /// Timeout in seconds for supervised mode approval prompts.
     /// After this duration with no human response, the action is
     /// auto-denied (fail-closed). Default: 300 (5 minutes).
@@ -188,6 +192,7 @@ impl Default for ThreadConfig {
             require_action_attempt: false,
             max_action_requirement_nudges: 2,
             supervised_mode: false,
+            shared_conversation: false,
             supervised_timeout_secs: 300,
             max_tokens_total: None,
             max_consecutive_errors: None,

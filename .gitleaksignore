@@ -32,3 +32,5 @@ ic/tests/test-pages/yahoo/source.html:generic-api-key:2516
 ic/tests/test-pages/cnn/source.html:generic-api-key:2466
 ic/tests/test-pages/cnn/source.html:generic-api-key:2468
 docs/proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-plan.md:generic-api-key:172
+ic/scripts/tests/test_darkirc_h3_analyzer.py:generic-api-key:31
+ic/scripts/tests/test_darkirc_h3_analyzer.py:generic-api-key:32

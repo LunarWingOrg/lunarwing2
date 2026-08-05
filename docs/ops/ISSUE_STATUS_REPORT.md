@@ -64,9 +64,11 @@ structured migration, plus public-only `prepare`, `respond`, deferred
 `complete`, `cancel`, inspection, and recovery through mt-admin. Full peer
 fingerprint authorization is mandatory and completion stops at `Installed`.
 
-**Verdict**: **Stage A complete; lifecycle remains open.** Activation/rollback,
-round-trip confirmation, rotation, revocation, same-host pairing, and delivery
-surfaces remain disabled pending their separate security stages.
+**Verdict**: **Stage A implemented; live acceptance pending.** Source-audit and
+fixture gates are closed. Dedicated real systemd-user and OpenRC two-user
+isolation/leak runs remain. Activation/rollback, round-trip confirmation,
+rotation, revocation, same-host pairing, and delivery surfaces remain disabled
+pending their separate security stages.
 
 ---
 
@@ -228,6 +230,6 @@ Based on codebase verification:
 |---|-------|----------|-------|
 | #240 | crate updates k 2 | Low (deferred to 2.0.0) | `rand`, `base64`, `tower-http` intentionally deferred |
 | #232 | Integration Test Improvements | Medium | Gentoo VM test improvements + health check checklist |
-| #223 | DarkIRC key exchange | Low | DarkIRC is opt-in; key exchange automation missing |
+| #223 | DarkIRC key exchange | High | Stage A implemented; real systemd-user/OpenRC H3 acceptance and final release CI remain pending. Later Stages B-D stay separately gated. |
 | #201 | memory de-duping routines | Low | Stub issue, no work started |
 | #5 | Reflex Compiler Integration | Medium | Full 8-phase validation largely uncompleted |

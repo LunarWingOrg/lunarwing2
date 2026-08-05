@@ -9,12 +9,12 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::tool::{ApprovalRequirement, Tool};
+use super::tool::Tool;
 
 /// User-visible reason shown when a tool's permission cannot be set to
 /// `always_allow`.
 pub const TOOL_PERMISSION_LOCKED_REASON: &str =
-    "This tool always requires explicit approval and cannot be set to always_allow.";
+    "This tool does not permit always_allow; every invocation requires explicit approval.";
 
 /// How a tool may be invoked by the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,18 +80,15 @@ fn seeded_default_permission_canonical(canonical_tool_name: &str) -> Option<Perm
     }
 }
 
-/// Returns true when a tool is intrinsically always-gated.
+/// Returns true when a tool does not permit a user-persisted `Always` grant.
 ///
 /// Parameter-sensitive tools such as `shell`, `memory_write`, and
 /// `skill_install` may return `Always` for specific invocations, but remain
 /// configurable at the whole-tool permission level. The empty-parameter check
-/// is the existing runtime signal for tools that always require explicit
-/// approval.
+/// is the existing runtime signal for tools that normally require explicit
+/// approval. A constrained tool may explicitly opt into persistent approval.
 pub fn tool_permission_locked(tool: &dyn Tool) -> bool {
-    matches!(
-        tool.requires_approval(&serde_json::Value::Object(serde_json::Map::new())),
-        ApprovalRequirement::Always
-    )
+    !tool.allows_always_approval(&serde_json::Value::Object(serde_json::Map::new()))
 }
 
 // ---------------------------------------------------------------------------
