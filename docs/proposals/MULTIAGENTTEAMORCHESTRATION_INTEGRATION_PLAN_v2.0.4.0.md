@@ -188,10 +188,11 @@ covering native and installable channels uniformly.
    expire after the configured 2-second TTL by default; they do not coordinate
    separate tenant daemons.
 
-5. **TagSchemaHook** (priority 20, TransformResponse only) — rejects messages
-   in coordination channels not starting with an allowed tag. Single-point
-   enforcement prevents one malformed response from consuming two strikes.
-   FailClosed.
+5. **TagSchemaHook** (priority 14, BeforeInbound + TransformResponse) — rejects
+   messages in coordination channels not starting with an allowed tag. Inbound
+   failures are attributed to the channel sender and halt before generation.
+   Outbound enforcement remains single-point so one malformed model response
+   cannot consume two local-agent strikes. FailClosed.
 
 6. **RateLimitHook** (priority 25, BeforeOutbound) — 2 messages/hour per agent
    per coordination channel. Sliding window. FailClosed.

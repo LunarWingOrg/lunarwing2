@@ -62,7 +62,7 @@ Generic workspace hook files keep their configured guards unchanged.
 | `coordination.secret_entropy` | 5 | beforeInbound, beforeOutbound | fail-closed |
 | `coordination.engagement_policy` | 15 | beforeInbound | fail-open |
 | `coordination.first_responder` | 16 | beforeInbound | fail-open |
-| `coordination.tag_schema` | 20 | transformResponse only | fail-closed |
+| `coordination.tag_schema` | 14 | beforeInbound, transformResponse | fail-closed |
 | `coordination.rate_limit` | 25 | beforeOutbound | fail-closed |
 
 Notes:
@@ -72,10 +72,20 @@ Notes:
   Inbound hook rejections now produce **typed suppression** (empty response,
   logged at debug) instead of synthetic `[Message rejected: …]` channel text
   that re-entered outbound hooks and mis-scored the local agent (ISSUE-004).
-- `TagSchemaHook` enforces at `transformResponse` **only** (ISSUE-004): legacy,
-  approval-resume, Engine V2 final responses, and mission notifications pass it exactly once,
-  so one malformed response costs one strike. Rejection is typed suppression:
-  no synthetic policy text is persisted, re-hooked, rate-limited, or delivered.
+- `TagSchemaHook` rejects malformed inbound room traffic before model execution
+  and attributes that violation to the channel sender, not the local agent or
+  conversation owner. Outbound enforcement remains `transformResponse` only:
+  legacy, approval-resume, Engine V2 final responses, and mission notifications
+  pass it exactly once, so one malformed response costs one strike. Rejection is
+  typed suppression: no synthetic policy text is persisted, re-hooked,
+  rate-limited, or delivered.
+- The agent receives a host-authored, coordination-scoped system instruction
+  requiring one-line tagged final output. It overrides persona/style formatting
+  for configured destinations without affecting DMs, casual rooms, or other
+  channels.
+- The XMPP bridge contract carries `sender_id` separately from the room/storage
+  target. Older payloads remain accepted; installable XMPP now preserves the
+  actual MUC actor for engagement and violation attribution.
 - `SecretEntropyHook` attributes violations by direction (ISSUE-004): inbound
   secrets strike the remote sender; outbound secrets strike the configured
   local agent (`COORD_AGENT_ID`). The event's `user_id` is the conversation

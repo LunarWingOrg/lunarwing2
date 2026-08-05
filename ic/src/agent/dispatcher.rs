@@ -119,6 +119,20 @@ impl Agent {
             }
         }
 
+        let policy_scope = crate::channels::routing_target_from_metadata(&message.metadata)
+            .unwrap_or_else(|| message.channel.clone());
+        if let Some(instruction) = self
+            .deps
+            .coordination_prompt_policy
+            .as_ref()
+            .and_then(|policy| policy.instruction_for_scope(&policy_scope))
+        {
+            system_prompt = Some(match system_prompt {
+                Some(prompt) => format!("{prompt}\n\n{instruction}"),
+                None => instruction.to_string(),
+            });
+        }
+
         // Select and prepare active skills (if skills system is enabled).
         let cavepony_activation = self.resolve_cavepony_activation(message).await;
         let active_skills = self.select_active_skills(&message.content, cavepony_activation);
@@ -1387,6 +1401,7 @@ mod tests {
             builder: None,
             llm_backend: "lunarwing_cloud".to_string(),
             coordination_gate: None,
+            coordination_prompt_policy: None,
             coordination_coalesce: None,
         };
 
@@ -2282,6 +2297,7 @@ mod tests {
             builder: None,
             llm_backend: "lunarwing_cloud".to_string(),
             coordination_gate: None,
+            coordination_prompt_policy: None,
             coordination_coalesce: None,
         };
 
@@ -2417,6 +2433,7 @@ mod tests {
                 builder: None,
                 llm_backend: "lunarwing_cloud".to_string(),
                 coordination_gate: None,
+                coordination_prompt_policy: None,
                 coordination_coalesce: None,
             };
 

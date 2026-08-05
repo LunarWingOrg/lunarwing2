@@ -502,6 +502,7 @@ async fn enqueue_message(state: &AppState, message: IncomingMessage) {
     let payload = BridgeMessage {
         message_id: message.id.to_string(),
         user_id: message.user_id,
+        sender_id: Some(message.sender_id),
         user_name: message.user_name,
         content: message.content,
         thread_id: message.thread_id,
