@@ -1,392 +1,142 @@
 # WeeChat Relay Channel for LunarWing
 
-A WeeChat Relay protocol WASM channel for LunarWing agents, providing bridge access to any IRC network via WeeChat.
+LunarWing reaches IRC networks through a per-instance WeeChat relay. The current integration has three components:
 
-## Overview
+1. WeeChat exposes its version-4 `api` relay on loopback.
+2. `ws_adapter.py` holds the WebSocket connection to WeeChat and exposes a local HTTP/long-poll API.
+3. The `weechat` WASM channel consumes that adapter and sends replies through the relay.
 
-This channel connects LunarWing to WeeChat's API relay (v2), allowing agents to communicate over any IRC network that WeeChat supports (libera, OFTC, ergo, darkirc, etc.).
+The adapter-to-WeeChat hop is WebSocket; the sandboxed channel-to-adapter hop is HTTP. See [`../../architecture/WEECHAT-CHANNEL-ARCHITECTURE.md`](../../architecture/WEECHAT-CHANNEL-ARCHITECTURE.md) for the current message flow, configuration precedence, sender principals, latency model, and known limitations.
 
-```
-LunarWing ◄─► WeeChat Relay WASM ◄─► WeeChat ◄─► IRC Networks
-(Agent)       (HTTP polling)         (relay)      (libera, darkirc, etc.)
-```
+## Source and Registry
 
-## Features
+- `lunarwing_weechat_wss/weechat_relay/` — canonical channel and adapter source
+- `ic/channels-src/weechat` — registry source symlink
+- `ic/registry/channels/weechat.json` — extension manifest
+- `lunarwing_weechat_wss/weechat_relay/weechat.capabilities.json` — setup and capability schema
+- [`../../ops/WEECHAT-SERVICES.md`](../../ops/WEECHAT-SERVICES.md) — authoritative MT service/runbook documentation
 
-- **Multi-network IRC support** - Connect to multiple networks simultaneously via WeeChat
-- **HTTP polling mode** - Poll WeeChat API every 3-5 seconds for new messages
-- **WebSocket support** (planned) - Real-time push notifications via WebSocket
-- **DM and group channels** - Support for both private messages and IRC channels
-- **Message chunking** - Automatically splits long responses for IRC line length limits
-- **Network filtering** - Allowlist or denylist specific IRC networks
-- **Pairing flow** - Secure user approval via `lunarwing pairing approve`
-- **Per-buffer watermarks** - Avoids replaying message history on restart
+The old nested install and troubleshooting guides were archived under `docs/guides/history/lunarwing_weechat_wss/`. They instructed operators to store passwords in capability JSON, edit database settings directly, and delete channel state; do not use those procedures.
 
-## Quick Start
+## Multi-Tenant Setup
 
-### 1. WeeChat Setup
+MT admin configures WeeChat by default when adding a tenant. It:
 
-In WeeChat, enable the API relay:
+- allocates `weechat` and `weechat_adapter` ports from `/etc/lunarwing/ports.json`;
+- generates a per-tenant relay password;
+- writes only `RELAY_PASSWORD` to the protected `env/weechat.env` consumed by WeeChat;
+- stores `${env:RELAY_PASSWORD}` literally in `relay.conf` rather than the resolved value;
+- binds the relay to `127.0.0.1` and disables relay IPv6 before binding;
+- renders WeeChat, adapter, and LunarWing dependencies for systemd user managers or OpenRC;
+- injects `RELAY_URL`, `WS_ADAPTER_URL`, and `RELAY_PASSWORD` into the host/channel setup path.
 
-```
-/set relay.network.password "your-secret-password"
-/set relay.network.allow_empty_password off
-/set relay.network.ipv6 off
-/set relay.network.bind_address "127.0.0.1"
-/relay add api 9001
-/save
-```
+Typical flow:
 
-Verify relay is running:
-
-```
-/relay list
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-wasm
+sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh doctor
 ```
 
-### 2. Build WASM Channel
+Use `--no-weechat-bootstrap` only when the relay should not be configured during tenant creation. Recover later with:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-weechat-relay <tenant>
+sudo ic/scripts/lunarwing-weechat-preflight.sh <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
+```
+
+The bootstrap and recovery command preserve any non-empty existing WeeChat configuration rather than overwriting it.
+
+After upgrading an existing tenant, use MT admin's supported reconciliation paths when needed:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh patch-env <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh render-units <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
+```
+
+Do not call bare system-bus `systemctl` for tenant units. On systemd hosts they live in the tenant user's user manager; on Gentoo they are OpenRC services.
+
+## Build or Install the Channel
+
+Prefer the registry workflow from `ic/`:
+
+```bash
+lunarwing registry info weechat
+lunarwing registry install weechat --build
+```
+
+For a repository-wide channel build:
+
+```bash
+cd ic
+taskset -c 0-5 scripts/build-wasm-extensions.sh --channels
+```
+
+For manual channel development:
 
 ```bash
 cd lunarwing_weechat_wss/weechat_relay
-./build.sh
+taskset -c 0-5 cargo build --release -j6 --target wasm32-wasip2
 ```
 
-Or manually:
+The installer publishes the channel WASM and current capability sidecar. Do not patch global URL validation for loopback HTTP; current validation allows localhost, and the capability file explicitly allowlists `127.0.0.1` and `localhost`.
 
-```bash
-cargo build --target wasm32-wasip2 --release
-cp target/wasm32-wasip2/release/weechat_relay_channel.wasm ~/.lunarwing/channels/weechat.wasm
-cp weechat.capabilities.json ~/.lunarwing/channels/
-```
+## Single-Instance Configuration
 
-(Use `$LUNARWING_BASE_DIR/channels/` if you run with a custom base dir.)
+For a non-MT instance, configure WeeChat's `api` relay on loopback and run the adapter under a real service manager. Provide its password through a protected environment file, not as a command-line argument or in shell history.
 
-### 3. Configure LunarWing
+Install the WASM channel, then use the authenticated extension setup flow for:
 
-The channel will prompt for configuration on first run, or you can edit `~/.lunarwing/channels/weechat.capabilities.json`:
+- required secret `weechat_relay_password`;
+- `relay_url` (defaults to `http://127.0.0.1:9001`);
+- `connection_mode`: `auto`, `websocket`, or `http`;
+- `ws_adapter_url` (defaults to `http://127.0.0.1:6681`);
+- network allowlist;
+- `dm_policy`, `group_policy`, and sender allowlist;
+- optional diagnostic logging fields.
 
-```json
-{
-  "relay_url": "http://127.0.0.1:9001",
-  "relay_password": "your-secret-password",
-  "connection_mode": "http",
-  "dm_policy": "pairing",
-  "group_policy": "allowlist",
-  "allow_from": ["your_irc_nick"],
-  "networks": [],
-  "poll_interval_seconds": 3
-}
-```
+The host injects `weechat_relay_password` as HTTP Basic authentication with username `plain`. Never add a `relay_password` field to the capability `config` object.
 
-### 4. Restart LunarWing
+## Policy and Pairing
 
-```bash
-systemctl restart lunarwing   # or restart the daemon however you run it
-```
+The channel supports:
 
-Check logs for:
+- DM policy: `open`, `allowlist`, or `pairing`;
+- group policy: `open`, `allowlist`, or `deny`;
+- sender patterns as nicks or `nick!user@host` values;
+- network include and exclude filters.
 
-```
-Connected to WeeChat 4.x (API v2)
-Found N IRC buffers
-```
-
-## Configuration
-
-### Connection Modes
-
-- **`http`** (default) - HTTP polling mode, polls every 3-5 seconds
-- **`websocket`** (future) - Real-time WebSocket push notifications
-
-### DM Policy
-
-Controls who can send direct messages to the agent:
-
-- **`open`** - Anyone can message
-- **`allowlist`** - Only users in `allow_from` array
-- **`pairing`** - Unknown users get a pairing code, approve via CLI
-
-### Group Policy
-
-Controls group/channel message handling:
-
-- **`open`** - Accept from anyone
-- **`allowlist`** - Only from users in `allow_from`
-- **`deny`** - Ignore all group messages
-
-### Network Filtering
-
-```json
-{
-  "networks": ["libera", "oftc"],
-  "exclude_networks": ["testnet"]
-}
-```
-
-- `networks` - Allowlist (empty = all networks)
-- `exclude_networks` - Denylist
-
-### Sender Allowlist
-
-```json
-{
-  "allow_from": [
-    "sun",
-    "alice!~user@example.com",
-    "*"
-  ]
-}
-```
-
-Supports:
-- Nick only: `"sun"`
-- Full hostmask: `"sun!~u@host.example.com"`
-- Wildcard: `"*"` (allow all)
-
-## Pairing Flow
-
-When an unknown user messages the agent (with `dm_policy: "pairing"`):
-
-1. User sends DM to bot on IRC
-2. Bot replies: `To pair with this agent, run: lunarwing pairing approve weechat CODE123`
-3. On the LunarWing host, approve: `lunarwing pairing approve weechat CODE123`
-4. User can now message the agent
-
-List pending pairing requests:
+Approve a DM pairing through the normal CLI in the tenant context:
 
 ```bash
 lunarwing pairing list weechat
+lunarwing pairing approve weechat <code>
 ```
 
-## Architecture
+IRC identity is not cryptographic. WeeChat sender principals are network-qualified and case-folded; owner routing and continuity rules are documented in [`../../architecture/IRC-SENDER-IDENTITY.md`](../../architecture/IRC-SENDER-IDENTITY.md).
 
-### HTTP Polling Mode
+## Verification
 
-Every 3-5 seconds (configurable):
+1. MT admin `status <tenant>` reports WeeChat, adapter, and LunarWing healthy; host `doctor` reports required dependencies available.
+2. The preflight script confirms the relay type, bind address, port, and protected password wiring.
+3. The adapter health endpoint responds on the tenant's `weechat_adapter` port.
+4. A configured IRC connection receives a direct message and channel message according to policy.
+5. Pairing rejects an unknown sender until approved.
+6. Outbound replies reach the correct network-qualified buffer.
+7. Restart restores WeeChat upgrade state and does not replay or mirror-loop prior messages.
 
-1. WASM channel calls `on_poll()`
-2. For each IRC buffer in WeeChat:
-   - GET `/api/buffers/<name>/lines?limit=10`
-   - Filter for new `irc_privmsg` lines (using watermarks)
-   - Parse nick, message text, tags
-   - Apply network/sender filters
-   - Emit to LunarWing agent via `emit_message()`
-
-3. Agent processes message and generates response
-4. WASM channel receives `on_respond()` callback
-5. Split response into IRC-sized chunks (420 chars)
-6. POST `/api/input` for each chunk to send via WeeChat
-
-### State Management
-
-All state persisted in the LunarWing workspace (SQLite):
-
-| Path | Purpose |
-|------|---------|
-| `state/relay_url` | WeeChat relay endpoint |
-| `state/relay_password` | Relay password |
-| `state/connection_mode` | `http` or `websocket` |
-| `state/last_seen_dates` | Per-buffer watermarks (JSON) |
-| `state/buffer_list` | Cached list of IRC buffers (JSON) |
-| `state/networks` | Network allowlist (JSON) |
-| `state/allow_from` | Sender allowlist (JSON) |
-
-Fresh WASM instance on each callback - no in-memory state.
-
-### Buffer Naming
-
-WeeChat buffer names follow: `irc.<network>.<target>`
-
-Examples:
-- `irc.libera.#openclaw` - #openclaw on libera
-- `irc.darkirc.sun` - DM with sun on darkirc
-- `irc.oftc.#debian` - #debian on OFTC
-
-Server buffers (`irc.server.*`) are filtered out.
-
-## WebSocket Support (Future)
-
-Stub functions are included for future WebSocket implementation:
-
-- `handle_websocket_poll()` - WebSocket health check and message processing
-- `_websocket_connect()` - Establish WebSocket connection
-- `_websocket_subscribe()` - Subscribe to buffer events
-- `_websocket_process_messages()` - Parse WebSocket frames
-
-**Note:** LunarWing's WASM sandbox currently only supports HTTP requests. WebSocket support requires either:
-
-1. Extension to WIT interface for streaming connections
-2. WebSocket→HTTP adapter (similar to `darkirc_adapter.py`)
-
-For now, use HTTP polling mode.
-
-## Message Chunking
-
-Long agent responses are split at word/newline boundaries to respect IRC line length limits:
-
-- Default max: 420 characters per chunk
-- Configurable via `max_chunk_length`
-- UTF-8 safe (checks char boundaries)
-- Breaks at newlines first, then spaces
-- Hard-splits if no break points available
-
-## Development
-
-### Project Structure
-
-```
-weechat_relay/
-├── Cargo.toml                    # Rust/WASM dependencies
-├── src/
-│   └── lib.rs                    # Main channel implementation
-├── weechat.capabilities.json     # Channel config schema
-├── build.sh                      # Build and install script
-└── README.md                     # This file
-```
-
-### Building
-
-Requires:
-- Rust toolchain with `wasm32-wasip2` target
-- LunarWing repo with `wit/channel.wit` interface
-- WeeChat >= 4.0 with API relay enabled
-
-```bash
-rustup target add wasm32-wasip2
-cargo build --target wasm32-wasip2 --release
-```
-
-### Testing
-
-Unit tests:
-
-```bash
-cargo test
-```
-
-Integration test with WeeChat:
-
-```bash
-# In WeeChat
-/relay add api 9001
-/set relay.network.password test123
-
-# Test relay endpoint
-curl -u "plain:test123" http://127.0.0.1:9001/api/version
-```
-
-### Debugging
-
-Enable LunarWing debug logs:
-
-```bash
-RUST_LOG=debug lunarwing
-```
-
-Channel debug logs will appear as:
-
-```
-[DEBUG weechat] Emitted message from 'sun' in irc.libera.#test (42 chars)
-[DEBUG weechat] Sent 2 of 2 chunk(s) to 'irc.libera.#test' (850 chars total)
-```
+Use test networks/rooms and redact relay credentials and message contents from evidence.
 
 ## Troubleshooting
 
-### "Cannot find lunarwing's wit/channel.wit"
-
-The `wit_bindgen` macro expects `../../wit/channel.wit` relative to `Cargo.toml`.
-
-Options:
-1. Place this project at `~/lunarwing/ic/channels-src/weechat_relay/`
-2. Set `LUNARWING_REPO=/path/to/lunarwing` (legacy `IRONCLAW_REPO` also accepted) and re-run build
-3. Symlink: `ln -s /path/to/lunarwing/ic/wit ../wit`
-
-### "HTTP request not allowed: Denied(InsecureScheme)"
-
-LunarWing's WASM sandbox blocks plain HTTP by default. You may need to patch `src/tools/wasm/host.rs` to allow localhost HTTP:
-
-```rust
-let validator = if capability.allowlist.iter().any(|p| {
-    p.host == "127.0.0.1" || p.host == "localhost" || p.host == "::1"
-}) {
-    validator.allow_http()
-} else {
-    validator
-};
-```
-
-Then rebuild the LunarWing binary: `cargo build --release --bin lunarwing`
-
-### "Invalid capabilities JSON"
-
-Ensure `~/.lunarwing/channels/weechat.capabilities.json` matches the schema. Common issues:
-
-- `"http"` must be a boolean `true`, not an object
-- `"secrets"` must be an array of secret names
-- `"poll_interval_seconds"` must be >= 3
-
-### No messages received
-
-Check:
-1. WeeChat relay is running: `/relay list` in WeeChat
-2. Relay password matches config
-3. LunarWing logs show polling activity: `Polling tick - calling on_poll channel=weechat`
-4. Network filters not excluding desired networks
-5. Sender allowlist includes the IRC nick
-
-Test relay manually:
-
-```bash
-curl -u "plain:your-password" http://127.0.0.1:9001/api/buffers
-```
-
-### Messages sent but not appearing on IRC
-
-Check WeeChat logs for errors:
-
-```
-/buffer set localvar set_no_log 0
-```
-
-Verify buffer name format:
-
-```bash
-curl -u "plain:password" http://127.0.0.1:9001/api/buffers | jq '.[] | .full_name'
-```
-
-## Container/Podman Considerations
-
-If LunarWing runs in a container and WeeChat is on the host:
-
-1. **Host gateway** (Podman >= 4.7):
-   ```json
-   {"relay_url": "http://host.containers.internal:9001"}
-   ```
-
-2. **Slirp4netns with loopback**:
-   ```ini
-   [Container]
-   Network=slirp4netns:allow_host_loopback=true
-   ```
-
-3. **Tailscale/VPN IP**:
-   ```json
-   {"relay_url": "http://100.x.y.z:9001"}
-   ```
-
-## Security
-
-- Relay password injected by the LunarWing host (not stored in WASM)
-- HTTP requests restricted to configured relay endpoint (localhost only by default)
-- All LunarWing security layers apply (prompt injection defense, rate limiting)
-- Pairing flow prevents unauthorized access
-- No shell command execution - pure IRC protocol via WeeChat
-
-## License
-
-MIT
-
-## See Also
-
-- [LunarWing Documentation](https://git.lunarwing.org/lunarwing/lunarwing2)
-- [WeeChat Relay Protocol](https://weechat.org/files/doc/stable/weechat_relay_protocol.en.html)
-- [WeeChat API Relay](https://weechat.org/doc/api/relay/)
+- **Wrong tenant ports:** run `patch-env`, `render-units`, then `doctor`; do not edit the settings table or capability JSON to fight generated MT values.
+- **Relay authentication loop:** run the secret-safe preflight and relay recovery command. Do not use `ic_sm` scripts or print the master key.
+- **Adapter disconnected:** verify WeeChat is running first, the relay type is `api`, and the loopback relay port matches the registry.
+- **No inbound messages:** inspect adapter health, network/sender policy, pairing, and the architecture guide's long-poll/fallback state.
+- **Duplicate or self-triggered messages:** inspect the current source's tag filters and adapter event cursor; do not delete channel workspace state as a first response.
+- **`Denied(InsecureScheme)`:** verify the endpoint is an allowlisted loopback HTTP URL. Never apply the old host-source patch.
+- **Upgrade restart loses buffers:** render current units so the committed WeeChat start/stop helpers use `/upgrade -quit` and `--upgrade` together.

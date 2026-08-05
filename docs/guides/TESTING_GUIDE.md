@@ -1,167 +1,114 @@
-# Testing Guide
+# LunarWing Release Testing Guide
 
-### By Ruffles
+Use this checklist for manual release validation. The resource-bounded commands, harness sequence, gateway smoke test, external-worker runner, and browser E2E instructions live in [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE-TESTING.md).
 
-**Pre‑Release Test Checklist** (run before every release)
+Record the exact commit, host profile, feature set, database backend, init system, and result for every tier. Never carry a previous release's pass count forward.
 
----
+## Before Testing
 
-## Production Release Checklist
+- [ ] Define the release scope, success criteria, rollback trigger, and known deferrals.
+- [ ] Confirm the release candidate commit and verify the worktree is understood.
+- [ ] Review schema changes and take a restorable database backup before migration tests.
+- [ ] Prepare isolated test credentials and disposable tenants; do not use production secrets.
+- [ ] Start long-running Rust and harness checks in `tmux`.
+- [ ] Limit every Cargo command to six CPUs and six jobs, as documented in `ic/AGENTS.md`.
+- [ ] Use `cargo check` for compile verification; do not run a full debug build.
 
-### Pre‑Release Preparation
+## Automated Baseline
 
-- [ ] Document the release scope (features, fixes, known issues) and success criteria
-- [ ] Confirm stakeholder alignment (dev, ops, support) – a brief review meeting
-- [ ] Verify all planned features/fixes are merged and built into the release candidate
-- [ ] Validate that code freeze rules are respected (no unapproved commits post‑freeze)
+Run the required tiers from [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE-TESTING.md):
 
-### Environment & Configuration Consistency
+- [ ] `cargo fmt --all -- --check`
+- [ ] default and all-feature `cargo check`
+- [ ] Rust tests with at most six test threads
+- [ ] all-feature Clippy with warnings denied
+- [ ] single-tenant/full-stack harness build, start, verify, and cleanup
+- [ ] authenticated `ic/scripts/release-test.sh` gateway smoke tests
+- [ ] configured external-worker smoke matrix
+- [ ] browser E2E and supplemental boundary checks where available
 
-- [ ] Run automated environment parity check (compare staging vs. production configs) – Ansible or custom script
-- [ ] Test database migration rollback (reversibility) in staging
-- [ ] Verify feature flags are correctly placed and default states are safe
-- [ ] Confirm that all required services/containers start with the same versions as production
+Treat a missing external dependency as a documented deferral, not a pass. If only the harness TensorZero probe fails, check its configured upstream before declaring the local deployment broken.
 
-### Testing & Validation
+## Channels
 
-The original functional smoke tests—now grouped under a dedicated section.
+For each enabled channel, test inbound and outbound delivery, sender identity, authorization, restart recovery, and rate limits.
 
-#### Multi-Tenant Setup Script
+- [ ] **XMPP direct message** — send and receive text; verify pairing/owner policy.
+- [ ] **XMPP room** — send and receive MUC traffic; verify sender attribution.
+- [ ] **XMPP attachments** — exercise the configured upload path and verify size/auth limits.
+- [ ] **WeeChat WSS** — connect relay and adapter, exchange messages, then reconnect after a service restart.
+- [ ] **DarkIRC** — verify the tenant adapter, contact-key boundary, delivery, and health reporting.
+- [ ] **WASM channels** — install, configure, activate, poll, and remove a disposable extension.
+- [ ] **Gotify** — send a real test notification without exposing the application token.
 
-#### Channels
+## Agent, Threads, and Approvals
 
-- [ ] **XMPP** – connect, send/receive 1:1, send/receive in MUC, verify no OMEMO fallback spam
-- [ ] **WeeChat** – connect, send/receive messages, verify channel stability
-- [ ] **Gotify** – send test push notification, confirm delivery
+- [ ] Create a fresh thread and continue an existing thread.
+- [ ] Switch threads while one has a pending approval; confirm the pending card is restored.
+- [ ] Approve once, deny, and use **Always** on a configurable tool.
+- [ ] Confirm intrinsically always-gated tools cannot be persisted as `always_allow`.
+- [ ] Enable supervised mode and confirm every tool action is gated, including normally auto-approved tools.
+- [ ] Trigger context compaction and verify the conversation remains usable.
+- [ ] Exercise a model/provider failure and verify bounded retry/failover behavior.
 
-#### Routines
+## Tools, Extensions, and Skills
 
-- [ ] **Cron routine** – create, verify fires on schedule, delete
-- [ ] **Event‑driven routine** – create with`system_event` trigger, emit test event, verify fires
-- [ ] **Manual routine** – create and fire manually via`routine_fire`
-- [ ] **Lightweight routine with tools** – routine that calls at least one tool (e.g.`time`,`memory_write`)
-- [ ] **Sandbox worker (full_job routine)** – routine that spawns a full autonomous job, verify completion
+- [ ] Read, write, list, patch, and shell behavior matches the active sandbox policy.
+- [ ] HTTP requests obey URL validation, private-address policy, redirects, and capability allowlists.
+- [ ] Memory read, write, tree, and hybrid search preserve workspace semantics.
+- [ ] Secret list/delete operations never return secret values.
+- [ ] Install, authenticate, activate, deactivate, update, and remove a disposable tool.
+- [ ] Install and invoke a WASM tool with host-injected credentials.
+- [ ] List, search, inspect, install, and remove a disposable skill.
+- [ ] Verify lifecycle operations that require approval cannot bypass the gate through the web API.
+- [ ] Exercise image analysis or generation only when the configured provider supports it.
 
-#### Workers
+## Routines and Events
 
-- [ ] **Opencode external worker** – submit job, verify WebSocket protocol + completion signaling
-- [ ] **Kimi Code external worker** – submit job, verify execution + completion signaling
-- [ ] **Pebble external worker** – submit job, verify NDJSON event streaming + completion signaling
-- [ ] **Docker sandbox worker** – submit job, verify execution + result return
+- [ ] Create, fire, inspect history for, disable, and delete a manual routine.
+- [ ] Create a cron routine and verify one scheduled execution.
+- [ ] Trigger an event-driven routine with `event_emit`.
+- [ ] Run a lightweight routine that uses a harmless tool.
+- [ ] Run a full-job routine through a configured supported worker.
+- [ ] Verify cooldown, duplicate-fire prevention, failure recording, and notification routing.
 
-#### Tools
+## Workers and Jobs
 
-- [ ] **GitHub integration** – list repos, list issues, verify auth works
-- [ ] **Secret management** –`secret_list` shows expected secrets, no values leaked
-- [ ] **Memory** –`memory_read`,`memory_write`,`memory_search` all functional
-- [ ] **HTTP tool** – GET request to public endpoint, verify response
-- [ ] **Time tool** – now, parse, convert, format, diff operations
-- [ ] **Image tools** –`image_generate`,`image_analyze`,`image_edit` (if applicable)
-- [ ] **Web search / LLM context** – query returns results
+Test only workers configured for the release candidate. Nanocode is retired and must not appear as a runnable option.
 
-#### Core Features
+- [ ] Pebble job: creation, NDJSON events, prompt/follow-up, completion, and cancellation.
+- [ ] OpenCode job: connection, event flow, completion, and failure handling.
+- [ ] Kimi Code job: connection, event flow, completion, and failure handling.
+- [ ] Worker disconnect: verify connection-level failover and clear terminal state.
+- [ ] Container boundary: verify secrets are not copied into worker output or environment diagnostics.
+- [ ] Job list, status, events, prompt, and cancel operations agree across CLI/web/tool surfaces.
 
-- [ ] **REPL v2** – interactive session, verify input/output, tool calls from REPL
-- [ ] **Job management** –`create_job`,`list_jobs`,`job_status`,`job_prompt`,`cancel_job`
-- [ ] **Message tool** – send message to each active channel
-- [ ] **Event emit** – emit system event, verify receipt by any listening routines
-- [ ] **Skill management** –`skill_list`,`skill_search` return results
+## Multi-Tenant and Init Coverage
 
-#### Database & Config
+- [ ] Provision a disposable tenant through `ic/scripts/lunarwing-mt-admin.sh` or its thin onboard wrapper.
+- [ ] Verify port allocation and registry entries, including `vision_service` and `vision_health` when OCR is enabled.
+- [ ] Run MT admin `status <tenant>` plus host `doctor`; do not substitute bare system-bus `systemctl`.
+- [ ] Verify systemd user-manager behavior on systemd hosts.
+- [ ] Verify OpenRC service rendering and lifecycle on a Gentoo/OpenRC host, or record the tier as deferred.
+- [ ] Start, stop, restart, build, and remove the disposable tenant through MT admin.
+- [ ] Confirm host health discovery uses the tenant port registry rather than a hardcoded single-node port.
 
-- [ ] **Database migration** – verify schema version matches expected, no migration errors on startup
-- [ ] **Config loading** –`lunarwing.env` parsed correctly, all expected keys present
-- [ ] **Web gateway** – starts, serves pages, API endpoints respond
+## Security and Recovery
 
-### Security & Compliance
+- [ ] Search logs, settings exports, API responses, worker events, and downloaded diagnostics for credential leaks.
+- [ ] Verify authentication, CORS/origin checks, body limits, rate limits, and webhook authorization on exposed listeners.
+- [ ] Test SSRF rejection for remote HTTP private, loopback, link-local, and metadata targets where applicable.
+- [ ] Verify sandbox and full-access double opt-in behavior.
+- [ ] Restore the database backup or execute the documented rollback in staging.
+- [ ] Confirm watchdog/self-heal alerts and restart limits behave as documented.
 
-- [ ] Run automated security scan (dependency checks, container image vulnerabilities) – integrated in CI
-- [ ] Confirm no secrets or API keys are exposed in logs or client‑facing code
-- [ ] Verify that TLS certificates are valid and haven’t expired
-- [ ] Check that RBAC/permissions are applied correctly (least privilege)
+## Cleanup and Sign-Off
 
-### Performance & Load Testing
+- [ ] Remove disposable tenants, routines, jobs, secrets, repositories, channels, tools, and containers.
+- [ ] Stop harness services even after a failed verification.
+- [ ] Confirm no orphaned processes, user units, OpenRC services, or port-registry entries remain.
+- [ ] Attach redacted logs and command results to the release evidence.
+- [ ] List every skipped or failed tier with owner, risk, and follow-up.
+- [ ] Reconcile release notes and known issues with the tested commit.
 
-- [ ] Execute a lightweight performance/load test against staging (throughput, latency, error rate)
-- [ ] For message‑heavy components, verify that throughput and latency remain within acceptable limits
-- [ ] Monitor resource usage (CPU, memory, disk) during load test – no unexpected spikes
-
-### Rollback & Incident Response
-
-- [ ] Test the rollback procedure in a staging environment (full revert and data restoration)
-- [ ] Prepare a rollback plan with clear triggers (e.g., error rate > X%) and communication steps
-- [ ] Verify that monitoring/alerting will fire if the release introduces errors
-- [ ] Ensure the on‑call roster is updated and accessible for the release window
-
-### Documentation & Release Notes
-
-- [ ] Prepare release notes: new features, bug fixes, known issues, upgrade instructions
-- [ ] Update internal runbooks or operational documentation if workflows changed
-- [ ] Tag the release in version control and build artifacts
-
-### Deployment Readiness
-
-- [ ] Confirm all deployment artifacts are built, tested, and signed
-- [ ] Verify CI/CD pipeline gates pass: tests, security scans, linting, production readiness score
-- [ ] Schedule the deployment window and notify all stakeholders
-- [ ] Freeze configuration changes in production until after post‑release validation
-
-### Post‑Release Monitoring
-
-- [ ] Define a post‑release validation checklist: monitor key metrics (latency, errors, throughput, job completions) for the first hour
-- [ ] Establish a feedback loop – collect user feedback and urgent bug reports via a dedicated channel
-- [ ] Run a quick production smoke test (subset of “Testing & Validation” items, read‑only if possible)
-- [ ] Confirm all monitoring dashboards are healthy and sending alerts as expected
-
-### Post‑Test Cleanup
-
-- [ ] Delete any test routines created during testing
-- [ ] Delete any test secrets created during testing
-- [ ] Clear test jobs from job list
-- [ ] Verify no orphaned processes or containers
-- [ ] Re‑enable any feature flags that were temporarily adjusted for testing
-
----
-
-**DevOps Automation Notes** – Many of these items can be automated using your existing toolchain:
-
-- Environment parity checks → Ansible playbook in CI
-- Security scans → integrated into Jenkins/GitLab CI with quality gates
-- Performance/load tests → scripted with k6 or Locust, triggered automatically against staging
-- Rollback testing → Docker Compose or Podman scripts to spin up a clean staging, then simulate rollback
-- Production readiness scoring → adopt a Scorecard (e.g., Cortex) to enforce gates before deployment
-
-## Created ic/scripts/release-test.sh. It automates the following from the testing guide:
- 
-  What it tests (16 checks with auth, 2 without):
-  - Gateway health + status endpoint
-  - Web gateway serving pages
-  - Settings load + export
-  - Memory tree, list, write, read, search
-  - Routines list + summary
-  - Jobs list + summary
-  - Skills list + search
-  - Extensions, tools, registry
-  - Chat threads + message send (exercises time tool)
-  - Gotify tool registration
-  - Credential leak detection in settings export
-  - Log level endpoint
-
-  What it documents as NOT automated (top-of-file comment block, lines 14-60):
-  - Pre-release process steps (human judgment)
-  - XMPP channel (needs live bridge + OMEMO)
-  - WeeChat channel (no test stub)
-  - Sandbox/Docker workers (need Docker daemon + built images)
-  - GitHub integration (needs credentials)
-  - Image/vision tools (needs LLM provider)
-  - Web search (needs LLM backend)
-  - REPL v2 (interactive)
-  - Performance/load testing (needs k6/locust)
-  - Rollback procedure (inherently manual)
-  - Post-release monitoring (needs Grafana)
-  - Documentation (human writing)
-
-  Run it with:
-  GATEWAY_URL=http://localhost:9098 GATEWAY_AUTH_TOKEN=yourtoken ./ic/scripts/release-test.sh
-
-Treat this checklist as a living artifact—after each release, review what worked and where gaps appeared, then refine accordingly.
+A release candidate is fully verified only when every required tier has fresh evidence or an explicit reviewed deferral.

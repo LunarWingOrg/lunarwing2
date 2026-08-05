@@ -121,8 +121,8 @@ sudo apt install weechat tmux python3-aiohttp
 
 ## 6. Python packages (ops tooling)
 
-The host-side Python tooling (multi-tenant onboard CLIs/web UI, Hermes importer, `ic_sm`
-secret scripts) needs these third-party modules. **The existing quickstart hints only list
+The supported host-side Python tooling (multi-tenant onboard CLIs/web UI and Hermes
+importer) needs these third-party modules. **The existing quickstart hints only list
 `python3-aiohttp`** — the full set below is what the tooling actually imports (verified
 against each tool's `requirements.txt` and source imports).
 
@@ -138,8 +138,8 @@ one. The venv route needs `python3-venv`.
 
 | Package | Consumers |
 |---------|-----------|
-| `python3-cryptography` | `ic_sm/scripts_4_db/*.py`, `lunarwing_mt_onboard/secrets_ops.py`, `hermes_kawarimi` (secrets crypto) |
-| `python3-psycopg2` | Live tenant DB writes from the same secret tooling (`pip` equivalent: `psycopg2-binary`) |
+| `python3-cryptography` | `lunarwing_mt_onboard/secrets_ops.py`, `hermes_kawarimi` (secrets crypto) |
+| `python3-psycopg2` | Onboarding secret writes to tenant PostgreSQL (`pip` equivalent: `psycopg2-binary`) |
 | `python3-rich` | `lunarwing_mt_onboard` CLI, `hermes_kawarimi` |
 | `python3-questionary` | `lunarwing_mt_onboard` interactive CLI, `hermes_kawarimi` (universe) |
 | `python3-yaml` | `hermes_kawarimi` (`config.yaml` parsing), `.gitlab/scripts/validate_config.py` (PyYAML) |

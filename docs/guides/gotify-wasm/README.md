@@ -2,20 +2,19 @@
 
 A WASM tool for LunarWing that sends push notifications to a self-hosted Gotify server.
 
-## Build
+## Build and Install
+
+The registry source is `ic/tools-src/gotify`, a symlink to the canonical `lunarwing-gotify-tool/` crate. Prefer the registry workflow from the `ic/` directory:
 
 ```bash
-cd lunarwing-gotify-tool
-cargo build --release --target wasm32-wasip2
-cp target/wasm32-wasip2/release/gotify_tool.wasm ~/.lunarwing/tools/gotify.wasm
+cd ic
+lunarwing registry install gotify --build
+lunarwing tool setup gotify
 ```
 
-## Installation
+`registry install --build` uses the manifest in `ic/registry/tools/gotify.json`, builds the WASM component from source, and installs its capability sidecar. `tool setup` prompts for the required `gotify_app_token` and stores it through LunarWing's encrypted secrets path.
 
-1. Copy `gotify.wasm` to `~/.lunarwing/tools/gotify.wasm`
-2. Copy `gotify.capabilities.json` alongside it at `~/.lunarwing/tools/gotify.capabilities.json`
-3. Store your Gotify app token as a secret named `gotify_app_token`
-4. Restart LunarWing to pick up the new tool
+For manual development builds, run `lunarwing-gotify-tool/build.sh`; it produces `lunarwing-gotify-tool/gotify.wasm`. Install both `gotify.wasm` and `gotify.capabilities.json` below `${LUNARWING_BASE_DIR:-$HOME/.lunarwing}/tools/`, then restart LunarWing.
 
 ## Configuration
 
@@ -64,25 +63,19 @@ Both changes take effect on restart — no WASM rebuild needed.
 
 If `config/gotify.json` is absent or unparseable, the tool falls back to the compiled-in defaults (URL and title).
 
-### Automated Setup via Scripts
+### Provisioning Support
 
-The setup scripts can configure the Gotify URL automatically during provisioning:
+For a single-instance deployment, use the registry/setup flow above and write the reviewed workspace JSON and capability host allowlist explicitly. The old `scripts/setup-instance.sh` path is deprecated in favor of `lunarwing onboard --quick` and the current extension lifecycle.
 
-**Single-instance** (`setup-instance.sh`):
+For a multi-tenant deployment, MT admin can configure Gotify during provisioning:
 ```bash
-scripts/setup-instance.sh --base-dir /srv/lunarwing --gotify-url https://gotify.example.com --gotify-title "My Agent" ...
-```
-Creates both `workspace/config/gotify.json` and `tools/gotify.capabilities.json` with the custom host. The `--gotify-title` flag is optional.
-
-**Multi-tenant** (`lunarwing-mt-admin.sh`):
-```bash
-sudo lunarwing-mt-admin.sh add-tenant myagent --gotify-url https://gotify.example.com --gotify-title "My Agent"
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant myagent --gotify-url https://gotify.example.com --gotify-title "My Agent"
 ```
 Creates the workspace config at provisioning time. The capabilities file is automatically rewritten when WASM tools are installed (`install-wasm`).
 
 To reconfigure an existing tenant:
 ```bash
-sudo lunarwing-mt-admin.sh configure-gotify myagent https://new-gotify.example.com "My Agent"
+sudo ic/scripts/lunarwing-mt-admin.sh configure-gotify myagent https://new-gotify.example.com "My Agent"
 ```
 
 **Test harness** (`lunarwing-xmpp-test-env.sh`):
@@ -106,7 +99,7 @@ The tool requires one secret:
 |---|---|
 | `gotify_app_token` | Gotify application token (injected as `X-Gotify-Key` header by the host — never exposed to WASM) |
 
-Use `ic_sm` or `lunarwing config` to store the secret.
+Use `lunarwing tool setup gotify` or the authenticated extension setup UI to store the secret. Do not place the token in the workspace JSON or capability file.
 
 ## Usage
 

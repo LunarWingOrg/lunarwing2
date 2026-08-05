@@ -1,288 +1,125 @@
-# DarkIRC Multitenant Adapter (Adapter-Only Milestone)
+# DarkIRC Multi-Tenant Adapter Architecture
 
-> **Reviewed 2026-06-21** — Reviewed against implementation in `ic/scripts/lunarwing-mt-admin.sh` and corrected. The shared-daison limitation was removed (per-tenant daemons implemented in Tasks 9-16). The `DARKIRC_ADAPTER_URL` env var wiring is now complete via the `env` field in `darkirc.capabilities.json`.
+**Status:** As-built. LunarWing provisions a dedicated DarkIRC daemon and HTTP adapter for every DarkIRC-enabled tenant.
 
-This document covers the **adapter-only milestone** for DarkIRC multitenant integration in LunarWing.
+This document describes the adapter boundary. Operational contact-key exchange and recovery procedures are in [`../../ops/DARKIRC-MULTITENANT.md`](../../ops/DARKIRC-MULTITENANT.md); build and installation steps are in [`DARKIRC_BUILD_GUIDE.md`](DARKIRC_BUILD_GUIDE.md).
 
-**Status**: Implementation complete (Tasks 1-16). QA scenarios documented but not yet executed.
+## Per-Tenant Topology
 
-**Status note**: The adapter-only milestone (Tasks 1-7) originally targeted a *shared daemon* model. During implementation, the daemon phase (Tasks 9-16) was completed in the same branch, so the full per-tenant stack — dedicated darkirc daemon + dedicated adapter per tenant — is already in place. This document describes the adapter layer specifically; see the daemon plan for daemon-level details.
-
-## Architecture
-
-### Topology
-
-Each tenant gets a dedicated DarkIRC daemon and adapter. The daemon is per-tenant because DarkIRC uses ChaCha keypairs for P2P encryption — sharing a daemon would mean sharing keys, which defeats the purpose.
-
-```
-Tenant A                                 Tenant B
-┌──────────────────────┐        ┌──────────────────────┐
-│ lunarwing-darkirc-$A         │        │ lunarwing-darkirc-$B         │
-│   (per-tenant daemon, IRC)   │        │   (per-tenant daemon, IRC)   │
-│   (ChaCha keypair, P2P)      │        │   (ChaCha keypair, P2P)      │
-│           ↓ IRC              │        │           ↓ IRC              │
-│ lunarwing-darkirc-adapter-$A │        │ lunarwing-darkirc-adapter-$B │
-│   ↓ HTTP                     │        │   ↓ HTTP                     │
-│ lunarwing-$A                 │        │ lunarwing-$B                 │
-└──────────────────────┘        └──────────────────────┘
-```
-
-### Components
-
-1. **Port Registry v6.1** (Task 1)
-   - Adds `darkirc_adapter` port to extended port range
-   - Each tenant gets a unique adapter port (e.g., 6660, 6670, 6680)
-   - Migration preserves existing port allocations
-
-2. **Adapter Environment** (Task 2)
-   - `write_tenant_darkirc_adapter_env()` generates `$TENANT_ENV_DIR/darkirc-adapter.env`
-   - Contains: `DARKIRC_HOST=127.0.0.1`, `DARKIRC_PORT=$darkirc_irc_port` (the tenant's own daemon IRC port from the registry), `DARKIRC_NICK=$TENANT-bridge`, `DARKIRC_USER=$TENANT`, `DARKIRC_REALNAME=LunarWing DarkIRC Bridge ($TENANT)`, `ADAPTER_HOST=127.0.0.1`, `ADAPTER_PORT=$darkirc_adapter_port`, `ADAPTER_SECRET=$TOKEN`, `ADAPTER_OUTBOX_JOURNAL=/home/$TENANT/lunarwing/state/darkirc-outbox.json`, `ADAPTER_LOG_LEVEL=INFO`
-   - The `ADAPTER_SECRET` is read back from `lunarwing.env` (`DARKIRC_ADAPTER_SECRET`) so it is preserved on re-run; a new token is generated only when absent
-   - `DARKIRC_ADAPTER_SECRET` is injected into `lunarwing.env` for the WASM channel side
-
-3. **Systemd Unit** (Task 3)
-   - `lunarwing-darkirc-adapter-$TENANT.service` in `~$TENANT/.config/systemd/user/`
-   - Type: simple, Restart: on-failure, RestartSec: 5
-   - EnvironmentFile: `$TENANT_ENV_DIR/darkirc-adapter.env`
-   - ExecStart: `/usr/bin/python3 $REPO_DIR/darkirc_channel_for_lunarwing/darkirc/adapter/darkirc_adapter.py`
-
-4. **OpenRC Unit** (Task 4)
-   - `/etc/init.d/lunarwing-darkirc-adapter-$TENANT`
-   - supervisor-daemon with respawn
-   - `depend()`: need net, after firewall, before lunarwing-$TENANT
-
-5. **Lifecycle Integration** (Task 5)
-   - `start-tenant`: enables + starts adapter service before main lunarwing daemon
-   - `stop-tenant`: stops adapter service
-   - `remove-tenant`: stops + disables + deletes unit + removes env files
-   - `status-tenant`: reports adapter service status (systemd: `is-active`, OpenRC: `status`)
-
-6. **Gateway Env Wiring** (Task 6)
-   - `DARKIRC_ADAPTER_URL` and `DARKIRC_ADAPTER_SECRET` injected into `lunarwing.env`
-   - Gateway reads these to route channel requests to the correct adapter
-   - Idempotent: patch-env adds missing vars without overwriting existing ones
-
-7. **Health Pipeline** (Task 7)
-   - Adapter exposes `GET /health` endpoint
-   - Returns: `{"status": "ok|error", "irc_connected": bool, "irc_nick": str, "queue_size": int}`
-   - Gateway `/api/gateway/status` probes adapter health and reports in `channel_health.darkirc`
-   - Watchdog (`lunarwing-self-heal.sh`) extracts adapter services and monitors them
-   - Escalation chain: adapter failure → gateway reports unhealthy → watchdog restarts service
-
-### Service Dependencies
-
-Systemd ordering (from `lunarwing-$TENANT.service`):
-```
-After=... lunarwing-darkirc-adapter-$TENANT.service
-Wants=... lunarwing-darkirc-adapter-$TENANT.service
+```text
+DarkIRC P2P network
+        |
+per-tenant darkirc daemon
+  - tenant ChaCha contact keys
+  - tenant datastore and host list
+  - registry darkirc_irc / darkirc_rpc ports
+        |
+      IRC
+        |
+per-tenant darkirc_adapter.py
+  - loopback HTTP
+  - bearer authentication
+  - bounded inbound queue
+  - paced durable outbound queue
+  - registry darkirc_adapter port
+        |
+versioned DarkIRC WASM channel
+        |
+per-tenant LunarWing daemon
 ```
 
-This ensures the adapter starts before the main LunarWing daemon, so the gateway can immediately connect to it.
+A shared DarkIRC daemon is not supported. It would collapse tenant P2P identity and key isolation.
 
-### Per-Tenant Daemon Isolation
+## Provisioning Ownership
 
-Each tenant gets a dedicated DarkIRC daemon (`lunarwing-darkirc-$TENANT`) with its own:
-- IRC listen port (`darkirc_irc` from port registry)
-- JSON-RPC port (`darkirc_rpc` from port registry)
-- P2P datastore and hostlist (under `$state_dir/darkirc/datastore/`)
-- Config file (`darkirc_config.toml`, auto-generated by `generate_darkirc_config()`)
+`ic/scripts/lunarwing-mt-admin.sh` owns the MT integration:
 
-**ChaCha keypairs for DM encryption** are configured inline in TOML under
-`[contact."nickname"]`; there is no separate keypair file. Each contact contains
-exactly:
+- `add-tenant --enable-darkirc` marks the tenant DarkIRC-enabled and allocates required primary/extended ports;
+- `build-darkirc` builds the approved pinned DarkFi revision and installs the trusted contact-key helper;
+- `build-tenant --with-wasm` builds and installs the current channel artifact;
+- `render-units` writes the correct systemd-user or OpenRC service definitions;
+- `start-tenant`, `stop-tenant`, `restart-tenant`, `status`, and `doctor` manage and inspect the complete tenant service graph;
+- `remove-tenant` removes managed services and configuration according to its selected retention/purge mode.
+
+Do not call internal shell helpers such as `write_tenant_darkirc_adapter_env` or `ports_get` from an operator runbook. They are implementation details, not stable commands.
+
+## Adapter Configuration
+
+MT admin writes a protected `darkirc-adapter.env` containing tenant-specific values such as:
+
+- daemon loopback host and `darkirc_irc` port;
+- adapter loopback host and `darkirc_adapter` port;
+- tenant bridge nick/user/real name;
+- `ADAPTER_SECRET` bearer token;
+- queue and message-size limits;
+- paced outbound interval;
+- durable outbox journal under tenant state;
+- adapter log level.
+
+It also writes `DARKIRC_ADAPTER_URL` and `DARKIRC_ADAPTER_SECRET` into the protected LunarWing environment. The channel setup schema sources the URL from the former and injects the latter as a host-side bearer credential.
+
+Re-rendering or patching a tenant preserves the existing adapter secret when present. Never compare secret-bearing files with plain `grep`, `diff`, or captured terminal output.
+
+## Service Management
+
+On systemd hosts, DarkIRC tenant services run in the tenant user's systemd user manager. On Gentoo they are OpenRC services. MT admin abstracts both.
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh doctor
+sudo ic/scripts/lunarwing-mt-admin.sh stop-tenant <tenant>
+```
+
+Do not use bare system-bus `systemctl` against tenant units. A system-bus probe can report inactive while the user-manager unit is healthy.
+
+The adapter must be available before the LunarWing channel begins polling. Generated service dependencies and MT admin's ordered lifecycle enforce that relationship on both supported init families.
+
+## HTTP Boundary
+
+The adapter exposes loopback endpoints for health, polling/acknowledgement, and outbound delivery. The WASM capability restricts HTTP to `127.0.0.1` and `localhost` and maps `darkirc_adapter_secret` to bearer authentication.
+
+The adapter:
+
+- applies TCP backpressure when its inbound queue is full;
+- returns bounded poll batches;
+- leaves a batch unacknowledged when dispatch into the agent fails, allowing retry;
+- normalizes IRC control characters;
+- chunks by UTF-8 byte boundaries and IRC frame limits;
+- paces outbound chunks;
+- journals queued outbound messages when MT configuration enables the durable path.
+
+The channel's 3000 ms polling minimum and host callback capacity are independent from IRC send pacing. Review both sides before changing throughput limits.
+
+## Contact-Key Isolation
+
+Each tenant daemon stores contact configuration with:
 
 - `dm_chacha_public` — the peer's public key;
-- `my_dm_chacha_secret` — this tenant's private key for the contact.
+- `my_dm_chacha_secret` — this tenant's private key for that contact.
 
-There is no `my_dm_chacha_public` assignment and
-`generate_darkirc_config()` does not create `darkirc_keypair.yaml`.
+There is no `my_dm_chacha_public` assignment and no shared `darkirc_keypair.yaml` file. Use MT admin's typed `darkirc-contact` exchange commands. The trusted helper keeps private material in protected tenant state and emits public artifacts only.
 
-Phase 0/1 and Stage A provide managed out-of-band exchange through
-`lunarwing-mt-admin.sh darkirc-contact prepare|respond|complete|cancel`. The
-typed helper captures and validates `darkirc --gen-chacha-keypair`, keeps the
-private half in protected tenant state, emits public artifacts only, and
-requires the full independently obtained peer fingerprint. Completion is
-transactional but deferred at `Installed`; activation and later lifecycle
-commands are not part of Stage A. See
-[`DARKIRC-MULTITENANT.md`](../../../ops/DARKIRC-MULTITENANT.md) for the operator
-workflow.
+Completion of a staged exchange does not remove the need to verify the full peer fingerprint through an independent channel. Follow [`../../ops/DARKIRC-MULTITENANT.md`](../../ops/DARKIRC-MULTITENANT.md) for prepare/respond/complete, migration, recovery, and lifecycle-state semantics.
 
-The adapter connects to its tenant's daemon on `127.0.0.1:$darkirc_irc_port`, not a shared port.
+## Health and Verification
 
-## QA Scenarios
+A healthy deployment should satisfy all of the following:
 
-**Status**: These scenarios document what should be tested. They have NOT been executed yet. Evidence files will be created when the scenarios are run.
+1. MT admin `status` reports the tenant daemon, DarkIRC daemon, and adapter in the expected init state.
+2. MT admin `doctor` finds no port, ownership, service, or contact-state fault.
+3. The adapter's loopback `/health` response reports an IRC connection and expected nick without exposing the bearer token.
+4. The authenticated gateway status reports healthy DarkIRC channel state.
+5. Paired/allowlisted sender behavior matches `dm_policy`.
+6. Restart preserves the durable outbox and does not duplicate acknowledged messages.
+7. Two DarkIRC-enabled tenants use different daemon state directories, ports, adapter secrets, and contact private keys.
 
-### Task 1: Port Registry Migration
+Use disposable tenants for failure testing. Stop or restart services through MT admin rather than mutating generated units directly.
 
-**Scenario 1.1**: Existing tenant gets `darkirc_adapter` port
-```bash
-# Preconditions: Port registry at v6 with existing tenants
-# Steps:
-jq '.tenants["<name>"].extended_ports' /etc/lunarwing/ports.json > /tmp/before.json
-sudo lunarwing-mt-admin.sh doctor  # triggers migration
-jq '.tenants["<name>"].extended_ports | has("darkirc_adapter")' /etc/lunarwing/ports.json
-jq '.tenants["<name>"].extended_ports | has("reserved_0")' /etc/lunarwing/ports.json
+## Common Failures
 
-# Expected: darkirc_adapter present, reserved_0 absent
-# Evidence: .sisyphus/evidence/task-1-existing-tenant-port.txt
-```
-
-**Scenario 1.2**: New tenant gets `darkirc_adapter` in allocation
-```bash
-# Preconditions: Port registry at v6.1+
-# Steps:
-sudo lunarwing-mt-admin.sh add-tenant testdarkirc1
-jq '.tenants.testdarkirc1.extended_ports' /etc/lunarwing/ports.json
-
-# Expected: darkirc_adapter present and non-null
-# Evidence: .sisyphus/evidence/task-1-new-tenant-port.txt
-```
-
-### Task 2: Adapter Environment Generation
-
-**Scenario 2.1**: Env file has correct adapter port
-```bash
-# Preconditions: Tenant created with darkirc_adapter port
-# Steps:
-write_tenant_darkirc_adapter_env testdarkirc1
-source $(tenant_env_dir testdarkirc1)/darkirc-adapter.env
-echo $ADAPTER_PORT
-ports_get testdarkirc1 darkirc_adapter
-
-# Expected: Ports match
-# Evidence: .sisyphus/evidence/task-2-adapter-port.txt
-```
-
-**Scenario 2.2**: Secret preserved on re-run
-```bash
-# Preconditions: darkirc-adapter.env already exists
-# Steps:
-grep ADAPTER_SECRET $(tenant_env_dir testdarkirc1)/darkirc-adapter.env > /tmp/before
-write_tenant_darkirc_adapter_env testdarkirc1
-grep ADAPTER_SECRET $(tenant_env_dir testdarkirc1)/darkirc-adapter.env > /tmp/after
-diff /tmp/before /tmp/after
-
-# Expected: No diff (secret unchanged)
-# Evidence: .sisyphus/evidence/task-2-secret-preserved.txt
-```
-
-### Task 3: Systemd Unit
-
-**Scenario 3.1**: Systemd unit file rendered correctly
-```bash
-# Preconditions: Tenant created, adapter env generated
-# Steps:
-sudo lunarwing-mt-admin.sh add-tenant testdarkirc1
-ls -la $(tenant_home testdarkirc1)/.config/systemd/user/lunarwing-darkirc-adapter-testdarkirc1.service
-grep ExecStart $(tenant_home testdarkirc1)/.config/systemd/user/lunarwing-darkirc-adapter-testdarkirc1.service
-grep EnvironmentFile $(tenant_home testdarkirc1)/.config/systemd/user/lunarwing-darkirc-adapter-testdarkirc1.service
-
-# Expected: File exists, ExecStart points to darkirc_adapter.py, EnvironmentFile points to darkirc-adapter.env
-# Evidence: .sisyphus/evidence/task-3-systemd-unit.txt
-```
-
-### Task 4: OpenRC Unit
-
-**Scenario 4.1**: OpenRC init script rendered correctly
-```bash
-# Preconditions: Tenant created
-# Steps:
-sudo lunarwing-mt-admin.sh add-tenant testdarkirc1
-stat -c '%a' /etc/init.d/lunarwing-darkirc-adapter-testdarkirc1
-grep 'supervisor=' /etc/init.d/lunarwing-darkirc-adapter-testdarkirc1
-grep 'before lunarwing-testdarkirc1' /etc/init.d/lunarwing-darkirc-adapter-testdarkirc1
-
-# Expected: File exists, executable (755), supervisor=supervise-daemon, depend() includes before lunarwing-testdarkirc1
-# Evidence: .sisyphus/evidence/task-4-openrc-unit.txt
-```
-
-### Task 5: Lifecycle Integration
-
-**Scenario 5.1**: start-tenant starts adapter
-```bash
-# Preconditions: Tenant created, units rendered
-# Steps:
-sudo lunarwing-mt-admin.sh start-tenant testdarkirc1
-systemctl --user -M testdarkirc1@ is-active lunarwing-darkirc-adapter-testdarkirc1.service
-curl -sf http://127.0.0.1:$(ports_get testdarkirc1 darkirc_adapter)/health | jq .status
-
-# Expected: Service active, health returns "ok"
-# Evidence: .sisyphus/evidence/task-5-start-tenant.txt
-```
-
-**Scenario 5.2**: stop-tenant stops adapter
-```bash
-# Preconditions: Tenant running
-# Steps:
-sudo lunarwing-mt-admin.sh stop-tenant testdarkirc1
-systemctl --user -M testdarkirc1@ is-active lunarwing-darkirc-adapter-testdarkirc1.service
-
-# Expected: Service inactive
-# Evidence: .sisyphus/evidence/task-5-stop-tenant.txt
-```
-
-### Task 6: Gateway Environment Wiring
-
-`DARKIRC_ADAPTER_URL` and `DARKIRC_ADAPTER_SECRET` are written to `$TENANT_ENV_DIR/lunarwing.env` by `write_tenant_darkirc_adapter_env()`. The WASM channel consumes them using the same env-var-reading pattern as WeeChat (`relay_url`/`RELAY_URL`) and XMPP (`xmpp_password`/`XMPP_PASSWORD`):
-
-- `adapter_url` in `darkirc_channel_for_lunarwing/darkirc/darkirc.capabilities.json` declares `"env": "DARKIRC_ADAPTER_URL"`, so `ic/src/channels/wasm/setup.rs` injects the per-tenant URL into the channel config at runtime.
-- `DARKIRC_ADAPTER_SECRET` is injected as a credential via the `darkirc_adapter_secret` secret mapping in the capabilities file; the fallback in `setup.rs` reads any `DARKIRC_*` prefixed env var.
-
-**Scenario 6.1**: add-tenant writes DARKIRC_ADAPTER_URL
-```bash
-# Preconditions: Tenant created
-# Steps:
-grep DARKIRC_ADAPTER_URL $(tenant_env_dir testdarkirc1)/lunarwing.env
-echo "Expected: http://127.0.0.1:$(ports_get testdarkirc1 darkirc_adapter)"
-
-# Expected: URL present and correct
-# Evidence: .sisyphus/evidence/task-6-env-url.txt
-```
-
-**Scenario 6.2**: patch-env adds missing vars
-```bash
-# Preconditions: Existing tenant missing DARKIRC_ADAPTER_URL
-# Steps:
-sed -i '/DARKIRC_ADAPTER_URL/d' $(tenant_env_dir testdarkirc1)/lunarwing.env
-sudo lunarwing-mt-admin.sh patch-env testdarkirc1
-grep DARKIRC_ADAPTER_URL $(tenant_env_dir testdarkirc1)/lunarwing.env
-
-# Expected: Var re-added
-# Evidence: .sisyphus/evidence/task-6-patch-env.txt
-```
-
-### Task 7: Health Pipeline
-
-**Scenario 7.1**: Adapter health endpoint reaches gateway status
-```bash
-# Preconditions: Tenant running with darkirc adapter, Gateway running
-# Steps:
-curl -sf http://127.0.0.1:$(ports_get testdarkirc1 darkirc_adapter)/health | jq .status
-curl -sf -H "Authorization: Bearer $TOKEN" http://127.0.0.1:$(ports_get testdarkirc1 gateway)/api/gateway/status | jq '.channel_health.darkirc'
-
-# Expected: /health returns "ok", gateway reports darkirc healthy
-# Evidence: .sisyphus/evidence/task-7-health-chain.txt
-```
-
-**Scenario 7.2**: Adapter down is detected
-```bash
-# Preconditions: Adapter running, then stopped
-# Steps:
-systemctl --user -M testdarkirc1@ stop lunarwing-darkirc-adapter-testdarkirc1.service
-sleep 10  # wait for health check cycle
-curl -sf -H "Authorization: Bearer $TOKEN" http://127.0.0.1:$(ports_get testdarkirc1 gateway)/api/gateway/status | jq '.channel_health.darkirc.healthy'
-
-# Expected: healthy == false, error contains reason
-# Evidence: .sisyphus/evidence/task-7-down-detected.txt
-```
-
-## Summary
-
-The adapter-only milestone delivers:
-- Per-tenant adapter services with unique ports
-- Full lifecycle management (start/stop/remove)
-- Health monitoring via gateway and watchdog
-- Gateway environment wiring for channel routing
-
-**Next phase**: Tasks 9-18 implement per-tenant DarkIRC daemon isolation, eliminating the shared daemon limitation.
+- **Adapter healthy, channel unhealthy:** verify the installed channel artifact, `DARKIRC_ADAPTER_URL`, bearer injection, and poll errors.
+- **IRC disconnected:** inspect the tenant daemon first, then the adapter's configured IRC registry port and logs.
+- **401 from adapter:** re-render/patch through MT admin and verify secret mapping without printing either secret-bearing file.
+- **Port collision:** run MT admin `doctor` and inspect `/etc/lunarwing/ports.json`; do not hand-edit generated service ports while units are running.
+- **Contact exchange blocked:** use `darkirc-contact status`/`doctor` and resolve the lifecycle state rather than editing TOML by hand.
