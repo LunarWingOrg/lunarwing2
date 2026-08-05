@@ -27,20 +27,24 @@ You do **not** need to clone DarkFi by hand. `build-darkirc` maintains one fixed
 
 ## Port Registry Requirements
 
-DarkIRC's three port fields were introduced by schema v7, but the current
-registry schema is **v13**. Normal `lunarwing-mt-admin.sh` commands call
-`ports_registry_init()` and migrate older registries through every version to
-v13 before operating. Do not intentionally leave a production registry at v7.
+DarkIRC's three port fields were introduced by schema v7. The current registry
+schema is **v14**: v13 dedicated `extended_ports.coord_admin`, and v14 assigns a
+stable, unique, non-secret `darkirc_scope_id` to every DarkIRC-enabled tenant.
+Normal `lunarwing-mt-admin.sh` mutating commands call `ports_registry_init()` and
+migrate older registries through every version to v14 before operating. Do not
+intentionally leave a production registry at an intermediate version.
 
 | Historical schema | Adds | Standalone migration |
 |-------------------|------|----------------------|
 | v6 | `extended_range`, `extended_base`, `extended_ports.reserved_0..reserved_9` | `ic/scripts/migrate-ports-v6.sh` |
 | v6.1 | `extended_ports.darkirc_adapter` from `reserved_0` | `ic/scripts/migrate-ports-v6.1.sh` |
 | v7 | `extended_ports.darkirc_irc` and `extended_ports.darkirc_rpc` from `reserved_1` and `reserved_2` | `ic/scripts/migrate-ports-v7.sh` |
+| v14 | Unique `darkirc_scope_id` for each enabled tenant | Integrated into `lunarwing-mt-admin.sh`; no standalone migration |
 
-New tenants already receive all three DarkIRC ports. Existing registries are
-migrated by the admin script; the standalone v6/v6.1/v7 scripts are retained
-for explicit recovery or rehearsal on old copies.
+New tenants already receive all three DarkIRC ports and their stable scope
+identity. Existing registries are migrated by the admin script; the standalone
+v6/v6.1/v7 scripts are retained for explicit recovery or rehearsal on old
+copies.
 
 ### Inspect Current Schema
 
@@ -72,12 +76,20 @@ Use the admin script rather than stopping at the old DarkIRC-specific v7 step:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh list-tenants
-jq -e '.version == 13' /etc/lunarwing/ports.json
+jq -e '.version == 14' /etc/lunarwing/ports.json
+jq -e '
+  [.tenants | to_entries[]
+   | select(.value.enable_darkirc == true)
+   | .value.darkirc_scope_id] as $ids
+  | all($ids[]; test("^[0-9a-f]{32}$") and . != "00000000000000000000000000000000")
+    and (($ids | unique | length) == ($ids | length))
+' /etc/lunarwing/ports.json
 ```
 
 `list-tenants` calls `ports_registry_init()`, which acquires the registry lock and
-runs the full v2 → v13 migration chain before printing tenants. Other normal
-admin operations that initialize the registry do the same.
+runs the full v2 → v14 migration chain before printing tenants. Other normal
+admin operations that initialize the registry do the same. Migration fails
+closed if an existing DarkIRC scope ID is invalid or duplicated.
 
 For a DarkIRC-only rehearsal on an old registry copy, the standalone v6,
 v6.1, and v7 scripts remain useful:
@@ -609,7 +621,7 @@ If the WASM channel is installed but the adapter is down, channel health will re
 
 For each production tenant:
 
-- [ ] `/etc/lunarwing/ports.json` is current schema v13.
+- [ ] `/etc/lunarwing/ports.json` is current schema v14.
 - [ ] `darkirc_adapter`, `darkirc_irc`, and `darkirc_rpc` exist under `.extended_ports`.
 - [ ] The root-owned DarkFi checkout is clean, non-writable, symlink-free, and at the approved revision.
 - [ ] The locked `lunarwing-build` account and host `cargo`/`make`/`taskset`/`setpriv` toolchain are available.
