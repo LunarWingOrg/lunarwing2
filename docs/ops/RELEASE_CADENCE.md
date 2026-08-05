@@ -9,5 +9,5 @@
 * Feature releases
 ## Major Releases
 * Contain very large changes or a very large amount of changes
-### An example of a MAJOR RELEASE is 1.1.0
-#### The next MAJOR RELEASE will be 2.0.0
+### Examples of major releases include 1.1.0 and 2.0.0
+#### Future major-release targets are tracked in [`ROADMAP_2026.md`](ROADMAP_2026.md)
