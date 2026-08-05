@@ -25,6 +25,11 @@ stat() {
   if [[ "${1:-}" == -c ]]; then format="$2"; fi
   case "$format" in
     %u) printf '0\n' ;;
+    # Overlay filesystems (CI containers) report directory st_nlink=1 while
+    # the production validator expects the normal-filesystem leaf-dir value 2.
+    # Report 2 for directories, the real count for files.
+    %h)
+      if [[ -d "$path" && ! -L "$path" ]]; then printf '2\n'; else command stat -c '%h' -- "$path"; fi ;;
     %u:%a:%h) command stat -c "0:%a:%h" -- "$path" ;;
     *) command stat "$@" ;;
   esac
