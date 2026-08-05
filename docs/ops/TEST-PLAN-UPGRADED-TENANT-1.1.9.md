@@ -222,6 +222,6 @@ Phase 0 baseline.
   init scripts — leftovers from a prior test tenant; harmless, delete at will.
 - `/home/lion/lunarwing` contains a ~74 MB regular file whose name is
   whitespace (mtime Jul 4 20:25) — likely a stray binary copy; worth a look.
-- `TENANT-RENAME-MIGRATION-1.1.9.md`'s footgun caveat originally pointed at
-  "GOALS item #7", which has since been renumbered; the fix is actually
-   scheduled for v2.0.3 (see that doc's corrected caveat).
+- `TENANT-RENAME-MIGRATION-1.1.9.md`'s original footgun caveat is historical.
+  The `enable_weechat` health and lifecycle gate has since landed; only the tmux
+  duplicate-session startup failure described there remains open.
