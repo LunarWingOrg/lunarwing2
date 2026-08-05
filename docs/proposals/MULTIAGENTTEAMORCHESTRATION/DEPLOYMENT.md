@@ -27,6 +27,14 @@ populate it with room JIDs (e.g. `coord@conference.example`). Native and
 installable (WASM) XMPP paths produce the same scope; XMPP DMs and unrelated
 rooms are unaffected. Matching is case-insensitive exact equality.
 
+Transient XMPP status output is also isolated at the shared channel boundary.
+When `COORD_ENABLED=true`, thinking indicators, tool progress/results, and safe
+reasoning summaries are suppressed for exact `COORD_CHANNELS` destinations
+before either the native or installable WASM XMPP adapter sees them. Final agent
+responses still use the normal outbound hook pipeline. Set
+`COORD_XMPP_STATUS_UPDATES=true` only when status chatter is intentionally wanted
+in coordination rooms; XMPP DMs and unrelated rooms are always unaffected.
+
 ## Phase 1 — Declarative hook bundle (no Rust needed)
 
 Ships as `ic/config/hooks/coordination.hook.json`.
@@ -151,6 +159,7 @@ channel, native and installable WASM XMPP channels coalesce identically.
 | `COORD_COALESCE_MS` | `2000` | First-responder claim TTL |
 | `COORD_ENTROPY_THRESHOLD` | `4.8` | Shannon entropy threshold (bits/char) |
 | `COORD_MIN_SECRET_LENGTH` | `32` | Min token length for entropy checks |
+| `COORD_XMPP_STATUS_UPDATES` | `false` | Allow transient thinking/tool/reasoning status messages in configured XMPP coordination rooms |
 | `COORD_ADMIN_USERS` | (empty) | Comma-separated admin user IDs |
 | `COORD_VIOLATION_MAX` | `3` | Strikes before auto-disable |
 | `COORD_VIOLATION_DISABLE_DURATION` | `86400` | Auto-disable seconds (24h) |

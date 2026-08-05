@@ -178,6 +178,8 @@ Set `COORD_CHANNELS` to exact room JIDs, then set `COORD_ENABLED=true` and
 restart tenant. `add-tenant` preserves existing coordination values and token;
 `patch-env <tenant>` backfills missing keys without rotating or printing token.
 Agent IDs must be 1–128 ASCII characters using letters, digits, `@.-_/:+~`.
+Transient XMPP thinking, tool, and reasoning statuses are suppressed in those
+rooms by default. Set `COORD_XMPP_STATUS_UPDATES=true` only to show them.
 
 ## Gateway (Web UI)
 

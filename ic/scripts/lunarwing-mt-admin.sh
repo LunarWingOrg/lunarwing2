@@ -516,19 +516,20 @@ Commands:
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
     --with-kimi                    Also build the kimi worker Docker image
-    --with-toolchains              Include toolchains in selected opencode and kimi
-                                   worker images (default: slim)
+    --with-toolchains              Include toolchains in selected pebble, opencode,
+                                   and kimi worker images (default: slim)
 
   build-all                        Build each tenant sequentially
     --with-wasm                    Also build WASM extensions
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
     --with-kimi                    Also build the kimi worker Docker image
-    --with-toolchains              Include toolchains in selected opencode and kimi
-                                   worker images (default: slim)
+    --with-toolchains              Include toolchains in selected pebble, opencode,
+                                   and kimi worker images (default: slim)
 
   build-pebble-worker             Build the pebble worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
+    --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
 
   build-opencode-worker            Build the opencode worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
@@ -2417,7 +2418,7 @@ build_tenant() {
   if [[ "$with_pebble" == "true" ]]; then
     say ""
     say "=== Building pebble worker image ==="
-    build_pebble_worker "false"
+    build_pebble_worker "false" "$with_toolchains"
   fi
 
   if [[ "$with_opencode" == "true" ]]; then
@@ -2775,7 +2776,7 @@ build_all() {
   if [[ "$with_pebble" == "true" ]]; then
     say ""
     say "=== Building pebble worker image ==="
-    build_pebble_worker "false"
+    build_pebble_worker "false" "$with_toolchains"
   fi
 
   if [[ "$with_opencode" == "true" ]]; then
@@ -2799,28 +2800,34 @@ build_all() {
 
 build_pebble_worker() {
   local no_cache="${1:-false}"
+  local with_toolchains="${2:-false}"
   local pebble_dir="${LUNARWING_ROOT}/pebble4lunarwing"
 
   [[ -d "$pebble_dir" ]] || die "pebble worker dir not found at $pebble_dir"
 
   ensure_container_runtime
 
-  say "building pebble worker Docker image ..."
+  local toolchain_desc="slim (no toolchains)"
+  [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
+  say "building pebble worker Docker image [$toolchain_desc] ..."
   local cache_flag=""
   [[ "$no_cache" == "true" ]] && cache_flag="--no-cache"
+
+  local -a toolchain_args=()
+  [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
 
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     # --network=host: podman's default build network
     # can't reach the internet for RUN steps on this host; the host netns has IPv4.
     # --format docker (O4): preserve the Dockerfile HEALTHCHECK (podman OCI drops it).
-    podman build $cache_flag --network=host --format docker -t lunarwing-worker-pebble:latest -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    podman build $cache_flag "${toolchain_args[@]}" --network=host --format docker -t lunarwing-worker-pebble:latest -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
       || die "pebble worker image build failed"
   else
-    docker build $cache_flag -t lunarwing-worker-pebble:latest -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    docker build $cache_flag "${toolchain_args[@]}" -t lunarwing-worker-pebble:latest -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
       || die "pebble worker image build failed"
   fi
 
-  say "pebble worker image built: lunarwing-worker-pebble:latest"
+  say "pebble worker image built: lunarwing-worker-pebble:latest [$toolchain_desc]"
 }
 
 build_opencode_worker() {
@@ -10392,14 +10399,16 @@ main() {
     build-pebble-worker)
       require_root
       local no_cache="false"
+      local with_toolchains="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --no-cache) no_cache="true"; shift ;;
+          --with-toolchains) with_toolchains="true"; shift ;;
           -*)         die "unknown flag: $1" ;;
           *)          die "unexpected argument: $1" ;;
         esac
       done
-      build_pebble_worker "$no_cache"
+      build_pebble_worker "$no_cache" "$with_toolchains"
       ;;
 
     build-opencode-worker)
