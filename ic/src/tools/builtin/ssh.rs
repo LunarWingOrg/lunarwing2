@@ -135,6 +135,12 @@ impl Tool for SshTool {
         true
     }
 
+    fn allows_autonomous_execution(&self) -> bool {
+        // Remote command execution is excluded from autonomous jobs/routines;
+        // only interactive users may run or persist approval for ssh.
+        false
+    }
+
     fn requires_sanitization(&self) -> bool {
         // Remote output is untrusted (potential prompt injection).
         true

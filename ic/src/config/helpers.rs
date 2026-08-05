@@ -19,9 +19,46 @@ pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// A poisoned mutex means a previous test panicked while holding the lock.
 /// The env state might be slightly stale, but cascading every subsequent
 /// test into a `PoisonError` panic is far worse. Recover and carry on.
+///
+/// Returns an RAII guard that snapshots the process environment on creation
+/// and restores it on drop — even when the test panics mid-mutation. A
+/// panicking test can therefore never leak env vars into the next serialized
+/// env test (cascade pollution).
 #[cfg(test)]
-pub(crate) fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-    ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+pub(crate) fn lock_env() -> EnvGuard {
+    let guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let snapshot = std::env::vars_os().collect();
+    EnvGuard {
+        _guard: guard,
+        snapshot,
+    }
+}
+
+/// RAII environment guard for tests: holds [`ENV_MUTEX`] and restores the
+/// process environment to the snapshot taken at construction. See
+/// [`lock_env`].
+#[cfg(test)]
+pub(crate) struct EnvGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    snapshot: HashMap<std::ffi::OsString, std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: ENV_MUTEX is still held (fields drop after this impl runs),
+        // so no other env-mutating test is running concurrently.
+        unsafe {
+            for (key, _) in std::env::vars_os() {
+                if !self.snapshot.contains_key(&key) {
+                    std::env::remove_var(key);
+                }
+            }
+            for (key, value) in &self.snapshot {
+                std::env::set_var(key, value);
+            }
+        }
+    }
 }
 
 /// Thread-safe mutable overlay for env vars set at runtime.

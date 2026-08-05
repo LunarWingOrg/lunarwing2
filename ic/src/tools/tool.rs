@@ -60,7 +60,9 @@ impl ApprovalRequirement {
 #[derive(Debug, Clone)]
 pub enum ApprovalContext {
     /// Autonomous job with no interactive user. Only tools in `allowed_tools`
-    /// may run, and `Always`-gated invocations remain blocked.
+    /// may run; approval tier does not gate autonomous execution (hard
+    /// exclusions live in `Tool::allows_autonomous_execution` and
+    /// `AUTONOMOUS_TOOL_DENYLIST`).
     Autonomous {
         /// Tool names that may run autonomously for this job/run.
         allowed_tools: std::collections::HashSet<String>,
@@ -83,22 +85,24 @@ impl ApprovalContext {
     }
 
     /// Check whether a tool invocation is blocked in this context.
-    pub fn is_blocked(&self, tool_name: &str, requirement: ApprovalRequirement) -> bool {
+    pub fn is_blocked(&self, tool_name: &str, _requirement: ApprovalRequirement) -> bool {
         match self {
-            Self::Autonomous { allowed_tools } => {
-                requirement == ApprovalRequirement::Always || !allowed_tools.contains(tool_name)
-            }
+            Self::Autonomous { allowed_tools } => !allowed_tools.contains(tool_name),
         }
     }
 
     /// Check whether a tool is blocked given an optional context.
     ///
     /// When `None`, falls back to legacy behavior: all non-`Never` tools are blocked.
+    /// Names on `AUTONOMOUS_TOOL_DENYLIST` are always blocked (defense-in-depth).
     pub fn is_blocked_or_default(
         context: &Option<Self>,
         tool_name: &str,
         requirement: ApprovalRequirement,
     ) -> bool {
+        if super::autonomy::is_autonomous_tool_denylisted(tool_name) {
+            return true;
+        }
         match context {
             Some(ctx) => ctx.is_blocked(tool_name, requirement),
             None => requirement.is_required(),
@@ -369,6 +373,16 @@ pub trait Tool: Send + Sync {
     /// semantics for global auto-approve and autonomous execution.
     fn allows_always_approval(&self, params: &serde_json::Value) -> bool {
         !matches!(self.requires_approval(params), ApprovalRequirement::Always)
+    }
+
+    /// Whether this tool may execute in autonomous contexts (background jobs,
+    /// routines) at all. Distinct from approval tier: interactive approval
+    /// behavior is unchanged. Hard exclusions (remote-command tools such as
+    /// `ssh`/`ssh_git`, or WASM tools carrying the SSH capability) override
+    /// this to return `false`; `AUTONOMOUS_TOOL_DENYLIST` remains as
+    /// name-based defense-in-depth.
+    fn allows_autonomous_execution(&self) -> bool {
+        true
     }
 
     /// Maximum time this tool is allowed to run before the caller kills it.
@@ -1075,8 +1089,8 @@ mod tests {
         let ctx =
             ApprovalContext::autonomous_with_tools(["shell".to_string(), "message".to_string()]);
         assert!(!ctx.is_blocked("shell", ApprovalRequirement::Never));
-        assert!(ctx.is_blocked("shell", ApprovalRequirement::Always));
-        assert!(ctx.is_blocked("message", ApprovalRequirement::Always));
+        assert!(!ctx.is_blocked("shell", ApprovalRequirement::Always));
+        assert!(!ctx.is_blocked("message", ApprovalRequirement::Always));
         assert!(ctx.is_blocked("http", ApprovalRequirement::Always));
     }
 
@@ -1111,7 +1125,7 @@ mod tests {
         let ctx = Some(ApprovalContext::autonomous_with_tools(
             ["shell".to_string()],
         ));
-        assert!(ApprovalContext::is_blocked_or_default(
+        assert!(!ApprovalContext::is_blocked_or_default(
             &ctx,
             "shell",
             ApprovalRequirement::Always

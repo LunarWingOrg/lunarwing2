@@ -558,8 +558,8 @@ impl Scheduler {
 
         // Scheduler-specific approval check
         let requirement = tool.requires_approval(&normalized_params);
-        let blocked =
-            ApprovalContext::is_blocked_or_default(&approval_context, tool_name, requirement);
+        let blocked = !tool.allows_autonomous_execution()
+            || ApprovalContext::is_blocked_or_default(&approval_context, tool_name, requirement);
         if blocked {
             return Err(autonomous_unavailable_error(tool_name, &job_ctx.user_id).into());
         }

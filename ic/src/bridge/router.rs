@@ -2912,8 +2912,10 @@ async fn handle_with_engine_inner(
         resolve_user_project(&state.store, &message.user_id, state.default_project_id).await?;
 
     let thread_config = {
-        let mut config = ThreadConfig::default();
-        config.shared_conversation = message.is_shared_conversation();
+        let mut config = ThreadConfig {
+            shared_conversation: message.is_shared_conversation(),
+            ..Default::default()
+        };
         if crate::llm::user_signals_execution_intent(content) {
             config.require_action_attempt = true;
         }

@@ -971,6 +971,17 @@ mod tests {
             AuthCapabilitySchema, CapabilitiesFile, OAuthConfigSchema,
         };
 
+        // Serialized under ENV_MUTEX: this test asserts the exchange-proxy and
+        // gateway-token env vars are unset, so it must not race siblings that
+        // set them. The RAII guard also restores any pre-existing values.
+        let _guard = lock_env();
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe {
+            std::env::remove_var("LUNARWING_OAUTH_EXCHANGE_URL");
+            std::env::remove_var("IRONCLAW_OAUTH_EXCHANGE_URL");
+            std::env::remove_var("GATEWAY_AUTH_TOKEN");
+        }
+
         let caps = CapabilitiesFile {
             auth: Some(AuthCapabilitySchema {
                 secret_name: "google_oauth_token".to_string(),

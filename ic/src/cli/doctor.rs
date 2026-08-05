@@ -1065,6 +1065,11 @@ mod tests {
         // SAFETY: Under ENV_MUTEX, no concurrent env access.
         unsafe {
             std::env::remove_var("LLM_BACKEND");
+            // Loopback URLs: config-time validation must not depend on
+            // external private DNS (http://127.0.0.1 passes via the
+            // localhost exemption).
+            std::env::set_var("LUNARWING_CLOUD_AUTH_URL", "http://127.0.0.1");
+            std::env::set_var("LUNARWING_CLOUD_BASE_URL", "http://127.0.0.1");
         }
         let settings = Settings::default();
         match check_llm_config(&settings) {
