@@ -35,7 +35,7 @@ For a multi-tenant installation, start with the init-agnostic admin command:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
-sudo ic/scripts/lunarwing-mt-admin.sh doctor <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh doctor
 ```
 
 Tenant units run under the tenant account's systemd user manager on systemd hosts and as OpenRC services on Gentoo. Do not diagnose a tenant with bare system-bus `systemctl`; it can report an inactive unit while the tenant is healthy.
