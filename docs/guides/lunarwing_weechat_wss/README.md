@@ -37,7 +37,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <tenant>
 sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-wasm
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <tenant>
 sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
-sudo ic/scripts/lunarwing-mt-admin.sh doctor <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh doctor
 ```
 
 Use `--no-weechat-bootstrap` only when the relay should not be configured during tenant creation. Recover later with:
@@ -121,7 +121,7 @@ IRC identity is not cryptographic. WeeChat sender principals are network-qualifi
 
 ## Verification
 
-1. MT admin `status` and `doctor` report WeeChat, adapter, and LunarWing healthy.
+1. MT admin `status <tenant>` reports WeeChat, adapter, and LunarWing healthy; host `doctor` reports required dependencies available.
 2. The preflight script confirms the relay type, bind address, port, and protected password wiring.
 3. The adapter health endpoint responds on the tenant's `weechat_adapter` port.
 4. A configured IRC connection receives a direct message and channel message according to policy.
