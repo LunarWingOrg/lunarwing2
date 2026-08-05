@@ -21,7 +21,10 @@ use lunarwing::{
     },
     config::Config,
     gate::violation_store::{ViolationStore, ViolationStoreConfig},
-    hooks::{CoordinationHookConfig, bootstrap_hooks, register_coordination_hooks},
+    hooks::{
+        CoordinationHookConfig, CoordinationPromptPolicy, bootstrap_hooks,
+        register_coordination_hooks,
+    },
     llm::create_session_manager,
     orchestrator::{ReaperConfig, SandboxReaper},
     pairing::PairingStore,
@@ -670,6 +673,7 @@ async fn async_main() -> anyhow::Result<()> {
                 ViolationStoreConfig::from_env(),
             ))
         });
+    let coordination_prompt_policy = CoordinationPromptPolicy::from_config(&coordination_config);
     // Phase 3: execution gate sharing the hooks' violation store, so a
     // strike-three (or manual) disable actually blocks tool execution
     // instead of only filtering channel traffic (ISSUE-003).
@@ -1079,6 +1083,7 @@ async fn async_main() -> anyhow::Result<()> {
         builder: components.builder,
         llm_backend: config.llm.backend.clone(),
         coordination_gate,
+        coordination_prompt_policy,
         coordination_coalesce,
     };
 

@@ -42,7 +42,12 @@ impl HookPoint {
 pub enum HookEvent {
     /// An inbound user message about to be processed.
     Inbound {
+        /// Storage/owner scope for the conversation.
         user_id: String,
+        /// Channel actor that sent the message. Older serialized events may
+        /// omit this and fall back to `user_id`.
+        #[serde(default)]
+        sender_id: Option<String>,
         channel: String,
         content: String,
         thread_id: Option<String>,

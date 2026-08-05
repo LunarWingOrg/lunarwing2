@@ -11,7 +11,7 @@
 
 ---
 
-1. [ ] update all external crates that need updating for entire project. see previous release notes for some examples of such crates - ensure CI/CD is also updated for the new crate versions
+1. [x] update all external crates that need updating for entire project. see previous release notes for some examples of such crates - ensure CI/CD is also updated for the new crate versions — DONE (2026-08-05): `cargo update` applied to all 18 tracked lockfiles (ic/ workspace + satellites: 15 patch/minor bumps incl. clap 4.6.5, russh 0.62.5, time 0.3.55, wasmparser/wat 0.255; top-level: serde 1.0.229, futures 0.3.33, tokio-family patches, etc.). No exact pins exist; behind-latest majors (reqwest 0.13, tokio-tungstenite 0.30, libsql 0.9, rand 0.10, wasmtime 47) remain deferred per CRATE_AUDIT_v2.0.4.0 rationale (see items #2/#3/#5). Verified: `cargo check` default + all-features + xmpp-bridge + 5 native satellites all exit 0; WASM channel/tool crates lockfile-only per precedent. CI/CD: no external crate versions are pinned in `.gitlab/` (only Rust 1.96.1 toolchain + cargo-deny 0.20.2 installer), `validate_config.py` passes — no CI changes required.
 2. [ ] ensure crates are updated
 3. [ ] identify crates which have not been updated which should be - put in a new doc
 4. [ ] Bump lunarwing crate versions and wasm channel crates for lunarwing that have same version. they are at 2.0.4. we need bump to 2.0.5 - ensure CI/CD is also updated for the new crate versions
