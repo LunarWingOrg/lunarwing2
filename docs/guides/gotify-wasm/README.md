@@ -63,25 +63,19 @@ Both changes take effect on restart — no WASM rebuild needed.
 
 If `config/gotify.json` is absent or unparseable, the tool falls back to the compiled-in defaults (URL and title).
 
-### Automated Setup via Scripts
+### Provisioning Support
 
-The setup scripts can configure the Gotify URL automatically during provisioning:
+For a single-instance deployment, use the registry/setup flow above and write the reviewed workspace JSON and capability host allowlist explicitly. The old `scripts/setup-instance.sh` path is deprecated in favor of `lunarwing onboard --quick` and the current extension lifecycle.
 
-**Single-instance** (`setup-instance.sh`):
+For a multi-tenant deployment, MT admin can configure Gotify during provisioning:
 ```bash
-scripts/setup-instance.sh --base-dir /srv/lunarwing --gotify-url https://gotify.example.com --gotify-title "My Agent" ...
-```
-Creates both `workspace/config/gotify.json` and `tools/gotify.capabilities.json` with the custom host. The `--gotify-title` flag is optional.
-
-**Multi-tenant** (`lunarwing-mt-admin.sh`):
-```bash
-sudo lunarwing-mt-admin.sh add-tenant myagent --gotify-url https://gotify.example.com --gotify-title "My Agent"
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant myagent --gotify-url https://gotify.example.com --gotify-title "My Agent"
 ```
 Creates the workspace config at provisioning time. The capabilities file is automatically rewritten when WASM tools are installed (`install-wasm`).
 
 To reconfigure an existing tenant:
 ```bash
-sudo lunarwing-mt-admin.sh configure-gotify myagent https://new-gotify.example.com "My Agent"
+sudo ic/scripts/lunarwing-mt-admin.sh configure-gotify myagent https://new-gotify.example.com "My Agent"
 ```
 
 **Test harness** (`lunarwing-xmpp-test-env.sh`):
