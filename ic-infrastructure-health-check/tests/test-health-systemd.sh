@@ -32,7 +32,9 @@ SD="$ROOT"
 sub="${1:-}"; shift || true
 [ -n "${HS_FAIL_USER:-}" ] && [ "${HS_TENANT_USER:-}" = "$HS_FAIL_USER" ] && exit 1
 case "$sub" in
-  --user) exec "$0" "$@" ;;
+  --user)
+    [ -n "${HS_CALL_LOG:-}" ] && printf 'user %s\n' "$*" >> "$HS_CALL_LOG"
+    exec "$0" "$@" ;;
   list-unit-files)
     [ -n "${HS_FAIL_ENUM_USER:-}" ] && [ "${HS_TENANT_USER:-}" = "$HS_FAIL_ENUM_USER" ] && exit 1
     pats=(); for a in "$@"; do case "$a" in --no-legend|--user|--type=service) ;; *) pats+=("$a");; esac; done
@@ -109,6 +111,12 @@ run_hs_registry() {  # <sb> [ENV=VALUE ...] -> health-systemd.sh JSON on stdout
     env PATH="$sb/bin:$PATH" HS_UNIT_DIR="$sb/units" \
         LUNARWING_SERVICE_MANAGER=systemd LUNARWING_TENANTS_FILE="$sb/ports.json" \
         "$@" bash "$HS" 2>/dev/null
+}
+run_hs_single() {  # <sb> [ENV=VALUE ...] -> single-node base-unit report
+    local sb="$1"; shift
+    env PATH="$sb/bin:$PATH" HS_UNIT_DIR="$sb/units" \
+        LUNARWING_SERVICE_MANAGER=systemd LUNARWING_TENANTS_FILE="$sb/no-registry.json" \
+        UNITS=lunarwing.service "$@" bash "$HS" 2>/dev/null
 }
 write_two_tenant_registry() {
     jq -n '{tenants:{acme:{user:"acme"},beta:{user:"beta"}}}' > "$1/ports.json"
@@ -348,5 +356,18 @@ oS="$(run_hs_registry "$s")"
 assert_eq "$(ustat "$oS" lunarwing-vision-acme.service)" "critical" "S1: active but unhealthy LunarVision container is critical"
 assert_eq "$(jq -r '.metrics.units[] | select(.name=="lunarwing-vision-acme.service") | .extra.container_health' <<<"$oS")" "unhealthy" "S2: LunarVision container health exposed"
 assert_eq "$(oall "$oS")" "critical" "S3: LunarVision container failure drives overall status"
+
+# ── T: single-node user scope probes the same bus remediation targets ────────
+echo "=== Section T: single-node user-manager scope ==="
+t="$(sb)"; mk_hs_mock "$t"
+unit_set "$t" lunarwing.service "loaded active running 0 enabled"
+: > "$t/systemctl-calls"
+oT="$(run_hs_single "$t" SELF_HEAL_SYSTEMD_SCOPE=user HS_CALL_LOG="$t/systemctl-calls")"
+assert_eq "$(ustat "$oT" lunarwing.service)" "healthy" "T1: user-scoped base unit is healthy"
+if grep -q '^user ' "$t/systemctl-calls"; then
+    ok "T2: base-unit probe uses systemctl --user"
+else
+    bad "T2: base-unit probe uses systemctl --user" "no user-bus call recorded"
+fi
 
 finish

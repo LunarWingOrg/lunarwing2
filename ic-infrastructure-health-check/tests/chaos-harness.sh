@@ -11,8 +11,8 @@
 # system* (fake systemctl/rc-service/sudo + fake component health checks, see
 # lib.sh:mk_mockbin) driven entirely by files under a throwaway sandbox. The
 # mock shadows the real binaries on PATH, so a "restart" flips a sandbox file —
-# never a real unit. Escalation runs the real send-notification.sh but with an
-# empty GOTIFY_TOKEN, so it short-circuits before any network call.
+# never a real unit. Escalation uses a sandbox notifier that confirms delivery
+# without any network call.
 #
 # Each scenario simulates cron ticks by invoking self-heal repeatedly; backoff
 # base is 0 so retries are not gated across the simulated ticks.

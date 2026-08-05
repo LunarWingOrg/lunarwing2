@@ -491,7 +491,7 @@ STATE_FILE="$SELF_HEAL_STATE_DIR/state.json"
 
 ensure_state_dir() {
     mkdir -p "$SELF_HEAL_STATE_DIR"
-    [[ -f "$STATE_FILE" ]] || echo '{}' > "$STATE_FILE"
+    [[ "$DRY_RUN" == true || -f "$STATE_FILE" ]] || echo '{}' > "$STATE_FILE"
 }
 
 load_state() {
@@ -514,8 +514,12 @@ load_state() {
         # it overwrites last-wins and cannot accumulate unbounded across recurring
         # corruption. Then start fresh so escalated state can be rebuilt from the
         # next tick.
-        mv "$STATE_FILE" "$STATE_FILE.corrupt" 2>/dev/null || true
-        log "WARNING: state.json is corrupt — renamed to state.json.corrupt and starting fresh"
+        if [[ "$DRY_RUN" == true ]]; then
+            log "WARNING: state.json is corrupt — [DRY-RUN] would rename to state.json.corrupt and start fresh"
+        else
+            mv "$STATE_FILE" "$STATE_FILE.corrupt" 2>/dev/null || true
+            log "WARNING: state.json is corrupt — renamed to state.json.corrupt and starting fresh"
+        fi
         echo '{}'
     fi
 }
@@ -525,6 +529,14 @@ save_state() {
     tmp="$(mktemp "$STATE_FILE.tmp.XXXXXX")"
     printf '%s\n' "$state" > "$tmp"
     mv "$tmp" "$STATE_FILE"
+}
+
+persist_state() {
+    if [[ "$DRY_RUN" == true ]]; then
+        log "[DRY-RUN] state changes not persisted"
+        return 0
+    fi
+    save_state "$1"
 }
 
 state_get_num() {
@@ -652,9 +664,9 @@ _send_notification() {
             now="$(date +%s)"
             age=$((now - last))
             if [[ "$last" -gt 0 && "$age" -ge 0 && "$age" -lt "$ESCALATE_COOLDOWN" ]]; then
-                log "COOLDOWN: page for $svc suppressed (last page ${age}s ago < ${ESCALATE_COOLDOWN}s cooldown); escalated state retained"
+                log "COOLDOWN: page for $svc deferred (last page ${age}s ago < ${ESCALATE_COOLDOWN}s cooldown); will retry next tick"
                 log_action "ESCALATE_PAGE_SUPPRESSED target=$svc last_page_age=${age}s cooldown=${ESCALATE_COOLDOWN}s"
-                return 0
+                return 2
             elif [[ "$last" -gt "$now" ]]; then
                 log "WARNING: future cooldown timestamp for $svc ignored"
             fi
@@ -668,9 +680,8 @@ _send_notification() {
         # CRITICAL: redirect the notifier's stdout to stderr. escalate_service runs
         # inside remediate_component, whose STDOUT is captured as the returned state
         # JSON (state="$(remediate_component ...)"). Any stdout here corrupts that
-        # JSON, so the next prune_state jq aborts under `set -e` BEFORE save_state —
-        # silently losing escalated:true. Also tolerate a non-zero notify (e.g.
-        # Gotify non-200) so the escalated state still persists if the page fails.
+        # JSON, so the next prune_state jq aborts under `set -e` BEFORE save_state.
+        # A non-zero notifier result leaves escalation pending for the next tick.
         #
         # Guard with timeout so a hung Gotify endpoint can't stall the self-heal tick.
         if [[ "$notify_script" == "$SCRIPT_DIR/send-notification.sh" && -z "${GOTIFY_TOKEN:-}" ]]; then
@@ -702,7 +713,7 @@ _send_notification() {
             log "WARNING: could not persist escalation cooldown for $svc"
         fi
     fi
-    return 0
+    [[ "$delivered" == true ]]
 }
 
 # escalate_service <svc> <retries> [reason]   (retries passed explicitly — no $STATE)
@@ -712,7 +723,7 @@ escalate_service() {
     log_action "ESCALATE target=$svc retries=$retries reason=$reason"
     if [[ "$DRY_RUN" == true ]]; then
         log "[DRY-RUN] would send escalation notification for $svc"
-        return 0
+        return 2
     fi
 
     local esc_report esc_key
@@ -722,8 +733,27 @@ escalate_service() {
         '{escalated: true, service: $svc, timestamp: $now, retries: $retries, reason: $reason, action: "manual_intervention_required"}' \
         > "$esc_report"
 
-    _send_notification "critical" "$esc_report" "$svc"
+    local notify_rc
+    if _send_notification "critical" "$esc_report" "$svc"; then
+        notify_rc=0
+    else
+        notify_rc=$?
+    fi
     rm -f "$esc_report"
+    return "$notify_rc"
+}
+
+escalate_and_update_state() {
+    local state="$1" svc="$2" retries="$3" reason="$4"
+    if [[ "$DRY_RUN" == true ]]; then
+        escalate_service "$svc" "$retries" "$reason" || true
+    elif escalate_service "$svc" "$retries" "$reason"; then
+        state="$(mark_escalated "$state" "$svc")"
+    else
+        log "ESCALATION PENDING: page for $svc not delivered; will retry next tick"
+        log_action "ESCALATE_PENDING target=$svc retries=$retries reason=$reason"
+    fi
+    printf '%s' "$state"
 }
 
 # ── Post-restart verification ───────────────────────────────────────────────
@@ -783,15 +813,13 @@ remediate_component() {
         flaps="$(flap_count "$state" "$svc" "$flap_since")"
         if [[ "$flaps" -ge "$FLAP_MAX_RESTARTS" ]]; then
             log "FLAPPING: $svc restarted $flaps times in ${FLAP_WINDOW_SECS}s; escalating instead"
-            state="$(mark_escalated "$state" "$svc")"
-            escalate_service "$svc" "$retries" "flapping"
+            state="$(escalate_and_update_state "$state" "$svc" "$retries" "flapping")"
             continue
         fi
 
         # Max retries reached → escalate.
         if [[ "$retries" -ge "$MAX_RETRIES" ]]; then
-            state="$(mark_escalated "$state" "$svc")"
-            escalate_service "$svc" "$retries" "max_retries"
+            state="$(escalate_and_update_state "$state" "$svc" "$retries" "max_retries")"
             continue
         fi
 
@@ -803,8 +831,7 @@ remediate_component() {
         fi
 
         if [[ "${MONITOR_ONLY[$comp]:-}" == "1" ]]; then
-            state="$(mark_escalated "$state" "$svc")"
-            escalate_service "$svc" "$retries" "monitor_only"
+            state="$(escalate_and_update_state "$state" "$svc" "$retries" "monitor_only")"
             continue
         fi
 
@@ -970,7 +997,7 @@ main() {
 
     if [[ ${#targets[@]} -eq 0 ]]; then
         state="$(prune_state "$state" "$now_epoch")"
-        save_state "$state"
+        persist_state "$state"
         log "=== Self-Healing complete (nothing to do) ==="
         exit 0
     fi
@@ -984,7 +1011,7 @@ main() {
     done
 
     state="$(prune_state "$state" "$now_epoch" "${!seen[@]}")"
-    save_state "$state"
+    persist_state "$state"
 
     local summary
     summary="$(echo "$state" | jq -r 'to_entries | map({service: .key, retries: (.value.retries // 0), escalated: (.value.escalated // false)})')"

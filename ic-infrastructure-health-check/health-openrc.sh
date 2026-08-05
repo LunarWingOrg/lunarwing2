@@ -106,6 +106,7 @@ TENANTS_FILE="${SELF_HEAL_TENANTS_FILE:-${LUNARWING_TENANTS_FILE:-/etc/lunarwing
 # Extract the tenant name from a unit, or "" for single-instance / non-tenant
 # units. Known per-service roles are stripped so every unit maps to its tenant:
 #   lunarwing-acme -> acme   lunarwing-proxy-acme -> acme
+#   lunarwing-vision-acme -> acme
 #   lunarwing-weechat-adapter-acme -> acme   xmpp-bridge-acme -> acme
 #   lunarwing-darkirc-adapter-acme -> acme   lunarwing-darkirc-acme -> acme
 # (weechat-adapter MUST precede weechat in the case so the longer role wins.
@@ -124,6 +125,7 @@ unit_tenant() {
         opencode-*)          rest="${rest#opencode-}" ;;
         kimi-*)              rest="${rest#kimi-}" ;;
         pebble-*)            rest="${rest#pebble-}" ;;
+        vision-*)            rest="${rest#vision-}" ;;
         weechat-adapter-*)   rest="${rest#weechat-adapter-}" ;;
         weechat-*)           rest="${rest#weechat-}" ;;
         darkirc-adapter-*)   rest="${rest#darkirc-adapter-}" ;;

@@ -240,7 +240,8 @@ Report shape:
    escalated, not looped.
 6. **Escalates** via Gotify (bounded by a timeout) after max retries or on
    flapping. Confirmed pages use a collision-resistant per-service cooldown;
-   failed or disabled notification delivery does not arm it.
+   failed, disabled, or cooldown-deferred delivery remains pending and retries
+   on later ticks.
 7. **Tracks state** in `$LUNARWING_BASE_DIR/workspace/reports/self-heal/state.json`,
    clears any service the latest report calls healthy ("report as truth"), and
    auto-prunes stale, non-escalated entries.
@@ -266,7 +267,7 @@ by service-manager checks (including `.service`); per-tenant systemd units are
 remediated as tenant user.
 
 ```bash
-# Test without restarting anything
+# Test without restarting anything or changing state.json
 ./lunarwing-self-heal.sh --dry-run
 
 # Tuning via flags
@@ -298,7 +299,7 @@ is not valid JSON).
 | `--prune-ttl S` | `SELF_HEAL_STATE_PRUNE_TTL` | 86400 | Prune non-escalated entries older than this; `0` (or `false`/`no`/`off`) disables |
 | `--verify-health B` | `SELF_HEAL_VERIFY_HEALTH` | true | Re-run the component health check after a restart (`false` → `is-active` only) |
 | `--report PATH` | — | latest | Act on a specific report instead of the newest in the report dir |
-| `--dry-run` / `-n` | — | off | Log intended actions; never restart, notify, or write escalations |
+| `--dry-run` / `-n` | — | off | Log intended actions; never restart, notify, quarantine corrupt state, or persist state changes |
 | — | `SELF_HEAL_FLAP_MAX_RESTARTS` | 5 | Restarts within the window that mark a service flapping |
 | — | `SELF_HEAL_FLAP_WINDOW_SECS` | 3600 | Flapping detection window (seconds) |
 | — | `SELF_HEAL_HISTORY_MAX` | 20 | Cap on `restart_history[]` length (must be ≥ flap-max) |
@@ -411,32 +412,33 @@ cd ic-infrastructure-health-check
 bash tests/run-all.sh                       # all registered suites
 bash tests/run-all.sh matrix chaos          # pick a subset
 bash tests/run-all.sh --list                # print suite names for CI introspection
-bash tests/test-self-heal-matrix.sh         # dry-run unit matrix (sections A–O)
-bash tests/chaos-harness.sh                 # end-to-end fault-injection (11 scenarios: CH1–CH6, CH9–CH13)
-bash tests/test-health-openrc.sh            # health-openrc.sh probe scenarios (S1–S6)
+bash tests/test-self-heal-matrix.sh         # synthetic report matrix (sections A–O)
+bash tests/chaos-harness.sh                 # end-to-end fault-injection (13 scenarios: CH1–CH6, CH9–CH15)
+bash tests/test-health-openrc.sh            # health-openrc.sh probe scenarios (S1–S13)
 bash tests/test-health-netbird.sh           # opt-in readiness probe scenarios
 ```
 
 | Suite | Script | What it does |
 |-------|--------|--------------|
 | `regression` | `test-self-heal.sh` | Original regression checks (jq precedence, backoff, grace, flapping, …). |
-| `matrix` | `test-self-heal-matrix.sh` | The full A–O matrix in `--dry-run` against synthetic reports (~120 assertions). |
+| `matrix` | `test-self-heal-matrix.sh` | Full A–O synthetic-report matrix: dry-run routing plus live state transitions against mock init (149 assertions). |
 | `chaos` | `chaos-harness.sh` | Drives the **real** self-heal loop (kill → restart → verify → recover/escalate) against a mock init system. |
 | `openrc` | `test-health-openrc.sh` | Exercises `health-openrc.sh` (discovery dedup, real exit-code capture, per-unit timeout, missing/stopped units). |
 | `systemd` | `test-health-systemd.sh` | Exercises tenant user-bus discovery, failure bias, and container health including LunarVision. |
-| `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 68 assertions: reachability, HTTP codes, JSON parsing, VL availability logic, metrics integration, cache/rate-limit stats, capabilities inference, disabled mode). |
+| `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 81 assertions: reachability, HTTP codes, JSON parsing, VL availability logic, metrics integration, cache/rate-limit stats, capabilities inference, disabled mode). |
 | `netbird` | `test-health-netbird.sh` | Exercises disabled, ready, unready, missing-binary, and timeout behavior against mock CLI. |
 | — | `lib.sh` | Shared harness + the mock init system (sourced, not run directly). |
 
 `run-all.sh` runs each suite in its own process, tallies per-suite
 `N passed, M failed`, and exits non-zero if any suite fails.
 
-**Safety.** The matrix is dry-run only and never triggers a real restart or the
-real HTTP/component probes. The chaos and OpenRC harnesses run for real but
-against a *mock* `systemctl`/`rc-service`/`sudo` shadowed onto `PATH`, so a
+**Safety.** Matrix routing cases use dry-run; state-transition cases and chaos
+run live only against a *mock* `systemctl`/`rc-service`/`sudo` shadowed onto
+`PATH`, so a
 "restart" flips a sandbox file — no live unit is touched — and escalation runs
-`send-notification.sh` with an empty `GOTIFY_TOKEN` so it never hits the
-network. Prefer a dedicated test box over a live multi-tenant host regardless.
+a sandbox notifier, so it never hits the network. OpenRC and service-manager
+probe suites use their own mocks. Prefer a dedicated test box over a live
+multi-tenant host regardless.
 
 The pure-function harness (`src_fn` in `lib.sh`) sources everything up to the
 `# HARNESS_ENTRY_POINT` sentinel in `lunarwing-self-heal.sh` to unit-test

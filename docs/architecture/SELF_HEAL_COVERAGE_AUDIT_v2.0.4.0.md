@@ -1,6 +1,6 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
-**Date:** 2026-08-03 (ported to v2.0.5.0 on 2026-08-05; content re-verified, 412/412 assertions green)
+**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; content re-verified, 427/427 assertions green)
 **Status:** Goal 2 implementation complete; residual gaps documented below
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
@@ -32,11 +32,15 @@ across fail/recover cycles.
 - Report-supplied service names cannot escape state directory through escalation
   report filename.
 - Missing `GOTIFY_TOKEN`, notifier failure, or timeout does not arm cooldown.
+- Undelivered or cooldown-deferred escalation remains retryable; only confirmed
+  delivery sets `escalated:true`.
+- Dry-run preserves `state.json` and corrupt-state evidence.
 - Recovery clears retries and streaks but retains in-window restart history.
 - `lunarwing-vision-<tenant>` resolves to correct tenant before generic prefix.
 - Active-but-unhealthy LunarVision containers become critical in systemd report.
+- OpenRC Vision units resolve to their real tenant before started-state gating.
 - Host-global MT config pins base service scope to system bus.
-- Single-node user-timer instructions pin base service scope to user bus.
+- Single-node user-timer probes and remediation share the configured user bus.
 - Explicitly delegated NetBird daemon restart remains on host system bus.
 - NetBird probe defaults off; enabled-but-missing CLI fails loud.
 

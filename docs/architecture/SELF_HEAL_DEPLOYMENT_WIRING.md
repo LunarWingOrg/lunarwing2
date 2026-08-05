@@ -148,6 +148,7 @@ installed per tenant:
 Non-tenant base units use `SELF_HEAL_SYSTEMD_SCOPE`: host-global MT installs use
 `system`; manually scheduled single-node user timers must set `user`. Tenant
 units ignore this setting and always route through registry owner user bus.
+Both base-unit health probes and remediation honor the selected scope.
 Host-global NetBird daemon always uses system bus when restart is delegated.
 
 ## Net effect on a fresh MT host

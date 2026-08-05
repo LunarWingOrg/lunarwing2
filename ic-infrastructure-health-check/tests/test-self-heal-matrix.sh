@@ -3,12 +3,9 @@
 # docs/proposals/CHAOS_ENGINEERING_TEST_PLAN.md.
 #
 # Every case runs against a synthetic health report in a throwaway sandbox and
-# asserts on stderr output, state.json mutations, and exit codes. It is safe to
-# run on any host: restarts are always --dry-run (never executed), the real
-# component health probes are never invoked (verify is forced with fake
-# health-*.sh fixtures), and the only real command ever reached is a read-only
-# `systemctl is-active` — and even that is shadowed by a mock for the cases that
-# assert on it. No live service is touched.
+# asserts on stderr output, state.json mutations, and exit codes. Output-only
+# cases use --dry-run; state-transition cases run live against the mock init
+# system from lib.sh. No live service or real component probe is touched.
 #
 # Run:  bash tests/test-self-heal-matrix.sh   (exit 0 = all pass)
 
@@ -224,28 +221,28 @@ assert_contains "$oD5" "would run: systemctl --user restart lunarwing" "D5: sing
 
 echo "=== Section E: Grace period ==="
 
-# E1/E2 — grace=2: first observation defers, second restarts (state persists).
-e="$(sb)"; report "$e" "$GW"
-oE1="$(run_dry "$e" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=2 SELF_HEAL_VERIFY_HEALTH=false)"
+# E1/E2 — grace=2: first live observation defers, second restarts.
+e="$(sb)"; mk_mockbin "$e"; svc_down "$e" lunarwing; report "$e" "$GW"
+oE1="$(run_chaos "$e" systemd SELF_HEAL_GRACE_CHECKS=2 SELF_HEAL_VERIFY_HEALTH=false)"
 assert_contains "$oE1" "GRACE: lunarwing unhealthy 1/2"            "E1: first observation defers (grace 1/2)"
-assert_absent   "$oE1" "would run: systemctl restart lunarwing"   "E1: no restart during grace"
-oE2="$(run_dry "$e" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=2 SELF_HEAL_VERIFY_HEALTH=false)"
-assert_contains "$oE2" "would run: systemctl restart lunarwing"   "E2: restart fires once grace met"
+assert_absent   "$oE1" "RESTART: lunarwing"                        "E1: no restart during grace"
+oE2="$(run_chaos "$e" systemd SELF_HEAL_GRACE_CHECKS=2 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oE2" "RESTART: lunarwing"                        "E2: restart fires once grace met"
 
 # E3 — grace=1: restart on the first observation.
 e3="$(sb)"; report "$e3" "$GW"
 oE3="$(run_dry "$e3" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
 assert_contains "$oE3" "would run: systemctl restart lunarwing" "E3: grace=1 restarts immediately"
 
-# E4 — healthy in between resets the streak (grace counts from 1 again).
-e4="$(sb)"; report "$e4" "$GW"
-run_dry "$e4" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=2 SELF_HEAL_VERIFY_HEALTH=false >/dev/null  # obs=1
+# E4 — healthy in between resets the persisted streak (grace counts from 1 again).
+e4="$(sb)"; mk_mockbin "$e4"; svc_down "$e4" lunarwing; report "$e4" "$GW"
+run_chaos "$e4" systemd SELF_HEAL_GRACE_CHECKS=2 SELF_HEAL_VERIFY_HEALTH=false >/dev/null                         # obs=1
 report "$e4" '{components:[{component:"gateway",status:"healthy",metrics:{}}]}'                                    # recover
-run_dry "$e4" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=2 SELF_HEAL_VERIFY_HEALTH=false >/dev/null  # clears streak
+run_chaos "$e4" systemd SELF_HEAL_GRACE_CHECKS=2 SELF_HEAL_VERIFY_HEALTH=false >/dev/null                         # clears streak
 report "$e4" "$GW"                                                                                                 # unhealthy again
-oE4="$(run_dry "$e4" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=2 SELF_HEAL_VERIFY_HEALTH=false)"
+oE4="$(run_chaos "$e4" systemd SELF_HEAL_GRACE_CHECKS=2 SELF_HEAL_VERIFY_HEALTH=false)"
 assert_contains "$oE4" "GRACE: lunarwing unhealthy 1/2"          "E4: healthy-in-between resets the grace streak"
-assert_absent   "$oE4" "would run: systemctl restart lunarwing" "E4: no restart on the reset first observation"
+assert_absent   "$oE4" "RESTART: lunarwing"                       "E4: no restart on the reset first observation"
 
 echo "=== Section F: Backoff & retry spacing (compute_backoff) ==="
 
@@ -274,13 +271,13 @@ assert_absent   "$oF3" "would run: systemctl restart lunarwing" "F3: no restart 
 
 echo "=== Section G: Max retries & escalation ==="
 
-# G1 — retries at max, still unhealthy → escalate (dry-run logs the notify).
+# G1 — retries at max, still unhealthy → dry-run previews but does not persist.
 g1="$(sb)"; report "$g1" "$GW"
 seed_state "$g1" '{lunarwing:{retries:3,consecutive_unhealthy:5,escalated:false}}'
 oG1="$(run_dry "$g1" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
 assert_contains "$oG1" "ESCALATING: lunarwing"                            "G1: max retries escalates"
 assert_contains "$oG1" "would send escalation notification for lunarwing" "G1: escalation notification fired"
-assert_eq "$(state_of "$g1" '.lunarwing.escalated')" "true"              "G1: state marked escalated"
+assert_eq "$(state_of "$g1" '.lunarwing.escalated')" "false"             "G1: dry-run does not persist escalation"
 assert_absent "$oG1" "would run: systemctl restart lunarwing"            "G1: no restart once escalated"
 
 # G2 — already escalated → skip, no restart.
@@ -305,6 +302,7 @@ env LUNARWING_BASE_DIR="$g3" SELF_HEAL_STATE_DIR="$g3/self-heal" GOTIFY_TOKEN=''
 assert_eq "$(jq -r '.escalated' "$g3/captured.json" 2>/dev/null)" "true"        "G3: escalation report written (escalated=true)"
 assert_eq "$(jq -r '.service'   "$g3/captured.json" 2>/dev/null)" "lunarwing"   "G3: escalation report names the service"
 assert_eq "$(jq -r '.reason'    "$g3/captured.json" 2>/dev/null)" "max_retries" "G3: escalation report records the reason"
+assert_eq "$(state_of "$g3" '.lunarwing.escalated')" "true"                  "G3: confirmed delivery persists escalation"
 
 # G4 — notifier missing → WARNING, no crash (run still completes).
 g4="$(sb)"; report "$g4" "$GW"
@@ -315,6 +313,33 @@ oG4="$(env LUNARWING_BASE_DIR="$g4" SELF_HEAL_STATE_DIR="$g4/self-heal" GOTIFY_T
     "$g4tool/lunarwing-self-heal.sh" --report "$g4/report.json" --backoff 0 2>&1)"; g4rc=$?
 assert_contains "$oG4" "send-notification.sh not found" "G4: missing notifier warns"
 assert_eq "$g4rc" "0" "G4: missing notifier does not crash the run"
+assert_eq "$(state_of "$g4" '.lunarwing.escalated')" "false" "G4: missing notifier leaves escalation retryable"
+
+# G9 — caller-level delivery failure stays pending and retries next tick.
+g9="$(sb)"; report "$g9" "$GW"
+seed_state "$g9" '{lunarwing:{retries:3,consecutive_unhealthy:5,escalated:false}}'
+cat > "$g9/notifier" <<'EOF'
+#!/usr/bin/env bash
+n=$(cat "${NOTIFY_COUNT_FILE:?}" 2>/dev/null || echo 0)
+echo $((n + 1)) > "$NOTIFY_COUNT_FILE"
+exit 1
+EOF
+chmod +x "$g9/notifier"
+for _ in 1 2; do
+    run_raw "$g9" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_NOTIFY_SCRIPT="$g9/notifier" \
+        NOTIFY_COUNT_FILE="$g9/count" -- --report "$g9/report.json" --backoff 0 >/dev/null
+done
+assert_eq "$(cat "$g9/count")" "2" "G9: failed escalation delivery retries next tick"
+assert_eq "$(state_of "$g9" '.lunarwing.escalated')" "false" "G9: failed delivery never locks escalated state"
+cat > "$g9/notifier" <<'EOF'
+#!/usr/bin/env bash
+n=$(cat "${NOTIFY_COUNT_FILE:?}" 2>/dev/null || echo 0)
+echo $((n + 1)) > "$NOTIFY_COUNT_FILE"
+EOF
+chmod +x "$g9/notifier"
+run_raw "$g9" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_NOTIFY_SCRIPT="$g9/notifier" \
+    NOTIFY_COUNT_FILE="$g9/count" -- --report "$g9/report.json" --backoff 0 >/dev/null
+assert_eq "$(state_of "$g9" '.lunarwing.escalated')" "true" "G9: confirmed retry persists escalation"
 
 echo "=== Section G2: Escalation cooldown ==="
 if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || command -v openssl >/dev/null 2>&1; then
@@ -397,63 +422,59 @@ assert_contains "$oH3" "would run: systemctl restart lunarwing" "H3: restart pro
 # review P2), seed cap+5 recent entries with a high flap threshold (so it
 # restarts rather than escalating), and force verify-fail so the entry (with its
 # trimmed history) survives into state.json.
-h4="$(sb)"; mk_check "$h4" gateway critical >/dev/null
+h4="$(sb)"; mk_mockbin "$h4"; svc_down "$h4" lunarwing; svc_stuck "$h4" lunarwing
 report "$h4" "$GW"
 h4cap="$(grep -oE 'RESTART_HISTORY_MAX=[0-9]+' "$SH" | head -1 | cut -d= -f2)"
 [[ "$h4cap" =~ ^[0-9]+$ ]] || h4cap=20          # fallback if the constant is renamed
 h4seed=$((h4cap + 5)); h4flap=$((h4seed + 50))  # seed past the cap; never flap
 seed_state "$h4" "$(jq -n --argjson n "$(now)" --argjson c "$h4seed" '{lunarwing:{consecutive_unhealthy:5,restart_history:[range(0;$c)|($n-(.*5))]}}')"
-run_dry "$h4" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_FLAP_MAX_RESTARTS="$h4flap" \
-    SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$h4/checks" >/dev/null
+run_chaos "$h4" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_FLAP_MAX_RESTARTS="$h4flap" \
+    SELF_HEAL_VERIFY_HEALTH=true >/dev/null
 assert_eq "$(state_of "$h4" '.lunarwing.restart_history | length')" "$h4cap" "H4: restart_history trimmed to cap ($h4cap, read from script)"
 
 echo "=== Section I: Post-restart verification ==="
 
 # I1 — verify healthy → SUCCESS, state cleared.
-i1="$(sb)"; mk_check "$i1" gateway healthy >/dev/null; report "$i1" "$GW"
-oI1="$(run_dry "$i1" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$i1/checks")"
+i1="$(sb)"; mk_mockbin "$i1"; svc_down "$i1" lunarwing; report "$i1" "$GW"
+oI1="$(run_chaos "$i1" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true)"
 assert_contains "$oI1" "SUCCESS: lunarwing healthy after restart" "I1: healthy verify clears the service"
 assert_eq "$(state_of "$i1" '.lunarwing.retries // 0')" "0" "I1: retry state cleared after verified recovery"
 assert_eq "$(state_of "$i1" '.lunarwing.restart_history | length')" "1" "I1: restart history retained for flap detection"
 
 # I2 — verify critical → retry bumped.
-i2="$(sb)"; mk_check "$i2" gateway critical >/dev/null; report "$i2" "$GW"
-oI2="$(run_dry "$i2" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$i2/checks")"
+i2="$(sb)"; mk_mockbin "$i2"; svc_down "$i2" lunarwing; svc_stuck "$i2" lunarwing; report "$i2" "$GW"
+oI2="$(run_chaos "$i2" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true)"
 assert_contains "$oI2" "VERIFY: gateway still critical"        "I2: still-critical detected"
 assert_eq "$(state_of "$i2" '.lunarwing.retries')" "1"        "I2: critical verify counts a retry"
 
 # I3 — verify degraded → retry bumped.
-i3="$(sb)"; mk_check "$i3" gateway degraded >/dev/null; report "$i3" "$GW"
-oI3="$(run_dry "$i3" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$i3/checks")"
+i3="$(sb)"; mk_mockbin "$i3"; svc_down "$i3" lunarwing; mk_check "$i3" gateway degraded >/dev/null; report "$i3" "$GW"
+oI3="$(run_chaos "$i3" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$i3/checks")"
 assert_contains "$oI3" "VERIFY: gateway still degraded" "I3: still-degraded detected"
 assert_eq "$(state_of "$i3" '.lunarwing.retries')" "1" "I3: degraded verify counts a retry"
 
 # I4 — verify inconclusive (unknown) → falls back to is-active (mock = down).
-i4="$(sb)"; mk_check "$i4" gateway unknown >/dev/null; mk_mockbin "$i4"; svc_down "$i4" lunarwing; report "$i4" "$GW"
-oI4="$(run_dry "$i4" PATH="$i4/bin:$PATH" SVC_STATE_DIR="$i4/svcstate" LUNARWING_SERVICE_MANAGER=systemd \
-    SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$i4/checks")"
+i4="$(sb)"; mk_mockbin "$i4"; svc_down "$i4" lunarwing; svc_stuck "$i4" lunarwing; mk_check "$i4" gateway unknown >/dev/null; report "$i4" "$GW"
+oI4="$(run_chaos "$i4" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$i4/checks")"
 assert_contains "$oI4" "falling back to is-active"     "I4: inconclusive verify falls back to is-active"
 assert_eq "$(state_of "$i4" '.lunarwing.retries')" "1" "I4: is-active(down) counts a retry"
 
 # I5 — verify disabled → is-active only (mock = down).
-i5="$(sb)"; mk_mockbin "$i5"; svc_down "$i5" lunarwing; report "$i5" "$GW"
-run_dry "$i5" PATH="$i5/bin:$PATH" SVC_STATE_DIR="$i5/svcstate" LUNARWING_SERVICE_MANAGER=systemd \
-    SELF_HEAL_GRACE_CHECKS=1 -- --verify-health false >/dev/null
+i5="$(sb)"; mk_mockbin "$i5"; svc_down "$i5" lunarwing; svc_stuck "$i5" lunarwing; report "$i5" "$GW"
+run_chaos "$i5" systemd SELF_HEAL_GRACE_CHECKS=1 -- --verify-health false >/dev/null
 assert_eq "$(state_of "$i5" '.lunarwing.retries')" "1" "I5: --verify-health false uses is-active only"
 
 # I6 — health-check script absent → falls back to is-active, no VERIFY log.
-i6="$(sb)"; mk_mockbin "$i6"; svc_down "$i6" lunarwing; mkdir -p "$i6/empty"; report "$i6" "$GW"
-oI6="$(run_dry "$i6" PATH="$i6/bin:$PATH" SVC_STATE_DIR="$i6/svcstate" LUNARWING_SERVICE_MANAGER=systemd \
-    SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$i6/empty")"
+i6="$(sb)"; mk_mockbin "$i6"; svc_down "$i6" lunarwing; svc_stuck "$i6" lunarwing; mkdir -p "$i6/empty"; report "$i6" "$GW"
+oI6="$(run_chaos "$i6" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$i6/empty")"
 assert_absent "$oI6" "VERIFY:"                          "I6: missing health script → no verify log"
 assert_eq "$(state_of "$i6" '.lunarwing.retries')" "1" "I6: missing health script falls back to is-active"
 
 # I7 — health-check script present but not executable → falls back to is-active.
-i7="$(sb)"; mk_mockbin "$i7"; svc_down "$i7" lunarwing; mkdir -p "$i7/noexec"
+i7="$(sb)"; mk_mockbin "$i7"; svc_down "$i7" lunarwing; svc_stuck "$i7" lunarwing; mkdir -p "$i7/noexec"
 printf '#!/usr/bin/env bash\necho %s\n' "'{\"status\":\"healthy\"}'" > "$i7/noexec/health-gateway.sh"
 chmod 644 "$i7/noexec/health-gateway.sh"; report "$i7" "$GW"
-oI7="$(run_dry "$i7" PATH="$i7/bin:$PATH" SVC_STATE_DIR="$i7/svcstate" LUNARWING_SERVICE_MANAGER=systemd \
-    SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$i7/noexec")"
+oI7="$(run_chaos "$i7" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$i7/noexec")"
 assert_absent "$oI7" "VERIFY:"                          "I7: non-executable health script → no verify log"
 assert_eq "$(state_of "$i7" '.lunarwing.retries')" "1" "I7: non-executable health script falls back to is-active"
 
@@ -461,7 +482,7 @@ echo "=== Section J: Restart failure ==="
 
 # J2 — unknown service manager → WARNING + restart treated as failure (retry).
 j2="$(sb)"; report "$j2" "$GW"
-oJ2="$(run_dry "$j2" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+oJ2="$(run_raw "$j2" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false -- --report "$j2/report.json" --backoff 0)"
 assert_contains "$oJ2" "WARNING: unknown service manager, cannot restart lunarwing" "J2: unknown manager warns"
 assert_contains "$oJ2" "FAILURE: restart command failed for lunarwing"             "J2: restart counted as failure"
 assert_eq "$(state_of "$j2" '.lunarwing.retries')" "1" "J2: failed restart bumps retry"
@@ -472,7 +493,7 @@ echo "=== Section K: State recovery & pruning ==="
 # K1 — report now says healthy → state cleared (report-as-truth recovery).
 k1="$(sb)"; report "$k1" '{components:[{component:"gateway",status:"healthy",metrics:{}}]}'
 seed_state "$k1" '{lunarwing:{retries:1,consecutive_unhealthy:2}}'
-oK1="$(run_dry "$k1" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_VERIFY_HEALTH=false)"
+oK1="$(run_raw "$k1" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_VERIFY_HEALTH=false -- --report "$k1/report.json" --backoff 0)"
 assert_contains "$oK1" "RECOVERED: cleared state for lunarwing" "K1: report-as-truth recovery"
 assert_eq "$(state_of "$k1")" '{}' "K1: recovered state cleared"
 
@@ -480,20 +501,21 @@ assert_eq "$(state_of "$k1")" '{}' "K1: recovered state cleared"
 k2="$(sb)"; report "$k2" '{components:[{component:"gateway",status:"healthy",metrics:{}}]}'
 old=$(( $(now) - 999999 ))
 seed_state "$k2" "$(jq -n --argjson o "$old" '{"old-svc":{retries:1,escalated:false,last_attempt:$o},"old-esc":{retries:3,escalated:true,last_attempt:$o}}')"
-run_dry "$k2" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_VERIFY_HEALTH=false >/dev/null
+run_raw "$k2" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_VERIFY_HEALTH=false -- --report "$k2/report.json" --backoff 0 >/dev/null
 assert_eq "$(state_of "$k2" 'keys')" '["old-esc"]' "K2/K4: stale pruned, escalated preserved"
 
 # K3 — --prune-ttl 0 disables pruning.
 k3="$(sb)"; report "$k3" '{components:[{component:"gateway",status:"healthy",metrics:{}}]}'
 seed_state "$k3" "$(jq -n --argjson o "$old" '{"old-svc":{retries:1,escalated:false,last_attempt:$o}}')"
-run_dry "$k3" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_VERIFY_HEALTH=false -- --prune-ttl 0 >/dev/null
+run_raw "$k3" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_VERIFY_HEALTH=false -- --report "$k3/report.json" --backoff 0 --prune-ttl 0 >/dev/null
 assert_eq "$(state_of "$k3" 'keys')" '["old-svc"]' "K3: --prune-ttl 0 disables pruning"
 
 # K5 — a currently-unhealthy service past TTL is preserved (it is in `seen`).
 # Force verify-fail so it stays unhealthy in state across the prune.
 k5="$(sb)"; mk_check "$k5" gateway critical >/dev/null; report "$k5" "$GW"
 seed_state "$k5" "$(jq -n --argjson o "$old" '{lunarwing:{retries:1,escalated:false,last_attempt:$o},"old-svc":{retries:1,escalated:false,last_attempt:$o}}')"
-run_dry "$k5" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$k5/checks" >/dev/null
+mk_mockbin "$k5"; svc_down "$k5" lunarwing; svc_stuck "$k5" lunarwing
+run_chaos "$k5" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$k5/checks" >/dev/null
 assert_eq "$(state_of "$k5" 'has("lunarwing")')" "true"  "K5: currently-unhealthy entry preserved past TTL"
 assert_eq "$(state_of "$k5" 'has("old-svc")')"   "false" "K5: unrelated stale entry still pruned"
 
@@ -530,7 +552,7 @@ HEALTHY='{components:[{component:"gateway",status:"healthy",metrics:{}}]}'
 # the tick still completes (nothing-to-do path against a healthy report).
 o1="$(sb)"; report "$o1" "$HEALTHY"
 seed_corrupt "$o1" '{"lunarwing":{"conse'
-oO1="$(run_dry "$o1" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+oO1="$(run_raw "$o1" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false -- --report "$o1/report.json" --backoff 0)"
 assert_contains "$oO1" "state.json is corrupt"                "O1: corrupt state is detected and logged"
 assert_contains "$oO1" "renamed to state.json.corrupt"        "O1: corrupt file is renamed (forensic slot)"
 assert_contains "$oO1" "Self-Healing complete"                "O1: run completes despite corrupt state"
@@ -545,7 +567,7 @@ assert_contains "$oO1" "Self-Healing complete"                "O1: run completes
 # reset every tick and never accumulate. Mirrors O1's recovery contract.
 o2="$(sb)"; report "$o2" "$HEALTHY"
 : > "$o2/self-heal/state.json"
-oO2="$(run_dry "$o2" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+oO2="$(run_raw "$o2" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false -- --report "$o2/report.json" --backoff 0)"
 assert_contains "$oO2" "state.json is corrupt"                "O2: empty state quarantined (not silently reset)"
 assert_contains "$oO2" "Self-Healing complete"                "O2: empty state runs cleanly after recovery"
 [[ -f "$o2/self-heal/state.json.corrupt" ]] && ok "O2: empty state preserved as .corrupt" \
@@ -556,11 +578,24 @@ assert_contains "$oO2" "Self-Healing complete"                "O2: empty state r
 # run (heals state.json), corrupt again, run — exactly one .corrupt file remains.
 o3="$(sb)"; report "$o3" "$HEALTHY"
 seed_corrupt "$o3" '{"lunarwing":'
-run_dry "$o3" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false >/dev/null
+run_raw "$o3" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false -- --report "$o3/report.json" --backoff 0 >/dev/null
 seed_corrupt "$o3" '{"broken'
-run_dry "$o3" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false >/dev/null
+run_raw "$o3" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false -- --report "$o3/report.json" --backoff 0 >/dev/null
 corrupt_count="$(find "$o3/self-heal" -maxdepth 1 -name 'state.json.corrupt*' | wc -l | tr -d ' ')"
 assert_eq "$corrupt_count" "1" "O3: single-slot rename — exactly one .corrupt file after repeated corruption"
+
+# O4 — dry-run reports recovery but preserves corrupt evidence byte-for-byte.
+o4="$(sb)"; report "$o4" "$HEALTHY"
+seed_corrupt "$o4" '{"preserve-this-corrupt-state"'
+o4_before="$(cat "$o4/self-heal/state.json")"
+oO4="$(run_dry "$o4" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oO4" "[DRY-RUN] would rename to state.json.corrupt" "O4: dry-run reports planned quarantine"
+assert_eq "$(cat "$o4/self-heal/state.json")" "$o4_before" "O4: dry-run preserves corrupt state bytes"
+if compgen -G "$o4/self-heal/state.json.corrupt*" >/dev/null; then
+    bad "O4: dry-run creates no forensic sidecar" "unexpected state.json.corrupt file"
+else
+    ok "O4: dry-run creates no forensic sidecar"
+fi
 
 echo "=== Section M: Dry-run mode ==="
 
@@ -569,10 +604,16 @@ m1="$(sb)"; report "$m1" "$GW"
 oM1="$(run_dry "$m1" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
 assert_contains "$oM1" "[DRY-RUN] would run: systemctl restart lunarwing" "M1: dry-run logs the would-be restart"
 
-# M2 — state tracking still mutates under dry-run (force verify-fail).
-m2="$(sb)"; mk_check "$m2" gateway critical >/dev/null; report "$m2" "$GW"
-run_dry "$m2" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$m2/checks" >/dev/null
-assert_eq "$(state_of "$m2" '.lunarwing.retries')" "1" "M2: dry-run still tracks retry state"
+# M2 — repeated dry-runs never poison live retry/flap/escalation state.
+m2="$(sb)"; seed_state "$m2" '{}'; report "$m2" "$GW"
+for _ in 1 2 3 4 5 6; do
+    run_dry "$m2" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false >/dev/null
+done
+assert_eq "$(state_of "$m2")" '{}' "M2: repeated dry-runs preserve state"
+mk_mockbin "$m2"; svc_down "$m2" lunarwing
+oM3="$(run_chaos "$m2" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true)"
+assert_contains "$oM3" "SUCCESS: lunarwing healthy after restart" "M3: live run still remediates after dry-runs"
+assert_eq "$(restarts_of "$m2" lunarwing)" "1" "M3: dry-runs create no phantom restart history"
 
 echo "=== Section N: CLI argument validation ==="
 

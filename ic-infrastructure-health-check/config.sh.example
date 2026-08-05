@@ -131,7 +131,8 @@
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Suppress repeat pages for one service after confirmed delivery. Set 0 to
-# disable. Missing/failed notification delivery never starts cooldown.
+# disable. Missing, failed, or cooldown-deferred delivery remains pending and
+# retries on later self-heal ticks.
 #SELF_HEAL_ESCALATE_COOLDOWN=3600
 
 # Base LunarWing systemd services live on `system` bus for host-global MT

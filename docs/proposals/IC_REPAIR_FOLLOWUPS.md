@@ -62,17 +62,17 @@ Recovery already half-exists: `load_state` falls back to `{}` on parse failure a
   preserved for forensics while being last-wins / bounded — it cannot accumulate across recurring
   corruption. (An earlier draft used `.corrupt.<ts>`, which the "won't accumulate" comment contradicted.)
 - **Tests:** Section O in `test-self-heal-matrix.sh`, rewritten to actually exercise the path —
-  O1: non-empty truncated state → detect + rename + recover + complete; O2: a 0-byte file is valid,
-  not flagged; O3: single-slot rename leaves exactly one `.corrupt` after repeated corruption. Seeds
+  O1: non-empty truncated state → detect + rename + recover + complete; O2: a 0-byte file is corrupt,
+  quarantined, and replaced with `{}`; O3: single-slot rename leaves exactly one `.corrupt` after repeated corruption. Seeds
   corrupt bytes directly (not via `seed_state`, whose `jq -n` rejects malformed JSON to an empty file).
-  Full self-heal suite green: **188 passed / 0 failed** (regression 28, matrix 124, chaos 36).
+  Dry-run reports the quarantine action but preserves the original file; live recovery performs it.
 
 #### 2. Wire systemd `.timer/.service` scheduling — ✅ FIXED
 
 The implementation steps below are retained as the historical design record.
-`ensure_health_pipeline()` is OpenRC-only, so the prod systemd leg gets the hardened scripts but no
-auto-scheduling (G1/G2 stay open there). The launcher (`/usr/local/sbin/lunarwing-mt-health`) and all
-pipeline scripts are **already init-agnostic** — only the scheduling layer needs a systemd branch.
+`ensure_health_pipeline()` now installs either OpenRC scheduling or a systemd
+service/timer. The launcher (`/usr/local/sbin/lunarwing-mt-health`) and pipeline
+scripts remain shared and init-agnostic.
 All edits are in `ic/scripts/lunarwing-mt-admin.sh`:
 
 1. Delete the hard non-OpenRC skip at `:2235-2238`. Steps 1–4 (sync scripts, mkdir report dir, write
@@ -104,7 +104,8 @@ All edits are in `ic/scripts/lunarwing-mt-admin.sh`:
 
 Implemented as collision-resistant per-service sidecars under self-heal state.
 Cooldown starts only after notifier confirms delivery; missing Gotify token,
-notifier failure, or timeout does not suppress next attempt. Flap history now
+notifier failure, timeout, or cooldown deferral leaves escalation pending for a
+later tick instead of setting the permanent `escalated` gate. Flap history now
 survives recovery, so repeated fail/recover cycles reach flap guard correctly.
 
 - Sidecars are named `.last_escalation_page.<safe-prefix>.<sha256>` so distinct

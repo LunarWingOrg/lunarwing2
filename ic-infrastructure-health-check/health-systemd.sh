@@ -20,6 +20,21 @@ else
   UNITS_ARR=("${UNITS_DEFAULT[@]}")
 fi
 
+# Single-node services may live on either the system manager or the timer
+# user's manager. Keep health probing on the same bus self-heal will remediate.
+SYSTEMD_SCOPE="${SELF_HEAL_SYSTEMD_SCOPE:-system}"
+case "$SYSTEMD_SCOPE" in
+  system|user) ;;
+  *) SYSTEMD_SCOPE=system ;;
+esac
+base_systemctl() {
+  if [ "$SYSTEMD_SCOPE" = "user" ]; then
+    systemctl --user "$@"
+  else
+    systemctl "$@"
+  fi
+}
+
 # Multi-tenant host? (a tenant registry exists). On MT hosts the base system-
 # level units (lunarwing.service, …) are not expected — tenants run per-user
 # units — so a missing base unit is skipped instead of flagged critical.
@@ -98,11 +113,11 @@ retired_nanocode_unit() {
 
 for unit in "${UNITS_ARR[@]}"; do
   if retired_nanocode_unit "$unit"; then
-    load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || echo "not-found")
+    load=$(base_systemctl show -p LoadState --value "$unit" 2>/dev/null || echo "not-found")
     if [ "$load" = "loaded" ]; then
-      active=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || echo "unknown")
-      sub=$(systemctl show -p SubState --value "$unit" 2>/dev/null || echo "unknown")
-      restarts=$(systemctl show -p NRestarts --value "$unit" 2>/dev/null || echo 0)
+      active=$(base_systemctl show -p ActiveState --value "$unit" 2>/dev/null || echo "unknown")
+      sub=$(base_systemctl show -p SubState --value "$unit" 2>/dev/null || echo "unknown")
+      restarts=$(base_systemctl show -p NRestarts --value "$unit" 2>/dev/null || echo 0)
       restarts=${restarts:-0}
     else
       active="missing"; sub="retired"; restarts=0
@@ -111,7 +126,7 @@ for unit in "${UNITS_ARR[@]}"; do
       "$(jq -n '{retired:true,worker:"nanocode"}')" "skipped")")
     continue
   fi
-  if ! systemctl list-unit-files "$unit" >/dev/null 2>&1 && ! systemctl status "$unit" >/dev/null 2>&1; then
+  if ! base_systemctl list-unit-files "$unit" >/dev/null 2>&1 && ! base_systemctl status "$unit" >/dev/null 2>&1; then
     # On a multi-tenant host the base system-level units don't exist (tenants run
     # per-user units) — skip rather than emit a phantom critical.
     [ "$IS_MT" = "true" ] && continue
@@ -121,9 +136,9 @@ for unit in "${UNITS_ARR[@]}"; do
     continue
   fi
 
-  active=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || echo "unknown")
-  sub=$(systemctl show -p SubState --value "$unit" 2>/dev/null || echo "unknown")
-  restarts=$(systemctl show -p NRestarts --value "$unit" 2>/dev/null || echo 0)
+  active=$(base_systemctl show -p ActiveState --value "$unit" 2>/dev/null || echo "unknown")
+  sub=$(base_systemctl show -p SubState --value "$unit" 2>/dev/null || echo "unknown")
+  restarts=$(base_systemctl show -p NRestarts --value "$unit" 2>/dev/null || echo 0)
   restarts=${restarts:-0}
 
   extra="{}"
@@ -131,11 +146,11 @@ for unit in "${UNITS_ARR[@]}"; do
   exit_code=0
 
   if [[ "$unit" == *.timer ]]; then
-    last=$(systemctl show -p LastTriggerUSec --value "$unit" 2>/dev/null || echo "")
-    next=$(systemctl show -p NextElapseUSecRealtime --value "$unit" 2>/dev/null || echo "")
+    last=$(base_systemctl show -p LastTriggerUSec --value "$unit" 2>/dev/null || echo "")
+    next=$(base_systemctl show -p NextElapseUSecRealtime --value "$unit" 2>/dev/null || echo "")
     extra=$(jq -n --arg last "$last" --arg next "$next" '{last_trigger:$last,next_elapse:$next}')
   else
-    since=$(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null || echo "")
+    since=$(base_systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null || echo "")
     extra=$(jq -n --arg since "$since" '{active_since:$since}')
   fi
 

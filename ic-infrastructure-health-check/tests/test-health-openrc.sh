@@ -242,5 +242,15 @@ run_hc "$s" SERVICES=lunarwing-nanocode-ghost
 assert_eq "$(svc_field "$OUT" lunarwing-nanocode-ghost status)" "skipped" "S12: missing retired Nanocode service → skipped"
 assert_eq "$RC" 0 "S12: missing retired Nanocode service keeps exit 0"
 
+# ── S13: Vision role maps to its running tenant, not tenant "vision-<name>" ─
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;        fix_set "$s" lunarwing-acme        " * status: started" 0
+mk_unit "$s" lunarwing-vision-acme; fix_set "$s" lunarwing-vision-acme " * status: stopped" 3
+enable_unit "$s" lunarwing-acme
+run_hc "$s"
+assert_eq "$(svc_field "$OUT" lunarwing-vision-acme status)" "critical" "S13: down Vision unit on started tenant is critical"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S13: Vision outage drives overall status"
+assert_eq "$RC" 2 "S13: Vision outage exits 2"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
