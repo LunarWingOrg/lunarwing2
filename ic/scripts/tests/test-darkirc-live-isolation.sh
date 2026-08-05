@@ -1,49 +1,98 @@
 #!/usr/bin/env bash
 # Live H3 evidence for the DarkIRC Stage A key exchange: real two-user
 # isolation plus live /proc, stdout/stderr, and service-log secret-leak scans
-# on an OpenRC host. See docs/ops/DARKIRC-KEYEXCHANGE-ITEM15-STATUS.md.
+# on an OpenRC host. See docs/ops/DARKIRC-KEYEXCHANGE-STATUS.md.
 #
 # This suite requires passwordless sudo (it creates two scratch OS users and
-# installs root-owned test assets), jq, python3, and a built
-# lunarwing-darkirc-key-helper. It skips cleanly (exit 0) when any of those
-# are unavailable so fixture-only environments and CI stay green.
+# installs root-owned test assets), jq, strace exec-delay support, a real
+# DarkIRC daemon, and an explicitly trusted helper with its source revision and
+# independently recorded digest. It skips cleanly (exit 0) when any are
+# unavailable, so a skip is never acceptance evidence.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 IC_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
-HELPER_SRC="$IC_ROOT/target/debug/lunarwing-darkirc-key-helper"
+HELPER_SRC="${DARKIRC_LIVE_HELPER:-}"
+HELPER_SOURCE_REVISION="${DARKIRC_LIVE_HELPER_SOURCE_REVISION:-}"
+HELPER_EXPECTED_SHA256="${DARKIRC_LIVE_HELPER_SHA256:-}"
+DAEMON_SRC="${DARKIRC_LIVE_DAEMON:-/usr/local/bin/darkirc}"
+DAEMON_EXPECTED_SHA256="${DARKIRC_LIVE_DAEMON_SHA256:-}"
 
 log() { printf 'LIVE: %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 skip() { printf 'SKIP: %s\n' "$*"; exit 0; }
 
-[[ -x "$HELPER_SRC" ]] || skip "helper binary not built: $HELPER_SRC"
+trusted_executable_source() {
+  local path="$1" current mode owner links
+  [[ "$path" == /* && "$(realpath -e -- "$path" 2>/dev/null)" == "$path" ]] || return 1
+  [[ -x "$path" && -f "$path" && ! -L "$path" ]] || return 1
+  owner="$(stat -c '%u' "$path" 2>/dev/null)" || return 1
+  links="$(stat -c '%h' "$path" 2>/dev/null)" || return 1
+  mode="$(stat -c '%a' "$path" 2>/dev/null)" || return 1
+  [[ "$owner" == 0 && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$mode & 07022) == 0 )) || return 1
+  current="$(dirname "$path")"
+  while [[ "$current" != / ]]; do
+    owner="$(stat -c '%u' "$current" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$current" 2>/dev/null)" || return 1
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+    current="$(dirname "$current")"
+  done
+}
+
+command -v git >/dev/null 2>&1 || skip "git is required"
+command -v realpath >/dev/null 2>&1 || skip "realpath is required"
+command -v sha256sum >/dev/null 2>&1 || skip "sha256sum is required"
+[[ -n "$HELPER_SRC" ]] && trusted_executable_source "$HELPER_SRC" \
+  || skip "DARKIRC_LIVE_HELPER must be root-owned, canonical, single-link, and non-writable"
+current_source_revision="$(git -C "$IC_ROOT/.." rev-parse HEAD 2>/dev/null || true)"
+[[ "$HELPER_SOURCE_REVISION" == "$current_source_revision" \
+  && "$HELPER_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] \
+  || skip "set DARKIRC_LIVE_HELPER_SOURCE_REVISION to current trusted source revision"
+[[ "$HELPER_EXPECTED_SHA256" =~ ^sha256:[0-9a-f]{64}$ \
+  && "$HELPER_EXPECTED_SHA256" == "sha256:$(sha256sum "$HELPER_SRC" | cut -d' ' -f1)" ]] \
+  || skip "set DARKIRC_LIVE_HELPER_SHA256 to trusted helper digest"
+trusted_executable_source "$DAEMON_SRC" \
+  || skip "DARKIRC_LIVE_DAEMON must be root-owned, canonical, single-link, and non-writable"
+[[ "$DAEMON_EXPECTED_SHA256" =~ ^sha256:[0-9a-f]{64}$ \
+  && "$DAEMON_EXPECTED_SHA256" == "sha256:$(sha256sum "$DAEMON_SRC" | cut -d' ' -f1)" ]] \
+  || skip "set DARKIRC_LIVE_DAEMON_SHA256 to trusted daemon digest"
 command -v jq >/dev/null 2>&1 || skip "jq is required"
 command -v sudo >/dev/null 2>&1 || skip "sudo is required"
 command -v useradd >/dev/null 2>&1 || skip "useradd is required"
-[[ -x /usr/bin/python3 ]] || skip "generator shim needs /usr/bin/python3"
+command -v strace >/dev/null 2>&1 || skip "strace with exec-delay injection is required"
+strace -f -qq -e trace=execve -e inject=execve:delay_exit=1ms \
+  -o /dev/null /bin/true 2>/dev/null \
+  || skip "strace exec-delay injection is unavailable"
 sudo -n true 2>/dev/null || skip "passwordless sudo is required"
 
 if [[ "$(id -u)" != 0 ]]; then
-  exec sudo -n --preserve-env=DARKIRC_LIVE_KEEP bash "$0" "$@"
+  exec sudo -n env DARKIRC_LIVE_KEEP="${DARKIRC_LIVE_KEEP:-0}" \
+    DARKIRC_LIVE_DAEMON="$DAEMON_SRC" DARKIRC_LIVE_HELPER="$HELPER_SRC" \
+    DARKIRC_LIVE_HELPER_SOURCE_REVISION="$HELPER_SOURCE_REVISION" \
+    DARKIRC_LIVE_HELPER_SHA256="$HELPER_EXPECTED_SHA256" \
+    DARKIRC_LIVE_DAEMON_SHA256="$DAEMON_EXPECTED_SHA256" bash "$0" "$@"
 fi
 
 USER_A="dklive-a"
 USER_B="dklive-b"
 A_SCOPE="11111111111111111111111111111111"
 B_SCOPE="22222222222222222222222222222222"
-GENERATOR="/usr/local/bin/darkirc"
-HELPER="/usr/local/libexec/lunarwing-darkirc-key-helper"
-COMPAT_FILE="/etc/lunarwing/darkirc-compat.json"
 WORK="/var/lib/darkirc-live-test"
+RELEASES_DIR="$WORK/releases"
+GENERATOR=""
+HELPER=""
+COMPAT_FILE=""
 SERVICE="darkirc-live-scan"
 SERVICE_SCRIPT="/etc/init.d/$SERVICE"
 SERVICE_WRAPPER="/usr/local/libexec/darkirc-live-invoke.sh"
 SERVICE_LOG="/var/log/darkirc-live-scan.log"
 REVISION="a05956d412a091e8b54c1cd4f4264c33b941203d"
 POLLER_PID=""
+TRACE_SEQ=0
 
-for path in "$GENERATOR" "$HELPER" "$COMPAT_FILE" "$SERVICE_SCRIPT" "$SERVICE_WRAPPER"; do
+for path in "$WORK" "$SERVICE_SCRIPT" "$SERVICE_WRAPPER"; do
   if [[ -e "$path" || -L "$path" ]]; then
     fail "refusing to overwrite existing asset: $path"
   fi
@@ -58,7 +107,6 @@ cleanup() {
   rc-service "$SERVICE" stop >/dev/null 2>&1
   rc-service "$SERVICE" zap >/dev/null 2>&1
   rm -f "$SERVICE_SCRIPT" "$SERVICE_WRAPPER" "$SERVICE_LOG"
-  rm -f "$GENERATOR" "$HELPER" "$COMPAT_FILE"
   userdel -r "$USER_A" >/dev/null 2>&1
   userdel -r "$USER_B" >/dev/null 2>&1
   if [[ "${DARKIRC_LIVE_KEEP:-0}" == 1 ]]; then
@@ -69,99 +117,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- Install root-owned test assets ---------------------------------------
+# --- Publish a root-owned immutable release v2 ----------------------------
 
-install -d -m 0700 "$WORK" "$WORK/proc" "$WORK/capture"
-
-# Generator shim: fresh, genuine X25519 keypair per call in the darkfi
-# `--gen-chacha-keypair` output format. Pure-Python RFC 7748 ladder so the
-# helper's own public-from-secret validation must accept the pair. The short
-# sleep widens the observation window for the live /proc poller.
-cat >"$GENERATOR" <<'PYEOF'
-#!/usr/bin/python3
-"""Live-test DarkIRC generator: fresh X25519 keypair in darkfi output format."""
-import os
-import sys
-import time
-
-P = 2**255 - 19
-ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
-
-def b58encode(data):
-    number = int.from_bytes(data, "big")
-    encoded = ""
-    while number > 0:
-        number, remainder = divmod(number, 58)
-        encoded = ALPHABET[remainder] + encoded
-    pad = 0
-    for byte in data:
-        if byte == 0:
-            pad += 1
-        else:
-            break
-    return "1" * pad + encoded
-
-
-def x25519(scalar_bytes, u_int=9):
-    key = bytearray(scalar_bytes)
-    key[0] &= 248
-    key[31] &= 127
-    key[31] |= 64
-    key_int = int.from_bytes(key, "little")
-    x_1 = u_int
-    x_2, z_2, x_3, z_3 = 1, 0, u_int, 1
-    swap = 0
-    for t in range(254, -1, -1):
-        k_t = (key_int >> t) & 1
-        swap ^= k_t
-        if swap:
-            x_2, x_3 = x_3, x_2
-            z_2, z_3 = z_3, z_2
-        swap = k_t
-        a = (x_2 + z_2) % P
-        aa = (a * a) % P
-        b = (x_2 - z_2) % P
-        bb = (b * b) % P
-        e = (aa - bb) % P
-        c = (x_3 + z_3) % P
-        d = (x_3 - z_3) % P
-        da = (d * a) % P
-        cb = (c * b) % P
-        x_3 = ((da + cb) ** 2) % P
-        z_3 = (x_1 * ((da - cb) ** 2)) % P
-        x_2 = (aa * bb) % P
-        z_2 = (e * (aa + 121665 * e)) % P
-    if swap:
-        x_2, x_3 = x_3, x_2
-        z_2, z_3 = z_3, z_2
-    return ((x_2 * pow(z_2, P - 2, P)) % P).to_bytes(32, "little")
-
-
-def main():
-    if sys.argv[1:] != ["--gen-chacha-keypair"]:
-        return 2
-    time.sleep(0.5)
-    secret = bytes(bytearray(os.urandom(32)))
-    sys.stdout.write("Public: %s\nSecret: %s\n" % (b58encode(x25519(secret)), b58encode(secret)))
-    return 0
-
-
-sys.exit(main())
-PYEOF
-chown root:root "$GENERATOR"
-chmod 0755 "$GENERATOR"
-
-install -m 0755 -o root -g root "$HELPER_SRC" "$HELPER"
-install -d -m 0755 -o root -g root /etc/lunarwing
-digest="sha256:$(sha256sum "$GENERATOR" | cut -d' ' -f1)"
-printf '%s\n' "{\"schema\":\"lunarwing.darkirc-compat/v1\",\"profile_id\":\"darkfi-a05956d41-chacha-v1\",\"binary_sha256\":\"$digest\",\"key_format\":\"darkfi-chacha-base58-32\",\"source_revision\":\"$REVISION\"}" >"$COMPAT_FILE"
+install -d -o root -g root -m 0711 "$WORK"
+install -d -o root -g root -m 0700 "$WORK/proc" "$WORK/capture"
+install -d -o root -g root -m 0755 "$RELEASES_DIR"
+daemon_digest="sha256:$(sha256sum "$DAEMON_SRC" | cut -d' ' -f1)"
+helper_digest="sha256:$(sha256sum "$HELPER_SRC" | cut -d' ' -f1)"
+helper_source_revision="$HELPER_SOURCE_REVISION"
+release_id="$REVISION-${helper_source_revision:0:16}-${daemon_digest:7:16}-${helper_digest:7:16}"
+release_dir="$RELEASES_DIR/$release_id"
+install -d -o root -g root -m 0755 "$release_dir"
+install -o root -g root -m 0555 "$DAEMON_SRC" "$release_dir/darkirc"
+install -o root -g root -m 0555 "$HELPER_SRC" "$release_dir/lunarwing-darkirc-key-helper"
+[[ "sha256:$(sha256sum "$release_dir/darkirc" | cut -d' ' -f1)" == "$DAEMON_EXPECTED_SHA256" ]] \
+  || fail "installed daemon changed after trusted digest validation"
+[[ "sha256:$(sha256sum "$release_dir/lunarwing-darkirc-key-helper" | cut -d' ' -f1)" \
+  == "$HELPER_EXPECTED_SHA256" ]] \
+  || fail "installed helper changed after trusted digest validation"
+GENERATOR="$release_dir/darkirc"
+HELPER="$release_dir/lunarwing-darkirc-key-helper"
+COMPAT_FILE="$release_dir/attestation.json"
+jq -n --arg release "$release_id" --arg daemon "$daemon_digest" \
+  --arg helper "$helper_digest" --arg helper_revision "$helper_source_revision" \
+  --arg revision "$REVISION" \
+  '{schema:"lunarwing.darkirc-compat/v2",release_id:$release,profile_id:"darkfi-a05956d41-chacha-v1",daemon_sha256:$daemon,helper_sha256:$helper,helper_source_revision:$helper_revision,key_format:"darkfi-chacha-base58-32",source_revision:$revision}' \
+  >"$COMPAT_FILE"
 chown root:root "$COMPAT_FILE"
-chmod 0600 "$COMPAT_FILE"
+chmod 0444 "$COMPAT_FILE"
+chmod 0555 "$release_dir"
 
-COMPAT_ARGS=(--generator-profile darkfi-a05956d41-chacha-v1 --binary-sha256 "$digest"
-  --binary-path "$GENERATOR" --key-format darkfi-chacha-base58-32 --source-revision "$REVISION")
-
+COMPAT_ARGS=(--generator-profile darkfi-a05956d41-chacha-v1
+  --binary-sha256 "$daemon_digest" --binary-path "$GENERATOR"
+  --helper-sha256 "$helper_digest" --release-id "$release_id"
+  --key-format darkfi-chacha-base58-32 --source-revision "$REVISION")
 useradd -m -s /bin/bash "$USER_A"
 useradd -m -s /bin/bash "$USER_B"
 for user in "$USER_A" "$USER_B"; do
@@ -170,6 +159,9 @@ for user in "$USER_A" "$USER_B"; do
   sudo -n -u "$user" chmod 0700 "/home/$user/lunarwing" \
     "/home/$user/lunarwing/state" "/home/$user/lunarwing/state/darkirc"
 done
+sudo -n -u "$USER_A" env -i HOME="/home/$USER_A" PATH="/usr/bin:/bin" \
+  "$HELPER" self-test-generator "${COMPAT_ARGS[@]}" >/dev/null \
+  || fail "real DarkIRC daemon failed unprivileged release-v2 generator self-test"
 
 # --- Helpers ---------------------------------------------------------------
 
@@ -178,10 +170,14 @@ done
 run_helper() {
   local user="$1"
   shift
-  local uid gid
+  local uid gid trace
   uid="$(id -u "$user")"
   gid="$(id -g "$user")"
-  ( cd "/home/$user" && sudo -n -u "$user" env -i HOME="/home/$user" PATH="/usr/bin:/bin" \
+  TRACE_SEQ=$((TRACE_SEQ + 1))
+  trace="$WORK/proc/run-$TRACE_SEQ.strace"
+  ( cd "/home/$user" && strace -f -qq -v -s 1048576 -e trace=execve \
+      -e inject=execve:delay_exit=50ms -o "$trace" \
+      sudo -n -u "$user" env -i HOME="/home/$user" PATH="/usr/bin:/bin" \
       "$HELPER" "$@" "${COMPAT_ARGS[@]}" --expected-uid "$uid" --expected-gid "$gid" )
 }
 
@@ -191,10 +187,11 @@ proc_poller() {
   while :; do
     local pid
     # shellcheck disable=SC2046
-    for pid in $(pgrep -f "lunarwing-darkirc-key-helper|$GENERATOR" 2>/dev/null || true); do
+    for pid in $(pgrep -f 'lunarwing-darkirc-key-helper|--gen-chacha-keypair' 2>/dev/null || true); do
       [[ -r "/proc/$pid/cmdline" ]] || continue
       cat "/proc/$pid/cmdline" >"$WORK/proc/$pid.cmdline" 2>/dev/null || true
       cat "/proc/$pid/environ" >"$WORK/proc/$pid.environ" 2>/dev/null || true
+      readlink "/proc/$pid/exe" >"$WORK/proc/$pid.exe" 2>/dev/null || true
     done
     sleep 0.05
   done
@@ -274,8 +271,9 @@ gid="\$(id -g $USER_A)"
 exec sudo -n -u $USER_A env -i HOME=/home/$USER_A PATH=/usr/bin:/bin \
   $HELPER prepare --tenant $USER_A --scope-id $A_SCOPE --contact peer-openrc \
   --out openrc-offer.json --json \
-  --generator-profile darkfi-a05956d41-chacha-v1 --binary-sha256 "$digest" \
-  --binary-path $GENERATOR --key-format darkfi-chacha-base58-32 \
+  --generator-profile darkfi-a05956d41-chacha-v1 --binary-sha256 "$daemon_digest" \
+  --binary-path $GENERATOR --helper-sha256 "$helper_digest" --release-id "$release_id" \
+  --key-format darkfi-chacha-base58-32 \
   --source-revision $REVISION --expected-uid "\$uid" --expected-gid "\$gid"
 EOF
   chown root:root "$SERVICE_WRAPPER"
@@ -327,7 +325,7 @@ log "extracted ${#SECRETS[@]} distinct pending secrets from mode-0600 records (n
 # Live /proc snapshots must exist and cover the helper and the generator.
 snapshot_count="$(find "$WORK/proc" -name '*.cmdline' -type f | wc -l)"
 [[ "$snapshot_count" -gt 0 ]] || fail "no live /proc snapshots captured"
-grep -Fqal -- "$GENERATOR" "$WORK"/proc/*.cmdline || fail "generator process never observed"
+grep -Fqal -- '--gen-chacha-keypair' "$WORK"/proc/*.cmdline || fail "generator process never observed"
 grep -Fqal -- "lunarwing-darkirc-key-helper" "$WORK"/proc/*.cmdline || fail "helper process never observed"
 
 for file in "$WORK"/capture/* "$WORK"/proc/*; do
