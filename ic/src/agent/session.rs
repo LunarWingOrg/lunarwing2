@@ -189,10 +189,17 @@ pub struct PendingApproval {
     #[serde(default)]
     pub user_timezone: Option<String>,
     /// Whether the "always" auto-approve option should be offered to the user.
-    /// `false` when the tool returned `ApprovalRequirement::Always` (e.g.
-    /// destructive shell commands), meaning every invocation must be confirmed.
+    /// Usually false for `ApprovalRequirement::Always`; constrained tools may
+    /// explicitly opt in.
     #[serde(default = "default_true")]
     pub allow_always: bool,
+}
+
+impl PendingApproval {
+    /// Ignore forged/stale `always=true` responses when prompt did not offer it.
+    pub(crate) fn clamp_always(&self, requested: bool) -> bool {
+        requested && self.allow_always
+    }
 }
 
 fn default_true() -> bool {
@@ -1214,6 +1221,7 @@ mod tests {
             user_timezone: None,
             allow_always: false,
         };
+        assert!(!approval.clamp_always(true));
 
         thread.await_approval(approval);
         assert_eq!(thread.state, ThreadState::AwaitingApproval);
@@ -1241,6 +1249,8 @@ mod tests {
             user_timezone: None,
             allow_always: true,
         };
+        assert!(approval.clamp_always(true));
+        assert!(!approval.clamp_always(false));
 
         thread.await_approval(approval);
         thread.clear_pending_approval();

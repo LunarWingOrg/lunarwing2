@@ -37,8 +37,10 @@ The main agent provides generic infrastructure; tools are self-contained units t
 - Workspace paths the tool can read
 - Approval policy: `never` (default), `unless_auto_approved`, or `always`
 
-`always` cannot be bypassed by global or session auto-approval. WASM tools with
-SSH capability always use `always`, regardless of declared policy.
+`always` cannot be bypassed by global auto-approval. It also rejects user
+`Always` grants unless tool explicitly opts in; built-in `ssh` is narrow
+exception. WASM tools with SSH capability always use non-bypassable `always`,
+regardless of declared policy.
 
 ### What Does NOT Go in Main Agent
 

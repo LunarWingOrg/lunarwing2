@@ -208,13 +208,12 @@ impl EffectBridgeAdapter {
                     }
                 }
             }
-        }
 
-        // Persisted settings are the source of truth and can revoke an earlier
-        // process-lifetime approval by changing it to AskEachTime or Disabled.
-        if persisted.is_some() {
+            // Configured settings storage is authoritative. A deleted grant
+            // revokes any process-lifetime cache entry immediately.
             return persisted;
         }
+
         if self
             .auto_approved
             .read()
@@ -223,7 +222,7 @@ impl EffectBridgeAdapter {
         {
             return Some(PermissionState::AlwaysAllow);
         }
-        persisted
+        None
     }
 
     fn coerce_to_u64(v: &serde_json::Value) -> Option<u64> {
@@ -574,19 +573,41 @@ impl EffectBridgeAdapter {
                 });
             }
 
+            let requirement = tool.requires_approval(&parameters);
+            if context.shared_conversation && requirement.is_required() {
+                return Err(Self::gate_paused(
+                    "approval",
+                    action_name,
+                    context.current_call_id.as_deref(),
+                    parameters,
+                    lunarwing_engine::ResumeKind::Approval {
+                        allow_always: false,
+                    },
+                    None,
+                ));
+            }
+            if context.thread_type != lunarwing_engine::ThreadType::Foreground
+                && requirement == ApprovalRequirement::Always
+            {
+                return Err(EngineError::LeaseDenied {
+                    reason: format!(
+                        "Tool '{}' requires explicit approval and cannot run autonomously.",
+                        action_name
+                    ),
+                });
+            }
+
             // ── Human delay / supervision mode ──
             // When supervised_mode is enabled on the thread, gate EVERY action
             // through human approval, regardless of the tool's tier.
             //
-            // Always-gated tools (ApprovalRequirement::Always) should not offer
-            // the "always approve" option in supervised mode either, so we set
-            // allow_always = false to be conservative.
+            // Supervision still gates every later action. Some constrained tools
+            // may nevertheless let the user persist a grant for normal mode.
             // A resolved pending action already has explicit approval for this
             // call. Later calls enter with `approval_already_granted = false`
             // and are gated again by supervision.
             if context.supervised_mode && !approval_already_granted {
-                let requirement = tool.requires_approval(&parameters);
-                let allow_always = !matches!(requirement, ApprovalRequirement::Always);
+                let allow_always = tool.allows_always_approval(&parameters);
                 return Err(Self::gate_paused(
                     "approval",
                     action_name,
@@ -597,39 +618,22 @@ impl EffectBridgeAdapter {
                 ));
             }
 
-            let requirement = tool.requires_approval(&parameters);
-            match requirement {
-                ApprovalRequirement::Always => {
-                    if !approval_already_granted {
-                        return Err(Self::gate_paused(
-                            "approval",
-                            action_name,
-                            context.current_call_id.as_deref(),
-                            parameters,
-                            lunarwing_engine::ResumeKind::Approval {
-                                allow_always: false,
-                            },
-                            None,
-                        ));
-                    }
-                }
-                ApprovalRequirement::UnlessAutoApproved => {
-                    let is_approved = permission_state == Some(PermissionState::AlwaysAllow);
-                    if !is_approved && !approval_already_granted {
-                        // Credential presence alone does NOT bypass approval.
-                        // Credentials indicate the call *can* be authenticated,
-                        // not that the user has authorized this specific request.
-                        return Err(Self::gate_paused(
-                            "approval",
-                            action_name,
-                            context.current_call_id.as_deref(),
-                            parameters,
-                            lunarwing_engine::ResumeKind::Approval { allow_always: true },
-                            None,
-                        ));
-                    }
-                }
-                ApprovalRequirement::Never => {}
+            let allow_always = tool.allows_always_approval(&parameters);
+            let user_auto_approved = permission_state == Some(PermissionState::AlwaysAllow);
+            if !approval_already_granted
+                && requirement.needs_prompt_with_user_grant(false, user_auto_approved, allow_always)
+            {
+                // Credential presence alone does NOT bypass approval.
+                // Credentials indicate the call *can* be authenticated, not
+                // that the user authorized this specific request.
+                return Err(Self::gate_paused(
+                    "approval",
+                    action_name,
+                    context.current_call_id.as_deref(),
+                    parameters,
+                    lunarwing_engine::ResumeKind::Approval { allow_always },
+                    None,
+                ));
             }
         }
 
@@ -1117,7 +1121,7 @@ fn permission_setting_keys(tool_name: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::context::JobContext;
-    use crate::tools::{Tool, ToolError, ToolOutput};
+    use crate::tools::{ApprovalRequirement, Tool, ToolError, ToolOutput};
     use async_trait::async_trait;
     use std::collections::HashMap;
 
@@ -1263,6 +1267,7 @@ mod tests {
             current_call_id: None,
             source_channel: None,
             supervised_mode: false,
+            shared_conversation: false,
             supervised_timeout_secs: 300,
             prompt_context: Arc::from([]),
         };
@@ -1351,6 +1356,42 @@ FINAL(echoed + "|" + http_result["error"])"#,
         }
     }
 
+    struct PersistableAlwaysApprovalTestTool;
+
+    #[async_trait]
+    impl Tool for PersistableAlwaysApprovalTestTool {
+        fn name(&self) -> &str {
+            "persistable_always_test"
+        }
+
+        fn description(&self) -> &str {
+            "Always-gated test tool with explicit persistent approval"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::success(
+                serde_json::json!({"ok": true}),
+                std::time::Duration::from_millis(1),
+            ))
+        }
+
+        fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+            ApprovalRequirement::Always
+        }
+
+        fn allows_always_approval(&self, _params: &serde_json::Value) -> bool {
+            true
+        }
+    }
+
     fn lease() -> lunarwing_engine::CapabilityLease {
         lunarwing_engine::CapabilityLease {
             id: lunarwing_engine::types::capability::LeaseId::new(),
@@ -1370,15 +1411,28 @@ FINAL(echoed + "|" + http_result["error"])"#,
         thread_id: lunarwing_engine::ThreadId,
         call_id: Option<&str>,
     ) -> lunarwing_engine::ThreadExecutionContext {
+        exec_ctx_for_type(
+            thread_id,
+            call_id,
+            lunarwing_engine::types::thread::ThreadType::Foreground,
+        )
+    }
+
+    fn exec_ctx_for_type(
+        thread_id: lunarwing_engine::ThreadId,
+        call_id: Option<&str>,
+        thread_type: lunarwing_engine::types::thread::ThreadType,
+    ) -> lunarwing_engine::ThreadExecutionContext {
         lunarwing_engine::ThreadExecutionContext {
             thread_id,
-            thread_type: lunarwing_engine::types::thread::ThreadType::Foreground,
+            thread_type,
             project_id: lunarwing_engine::ProjectId::new(),
             user_id: "test_user".to_string(),
             step_id: lunarwing_engine::StepId::new(),
             current_call_id: call_id.map(str::to_string),
             source_channel: None,
             supervised_mode: false,
+            shared_conversation: false,
             supervised_timeout_secs: 300,
             prompt_context: Arc::from([]),
         }
@@ -1956,6 +2010,186 @@ FINAL(echoed + "|" + http_result["error"])"#,
     }
 
     #[tokio::test]
+    async fn explicit_always_grant_bypasses_opted_in_always_tool() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools
+            .register(Arc::new(PersistableAlwaysApprovalTestTool))
+            .await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+
+        let first = adapter
+            .execute_action(
+                "persistable_always_test",
+                serde_json::json!({}),
+                &lease(),
+                &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_first")),
+            )
+            .await;
+        assert!(matches!(
+            first,
+            Err(EngineError::GatePaused {
+                resume_kind,
+                ..
+            }) if matches!(
+                *resume_kind,
+                lunarwing_engine::ResumeKind::Approval { allow_always: true }
+            )
+        ));
+
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.persistable_always_test",
+                &serde_json::json!("always_allow"),
+            )
+            .await
+            .expect("persist setting");
+        adapter
+            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+
+        let second = adapter
+            .execute_action(
+                "persistable_always_test",
+                serde_json::json!({}),
+                &lease(),
+                &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_second")),
+            )
+            .await;
+        assert!(matches!(
+            second,
+            Ok(ActionResult {
+                is_error: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn always_tool_is_denied_in_autonomous_threads_despite_persisted_grant() {
+        use lunarwing_engine::ThreadType;
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools
+            .register(Arc::new(PersistableAlwaysApprovalTestTool))
+            .await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.persistable_always_test",
+                &serde_json::json!("always_allow"),
+            )
+            .await
+            .expect("persist setting");
+        adapter
+            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+
+        for thread_type in [ThreadType::Research, ThreadType::Mission] {
+            let context = exec_ctx_for_type(
+                lunarwing_engine::ThreadId::new(),
+                Some("call_autonomous"),
+                thread_type,
+            );
+            let result = adapter
+                .execute_action(
+                    "persistable_always_test",
+                    serde_json::json!({}),
+                    &lease(),
+                    &context,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(EngineError::LeaseDenied { .. })),
+                "{thread_type:?} thread must deny Always tool, got: {result:?}"
+            );
+
+            let resolved = adapter
+                .execute_resolved_pending_action(
+                    "persistable_always_test",
+                    serde_json::json!({}),
+                    &lease(),
+                    &context,
+                    true,
+                )
+                .await;
+            assert!(
+                matches!(resolved, Err(EngineError::LeaseDenied { .. })),
+                "{thread_type:?} thread must reject resolved approval, got: {resolved:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_conversation_ignores_persisted_always_grant() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools
+            .register(Arc::new(PersistableAlwaysApprovalTestTool))
+            .await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.persistable_always_test",
+                &serde_json::json!("always_allow"),
+            )
+            .await
+            .expect("persist setting");
+        adapter
+            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+
+        let mut context = exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_shared"));
+        context.shared_conversation = true;
+        let result = adapter
+            .execute_action(
+                "persistable_always_test",
+                serde_json::json!({}),
+                &lease(),
+                &context,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(EngineError::GatePaused { resume_kind, .. })
+                if matches!(
+                    *resume_kind,
+                    lunarwing_engine::ResumeKind::Approval { allow_always: false }
+                )
+        ));
+    }
+
+    #[tokio::test]
     async fn persisted_disabled_permission_denies_execution() {
         use lunarwing_safety::SafetyConfig;
 
@@ -1994,7 +2228,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
     }
 
     #[tokio::test]
-    async fn persisted_ask_each_time_revokes_session_auto_approval() {
+    async fn persisted_revocation_overrides_session_auto_approval() {
         use lunarwing_safety::SafetyConfig;
 
         let tools = Arc::new(ToolRegistry::new());
@@ -2020,7 +2254,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
             .await
             .expect("persist setting");
         adapter
-            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .set_settings_store(settings.clone() as Arc<dyn SettingsStore + Send + Sync>)
             .await;
 
         let result = adapter
@@ -2035,6 +2269,23 @@ FINAL(echoed + "|" + http_result["error"])"#,
             )
             .await;
         assert!(matches!(result, Err(EngineError::GatePaused { .. })));
+
+        settings
+            .delete_setting("test_user", "tool_permissions.approval_test")
+            .await
+            .expect("delete persisted permission");
+        let after_delete = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &exec_ctx(
+                    lunarwing_engine::ThreadId::new(),
+                    Some("call_deleted_permission"),
+                ),
+            )
+            .await;
+        assert!(matches!(after_delete, Err(EngineError::GatePaused { .. })));
     }
 
     // ── extract_credential_name tests ──────────────────────────
@@ -2216,6 +2467,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
             current_call_id: None,
             source_channel: None,
             supervised_mode: false,
+            shared_conversation: false,
             supervised_timeout_secs: 300,
             prompt_context: Arc::from([]),
         };
@@ -2310,6 +2562,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
             current_call_id: Some("call_123".to_string()),
             source_channel: None,
             supervised_mode: false,
+            shared_conversation: false,
             supervised_timeout_secs: 300,
             prompt_context: Arc::from([]),
         };

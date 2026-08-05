@@ -60,7 +60,8 @@ The seeded permission baseline is conservative:
 - unknown tools also default to `ask_each_time`;
 - a small set of read-only or messaging helpers defaults to `always_allow`;
 - an explicit `disabled` permission prevents use;
-- intrinsically always-gated tools cannot be changed to `always_allow`.
+- intrinsically always-gated tools cannot be changed to `always_allow` unless
+  the tool explicitly opts in; built-in `ssh` is the narrow exception.
 
 The authenticated web approval card offers **Approve**, **Deny**, and, when the tool permits it, **Always**. The `tool_permission_set` built-in tool can also request a permission change through the approval path. Persisted per-user settings are the source of truth; do not edit the settings table directly for routine administration.
 

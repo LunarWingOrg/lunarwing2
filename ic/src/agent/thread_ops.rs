@@ -22,6 +22,7 @@ use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::{ChatMessage, ToolCall};
+use crate::tools::permissions::PermissionState;
 use crate::tools::redact_params;
 
 const FORGED_THREAD_ID_ERROR: &str = "Invalid or unauthorized thread ID.";
@@ -33,6 +34,82 @@ fn requires_preexisting_uuid_thread(channel: &str) -> bool {
 }
 
 impl Agent {
+    pub(super) async fn has_tool_always_grant(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        tool_name: &str,
+    ) -> bool {
+        let (user_id, cached) = {
+            let session = session.lock().await;
+            (
+                session.user_id.clone(),
+                session.is_tool_auto_approved(tool_name),
+            )
+        };
+        let Some(store) = self.deps.store.as_ref() else {
+            return cached;
+        };
+        let key = format!("tool_permissions.{tool_name}");
+        match store.get_setting(&user_id, &key).await {
+            Ok(Some(value)) => {
+                serde_json::from_value::<PermissionState>(value).ok()
+                    == Some(PermissionState::AlwaysAllow)
+            }
+            // Configured persistence is authoritative. Deleting a grant must
+            // revoke any session cache entry rather than reveal it again.
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    tool = tool_name,
+                    %error,
+                    "Failed to read persistent tool approval; denying cached grant"
+                );
+                false
+            }
+        }
+    }
+
+    async fn persist_tool_always_grant(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        tool_name: &str,
+    ) -> bool {
+        let user_id = session.lock().await.user_id.clone();
+        if let Some(store) = self.deps.store.as_ref() {
+            let key = format!("tool_permissions.{tool_name}");
+            if let Err(error) = store
+                .set_setting(&user_id, &key, &serde_json::json!("always_allow"))
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    tool = tool_name,
+                    %error,
+                    "Failed to persist tool approval; grant remains disabled"
+                );
+                return false;
+            }
+        }
+
+        session.lock().await.auto_approve_tool(tool_name);
+        true
+    }
+
+    fn tool_execution_earned_always(tool_name: &str, result: &Result<String, Error>) -> bool {
+        let Ok(output) = result else {
+            return false;
+        };
+        if tool_name != "ssh" {
+            return true;
+        }
+
+        serde_json::from_str::<serde_json::Value>(output)
+            .ok()
+            .and_then(|value| value.get("success").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false)
+    }
+
     /// Run final-response transforms once. Rejections suppress output instead
     /// of manufacturing policy text that could re-enter outbound hooks.
     pub(crate) async fn transform_response(
@@ -1093,17 +1170,7 @@ impl Agent {
         }
 
         if approved {
-            // If always, add to auto-approved set
-            if always {
-                let mut sess = session.lock().await;
-                sess.auto_approve_tool(&pending.tool_name);
-                tracing::info!(
-                    "Auto-approved tool '{}' for session {}",
-                    pending.tool_name,
-                    sess.id
-                );
-            }
-
+            let always = pending.clamp_always(always);
             // Reset thread state to processing
             {
                 let mut sess = session.lock().await;
@@ -1143,6 +1210,19 @@ impl Agent {
             let tool_result = self
                 .execute_chat_tool(&pending.tool_name, &pending.parameters, &job_ctx)
                 .await;
+
+            // Failed execution must not earn a future approval bypass.
+            if always
+                && Self::tool_execution_earned_always(&pending.tool_name, &tool_result)
+                && self
+                    .persist_tool_always_grant(&session, &pending.tool_name)
+                    .await
+            {
+                tracing::info!(
+                    tool = %pending.tool_name,
+                    "Persisted user approval for future tool calls"
+                );
+            }
 
             let tool_ref = self.tools().get(&pending.tool_name).await;
             let _ = self
@@ -1256,20 +1336,18 @@ impl Agent {
 
             for (idx, tc) in deferred_tool_calls.iter().enumerate() {
                 if let Some(tool) = self.tools().get(&tc.name).await {
-                    use crate::tools::ApprovalRequirement;
                     let requirement = tool.requires_approval(&tc.arguments);
-                    let session_auto_approved = match requirement {
-                        ApprovalRequirement::UnlessAutoApproved
-                            if !self.config.auto_approve_tools =>
-                        {
-                            let sess = session.lock().await;
-                            sess.is_tool_auto_approved(&tc.name)
-                        }
-                        _ => false,
+                    let allow_always = tool.allows_always_approval(&tc.arguments);
+                    let session_auto_approved = if allow_always {
+                        self.has_tool_always_grant(&session, &tc.name).await
+                    } else {
+                        false
                     };
-                    let needs_approval = requirement
-                        .needs_prompt(self.config.auto_approve_tools, session_auto_approved);
-                    let allow_always = !matches!(requirement, ApprovalRequirement::Always);
+                    let needs_approval = requirement.needs_prompt_with_user_grant(
+                        self.config.auto_approve_tools,
+                        session_auto_approved,
+                        allow_always,
+                    );
 
                     if needs_approval {
                         approval_needed = Some((idx, tc.clone(), tool, allow_always));
@@ -2024,6 +2102,71 @@ fn rebuild_chat_messages_from_db(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "libsql")]
+    async fn tool_approval_test_agent() -> (Agent, Arc<dyn crate::db::Database>, tempfile::TempDir)
+    {
+        let (db, temp_dir) = crate::testing::test_db().await;
+        let harness = crate::testing::TestHarnessBuilder::new()
+            .with_db(Arc::clone(&db))
+            .build()
+            .await;
+        let agent = Agent::new(
+            crate::config::AgentConfig::for_testing(),
+            harness.deps,
+            Arc::new(crate::channels::ChannelManager::new()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        (agent, db, temp_dir)
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn legacy_always_grant_persists_and_honors_revocation() {
+        let (agent, db, _temp_dir) = tool_approval_test_agent().await;
+        let session = Arc::new(Mutex::new(Session::new("alice")));
+
+        assert!(!agent.has_tool_always_grant(&session, "ssh").await);
+        assert!(agent.persist_tool_always_grant(&session, "ssh").await);
+        assert_eq!(
+            db.get_setting("alice", "tool_permissions.ssh")
+                .await
+                .expect("read persisted grant"),
+            Some(serde_json::json!("always_allow"))
+        );
+
+        let fresh_session = Arc::new(Mutex::new(Session::new("alice")));
+        assert!(agent.has_tool_always_grant(&fresh_session, "ssh").await);
+
+        db.set_setting(
+            "alice",
+            "tool_permissions.ssh",
+            &serde_json::json!("ask_each_time"),
+        )
+        .await
+        .expect("revoke persisted grant");
+        assert!(!agent.has_tool_always_grant(&session, "ssh").await);
+
+        db.delete_setting("alice", "tool_permissions.ssh")
+            .await
+            .expect("delete persisted grant");
+        assert!(!agent.has_tool_always_grant(&session, "ssh").await);
+    }
+
+    #[test]
+    fn ssh_command_must_exit_successfully_to_earn_always() {
+        let success = Ok(serde_json::json!({"success": true, "exit_code": 0}).to_string());
+        let nonzero = Ok(serde_json::json!({"success": false, "exit_code": 1}).to_string());
+        let malformed = Ok("not json".to_string());
+
+        assert!(Agent::tool_execution_earned_always("ssh", &success));
+        assert!(!Agent::tool_execution_earned_always("ssh", &nonzero));
+        assert!(!Agent::tool_execution_earned_always("ssh", &malformed));
+    }
 
     #[test]
     fn test_rebuild_chat_messages_user_assistant_only() {

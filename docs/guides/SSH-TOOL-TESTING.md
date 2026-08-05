@@ -25,10 +25,17 @@ Use the ssh tool with host <ssh-host> to run "hostname && whoami && date". Show 
 
 Expected behavior:
 
-- the action requires approval;
+- the first action requires approval and offers **Always**;
 - the reported host matches the configured allowlist entry;
 - the command exits successfully with bounded stdout and stderr;
 - the remote username and hostname match the configured target.
+
+Selecting **Always** after reviewing a harmless command suppresses later
+built-in `ssh` prompts for that user, across all configured aliases. Verify a
+second harmless call runs without a prompt, restart LunarWing, then verify the
+grant still applies. Set `tool_permissions.ssh` back to `ask_each_time` and
+verify the next call prompts again. This grant does not apply to `ssh_git`,
+WASM SSH, autonomous jobs, or supervised mode.
 
 The built-in tool runs the SSH client in the LunarWing process and verifies the server key through the configured host-key policy.
 

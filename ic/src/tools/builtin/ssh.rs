@@ -7,8 +7,10 @@
 //! target arbitrary hosts. Keys are loaded from the encrypted secrets store and
 //! never appear as tool parameters.
 //!
-//! Runs in the main agent process (`ToolDomain::Orchestrator`) and always
-//! requires approval. See `docs/proposals/SSH_HARNESS_OPTION_2_3_IMPLEMENTATION.md`.
+//! Runs in the main agent process (`ToolDomain::Orchestrator`) and requires
+//! approval by default. An authenticated user may explicitly grant `Always`;
+//! global auto-approve and autonomous execution still cannot bypass the gate.
+//! See `docs/proposals/SSH_HARNESS_OPTION_2_3_IMPLEMENTATION.md`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +46,7 @@ impl Tool for SshTool {
         "Run a command on a configured remote SSH host and return its stdout, stderr, and exit code. \
          The `host` must be one of the aliases configured in [[ssh.hosts]]; the user, port, and key are \
          taken from that configuration (you cannot target arbitrary hosts). Ed25519 and ECDSA keys are \
-         supported; RSA is not."
+         supported; RSA is not. Choosing `Always` authorizes future commands to every configured SSH alias."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -122,8 +124,15 @@ impl Tool for SshTool {
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        // Remote command execution — always require explicit approval.
+        // Keep global auto-approve and autonomous execution blocked. Explicit
+        // user persistence is controlled separately below.
         ApprovalRequirement::Always
+    }
+
+    fn allows_always_approval(&self, _params: &serde_json::Value) -> bool {
+        // Host aliases remain constrained by [[ssh.hosts]], credentials stay in
+        // the encrypted store, and rate limiting remains active.
+        true
     }
 
     fn requires_sanitization(&self) -> bool {
@@ -214,10 +223,14 @@ mod tests {
     async fn test_metadata_and_approval() {
         let tool = SshTool::new(bridge_with(test_store(), vec![]).await);
         assert_eq!(tool.name(), "ssh");
-        assert!(matches!(
-            tool.requires_approval(&serde_json::json!({})),
-            ApprovalRequirement::Always
-        ));
+        let params = serde_json::json!({});
+        let requirement = tool.requires_approval(&params);
+        let allows_always = tool.allows_always_approval(&params);
+        assert!(matches!(requirement, ApprovalRequirement::Always));
+        assert!(allows_always);
+        assert!(requirement.needs_prompt_with_user_grant(true, false, allows_always));
+        assert!(!requirement.needs_prompt_with_user_grant(false, true, allows_always));
+        assert!(!crate::tools::permissions::tool_permission_locked(&tool));
         assert!(matches!(tool.domain(), ToolDomain::Orchestrator));
         assert!(tool.requires_sanitization());
     }

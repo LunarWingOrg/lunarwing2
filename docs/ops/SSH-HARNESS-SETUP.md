@@ -229,8 +229,9 @@ in the store, the daemon almost certainly needs a restart (see step 3).
 ## Agent-facing SSH tools
 
 Beyond worker mode, the agent has built-in tools that run SSH **in the gateway
-process** (no container). All take a configured `host` alias and require
-approval on every call. Full details + when-to-use each:
+process** (no container). All take a configured `host` alias. Built-in `ssh`
+prompts initially and supports explicit per-user **Always**; `ssh_git` and WASM
+SSH still require approval on every call. Full details + when-to-use each:
 [`../architecture/SSH_DELIVERY_MECHANISMS.md`](../architecture/SSH_DELIVERY_MECHANISMS.md).
 
 - **`ssh`** — run one command on a configured host: `{host, command}` →

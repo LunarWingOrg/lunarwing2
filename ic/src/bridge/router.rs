@@ -406,6 +406,15 @@ async fn persist_and_notify_thread_gate(
         ));
     };
 
+    if shared_channel_blocks_gate(message, &resume_kind) {
+        finalize_silently_stopped_thread(state, conversation_id, thread_id, &message.user_id)
+            .await?;
+        return Ok(Some(format!(
+            "Tool '{}' requires approval and cannot run in shared channels. Ask the user to message me directly (DM) to use this tool.",
+            action_name
+        )));
+    }
+
     let redacted_params = if let Some(tool) = state.effect_adapter.tools().get(&action_name).await {
         crate::tools::redact_params(&parameters, tool.sensitive_params())
     } else {
@@ -438,6 +447,14 @@ async fn persist_and_notify_thread_gate(
     insert_and_notify_pending_gate(channels, state, message, pending).await
 }
 
+fn shared_channel_blocks_gate(
+    message: &IncomingMessage,
+    resume_kind: &lunarwing_engine::ResumeKind,
+) -> bool {
+    matches!(resume_kind, lunarwing_engine::ResumeKind::Approval { .. })
+        && message.is_shared_conversation()
+}
+
 fn is_valid_tool_permission_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -454,22 +471,17 @@ async fn persist_always_allow(state: &EngineState, pending: &PendingGate) {
         return;
     }
 
-    let is_locked = state
+    let allows_always = state
         .effect_adapter
         .tools()
         .get_resolved(&pending.action_name)
         .await
-        .map(|(_, tool)| {
-            matches!(
-                tool.requires_approval(&pending.parameters),
-                crate::tools::ApprovalRequirement::Always
-            )
-        })
+        .map(|(_, tool)| tool.allows_always_approval(&pending.parameters))
         .unwrap_or(false);
-    if is_locked {
+    if !allows_always {
         debug!(
             tool = %pending.action_name,
-            "Skipping persisted AlwaysAllow for ApprovalRequirement::Always tool"
+            "Skipping persisted AlwaysAllow for tool that disallows it"
         );
         return;
     }
@@ -614,6 +626,7 @@ async fn execute_pending_gate_action(
         current_call_id: Some(pending.call_id.clone()),
         source_channel: Some(pending.source_channel.clone()),
         supervised_mode: thread.config.supervised_mode,
+        shared_conversation: thread.config.shared_conversation,
         supervised_timeout_secs: thread.config.supervised_timeout_secs,
         prompt_context: lunarwing_engine::prompt_context_from_thread_messages(&thread.messages),
     };
@@ -658,7 +671,9 @@ async fn execute_pending_gate_action(
             // Only a genuinely successful action earns AlwaysAllow: tool-level
             // failures arrive as Ok(ActionResult { is_error: true }) and must
             // not permanently auto-approve the tool.
-            if approval.enable_always_after_success && !result.is_error {
+            if approval.enable_always_after_success
+                && action_result_earned_always(&pending.action_name, &result)
+            {
                 enable_always_allow(state, pending).await;
             }
             state
@@ -1975,6 +1990,16 @@ pub fn clamp_always_to_resume_kind(
         )
 }
 
+fn action_result_earned_always(action_name: &str, result: &lunarwing_engine::ActionResult) -> bool {
+    !result.is_error
+        && (action_name != "ssh"
+            || result
+                .output
+                .get("success")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true))
+}
+
 /// Resolve a unified pending gate.
 ///
 /// This is the single entry point for resolving gates stored in the
@@ -2023,6 +2048,14 @@ pub async fn resolve_gate(
                 other => engine_err("gate", other),
             }
         })?;
+
+    if shared_channel_blocks_gate(message, &pending.resume_kind) {
+        finalize_silently_stopped_pending_thread(state, &pending).await?;
+        return Ok(Some(format!(
+            "Tool '{}' requires approval and cannot run in shared channels. Ask the user to message me directly (DM) to use this tool.",
+            pending.action_name
+        )));
+    }
 
     let event_rx = match resolution {
         lunarwing_engine::GateResolution::Approved { always: raw_always } => {
@@ -2880,6 +2913,7 @@ async fn handle_with_engine_inner(
 
     let thread_config = {
         let mut config = ThreadConfig::default();
+        config.shared_conversation = message.is_shared_conversation();
         if crate::llm::user_signals_execution_intent(content) {
             config.require_action_attempt = true;
         }
@@ -6225,6 +6259,42 @@ mod tests {
             true,
             &ResumeKind::External {
                 callback_id: "abc".to_string()
+            }
+        ));
+    }
+
+    #[test]
+    fn ssh_nonzero_exit_does_not_earn_always() {
+        let result = lunarwing_engine::ActionResult {
+            call_id: "call-1".to_string(),
+            action_name: "ssh".to_string(),
+            output: serde_json::json!({"success": false, "exit_code": 1}),
+            is_error: false,
+            duration: std::time::Duration::ZERO,
+        };
+        assert!(!action_result_earned_always("ssh", &result));
+
+        let success = lunarwing_engine::ActionResult {
+            output: serde_json::json!({"success": true, "exit_code": 0}),
+            ..result
+        };
+        assert!(action_result_earned_always("ssh", &success));
+    }
+
+    #[test]
+    fn shared_rooms_block_approval_gates_only() {
+        let message = IncomingMessage::new("xmpp", "room@example", "run ssh")
+            .with_metadata(serde_json::json!({"xmpp_type": "groupchat"}));
+        assert!(shared_channel_blocks_gate(
+            &message,
+            &lunarwing_engine::ResumeKind::Approval { allow_always: true }
+        ));
+        assert!(!shared_channel_blocks_gate(
+            &message,
+            &lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "token".to_string(),
+                instructions: "configure token".to_string(),
+                auth_url: None,
             }
         ));
     }

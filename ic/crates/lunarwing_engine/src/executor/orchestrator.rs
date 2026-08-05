@@ -847,6 +847,7 @@ async fn handle_execute_code_step(
         current_call_id: None,
         source_channel: thread_source_channel(thread),
         supervised_mode: thread.config.supervised_mode,
+        shared_conversation: thread.config.shared_conversation,
         supervised_timeout_secs: thread.config.supervised_timeout_secs,
         prompt_context: prompt_context_from_thread_messages(&thread.messages),
     };
@@ -981,6 +982,7 @@ async fn handle_execute_action(
         current_call_id: Some(call_id.clone()),
         source_channel: thread_source_channel(thread),
         supervised_mode: thread.config.supervised_mode,
+        shared_conversation: thread.config.shared_conversation,
         supervised_timeout_secs: thread.config.supervised_timeout_secs,
         prompt_context: prompt_context_from_thread_messages(&thread.messages),
     };
@@ -1547,6 +1549,7 @@ async fn handle_execute_actions_parallel(
             current_call_id: Some(pc.call_id.clone()),
             source_channel: None,
             supervised_mode: thread.config.supervised_mode,
+            shared_conversation: thread.config.shared_conversation,
             supervised_timeout_secs: thread.config.supervised_timeout_secs,
             prompt_context: Arc::clone(&prompt_context),
         };
@@ -1596,6 +1599,7 @@ async fn handle_execute_actions_parallel(
                 current_call_id: Some(pc_call_id.clone()),
                 source_channel: None,
                 supervised_mode: thread.config.supervised_mode,
+                shared_conversation: thread.config.shared_conversation,
                 supervised_timeout_secs: thread.config.supervised_timeout_secs,
                 prompt_context: Arc::clone(&prompt_context),
             };
