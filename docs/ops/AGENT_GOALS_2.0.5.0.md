@@ -12,7 +12,7 @@
 ---
 
 1. [ ] update all external crates that need updating for entire project. see previous release notes for some examples of such crates - ensure CI/CD is also updated for the new crate versions
-2. [ ] ensure crates are updated
+2. [x] ensure crates are updated — DONE: `cargo update` applied to all 13 lockfiles in repo (ic/ + 12 standalone crates); all now resolve 0 pending semver-compatible updates; every crate passes `cargo check`. Semver-incompatible upgrades (e.g. 44 deps "behind latest" in ic/) left to items #1/#3.
 3. [ ] identify crates which have not been updated which should be - put in a new doc
 4. [ ] Bump lunarwing crate versions and wasm channel crates for lunarwing that have same version. they are at 2.0.4. we need bump to 2.0.5 - ensure CI/CD is also updated for the new crate versions
 5. [ ] ensure EXTERNAL crates are updated
