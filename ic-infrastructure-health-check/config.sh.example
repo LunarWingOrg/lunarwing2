@@ -107,9 +107,38 @@
 #HEALTH_LUNARVISION_LATENCY_CRITICAL_MS=5000
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Component: netbird (host tunnel peer readiness)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Opt in to `netbird status --check startup`. Disabled by default because
+# NetBird enrollment and daemon lifecycle are operator-owned.
+#HEALTH_NETBIRD_ENABLED=false
+
+# Optional binary/path override and readiness timeout in seconds.
+#NETBIRD_BINARY="netbird"
+#HEALTH_NETBIRD_TIMEOUT=5
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Component: svcmgr (service manager — systemd / openrc / launchd)
 # ═════════════════════════════════════════════════════════════════════════════
 
 # The service manager check is auto-detected. One environment variable is
 # available for OpenRC specifically:
 #HEALTH_OPENRC_STATUS_TIMEOUT=8
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Self-healing
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Suppress repeat pages for one service after confirmed delivery. Set 0 to
+# disable. Missing/failed notification delivery never starts cooldown.
+#SELF_HEAL_ESCALATE_COOLDOWN=3600
+
+# Base LunarWing systemd services live on `system` bus for host-global MT
+# installs and on `user` bus for user-timer/single-node installs. Tenant units
+# always resolve through owning user's bus; host NetBird daemon stays on system.
+#SELF_HEAL_SYSTEMD_SCOPE=system
+
+# NetBird failures are monitor-only by default. Enable only when operator
+# delegates restart ownership to LunarWing.
+#SELF_HEAL_NETBIRD_REMEDIATE=false
