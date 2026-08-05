@@ -90,6 +90,22 @@ b_skip B6 ratelimit "SKIP: component 'ratelimit' has no standalone service"
 b_skip B7 models    "SKIP: component 'models' has no standalone service"
 b_skip B8 gibberish "WARNING: no service mapping for component 'gibberish'"
 
+# NetBird is visible but operator-owned: monitor-only by default, restart only
+# after explicit delegation. Host-global monitoring survives MT logical disable.
+b10="$(sb)"; report "$b10" '{components:[{component:"netbird",status:"critical",metrics:{}}]}'
+oB10="$(run_dry "$b10" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oB10" "ESCALATING: netbird (monitor_only" "B10: NetBird defaults to monitor-only escalation"
+assert_absent "$oB10" "restart netbird" "B10: NetBird daemon not restarted by default"
+
+b11="$(sb)"; report "$b11" '{components:[{component:"netbird",status:"critical",metrics:{}}]}'
+oB11="$(run_dry "$b11" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_SYSTEMD_SCOPE=user SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false SELF_HEAL_NETBIRD_REMEDIATE=true)"
+assert_contains "$oB11" "would run: systemctl restart netbird" "B11: explicit NetBird restart delegation honored"
+assert_absent "$oB11" "systemctl --user restart netbird" "B11: host NetBird daemon stays on system bus"
+
+b12="$(sb)"; report "$b12" '{components:[{component:"netbird",status:"critical",metrics:{}}]}'
+oB12="$(run_dry "$b12" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_REMEDY_LOGICAL=false)"
+assert_contains "$oB12" "ESCALATING: netbird (monitor_only" "B12: MT logical disable retains host NetBird monitoring"
+
 # B9 — three unhealthy logical components, all targeted in one run.
 b9="$(sb)"; report "$b9" '{components:[
   {component:"gateway",   status:"degraded",metrics:{}},
@@ -198,8 +214,13 @@ assert_eq "$(src_fn -- unit_tenant lunarwing-proxy-acme.service)" "acme"   "D: u
 assert_eq "$(src_fn -- unit_tenant ironclaw-proxy-acme.service)"  "acme"   "D: unit_tenant ironclaw-proxy-<t>"
 assert_eq "$(src_fn -- unit_tenant xmpp-bridge-globex.service)"   "globex" "D: unit_tenant xmpp-bridge-<t>"
 assert_eq "$(src_fn -- unit_tenant lunarwing-acme.service)"       "acme"   "D: unit_tenant lunarwing-<t>"
+assert_eq "$(src_fn -- unit_tenant lunarwing-vision-acme.service)" "acme"   "D: unit_tenant lunarwing-vision-<t>"
 assert_eq "$(src_fn -- unit_tenant lunarwing.service)"            ""       "D: unit_tenant base unit → no tenant"
 assert_eq "$(src_fn -- unit_tenant clickhouse-server.service)"    ""       "D: unit_tenant foreign unit → no tenant"
+
+d5="$(sb)"; report "$d5" "$GW"
+oD5="$(run_dry "$d5" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_SYSTEMD_SCOPE=user SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oD5" "would run: systemctl --user restart lunarwing" "D5: single-node user scope targets user bus"
 
 echo "=== Section E: Grace period ==="
 
@@ -275,9 +296,10 @@ assert_absent   "$oG2" "would run: systemctl restart lunarwing" "G2: no restart 
 g3="$(sb)"; report "$g3" "$GW"
 seed_state "$g3" '{lunarwing:{retries:3,consecutive_unhealthy:5,escalated:false}}'
 g3tool="$(mk_tool "$g3")"
-{ echo '#!/usr/bin/env bash'; echo "cp \"\$2\" \"$g3/captured.json\""; } > "$g3tool/send-notification.sh"
-chmod +x "$g3tool/send-notification.sh"
+{ echo '#!/usr/bin/env bash'; echo "cp \"\$2\" \"$g3/captured.json\""; } > "$g3/capture-notifier"
+chmod +x "$g3/capture-notifier"
 env LUNARWING_BASE_DIR="$g3" SELF_HEAL_STATE_DIR="$g3/self-heal" GOTIFY_TOKEN='' \
+    SELF_HEAL_NOTIFY_SCRIPT="$g3/capture-notifier" \
     LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false \
     "$g3tool/lunarwing-self-heal.sh" --report "$g3/report.json" --backoff 0 >/dev/null 2>&1
 assert_eq "$(jq -r '.escalated' "$g3/captured.json" 2>/dev/null)" "true"        "G3: escalation report written (escalated=true)"
@@ -293,6 +315,58 @@ oG4="$(env LUNARWING_BASE_DIR="$g4" SELF_HEAL_STATE_DIR="$g4/self-heal" GOTIFY_T
     "$g4tool/lunarwing-self-heal.sh" --report "$g4/report.json" --backoff 0 2>&1)"; g4rc=$?
 assert_contains "$oG4" "send-notification.sh not found" "G4: missing notifier warns"
 assert_eq "$g4rc" "0" "G4: missing notifier does not crash the run"
+
+echo "=== Section G2: Escalation cooldown ==="
+if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || command -v openssl >/dev/null 2>&1; then
+    g5="$(sb)"; report "$g5" "$GW"
+    cat > "$g5/notifier" <<'EOF'
+#!/usr/bin/env bash
+n=$(cat "${NOTIFY_COUNT_FILE:?}" 2>/dev/null || echo 0)
+echo $((n + 1)) > "$NOTIFY_COUNT_FILE"
+EOF
+    chmod +x "$g5/notifier"
+    src_fn SELF_HEAL_STATE_DIR="$g5/self-heal" SELF_HEAL_NOTIFY_SCRIPT="$g5/notifier" NOTIFY_COUNT_FILE="$g5/count" \
+        -- _send_notification critical "$g5/report.json" lunarwing >/dev/null
+    src_fn SELF_HEAL_STATE_DIR="$g5/self-heal" SELF_HEAL_NOTIFY_SCRIPT="$g5/notifier" NOTIFY_COUNT_FILE="$g5/count" \
+        -- _send_notification critical "$g5/report.json" lunarwing >/dev/null
+    assert_eq "$(cat "$g5/count")" "1" "G5: repeat page suppressed after confirmed delivery"
+
+    src_fn SELF_HEAL_STATE_DIR="$g5/self-heal" SELF_HEAL_NOTIFY_SCRIPT="$g5/notifier" NOTIFY_COUNT_FILE="$g5/count" \
+        -- _send_notification critical "$g5/report.json" 'a/b' >/dev/null
+    src_fn SELF_HEAL_STATE_DIR="$g5/self-heal" SELF_HEAL_NOTIFY_SCRIPT="$g5/notifier" NOTIFY_COUNT_FILE="$g5/count" \
+        -- _send_notification critical "$g5/report.json" 'a?b' >/dev/null
+    assert_eq "$(cat "$g5/count")" "3" "G6: sanitized-name collision does not share cooldown"
+
+    g7="$(sb)"; report "$g7" "$GW"
+    cat > "$g7/notifier" <<'EOF'
+#!/usr/bin/env bash
+n=$(cat "${NOTIFY_COUNT_FILE:?}" 2>/dev/null || echo 0)
+echo $((n + 1)) > "$NOTIFY_COUNT_FILE"
+exit 1
+EOF
+    chmod +x "$g7/notifier"
+    src_fn SELF_HEAL_STATE_DIR="$g7/self-heal" SELF_HEAL_NOTIFY_SCRIPT="$g7/notifier" NOTIFY_COUNT_FILE="$g7/count" \
+        -- _send_notification critical "$g7/report.json" lunarwing >/dev/null
+    src_fn SELF_HEAL_STATE_DIR="$g7/self-heal" SELF_HEAL_NOTIFY_SCRIPT="$g7/notifier" NOTIFY_COUNT_FILE="$g7/count" \
+        -- _send_notification critical "$g7/report.json" lunarwing >/dev/null
+    assert_eq "$(cat "$g7/count")" "2" "G7: failed delivery does not arm cooldown"
+
+    g8="$(sb)"; report "$g8" "$GW"
+    cp "$LIB_DIR/../send-notification.sh" "$ROOT/send-notification.sh"
+    chmod +x "$ROOT/send-notification.sh"
+    src_fn SELF_HEAL_STATE_DIR="$g8/self-heal" GOTIFY_TOKEN='' \
+        -- _send_notification critical "$g8/report.json" lunarwing >/dev/null
+    if compgen -G "$g8/self-heal/.last_escalation_page.*" >/dev/null; then
+        bad "G8: absent Gotify token does not arm cooldown" "cooldown sidecar exists"
+    else
+        ok "G8: absent Gotify token does not arm cooldown"
+    fi
+else
+    ok "G5: skipped (no SHA-256 tool)"
+    ok "G6: skipped (no SHA-256 tool)"
+    ok "G7: skipped (no SHA-256 tool)"
+    ok "G8: skipped (no SHA-256 tool)"
+fi
 
 echo "=== Section H: Flapping guard ==="
 
@@ -339,7 +413,8 @@ echo "=== Section I: Post-restart verification ==="
 i1="$(sb)"; mk_check "$i1" gateway healthy >/dev/null; report "$i1" "$GW"
 oI1="$(run_dry "$i1" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=true SELF_HEAL_HEALTH_CHECK_DIR="$i1/checks")"
 assert_contains "$oI1" "SUCCESS: lunarwing healthy after restart" "I1: healthy verify clears the service"
-assert_eq "$(state_of "$i1")" '{}' "I1: state empty after verified-healthy restart"
+assert_eq "$(state_of "$i1" '.lunarwing.retries // 0')" "0" "I1: retry state cleared after verified recovery"
+assert_eq "$(state_of "$i1" '.lunarwing.restart_history | length')" "1" "I1: restart history retained for flap detection"
 
 # I2 — verify critical → retry bumped.
 i2="$(sb)"; mk_check "$i2" gateway critical >/dev/null; report "$i2" "$GW"
@@ -525,4 +600,3 @@ assert_contains "$oN3" "base=123s"       "N3: --backoff-base parsed"
 assert_contains "$oN3" "verify=false"    "N3: --verify-health parsed"
 
 finish
-

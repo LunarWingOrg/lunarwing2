@@ -79,11 +79,19 @@ EOF
 }
 exec /usr/bin/id "$@"
 EOF
+    cat > "$bin/podman" <<'EOF'
+#!/usr/bin/env bash
+ROOT="${HS_UNIT_DIR:?}"
+user="${HS_TENANT_USER:-}"
+container="${@: -1}"
+cat "$ROOT/$user/$container.container-health" 2>/dev/null
+EOF
     chmod +x "$bin"/*
 }
 
 unit_set() { printf '%s\n' "$3" > "$1/units/$2"; }   # <sb> <unit> "<ls> <as> <ss> <nr> <uf>"
 unit_set_user() { mkdir -p "$1/units/$2"; printf '%s\n' "$4" > "$1/units/$2/$3"; }
+container_health_user() { mkdir -p "$1/units/$2"; printf '%s\n' "$4" > "$1/units/$2/$3.container-health"; }
 
 run_hs() {  # <sb> <tenant> <user> [weechat:true|false|absent] -> health-systemd.sh JSON on stdout
     local sb="$1" t="$2" u="$3" w="${4:-absent}"
@@ -328,5 +336,17 @@ unit_set "$r" lunarwing-acme.service "loaded inactive dead 0 enabled"
 oR="$(run_hs_registry "$r" HS_FAIL_UFS_USER=acme)"
 assert_eq "$(oall "$oR")" "critical" "R1: inconclusive enable-state for down unit fails loud"
 assert_contains "$oR" "probe(s) failed" "R2: enable-state probe failure surfaced"
+
+# ── S: LunarVision is a container unit; active+unhealthy must be critical ─────
+echo "=== Section S: LunarVision container health ==="
+s="$(sb)"; mk_hs_mock "$s"
+jq -n '{tenants:{acme:{user:"acme"}}}' > "$s/ports.json"
+unit_set_user "$s" acme lunarwing-acme.service "loaded active running 0 enabled"
+unit_set_user "$s" acme lunarwing-vision-acme.service "loaded active running 0 generated"
+container_health_user "$s" acme lunarwing-vision-acme unhealthy
+oS="$(run_hs_registry "$s")"
+assert_eq "$(ustat "$oS" lunarwing-vision-acme.service)" "critical" "S1: active but unhealthy LunarVision container is critical"
+assert_eq "$(jq -r '.metrics.units[] | select(.name=="lunarwing-vision-acme.service") | .extra.container_health' <<<"$oS")" "unhealthy" "S2: LunarVision container health exposed"
+assert_eq "$(oall "$oS")" "critical" "S3: LunarVision container failure drives overall status"
 
 finish
