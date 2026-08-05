@@ -7,7 +7,8 @@
 | Lunartica UI reskin continuation | v2.0.5.0 |
 | Upgrade old testing harness | v2.0.5.0 |
 | Further external worker polishing | v2.0.5.0 |
-| Unfinished features from previous releases, including the DarkIRC key manager | v2.0.5.0
+| Unfinished features from previous releases, including the DarkIRC key manager | v2.0.5.0 |
+| Coordination pipeline improvements | v2.0.5.0 |
 | Feature set of subset of agent features adopted from Hermes Agent (Human Delay mode already landed in a prior release); comprehensive documentation to accompany each new feature | v2.0.6.0 |
 | Input-validation security improvements | v2.0.6.0 |
 | ONNX Runtime speech to text model support necessary for LunarVoice | v2.0.6.0 |
