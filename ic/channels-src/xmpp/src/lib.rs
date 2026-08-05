@@ -67,6 +67,8 @@ struct PollResponse {
 #[derive(Debug, Deserialize)]
 struct BridgeIncomingMessage {
     user_id: String,
+    #[serde(default)]
+    sender_id: Option<String>,
     user_name: Option<String>,
     content: String,
     thread_id: Option<String>,
@@ -193,8 +195,9 @@ impl Guest for XmppChannel {
         let new_cursor = response.cursor;
         for message in response.messages {
             let inbound_attachments = decode_inbound_attachments(message.attachments);
+            let sender_id = message.sender_id.unwrap_or(message.user_id);
             channel_host::emit_message(&EmittedMessage {
-                user_id: message.user_id,
+                user_id: sender_id,
                 user_name: message.user_name,
                 content: message.content,
                 thread_id: message.thread_id,

@@ -32,7 +32,11 @@ pub struct ConfigureResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BridgeMessage {
     pub message_id: String,
+    /// Conversation/storage target retained for backward compatibility.
     pub user_id: String,
+    /// Actual channel actor. Older bridge payloads omit this field.
+    #[serde(default)]
+    pub sender_id: Option<String>,
     pub user_name: Option<String>,
     pub content: String,
     pub thread_id: Option<String>,
@@ -144,6 +148,7 @@ mod tests {
         let json = r#"{"message_id":"1","user_id":"a@b","content":"hi","metadata_json":"{}"}"#;
         let msg: BridgeMessage = serde_json::from_str(json).expect("deserializes");
         assert_eq!(msg.message_id, "1");
+        assert!(msg.sender_id.is_none());
         assert!(msg.attachments.is_empty());
     }
 
@@ -152,6 +157,7 @@ mod tests {
         let msg = BridgeMessage {
             message_id: "1".to_string(),
             user_id: "a@b".to_string(),
+            sender_id: Some("room@conference.example/alice".to_string()),
             user_name: None,
             content: "see file".to_string(),
             thread_id: None,
@@ -165,6 +171,10 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serializes");
         let decoded: BridgeMessage = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(decoded.attachments.len(), 1);
+        assert_eq!(
+            decoded.sender_id.as_deref(),
+            Some("room@conference.example/alice")
+        );
         assert_eq!(decoded.attachments[0].filename, "photo.jpg");
     }
 

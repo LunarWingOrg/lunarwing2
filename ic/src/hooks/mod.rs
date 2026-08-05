@@ -23,8 +23,8 @@ pub use bundled::{
     HookBundleConfig, HookRegistrationSummary, register_bundle, register_bundled_hooks,
 };
 pub use coordination::{
-    CoordinationHookConfig, CoordinationState, MAX_COORD_AGENT_ID_LEN, register_coordination_hooks,
-    valid_coordination_agent_id,
+    CoordinationHookConfig, CoordinationPromptPolicy, CoordinationState, MAX_COORD_AGENT_ID_LEN,
+    register_coordination_hooks, valid_coordination_agent_id,
 };
 pub use hook::{Hook, HookContext, HookError, HookEvent, HookFailureMode, HookOutcome, HookPoint};
 pub use registry::HookRegistry;

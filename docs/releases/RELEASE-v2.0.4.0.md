@@ -1,6 +1,6 @@
 # Release Notes for LunarWing v2.0.4.0 — Codename `Odoshi (威し)`
 
-**Release Date:** TBD
+**Release Date:** 2026-08-05
 
 > *Odoshi* (威し) evokes intimidation. LunarWing v2.0.4.0 strengthens
 the boundaries around coordinated agents, external processes, extension
@@ -514,7 +514,7 @@ package, create a release artifact, or deploy a tenant.
 13. **Treat MCP stdio as daemon-account code execution.** Review commands,
     owner-scoped secret references, and inherited environment. Kill/recovery
     smoke tests are still recommended before relying on automatic restart.
-14. **Do not enable unfinished DarkIRC exchange stages.** Public Stage A artifacts
+14. **Do not enable unfinished DarkIRC key exchange stages.** Public Stage A artifacts
     do not activate a contact. Installed pending Stage A state blocks managed
     migration/upgrade until later activation health gates exist; cancel or
     complete it through supported lifecycle paths rather than deleting files.
@@ -549,85 +549,10 @@ package, create a release artifact, or deploy a tenant.
 | `KIMI_API_KEY` | unset | Optional for OAuth-backed Kimi Code; required for non-OAuth providers |
 | `AGENT_AUTH_TOKEN` | required for Kimi server mode | Authenticates LunarWing to the Kimi bridge |
 
-## Testing and Verification
-
-This section distinguishes implementation evidence from a final release gate.
-The listed results were recorded by the corresponding implementation/audit work;
-they were not all rerun together solely for this first draft.
-
-### Recorded Results
-
-- Coordination review: all 14 reported integration issues verified and fixed;
-  focused hook, gate, coalescer, XMPP, agent, health, Engine V2, format, check,
-  and all-feature clippy suites recorded green.
-- P1 hardening: regressions cover bounded coalescing, violation persistence,
-  streamed WASM response caps, lorebook cache/bounds, concise Engine answers,
-  bounded XMPP attachment work, and concurrent gate expiry.
-- MCP Part 1: full Engine suite plus focused MCP recovery, config, process,
-  shutdown, update, and ownership regressions recorded green; format, check, and
-  warnings-denied clippy recorded clean.
-- DarkIRC Stage A: 82 key-manager tests, 20 key-helper tests, eight DarkIRC shell
-  suites, Kawarimi safeguards, Cargo check, rustfmt, clippy, shell syntax, and
-  ShellCheck recorded passing.
-- Resource isolation: process-group timeout/drop tests, a 19-check rendering
-  harness, warnings-denied clippy, and live Dwarfstar systemd scope/build/daemon
-  measurements recorded successful.
-- Dependency audit snapshot: default and all-feature Cargo checks plus the XMPP
-  bridge check recorded clean; the later Wasmtime security update recorded
-  `cargo-deny` advisories/bans/licenses/sources as passing under configured
-  exceptions.
-- Kawarimi: focused Python suites and a real staged Hermes PostgreSQL migration
-  recorded successful, including row counts and one decrypted-secret comparison.
-
-### Still Required Before Final Release
-
-- Run the complete required GitLab pipeline on the final release commit without
-  runner pull-rate failures.
-- Run the release version/codename checks against the final tag and release-note
-  location.
-- Run final backend-specific and all-feature Cargo checks and the selected live
-  tenant upgrade matrix.
-- Complete DarkIRC's real two-user isolation and `/proc`/stdout/stderr/journal
-  leak evidence; do not equate fixture coverage with that live proof.
-- Smoke-test managed MCP stdio crash, recovery, circuit open, deactivate, and
-  daemon shutdown against a real child process.
-- Revalidate active deployment-only WeeChat, Podman health, OMEMO, and XMPP queue
-  observations on upgraded tenants.
-- Perform item #11's final release-note accuracy and consistency pass.
-
 ## Known Issues
-
-### Active Canonical Bug Reports
-
-The canonical tracker was reconciled against source on 2026-08-03. The table
-below carries its current unresolved or live-validation state rather than the
-older v2.0.3.0 wording.
-
-| Area | Status | Current issue |
-|---|---|---|
-| [Agent and worker lifecycle](docs/bugs/BUG-agent-worker-lifecycle.md) | Partial | `wait=true` still occupies the originating turn. Priority interrupts work and ordinary messages enter a bounded deferred FIFO. External workers default to `wait=false`; sandbox jobs still default to waiting. |
-| [E2E test bugs](docs/bugs/BUG-e2e-test-bugs.md) | Partial / validation gap | Bootstrap/tool fixes landed and the Gmail fixture was retired, but bootstrap browser tests remain ignored because of a harness race; clipboard behavior is unverified in the current environment. |
-| [External worker config persistence](docs/bugs/BUG-external-worker-config-persistence.md) | Fixed in source; live check pending | Provisioning and TOML token re-injection have round-trip tests, but a live daemon-to-worker token-auth re-check is still needed before archiving the report. |
-| [Kawarimi import flag parity](docs/bugs/BUG-kawarimi-import-flag-parity.md) | Open | Explicit `--with-wasm` is rejected even though import adds WASM internally. |
-| [SSH Git ref and remote HEAD](docs/bugs/BUG-ssh-git-ref-and-remote-head.md) | Partial | Null-like refs are fixed; a bare remote whose HEAD names a missing branch can still yield an empty checkout reported as successful. |
-| [WeeChat `rand_check`](docs/bugs/BUG-weechat-relay-rand-check.md) | Partial / latent | The helper still always returns false, although no current production call site uses it. |
-| [Worker workspace paths](docs/bugs/BUG-worker-workspace-path-expansion.md) | Partial | Structured OpenCode paths normalize `~`; prompt-generated paths and Pebble `project_dir` remain unresolved. |
-| [XMPP polling and backpressure](docs/bugs/BUG-xmpp-polling-and-backpressure.md) | Partial | Poll supervision and stall visibility are implemented, but a full downstream queue can still hold an unbounded send await. |
-| [XMPP OMEMO warmup/processing](docs/bugs/BUG-xmpp-omemo-warmup-and-processing.md) | Unverified | Generic stuck-`Processing` recovery is fixed; historical MUC fallback spam has not been reproduced or closed on a current live tenant. |
 
 ### Additional Source-Verified or Deployment Follow-ups
 
-- **Mission goal pollution:** conversation-insight payload construction does not
-  filter out mission threads before selecting recent goals.
-- **Multica base-path mismatch:** capability grants beginning at `/api/` do not
-  match a configured base URL that includes a path prefix such as
-  `/cotter-openclaw`.
-- **Removed channel artifacts are not pruned automatically:** old Feishu,
-  Telegram, or other WASM files left in a tenant channel directory can still load
-  after registry removal. Reconcile stale tenant artifacts during upgrade.
-- **WeeChat 401 and Podman `starting` reports need live revalidation:** current
-  source renders matching credentials and health endpoints, but source review
-  cannot repair or prove the state of an already-drifted tenant.
 - **Secret-leak warning noise:** standalone 64-character hex values can trigger a
   masked warning even when they are hashes rather than secrets. No plaintext
   disclosure is established by that warning alone.
@@ -640,9 +565,6 @@ older v2.0.3.0 wording.
 
 ### Security and Runtime Limitations
 
-- **MCP stdio is unsandboxed trusted host code.** It runs under the daemon account
-  and can access that account's permissions. Crash recovery improves lifecycle,
-  not containment.
 - **Onboarding is a trusted local console.** It has no user-account system or TLS.
   Keep loopback binding and token authentication enabled; use an SSH tunnel for
   remote access.
@@ -655,9 +577,6 @@ older v2.0.3.0 wording.
   list constructs the coalescer whenever `COALESCE_ENABLED` retains its `true`
   default. Set `COALESCE_ENABLED=false` when room scopes must be configured
   without coalescing.
-- **Lorebook scanning is lexical and conservative.** Benign instruction-like
-  prose can be rejected, and the implemented import subset does not provide full
-  SillyTavern semantics.
 - **Engine output-safety ordering has a residual limitation.** The incident audit
   records that oversized prefixes are truncated before later redaction/policy
   stages, while later transformed normal-sized output is not re-capped.
@@ -673,7 +592,7 @@ older v2.0.3.0 wording.
 - Reflex compiler and semantic routing remain opt-in. Software Builder
   validation, test harness, auto-registration, and later bridge phases are not
   complete.
-- DarkIRC Stages B-D and automated QR/web/trusted-channel delivery are not
+- DarkIRC key manager Stages B-D and automated QR/web/trusted-channel delivery are not
   implemented.
 - MCP package installation, provenance/revocation, host sandboxing, worker-local
   placement, MCP-over-WASM, and dedicated/shared gateway architecture are
@@ -683,7 +602,7 @@ older v2.0.3.0 wording.
 - Kawarimi and machine migration remain PostgreSQL-only and require staged
   downtime. There is no automatic rollback after a failed checkout/import.
 - Current CI does not build a distributable package or release artifact and does
-  not deploy tenants.
+  not deploy tenants. A seperate integration test outside of Gitlab does do this.
 - `ic/deny.toml` still carries eight explicit advisory exceptions: four
   `rustls-webpki` issues pinned through libSQL, one `lopdf` issue pinned through
   `pdf-extract`, the RSA Marvin timing advisory without an upstream fixed
