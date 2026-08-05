@@ -70,7 +70,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <tenant> \
 sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-wasm
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <tenant>
 sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
-sudo ic/scripts/lunarwing-mt-admin.sh doctor <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh doctor
 ```
 
 MT admin allocates `darkirc_irc`, `darkirc_rpc`, and `darkirc_adapter` ports from the registry, writes protected adapter/daemon configuration, and renders systemd-user or OpenRC services. Use MT admin for restart and status; do not probe tenant units through bare system-bus `systemctl`.
@@ -121,7 +121,7 @@ Changing only the WASM response split does not change IRC framing or delivery pa
 
 For a tenant managed by MT admin:
 
-1. `status` and `doctor` report the daemon, adapter, and LunarWing healthy.
+1. `status <tenant>` reports the daemon, adapter, and LunarWing healthy; host `doctor` reports required dependencies available.
 2. The adapter `/health` endpoint reports an IRC connection on the tenant's registry port.
 3. Authenticated gateway status reports healthy DarkIRC channel state.
 4. A paired test nick can send and receive a direct message.
