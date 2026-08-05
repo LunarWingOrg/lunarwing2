@@ -1,25 +1,49 @@
+# Create a LunarWing Tenant
 
+`ic/scripts/create-tenant.sh` is the convenience wrapper for provisioning one multi-tenant LunarWing instance. It delegates lifecycle work to `ic/scripts/lunarwing-mt-admin.sh`; use the MT admin directly for ongoing start, stop, status, build, and removal operations.
 
-● Done. ic/scripts/create-tenant.sh is the generic version — executable, bash -n + shellcheck clean, and I won't run it (it's a root/sudo provisioner for you).
+## Before You Run It
 
-  Usage
+- Run the script from the checkout and branch that the tenant should use. The MT tooling checks out the source repository's current branch and prints the selected branch and commit before provisioning.
+- Review [MT-ADMIN-QUICKSTART.md](MT-ADMIN-QUICKSTART.md), especially the host prerequisites and port registry behavior.
+- Run as root through `sudo`. Provisioning creates an OS user, PostgreSQL resources, service definitions, environment files, and port-registry entries.
+- Avoid putting passwords or API keys in shell history. Omit them when generated defaults are appropriate, or pass protected environment values with an approved operator workflow.
 
-  sudo ic/scripts/create-tenant.sh <name> [options]
+## Usage
 
-  The name is positional and gets sanitized to [a-z0-9-] (e.g. Vex_Test → vex-test, with a note). Everything name-specific is derived: JID
-  <name>@xmpp.your.domain, token-<name> LLM key, /home/<name>/... paths, and the WeeChat tmux instructions.
+```bash
+sudo ic/scripts/create-tenant.sh <name> [options]
+```
 
-  sudo ic/scripts/create-tenant.sh vex                                   # == the bespoke vex script
-  sudo ic/scripts/create-tenant.sh acme --xmpp-jid acme@xmpp.example.org --yes
-  sudo ic/scripts/create-tenant.sh scratch --minimal                     # core daemon only, no workers/docker-group
-  sudo ic/scripts/create-tenant.sh bot --no-pebble
-  sudo ic/scripts/create-tenant.sh --help
+The name is lowercased and sanitized to `[a-z0-9-]`. All paths, service names, and default tenant identifiers are derived from it.
 
-  What carried over / what's new
+Common examples:
 
-  - Same 5-step flow + WeeChat tmux instructions as the vex script, all parameterized by $TENANT.
-  - Every knob is now a flag (with env-var fallback): --xmpp-jid, --xmpp-domain, --xmpp-password, --llm-api-key, --llm-base-url, --gotify-url, --[no-]docker-group,
-  --[no-]pebble, --[no-]wasm, --[no-]ensure-toolchain, --minimal, --yes.
-  - Defaults are full-featured (docker-group + pebble + wasm + cargo-component bootstrap all on), so sudo create-tenant.sh vex is identical to
-  create-tenant-vex.sh.
-  - Same safety guards: refuses if the tenant already exists, root/jq/MT checks, host-dep report, --help/missing-name/unknown-flag handling all verified.
+```bash
+# Full tenant: core daemon, Pebble worker, and WASM extensions
+sudo ic/scripts/create-tenant.sh acme
+
+# Skip the Pebble worker
+sudo ic/scripts/create-tenant.sh acme --no-pebble
+
+# Core daemon without Pebble or Docker-group membership
+sudo ic/scripts/create-tenant.sh scratch --minimal
+
+# Preview every current option and environment override
+bash ic/scripts/create-tenant.sh --help
+```
+
+The default full flow calls MT admin to add the tenant, ensures the WASM toolchain when requested, builds the selected components, starts the tenant, verifies health, and prints WeeChat setup instructions. Use `--yes` only after reviewing the printed plan.
+
+Do not use retired Nanocode flags. The script rejects `--nanocode`, `--with-nanocode`, and `--no-nanocode`; Pebble is the supported external worker.
+
+## After Provisioning
+
+Use the init-agnostic MT admin interface rather than calling tenant services directly:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh status acme
+sudo ic/scripts/lunarwing-mt-admin.sh doctor acme
+```
+
+On systemd hosts, tenant units run in the tenant user's user manager. On OpenRC hosts, MT admin uses the corresponding OpenRC services. Do not substitute bare system-bus `systemctl` checks.
