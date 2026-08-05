@@ -1,6 +1,9 @@
 # Test Plan: Upgraded Tenant Across the 1.1.9 Renames (OpenRC/Gentoo)
 
-**Current**
+> **Historical validated plan.** “Current script,” registry v11, host inventory,
+> and line-level assumptions below refer to the 2026-07-04 1.1.8→1.1.9 test.
+> Current production registries are v14; use this document to reproduce the old
+> compatibility boundary, not as a general v2.0.4 upgrade runbook.
 
 **Goal:** validate `docs/ops/TENANT-RENAME-MIGRATION-1.1.9.md` end-to-end on a
 tenant that was **provisioned on v1.1.8** and upgraded to 1.1.9 — the case the
