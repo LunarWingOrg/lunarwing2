@@ -597,11 +597,15 @@ sudo cp /etc/lunarwing/ports.json.bak.<TIMESTAMP> /etc/lunarwing/ports.json
 
 Restart affected tenants after rollback if services were already rendered or started with migrated ports.
 
-### Disable DarkIRC for One Tenant
+### Temporarily Stop DarkIRC for One Tenant
 
-Stop the DarkIRC services while leaving the main tenant stack intact.
+There is no supported `disable-darkirc` verb. The commands below are a temporary
+maintenance stop only: `enable_darkirc=true` remains in the registry,
+`start-tenant` will start the services again, and host health/self-heal still
+expects them. Coordinate the maintenance window with that health policy so an
+automatic repair does not undo the stop.
 
-Systemd:
+Systemd user manager:
 
 ```bash
 sudo -u <TENANT> XDG_RUNTIME_DIR=/run/user/$(id -u <TENANT>) \
@@ -615,7 +619,11 @@ sudo rc-service lunarwing-darkirc-adapter-<TENANT> stop
 sudo rc-service lunarwing-darkirc-<TENANT> stop
 ```
 
-If the WASM channel is installed but the adapter is down, channel health will report degraded/unhealthy until either the service is restored or the channel is removed from the tenant's installed channels.
+If the WASM channel remains installed while the adapter is down, channel health
+reports degraded/unhealthy. Restore the services after maintenance. Permanent
+removal requires an explicit teardown plan for channel activation, units and
+boot persistence, registry state, env/config, contacts, and key material; do not
+flip `enable_darkirc` manually and leave the other surfaces inconsistent.
 
 ## Operator Checklist
 
