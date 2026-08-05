@@ -1,6 +1,6 @@
 # Pre-Release Testing
 
-> Last reconciled with the repository on 2026-08-02. Do not carry historical
+> Last reconciled with the repository on 2026-08-05. Do not carry historical
 > pass counts forward: record the tested commit and fresh results for each
 > release candidate.
 
