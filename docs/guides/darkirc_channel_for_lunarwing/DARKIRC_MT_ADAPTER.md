@@ -67,7 +67,7 @@ On systemd hosts, DarkIRC tenant services run in the tenant user's systemd user 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <tenant>
 sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
-sudo ic/scripts/lunarwing-mt-admin.sh doctor <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh doctor
 sudo ic/scripts/lunarwing-mt-admin.sh stop-tenant <tenant>
 ```
 
