@@ -1,4 +1,4 @@
-use std::io::{self, Write};                                                                                                                                                      15:01:24 [252/9142]
+use std::io::{self, Write};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -74,8 +74,8 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("    (You can adjust MODEL_TIMEOUT in the code)");
             }
         }
-     
+    }
+
     println!("Goodbye! 👋");
     Ok(())
-}
 }
