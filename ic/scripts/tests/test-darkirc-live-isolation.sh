@@ -25,7 +25,7 @@ command -v useradd >/dev/null 2>&1 || skip "useradd is required"
 sudo -n true 2>/dev/null || skip "passwordless sudo is required"
 
 if [[ "$(id -u)" != 0 ]]; then
-  exec sudo -n bash "$0" "$@"
+  exec sudo -n --preserve-env=DARKIRC_LIVE_KEEP bash "$0" "$@"
 fi
 
 USER_A="dklive-a"
@@ -61,6 +61,10 @@ cleanup() {
   rm -f "$GENERATOR" "$HELPER" "$COMPAT_FILE"
   userdel -r "$USER_A" >/dev/null 2>&1
   userdel -r "$USER_B" >/dev/null 2>&1
+  if [[ "${DARKIRC_LIVE_KEEP:-0}" == 1 ]]; then
+    rm -rf /tmp/darkirc-live-evidence
+    cp -a "$WORK" /tmp/darkirc-live-evidence
+  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -239,18 +243,24 @@ run_helper "$USER_A" complete --tenant "$USER_A" --scope-id "$A_SCOPE" --contact
   --defer-apply --json >"$WORK/capture/a-complete.out" 2>"$WORK/capture/a-complete.err"
 log "PASS: deferred complete as $USER_A"
 
-# Read-only operator surfaces on both tenants.
+# Read-only operator surfaces on both tenants. These exist to be scanned for
+# secret material, so a nonzero exit (for example a tenant without a ledger
+# yet) is captured, not fatal.
 for user in "$USER_A" "$USER_B"; do
   short="${user#dklive-}"
-  run_helper "$user" list --tenant "$user" >"$WORK/capture/$short-list.out" 2>&1
-  run_helper "$user" doctor --tenant "$user" >"$WORK/capture/$short-doctor.out" 2>&1
-  run_helper "$user" exchanges --tenant "$user" --scope-id "$A_SCOPE" \
-    >"$WORK/capture/$short-exchanges.out" 2>&1
-  run_helper "$user" ledger --tenant "$user" --scope-id "$A_SCOPE" \
-    >"$WORK/capture/$short-ledger.out" 2>&1
+  scope="$A_SCOPE"
+  [[ "$user" == "$USER_A" ]] || scope="$B_SCOPE"
+  for op in list doctor exchanges ledger; do
+    rc=0
+    run_helper "$user" "$op" --tenant "$user" --scope-id "$scope" \
+      >"$WORK/capture/$short-$op.out" 2>&1 || rc=$?
+    log "surface $user $op exit=$rc"
+  done
 done
+rc=0
 run_helper "$USER_A" status --tenant "$USER_A" --contact peer-b \
-  >"$WORK/capture/a-status.out" 2>&1
+  >"$WORK/capture/a-status.out" 2>&1 || rc=$?
+log "surface $USER_A status exit=$rc"
 
 # --- OpenRC-supervised execution with init-captured logs --------------------
 
