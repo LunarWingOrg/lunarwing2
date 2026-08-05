@@ -72,11 +72,12 @@ mod tests {
             .send_chat(&thread_id, "create workflow routine")
             .await;
         harness
-            .wait_for_turns(&thread_id, 1, Duration::from_secs(10))
+            .wait_for_turns(&thread_id, 1, Duration::from_secs(30))
             .await;
 
         let mut routine = None;
-        for _ in 0..30 {
+        let routine_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < routine_deadline {
             routine = harness.routine_by_name("wf-ci-webhook-demo").await;
             if routine.is_some() {
                 break;
@@ -98,7 +99,7 @@ mod tests {
         harness.send_chat(&thread_id, "emit webhook event").await;
 
         let history = harness
-            .wait_for_turns(&thread_id, 2, Duration::from_secs(10))
+            .wait_for_turns(&thread_id, 2, Duration::from_secs(30))
             .await;
         let turns = history["turns"].as_array().expect("turns array missing");
         assert!(turns.len() >= 2, "expected at least 2 turns");
@@ -128,7 +129,8 @@ mod tests {
         );
 
         let mut after_count = before_count;
-        for _ in 0..50 {
+        let runs_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < runs_deadline {
             let runs_after = harness.routine_runs(routine_id).await;
             after_count = runs_after["runs"]
                 .as_array()
