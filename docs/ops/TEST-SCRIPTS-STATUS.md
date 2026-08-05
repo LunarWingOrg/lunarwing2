@@ -1,7 +1,7 @@
 # Test Scripts Status Report
 
 **Generated**: 2026-07-08 (v1.1.9 `Kiyome きよめ` pre-release, item #3)
-**Rechecked**: 2026-08-02 (paths, command interfaces, and current worker matrix)
+**Rechecked**: 2026-08-05 (paths, command interfaces, release-smoke checks, and current worker matrix)
 **Author**: Rarity
 
 This report catalogs every automated testing script in the LunarWing repo, its
@@ -63,7 +63,7 @@ current status, what was fixed, and what remains untested or broken.
 | **Status** | ✅ Working (bash syntax valid, no issues found) |
 | **Language** | Bash |
 | **Purpose** | Hits gateway API to verify core subsystems: health, settings, memory, routines, jobs, skills, extensions, chat, gotify, secrets, logging |
-| **Checks** | 16 authenticated checks + 2 unauthenticated |
+| **Checks** | 22 token-dependent outcomes + 2 unauthenticated connectivity/page checks |
 | **Run** | `GATEWAY_URL=http://localhost:9098 GATEWAY_AUTH_TOKEN=tok ./ic/scripts/release-test.sh` |
 | **Not automated** | XMPP, WeeChat, Docker/sandbox workers, GitHub integration, image tools, REPL v2, performance/load, rollback, post-release monitoring, documentation (all documented in script header) |
 
@@ -91,7 +91,7 @@ current status, what was fixed, and what remains untested or broken.
 
 | Field | Value |
 |-------|-------|
-| **Status** | ✅ Working (bash syntax valid, 2650 lines) |
+| **Status** | ✅ Working (bash syntax valid; command surface rechecked) |
 | **Language** | Bash |
 | **Purpose** | Full-stack test environment: PostgreSQL, TensorZero proxy, XMPP bridge, WASM channels/tools, and the LunarWing daemon |
 | **Commands** | `init`, `build`, `build-wasm`, `install-wasm`, `doctor`, `up`, `down`, `status`, `verify`, `start-postgres`, `start-proxy`, `start-bridge`, `start-lunarwing`, `repl`, etc. |

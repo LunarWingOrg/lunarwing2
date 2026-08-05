@@ -2,12 +2,14 @@
 
 All project documentation, organized by category. This index reflects the current tree —
 every **active** file is listed below. Archived material lives under
-[`internal/history/`](internal/history/) (superseded LunarWing docs).
+[`internal/history/`](internal/history/) and subsystem archives such as
+[`guides/history/`](guides/history/).
 
 * Original Author: Starforce Nebula *
 * Updated on July 6th by Rarity to reflect recent changes to the documentation tree: added missing entries for reviews/, specs/, superpowers/; fixed broken links (ROADMAP_2026, DOCS_REORG_CHECKLIST); added READMEs to previously undocumentated subdirectories.*
 * Updated on July 20th, 2026 to reconcile the complete proposal index with current source and tests at revision `50c8f99`.*
 * Updated on July 28th, 2026 to reconcile this index with the current documentation tree.*
+* Updated on August 5th, 2026 after the v2.0.4.0 guide audit and archival pass.*
 
 ## Directory Structure
 
@@ -35,34 +37,32 @@ How-to guides, build instructions, and setup walkthroughs.
 
 | File | Description |
 |------|-------------|
-| [`MT-ADMIN-QUICKSTART.md`](guides/MT-ADMIN-QUICKSTART.md) | `lunarwing-mt-admin.sh` multi-tenant quickstart |
-| [`CREATE_TENANT_NEW_SCRIPT.md`](guides/CREATE_TENANT_NEW_SCRIPT.md) | Creating a tenant with the new script |
-| [`MIGRATE_IRONCLAW_TO_LUNARWING.md`](guides/MIGRATE_IRONCLAW_TO_LUNARWING.md) | Migrate an existing IronClaw PostgreSQL instance to LunarWing |
-| [`MIGRATE_IRONCLAW_TO_MT.md`](guides/MIGRATE_IRONCLAW_TO_MT.md) | PostgreSQL migration to multi-tenant |
-| [`MIGRATE_IRONCLAW_LIBSQL_TO_MT.md`](guides/MIGRATE_IRONCLAW_LIBSQL_TO_MT.md) | libSQL cross-backend migration to multi-tenant |
-| [`TESTING_GUIDE.md`](guides/TESTING_GUIDE.md) | Pre-release test checklist + automated release testing (linked from `CLAUDE.md`) |
-| [`EMBEDDINGS_SETUP.md`](guides/EMBEDDINGS_SETUP.md) | Embedding provider config (OpenAI-compatible, Ollama, NEAR AI) |
+| [`MT-ADMIN-QUICKSTART.md`](guides/MT-ADMIN-QUICKSTART.md) | Init-agnostic multi-tenant provisioning and lifecycle quickstart |
+| [`CREATE_TENANT_NEW_SCRIPT.md`](guides/CREATE_TENANT_NEW_SCRIPT.md) | Full-featured tenant convenience wrapper |
+| [`MIGRATE_IRONCLAW_TO_LUNARWING.md`](guides/MIGRATE_IRONCLAW_TO_LUNARWING.md) | Rehearsed single-instance PostgreSQL migration from IronClaw |
+| [`MIGRATE_IRONCLAW_TO_MT.md`](guides/MIGRATE_IRONCLAW_TO_MT.md) | Guarded PostgreSQL migration into an MT-admin tenant |
+| [`MIGRATE_IRONCLAW_LIBSQL_TO_MT.md`](guides/MIGRATE_IRONCLAW_LIBSQL_TO_MT.md) | Current unsupported status and safe requirements for libSQL cross-backend ETL |
+| [`TESTING_GUIDE.md`](guides/TESTING_GUIDE.md) | Current manual release matrix and links to bounded automated tiers |
+| [`DEBUG_LOG.md`](guides/DEBUG_LOG.md) | Stable logging levels, service diagnostics, and evidence collection |
+| [`EMBEDDINGS_SETUP.md`](guides/EMBEDDINGS_SETUP.md) | Database-backed and environment embedding provider configuration |
+| [`ENABLING_DEV_TOOLS.md`](guides/ENABLING_DEV_TOOLS.md) | Local tool registration, sandbox policy, and approval controls |
+| [`human-delay-mode.md`](guides/human-delay-mode.md) | Current supervised-mode behavior and enablement |
+| [`SSH-TOOL-TESTING.md`](guides/SSH-TOOL-TESTING.md) | Tests for built-in, WASM, Git, and worker SSH paths |
+| [`VISION_OCR_SIDECAR.md`](guides/VISION_OCR_SIDECAR.md) | Versioned Vision/OCR sidecar endpoints and MT port behavior |
+| [`MULTICA_DEPLOYMENT.md`](guides/MULTICA_DEPLOYMENT.md) | Multica/Lunartica WASM channel and tool deployment |
 | [`NETBIRD_TUNNEL.md`](guides/NETBIRD_TUNNEL.md) | Self-hosted NetBird Reverse Proxy tunnel setup |
-| [`TUNNEL_PROVIDER_MIGRATION.md`](guides/TUNNEL_PROVIDER_MIGRATION.md) | Migrate from removed managed Cloudflare/ngrok/Tailscale tunnels |
-| [`VISION_OCR_SIDECAR.md`](guides/VISION_OCR_SIDECAR.md) | Vision/OCR sidecar service overview |
-| [`GENTOO_PACKAGE_LIST.md`](guides/GENTOO_PACKAGE_LIST.md) | Gentoo package list + rootless-podman MT prerequisites |
-| [`ARCHLINUX_PACKAGE_LIST.md`](guides/ARCHLINUX_PACKAGE_LIST.md) | Arch Linux package list (systemd MT equivalent of the Gentoo list) |
-| [`MULTICA_DEPLOYMENT.md`](guides/MULTICA_DEPLOYMENT.md) | Multica/Lunartica deployment guide |
-| [`human-delay-mode.md`](guides/human-delay-mode.md) | Human-delay mode overview |
-| [`DEBUG_LOG.md`](guides/DEBUG_LOG.md) | Catalog of debug/info log points by `file:line` |
-| [`ENABLING_DEV_TOOLS.md`](guides/ENABLING_DEV_TOOLS.md) | Enabling filesystem/shell developer tools for a tenant |
-| [`SSH-TOOL-TESTING.md`](guides/SSH-TOOL-TESTING.md) | Test prompts for validating the three SSH delivery mechanisms |
-| [`AI-CODE-CONTRIBUTION-POLICY.md`](guides/AI-CODE-CONTRIBUTION-POLICY.md) | AI code contribution policy (effective July 7th, 2026) |
-| [`CLAUDE_CODEX_ORCHESTRATION.md`](guides/CLAUDE_CODEX_ORCHESTRATION.md) | Claude Code → Codex parallel feature orchestration (worktrees, `/codex-impl`, `/features-parallel`) |
-| [`darkirc_channel_for_lunarwing/BUILD_INSTRUCTIONS.md`](guides/darkirc_channel_for_lunarwing/BUILD_INSTRUCTIONS.md) | DarkIRC channel build instructions |
-| [`darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md`](guides/darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md) | Full DarkIRC build guide |
-| [`darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md`](guides/darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md) | DarkIRC multi-tenant adapter |
-| [`lunarwing_weechat_wss/README.md`](guides/lunarwing_weechat_wss/README.md) | WeeChat WSS channel overview |
-| [`lunarwing_weechat_wss/weechat_relay/INSTALL.md`](guides/lunarwing_weechat_wss/weechat_relay/INSTALL.md) | WeeChat relay installation |
-| [`lunarwing_weechat_wss/weechat_relay/TROUBLESHOOTING.md`](guides/lunarwing_weechat_wss/weechat_relay/TROUBLESHOOTING.md) | WeeChat relay troubleshooting |
-| [`gotify-wasm/README.md`](guides/gotify-wasm/README.md) | Gotify WASM tool |
-| [`ic_sm/README.md`](guides/ic_sm/README.md) | Secret manager (`ic_sm`) |
-| [`git-lunarwing-unix-socket-repl-server-repo/README.md`](guides/git-lunarwing-unix-socket-repl-server-repo/README.md) | REPLv2 Unix-socket REPL server |
+| [`TUNNEL_PROVIDER_MIGRATION.md`](guides/TUNNEL_PROVIDER_MIGRATION.md) | Migration from removed managed Cloudflare/ngrok/Tailscale providers |
+| [`DEBIAN_PACKAGE_LIST.md`](guides/DEBIAN_PACKAGE_LIST.md) | Debian MT host packages and Python tooling dependencies |
+| [`UBUNTU_PACKAGE_LIST.md`](guides/UBUNTU_PACKAGE_LIST.md) | Ubuntu MT host packages and Python tooling dependencies |
+| [`FEDORA_PACKAGE_LIST.md`](guides/FEDORA_PACKAGE_LIST.md) | Fedora MT host packages and Python tooling dependencies |
+| [`ARCHLINUX_PACKAGE_LIST.md`](guides/ARCHLINUX_PACKAGE_LIST.md) | Arch Linux MT host packages and Python tooling dependencies |
+| [`GENTOO_PACKAGE_LIST.md`](guides/GENTOO_PACKAGE_LIST.md) | Gentoo/OpenRC MT packages and rootless Podman prerequisites |
+| [`AI-CODE-CONTRIBUTION-POLICY.md`](guides/AI-CODE-CONTRIBUTION-POLICY.md) | AI code contribution policy (effective August 15th, 2026) |
+| [`darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md`](guides/darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md) | DarkIRC registry, daemon, tenant, and contact-key build/deploy guide |
+| [`darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md`](guides/darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md) | Current per-tenant DarkIRC adapter architecture |
+| [`lunarwing_weechat_wss/README.md`](guides/lunarwing_weechat_wss/README.md) | Current WeeChat relay, adapter, and WASM channel guide |
+| [`gotify-wasm/README.md`](guides/gotify-wasm/README.md) | Gotify WASM tool build, setup, secret, and MT configuration |
+| [`history/`](guides/history/) | Archived v1, duplicate, placeholder, and unsafe one-off guides |
 
 ---
 

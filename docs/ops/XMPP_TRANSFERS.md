@@ -1,6 +1,6 @@
 # XMPP File Transfer Methods — Quick Reference
 
-## Update 2026-07-25
+## Update 2026-08-05
 
 Inbound XMPP images now pass through automatic LunarVision OCR/VL enrichment
 when `VISION_SERVICE_URL` is configured. Enrichment uses the per-tenant
@@ -41,13 +41,13 @@ XMPP supports multiple file transfer methods, each with different tradeoffs in t
 | Size cap | ✅ Implemented | 20MB limit per file |
 | Unit tests | ✅ Implemented | `ic/src/channels/xmpp/mod.rs` |
 | Automatic LunarVision enrichment | ✅ Implemented | Host-side Bearer auth when configured; OCR/VL text plus original image |
+| Inbound download egress policy | ✅ Implemented | HTTPS by default; rejects credentials/private resolution, pins validated addresses, disables redirects and environment proxies |
 
 ### ⏳ Pending
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | End-to-end validation | ⏳ Pending | Live testing with Conversations/Gajim |
-| Inbound download SSRF guard | ⏳ Deferred | Network boundary relied upon for now |
 
 ### ❌ Not Implemented
 
@@ -108,10 +108,12 @@ XMPP Client → XMPP Bridge → Agent
 - [ ] Verify HTTP Upload URL handling
 - [ ] Verify OOB URL handling
 
-### Phase 3: SSRF Hardening (⏳ Deferred)
-- [ ] Implement allowlist for download domains
-- [ ] Add network isolation for download workers
-- [ ] Document security tradeoffs
+### Phase 3: Inbound Egress Hardening (✅ Complete)
+- [x] Require HTTPS unless `ALLOW_PRIVATE_IPS=1` explicitly permits local HTTP
+- [x] Reject embedded URL credentials and non-public resolved addresses by default
+- [x] Pin validated addresses to prevent DNS rebinding
+- [x] Disable redirects and environment proxies
+- [x] Cover the policy with focused unit tests
 
 ---
 

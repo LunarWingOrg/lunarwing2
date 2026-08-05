@@ -1,5 +1,14 @@
 # XMPP File-Transfer Security and Robustness Review R
 
+> **Historical point-in-time review.** The attacker-directed URL and credential
+> URL handling described as open below was hardened after commit `f4717e3`:
+> current inbound downloads enforce HTTPS/public-address/DNS-pinning policy,
+> disable redirects and environment proxies, and strip/redact recognized URLs.
+> Other findings remain review evidence unless separately closed. Line references
+> and the verdict are not a current-source status report; see
+> [`XMPP_TRANSFERS.md`](XMPP_TRANSFERS.md) and
+> [`XMPP_KNOWN_ISSUES.md`](XMPP_KNOWN_ISSUES.md).
+
 - Review date: 2026-07-28
 - Reviewed at commit: `f4717e3`
 

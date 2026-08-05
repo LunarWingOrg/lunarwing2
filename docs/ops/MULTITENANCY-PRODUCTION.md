@@ -50,7 +50,13 @@ Add all tenants at once. Names are comma-separated and will be lowercased automa
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenants "Ruffles,Miyuki,Sparkie,Starforce" --docker-group
 ```
 
-> **DarkIRC opt-in:** DarkIRC services are disabled by default. To provision DarkIRC daemon and adapter services for tenants, append `--enable-darkirc` to the command above. The flag state is persisted per-tenant in `/etc/lunarwing/ports.json`.
+> **Optional services are explicit selections.** Add `--enable-proxy` or
+> `--enable-darkirc` to provision those sidecars. Add `--with-pebble`,
+> `--with-opencode`, or `--with-kimi` to select workers for these tenants.
+> Building a shared worker image does not select that worker. Re-running
+> `add-tenant <name>` with one of these flags enables it for an existing tenant;
+> omitting a flag never disables an already-selected service. Selection is
+> persisted in `/etc/lunarwing/ports.json`.
 
 This creates OS users, allocates port blocks, clones the repo, generates env files, starts PostgreSQL containers, and renders service units for each tenant.
 
@@ -68,16 +74,20 @@ Or build one at a time:
 sudo ic/scripts/lunarwing-mt-admin.sh build-tenant ruffles
 ```
 
-Include WASM extensions and/or worker images:
+Include WASM extensions and/or shared worker images:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-all --with-wasm
 sudo ic/scripts/lunarwing-mt-admin.sh build-all --with-pebble --with-opencode --with-kimi
 ```
 
+Use `--with-toolchains` with the OpenCode or Kimi image flags when those workers
+need Rust, Go, C/C++, Python, and native build tooling; their default images are
+slim.
+
 ### Step 3b: Configure external workers (optional)
 
-If using the pebble worker, configure the NanoGPT API key for each tenant that needs it:
+If using the Pebble worker, configure the NanoGPT API key for each selected tenant that needs it:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh configure-pebble ruffles --nanogpt-api-key <key>
@@ -91,7 +101,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh configure-pebble ruffles --nanogpt-api-key
 
 This creates `pebble.env` (mode 600) in the tenant's env directory. The worker container reads it on next start.
 
-If using the opencode worker, optionally override the model and/or upstream base URL per tenant:
+If using the OpenCode worker, optionally override the model and/or upstream base URL per tenant:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh configure-opencode ruffles --model openai/gpt-5.2
@@ -99,6 +109,17 @@ sudo ic/scripts/lunarwing-mt-admin.sh configure-opencode ruffles --base-url http
 ```
 
 This upserts `OPENCODE_MODEL`/`OPENCODE_BASE_URL` into the tenant's `lunarwing.env`. Optional Paseo MCP integration is available via `PASEO_URL`/`PASEO_TOKEN` in the env.
+
+For Kimi Code, pass credentials through a root-readable file rather than the
+process list:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-kimi ruffles \
+  --model <model> --base-url <url> --api-key-file /root/kimi-api-key
+```
+
+This upserts `KIMI_MODEL`, `KIMI_BASE_URL`, and `KIMI_API_KEY` into the tenant's
+mode-0600 `lunarwing.env`; restart that worker after changing its settings.
 
 ### Step 4: Start services
 
@@ -259,7 +280,7 @@ The port registry lives at `/etc/lunarwing/ports.json` (root-owned, world-readab
 
 ### Port blocks
 
-Each tenant gets a contiguous block of 10 ports from the range `10000-19999`, supporting up to 1000 tenants, plus a mirrored **extended block** of 10 ports in the range `20000-29999` (`extended_base = base_port + 10000`) holding worker health/darkirc/vision-sidecar services.
+Each tenant gets a contiguous block of 10 ports from the range `10000-19999`, supporting up to 1000 tenants, plus a mirrored **extended block** of 10 ports in the range `20000-29999` (`extended_base = base_port + 10000`) and a two-port Kimi block in `30000-39999` (`kimi_base = base_port + 20000`).
 
 Primary block (10000-19999):
 
@@ -270,13 +291,13 @@ Primary block (10000-19999):
 | +2 | bridge | XMPP bridge HTTP API |
 | +3 | postgres | PostgreSQL container port |
 | +4 | proxy | TensorZero LLM proxy |
-| +5 | weechat | WeeChat relay (reserved) |
+| +5 | weechat | WeeChat relay |
 | +6 | orchestrator | Job orchestrator API |
 | +7 | nanocode_wss | Reserved legacy Nanocode slot; never reallocated |
 | +8 | pebble_wss | Pebble worker WebSocket |
 | +9 | weechat_adapter | WeeChat WS adapter HTTP API |
 
-Extended block (20000-29999, registry version ≥ 6; slots dedicated through v11):
+Extended block (20000-29999):
 
 | Offset | Service | Description |
 |--------|---------|-------------|
@@ -287,30 +308,53 @@ Extended block (20000-29999, registry version ≥ 6; slots dedicated through v11
 | ebase+4 | pebble_health | Pebble worker `/health` (host self-heal) |
 | ebase+5 | vision_service | LunarVision sidecar API (OCR port 8088) |
 | ebase+6 | vision_health | LunarVision sidecar `/health` (port 8089) |
-| ebase+7 | opencode_wss | Opencode worker WebSocket (v11) |
-| ebase+8 | opencode_health | Opencode worker `/health` (host self-heal, v11) |
+| ebase+7 | opencode_wss | OpenCode worker WebSocket |
+| ebase+8 | opencode_health | OpenCode worker `/health` (host self-heal) |
+| ebase+9 | coord_admin | Authenticated coordination admin API |
+
+Kimi block (30000-39999):
+
+| Offset | Service | Description |
+|--------|---------|-------------|
+| kbase+0 | kimi_wss | Kimi Code worker WebSocket |
+| kbase+1 | kimi_health | Kimi Code worker `/health` (host self-heal) |
 
 ### Example allocation
 
-| Tenant | Base | Gateway | HTTP | Bridge | PG | Proxy | Orchestrator | Legacy reserved | Pebble |
-|--------|------|---------|------|--------|----|-------|-------------|----------|--------|
-| ruffles | 10000 | 10000 | 10001 | 10002 | 10003 | 10004 | 10006 | 10007 | 10008 |
-| miyuki | 10010 | 10010 | 10011 | 10012 | 10013 | 10014 | 10016 | 10017 | 10018 |
+| Tenant | Base | Gateway | HTTP | Bridge | PG | Proxy | Orchestrator | Legacy reserved | Pebble | Kimi WSS |
+|--------|------|---------|------|--------|----|-------|-------------|-----------------|--------|----------|
+| ruffles | 10000 | 10000 | 10001 | 10002 | 10003 | 10004 | 10006 | 10007 | 10008 | 30000 |
+| miyuki | 10010 | 10010 | 10011 | 10012 | 10013 | 10014 | 10016 | 10017 | 10018 | 30010 |
 
 ### Registry schema
 
+The current schema is v14. In addition to ports and feature selections, it gives
+every DarkIRC-enabled tenant a stable, unique, non-secret `darkirc_scope_id`.
+
 ```json
 {
-  "version": 11,
+  "version": 14,
   "range": { "start": 10000, "end": 19999 },
   "block_size": 10,
   "extended_range": { "start": 20000, "end": 29999 },
   "extended_block_size": 10,
+  "kimi_range": { "start": 30000, "end": 39999 },
+  "kimi_block_size": 2,
   "tenants": {
     "ruffles": {
       "base_port": 10000,
       "user": "ruffles",
-      "created_at": "2026-05-04T12:00:00Z",
+      "created_at": "2026-08-05T00:00:00Z",
+      "enable_darkirc": false,
+      "darkirc_scope_id": null,
+      "enable_proxy": false,
+      "enable_weechat": true,
+      "workers": {
+        "nanocode": false,
+        "pebble": true,
+        "opencode": false,
+        "kimi": false
+      },
       "ports": {
         "gateway": 10000,
         "http": 10001,
@@ -333,7 +377,13 @@ Extended block (20000-29999, registry version ≥ 6; slots dedicated through v11
         "vision_service": 20005,
         "vision_health": 20006,
         "opencode_wss": 20007,
-        "opencode_health": 20008
+        "opencode_health": 20008,
+        "coord_admin": 20009
+      },
+      "kimi_base": 30000,
+      "kimi_ports": {
+        "kimi_wss": 30000,
+        "kimi_health": 30001
       }
     }
   }
@@ -344,75 +394,89 @@ Extended block (20000-29999, registry version ≥ 6; slots dedicated through v11
 
 ```
 /home/<tenant>/lunarwing/
-  ic/                          # Git clone of the LunarWing repo
-    target/<profile>/lunarwing  # Built main binary
+  ic/                            # Git clone of the core daemon
+    target/<profile>/lunarwing   # Built main binary
     bridges/xmpp-bridge/
-      target/<profile>/xmpp-bridge  # Built bridge binary
+      target/<profile>/xmpp-bridge
   env/
-    lunarwing.env              # Main daemon env (mode 0600)
-    xmpp-bridge.env            # Bridge env
-    proxy.env                  # TensorZero proxy env
-    nanocode.env.retired       # Archived legacy Nanocode env, when present
-    pebble.env                 # Pebble worker env (optional, mode 0600)
-  state/                       # LUNARWING_BASE_DIR
-    channels/                  # WASM channel artifacts
-    tools/                     # WASM tool artifacts
-    xmpp/                      # XMPP OMEMO state
-  nanocode-workspace/          # Preserved legacy data; never deleted automatically
-  pebble-workspace/            # Pebble worker task workspace (if enabled)
-  opencode-workspace/          # Opencode worker task workspace (if enabled)
-  logs/                        # Log files (OpenRC) or symlink to journal
-  run/                         # PID files, sockets
+    lunarwing.env                # Main daemon and worker settings (mode 0600)
+    pg.secret                    # Stable per-tenant PostgreSQL password (mode 0600)
+    xmpp-bridge.env              # Bridge env (mode 0600)
+    weechat.env                  # Minimal relay credential env (mode 0600)
+    proxy.env                    # Present only when the proxy is enabled
+    vision.env                   # LunarVision sidecar env
+    darkirc-adapter.env          # Present only when DarkIRC is enabled
+    pebble.env                   # Pebble worker env (optional, mode 0600)
+    nanocode.env.retired*        # Archived legacy Nanocode env, when present
+  state/                         # LUNARWING_BASE_DIR
+    channels/                    # WASM channel artifacts
+    tools/                       # WASM tool artifacts
+    xmpp/                        # XMPP/OMEMO state
+    darkirc/                     # DarkIRC state when enabled
+  nanocode-workspace/            # Preserved legacy data; never deleted automatically
+  pebble-workspace/              # Pebble worker task workspace (if selected)
+  opencode-workspace/            # OpenCode worker task workspace (if selected)
+  kimi-workspace/                # Kimi Code worker task workspace (if selected)
+  logs/                          # OpenRC logs
+  run/                           # PID files and sockets
 ```
 
 ## Services Per Tenant
 
+The unit set is feature- and runtime-dependent; there is no fixed per-tenant
+unit count. Always use `lunarwing-mt-admin.sh status <name>` for the authoritative
+view rather than assuming every optional unit exists.
+
 ### Systemd (user-level with linger)
 
-Currently: Each tenant gets 5 user-level systemd units installed to `~/.config/systemd/user/`:
+Units are installed under `~/.config/systemd/user/` and run on the tenant's user
+manager. `loginctl enable-linger` keeps them running after logout.
 
-| Unit | Description |
-|------|-------------|
-| `lunarwing-<name>.service` | Main daemon (Wants bridge + proxy) |
-| `xmpp-bridge-<name>.service` | XMPP bridge (PartOf main) |
-| `lunarwing-proxy-<name>.service` | TensorZero proxy |
+| Unit | When present |
+|------|--------------|
+| `lunarwing-<name>.service` | Always; main daemon |
+| `xmpp-bridge-<name>.service` | Always; `PartOf` the main daemon |
+| `lunarwing-weechat-<name>.service` and `lunarwing-weechat-adapter-<name>.service` | WeeChat enabled (the default) |
+| `lunarwing-proxy-<name>.service` | `--enable-proxy` selected |
+| `lunarwing-darkirc-<name>.service` and `lunarwing-darkirc-adapter-<name>.service` | `--enable-darkirc` selected |
+| `lunarwing-pg-<name>.service`, LunarVision, and selected worker units | Rootless Podman Quadlets after their containers are provisioned |
+| `lunarwing-workloads.slice` and `lunarwing-build.slice` | Always; resource bounds for agent and operator workloads |
 
-The main unit has `Wants=` on the bridge and proxy, so starting it pulls in the sidecars. `loginctl enable-linger` keeps services running after the user logs out.
+The main unit pulls in only sidecars that are enabled. Admin tooling always
+addresses tenant units through that user's bus:
 
-Admin manages these via:
 ```bash
 sudo -u <tenant> XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user <command> <unit>
 ```
 
-Tenant can also manage their own services directly:
+A tenant can manage its own user units directly:
+
 ```bash
 systemctl --user status lunarwing-<name>.service
 journalctl --user -u lunarwing-<name>.service -f
 ```
 
-### OpenRC (system-level with User= directives)
+### OpenRC (system-level with tenant execution)
 
-Each tenant gets 3 init scripts in `/etc/init.d/` with corresponding `/etc/conf.d/` files:
+OpenRC scripts live in `/etc/init.d/`; the baseline is
+`lunarwing-<name>`, `xmpp-bridge-<name>`, and `lunarwing-pg-<name>`.
+WeeChat and its adapter are present by default. Proxy and DarkIRC scripts are
+rendered only when selected, while LunarVision and selected Pebble/OpenCode/Kimi
+workers get container services when provisioned. Rootless Podman PostgreSQL and
+worker containers also get `<container>-sup` babysitter services.
 
-| Init script | Conf.d |
-|-------------|--------|
-| `/etc/init.d/lunarwing-<name>` | `/etc/conf.d/lunarwing-<name>` |
-| `/etc/init.d/xmpp-bridge-<name>` | `/etc/conf.d/xmpp-bridge-<name>` |
-| `/etc/init.d/lunarwing-proxy-<name>` | `/etc/conf.d/lunarwing-proxy-<name>` |
-
-All use `supervise-daemon` with `command_user` set to the tenant. Dependency wiring ensures proxy and bridge start before the main daemon.
-
-The main daemon, XMPP bridge, proxy, WeeChat client, and WeeChat/DarkIRC adapters
-do not source tenant-owned environment files from root-side OpenRC hooks. Unit
-rendering installs a root-owned launcher at
-`/usr/local/libexec/lunarwing-openrc-env-exec`; the service manager drops to the
-tenant before the launcher validates and literally parses the tenant's
-`KEY=value` file. The launcher fails closed unless the tenant env directory is
-owned by that tenant with mode `0700` and the env file is a non-symlink,
-single-link, tenant-owned regular file with mode `0600`.
+The process services use `supervise-daemon` with the tenant identity. Dependency
+wiring starts PostgreSQL and enabled sidecars before the main daemon. The main
+daemon, XMPP bridge, proxy, WeeChat client, and WeeChat/DarkIRC adapters do not
+source tenant-owned environment files from root-side hooks. Unit rendering
+installs `/usr/local/libexec/lunarwing-openrc-env-exec`; after dropping to the
+tenant, that root-owned launcher validates and literally parses `KEY=value`
+files. It fails closed unless the env directory is tenant-owned mode `0700` and
+the env file is a non-symlink, single-link, tenant-owned regular file mode
+`0600`.
 
 Existing OpenRC tenants adopt this boundary after `render-units <name>` followed
-by `restart-tenant <name>`. Check the env ownership and modes before restarting.
+by `restart-tenant <name>`. Check ownership and modes before restarting.
 
 ```bash
 rc-service lunarwing-<name> start
@@ -477,81 +541,75 @@ sudo scripts/lunarwing-mt-admin.sh build-kimi-worker
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LUNARWING_SERVICE_MANAGER` | auto-detect | Force `systemd` or `openrc` |
-| `LUNARWING_CONTAINER_RUNTIME` | saved choice, else auto-detect | Force `docker` or `podman` — persisted to /etc/lunarwing/container-runtime on first explicit use (set once) |
-| `LUNARWING_MT_PROFILE` | `release` | Build profile. Keep `release` on production and this dev VM; full debug builds are not supported for routine verification. |
-| `LUNARWING_MT_SOURCE_REPO` | parent of script | Path to source repo to clone from |
-| `LUNARWING_MT_TENSORZERO_URL` | `http://192.168.1.157:3000/openai/v1` | Default upstream TensorZero URL |
+| `LUNARWING_CONTAINER_RUNTIME` | saved choice, else auto-detect | Force `docker` or `podman`; an explicit choice is persisted in `/etc/lunarwing/container-runtime` |
+| `LUNARWING_MT_PROFILE` | `release` | Build profile. Keep `release` for production and routine verification; do not use full debug builds. |
+| `LUNARWING_MT_BUILD_JOBS` | `$(nproc)` | Explicit Cargo job cap for tenant builds |
+| `LUNARWING_MT_SOURCE_REPO` | repository root | Source checkout cloned for each tenant |
+| `LUNARWING_MT_TENSORZERO_URL` | `http://192.168.1.157:3000/openai/v1` | Upstream LLM URL and proxy upstream default |
+| `LUNARWING_MT_LLM_BASE_URL` | empty | Fleet default `LLM_BASE_URL`; empty selects the local proxy when enabled, otherwise `LUNARWING_MT_TENSORZERO_URL` |
+| `LUNARWING_MT_BACKUP_DIR` | `/var/lib/lunarwing-backups` | PostgreSQL dump root |
+| `LUNARWING_MT_BACKUP_KEEP` | `7` | Dumps retained per tenant; `0` keeps all |
 
 ## Command Reference
 
 This is a compact operator reference, not the parser's exhaustive help. Run
 `sudo ic/scripts/lunarwing-mt-admin.sh help` for every current flag and worker,
-backup, migration, and configuration subcommand.
+backup, migration, DarkIRC, and configuration subcommand.
 
 ```
 add-tenant <name> [options]      Create user, allocate ports, clone repo,
                                  generate env, render and install services
+add-tenants <names> [options]    Apply the same options to comma-separated names
   --docker-group                 Add user to docker/podman group
-  --enable-proxy                Provision TensorZero proxy service
-                                 (opt-in as of v1.1.9; without it, daemon
-                                 connects directly to upstream TENSORZERO_URL)
-  --enable-darkirc               Enable DarkIRC daemon and adapter services
-                                 (disabled by default; persisted in ports.json)
-  --xmpp-jid <jid>              XMPP JID for this tenant
-  --xmpp-password <pass>        XMPP password (generated if omitted)
-  --tensorzero-url <url>         Upstream TensorZero URL
-  --llm-base-url <url>           LLM endpoint (LLM_BASE_URL); default: local proxy
+  --enable-proxy                 Provision the optional TensorZero proxy
+  --enable-darkirc               Provision DarkIRC daemon and adapter
+  --with-pebble                  Select Pebble for these tenants
+  --with-opencode                Select OpenCode for these tenants
+  --with-kimi                    Select Kimi Code for these tenants
+  --xmpp-jid <jid>               XMPP JID for add-tenant
+  --xmpp-domain <domain>         XMPP domain for add-tenants
+  --llm-base-url <url>           Explicit daemon LLM endpoint
+  --no-health                    Skip host health-pipeline installation
+  --no-ssh                       Skip SSH harness provisioning
+  --no-weechat-bootstrap         Skip relay auto-bootstrap
 
-add-tenants <names> [options]    Comma-separated list (e.g. "Ruffles,Miyuki")
-  --docker-group                 Add user to docker/podman group
-  --enable-proxy                Provision TensorZero proxy service
-                                 (opt-in as of v1.1.9)
-  --enable-darkirc               Enable DarkIRC daemon and adapter services
-                                 (disabled by default; persisted in ports.json)
-  --xmpp-domain <domain>        XMPP domain for JIDs (default: xmpp.localhost)
-  --tensorzero-url <url>         Upstream TensorZero URL
-  --llm-base-url <url>           LLM endpoint (LLM_BASE_URL); default: local proxy
+remove-tenant <name>             Stop services and deallocate ports
+  --purge                        Also delete the OS user and home
 
-remove-tenant <name>             Stop services, deallocate ports
-  --purge                        Also delete OS user and home directory
-
-build-tenant <name>              Build binaries for one tenant (flock-serialized)
+build-tenant <name>              Build one tenant (flock-serialized)
+build-all                        Build registered tenants sequentially
   --with-wasm                    Also build WASM extensions
-  --with-pebble                  Also build the pebble worker Docker image
-  --with-opencode                Also build the opencode worker Docker image
-  --with-kimi                    Also build the Kimi Code worker Docker image
+  --require-wasm                 Fail rather than preserve stale WASM (build-tenant)
+  --with-pebble                  Also build the shared Pebble image
+  --with-opencode                Also build the shared OpenCode image
+  --with-kimi                    Also build the shared Kimi Code image
+  --with-toolchains              Use full toolchain OpenCode/Kimi images
 
-build-all                        Build each tenant sequentially
-  --with-wasm                    Also build WASM extensions
-  --with-pebble                  Also build the pebble worker Docker image
-  --with-opencode                Also build the opencode worker Docker image
-  --with-kimi                    Also build the Kimi Code worker Docker image
+build-pebble-worker              Build the Pebble image
+build-opencode-worker            Build the OpenCode image
+build-kimi-worker                Build the Kimi Code image
+  --no-cache                     Force a clean image rebuild
 
-build-pebble-worker              Build the pebble worker Docker image
-  --no-cache                     Force a full rebuild without Docker cache
+configure-pebble <name>          Set Pebble API key/model
+configure-opencode <name>        Set OpenCode model/base URL
+configure-kimi <name>            Set Kimi model/base URL/API key file
 
-build-opencode-worker            Build the opencode worker Docker image
-  --no-cache                     Force a full rebuild without Docker cache
-
-configure-pebble <name>          Configure pebble worker for a tenant
-  --nanogpt-api-key <key>        NanoGPT API key (required)
-  --model <model>                Pebble model (default: openai/gpt-5.2)
-
-configure-opencode <name>        Configure opencode worker for a tenant
-  --model <model>                Opencode model override (OPENCODE_MODEL)
-  --base-url <url>               Opencode upstream base URL (OPENCODE_BASE_URL)
-
-build-kimi-worker                Build the Kimi Code worker Docker image
-  --no-cache                     Force a full rebuild without Docker cache
-
-start-tenant <name>              Start all services for a tenant
-                                 (includes selected Pebble/OpenCode/Kimi workers)
-stop-tenant <name>               Stop all services for a tenant
+start-tenant <name>              Start core and selected optional services
+stop-tenant <name>               Stop all tenant services
 restart-tenant <name>            Stop then start
+start-worker <name> <worker>     Start one selected worker
+stop-worker <name> <worker>      Gracefully stop one worker
+restart-worker <name> <worker>   Restart one worker
+kill-worker <name> <worker>      Emergency zero-grace worker stop
+                                 workers: pebble, opencode, kimi
+render-units <name>              Re-render units without restarting
+patch-env <name>                 Add missing current environment values
 
+backup-tenant <name>             Create a custom-format PostgreSQL dump
+restore-tenant <name> <file>     Destructive restore; requires --yes
 list-tenants                     Show all tenants with ports
-status <name>                    Detailed status for one tenant
-tokens [name]                    Print gateway auth tokens (all or one)
+status <name>                    Detailed init-agnostic tenant status
+tokens [name]                    Print gateway auth tokens
 doctor                           System dependency and health checks
 ```
 
@@ -578,14 +636,23 @@ The production admin script (`lunarwing-mt-admin.sh`) is for persistent deployme
 
 ## Health Checks
 
-The infrastructure health check suite (`ic-infrastructure-health-check/`) auto-detects the init system and runs the appropriate service health check:
+The host-global infrastructure health suite (`ic-infrastructure-health-check/`)
+auto-detects the init system and checks every registered tenant:
 
-- **systemd**: runs `health-systemd.sh` (checks unit active state, restart count, timer metadata)
-- **OpenRC**: runs `health-openrc.sh` (checks `rc-service` status, PID liveness)
+- **systemd**: `health-systemd.sh` discovers tenant user managers and checks
+  their units, restart counts, and timer metadata.
+- **OpenRC**: `health-openrc.sh` discovers `/etc/init.d/lunarwing-*` and
+  `xmpp-bridge-*`, which includes core, sidecar, worker, and babysitter units.
 
-On OpenRC, `health-openrc.sh` auto-discovers multi-tenant services by scanning `/etc/init.d/` for `lunarwing-*`, `xmpp-bridge-*`, and `lunarwing-proxy-*` patterns. No configuration needed — all tenants are automatically monitored. Override with `SERVICES="svc1 svc2"` if needed.
+Registry feature flags keep intentionally disabled WeeChat, proxy, DarkIRC, and
+worker services classified as `skipped`; retired Nanocode units remain visible
+but cannot degrade host health. LunarVision health ports are discovered per
+tenant from `vision_health` in `/etc/lunarwing/ports.json`, so multi-tenant hosts
+must not force the single-node `127.0.0.1:8088` default. `SERVICES="svc1 svc2"`
+remains an intentional OpenRC override.
 
-The init system detection can be forced via `LUNARWING_SERVICE_MANAGER=systemd` or `LUNARWING_SERVICE_MANAGER=openrc`.
+Force init detection only when necessary with
+`LUNARWING_SERVICE_MANAGER=systemd` or `LUNARWING_SERVICE_MANAGER=openrc`.
 
 ## Routine System Improvements
 
@@ -614,7 +681,7 @@ These mechanisms prevent a single failed routine from permanently blocking itsel
 
 - The flock on `/var/lock/lunarwing-build.lock` ensures only one tenant build at a time.
 - Keep `LUNARWING_MT_PROFILE=release`; do not switch to a full debug build.
-- Set `CARGO_BUILD_JOBS=6` or lower to cap parallel rustc instances, and increase swap if the host still runs out of memory.
+- Set `LUNARWING_MT_BUILD_JOBS=6` or lower to cap tenant Cargo jobs, and increase swap if the host still runs out of memory.
 
 ### Tenant user can't access Docker
 

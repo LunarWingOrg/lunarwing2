@@ -1,7 +1,7 @@
 # Managed Tunnel Provider Migration
 
-LunarWing v2.0.3 manages NetBird Reverse Proxy and custom tunnel commands.
-Managed Cloudflare Tunnel, ngrok, and Tailscale providers were removed. An
+Since LunarWing v2.0.3, the managed providers are NetBird Reverse Proxy and
+custom tunnel commands. Managed Cloudflare Tunnel, ngrok, and Tailscale providers were removed. An
 externally managed service from any vendor remains supported through a static
 HTTPS `TUNNEL_URL`.
 

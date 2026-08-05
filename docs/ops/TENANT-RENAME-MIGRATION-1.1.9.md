@@ -22,13 +22,13 @@ ExecStart=... /home/<tenant>/lunarwing/darkirc_channel_for_ironclaw/darkirc/adap
 ```
 
 Unit files are static: `git pull` never rewrites them. To bridge the gap,
-1.1.9 ships **repo-root compat symlinks** (`ironclaw_weechat_wss` →
+1.1.9 added **repo-root compat symlinks** (`ironclaw_weechat_wss` →
 `lunarwing_weechat_wss`, `darkirc_channel_for_ironclaw` →
-`darkirc_channel_for_lunarwing`). These exist **for the 1.1.9 release
-only** and are removed in v2.0.0 (see `ROADMAP_2026.md`). The WebSocket
-subprotocol has a parallel transition (daemon offers both
-`lunarwing-agent-v1` and legacy `ironclaw-agent-v1` in 1.1.9) that needs
-no operator action — workers and daemon negotiate automatically.
+`darkirc_channel_for_lunarwing`). Their originally planned v2.0.0 removal did
+not occur: both symlinks remain in the v2.0.4 tree. The WebSocket transition is
+likewise still compatible: the daemon offers `lunarwing-agent-v1` and legacy
+`ironclaw-agent-v1`, and current workers accept both. Treat these as temporary
+upgrade aliases, not as permission to defer unit regeneration indefinitely.
 
 ## Per-tenant flow
 
@@ -39,7 +39,7 @@ no operator action — workers and daemon negotiate automatically.
    tmux — it rebuilds the tenant):
 
    ```bash
-   ic/scripts/lunarwing-mt-admin.sh upgrade-tenant <tenant> --target <ref>
+   sudo ic/scripts/lunarwing-mt-admin.sh upgrade-tenant <tenant> --target <ref>
    ```
 
    This composes the full verified sequence: backup → `git fetch` → restore
@@ -68,15 +68,22 @@ no operator action — workers and daemon negotiate automatically.
    convenient time afterwards:
 
    ```bash
-   ic/scripts/lunarwing-mt-admin.sh render-units <tenant>
+   sudo ic/scripts/lunarwing-mt-admin.sh render-units <tenant>
    ```
 
    Then reload and restart the affected adapter services:
-   - systemd: `systemctl --user daemon-reload` (as the tenant user, or
-     the system-level equivalent), then restart the weechat/darkirc
-     adapter units.
-   - OpenRC: restart the tenant's weechat/darkirc adapter services via
-     `rc-service`.
+   - systemd user manager:
+
+     ```bash
+     sudo -u <tenant> XDG_RUNTIME_DIR=/run/user/$(id -u <tenant>) \
+       systemctl --user daemon-reload
+     ```
+
+     Restart through `lunarwing-mt-admin.sh restart-tenant <tenant>` unless a
+     deliberately narrower adapter-only restart is required. Never use the
+     system bus for tenant units.
+   - OpenRC: use `lunarwing-mt-admin.sh restart-tenant <tenant>`, or restart the
+     specific adapter through `rc-service` when a narrow restart is intentional.
 4. **Verify** no unit still references an old path:
 
    ```bash
@@ -84,25 +91,26 @@ no operator action — workers and daemon negotiate automatically.
      ~<tenant>/.config/systemd/user/ /etc/init.d/ 2>/dev/null
    ```
 
-   Empty output = clean. Prefer read-only checks (`systemctl status`,
-   logs) over restarts when diagnosing.
+   Empty output = clean. Start diagnosis with the init-agnostic
+   `lunarwing-mt-admin.sh status <tenant>` and logs rather than a restart.
 
 ## Deadline
 
-**Before upgrading a tenant to v2.0.0.** The compat symlinks are removed
-there; a tenant reaching 2.0.0 with un-rerendered units will have adapter
-services pointing at paths that no longer exist.
+The original v2.0.0 deadline passed without alias removal. Current v2.0.4
+checkouts still provide both compatibility symlinks, but operators should
+re-render now and verify clean unit paths before any future release removes
+them. Do not build an upgrade procedure that depends on the aliases remaining.
 
-## Caveat: render-units footgun (fix scheduled v2.0.3)
+## Remaining WeeChat Caveat
 
-A per-tenant WeeChat health-glob gate / service-flap footgun exists
-around `render-units` (writeup: `docs/proposals/RENDER_UNITS_SMALL_BUG.md`;
-carried as a known issue since v1.1.4). The fix is scheduled for
-**v2.0.3** (`ROADMAP_2026.md`), so it will NOT land in 1.1.9: when doing
-the tenant-by-tenant `render-units` sweep, watch the weechat/adapter
-services for a flap after restart (`supervise-daemon` respawn limit is
-5 per 60s) and expect possible transient health-pipeline noise. See
-`TEST-PLAN-UPGRADED-TENANT-1.1.9.md` for the validated upgrade test flow.
+The health and service-lifecycle portions of the historical `render-units`
+footgun are fixed: `enable_weechat` now controls rendering, dependencies,
+startup, boot persistence, and skipped-health classification on systemd and
+OpenRC. The tmux duplicate-session start failure described in
+`docs/proposals/RENDER_UNITS_SMALL_BUG.md` remains open. After a restart, inspect
+`lunarwing-mt-admin.sh status <tenant>` and the WeeChat logs if the backend does
+not come up. See `TEST-PLAN-UPGRADED-TENANT-1.1.9.md` for the historical
+validated upgrade test flow.
 
 ## Single-tenant deployments
 
