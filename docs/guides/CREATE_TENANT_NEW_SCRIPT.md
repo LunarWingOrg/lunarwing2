@@ -43,7 +43,7 @@ Use the init-agnostic MT admin interface rather than calling tenant services dir
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh status acme
-sudo ic/scripts/lunarwing-mt-admin.sh doctor acme
+sudo ic/scripts/lunarwing-mt-admin.sh doctor
 ```
 
 On systemd hosts, tenant units run in the tenant user's user manager. On OpenRC hosts, MT admin uses the corresponding OpenRC services. Do not substitute bare system-bus `systemctl` checks.
