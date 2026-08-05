@@ -2,7 +2,7 @@
   "name": "xmpp",
   "display_name": "XMPP Channel",
   "kind": "channel",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "wit_version": "0.3.0",
   "description": "Talk to LunarWing over XMPP through the local xmpp-bridge service",
   "keywords": [
