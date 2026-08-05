@@ -1,315 +1,141 @@
-# DarkIRC Channel for LunarWing — Build & Maintenance Guide
+# DarkIRC Channel Build and Deployment Guide
 
-## Directory Layout
+LunarWing's DarkIRC integration has three components:
 
-```
-~/lunarwing/                          ← LunarWing repo (main binary)
-├── wit/
-│   └── channel.wit                  ← WASM channel interface definition
-├── src/
-│   └── tools/wasm/
-│       └── host.rs                  ← Patched: localhost HTTP allowed
-├── channels-src/
-│   └── darkirc/                     ← DarkIRC channel project
-│       ├── build.sh
-│       ├── Cargo.toml               ← [workspace] at end, wit-bindgen = "0.36"
-│       ├── darkirc.capabilities.json
-│       ├── src/
-│       │   └── lib.rs               ← WASM channel source
-│       └── adapter/
-│           ├── darkirc_adapter.py   ← IRC-to-HTTP bridge (Python, no deps)
-│           ├── darkirc-adapter.service
-│           └── Containerfile
-└── target/release/lunarwing          ← Main binary (rebuild only for lunarwing patches)
+1. a pinned DarkIRC daemon built from the approved DarkFi source revision;
+2. a per-tenant Python IRC/HTTP adapter;
+3. the `darkirc` WASM channel, which polls and emits through that adapter.
 
-~/.lunarwing/                         ← LunarWing runtime data
-├── .env                             ← Bootstrap config (DATABASE_BACKEND, LLM_*, etc.)
-├── lunarwing.db                      ← SQLite database (workspace, pairing, history)
-└── channels/
-    ├── darkirc.wasm                 ← Compiled WASM channel (copied after build)
-    └── darkirc.capabilities.json    ← Channel config (copied after changes)
-```
+Multi-tenant deployments use one daemon and adapter per tenant. Sharing a daemon would share DarkIRC key material and is not a supported isolation model.
 
-## What Lives Where
+## Source Layout
 
-| Thing | Location | When to touch |
-|-------|----------|---------------|
-| WASM channel source | `channels-src/darkirc/src/lib.rs` | Changing channel behavior |
-| Capabilities JSON | `channels-src/darkirc/darkirc.capabilities.json` | Changing permissions, polling, allowlist |
-| Adapter source | `channels-src/darkirc/adapter/darkirc_adapter.py` | Changing IRC behavior, message limits |
-| Installed WASM | `~/.lunarwing/channels/darkirc.wasm` | Never edit directly — copy from build |
-| Installed capabilities | `~/.lunarwing/channels/darkirc.capabilities.json` | Never edit directly — copy from source |
-| LunarWing localhost patch | `src/tools/wasm/host.rs` line ~265 | Only if lunarwing repo is reset/updated |
+From the repository root:
 
-## Build: WASM Channel Only (most common)
+- `darkirc_channel_for_lunarwing/darkirc/` — canonical WASM channel and adapter source;
+- `ic/channels-src/darkirc` — symlink used by the extension registry;
+- `ic/registry/channels/darkirc.json` — registry manifest;
+- `ic/scripts/lunarwing-mt-admin.sh` — daemon build, tenant provisioning, service lifecycle, ports, and contact exchange;
+- [`../../ops/DARKIRC-MULTITENANT.md`](../../ops/DARKIRC-MULTITENANT.md) — operator runbook for contact keys and tenant lifecycle;
+- [`DARKIRC_MT_ADAPTER.md`](DARKIRC_MT_ADAPTER.md) — adapter architecture and implementation notes.
 
-After editing `src/lib.rs`, `Cargo.toml`, or `darkirc.capabilities.json`:
+Do not patch `ic/src/tools/wasm/host.rs` to allow localhost HTTP. Current URL validation already permits loopback HTTP, and the channel capability explicitly allowlists `127.0.0.1` and `localhost`.
+
+## Build the WASM Channel
+
+Prefer the registry workflow from `ic/`:
 
 ```bash
-cd ~/lunarwing/channels-src/darkirc
-cargo build --target wasm32-wasip2 --release
-cp target/wasm32-wasip2/release/darkirc_channel.wasm ~/.lunarwing/channels/darkirc.wasm
-cp darkirc.capabilities.json ~/.lunarwing/channels/
+lunarwing registry info darkirc
+lunarwing registry install darkirc --build
 ```
 
-Then restart lunarwing. No need to rebuild the main binary.
-
-### Common build errors
-
-**"current package believes it's in a workspace"**
-```bash
-echo '[workspace]' >> Cargo.toml
-```
-
-**"can't find library darkirc_channel"**
-Make sure `Cargo.toml` and `src/lib.rs` are at the same level — not inside a `channel/` subdirectory.
-
-**wit_bindgen path errors**
-The path in `lib.rs` must resolve from `Cargo.toml` location to `~/lunarwing/wit/channel.wit`:
-```rust
-wit_bindgen::generate!({
-    world: "sandboxed-channel",
-    path: "../../wit/channel.wit",  // from channels-src/darkirc/ → wit/
-});
-```
-
-## Build: LunarWing Binary (rare)
-
-Only needed when patching LunarWing itself (e.g., the localhost HTTP fix in `host.rs`):
+For a repository-wide extension build:
 
 ```bash
-cd ~/lunarwing
-cargo build --release
+cd ic
+taskset -c 0-5 scripts/build-wasm-extensions.sh --channels
 ```
 
-This takes a while. The binary lands at `~/lunarwing/target/release/lunarwing`.
+The source crate produces `darkirc_channel.wasm`; the installer publishes it as `darkirc.wasm` with `darkirc.capabilities.json` in the configured channel directory. Do not edit installed copies and then expect the source registry to retain those changes.
 
-### The Localhost HTTP Patch
-
-LunarWing's WASM sandbox blocks plain HTTP. Our patch in `src/tools/wasm/host.rs` (~line 265) allows it for localhost:
-
-```rust
-let validator = AllowlistValidator::new(capability.allowlist.clone());
-// Allow plain HTTP for localhost/loopback endpoints
-let validator = if capability.allowlist.iter().any(|p| p.host == "127.0.0.1" || p.host == "localhost" || p.host == "::1") {
-    validator.allow_http()
-} else {
-    validator
-};
-```
-
-If you pull upstream changes to lunarwing, check if this patch survives. If `host.rs` was modified upstream, you may need to re-apply it.
-
-## Running
-
-### 1. Start the adapter
+For a manual source build during channel development:
 
 ```bash
-# Direct
-DARKIRC_NICK=kageho python3 ~/lunarwing/channels-src/darkirc/adapter/darkirc_adapter.py
-
-# Or via systemd user service
-cp ~/lunarwing/channels-src/darkirc/adapter/darkirc-adapter.service ~/.config/systemd/user/
-# Edit the service file: set DARKIRC_NICK, paths, etc.
-systemctl --user daemon-reload
-systemctl --user enable --now darkirc-adapter
+cd darkirc_channel_for_lunarwing/darkirc
+taskset -c 0-5 cargo build --release -j6 --target wasm32-wasip2
 ```
 
-The adapter connects to DarkIRC on `localhost:6667` and listens for HTTP on `localhost:6680`.
+Use the committed `build.sh` only after reviewing its install destination. It can install directly into `${LUNARWING_HOME:-$HOME/.lunarwing}/channels/`.
 
-### 2. Start LunarWing
+## Build the DarkIRC Daemon for MT
+
+MT admin builds a pinned, approved DarkFi revision as a dedicated unprivileged build user, validates the root-owned source checkout, uses a disposable build tree, and publishes the daemon and trusted contact-key helper transactionally:
 
 ```bash
-# Using the start script (loads env vars)
-~/lunarwing/start_lunarwing.sh
-
-# Or manually
-cd ~/lunarwing
-source ~/.lunarwing/.env
-source .lunarwing.env  # if you have extra vars here
-HTTP_PORT=9098 HTTP_WEBHOOK_SECRET="your-secret" ./target/release/lunarwing
+sudo ic/scripts/lunarwing-mt-admin.sh build-darkirc
 ```
 
-### 3. Verify
+Do not replace this with an arbitrary `cargo build` from a mutable clone. The approved revision and artifact validation are part of the deployment boundary.
 
-Check lunarwing startup logs for:
-```
-Added channel: darkirc
-```
+The build is resource-bounded by MT admin. Run long build/provision operations inside `tmux`.
 
-And polling activity:
-```
-Polling tick - calling on_poll channel=darkirc
-```
+## Provision an MT Tenant
 
-Test the adapter directly:
-```bash
-curl http://127.0.0.1:6680/health
-curl http://127.0.0.1:6680/poll
-```
-
-## Adapter Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DARKIRC_HOST` | `127.0.0.1` | DarkIRC IRC server |
-| `DARKIRC_PORT` | `6667` | DarkIRC IRC port |
-| `DARKIRC_NICK` | `kageho-bridge` | Bot nick on IRC |
-| `ADAPTER_HOST` | `127.0.0.1` | HTTP listen address |
-| `ADAPTER_PORT` | `6680` | HTTP listen port |
-| `ADAPTER_SECRET` | (empty) | Bearer token (optional) |
-| `ADAPTER_MAX_QUEUE` | `500` | Max fresh inbound messages before TCP backpressure |
-| `DARKIRC_MAX_MESSAGE_BYTES` | `400` | Max UTF-8 payload bytes per adapter chunk |
-| `DARKIRC_PRIVMSG_INTERVAL` | `7.0` | Minimum seconds between outbound chunks |
-| `ADAPTER_MAX_OUTBOX` | `400` | Max queued outbound chunks |
-| `ADAPTER_OUTBOX_JOURNAL` | (disabled) | Durable outbox path; production template sets a tenant-local file |
-| `ADAPTER_LOG_LEVEL` | `INFO` | Log verbosity |
-
-Inbound `/poll` responses contain at most 100 messages, matching host callback
-capacity. LunarWing acknowledges each batch on a later poll only after every
-message entered the host agent queue; failed dispatch leaves the batch unacked
-for retry.
-
-## Capabilities JSON Reference
-
-The file at `~/.lunarwing/channels/darkirc.capabilities.json` must match LunarWing's expected schema exactly. Known working version:
-
-```json
-{
-  "type": "channel",
-  "name": "darkirc",
-  "description": "DarkIRC P2P anonymous IRC channel via local HTTP adapter",
-  "setup": {
-    "required_secrets": []
-  },
-  "capabilities": {
-    "http": {
-      "allowlist": [
-        { "host": "127.0.0.1", "path_prefix": "/" },
-        { "host": "localhost", "path_prefix": "/" }
-      ],
-      "rate_limit": {
-        "requests_per_minute": 60,
-        "requests_per_hour": 3000
-      }
-    },
-    "secrets": {
-      "allowed_names": []
-    },
-    "channel": {
-      "allowed_paths": [],
-      "allow_polling": true,
-      "min_poll_interval_ms": 3000,
-      "workspace_prefix": "channels/darkirc/",
-      "emit_rate_limit": {
-        "messages_per_minute": 100,
-        "messages_per_hour": 5000
-      }
-    }
-  },
-  "config": {
-    "adapter_url": "http://127.0.0.1:6680",
-    "dm_policy": "pairing",
-    "allow_from": [],
-    "poll_interval_seconds": 3
-  }
-}
-```
-
-### Schema gotchas
-
-- `"http"` must be an object with `allowlist`, NOT a boolean
-- `"secrets"` must be `{"allowed_names": [...]}`, NOT a string array
-- `"channel"` must include `allow_polling`, `workspace_prefix`, `emit_rate_limit`
-- `"required_secrets"` must be `[]` (empty array) unless you actually use secrets
-- Do NOT include `"credentials"` unless you match the exact sub-schema (has a required `name` field)
-
-## Pairing
-
-DM policy in `config.dm_policy`:
-- `"open"` — anyone can message
-- `"allowlist"` — only nicks in `config.allow_from` array
-- `"pairing"` — unknown senders get a code, approve via CLI
+Enable DarkIRC when adding the tenant:
 
 ```bash
-# List pending pairing requests
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <tenant> \
+  --enable-darkirc
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <tenant> --with-wasm
+sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh doctor <tenant>
+```
+
+MT admin allocates `darkirc_irc`, `darkirc_rpc`, and `darkirc_adapter` ports from the registry, writes protected adapter/daemon configuration, and renders systemd-user or OpenRC services. Use MT admin for restart and status; do not probe tenant units through bare system-bus `systemctl`.
+
+The adapter secret and URL are injected through `DARKIRC_ADAPTER_SECRET` and `DARKIRC_ADAPTER_URL`. The WASM channel receives the secret as a host-injected bearer credential. Never write it into workspace memory, a prompt, or a public capability file.
+
+## Current Channel Capability
+
+The source of truth is `darkirc_channel_for_lunarwing/darkirc/darkirc.capabilities.json`. It currently declares:
+
+- optional `darkirc_adapter_secret`, sourced from `DARKIRC_ADAPTER_SECRET`;
+- `adapter_url`, sourced from `DARKIRC_ADAPTER_URL`;
+- loopback-only HTTP allowlist and credential host patterns;
+- channel-scoped workspace prefix `channels/darkirc/`;
+- polling enabled with a 3000 ms minimum interval;
+- default DM policy `pairing`.
+
+Do not copy an old JSON example over the current capability file. Schema and credential-location fields are versioned with the WIT/host interface.
+
+## Direct Messages and Contact Keys
+
+DarkIRC nick identity is RFC1459-case-folded and versioned, but it is not cryptographic identity; nick reuse can transfer conversational continuity. See [`../../architecture/IRC-SENDER-IDENTITY.md`](../../architecture/IRC-SENDER-IDENTITY.md).
+
+Channel DM policy supports `open`, `allowlist`, and `pairing`. Handle pairing through the normal pairing CLI:
+
+```bash
 lunarwing pairing list darkirc
-
-# Approve a user
-lunarwing pairing approve darkirc CODE123
-
-# Pre-approve nicks in capabilities JSON
-"allow_from": ["sun", "cmcsunmoon"]
+lunarwing pairing approve darkirc <code>
 ```
 
-Pairing approvals survive restarts (stored in database). They do NOT survive `lunarwing onboard` (which can wipe the database).
+DarkIRC encrypted-contact configuration is a separate operator workflow. Each contact has `dm_chacha_public` and `my_dm_chacha_secret` values in protected daemon configuration. Use the typed MT admin exchange commands rather than copying private keys manually:
 
-Pairing and conversation scope use an RFC1459 case-folded, versioned nick
-principal. This is not cryptographic identity, and nick reuse can transfer
-continuity. See
-[`IRC-SENDER-IDENTITY.md`](../../architecture/IRC-SENDER-IDENTITY.md) for the
-exact format and migration policy.
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact prepare <tenant> <contact>
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact respond <tenant> <contact>
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact complete <tenant> <contact>
+```
 
-## Message Splitting
+Follow [`../../ops/DARKIRC-MULTITENANT.md`](../../ops/DARKIRC-MULTITENANT.md) for the full artifact and fingerprint exchange. Independently verify the peer fingerprint; do not accept one received over the same untrusted path as the exchange artifact.
 
-Engine channel budget asks agents to keep DarkIRC replies within six 390-byte
-messages (2,340 UTF-8 bytes total). Oversized replies are truncated by the
-host's `BeforeOutbound` hook before delivery.
+## Message Limits
 
-WASM channel posts each response to adapter outbox; its 30,000-byte split is
-only an HTTP body safety valve. Adapter owns IRC chunking: it emits UTF-8-safe
-payloads of at most 400 bytes, adds `[i/N]` ordering markers, keeps complete
-IRC frames within 450 bytes, and paces sends at configured interval (default
-seven seconds). CR/LF and other IRC controls are normalized before framing.
+The host's channel budget asks the model to stay within six 390-byte DarkIRC messages. The adapter performs UTF-8-safe IRC chunking, ordering markers, framing limits, and paced outbound delivery. Its durable outbox location and limits are set by the tenant adapter environment.
+
+Changing only the WASM response split does not change IRC framing or delivery pacing. Review the adapter source and the host outbound hook together when modifying limits.
+
+## Verification
+
+For a tenant managed by MT admin:
+
+1. `status` and `doctor` report the daemon, adapter, and LunarWing healthy.
+2. The adapter `/health` endpoint reports an IRC connection on the tenant's registry port.
+3. Authenticated gateway status reports healthy DarkIRC channel state.
+4. A paired test nick can send and receive a direct message.
+5. An unpaired nick follows the configured policy.
+6. A contact-key exchange uses the expected independently verified fingerprint.
+7. Restarting the tenant preserves durable outbox and contact state without duplicate delivery.
+
+Redact adapter bearer tokens, contact private keys, service environment, and message content from evidence.
 
 ## Troubleshooting
 
-### "HTTP request not allowed: Denied(InsecureScheme)"
-The localhost HTTP patch in `host.rs` is missing. Re-apply it and rebuild lunarwing.
-
-### "Invalid capabilities JSON"
-Schema mismatch. Replace `~/.lunarwing/channels/darkirc.capabilities.json` with the known working version above.
-
-### "WASM on_respond call failed" (trap/panic)
-Usually a UTF-8 slicing issue in `split_message`. Make sure you're using the version with `is_char_boundary` checks.
-
-### Channel shows "installed=yes active=no"
-- Is the adapter running? (`curl http://127.0.0.1:6680/health`)
-- Check lunarwing startup logs for darkirc errors
-- Re-copy both `.wasm` and `.capabilities.json` to `~/.lunarwing/channels/`
-
-### Approval flow broken over DarkIRC
-Tool approval over IRC is flaky. Auto-approve is the pragmatic workaround:
-```bash
-lunarwing config set agent.auto_approve true
-```
-
-### Database wiped by onboard
-`lunarwing onboard` can destroy your database and `.env`. NEVER re-run it casually. Back up first:
-```bash
-cp ~/.lunarwing/lunarwing.db ~/.lunarwing/lunarwing.db.bak
-cp ~/.lunarwing/.env ~/.lunarwing/.env.bak
-```
-
-## Workspace Memory
-
-Stored in SQLite (`~/.lunarwing/lunarwing.db`), not filesystem.
-
-```bash
-# List workspace files
-lunarwing memory tree
-
-# Read a file
-lunarwing memory read SOUL.md
-
-# Write a file
-lunarwing memory write SOUL.md < ~/SOUL.md
-
-# Write inline
-lunarwing memory write config/gotify.md << 'EOF'
-Gotify endpoint: http://192.168.1.157:8080
-Gotify API token: your-token
-EOF
-```
-
-The agent cannot write to protected paths like `SOUL.md` directly (security policy). Use the CLI.
+- **Channel installed but inactive** — verify the adapter and daemon through MT admin, confirm the tenant's registry ports, then inspect tenant logs.
+- **`Denied(InsecureScheme)`** — confirm the URL is loopback HTTP and matches the installed capability allowlist. Do not patch global URL validation.
+- **Authentication failure** — verify MT admin preserved the adapter secret and that the installed capability maps it to a bearer credential; never print the value.
+- **Pairing or approval issue** — inspect pending thread/approval state and sender identity. Do not enable global auto-approve as a workaround.
+- **WASM trap** — rebuild from the current source and WIT, then inspect the exact host/guest error. Do not replace source with an old prebuilt artifact.
+- **Database concern** — use supported backup and migration tools. Running onboarding is not a substitute for database recovery.
