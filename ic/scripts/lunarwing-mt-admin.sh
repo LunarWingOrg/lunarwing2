@@ -425,6 +425,33 @@ tenant_worker_enabled() {
   [[ "$val" == "true" ]]
 }
 
+# OpenRC worker pause state. Existing enabled workers default to running when
+# this optional field is absent; stop-worker/kill-worker persist false and
+# start-worker restores true. Kept separate from .workers because selection and
+# operator-requested runtime state are different concerns.
+tenant_worker_desired_running() {
+  local name="$1" worker="$2" val
+  tenant_worker_enabled "$name" "$worker" || return 1
+  val="$(jq -r --arg name "$name" --arg worker "$worker" '
+    if .tenants[$name].worker_runtime[$worker].desired_running == false
+    then "false" else "true" end
+  ' "$PORTS_REGISTRY" 2>/dev/null || true)"
+  [[ "$val" == "true" ]]
+}
+
+# Cleanup may stop live services, so unknown registry state must fail safe. Only
+# an explicit unselected worker or desired_running=false authorizes OpenRC stop.
+tenant_worker_openrc_stop_requested() {
+  local name="$1" worker="$2" val
+  val="$(jq -r --arg name "$name" --arg worker "$worker" '
+    if .tenants[$name] == null then "unknown"
+    elif .tenants[$name].workers[$worker] != true then "stopped"
+    elif .tenants[$name].worker_runtime[$worker].desired_running == false then "stopped"
+    else "running" end
+  ' "$PORTS_REGISTRY" 2>/dev/null)" || return 1
+  [[ "$val" == "stopped" ]]
+}
+
 # Per-tenant PostgreSQL password. The source of truth is a 0600, tenant-owned
 # secret file, generated once (hex → URL-safe inside DATABASE_URL) and reused so
 # it stays STABLE across restarts/reconfigures — POSTGRES_PASSWORD only
@@ -1950,6 +1977,39 @@ ports_enable_worker() {
   mv "$tmp" "$PORTS_REGISTRY"
   [[ "$had_lock" == "true" ]] || release_ports_lock
   say "worker '$worker' for tenant '$name': disabled -> enabled" >&2
+}
+
+# Persist OpenRC worker runtime intent without changing worker selection.
+# Optional field: enabled workers without it retain historical auto-start.
+ports_set_worker_desired_running() {
+  local name="$1" worker="$2" desired="$3"
+  require_cmd jq
+  case "$worker" in
+    pebble|opencode|kimi) ;;
+    *) die "ports_set_worker_desired_running: unknown worker '$worker'" ;;
+  esac
+  case "$desired" in true|false) ;; *) die "worker desired_running must be true or false" ;; esac
+
+  acquire_ports_lock
+  if ! jq -e --arg name "$name" '.tenants[$name]' "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
+
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  if ! jq --arg name "$name" --arg worker "$worker" --argjson desired "$desired" '
+      .tenants[$name].worker_runtime = (.tenants[$name].worker_runtime // {})
+      | .tenants[$name].worker_runtime[$worker] =
+          ((.tenants[$name].worker_runtime[$worker] // {}) + {desired_running: $desired})
+    ' "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    release_ports_lock
+    die "failed to set desired state for worker '$worker' on tenant '$name'"
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  release_ports_lock
 }
 
 # Preserve the legacy registry field while making retirement explicit. This runs
@@ -8472,9 +8532,14 @@ start_tenant_openrc() {
   fi
   rc-service "xmpp-bridge-${name}" start
   rc-service "lunarwing-${name}" start
-  # Start worker babysitters (if workers are configured)
+  # Remove stale worker supervision for unselected or intentionally stopped
+  # workers. Selected running workers register/start their own units after the
+  # daemon is ready, preserving the SSH-agent socket ordering.
   for worker in pebble opencode kimi; do
-    rc-service "lunarwing-${worker}-${name}-sup" start 2>/dev/null || true
+    if tenant_worker_openrc_stop_requested "$name" "$worker"; then
+      openrc_worker_stop_disable "$name" "$worker" \
+        || die "failed to disable OpenRC worker $worker for tenant '$name'"
+    fi
   done
   say "OpenRC services started for $name"
 
@@ -8493,12 +8558,6 @@ start_tenant_openrc() {
   for svc in "${boot_svcs[@]}"; do
     if rc-service "$svc" status >/dev/null 2>&1; then
       rc-update add "$svc" default >/dev/null 2>&1 || true
-    fi
-  done
-  # Auto-enable worker babysitters
-  for worker in pebble opencode kimi; do
-    if rc-service "lunarwing-${worker}-${name}-sup" status >/dev/null 2>&1; then
-      rc-update add "lunarwing-${worker}-${name}-sup" default >/dev/null 2>&1 || true
     fi
   done
   say "enabled boot persistence (default runlevel) for $name's running services"
@@ -9148,9 +9207,11 @@ SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY
 # checks that are N/A host-globally; page only on self-heal escalation (not on
 # every non-healthy run); ignore stale reports.
 SELF_HEAL_REMEDY_LOGICAL=false
+SELF_HEAL_SYSTEMD_SCOPE=system
 HEALTH_XMPP_SERVER=
 HEALTH_MODELS_ENABLED=false
 HEALTH_OMEMO_ENABLED=false
+HEALTH_NETBIRD_ENABLED=false
 HEALTHCHECK_NOTIFY=false
 SELF_HEAL_MAX_REPORT_AGE=$(( HEALTH_INTERVAL_MIN * 60 * 4 ))
 
@@ -9159,6 +9220,11 @@ SELF_HEAL_MAX_REPORT_AGE=$(( HEALTH_INTERVAL_MIN * 60 * 4 ))
 # (single-node still falls back to http://127.0.0.1:8088). Only set the URL
 # if you intentionally force a single override target.
 # HEALTH_LUNARVISION_URL=
+
+# NetBird is operator-owned and disabled by default. To monitor readiness, set
+# HEALTH_NETBIRD_ENABLED=true. Automatic daemon restart also requires explicit
+# SELF_HEAL_NETBIRD_REMEDIATE=true; otherwise failures only escalate.
+# SELF_HEAL_NETBIRD_REMEDIATE=false
 
 # Escalation notifications (fill in to enable Gotify pushes).
 GOTIFY_URL=$HEALTH_GOTIFY_URL
@@ -9678,8 +9744,11 @@ start_tenant() {
   # (host-wide). See tenant_worker_enabled / PER_TENANT_WORKER_GATING.md.
   local _w
   for _w in pebble opencode kimi; do
-    if tenant_worker_enabled "$name" "$_w"; then
+    if tenant_worker_enabled "$name" "$_w" \
+        && { [[ "$INIT_SYSTEM" != "openrc" ]] || tenant_worker_desired_running "$name" "$_w"; }; then
       "start_tenant_${_w}" "$name"
+    elif [[ "$INIT_SYSTEM" == "openrc" ]] && tenant_worker_enabled "$name" "$_w"; then
+      say "$_w worker intentionally stopped for $name (skipping; use 'start-worker $name $_w')"
     else
       say "$_w worker not selected for $name (skipping; enable with 'add-tenant $name --with-$_w')"
     fi
@@ -9893,12 +9962,40 @@ prepare_worker_lifecycle() {
   printf '%s %s\n' "$name" "$worker"
 }
 
+openrc_service_remove_runlevels() {
+  local svc="$1" link runlevel
+  for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
+    [[ -e "$link" || -L "$link" ]] || continue
+    runlevel="$(basename "$(dirname "$link")")"
+    rc-update del "$svc" "$runlevel" >/dev/null 2>&1 \
+      || { say "failed to remove $svc from OpenRC runlevel $runlevel" >&2; return 1; }
+  done
+}
+
+# Stop both worker units and remove every boot path. Init scripts stay rendered
+# so an explicit start-worker can re-enable them without reprovisioning.
+openrc_worker_stop_disable() {
+  local name="$1" worker="$2" container svc
+  container="lunarwing-${worker}-${name}"
+  for svc in "${container}-sup" "$container"; do
+    if [[ -x "$OPENRC_INITD_DIR/$svc" ]]; then
+      rc-service "$svc" stop >/dev/null 2>&1 \
+        || { say "failed to stop OpenRC service $svc" >&2; return 1; }
+    fi
+    openrc_service_remove_runlevels "$svc" || return 1
+  done
+}
+
 start_worker() {
   local prepared name worker
   prepared="$(prepare_worker_lifecycle "$1" "$2")" || return
   read -r name worker <<<"$prepared"
   tenant_worker_enabled "$name" "$worker" \
     || die "worker '$worker' is not enabled for tenant '$name'"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    ports_set_worker_desired_running "$name" "$worker" true
+  fi
   "start_tenant_${worker}" "$name"
 }
 
@@ -9917,16 +10014,11 @@ stop_worker() {
       || _ctr "$name" stop "$container" >/dev/null 2>&1 \
       || die "failed to stop $service"
   elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-    if [[ -f "/etc/init.d/${container}-sup" ]]; then
-      rc-service "${container}-sup" stop >/dev/null 2>&1 \
-        || die "failed to stop OpenRC supervisor ${container}-sup"
-    else
-      rc-service "${container}-sup" stop >/dev/null 2>&1 || true
-    fi
-    if [[ -f "/etc/init.d/${container}" ]]; then
-      rc-service "$container" stop >/dev/null 2>&1 \
-        || die "failed to stop OpenRC service $container"
-    elif _ctr "$name" inspect "$container" &>/dev/null; then
+    ports_set_worker_desired_running "$name" "$worker" false
+    openrc_worker_stop_disable "$name" "$worker" \
+      || die "failed to stop and disable OpenRC worker $worker for tenant '$name'"
+    if [[ ! -x "$OPENRC_INITD_DIR/$container" ]] \
+        && _ctr "$name" inspect "$container" &>/dev/null; then
       _ctr "$name" stop "$container" >/dev/null 2>&1 \
         || die "failed to stop container $container"
     fi
@@ -9952,7 +10044,12 @@ kill_worker() {
       && podman_supports_quadlet; then
     _systemctl_user "$name" stop --no-block "$service" >/dev/null 2>&1 || true
   elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    ports_set_worker_desired_running "$name" "$worker" false
     rc-service "${container}-sup" stop >/dev/null 2>&1 || true
+    openrc_service_remove_runlevels "${container}-sup" \
+      || die "failed to disable OpenRC supervisor ${container}-sup"
+    openrc_service_remove_runlevels "$container" \
+      || die "failed to disable OpenRC service $container"
   fi
 
   if _ctr "$name" inspect "$container" &>/dev/null; then
@@ -9963,7 +10060,7 @@ kill_worker() {
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
     _systemctl_user "$name" stop "$service" >/dev/null 2>&1 || true
-  elif [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container}" ]]; then
+  elif [[ "$INIT_SYSTEM" == "openrc" && -x "$OPENRC_INITD_DIR/${container}" ]]; then
     rc-service "$container" stop >/dev/null 2>&1 || true
   fi
   say "$worker worker killed and left stopped for $name"

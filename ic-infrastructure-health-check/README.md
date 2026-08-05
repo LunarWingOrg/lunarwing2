@@ -1,9 +1,9 @@
 # LunarWing Infrastructure Health Check System
 
-_Last updated: 2026-06-24 — self-heal watchdog v2.0.0; LunarVision check added._
+_Last updated: 2026-08-03 — self-heal watchdog v2.1.0; NetBird readiness added._
 
 Automated health monitoring and self-healing for LunarWing infrastructure.
-Nine parallel component checks aggregate into a JSON report; a separate
+Ten parallel component checks aggregate into a JSON report; a separate
 watchdog reads that report and auto-remediates unhealthy services with a grace
 period, exponential backoff, a flapping guard, post-restart verification, and
 multi-tenant awareness.
@@ -21,6 +21,7 @@ cron-wrapper.sh
   │     ├── health-tensorzero.sh       (proxy p50/p95, error rate, queue, GPU)
   │     ├── health-models.sh           (LLM provider APIs)
   │     ├── health-lunarvision.sh      (OCR + VL sidecar: health, metrics, VL status)
+  │     ├── health-netbird.sh          (opt-in host tunnel readiness)
   │     └── health-{systemd,openrc,launchd}.sh  (service manager — one, auto-detected)
   │
   └── lunarwing-self-heal.sh           (reads report → restarts → verifies → escalates)
@@ -112,6 +113,7 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 | tensorzero | health-tensorzero.sh | Proxy latency/errors (from ClickHouse) + GPU | `p50_ms`, `p95_ms`, `error_rate`, `queue_depth`, `gpu_utilization` |
 | models | health-models.sh | OpenRouter / OpenAI / Anthropic / local LLM APIs | per-provider `status`, `latency_ms`, `last_error` |
 | lunarvision | health-lunarvision.sh | OCR + VL sidecar `/health` and `/vision/metrics` | `service_status`, `ocr_available`, `vl_available`, `capabilities`, `latency_ms`, cache `hit_rate`, `rate_limited`, `avg_latency_ms` |
+| netbird | health-netbird.sh | `netbird status --check startup` (opt-in) | `enabled`, `ready`, `probe_exit` |
 | systemd / openrc / launchd | health-{systemd,openrc,launchd}.sh | Service-manager unit state (incl. per-tenant) | `metrics.units` / `.services` / `.agents` |
 
 A check that cannot reach its target generally reports `critical`; several
@@ -150,6 +152,9 @@ checks can instead be **disabled** so they report `healthy` with
 | `HEALTH_LUNARVISION_REQUIRE_VL` | health-lunarvision.sh | `false` | Degrade if the VL backend is not confirmed available |
 | `HEALTH_LUNARVISION_LATENCY_DEGRADED_MS` | health-lunarvision.sh | `2000` | Health-endpoint latency threshold for `degraded` |
 | `HEALTH_LUNARVISION_LATENCY_CRITICAL_MS` | health-lunarvision.sh | `5000` | Health-endpoint latency threshold for `critical` |
+| `HEALTH_NETBIRD_ENABLED` | health-netbird.sh | `false` | Opt in to host NetBird readiness monitoring |
+| `HEALTH_NETBIRD_TIMEOUT` | health-netbird.sh | `5` | Readiness probe timeout (seconds) |
+| `NETBIRD_BINARY` | health-netbird.sh | `netbird` | NetBird CLI name or path |
 | `OPENROUTER_API_KEY` | health-models.sh | (empty) | OpenRouter key; unset → provider `unknown` (degraded) |
 | `OPENAI_API_KEY` | health-models.sh | (empty) | OpenAI key; unset → provider `unknown` (degraded) |
 | `ANTHROPIC_API_KEY` | health-models.sh | (empty) | Anthropic key; unset → provider `unknown` (degraded) |
@@ -176,6 +181,7 @@ HEALTH_XMPP_SERVER=''        # skip the XMPP reachability probe
 HEALTH_OMEMO_ENABLED=false   # skip the OMEMO store probe
 HEALTH_MODELS_ENABLED=false  # skip the LLM-provider probe
 HEALTH_LUNARVISION_ENABLED=false  # skip the OCR/VL sidecar probe
+HEALTH_NETBIRD_ENABLED=false      # default; opt in only on NetBird hosts
 HEALTHCHECK_NOTIFY=false     # don't page on every per-run degrade (let self-heal escalations page instead)
 ```
 
@@ -217,7 +223,7 @@ Report shape:
 
 ## Self-Healing
 
-`lunarwing-self-heal.sh` (v2.0.0) reads the latest health report and:
+`lunarwing-self-heal.sh` (v2.1.0) reads the latest health report and:
 
 1. **Maps** unhealthy logical components to base service names
    (`gateway → lunarwing`, …) and discovers per-tenant init sub-units from the
@@ -233,7 +239,9 @@ Report shape:
 5. **Flapping guard** — a service restarted too many times inside the window is
    escalated, not looped.
 6. **Escalates** via Gotify (bounded by a timeout) after max retries or on
-   flapping.
+   flapping. Confirmed pages use a collision-resistant per-service cooldown;
+   failed, disabled, or cooldown-deferred delivery remains pending and retries
+   on later ticks.
 7. **Tracks state** in `$LUNARWING_BASE_DIR/workspace/reports/self-heal/state.json`,
    clears any service the latest report calls healthy ("report as truth"), and
    auto-prunes stale, non-escalated entries.
@@ -250,13 +258,16 @@ wedge it.
 | xmpp | `xmpp-bridge` | health-xmpp.sh |
 | tensorzero | `tensorzero-gateway` | health-tensorzero.sh |
 | clickhouse | `clickhouse-server` | health-clickhouse.sh |
+| lunarvision | `ocr-sidecar` | health-lunarvision.sh |
+| netbird | `netbird` (monitor-only unless explicitly delegated) | health-netbird.sh |
 | omemo, ratelimit, models | _(none — feature/external, never remediated)_ | — |
 
-On systemd the base names get a `.service` suffix; per-tenant sub-units
-discovered from the service report are remediated as the tenant user.
+Logical mappings use configured base names. Init sub-units retain names reported
+by service-manager checks (including `.service`); per-tenant systemd units are
+remediated as tenant user.
 
 ```bash
-# Test without restarting anything
+# Test without restarting anything or changing state.json
 ./lunarwing-self-heal.sh --dry-run
 
 # Tuning via flags
@@ -288,13 +299,17 @@ is not valid JSON).
 | `--prune-ttl S` | `SELF_HEAL_STATE_PRUNE_TTL` | 86400 | Prune non-escalated entries older than this; `0` (or `false`/`no`/`off`) disables |
 | `--verify-health B` | `SELF_HEAL_VERIFY_HEALTH` | true | Re-run the component health check after a restart (`false` → `is-active` only) |
 | `--report PATH` | — | latest | Act on a specific report instead of the newest in the report dir |
-| `--dry-run` / `-n` | — | off | Log intended actions; never restart, notify, or write escalations |
+| `--dry-run` / `-n` | — | off | Log intended actions; never restart, notify, quarantine corrupt state, or persist state changes |
 | — | `SELF_HEAL_FLAP_MAX_RESTARTS` | 5 | Restarts within the window that mark a service flapping |
 | — | `SELF_HEAL_FLAP_WINDOW_SECS` | 3600 | Flapping detection window (seconds) |
 | — | `SELF_HEAL_HISTORY_MAX` | 20 | Cap on `restart_history[]` length (must be ≥ flap-max) |
 | — | `SELF_HEAL_ESCALATE_TIMEOUT` | 30 | Timeout (s) around the notifier so a hung Gotify can't stall a tick |
+| — | `SELF_HEAL_ESCALATE_COOLDOWN` | 3600 | Per-service cooldown after confirmed page delivery; `0`/`false` disables |
+| — | `SELF_HEAL_NOTIFY_SCRIPT` | bundled Gotify notifier | Executable custom notifier; exit 0 confirms delivery |
 | — | `SELF_HEAL_MAX_REPORT_AGE` | 0 | Refuse to act on a report older than this many seconds; `0` disables |
 | — | `SELF_HEAL_REMEDY_LOGICAL` | true | `false` → remediate **only** discovered init sub-units, not logical base services (MT hosts) |
+| — | `SELF_HEAL_SYSTEMD_SCOPE` | system | Bus for non-tenant LunarWing base services: `system` or `user`; host NetBird daemon stays on system bus |
+| — | `SELF_HEAL_NETBIRD_REMEDIATE` | false | Allow NetBird daemon restart; otherwise NetBird failure is escalation-only |
 | — | `SELF_HEAL_STATE_DIR` | `<reports>/../self-heal` | State + lock + escalation directory |
 | — | `SELF_HEAL_LOG` | `<state-dir>/actions.log` | Action log path |
 | — | `SELF_HEAL_HEALTH_CHECK_DIR` | script dir | Where the `health-*.sh` verify scripts live |
@@ -306,7 +321,8 @@ path is preferred because on some platforms — e.g. Umbrel — `/etc/` is not
 persistent across app updates.)
 
 The self-heal state directory holds `state.json`, `actions.log`,
-`self-heal.lock`, transient `escalation-*.json`, and (on corruption) a single
+`self-heal.lock`, per-service `.last_escalation_page.*` cooldown sidecars,
+transient `escalation-*.json.*`, and (on corruption) a single
 `state.json.corrupt` forensic copy.
 
 > **Backoff is a cross-tick gate**, not an in-run sleep: a failed service's
@@ -327,8 +343,8 @@ The self-heal state directory holds `state.json`, `actions.log`,
 
 ### systemd (recommended for Linux)
 
-Run `cron-wrapper.sh` on a user-level timer (adjust the path to where this
-directory lives):
+Run `cron-wrapper.sh` on a user-level timer (adjust path). Explicitly select
+user bus so base-service remediation targets units owned by timer user:
 
 ```bash
 DIR="$(pwd)"   # run from inside ic-infrastructure-health-check/
@@ -339,6 +355,7 @@ cat > ~/.config/systemd/user/lunarwing-health-check.service <<EOF
 Description=LunarWing infrastructure health check
 [Service]
 Type=oneshot
+Environment=SELF_HEAL_SYSTEMD_SCOPE=user
 ExecStart=$DIR/cron-wrapper.sh
 EOF
 
@@ -367,7 +384,7 @@ systemctl --user list-timers lunarwing-health-check.timer
 
 ```bash
 # Run every 30 minutes
-*/30 * * * * /path/to/ic-infrastructure-health-check/cron-wrapper.sh
+*/30 * * * * SELF_HEAL_SYSTEMD_SCOPE=user /path/to/ic-infrastructure-health-check/cron-wrapper.sh
 ```
 
 ### launchd (macOS)
@@ -392,32 +409,36 @@ The self-heal watchdog and the OpenRC probe have a test suite under `tests/`
 
 ```bash
 cd ic-infrastructure-health-check
-bash tests/run-all.sh                       # all suites: regression → matrix → chaos → openrc
+bash tests/run-all.sh                       # all registered suites
 bash tests/run-all.sh matrix chaos          # pick a subset
 bash tests/run-all.sh --list                # print suite names for CI introspection
-bash tests/test-self-heal-matrix.sh         # dry-run unit matrix (sections A–O)
-bash tests/chaos-harness.sh                 # end-to-end fault-injection (11 scenarios: CH1–CH6, CH9–CH13)
-bash tests/test-health-openrc.sh            # health-openrc.sh probe scenarios (S1–S6)
+bash tests/test-self-heal-matrix.sh         # synthetic report matrix (sections A–O)
+bash tests/chaos-harness.sh                 # end-to-end fault-injection (13 scenarios: CH1–CH6, CH9–CH15)
+bash tests/test-health-openrc.sh            # health-openrc.sh probe scenarios (S1–S13)
+bash tests/test-health-netbird.sh           # opt-in readiness probe scenarios
 ```
 
 | Suite | Script | What it does |
 |-------|--------|--------------|
 | `regression` | `test-self-heal.sh` | Original regression checks (jq precedence, backoff, grace, flapping, …). |
-| `matrix` | `test-self-heal-matrix.sh` | The full A–O matrix in `--dry-run` against synthetic reports (~120 assertions). |
+| `matrix` | `test-self-heal-matrix.sh` | Full A–O synthetic-report matrix: dry-run routing plus live state transitions against mock init (149 assertions). |
 | `chaos` | `chaos-harness.sh` | Drives the **real** self-heal loop (kill → restart → verify → recover/escalate) against a mock init system. |
 | `openrc` | `test-health-openrc.sh` | Exercises `health-openrc.sh` (discovery dedup, real exit-code capture, per-unit timeout, missing/stopped units). |
-| `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 68 assertions: reachability, HTTP codes, JSON parsing, VL availability logic, metrics integration, cache/rate-limit stats, capabilities inference, disabled mode). |
+| `systemd` | `test-health-systemd.sh` | Exercises tenant user-bus discovery, failure bias, and container health including LunarVision. |
+| `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 81 assertions: reachability, HTTP codes, JSON parsing, VL availability logic, metrics integration, cache/rate-limit stats, capabilities inference, disabled mode). |
+| `netbird` | `test-health-netbird.sh` | Exercises disabled, ready, unready, missing-binary, and timeout behavior against mock CLI. |
 | — | `lib.sh` | Shared harness + the mock init system (sourced, not run directly). |
 
 `run-all.sh` runs each suite in its own process, tallies per-suite
 `N passed, M failed`, and exits non-zero if any suite fails.
 
-**Safety.** The matrix is dry-run only and never triggers a real restart or the
-real HTTP/component probes. The chaos and OpenRC harnesses run for real but
-against a *mock* `systemctl`/`rc-service`/`sudo` shadowed onto `PATH`, so a
+**Safety.** Matrix routing cases use dry-run; state-transition cases and chaos
+run live only against a *mock* `systemctl`/`rc-service`/`sudo` shadowed onto
+`PATH`, so a
 "restart" flips a sandbox file — no live unit is touched — and escalation runs
-`send-notification.sh` with an empty `GOTIFY_TOKEN` so it never hits the
-network. Prefer a dedicated test box over a live multi-tenant host regardless.
+a sandbox notifier, so it never hits the network. OpenRC and service-manager
+probe suites use their own mocks. Prefer a dedicated test box over a live
+multi-tenant host regardless.
 
 The pure-function harness (`src_fn` in `lib.sh`) sources everything up to the
 `# HARNESS_ENTRY_POINT` sentinel in `lunarwing-self-heal.sh` to unit-test

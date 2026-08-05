@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Shared test harness for the LunarWing self-heal chaos suite.
 #
-# Sourced by test-self-heal-matrix.sh (dry-run unit matrix) and
-# chaos-harness.sh (end-to-end, non-dry-run against a mock init system).
+# Sourced by self-heal regression/matrix tests and chaos-harness.sh.
 # Provides:
 #   - assertion helpers + pass/fail counters
 #   - a per-suite sandbox ($ROOT, auto-cleaned) and sandbox builder `sb`
@@ -77,7 +76,7 @@ mk_check() {
     printf '%s' "$dir"
 }
 
-# ── Drivers (dry-run unit matrix) ────────────────────────────────────────────
+# ── Drivers ──────────────────────────────────────────────────────────────────
 
 # run_dry <sb> [ENV=VAL ...] [-- <script args>]
 #   Always --dry-run, auto-targets <sb>/report.json, settle backoff 0 (fast).
@@ -262,6 +261,11 @@ else printf '{"status":"critical"}\n'; fi
 EOF
     done
 
+    cat > "$bin/notifier" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
     chmod +x "$bin"/*
 }
 
@@ -286,7 +290,6 @@ run_chaos() {
     env PATH="$sb/bin:$PATH" SVC_STATE_DIR="$sb/svcstate" \
         LUNARWING_BASE_DIR="$sb" SELF_HEAL_STATE_DIR="$sb/self-heal" \
         LUNARWING_SERVICE_MANAGER="$mgr" SELF_HEAL_HEALTH_CHECK_DIR="$sb/bin" \
-        GOTIFY_TOKEN='' "${envs[@]}" \
+        SELF_HEAL_NOTIFY_SCRIPT="$sb/bin/notifier" GOTIFY_TOKEN='' "${envs[@]}" \
         "$SH" --report "$sb/report.json" --backoff 0 "${args[@]}" 2>&1
 }
-

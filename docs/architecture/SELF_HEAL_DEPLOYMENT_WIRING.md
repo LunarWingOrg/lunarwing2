@@ -1,6 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Date:** 2026-06-13 (revalidated 2026-07-20)
+**Date:** 2026-06-13 (revalidated 2026-08-05)
 **Status:** Reference (as-is) — documents current behavior, not a proposal
 **Related:** `ic-infrastructure-health-check/README.md`, `docs/ops/MULTITENANCY-PRODUCTION.md`, `docs/internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md`
 
@@ -53,6 +53,10 @@ cron-wrapper.sh
 Health-check failures don't abort the run — `cron-wrapper.sh` always proceeds to
 self-heal so a partial report can still drive remediation.
 
+NetBird readiness is opt-in (`HEALTH_NETBIRD_ENABLED=true`) because enrollment
+and daemon lifecycle are operator-owned. Failure escalates without daemon
+restart unless operator also sets `SELF_HEAL_NETBIRD_REMEDIATE=true`.
+
 ## How it actually gets onto a host
 
 There are two installation paths:
@@ -67,7 +71,8 @@ of tenant provisioning (unless `--no-health` is passed). This function:
 2. Creates the host-level report/state dir.
 3. Writes a config env file (`/etc/lunarwing/health.env`, mode 0600) if absent —
    includes `LUNARWING_BASE_DIR`, `LUNARWING_SERVICE_MANAGER`, tenant registry
-   path, and MT-hardening flags. If the file already exists, only the
+   path, `SELF_HEAL_SYSTEMD_SCOPE=system`, disabled-by-default NetBird probing,
+   and MT-hardening flags. If the file already exists, only the
    `LUNARWING_SERVICE_MANAGER` and `SELF_HEAL_TENANTS_FILE` lines are
    reconciled (preserving operator edits).
 4. Writes a launcher script that sources the env file and execs `cron-wrapper.sh`.
@@ -139,6 +144,12 @@ installed per tenant:
 - **Remediation:** `lunarwing-self-heal.sh` maps each unhealthy unit back to its
   owning tenant via the registry and restarts it on that user's bus
   (`sudo -u <user> systemctl --user restart …`) or via `rc-service` on OpenRC.
+
+Non-tenant base units use `SELF_HEAL_SYSTEMD_SCOPE`: host-global MT installs use
+`system`; manually scheduled single-node user timers must set `user`. Tenant
+units ignore this setting and always route through registry owner user bus.
+Both base-unit health probes and remediation honor the selected scope.
+Host-global NetBird daemon always uses system bus when restart is delegated.
 
 ## Net effect on a fresh MT host
 
