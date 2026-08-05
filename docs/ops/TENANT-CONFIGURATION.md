@@ -453,7 +453,9 @@ Each tenant gets a 10-port primary block from `/etc/lunarwing/ports.json`
 (range 10000-19999), a mirrored 10-port extended block in 20000-29999
 (`extended_base = base_port + 10000`), and a two-port Kimi block in
 30000-39999 (`kimi_base = base_port + 20000`). The current registry schema is
-v13.
+v14. Schema v14 also gives every DarkIRC-enabled tenant a unique, stable,
+non-secret `darkirc_scope_id`; mt-admin creates or migrates that identity and
+rejects invalid or duplicate values.
 
 Primary block:
 
