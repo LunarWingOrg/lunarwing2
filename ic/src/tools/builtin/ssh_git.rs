@@ -264,6 +264,12 @@ impl Tool for SshGitTool {
         ApprovalRequirement::Always
     }
 
+    fn allows_autonomous_execution(&self) -> bool {
+        // Remote git operations are excluded from autonomous jobs/routines,
+        // same as the built-in ssh tool.
+        false
+    }
+
     fn requires_sanitization(&self) -> bool {
         // Remote git output (branch names, commit messages, server stderr) is untrusted.
         true

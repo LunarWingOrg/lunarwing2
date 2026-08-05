@@ -8,6 +8,12 @@ source "$MT_ADMIN"
 
 failures=0
 CALLS=()
+fixture="$(mktemp -d)"
+trap 'command rm -rf "$fixture"' EXIT
+OPENRC_INITD_DIR="$fixture/init.d"
+OPENRC_CONFD_DIR="$fixture/conf.d"
+OPENRC_RUNLEVELS_DIR="$fixture/runlevels"
+mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR" "$OPENRC_RUNLEVELS_DIR/default"
 
 fail() {
   printf 'FAIL: %s\n' "$1"
@@ -58,6 +64,8 @@ podman_supports_quadlet() { return 0; }
 say() { :; }
 _systemctl_user() { CALLS+=("systemctl:$*"); }
 rc-service() { CALLS+=("rc:$*"); }
+rc-update() { CALLS+=("rc-update:$*"); }
+ports_set_worker_desired_running() { CALLS+=("desired:$*"); }
 _ctr() {
   CALLS+=("ctr:$*")
   return 0
@@ -85,32 +93,92 @@ assert_before \
 # Override consumed by sourced stop_tenant dispatcher.
 # shellcheck disable=SC2034
 INIT_SYSTEM="openrc"
+for worker in opencode kimi; do
+  touch "$OPENRC_INITD_DIR/lunarwing-${worker}-alice" \
+    "$OPENRC_INITD_DIR/lunarwing-${worker}-alice-sup"
+  chmod +x "$OPENRC_INITD_DIR/lunarwing-${worker}-alice" \
+    "$OPENRC_INITD_DIR/lunarwing-${worker}-alice-sup"
+  touch "$OPENRC_RUNLEVELS_DIR/default/lunarwing-${worker}-alice" \
+    "$OPENRC_RUNLEVELS_DIR/default/lunarwing-${worker}-alice-sup"
+done
 CALLS=()
 stop_worker alice opencode
+assert_call "desired:alice opencode false"
 assert_call "rc:lunarwing-opencode-alice-sup stop"
-assert_call "ctr:alice stop lunarwing-opencode-alice"
-assert_before "rc:lunarwing-opencode-alice-sup stop" "ctr:alice stop lunarwing-opencode-alice"
+assert_call "rc:lunarwing-opencode-alice stop"
+assert_call "rc-update:del lunarwing-opencode-alice-sup default"
+assert_call "rc-update:del lunarwing-opencode-alice default"
+assert_before "desired:alice opencode false" "rc:lunarwing-opencode-alice-sup stop"
+assert_before "rc:lunarwing-opencode-alice-sup stop" "rc:lunarwing-opencode-alice stop"
 
 CALLS=()
 kill_worker alice opencode
+assert_call "desired:alice opencode false"
 assert_call "rc:lunarwing-opencode-alice-sup stop"
+assert_call "rc-update:del lunarwing-opencode-alice-sup default"
+assert_call "rc-update:del lunarwing-opencode-alice default"
 assert_call "ctr:alice stop --time 0 lunarwing-opencode-alice"
+assert_call "rc:lunarwing-opencode-alice stop"
 assert_before \
   "rc:lunarwing-opencode-alice-sup stop" \
   "ctr:alice stop --time 0 lunarwing-opencode-alice"
 
 CALLS=()
 start_worker alice opencode
+assert_call "desired:alice opencode true"
 assert_call "start-opencode:alice"
+assert_before "desired:alice opencode true" "start-opencode:alice"
 
 CALLS=()
 start_worker alice kimi
+assert_call "desired:alice kimi true"
 assert_call "start-kimi:alice"
 
 CALLS=()
 stop_worker alice kimi
+assert_call "desired:alice kimi false"
 assert_call "rc:lunarwing-kimi-alice-sup stop"
-assert_call "ctr:alice stop lunarwing-kimi-alice"
+assert_call "rc:lunarwing-kimi-alice stop"
+
+# Destructive reconciliation requires explicit registry evidence. Unknown or
+# malformed state must not authorize stopping a live worker.
+PORTS_REGISTRY="$fixture/ports.json"
+jq -n '{tenants:{alice:{workers:{pebble:true,opencode:true,kimi:false},worker_runtime:{opencode:{desired_running:false}}}}}' >"$PORTS_REGISTRY"
+if tenant_worker_openrc_stop_requested alice opencode; then
+  printf 'PASS: explicit desired-running false authorizes cleanup\n'
+else
+  fail "explicit desired-running false did not authorize cleanup"
+fi
+if tenant_worker_openrc_stop_requested alice kimi; then
+  printf 'PASS: explicit unselected worker authorizes cleanup\n'
+else
+  fail "explicit unselected worker did not authorize cleanup"
+fi
+if tenant_worker_openrc_stop_requested alice pebble; then
+  fail "selected worker with absent intent authorized cleanup"
+else
+  printf 'PASS: selected worker with absent intent remains running\n'
+fi
+printf '{malformed' >"$PORTS_REGISTRY"
+if tenant_worker_openrc_stop_requested alice opencode; then
+  fail "malformed registry authorized destructive cleanup"
+else
+  printf 'PASS: malformed registry fails safe\n'
+fi
+
+# start-tenant must clean stale supervisors instead of starting workers whose
+# selection or desired-running state says they should stay down.
+tenant_worker_openrc_stop_requested() { [[ "$2" != "pebble" ]]; }
+openrc_worker_stop_disable() { CALLS+=("reconcile-stop:$*"); }
+tenant_weechat_enabled() { return 1; }
+tenant_darkirc_enabled() { return 1; }
+tenant_proxy_enabled() { return 1; }
+CALLS=()
+start_tenant_openrc alice
+assert_call "reconcile-stop:alice opencode"
+assert_call "reconcile-stop:alice kimi"
+assert_no_call "rc:lunarwing-opencode-alice-sup start"
+assert_no_call "rc:lunarwing-kimi-alice-sup start"
 
 INIT_SYSTEM="systemd"
 MT_ROOTLESS="false"
@@ -138,8 +206,6 @@ fi
 
 # ── Legacy Nanocode lifecycle ────────────────────────────────────────────────
 
-fixture="$(mktemp -d)"
-trap 'command rm -rf "$fixture"' EXIT
 tenant_home() { printf '%s/home/%s' "$fixture" "$1"; }
 tenant_quadlet_dir() { printf '%s/quadlets' "$fixture"; }
 id() {
@@ -183,10 +249,6 @@ CALLS=()
 _stop_nanocode_supervision alice
 assert_call "systemctl:alice stop lunarwing-nanocode-alice.service"
 
-OPENRC_INITD_DIR="$fixture/init.d"
-OPENRC_CONFD_DIR="$fixture/conf.d"
-OPENRC_RUNLEVELS_DIR="$fixture/runlevels"
-mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR" "$OPENRC_RUNLEVELS_DIR/default"
 touch "$OPENRC_INITD_DIR/lunarwing-nanocode-alice" \
   "$OPENRC_INITD_DIR/lunarwing-nanocode-alice-sup"
 INIT_SYSTEM="openrc"

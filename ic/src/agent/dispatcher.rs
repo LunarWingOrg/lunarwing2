@@ -680,47 +680,36 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
 
             // Check if tool requires approval
             if let Some(tool) = tool_opt {
-                use crate::tools::ApprovalRequirement;
                 let requirement = tool.requires_approval(&tc.arguments);
-                let session_auto_approved = match requirement {
-                    ApprovalRequirement::UnlessAutoApproved
-                        if !self.agent.config.auto_approve_tools =>
-                    {
-                        let sess = self.session.lock().await;
-                        sess.is_tool_auto_approved(&tc.name)
-                    }
-                    _ => false,
+                if requirement.is_required() && self.message.is_shared_conversation() {
+                    tracing::info!(
+                        tool = %tc.name,
+                        channel = %self.message.channel,
+                        "Auto-denying approval-requiring tool in shared channel"
+                    );
+                    let reject_msg = format!(
+                        "Tool '{}' requires approval and cannot run in shared channels. \
+                         Ask the user to message me directly (DM) to use this tool.",
+                        tc.name
+                    );
+                    preflight.push((tc, PreflightOutcome::Rejected(reject_msg)));
+                    continue;
+                }
+                let allow_always = tool.allows_always_approval(&tc.arguments);
+                let session_auto_approved = if allow_always {
+                    self.agent
+                        .has_tool_always_grant(&self.session, &tc.name)
+                        .await
+                } else {
+                    false
                 };
-                let needs_approval = requirement
-                    .needs_prompt(self.agent.config.auto_approve_tools, session_auto_approved);
+                let needs_approval = requirement.needs_prompt_with_user_grant(
+                    self.agent.config.auto_approve_tools,
+                    session_auto_approved,
+                    allow_always,
+                );
 
                 if needs_approval {
-                    // In non-DM relay channels, auto-deny approval-
-                    // requiring tools to prevent stuck AwaitingApproval
-                    // state and prompt injection from other users.
-                    let is_relay = self.message.channel.ends_with("-relay");
-                    let is_dm = self
-                        .message
-                        .metadata
-                        .get("event_type")
-                        .and_then(|v| v.as_str())
-                        == Some("direct_message");
-                    if is_relay && !is_dm {
-                        tracing::info!(
-                            tool = %tc.name,
-                            channel = %self.message.channel,
-                            "Auto-denying approval-requiring tool in non-DM relay channel"
-                        );
-                        let reject_msg = format!(
-                            "Tool '{}' requires approval and cannot run in shared channels. \
-                             Ask the user to message me directly (DM) to use this tool.",
-                            tc.name
-                        );
-                        preflight.push((tc, PreflightOutcome::Rejected(reject_msg)));
-                        continue;
-                    }
-
-                    let allow_always = !matches!(requirement, ApprovalRequirement::Always);
                     approval_needed = Some((idx, tc, tool, allow_always));
                     break;
                 }
@@ -1573,15 +1562,13 @@ mod tests {
         assert!(always_needs, "Always must always require approval");
     }
 
-    /// Regression test: `allow_always` must be `false` for `Always` and
-    /// `true` for `UnlessAutoApproved`, so the UI hides the "always" button
-    /// for tools that truly cannot be auto-approved.
+    /// Baseline policy: `Always` hides the button unless a concrete tool
+    /// overrides `Tool::allows_always_approval` (built-in SSH does).
     #[test]
-    fn test_allow_always_matches_approval_requirement() {
+    fn test_default_allow_always_matches_approval_requirement() {
         use crate::tools::ApprovalRequirement;
 
-        // Mirrors the expression used in dispatcher.rs and thread_ops.rs:
-        //   let allow_always = !matches!(requirement, ApprovalRequirement::Always);
+        // Mirrors the Tool trait's default policy.
 
         // UnlessAutoApproved → allow_always = true
         let req = ApprovalRequirement::UnlessAutoApproved;
@@ -2675,18 +2662,16 @@ mod tests {
         // Case 1: relay channel + non-DM → should auto-deny
         let msg = IncomingMessage::new("xmpp-relay", "u1", "hello")
             .with_metadata(serde_json::json!({ "event_type": "message" }));
-        let is_relay = msg.channel.ends_with("-relay");
-        let is_dm =
-            msg.metadata.get("event_type").and_then(|v| v.as_str()) == Some("direct_message");
-        assert!(is_relay && !is_dm, "Should auto-deny in relay non-DM");
+        assert!(
+            msg.is_shared_conversation(),
+            "Should auto-deny in relay non-DM"
+        );
 
         // Case 2: relay channel + DM → should NOT auto-deny
         let msg_dm = IncomingMessage::new("xmpp-relay", "u1", "hello")
             .with_metadata(serde_json::json!({ "event_type": "direct_message" }));
-        let is_dm_2 =
-            msg_dm.metadata.get("event_type").and_then(|v| v.as_str()) == Some("direct_message");
         assert!(
-            !msg_dm.channel.ends_with("-relay") || is_dm_2,
+            !msg_dm.is_shared_conversation(),
             "Should NOT auto-deny in relay DM"
         );
 
@@ -2694,8 +2679,15 @@ mod tests {
         let msg_web = IncomingMessage::new("web", "u1", "hello")
             .with_metadata(serde_json::json!({ "event_type": "message" }));
         assert!(
-            !msg_web.channel.ends_with("-relay"),
+            !msg_web.is_shared_conversation(),
             "Non-relay channel should not trigger auto-deny"
+        );
+
+        let xmpp_room = IncomingMessage::new("xmpp", "room@example", "hello")
+            .with_metadata(serde_json::json!({ "xmpp_type": "groupchat" }));
+        assert!(
+            xmpp_room.is_shared_conversation(),
+            "XMPP rooms must auto-deny"
         );
     }
 

@@ -1,6 +1,6 @@
 # SSH Delivery Mechanisms
 
-**Status:** As-built (all three mechanisms shipped). Revalidated against source 2026-07-20.
+**Status:** As-built (all three mechanisms shipped). Revalidated against source 2026-08-05.
 **Core design:** [`SSH_AGENT_HARNESS.md`](SSH_AGENT_HARNESS.md) — the per-tenant bridge, agent socket, secrets, and host-key verifier that all three mechanisms share.
 **Operator setup:** [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 
@@ -30,7 +30,7 @@ and how to enable it.
 | Latency | High (container spin-up) | Low | Low |
 | Filesystem writes | worker's own FS | `ssh_git` only, confined to `<base_dir>/ssh-git/` | none (one-shot exec) |
 | Host-key verification | worker's own `known_hosts` | **`HostKeyVerifier`** (live) | `HostKeyVerifier` (live, host-side) |
-| Approval | per the job/tool policy | **Always** | **Always** |
+| Approval | per the job/tool policy | `ssh`: prompt with explicit **Always** option; `ssh_git`: every call | **Every call** |
 | Key algorithms | anything the worker's ssh supports | **Ed25519 / ECDSA** (RSA rejected) | Ed25519 / ECDSA |
 | Enable | `mt-admin` bind-mounts the socket | on when `[[ssh.hosts]]` + secrets store exist | build the guest wasm + grant the `ssh` capability |
 | Best for | heavy/long jobs, strong isolation | quick remote command / git ops, no container | capability-scoped per-tool host allowlist; WASM extensibility |
@@ -77,9 +77,10 @@ description that runs the git/ssh commands. See the worker docs
 ## Mechanism 2 — Built-in Rust tools (Option 2)
 
 Two agent-visible built-in tools that run **in the gateway process** — no
-container, low latency. Both take a configured `host` alias, both are
-`requires_approval = Always`, both mark their output for sanitization, and both
-are the **first live consumers of the harness `HostKeyVerifier`**.
+container, low latency. Both take a configured `host` alias, both retain
+`requires_approval = Always`, both mark output for sanitization, and both are
+the **first live consumers of the harness `HostKeyVerifier`**. Built-in `ssh`
+explicitly permits user-selected **Always**; `ssh_git` remains per-call.
 
 Code: `ic/src/bridge/ssh_client.rs` (russh client), `ic/src/tools/builtin/ssh.rs`
 and `ic/src/tools/builtin/ssh_git.rs` (the tools).
@@ -106,6 +107,16 @@ client (the first live use of the client half — the harness otherwise only use
   (RSA key support is not implemented; only Ed25519 and ECDSA are accepted).
 - **Limits:** connect/operation timeouts from the host config; stdout/stderr
   capped at 1 MiB each (`truncated` flag).
+- **Approval:** first call prompts with **Approve**, **Always**, and **Deny**.
+  **Always** is per user and applies to every future built-in `ssh` command and
+  every configured host alias. It persists only after successful execution.
+  Research and mission threads cannot use this grant; built-in `ssh` remains
+  denied outside interactive foreground threads. Shared rooms cannot approve
+  SSH calls or create grants; use a direct message.
+  Host allowlisting, host-key verification, sanitization, and rate limiting stay
+  active. Global auto-approve and autonomous execution cannot create this grant;
+  supervised mode continues to prompt every time. Revoke by returning `ssh` to
+  `ask_each_time` through tool permissions.
 
 **When to use.** A quick one-off remote command where a full worker/container is
 overkill.
@@ -141,6 +152,7 @@ key). Keys never leave the agent.
 - **Safety extras:** env-scrubbed subprocess (no gateway secrets leak to git),
   `GIT_TERMINAL_PROMPT=0`, `pull --ff-only`, **force-push (`+ref`) blocked**,
   option-injection guards, 64 KiB output cap, timeout + child kill.
+- **Approval:** every invocation requires approval; no **Always** option.
 
 **When to use.** Any git operation over SSH from a chat turn, without a worker.
 

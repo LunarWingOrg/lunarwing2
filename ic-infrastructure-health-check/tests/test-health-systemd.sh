@@ -32,7 +32,9 @@ SD="$ROOT"
 sub="${1:-}"; shift || true
 [ -n "${HS_FAIL_USER:-}" ] && [ "${HS_TENANT_USER:-}" = "$HS_FAIL_USER" ] && exit 1
 case "$sub" in
-  --user) exec "$0" "$@" ;;
+  --user)
+    [ -n "${HS_CALL_LOG:-}" ] && printf 'user %s\n' "$*" >> "$HS_CALL_LOG"
+    exec "$0" "$@" ;;
   list-unit-files)
     [ -n "${HS_FAIL_ENUM_USER:-}" ] && [ "${HS_TENANT_USER:-}" = "$HS_FAIL_ENUM_USER" ] && exit 1
     pats=(); for a in "$@"; do case "$a" in --no-legend|--user|--type=service) ;; *) pats+=("$a");; esac; done
@@ -79,11 +81,19 @@ EOF
 }
 exec /usr/bin/id "$@"
 EOF
+    cat > "$bin/podman" <<'EOF'
+#!/usr/bin/env bash
+ROOT="${HS_UNIT_DIR:?}"
+user="${HS_TENANT_USER:-}"
+container="${@: -1}"
+cat "$ROOT/$user/$container.container-health" 2>/dev/null
+EOF
     chmod +x "$bin"/*
 }
 
 unit_set() { printf '%s\n' "$3" > "$1/units/$2"; }   # <sb> <unit> "<ls> <as> <ss> <nr> <uf>"
 unit_set_user() { mkdir -p "$1/units/$2"; printf '%s\n' "$4" > "$1/units/$2/$3"; }
+container_health_user() { mkdir -p "$1/units/$2"; printf '%s\n' "$4" > "$1/units/$2/$3.container-health"; }
 
 run_hs() {  # <sb> <tenant> <user> [weechat:true|false|absent] -> health-systemd.sh JSON on stdout
     local sb="$1" t="$2" u="$3" w="${4:-absent}"
@@ -101,6 +111,12 @@ run_hs_registry() {  # <sb> [ENV=VALUE ...] -> health-systemd.sh JSON on stdout
     env PATH="$sb/bin:$PATH" HS_UNIT_DIR="$sb/units" \
         LUNARWING_SERVICE_MANAGER=systemd LUNARWING_TENANTS_FILE="$sb/ports.json" \
         "$@" bash "$HS" 2>/dev/null
+}
+run_hs_single() {  # <sb> [ENV=VALUE ...] -> single-node base-unit report
+    local sb="$1"; shift
+    env PATH="$sb/bin:$PATH" HS_UNIT_DIR="$sb/units" \
+        LUNARWING_SERVICE_MANAGER=systemd LUNARWING_TENANTS_FILE="$sb/no-registry.json" \
+        UNITS=lunarwing.service "$@" bash "$HS" 2>/dev/null
 }
 write_two_tenant_registry() {
     jq -n '{tenants:{acme:{user:"acme"},beta:{user:"beta"}}}' > "$1/ports.json"
@@ -328,5 +344,30 @@ unit_set "$r" lunarwing-acme.service "loaded inactive dead 0 enabled"
 oR="$(run_hs_registry "$r" HS_FAIL_UFS_USER=acme)"
 assert_eq "$(oall "$oR")" "critical" "R1: inconclusive enable-state for down unit fails loud"
 assert_contains "$oR" "probe(s) failed" "R2: enable-state probe failure surfaced"
+
+# ── S: LunarVision is a container unit; active+unhealthy must be critical ─────
+echo "=== Section S: LunarVision container health ==="
+s="$(sb)"; mk_hs_mock "$s"
+jq -n '{tenants:{acme:{user:"acme"}}}' > "$s/ports.json"
+unit_set_user "$s" acme lunarwing-acme.service "loaded active running 0 enabled"
+unit_set_user "$s" acme lunarwing-vision-acme.service "loaded active running 0 generated"
+container_health_user "$s" acme lunarwing-vision-acme unhealthy
+oS="$(run_hs_registry "$s")"
+assert_eq "$(ustat "$oS" lunarwing-vision-acme.service)" "critical" "S1: active but unhealthy LunarVision container is critical"
+assert_eq "$(jq -r '.metrics.units[] | select(.name=="lunarwing-vision-acme.service") | .extra.container_health' <<<"$oS")" "unhealthy" "S2: LunarVision container health exposed"
+assert_eq "$(oall "$oS")" "critical" "S3: LunarVision container failure drives overall status"
+
+# ── T: single-node user scope probes the same bus remediation targets ────────
+echo "=== Section T: single-node user-manager scope ==="
+t="$(sb)"; mk_hs_mock "$t"
+unit_set "$t" lunarwing.service "loaded active running 0 enabled"
+: > "$t/systemctl-calls"
+oT="$(run_hs_single "$t" SELF_HEAL_SYSTEMD_SCOPE=user HS_CALL_LOG="$t/systemctl-calls")"
+assert_eq "$(ustat "$oT" lunarwing.service)" "healthy" "T1: user-scoped base unit is healthy"
+if grep -q '^user ' "$t/systemctl-calls"; then
+    ok "T2: base-unit probe uses systemctl --user"
+else
+    bad "T2: base-unit probe uses systemctl --user" "no user-bus call recorded"
+fi
 
 finish

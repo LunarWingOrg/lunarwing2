@@ -36,6 +36,21 @@ impl ApprovalRequirement {
             Self::Always => true,
         }
     }
+
+    /// Apply an explicit user-granted `Always` permission without letting a
+    /// global auto-approve setting bypass intrinsically gated tools.
+    pub fn needs_prompt_with_user_grant(
+        self,
+        globally_auto_approved: bool,
+        user_auto_approved: bool,
+        allows_always: bool,
+    ) -> bool {
+        if matches!(self, Self::Always) && allows_always {
+            !user_auto_approved
+        } else {
+            self.needs_prompt(globally_auto_approved, user_auto_approved)
+        }
+    }
 }
 
 /// Precomputed autonomous tool scope for background jobs and routines.
@@ -45,7 +60,9 @@ impl ApprovalRequirement {
 #[derive(Debug, Clone)]
 pub enum ApprovalContext {
     /// Autonomous job with no interactive user. Only tools in `allowed_tools`
-    /// may run; interactive approval requirements are ignored.
+    /// may run; approval tier does not gate autonomous execution (hard
+    /// exclusions live in `Tool::allows_autonomous_execution` and
+    /// `AUTONOMOUS_TOOL_DENYLIST`).
     Autonomous {
         /// Tool names that may run autonomously for this job/run.
         allowed_tools: std::collections::HashSet<String>,
@@ -77,11 +94,15 @@ impl ApprovalContext {
     /// Check whether a tool is blocked given an optional context.
     ///
     /// When `None`, falls back to legacy behavior: all non-`Never` tools are blocked.
+    /// Names on `AUTONOMOUS_TOOL_DENYLIST` are always blocked (defense-in-depth).
     pub fn is_blocked_or_default(
         context: &Option<Self>,
         tool_name: &str,
         requirement: ApprovalRequirement,
     ) -> bool {
+        if super::autonomy::is_autonomous_tool_denylisted(tool_name) {
+            return true;
+        }
         match context {
             Some(ctx) => ctx.is_blocked(tool_name, requirement),
             None => requirement.is_required(),
@@ -343,6 +364,25 @@ pub trait Tool: Send + Sync {
     /// must always prompt (e.g. destructive shell commands, HTTP with auth).
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
         ApprovalRequirement::Never
+    }
+
+    /// Whether an interactive user may grant `Always` for this invocation.
+    ///
+    /// `ApprovalRequirement::Always` blocks persistent approval by default.
+    /// Narrowly constrained tools may override this while retaining `Always`
+    /// semantics for global auto-approve and autonomous execution.
+    fn allows_always_approval(&self, params: &serde_json::Value) -> bool {
+        !matches!(self.requires_approval(params), ApprovalRequirement::Always)
+    }
+
+    /// Whether this tool may execute in autonomous contexts (background jobs,
+    /// routines) at all. Distinct from approval tier: interactive approval
+    /// behavior is unchanged. Hard exclusions (remote-command tools such as
+    /// `ssh`/`ssh_git`, or WASM tools carrying the SSH capability) override
+    /// this to return `false`; `AUTONOMOUS_TOOL_DENYLIST` remains as
+    /// name-based defense-in-depth.
+    fn allows_autonomous_execution(&self) -> bool {
+        true
     }
 
     /// Maximum time this tool is allowed to run before the caller kills it.
@@ -808,8 +848,11 @@ mod tests {
     }
 
     #[test]
-    fn approval_requirement_always_ignores_auto_approval() {
+    fn approval_requirement_always_ignores_global_but_can_honor_user_grant() {
         assert!(ApprovalRequirement::Always.needs_prompt(true, true));
+        assert!(ApprovalRequirement::Always.needs_prompt_with_user_grant(true, false, true));
+        assert!(!ApprovalRequirement::Always.needs_prompt_with_user_grant(false, true, true));
+        assert!(ApprovalRequirement::Always.needs_prompt_with_user_grant(false, true, false));
         assert!(!ApprovalRequirement::UnlessAutoApproved.needs_prompt(true, false));
         assert!(!ApprovalRequirement::UnlessAutoApproved.needs_prompt(false, true));
         assert!(ApprovalRequirement::UnlessAutoApproved.needs_prompt(false, false));

@@ -21,8 +21,10 @@ declare -A SUITES=(
     [chaos]="chaos-harness.sh"
     [openrc]="test-health-openrc.sh"
     [systemd]="test-health-systemd.sh"
+    [lunarvision]="test-health-lunarvision.sh"
+    [netbird]="test-health-netbird.sh"
 )
-ORDER=(regression matrix chaos openrc systemd)
+ORDER=(regression matrix chaos openrc systemd lunarvision netbird)
 
 # --list: print available suites and exit (for CI introspection). Derived from
 # ORDER so it can never drift out of sync with the registered suites.

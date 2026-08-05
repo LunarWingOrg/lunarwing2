@@ -40,13 +40,61 @@ tenant_exists_in_registry() { return 0; }
 tenant_state_dir() { printf '%s/state\n' "$fixture"; }
 tenant_env_dir() { printf '%s/env\n' "$fixture"; }
 tenant_run_dir() { printf '%s/run\n' "$fixture"; }
+tenant_home() { printf '%s\n' "$fixture"; }
+ensure_init_system() { :; }
 mkdir -p "$fixture/state/darkirc" "$fixture/env" "$fixture/run"
 : >"$fixture/env/lunarwing.env"
-DARKIRC_KEY_HELPER="$fixture/helper"
-DARKIRC_COMPAT_FILE="$fixture/compat.json"
-: >"$DARKIRC_KEY_HELPER"
-: >"$DARKIRC_COMPAT_FILE"
+
+DARKIRC_RELEASE_DAEMON="$fixture/releases/current/darkirc"
+systemd_unit="$fixture/.config/systemd/user/lunarwing-darkirc-fixture.service"
+mkdir -p "${systemd_unit%/*}"
+printf '[Service]\nExecStart=%s --config %s/state/darkirc/darkirc_config.toml\n' \
+  "$DARKIRC_RELEASE_DAEMON" "$fixture" >"$systemd_unit"
+systemd_drop_ins=""
+_systemctl_user() {
+  shift
+  if [[ "$1" == daemon-reload ]]; then
+    return 0
+  elif [[ "$*" == *FragmentPath* ]]; then
+    printf '%s\n' "$systemd_unit"
+  elif [[ "$*" == *DropInPaths* ]]; then
+    printf '%s\n' "$systemd_drop_ins"
+  else
+    return 1
+  fi
+}
+INIT_SYSTEM=systemd
+darkirc_service_uses_release_selector fixture \
+  || fail "selector-backed systemd unit was rejected"
+systemd_drop_ins="$fixture/override.conf"
+if darkirc_service_uses_release_selector fixture; then
+  fail "systemd unit with command drop-in was accepted"
+fi
+systemd_drop_ins=""
+printf 'ExecStart=/usr/local/bin/darkirc --config stale\n' >>"$systemd_unit"
+if darkirc_service_uses_release_selector fixture; then
+  fail "systemd unit with second stale command was accepted"
+fi
+
+OPENRC_INITD_DIR="$fixture/openrc"
+mkdir -p "$OPENRC_INITD_DIR"
+printf 'darkirc_command="%s"\n' "$DARKIRC_RELEASE_DAEMON" \
+  >"$OPENRC_INITD_DIR/lunarwing-darkirc-fixture"
+# Consumed by sourced mt-admin service validator.
+# shellcheck disable=SC2034
+INIT_SYSTEM=openrc
+darkirc_service_uses_release_selector fixture \
+  || fail "selector-backed OpenRC unit was rejected"
+printf 'darkirc_command="/usr/local/bin/darkirc"\n' \
+  >>"$OPENRC_INITD_DIR/lunarwing-darkirc-fixture"
+if darkirc_service_uses_release_selector fixture; then
+  fail "OpenRC unit with second stale command was accepted"
+fi
+pass "stale DarkIRC service commands rejected"
+
 darkirc_validate_root_executable() { [[ -f "$1" ]]; }
+darkirc_load_compatibility() { return 0; }
+darkirc_service_uses_release_selector() { return 0; }
 generate_darkirc_config() {
   printf 'generated\n' >"$fixture/state/darkirc/darkirc_config.toml"
 }
@@ -58,7 +106,6 @@ with_tenant_lifecycle_lock() { shift; "$@"; }
 _start_tenant_init_services() {
   [[ -f "$fixture/state/darkirc/darkirc_config.toml" ]]
 }
-tenant_home() { printf '%s\n' "$fixture"; }
 warn_if_sshd_unreachable() { :; }
 upload_tenant_darkirc_secret() { :; }
 _ssh_ready_summary() { :; }

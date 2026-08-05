@@ -8957,7 +8957,7 @@ done
     /// Clears `IRONCLAW_OAUTH_CALLBACK_URL` for the duration, restoring on drop.
     struct EnvGuard {
         original: Option<String>,
-        _mutex: std::sync::MutexGuard<'static, ()>,
+        _mutex: crate::config::helpers::EnvGuard,
     }
 
     impl EnvGuard {

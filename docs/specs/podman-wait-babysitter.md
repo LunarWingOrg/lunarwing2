@@ -52,6 +52,15 @@ In `lunarwing-mt-admin.sh`:
 - `stop_tenant_openrc`: stop babysitter units
 - `uninstall_tenant_openrc`: disable + remove babysitter units
 - `status_tenant`: show babysitter unit status
+- `stop-worker` / `kill-worker`: persist `desired_running=false`, stop direct and
+  babysitter units, and remove both from all runlevels
+- `start-worker`: persist `desired_running=true`, then re-enable and start both
+  units through normal worker registration
+
+`start-tenant` reconciles unselected and intentionally stopped workers by
+stopping stale units and removing stale runlevel links. Health reports those
+down units as `skipped`, so periodic remediation cannot override operator
+intent.
 
 ### Worker Registration
 

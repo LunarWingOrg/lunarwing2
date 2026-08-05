@@ -2295,6 +2295,7 @@ mod tests {
             current_call_id: None,
             source_channel: None,
             supervised_mode: false,
+            shared_conversation: false,
             supervised_timeout_secs: 300,
             prompt_context: crate::prompt_context_from_thread_messages(&thread.messages),
         }

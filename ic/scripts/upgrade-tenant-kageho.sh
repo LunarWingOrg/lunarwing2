@@ -23,7 +23,7 @@
 # Flow (--apply):
 #   gates -> backup(DB + env + ports + caps) -> stop -> fetch+checkout TARGET ->
 #   build-tenant --with-wasm --require-wasm -> install-wasm -> patch-env -> weechat pre-flight GATE
-#   -> start (refinery applies V21 on boot) -> remove stale weechat unit -> verify.
+#   -> remove stale weechat unit -> start (refinery applies V21 on boot) -> verify.
 # Rollback steps are printed at the end.
 #
 # Run as root:
@@ -195,6 +195,7 @@ say "  side backup dir: $BACKUP_DIR"
 
 banner "2/9  stop-tenant"
 "$MT" stop-tenant "$TENANT"
+"$MT" cleanup-legacy-weechat "$TENANT"
 
 banner "3/9  fetch tags + checkout $TARGET (as $TENANT)"
 sudo -u "$TENANT" git -c safe.directory="$HOME_DIR" -C "$HOME_DIR" fetch --tags --prune origin \
@@ -207,6 +208,8 @@ say "  now at: $(sudo -u "$TENANT" git -c safe.directory="$HOME_DIR" -C "$HOME_D
 
 banner "4/9  build-tenant --with-wasm --require-wasm  (binary + bridge + refreshed capabilities.json)"
 "$MT" build-tenant "$TENANT" --with-wasm --require-wasm
+"$MT" ensure-darkirc-release "$TENANT"
+"$MT" render-units "$TENANT"
 
 banner "5/9  install-wasm  (installs caps with the new env-source fields)"
 "$MT" install-wasm "$TENANT"
@@ -222,18 +225,6 @@ confirm "Pre-flight clean. Start kageho on $TARGET now? (refinery applies V21 on
 
 banner "8/9  start-tenant  (V21 applies automatically on first connect)"
 "$MT" start-tenant "$TENANT"
-
-banner "9/9  remove stale pre-v1.1.0 weechat unit orphan (if present)"
-uid="$(id -u "$TENANT" 2>/dev/null || echo '')"
-OLD_UNIT="/home/$TENANT/.config/systemd/user/weechat-$TENANT.service"
-if [[ -n "$uid" && -f "$OLD_UNIT" ]]; then
-  sudo -u "$TENANT" env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user disable --now "weechat-$TENANT.service" 2>/dev/null || true
-  rm -f "$OLD_UNIT"
-  sudo -u "$TENANT" env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user daemon-reload 2>/dev/null || true
-  say "  removed $OLD_UNIT (replaced by lunarwing-weechat-$TENANT.service)"
-else
-  say "  no stale weechat-$TENANT.service unit found (ok)"
-fi
 
 # ================================================================================
 banner "VERIFY"

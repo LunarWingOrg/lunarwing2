@@ -25,6 +25,8 @@ pub const AUTONOMOUS_TOOL_DENYLIST: &[&str] = &[
     "skill_remove",
     "secret_list",
     "secret_delete",
+    "ssh",
+    "ssh_git",
 ];
 
 pub fn is_autonomous_tool_denylisted(tool_name: &str) -> bool {
@@ -159,11 +161,13 @@ mod tests {
         let tools = Arc::new(ToolRegistry::new());
         tools.register_sync(Arc::new(FakeTool { name: "echo" }));
         tools.register_sync(Arc::new(FakeTool { name: "restart" }));
+        tools.register_sync(Arc::new(FakeTool { name: "ssh" }));
 
         let allowed = autonomous_allowed_tool_names(&tools, None, "default").await;
 
         assert!(allowed.contains("echo"));
         assert!(!allowed.contains("restart"));
+        assert!(!allowed.contains("ssh"));
     }
 
     #[tokio::test]

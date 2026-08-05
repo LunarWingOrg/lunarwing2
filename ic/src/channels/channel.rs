@@ -157,6 +157,26 @@ impl IncomingMessage {
         self
     }
 
+    /// Whether this message belongs to a room/group where multiple actors can
+    /// share one conversation scope.
+    pub fn is_shared_conversation(&self) -> bool {
+        self.metadata
+            .get("chat_type")
+            .and_then(|value| value.as_str())
+            == Some("group")
+            || self
+                .metadata
+                .get("xmpp_type")
+                .and_then(|value| value.as_str())
+                == Some("groupchat")
+            || (self.channel.ends_with("-relay")
+                && self
+                    .metadata
+                    .get("event_type")
+                    .and_then(|value| value.as_str())
+                    != Some("direct_message"))
+    }
+
     /// Set user name.
     pub fn with_user_name(mut self, name: impl Into<String>) -> Self {
         self.user_name = Some(name.into());
@@ -352,9 +372,8 @@ pub enum StatusUpdate {
         description: String,
         parameters: serde_json::Value,
         /// When `true`, the UI should offer an "always" option that auto-approves
-        /// future calls to this tool for the rest of the session.  When `false`
-        /// (i.e. `ApprovalRequirement::Always`), the tool must be approved every
-        /// time and the "always" button should be hidden.
+        /// future calls to this tool. Tools choose this independently from their
+        /// base approval requirement; most `Always` tools keep it disabled.
         allow_always: bool,
     },
     /// Extension needs user authentication (token or OAuth).
@@ -697,6 +716,26 @@ mod tests {
     fn test_incoming_message_with_timezone() {
         let msg = IncomingMessage::new("test", "user1", "hello").with_timezone("America/New_York");
         assert_eq!(msg.timezone.as_deref(), Some("America/New_York"));
+    }
+
+    #[test]
+    fn shared_conversation_detects_groups_but_not_direct_messages() {
+        let xmpp_room = IncomingMessage::new("xmpp", "room@example", "hello")
+            .with_metadata(serde_json::json!({"xmpp_type": "groupchat"}));
+        let signal_group = IncomingMessage::new("signal", "group", "hello")
+            .with_metadata(serde_json::json!({"chat_type": "group"}));
+        let relay_room = IncomingMessage::new("darkirc-relay", "room", "hello")
+            .with_metadata(serde_json::json!({"event_type": "channel_message"}));
+        let relay_dm = IncomingMessage::new("darkirc-relay", "alice", "hello")
+            .with_metadata(serde_json::json!({"event_type": "direct_message"}));
+        let xmpp_dm = IncomingMessage::new("xmpp", "alice@example", "hello")
+            .with_metadata(serde_json::json!({"chat_type": "private", "xmpp_type": "chat"}));
+
+        assert!(xmpp_room.is_shared_conversation());
+        assert!(signal_group.is_shared_conversation());
+        assert!(relay_room.is_shared_conversation());
+        assert!(!relay_dm.is_shared_conversation());
+        assert!(!xmpp_dm.is_shared_conversation());
     }
 
     #[test]
