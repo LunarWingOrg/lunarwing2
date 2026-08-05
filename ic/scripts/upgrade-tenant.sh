@@ -24,8 +24,8 @@
 # Flow (rootless adopt):
 #   preflight GATE -> backup(DB+ports+env) & VERIFY -> stop(old) -> git update +
 #   build-tenant + install-wasm -> add-tenant --no-health (rootless prereqs +
-#   empty PG + render units, NO daemon) -> restore-tenant --yes -> start-tenant ->
-#   weechat-orphan cleanup -> verify. Rollback steps printed at the end.
+#   empty PG + render units, NO daemon) -> restore-tenant --yes ->
+#   weechat-orphan cleanup -> start-tenant -> verify. Rollback steps printed at the end.
 #
 # SAFETY: never proceeds past a failed/again-unverified backup; never starts the
 # daemon before the restore (so restore-tenant's "daemon stopped" gate holds);
@@ -273,6 +273,7 @@ note "prior clone rev recorded for rollback: $PRIOR_REV"
 # ---- 2. STOP the OLD model (daemon + old PG); old container/volume preserved --
 banner "2/8  Stop tenant (old model)"
 run mt_rootful stop-tenant-for-upgrade "$TENANT"
+run mt cleanup-legacy-weechat "$TENANT"
 
 # ---- 3. UPDATE the tenant clone + REBUILD (mt-admin does NOT auto-update) -----
 banner "3/8  Update clone + build"
@@ -290,6 +291,7 @@ else
   run mt "${build_args[@]}"
   run mt install-wasm "$TENANT"
 fi
+run mt ensure-darkirc-release "$TENANT"
 
 # ---- 4. PROVISION rootless + render units + bring up EMPTY PG (NO daemon) -----
 banner "4/8  Provision + render (add-tenant --no-health, idempotent)"
@@ -337,20 +339,8 @@ fi
 banner "6/8  Start tenant"
 run mt start-tenant "$TENANT"
 
-# ---- 7. CLEAN UP the orphaned old WeeChat unit (rename left it) --------------
-banner "7/8  Orphan cleanup"
-OLD_WC="$HOME_T/.config/systemd/user/weechat-$TENANT.service"
-if [[ -f "$OLD_WC" ]]; then
-  run sudo -u "$TENANT" env XDG_RUNTIME_DIR="/run/user/$UID_T" systemctl --user disable --now "weechat-$TENANT.service"
-  run rm -f "$OLD_WC"
-  run sudo -u "$TENANT" env XDG_RUNTIME_DIR="/run/user/$UID_T" systemctl --user daemon-reload
-  note "removed orphaned weechat-$TENANT.service (replaced by lunarwing-weechat-$TENANT.service)"
-else
-  note "no orphaned weechat-$TENANT.service found"
-fi
-
-# ---- 8. VERIFY ---------------------------------------------------------------
-banner "8/8  Verify"
+# ---- 7. VERIFY ---------------------------------------------------------------
+banner "7/8  Verify"
 run mt status "$TENANT"
 if [[ "$KEEP_ROOTFUL" == false ]] && ! $DRY_RUN; then
   vrows="$(rootless_data_rows "$TENANT")"   # row count, not table count (schema exists regardless of restore)
