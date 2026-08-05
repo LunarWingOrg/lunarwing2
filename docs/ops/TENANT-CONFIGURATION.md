@@ -9,18 +9,24 @@ Each tenant's configuration lives under their home directory:
 ```
 /home/<tenant>/lunarwing/
 ├── env/
-│   ├── lunarwing.env       # Main daemon environment (LLM, DB, XMPP, gateway, WASM)
+│   ├── lunarwing.env       # Main daemon and worker settings (mode 0600)
+│   ├── pg.secret           # Stable PostgreSQL password (mode 0600)
 │   ├── xmpp-bridge.env     # XMPP bridge service environment
-│   ├── proxy.env           # TensorZero proxy environment
-│   ├── weechat.env         # WeeChat relay credential only (RELAY_PASSWORD, mode 0600)
+│   ├── weechat.env         # WeeChat relay credential only (mode 0600)
+│   ├── vision.env          # LunarVision sidecar environment
+│   ├── proxy.env           # Present only when --enable-proxy is selected
+│   ├── darkirc-adapter.env # Present only when --enable-darkirc is selected
+│   ├── pebble.env          # Present after configure-pebble
 │   └── gotify.json         # Gotify notification settings (optional)
 ├── state/
 │   ├── config.toml         # Daemon settings (auto-seeded on first start)
 │   ├── workspace-template/ # Identity files (SOUL.md, IDENTITY.md, etc.)
 │   ├── tools/              # Installed WASM tools
 │   ├── channels/           # Installed WASM channels
+│   ├── darkirc/            # DarkIRC state when enabled
 │   └── xmpp/               # OMEMO key store
-├── logs/                   # Service log output
+├── logs/                   # OpenRC service log output
+├── run/                    # Runtime sockets and PID files
 └── ic/                     # Repo clone (source + build artifacts)
 ```
 
@@ -30,7 +36,7 @@ After changing any env file, restart the affected service for changes to take ef
 
 ## LLM Provider Configuration
 
-The LLM backend is configured in `env/lunarwing.env`. By default, tenants route through a per-tenant TensorZero proxy, but you can point directly at any OpenAI-compatible endpoint.
+The LLM backend is configured in `env/lunarwing.env`. The per-tenant TensorZero proxy is opt-in; without `--enable-proxy`, provisioning points `LLM_BASE_URL` directly at `LUNARWING_MT_TENSORZERO_URL` (or an explicit `--llm-base-url`).
 
 ### Setting your API key
 
@@ -44,17 +50,19 @@ If using TensorZero as a proxy, the key is passed through to the upstream provid
 
 ### Switching LLM backends
 
-The default setup routes through a local TensorZero proxy:
+The default setup connects directly to the configured upstream TensorZero URL:
 
 ```bash
 LLM_BACKEND=openai_compatible
-LLM_BASE_URL=http://127.0.0.1:<proxy_port>/v1
+LLM_BASE_URL=http://192.168.1.157:3000/openai/v1
 LLM_MODEL=tensorzero::function_name::lunarwing
 ```
 
-> `LLM_BASE_URL` can be set at provisioning time with `add-tenant --llm-base-url <url>` (or
-> fleet-wide via `LUNARWING_MT_LLM_BASE_URL`) instead of hand-editing it here — useful for
-> pointing tenants straight at a gateway or upstream endpoint as the proxy is phased out.
+Set the upstream with `LUNARWING_MT_TENSORZERO_URL`, or set `LLM_BASE_URL`
+directly at provisioning time with `add-tenant --llm-base-url <url>` (fleet-wide:
+`LUNARWING_MT_LLM_BASE_URL`). When `--enable-proxy` is selected and no explicit
+LLM base URL is supplied, mt-admin instead writes
+`http://127.0.0.1:<proxy_port>/v1`.
 
 To point directly at OpenAI (bypassing TensorZero):
 
@@ -92,7 +100,11 @@ LLM_MODEL=your-model-name
 
 ### TensorZero proxy configuration
 
-Each tenant has a TensorZero proxy configured in `env/proxy.env`:
+The proxy is disabled by default. Provision it with
+`add-tenant <name> --enable-proxy` (the command is idempotent for an existing
+tenant). mt-admin then
+creates `env/proxy.env`, renders the init-specific proxy unit, and defaults the
+daemon to that loopback endpoint:
 
 ```bash
 PROXY_PORT=<allocated_port>
@@ -100,7 +112,9 @@ PROXY_BIND=127.0.0.1
 TENSORZERO_URL=http://192.168.1.157:3000/openai/v1
 ```
 
-`TENSORZERO_URL` is the upstream TensorZero instance that the per-tenant proxy forwards to. Change this if your TensorZero server is at a different address.
+`TENSORZERO_URL` is the upstream instance that the per-tenant proxy forwards to.
+Change it through `--tensorzero-url` or `LUNARWING_MT_TENSORZERO_URL`, then
+re-render/restart the tenant as appropriate.
 
 ## XMPP Configuration
 
