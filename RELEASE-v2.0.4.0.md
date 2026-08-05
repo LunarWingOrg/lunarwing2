@@ -1,6 +1,6 @@
 # Release Notes for LunarWing v2.0.4.0 — Codename `Odoshi (威し)`
 
-**Release Date:** TBD
+**Release Date:** 2026-08-05
 
 > *Odoshi* (威し) evokes intimidation. LunarWing v2.0.4.0 strengthens
 the boundaries around coordinated agents, external processes, extension
@@ -640,9 +640,6 @@ older v2.0.3.0 wording.
 
 ### Security and Runtime Limitations
 
-- **MCP stdio is unsandboxed trusted host code.** It runs under the daemon account
-  and can access that account's permissions. Crash recovery improves lifecycle,
-  not containment.
 - **Onboarding is a trusted local console.** It has no user-account system or TLS.
   Keep loopback binding and token authentication enabled; use an SSH tunnel for
   remote access.
@@ -655,9 +652,6 @@ older v2.0.3.0 wording.
   list constructs the coalescer whenever `COALESCE_ENABLED` retains its `true`
   default. Set `COALESCE_ENABLED=false` when room scopes must be configured
   without coalescing.
-- **Lorebook scanning is lexical and conservative.** Benign instruction-like
-  prose can be rejected, and the implemented import subset does not provide full
-  SillyTavern semantics.
 - **Engine output-safety ordering has a residual limitation.** The incident audit
   records that oversized prefixes are truncated before later redaction/policy
   stages, while later transformed normal-sized output is not re-capped.
@@ -673,7 +667,7 @@ older v2.0.3.0 wording.
 - Reflex compiler and semantic routing remain opt-in. Software Builder
   validation, test harness, auto-registration, and later bridge phases are not
   complete.
-- DarkIRC Stages B-D and automated QR/web/trusted-channel delivery are not
+- DarkIRC key manager Stages B-D and automated QR/web/trusted-channel delivery are not
   implemented.
 - MCP package installation, provenance/revocation, host sandboxing, worker-local
   placement, MCP-over-WASM, and dedicated/shared gateway architecture are
@@ -683,7 +677,7 @@ older v2.0.3.0 wording.
 - Kawarimi and machine migration remain PostgreSQL-only and require staged
   downtime. There is no automatic rollback after a failed checkout/import.
 - Current CI does not build a distributable package or release artifact and does
-  not deploy tenants.
+  not deploy tenants. A seperate integration test outside of Gitlab does do this.
 - `ic/deny.toml` still carries eight explicit advisory exceptions: four
   `rustls-webpki` issues pinned through libSQL, one `lopdf` issue pinned through
   `pdf-extract`, the RSA Marvin timing advisory without an upstream fixed
