@@ -23,11 +23,16 @@
 > validator (`validate_config.py`) now enforces README↔defaults image digest
 > parity and `rust-toolchain.toml` channel agreement, so the drift classes
 > cannot recur silently.
+>
+> **Post-review change (verified 2026-08-05):** the active pipeline now includes
+> `.gitlab/ci/containers.yml` and a `containers` stage with manual Pebble,
+> OpenCode, and Kimi image jobs. The detailed findings remain a 2026-07-26 review
+> record rather than an exhaustive inventory of later jobs.
 
-## 1. Current pipeline summary (verified)
+## 1. Reviewed pipeline summary (updated for the container stage)
 
-- **Stages:** `validate` → `check` → `test` → `security` → `observe`.
-- **Entry:** `.gitlab-ci.yml` includes six local files under `.gitlab/ci/`.
+- **Stages:** `validate` → `check` → `test` → `security` → `containers` → `observe`.
+- **Entry:** `.gitlab-ci.yml` includes seven local files under `.gitlab/ci/`.
 - **Workflow rules** suppress duplicate branch pipelines once an MR exists
   (`.gitlab/ci/workflow.yml`).
 - **Required (blocking) jobs:** `ci-config`, `shell-syntax`, `python-syntax`,

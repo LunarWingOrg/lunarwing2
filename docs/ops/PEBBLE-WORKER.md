@@ -47,9 +47,17 @@ user/assistant history. Default `none` preserves prompt-only behavior.
 
 ## Multi-Tenant Setup
 
-### Build
+### Select and Build
 
-Run long worker-image builds in `tmux`:
+Worker selection is per tenant and defaults off. Select Pebble while provisioning,
+or re-run the idempotent add command for an existing tenant:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-pebble
+```
+
+This flips `workers.pebble=true` in `/etc/lunarwing/ports.json`; building the
+shared image alone does not select it. Run long worker-image builds in `tmux`:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker

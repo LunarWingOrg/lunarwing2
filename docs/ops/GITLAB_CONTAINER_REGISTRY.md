@@ -5,9 +5,10 @@ and publish supported external-worker images (`worker-pebble`,
 `worker-opencode`, and `worker-kimi`) from CI, so MT hosts can pull prebuilt images instead of
 building locally on every upgrade.
 
-The CI side lives in `.gitlab/ci/containers.yml` (branch
-`c0ntainers/mcr/v2.0.3.0`). The server side must be done once on the GitLab
-host by someone with access.
+The active CI definition lives in `.gitlab/ci/containers.yml`; the original
+implementation branch was `c0ntainers/mcr/v2.0.3.0`, but operators should use
+the merged file in their target commit. The server side is a one-time GitLab
+host operation for an administrator.
 
 **Environment (confirmed 2026-07-29):** GitLab runs as a Docker container
 behind **Traefik** (`proxy` network, `websecure` entrypoint, `letsencrypt`
@@ -159,9 +160,10 @@ Details:
   `allow_failure: true`; multi-GB worker builds never start automatically. Run
   the pipeline and explicitly trigger only the image jobs needed for the
   release.
-- Variable: `WITH_TOOLCHAINS` for opencode (default `false`; set `true` on a
-  manual pipeline run for the fat
-  toolchain image — mirrors mt-admin's `--with-toolchains`).
+- Variable: `WITH_TOOLCHAINS` for both OpenCode and Kimi jobs (default
+  `false`; set `true` on the selected manual job for the full toolchain image —
+  mirrors mt-admin's `--with-toolchains`). Kimi also exposes
+  `KIMI_CODE_VERSION` (currently `0.30.0`).
 - If gcr.io is unreachable from the runners, pull the executor image
   elsewhere, push it into our registry once section 1 is done, and update
   `.container-job`'s `image:name`.
