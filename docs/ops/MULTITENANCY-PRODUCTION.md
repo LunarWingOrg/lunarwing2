@@ -613,6 +613,12 @@ tokens [name]                    Print gateway auth tokens
 doctor                           System dependency and health checks
 ```
 
+On OpenRC, `stop-worker` and `kill-worker` persist operator intent and remove
+both direct worker and `-sup` babysitter units from every runlevel. Later
+`start-tenant` calls and health remediation leave that worker stopped until
+`start-worker` (or `restart-worker`) restores desired-running state and boot
+persistence. Unselected workers receive same stale-unit cleanup.
+
 ## Relationship to Test Harness
 
 The test harness (`ic/scripts/lunarwing-xmpp-test-env.sh`) provides `mt-init`,

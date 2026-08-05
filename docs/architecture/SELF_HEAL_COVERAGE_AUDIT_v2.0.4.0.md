@@ -1,6 +1,6 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
-**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; content re-verified, 427/427 assertions green)
+**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; content re-verified, 435/435 assertions green)
 **Status:** Goal 2 implementation complete; residual gaps documented below
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
@@ -22,7 +22,7 @@ across fail/recover cycles.
 | NetBird | Opt-in `netbird status --check startup` | Escalation-only by default; restart requires explicit delegation | NetBird probe, matrix |
 | systemd MT | Tenant registry plus user-manager enumeration | Tenant owner user bus with `XDG_RUNTIME_DIR` | systemd, matrix, chaos |
 | systemd single-node | Base unit health | Configurable `system`/`user` scope | matrix |
-| OpenRC | Init-script discovery and status | `rc-service` through shared remediation path | OpenRC, matrix, chaos mocks |
+| OpenRC | Init-script discovery, status, and persisted worker intent | `rc-service` through shared remediation path; intentionally stopped workers skipped | OpenRC, worker lifecycle, matrix, chaos mocks |
 | launchd | Agent report | Existing stop/start path | matrix |
 | Escalation | Max retries, flapping, monitor-only failures | Timeout, custom notifier, confirmed-delivery cooldown | matrix |
 
@@ -39,6 +39,11 @@ across fail/recover cycles.
 - `lunarwing-vision-<tenant>` resolves to correct tenant before generic prefix.
 - Active-but-unhealthy LunarVision containers become critical in systemd report.
 - OpenRC Vision units resolve to their real tenant before started-state gating.
+- OpenRC worker stop/kill intent survives `start-tenant` and reboot; stale direct
+  and babysitter runlevel links are removed, while health skips intentionally
+  stopped or unselected workers.
+- OpenRC worker babysitter names resolve to their real tenant, keeping crashes
+  critical when worker remains selected and desired-running.
 - Host-global MT config pins base service scope to system bus.
 - Single-node user-timer probes and remediation share the configured user bus.
 - Explicitly delegated NetBird daemon restart remains on host system bus.
