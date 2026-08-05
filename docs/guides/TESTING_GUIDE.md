@@ -87,7 +87,7 @@ Test only workers configured for the release candidate. Nanocode is retired and 
 
 - [ ] Provision a disposable tenant through `ic/scripts/lunarwing-mt-admin.sh` or its thin onboard wrapper.
 - [ ] Verify port allocation and registry entries, including `vision_service` and `vision_health` when OCR is enabled.
-- [ ] Run MT admin `status` and `doctor`; do not substitute bare system-bus `systemctl`.
+- [ ] Run MT admin `status <tenant>` plus host `doctor`; do not substitute bare system-bus `systemctl`.
 - [ ] Verify systemd user-manager behavior on systemd hosts.
 - [ ] Verify OpenRC service rendering and lifecycle on a Gentoo/OpenRC host, or record the tier as deferred.
 - [ ] Start, stop, restart, build, and remove the disposable tenant through MT admin.
