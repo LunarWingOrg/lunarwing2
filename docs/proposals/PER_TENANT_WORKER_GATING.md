@@ -1,8 +1,11 @@
 # Per-tenant worker gating (fix: unselected workers start anyway)
 
-> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED.** Worker selection
-> is persisted per tenant, `start-tenant` gates each worker from that registry,
-> and Kawarimi plus onboarding paths forward the selected `--with-*` flags.
+> **Current status (updated 2026-08-04): IMPLEMENTED / HISTORICAL.** Worker
+> selection is persisted per tenant and `start-tenant` gates each supported
+> worker from that registry. Supported persistent workers are now Pebble,
+> OpenCode, and Kimi Code. Nanocode was retired after this fix; its registry
+> value is forced false and `--with-nanocode` is rejected. The Nanocode examples
+> below preserve the original bug and implementation context.
 
 ## Bug
 

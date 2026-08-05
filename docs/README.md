@@ -2,12 +2,14 @@
 
 All project documentation, organized by category. This index reflects the current tree —
 every **active** file is listed below. Archived material lives under
-[`internal/history/`](internal/history/) (superseded LunarWing docs).
+[`internal/history/`](internal/history/) and subsystem archives such as
+[`guides/history/`](guides/history/).
 
 * Original Author: Starforce Nebula *
 * Updated on July 6th by Rarity to reflect recent changes to the documentation tree: added missing entries for reviews/, specs/, superpowers/; fixed broken links (ROADMAP_2026, DOCS_REORG_CHECKLIST); added READMEs to previously undocumentated subdirectories.*
 * Updated on July 20th, 2026 to reconcile the complete proposal index with current source and tests at revision `50c8f99`.*
 * Updated on July 28th, 2026 to reconcile this index with the current documentation tree.*
+* Updated on August 5th, 2026 after the v2.0.4.0 guide audit and archival pass.*
 
 ## Directory Structure
 
@@ -35,34 +37,32 @@ How-to guides, build instructions, and setup walkthroughs.
 
 | File | Description |
 |------|-------------|
-| [`MT-ADMIN-QUICKSTART.md`](guides/MT-ADMIN-QUICKSTART.md) | `lunarwing-mt-admin.sh` multi-tenant quickstart |
-| [`CREATE_TENANT_NEW_SCRIPT.md`](guides/CREATE_TENANT_NEW_SCRIPT.md) | Creating a tenant with the new script |
-| [`MIGRATE_IRONCLAW_TO_LUNARWING.md`](guides/MIGRATE_IRONCLAW_TO_LUNARWING.md) | Migrate an existing IronClaw PostgreSQL instance to LunarWing |
-| [`MIGRATE_IRONCLAW_TO_MT.md`](guides/MIGRATE_IRONCLAW_TO_MT.md) | PostgreSQL migration to multi-tenant |
-| [`MIGRATE_IRONCLAW_LIBSQL_TO_MT.md`](guides/MIGRATE_IRONCLAW_LIBSQL_TO_MT.md) | libSQL cross-backend migration to multi-tenant |
-| [`TESTING_GUIDE.md`](guides/TESTING_GUIDE.md) | Pre-release test checklist + automated release testing (linked from `CLAUDE.md`) |
-| [`EMBEDDINGS_SETUP.md`](guides/EMBEDDINGS_SETUP.md) | Embedding provider config (OpenAI-compatible, Ollama, NEAR AI) |
+| [`MT-ADMIN-QUICKSTART.md`](guides/MT-ADMIN-QUICKSTART.md) | Init-agnostic multi-tenant provisioning and lifecycle quickstart |
+| [`CREATE_TENANT_NEW_SCRIPT.md`](guides/CREATE_TENANT_NEW_SCRIPT.md) | Full-featured tenant convenience wrapper |
+| [`MIGRATE_IRONCLAW_TO_LUNARWING.md`](guides/MIGRATE_IRONCLAW_TO_LUNARWING.md) | Rehearsed single-instance PostgreSQL migration from IronClaw |
+| [`MIGRATE_IRONCLAW_TO_MT.md`](guides/MIGRATE_IRONCLAW_TO_MT.md) | Guarded PostgreSQL migration into an MT-admin tenant |
+| [`MIGRATE_IRONCLAW_LIBSQL_TO_MT.md`](guides/MIGRATE_IRONCLAW_LIBSQL_TO_MT.md) | Current unsupported status and safe requirements for libSQL cross-backend ETL |
+| [`TESTING_GUIDE.md`](guides/TESTING_GUIDE.md) | Current manual release matrix and links to bounded automated tiers |
+| [`DEBUG_LOG.md`](guides/DEBUG_LOG.md) | Stable logging levels, service diagnostics, and evidence collection |
+| [`EMBEDDINGS_SETUP.md`](guides/EMBEDDINGS_SETUP.md) | Database-backed and environment embedding provider configuration |
+| [`ENABLING_DEV_TOOLS.md`](guides/ENABLING_DEV_TOOLS.md) | Local tool registration, sandbox policy, and approval controls |
+| [`human-delay-mode.md`](guides/human-delay-mode.md) | Current supervised-mode behavior and enablement |
+| [`SSH-TOOL-TESTING.md`](guides/SSH-TOOL-TESTING.md) | Tests for built-in, WASM, Git, and worker SSH paths |
+| [`VISION_OCR_SIDECAR.md`](guides/VISION_OCR_SIDECAR.md) | Versioned Vision/OCR sidecar endpoints and MT port behavior |
+| [`MULTICA_DEPLOYMENT.md`](guides/MULTICA_DEPLOYMENT.md) | Multica/Lunartica WASM channel and tool deployment |
 | [`NETBIRD_TUNNEL.md`](guides/NETBIRD_TUNNEL.md) | Self-hosted NetBird Reverse Proxy tunnel setup |
-| [`TUNNEL_PROVIDER_MIGRATION.md`](guides/TUNNEL_PROVIDER_MIGRATION.md) | Migrate from removed managed Cloudflare/ngrok/Tailscale tunnels |
-| [`VISION_OCR_SIDECAR.md`](guides/VISION_OCR_SIDECAR.md) | Vision/OCR sidecar service overview |
-| [`GENTOO_PACKAGE_LIST.md`](guides/GENTOO_PACKAGE_LIST.md) | Gentoo package list + rootless-podman MT prerequisites |
-| [`ARCHLINUX_PACKAGE_LIST.md`](guides/ARCHLINUX_PACKAGE_LIST.md) | Arch Linux package list (systemd MT equivalent of the Gentoo list) |
-| [`MULTICA_DEPLOYMENT.md`](guides/MULTICA_DEPLOYMENT.md) | Multica/Lunartica deployment guide |
-| [`human-delay-mode.md`](guides/human-delay-mode.md) | Human-delay mode overview |
-| [`DEBUG_LOG.md`](guides/DEBUG_LOG.md) | Catalog of debug/info log points by `file:line` |
-| [`ENABLING_DEV_TOOLS.md`](guides/ENABLING_DEV_TOOLS.md) | Enabling filesystem/shell developer tools for a tenant |
-| [`SSH-TOOL-TESTING.md`](guides/SSH-TOOL-TESTING.md) | Test prompts for validating the three SSH delivery mechanisms |
-| [`AI-CODE-CONTRIBUTION-POLICY.md`](guides/AI-CODE-CONTRIBUTION-POLICY.md) | AI code contribution policy (effective July 7th, 2026) |
-| [`CLAUDE_CODEX_ORCHESTRATION.md`](guides/CLAUDE_CODEX_ORCHESTRATION.md) | Claude Code → Codex parallel feature orchestration (worktrees, `/codex-impl`, `/features-parallel`) |
-| [`darkirc_channel_for_lunarwing/BUILD_INSTRUCTIONS.md`](guides/darkirc_channel_for_lunarwing/BUILD_INSTRUCTIONS.md) | DarkIRC channel build instructions |
-| [`darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md`](guides/darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md) | Full DarkIRC build guide |
-| [`darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md`](guides/darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md) | DarkIRC multi-tenant adapter |
-| [`lunarwing_weechat_wss/README.md`](guides/lunarwing_weechat_wss/README.md) | WeeChat WSS channel overview |
-| [`lunarwing_weechat_wss/weechat_relay/INSTALL.md`](guides/lunarwing_weechat_wss/weechat_relay/INSTALL.md) | WeeChat relay installation |
-| [`lunarwing_weechat_wss/weechat_relay/TROUBLESHOOTING.md`](guides/lunarwing_weechat_wss/weechat_relay/TROUBLESHOOTING.md) | WeeChat relay troubleshooting |
-| [`gotify-wasm/README.md`](guides/gotify-wasm/README.md) | Gotify WASM tool |
-| [`ic_sm/README.md`](guides/ic_sm/README.md) | Secret manager (`ic_sm`) |
-| [`git-lunarwing-unix-socket-repl-server-repo/README.md`](guides/git-lunarwing-unix-socket-repl-server-repo/README.md) | REPLv2 Unix-socket REPL server |
+| [`TUNNEL_PROVIDER_MIGRATION.md`](guides/TUNNEL_PROVIDER_MIGRATION.md) | Migration from removed managed Cloudflare/ngrok/Tailscale providers |
+| [`DEBIAN_PACKAGE_LIST.md`](guides/DEBIAN_PACKAGE_LIST.md) | Debian MT host packages and Python tooling dependencies |
+| [`UBUNTU_PACKAGE_LIST.md`](guides/UBUNTU_PACKAGE_LIST.md) | Ubuntu MT host packages and Python tooling dependencies |
+| [`FEDORA_PACKAGE_LIST.md`](guides/FEDORA_PACKAGE_LIST.md) | Fedora MT host packages and Python tooling dependencies |
+| [`ARCHLINUX_PACKAGE_LIST.md`](guides/ARCHLINUX_PACKAGE_LIST.md) | Arch Linux MT host packages and Python tooling dependencies |
+| [`GENTOO_PACKAGE_LIST.md`](guides/GENTOO_PACKAGE_LIST.md) | Gentoo/OpenRC MT packages and rootless Podman prerequisites |
+| [`AI-CODE-CONTRIBUTION-POLICY.md`](guides/AI-CODE-CONTRIBUTION-POLICY.md) | AI code contribution policy (effective August 15th, 2026) |
+| [`darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md`](guides/darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md) | DarkIRC registry, daemon, tenant, and contact-key build/deploy guide |
+| [`darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md`](guides/darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md) | Current per-tenant DarkIRC adapter architecture |
+| [`lunarwing_weechat_wss/README.md`](guides/lunarwing_weechat_wss/README.md) | Current WeeChat relay, adapter, and WASM channel guide |
+| [`gotify-wasm/README.md`](guides/gotify-wasm/README.md) | Gotify WASM tool build, setup, secret, and MT configuration |
+| [`history/`](guides/history/) | Archived v1, duplicate, placeholder, and unsafe one-off guides |
 
 ---
 
@@ -206,10 +206,9 @@ Agent-driven plan and spec documents produced by the superpowers workflow.
 ### 💡 [`proposals/`](proposals/)
 
 The directory contains active proposals plus retained implementation, verification,
-superseded, and historical records. Files present at the time were audited against
-current source and tests on 2026-07-20 at revision `50c8f99`; later additions were
-not part of that audit and use their own status notes, or `Open` when unstated.
-Shipped or superseded records may later move to
+superseded, and historical records. Statuses were reconciled against current
+source on 2026-08-04 at revision `be798a9`; point-in-time design and audit records
+retain their original evidence dates. Shipped or superseded records may later move to
 [`internal/history/proposals/`](internal/history/proposals/), but remain indexed
 here while they are still present in `proposals/`.
 
@@ -221,17 +220,19 @@ here while they are still present in `proposals/`.
 | [`CARGO_TESTS_FIX.md`](proposals/CARGO_TESTS_FIX.md) | Partial | Ten test fixes landed; six architectural test cases remain deferred |
 | [`CHAOS_FOLLOWUP_TESTS.md`](proposals/CHAOS_FOLLOWUP_TESTS.md) | Partial | Truncated-state coverage landed; most proposed chaos cases remain open |
 | [`COOL_THINGS_THAT_HERMES_AGENT_HAS.md`](proposals/COOL_THINGS_THAT_HERMES_AGENT_HAS.md) | Historical | Roadmap snapshot with several shipped ideas and a larger open wishlist |
-| [`DARKIRC_SECURE_KEY_EXCHANGE.md`](proposals/DARKIRC_SECURE_KEY_EXCHANGE.md) | Open | Secure contact-key exchange design; Phase 0 prerequisite is not implemented |
+| [`DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md`](proposals/DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md) | Open / security-gated | Post-Stage-A key-exchange roadmap with explicit live-isolation and leak-test gates |
+| [`DARKIRC_SECURE_KEY_EXCHANGE.md`](proposals/DARKIRC_SECURE_KEY_EXCHANGE.md) | Partial | Phase 0/1 and Stage A shipped; Stage B and later remain deferred behind security gates |
 | [`DARKIRC_THINGS_TO_ADD.md`](proposals/DARKIRC_THINGS_TO_ADD.md) | Partial | Disabled-by-default behavior shipped; Tor and seed work remain open |
 | [`ENGINE_LLM_STREAMING.md`](proposals/ENGINE_LLM_STREAMING.md) | Implemented | Engine streaming and cancellation phases 0-5; channel rollout validation remains operational |
 | [`ENGINE_V2_POLISH_v2.0.3.0.md`](proposals/ENGINE_V2_POLISH_v2.0.3.0.md) | Implemented | v2.0.3.0 Engine V2 fixes for provenance, mission controls, gates, and memory; P1/P2 landed, P3 partially deferred |
 | [`EXTERNAL-WORKER-AUDIT-2026-06-23.md`](proposals/EXTERNAL-WORKER-AUDIT-2026-06-23.md) | Implemented / historical | External-worker security findings and landed fixes |
 | [`EXTERNAL-WORKER-PLAN-UPGRADES.md`](proposals/EXTERNAL-WORKER-PLAN-UPGRADES.md) | Implemented | Context, pooling, load balancing, and surviving worker updates landed |
-| [`EXTERNAL-WORKER-PROMPT-CONTEXT.md`](proposals/EXTERNAL-WORKER-PROMPT-CONTEXT.md) | Implemented | Typed, bounded, opt-in conversation context propagation for OpenCode, Nanocode, and Pebble workers |
+| [`EXTERNAL-WORKER-PROMPT-CONTEXT.md`](proposals/EXTERNAL-WORKER-PROMPT-CONTEXT.md) | Implemented | Typed, bounded, opt-in conversation context propagation for Pebble, OpenCode, and Kimi Code workers; Nanocode coverage retained as history |
 | [`EXTERNAL-WORKER-UPGRADES-PROGRESS.md`](proposals/EXTERNAL-WORKER-UPGRADES-PROGRESS.md) | Implemented / historical | Completed external-worker progress record |
-| [`GITLAB_CI_CD_PLAN.md`](proposals/GITLAB_CI_CD_PLAN.md) | Partial / activation pending | Four-layer GitLab CI/CD rollout plan; Phase 1 is implemented and later phases remain gated |
+| [`EXTWORKERCONVERSATIONHIST.md`](proposals/EXTWORKERCONVERSATIONHIST.md) | Implemented | Concise `context_scope=recent` and local/Docker iteration-budget usage note |
+| [`GITLAB_CI_CD_PLAN.md`](proposals/GITLAB_CI_CD_PLAN.md) | Phase 1 active / Phase 2 partial | Green default-branch and MR pipelines verify the required CI; PostgreSQL/browser/coverage/standalone integration plus package and deployment phases remain |
 | [`GITWASM/README.md`](proposals/GITWASM/README.md) | Open | Gitoxide-based Git/Markdown WASM tool proposal |
-| [`HERMES-KAWARIMI-ADAPTER.md`](proposals/HERMES-KAWARIMI-ADAPTER.md) | Partial / rehearsal pending | Provision-then-populate Hermes import adapter with tested read-only paths and an unrehearsed live apply path |
+| [`HERMES-KAWARIMI-ADAPTER.md`](proposals/HERMES-KAWARIMI-ADAPTER.md) | Implemented (Phase 1) | Live-validated provision-then-populate Hermes import with owner-scope checks, encrypted secrets, explicit PG-only window, and failure cleanup |
 | [`HTTP_TOOL_SSRF_PROTECTIONS.md`](proposals/HTTP_TOOL_SSRF_PROTECTIONS.md) | Implemented / historical | Investigation record for the active HTTP-tool SSRF controls |
 | [`human-delay-mode-phase1-test-checklist.md`](proposals/human-delay-mode-phase1-test-checklist.md) | Implemented | Verified Phase 1 supervised-mode checklist |
 | [`human-delay-mode-phase1-verification-handoff.md`](proposals/human-delay-mode-phase1-verification-handoff.md) | Superseded | Fulfilled Phase 1 verification handoff |
@@ -253,16 +254,18 @@ here while they are still present in `proposals/`.
 | [`MT-LEGACY-UPGRADE-VERIFICATION.md`](proposals/MT-LEGACY-UPGRADE-VERIFICATION.md) | Verification pending | Legacy harness canary, rollback, soak, and sign-off plan |
 | [`MT-ONBOARDING-CLI.md`](proposals/MT-ONBOARDING-CLI.md) | Historical pointer | Original design moved to `internal/history/proposals/`; current commands live in `lunarwing_mt_onboard/README.md` |
 | [`MT-WEECHAT-CONSISTENCY-AND-CHANNEL-PRUNING.md`](proposals/MT-WEECHAT-CONSISTENCY-AND-CHANNEL-PRUNING.md) | Superseded | Historical deployment snapshot; allowlist and log rotation ideas remain |
-| [`MULTIAGENTTEAMORCHESTRATION_INTEGRATION_PLAN_v2.0.4.0.md`](proposals/MULTIAGENTTEAMORCHESTRATION_INTEGRATION_PLAN_v2.0.4.0.md) | Open | Release-scoped plan for structured multi-agent coordination hooks, policies, and enforcement |
-| [`MULTIAGENTTEAMORCHESTRATION/coordination-phase1-hooks.md`](proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-hooks.md) | Open | Declarative-hook capabilities, enforcement scope, and limitations for coordination Phase 1 |
-| [`MULTIAGENTTEAMORCHESTRATION/coordination-phase1-plan.md`](proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-plan.md) | Ready for deployment | Deployment-ready Phase 1 plan using workspace hook bundles without Rust changes |
-| [`MULTIAGENTTEAMORCHESTRATION/coordination-pipeline-plan.md`](proposals/MULTIAGENTTEAMORCHESTRATION/coordination-pipeline-plan.md) | Draft | Engine V2 implementation plan for hooks, engagement policy, rate limits, and auto-disable gates |
-| [`MULTIAGENTTEAMORCHESTRATION/OriginalAgentFrameworkFromMidApril.md`](proposals/MULTIAGENTTEAMORCHESTRATION/OriginalAgentFrameworkFromMidApril.md) | Open | Original hook-based coordination framework for structured XMPP and IRC group-chat agents |
-| [`MULTIAGENTTEAMORCHESTRATION/rarity-source-verification.md`](proposals/MULTIAGENTTEAMORCHESTRATION/rarity-source-verification.md) | Open | Source verification and feasibility assessment of the Engine V2 coordination pipeline plan |
+| [`MULTIAGENTTEAMORCHESTRATION_INTEGRATION_PLAN_v2.0.4.0.md`](proposals/MULTIAGENTTEAMORCHESTRATION_INTEGRATION_PLAN_v2.0.4.0.md) | Implemented | Release-scoped design reconciled with the shipped four-phase coordination pipeline |
+| [`MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md`](proposals/MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md) | Implemented / operational | Current environment, policy-scope, gate, admin API, and coalescing contract |
+| [`MULTIAGENTTEAMORCHESTRATION/coordination-phase1-bundle.json`](proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-bundle.json) | Implemented artifact | Guarded declarative bundle synchronized with `ic/config/hooks/coordination.hook.json` |
+| [`MULTIAGENTTEAMORCHESTRATION/coordination-phase1-hooks.md`](proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-hooks.md) | Implemented / historical | Declarative-hook capabilities and Phase 1 limitation record |
+| [`MULTIAGENTTEAMORCHESTRATION/coordination-phase1-plan.md`](proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-plan.md) | Implemented / historical | Pre-implementation Phase 1 deployment plan |
+| [`MULTIAGENTTEAMORCHESTRATION/coordination-pipeline-plan.md`](proposals/MULTIAGENTTEAMORCHESTRATION/coordination-pipeline-plan.md) | Superseded design | Original Engine V2 pipeline draft; deployment guide is authoritative |
+| [`MULTIAGENTTEAMORCHESTRATION/OriginalAgentFrameworkFromMidApril.md`](proposals/MULTIAGENTTEAMORCHESTRATION/OriginalAgentFrameworkFromMidApril.md) | Historical source | Original hook-based coordination framework for structured XMPP and IRC group-chat agents |
+| [`MULTIAGENTTEAMORCHESTRATION/rarity-source-verification.md`](proposals/MULTIAGENTTEAMORCHESTRATION/rarity-source-verification.md) | Historical | v2.0.2 feasibility assessment superseded by the shipped implementation |
 | [`MULTICA_INTEGRATION_PLAN.md`](proposals/MULTICA_INTEGRATION_PLAN.md) | Partial | Bridge and polling channel shipped; real-time WS and skill import remain open |
 | [`MULTICA_LUNARTICA_RESKIN.md`](proposals/MULTICA_LUNARTICA_RESKIN.md) | Open / external | Lunartica UI reskin plan for a separate repository |
 | [`MULTICA_SUPPORT.md`](proposals/MULTICA_SUPPORT.md) | Superseded | Stub absorbed by the main Multica integration plan |
-| [`OH-MY-OPENAGENT.md`](proposals/OH-MY-OPENAGENT.md) | Partial | Plugin bundled in managed configs; no standalone drop-in config exists |
+| [`OH-MY-OPENAGENT.md`](proposals/OH-MY-OPENAGENT.md) | Open / unscoped | Neither a standalone drop-in nor an `oh-my-openagent` plugin entry exists in the current managed OpenCode config |
 | [`OLDPROJECT_PORT_ANALYSES/README.md`](proposals/OLDPROJECT_PORT_ANALYSES/README.md) | Partial / verification pending | Status index for the five pre-fork analyses; advisory baseline needs refresh |
 | [`OLDPROJECT_PORT_ANALYSES/ironclaw-0.28.1-port-analysis.md`](proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-0.28.1-port-analysis.md) | Partial | Approval clamping landed; remaining selected ports stay open |
 | [`OLDPROJECT_PORT_ANALYSES/ironclaw-0.28.2-port-analysis.md`](proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-0.28.2-port-analysis.md) | Partial | Security fixes landed; model facade and snapshot harness remain open |
@@ -282,10 +285,10 @@ here while they are still present in `proposals/`.
 | [`Profiles.md`](proposals/Profiles.md) | Open | Unscoped agent-profile/personality idea |
 | [`qwen3vl-ocr-podman.md`](proposals/qwen3vl-ocr-podman.md) | Open / external | External Qwen3-VL and Tesseract Podman runbook |
 | [`REFINE_LIBSQL_MIGRATION_GUIDE.md`](proposals/REFINE_LIBSQL_MIGRATION_GUIDE.md) | Open | Runtime-agnostic libSQL migration-guide refinement |
-| [`REFLEX_COMPILER_V2_UPGRADE_PLAN.md`](proposals/REFLEX_COMPILER_V2_UPGRADE_PLAN.md) | Open | Five-phase v2 upgrade plan for Reflex Compiler and Software Builder wiring, tenancy, reliability, and hardening |
-| [`REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED/REFLEXCOMPILERANALYSIS.md`](proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED/REFLEXCOMPILERANALYSIS.md) | Open | Comprehensive current-state and gap analysis of the Reflex Compiler fast path |
-| [`REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED/SOFTWAREBUILDERANALYSIS.md`](proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED/SOFTWAREBUILDERANALYSIS.md) | Open | Analysis of Software Builder architecture, consumers, artifact types, and implementation gaps |
-| [`RENDER_UNITS_SMALL_BUG.md`](proposals/RENDER_UNITS_SMALL_BUG.md) | Partial | `render-units` fix landed; optional-WeeChat health footgun remains |
+| [`REFLEX_COMPILER_V2_UPGRADE_PLAN.md`](proposals/REFLEX_COMPILER_V2_UPGRADE_PLAN.md) | Partial | Phase 1–3 reflex wiring, semantic opt-in, and batched hit telemetry shipped; Software Builder and later architectural work remain |
+| [`REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED/REFLEXCOMPILERANALYSIS.md`](proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED/REFLEXCOMPILERANALYSIS.md) | Partial / updated | Gap analysis with source-verified fixes through the semantic and write-behind fourth pass |
+| [`REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED/SOFTWAREBUILDERANALYSIS.md`](proposals/REFLEXCOMPILERANDSOFTWAREBUILDERUPDATESNEEDED/SOFTWAREBUILDERANALYSIS.md) | Open / reverified | Builder is callable, but validation, testing, registration, templates, persistence, and v2 integration gaps remain |
+| [`RENDER_UNITS_SMALL_BUG.md`](proposals/RENDER_UNITS_SMALL_BUG.md) | Partial | `render-units` and tenant-level WeeChat lifecycle gating shipped; the tmux duplicate-session start failure remains separate |
 | [`rootless-podman-babysitter.md`](proposals/rootless-podman-babysitter.md) | Implemented | Completed and reviewed rootless-Podman babysitter plan |
 | [`ROOTLESS_PODMAN_CONTAINER_SUPERVISION_GAP.md`](proposals/ROOTLESS_PODMAN_CONTAINER_SUPERVISION_GAP.md) | Superseded | Gap closed by OpenRC babysitters and systemd Quadlets |
 | [`ROUTINE_ENGINE_IMPROVEMENTS.md`](proposals/ROUTINE_ENGINE_IMPROVEMENTS.md) | Partial | Items 1-3 landed; items 4-8 remain deprioritized |

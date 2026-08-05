@@ -7,7 +7,7 @@ See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
 
 ## LunarWing Worker
 
-The main sandbox worker. Includes dev tools (git, build-essential, Node.js, Python3, Rust, GitHub CLI) and Claude Code CLI. The orchestrator (`ic/src/orchestrator/`) manages container lifecycle, LLM proxying, and credential injection.
+The main sandbox worker. Its runtime image includes Git, build-essential, Node.js/npm, Python 3, Rust, and GitHub CLI; it does not install a Claude Code executable. The orchestrator (`ic/src/orchestrator/`) manages container lifecycle, LLM proxying, and credential injection.
 
 **Dockerfile:** `ic/Dockerfile.worker`
 
@@ -28,7 +28,8 @@ Rust-based Pebble agentic coding harness. Bridges the NanoGPT community `pebble`
 cd pebble4lunarwing
 docker build -t lunarwing-worker-pebble:latest .
 
-# Or via the mt-admin lifecycle
+# Or select the worker per tenant and build the shared image via mt-admin
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-pebble
 sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 ```
 
@@ -44,10 +45,11 @@ Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` fo
 cd opencode4lunarwing
 docker build -t lunarwing-worker-opencode:latest .
 
-# Or via the mt-admin lifecycle
+# Select the worker per tenant, then build the shared image via mt-admin
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-opencode
 sudo ic/scripts/lunarwing-mt-admin.sh build-opencode-worker
 
-# Or as part of a per-tenant build
+# Or build the shared image as part of a per-tenant build
 sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <name> --with-opencode
 
 # Include Rust, Go, and C/C++ compilers for build/test jobs
@@ -91,6 +93,11 @@ Compose rejects a missing value before container launch. `KIMI_API_KEY` remains
 optional for OAuth-backed setups. mt-admin keeps both credentials out of process
 arguments by materializing private `kimi-runtime.env`; API key input uses file
 path rather than plaintext argv.
+
+For every persistent worker, `add-tenant --with-<worker>` controls the tenant's
+selection in `/etc/lunarwing/ports.json`. `build-tenant --with-<worker>` and the
+standalone build commands build shared images but do not select a worker for a
+tenant.
 
 ## Shared Protocol
 

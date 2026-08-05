@@ -94,15 +94,15 @@ sudo emerge net-irc/weechat app-misc/tmux dev-python/aiohttp
 
 ## 6. Python packages (ops tooling)
 
-The host-side Python tooling (multi-tenant onboard CLIs/web UI, Hermes importer, `ic_sm` secret
-scripts) needs these third-party modules. Gentoo's system Python is PEP-668 managed, so either
+The supported host-side Python tooling (multi-tenant onboard CLIs/web UI and Hermes importer)
+needs these third-party modules. Gentoo's system Python is PEP-668 managed, so either
 emerge the `dev-python/*` atoms **or** install the pinned requirements into a venv
 (`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`) — each tool ships one.
 
 | Package | Consumers |
 |---------|-----------|
-| `dev-python/cryptography` | `ic_sm/scripts_4_db/*.py`, `lunarwing_mt_onboard/secrets_ops.py`, `hermes_kawarimi` (secrets crypto) |
-| `dev-python/psycopg` | Live tenant DB writes from the same secret tooling (imports `psycopg2`; use a slot/venv providing psycopg 2.x, or `pip install psycopg2-binary` in a venv) |
+| `dev-python/cryptography` | `lunarwing_mt_onboard/secrets_ops.py`, `hermes_kawarimi` (secrets crypto) |
+| `dev-python/psycopg` | Onboarding secret writes to tenant PostgreSQL (imports `psycopg2`; use a slot/venv providing psycopg 2.x, or `pip install psycopg2-binary` in a venv) |
 | `dev-python/rich` | `lunarwing_mt_onboard` CLI, `hermes_kawarimi` |
 | `dev-python/questionary` | `lunarwing_mt_onboard` interactive CLI, `hermes_kawarimi` |
 | `dev-python/pyyaml` | `hermes_kawarimi` (`config.yaml` parsing), `.gitlab/scripts/validate_config.py` |

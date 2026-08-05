@@ -1,9 +1,11 @@
 # proposal
 
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** No standalone
-> `oh-my-openagent.jsonc` equivalent exists. Bundled OpenCode/Nanocode configs
-> include the plugin, which addresses managed worker images but not an arbitrary
-> fresh user OpenCode installation.
+> **Current status (reverified 2026-08-04): OPEN / UNSCOPED.** No standalone
+> `oh-my-openagent.jsonc` equivalent exists, and the current managed OpenCode
+> config (`opencode4lunarwing/config/opencode.json`) does not list an
+> `oh-my-openagent` plugin. Nanocode is retired. Any implementation should first
+> identify the maintained plugin/package and define how it coexists with the
+> five plugins already shipped in the managed OpenCode image.
 
 ## prob
 

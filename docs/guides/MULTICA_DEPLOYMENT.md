@@ -1,209 +1,108 @@
-# Quick Reference: Connecting LunarWing to Multica
+# Connect LunarWing to Multica/Lunartica
 
-**Target:** LunarWing instance on branch `1.1.0-new-lunartica`  
-**Multica Version:** Any recent release (server verified compatible as of 2026-06-01)
+LunarWing ships two registry extensions for Multica/Lunartica:
 
----
+- the **`multica` WASM channel**, which polls for tasks, heartbeats, auto-registers a runtime when needed, and routes agent output back to the board;
+- the **`multica-bridge` WASM tool**, whose agent-visible tool name is `multica` and which performs explicit runtime, task, issue, comment, and skill actions.
+
+This integration is available on the current LunarWing source tree; it is not tied to the retired `1.1.0-new-lunartica` branch.
 
 ## Prerequisites
 
-- LunarWing running with the `1.1.0-new-lunartica` branch deployed
-- A running Multica server instance
-- A Multica workspace with at least one member
-- Ability to generate a Personal Access Token (PAT) in Multica
+- A reachable Multica/Lunartica server and workspace UUID.
+- A Personal Access Token accepted by that server, normally beginning with `mul_`.
+- A unique daemon identifier for this LunarWing instance.
+- A server URL allowed by the installed extension capability policy.
 
----
+Use HTTPS for remote servers. Plain HTTP remote URLs are rejected by LunarWing's normal outbound URL safety policy unless the deployment explicitly enables private-network access.
 
-## Step 1: Gather Multica Credentials
+## Install the Extensions
 
-In your Multica instance UI:
+From the `ic/` checkout, build and install one or both registry entries:
 
-1. Navigate to **Settings → Tokens** (or equivalent)
-2. Create a new Personal Access Token
-3. Copy the token (starts with `mul_`)
-4. Note your **Workspace UUID** (visible in the workspace URL or settings)
+```bash
+lunarwing registry install multica --build
+lunarwing registry install multica-bridge --build
+```
 
----
+Use the authenticated Extensions setup flow to provide the channel's required fields and `multica_api_token`. For the tool, `lunarwing tool auth multica-bridge` configures its declared token secret. The host injects the bearer token at the HTTP boundary; never write it into workspace JSON or a capability file.
 
-## Step 2: Configure LunarWing
+Restart LunarWing after installing a channel or changing startup extension directories.
 
-Create or edit the multica config at `config/multica.json` in your LunarWing workspace:
+## Configure the Channel
+
+The channel setup schema accepts:
 
 ```json
 {
-  "url": "http://your-multica-server:8080",
-  "workspace_id": "your-workspace-uuid-here",
-  "daemon_id": "lunarwing",
+  "multica_url": "https://multica.example.com",
+  "workspace_id": "<workspace-uuid>",
+  "daemon_id": "lunarwing-prod-1",
+  "runtime_type": "lunarwing",
+  "polling_enabled": true,
+  "poll_interval_ms": 30000
+}
+```
+
+`poll_interval_ms` is clamped to a minimum of `30000`. On startup, the channel persists its scoped configuration, verifies that `multica_api_token` exists, and polls only when `polling_enabled` is true. If no runtime ID exists, it registers and stores the resulting ID in channel-scoped state.
+
+The channel capability confines its workspace files below `channels/multica/`. Do not copy the tool's `config/multica.json` path into that directory manually; use extension setup so the host supplies the channel configuration in the expected shape.
+
+## Configure the Tool
+
+The `multica-bridge` tool reads `config/multica.json` from the agent workspace:
+
+```json
+{
+  "url": "https://multica.example.com",
+  "workspace_id": "<workspace-uuid>",
+  "daemon_id": "lunarwing-prod-1",
   "runtime_type": "lunarwing"
 }
 ```
 
-| Field | Description | Example |
-|-------|-------------|---------|
-| `url` | Full URL of your Multica server | `http://localhost:8080` |
-| `workspace_id` | UUID of the workspace | `a1b2c3d4-...` |
-| `daemon_id` | Unique identifier for this instance | `lunarwing` (default) |
-| `runtime_type` | Runtime type string | `lunarwing` (default) |
-
----
-
-## Step 3: Set the Secret
-
-Configure the `multica_api_token` secret in LunarWing:
-
-```bash
-lunarwing secret set multica_api_token
-# Enter your PAT when prompted (starts with mul_)
-```
-
-Or via environment variable:
-
-```bash
-export MULTICA_API_TOKEN="mul_your_token_here"
-```
-
----
-
-## Step 4: Register as a Runtime
-
-Use the `multica-bridge` tool to register LunarWing with the Multica board:
-
-```
-multica(action: "register")
-```
-
-This will:
-- Register LunarWing as a runtime in the workspace
-- Return a `runtime_id` — save this in `config/multica.json` as `"runtime_id": "..."`
-- If not auto-saved, manually add it:
+Call the `multica` tool with `action: "register"`. Registration returns server JSON containing the runtime ID; add that value to the tool configuration before using runtime-scoped actions:
 
 ```json
 {
-  "url": "http://your-multica-server:8080",
-  "workspace_id": "your-workspace-uuid-here",
-  "runtime_id": "returned-runtime-uuid-here",
-  "daemon_id": "lunarwing",
+  "url": "https://multica.example.com",
+  "workspace_id": "<workspace-uuid>",
+  "runtime_id": "<runtime-uuid>",
+  "daemon_id": "lunarwing-prod-1",
   "runtime_type": "lunarwing"
 }
 ```
 
----
+The tool also supports legacy individual workspace keys such as `config/multica_url`, but the single JSON file is easier to audit.
 
-## Step 5: Recover Any Orphaned Tasks
+## Tool Actions
 
-If LunarWing crashed previously, claim any tasks left in progress:
-
-```
-multica(action: "recover_orphans")
-```
-
----
-
-## Step 6: Start Polling
-
-Enable the `multica` channel in your LunarWing configuration:
-
-```json
-{
-  "channels": {
-    "multica": {
-      "enabled": true,
-      "poll_interval_ms": 30000
-    }
-  }
-}
-```
-
-Or let the channel auto-poll on startup if `polling_enabled: true` is set in the capabilities config.
-
----
-
-## Full Polling Loop (via Skill)
-
-The `ic/skills/multica-poll/SKILL.md` skill defines the full lifecycle. Key actions:
+The current capability manifest exposes:
 
 | Action | Purpose |
-|--------|---------|
-| `register` | First-time setup — creates runtime entry |
-| `heartbeat` | Keep alive + receive pending skill requests |
-| `claim_task` | Pick up the next pending task from the board |
-| `start_task` | Mark a claimed task as "running" |
-| `report_progress` | Update progress (step/total) |
-| `complete_task` | Mark task done, attach output or PR URL |
-| `fail_task` | Mark task failed with reason |
-| `post_comment` | Comment on an issue |
-| `recover_orphans` | Reclaim tasks from crashed runtime |
+| --- | --- |
+| `register`, `heartbeat`, `recover_orphans` | Runtime lifecycle |
+| `claim_task`, `start_task`, `complete_task`, `fail_task` | Task lifecycle |
+| `report_progress`, `report_messages` | Execution reporting |
+| `list_issues`, `get_issue`, `update_issue`, `post_comment` | Issue operations |
+| `list_skills`, `get_skill`, `export_skill` | Board skill exchange |
 
----
+The full polling lifecycle and required action order are defined in [`../../ic/skills/multica-poll/SKILL.md`](../../ic/skills/multica-poll/SKILL.md). Treat that skill and the extension manifests as the current parameter reference.
 
-## Tool Actions Reference
+## Verify
 
-The `multica-bridge` tool supports these actions (use `action` parameter):
+1. Confirm `lunarwing registry info multica` and `lunarwing registry info multica-bridge` resolve the expected manifests.
+2. Confirm the extensions are installed and the token setup reports configured without displaying its value.
+3. For the channel, inspect logs for successful registration or heartbeat and verify the poll interval is at least 30 seconds.
+4. For the tool, run `register`, save the returned runtime ID, then run `heartbeat`.
+5. Use a disposable board task to validate claim, progress, and completion routing.
 
-```
-multica(action: "register")
-multica(action: "heartbeat")
-multica(action: "claim_task")
-multica(action: "start_task", task_id: "...")
-multica(action: "complete_task", task_id: "...", output: "...", pr_url: "...")
-multica(action: "fail_task", task_id: "...", reason: "...")
-multica(action: "report_progress", task_id: "...", output: "...", step: 2, total: 5)
-multica(action: "post_comment", issue_id: "MUL-123", comment: "...")
-multica(action: "list_issues", status: "open")
-multica(action: "get_issue", issue_id: "MUL-123")
-multica(action: "update_issue", issue_id: "MUL-123", status: "in_progress")
-multica(action: "recover_orphans")
-multica(action: "report_messages", task_id: "...", messages: [...])
-multica(action: "list_skills")
-multica(action: "get_skill", skill_id: "...")
-multica(action: "export_skill", skill_name: "...", skill_description: "...", skill_content: "...")
-```
-
----
+For local protocol checks, use `ic/scripts/multica-local-test-server.sh` and `ic/scripts/multica-bridge-smoke-test.sh`. Review those scripts before running them and keep test credentials separate from production.
 
 ## Troubleshooting
 
-**"multica_api_token secret not configured"**
-→ Set the secret in Step 3. Run `lunarwing secret set multica_api_token`.
-
-**"runtime_id not set — run register first"**
-→ Run `multica(action: "register")` and save the returned `runtime_id` to config.
-
-**"workspace not found" (404 on register)**
-→ Verify `workspace_id` in config matches your actual Multica workspace UUID exactly.
-
-**"daemon_id is required" (400 on register)**
-→ Ensure `daemon_id` is set in `config/multica.json`. Defaults to `"lunarwing"` if omitted.
-
-**"runtime not in connection workspace" (WebSocket)**
-→ The token's user must be a member of the workspace. Check PAT permissions.
-
-**Tasks not appearing in polling loop**
-→ Verify `polling_enabled: true` in channel config. Check Multica board has open tasks assigned to the correct runtime type.
-
----
-
-## Architecture Overview
-
-```
-┌─────────────────────┐       ┌────────────────────────┐
-│      LunarWing      │       │    Multica Server       │
-│                     │       │                        │
-│  ┌─────────────┐   │ HTTP  │  ┌──────────────────┐  │
-│  │  Channel    │◄──┼───────┼─►│ /api/daemon/*    │  │
-│  │  (poll/emit)│   │       │  │ (runtime mgmt)   │  │
-│  └─────────────┘   │       │  └──────────────────┘  │
-│                     │       │                        │
-│  ┌─────────────┐   │       │  ┌──────────────────┐  │
-│  │   Tool      │◄──┼───────┼─►│ /api/issues/*    │  │
-│  │  (actions)  │   │       │  │ /api/skills/*    │  │
-│  └─────────────┘   │       │  └──────────────────┘  │
-└─────────────────────┘       └────────────────────────┘
-```
-
-- **Channel:** Polls for tasks, emits them as agent messages, routes completions back
-- **Tool:** Direct API access for all daemon + user operations (used by skill/routines)
-
----
-
-*Dark Forest Wizard Chief of Engineering — Deployment Ready* ⚡🐴
+- **`multica_api_token secret not configured`** — complete channel setup or run `lunarwing tool auth multica-bridge`; exporting an environment variable alone does not place a token in the WASM secret store.
+- **`runtime_id not set in config`** — the tool does not persist its registration response; add the returned ID to `config/multica.json`. The channel manages its own runtime state automatically.
+- **Workspace or membership errors** — verify the workspace UUID and that the PAT's user belongs to that workspace.
+- **No tasks arrive** — verify `polling_enabled`, the 30-second minimum interval, runtime assignment, and the channel's heartbeat response.
+- **Outbound request rejected** — check the configured URL and installed HTTP capability allowlist. Do not weaken global URL validation merely to bypass a typo or an unexpected redirect.

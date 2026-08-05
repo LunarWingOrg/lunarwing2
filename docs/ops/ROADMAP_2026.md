@@ -1,9 +1,13 @@
 # The Roadmap Document
 
 
-## Things to add:
-### Container Registry
-### update opencode to new version
+## Maintenance notes
+
+- GitLab container-registry setup and manual worker-image CI are implemented;
+  see [`GITLAB_CONTAINER_REGISTRY.md`](GITLAB_CONTAINER_REGISTRY.md).
+- OpenCode updates remain normal dependency maintenance. The current worker
+  image pins upstream `v1.17.13`; change that pin only with worker-image and
+  bridge validation.
 
 ## Actual Official Roadmap:
 | Feature | Target |

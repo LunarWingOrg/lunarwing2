@@ -1,6 +1,9 @@
 # Test Plan: Upgraded Tenant Across the 1.1.9 Renames (OpenRC/Gentoo)
 
-**Current**
+> **Historical validated plan.** “Current script,” registry v11, host inventory,
+> and line-level assumptions below refer to the 2026-07-04 1.1.8→1.1.9 test.
+> Current production registries are v14; use this document to reproduce the old
+> compatibility boundary, not as a general v2.0.4 upgrade runbook.
 
 **Goal:** validate `docs/ops/TENANT-RENAME-MIGRATION-1.1.9.md` end-to-end on a
 tenant that was **provisioned on v1.1.8** and upgraded to 1.1.9 — the case the
@@ -222,6 +225,6 @@ Phase 0 baseline.
   init scripts — leftovers from a prior test tenant; harmless, delete at will.
 - `/home/lion/lunarwing` contains a ~74 MB regular file whose name is
   whitespace (mtime Jul 4 20:25) — likely a stray binary copy; worth a look.
-- `TENANT-RENAME-MIGRATION-1.1.9.md`'s footgun caveat originally pointed at
-  "GOALS item #7", which has since been renumbered; the fix is actually
-   scheduled for v2.0.3 (see that doc's corrected caveat).
+- `TENANT-RENAME-MIGRATION-1.1.9.md`'s original footgun caveat is historical.
+  The `enable_weechat` health and lifecycle gate has since landed; only the tmux
+  duplicate-session startup failure described there remains open.

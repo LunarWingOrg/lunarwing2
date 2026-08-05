@@ -1,5 +1,12 @@
 # Software Builder System — Analysis Report
 
+**Status (reverified 2026-08-04):** The §7 functional-gap summary remains
+current. `validate_wasm`, `run_tests`, `auto_register`, `wasm_output_dir`, and
+`cleanup_on_failure` are still configuration/result fields rather than executed
+build-loop stages; `TemplateEngine`, `TestHarness`, and `WasmValidator` remain
+unwired from `core.rs`. Templates still use the 2021 edition and raw `extern
+"C"` ABI. Line numbers below are the 2026-07-23 snapshot and may have shifted.
+
 **Date:** 2026-07-23
 **Analyst:** Automated deep-dive
 **Codebase:** LunarWing v2 (`/home/openjaw/lunarwing2/ic`)

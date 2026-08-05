@@ -1,6 +1,10 @@
-# other v2 things md
+# Other v2 Scratch Tasks
 
-# before 2.0.0.0 releases
+> **Historical snapshot.** This list predates v2.0.0.0 and is not a current
+> release checklist. Use [`AGENT_GOALS_2.0.4.0.md`](AGENT_GOALS_2.0.4.0.md) and
+> [`ROADMAP_2026.md`](ROADMAP_2026.md) for active release work and future targets.
+
+# Before the 2.0.0.0 release (historical)
 
 - [x] this is a task ✅ 2026-07-12
 - [x] this is another ✅ 2026-07-12
