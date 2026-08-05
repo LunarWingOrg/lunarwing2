@@ -38,8 +38,12 @@ pub async fn run_task(
     let timeout_ms = request.timeout_ms.unwrap_or(protocol::DEFAULT_TIMEOUT_MS);
 
     let mut child = match spawn_pebble(config, request) {
-        Ok(child) => child,
+        Ok(child) => {
+            eprintln!("[exec] {}: spawned pebble pid={:?}", request.task_id, child.id());
+            child
+        }
         Err(e) => {
+            eprintln!("[exec] {}: spawn failed: {e}", request.task_id);
             let _ = event_tx.send(ExecutorEvent::Result(protocol::result_envelope(
                 &request.task_id,
                 "error",
@@ -74,8 +78,10 @@ pub async fn run_task(
         stdout, &task_id, &event_tx, timeout_ms, cancel_rx, &mut child,
     )
     .await;
+    eprintln!("[exec] {}: stdout stream ended", request.task_id);
 
     let _ = stderr_handle.await;
+    eprintln!("[exec] {}: stderr stream ended", request.task_id);
 
     let duration_ms = elapsed_ms(start);
     let output = final_message.as_deref().unwrap_or(&accumulated_output);
@@ -89,6 +95,7 @@ pub async fn run_task(
         duration_ms,
     )
     .await;
+    eprintln!("[exec] {}: result built, forwarding", request.task_id);
     let _ = event_tx.send(ExecutorEvent::Result(result));
 }
 
@@ -105,7 +112,7 @@ fn spawn_pebble(
     let mut cmd = Command::new(&config.pebble_bin);
     cmd.args([
         "--output-format",
-        "ndjson",
+        "json",
         "--permission-mode",
         &config.permission_mode,
         "--model",
@@ -114,6 +121,7 @@ fn spawn_pebble(
     ])
     .arg(build_task_prompt(request))
     .current_dir(work_dir)
+    .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .kill_on_drop(true);
@@ -186,7 +194,7 @@ async fn stream_stdout(
                 if line.trim().is_empty() {
                     continue;
                 }
-                if let Some(early) = process_ndjson_line(
+                if let Some(early) = process_json_line(
                     &line, task_id, event_tx, &mut accumulated_output, &mut final_message,
                 ) {
                     return early;
@@ -209,7 +217,7 @@ async fn stream_stdout(
     (outcome, accumulated_output, final_message)
 }
 
-fn process_ndjson_line(
+fn process_json_line(
     line: &str,
     task_id: &str,
     event_tx: &mpsc::UnboundedSender<ExecutorEvent>,
@@ -300,10 +308,17 @@ fn process_ndjson_line(
             )));
             None
         }
+        // `pebble --output-format json` prints a single JSON document at the
+        // end of a turn ({"message": ..., "iterations": ..., ...}) with no
+        // `type` field; capture its `message` as the task's final result.
         _ => {
-            let _ = event_tx.send(ExecutorEvent::Progress(protocol::progress_envelope(
-                task_id, line,
-            )));
+            if let Some(message) = parsed.get("message").and_then(serde_json::Value::as_str) {
+                *final_message = Some(message.to_string());
+            } else {
+                let _ = event_tx.send(ExecutorEvent::Progress(protocol::progress_envelope(
+                    task_id, line,
+                )));
+            }
             None
         }
     }
@@ -486,5 +501,34 @@ mod tests {
         assert!(!history_section.contains("</task>"));
         assert!(!history_section.contains("<task>"));
         assert!(!history_section.contains('&'));
+    }
+
+    #[test]
+    fn final_json_document_becomes_final_message() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut output = String::new();
+        let mut final_message = None;
+        // Shape printed by `pebble --output-format json` at end of turn.
+        let line = r#"{"message":"done working","model":"openai/gpt-5.2","iterations":2,"tool_uses":[],"usage":{}}"#;
+
+        let outcome = process_json_line(line, "task-1", &tx, &mut output, &mut final_message);
+
+        assert!(outcome.is_none());
+        assert_eq!(final_message.as_deref(), Some("done working"));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn plain_stdout_lines_accumulate_and_forward() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut output = String::new();
+        let mut final_message = None;
+
+        let outcome = process_json_line("working on it", "task-1", &tx, &mut output, &mut final_message);
+
+        assert!(outcome.is_none());
+        assert_eq!(output, "working on it\n");
+        assert!(final_message.is_none());
+        assert!(rx.try_recv().is_ok());
     }
 }
