@@ -47,6 +47,10 @@ for older releases.
   parser stack to fix `RUSTSEC-2026-0187`.
 - Hardened release and CI tests for DarkIRC on overlayfs runners, synthetic H3
   secret canaries, and gateway webhook polling under load.
+- Fixed 25 of 26 web-gateway UI findings from `UI_FIX_SUGGESTIONS.md`,
+  including vendored offline JavaScript dependencies, mobile and accessibility
+  gaps, memory-editor safety, and an auth-expiry path; only the SSE
+  token-in-URL item (L4) remains open.
 
 ## Compatibility
 
@@ -62,6 +66,7 @@ for older releases.
 | Self-heal watchdog | v2.1.0; NetBird probe off and remediation disabled by default |
 | Base systemd service scope | `SELF_HEAL_SYSTEMD_SCOPE=system` by default; `user` supported for single-node user units |
 | Coordination schema | Inbound and outbound checks; actual inbound sender attribution |
+| Web gateway UI | 25 of 26 suggested fixes shipped; L4 (SSE token in URL) open |
 | CI scope | Source verification only; no package, release artifact, or tenant deployment job |
 
 ## Changes
@@ -165,6 +170,38 @@ NetBird suites.
 This fixes the observed failure where short untagged XMPP room messages reached
 the model, three generated persona replies were charged to the receiving agent,
 and the receiving agent disabled itself for 24 hours.
+
+### Web Gateway UI Fixes
+
+This release ships 25 of the 26 findings in `docs/ops/UI_FIX_SUGGESTIONS.md`.
+Only L4 (SSE bearer token in the URL query string) remains open for a later
+transport change.
+
+- Vendors DOMPurify and marked under `static/vendor/` with a non-empty
+  fallback and a tighter Content-Security-Policy, so the UI no longer breaks
+  in offline or private-network installs (H1).
+- Mobile and accessibility pass: the Logs tab and a connection indicator are
+  reachable at ≤768px, popovers work on touch and keyboard, tabs implement
+  ARIA keyboard navigation, jobs/routines tables are usable on narrow screens,
+  and toasts are exposed to assistive technology (H2, M1, M13, L6, L10).
+- Memory editor safety: reads can no longer pair one file's content with
+  another file's path, switching files warns on unsaved edits, and a tree load
+  failure no longer looks like an empty workspace (H3, M12, L1).
+- Routes native `alert()`/`confirm()`/`prompt()` calls through the app's modal
+  and toast system and moves hardcoded English strings to i18n (M2, M3, L9).
+- Logs auto-scroll only sticks when the user is near the top, and history
+  messages show real server timestamps instead of page-load time (M4, M6).
+- 401/403 responses route back to the auth screen instead of infinite
+  reconnects and raw error toasts (M7).
+- The restart progress modal gains a watchdog escape hatch (M8).
+- `escapeHtml()` is now attribute-safe inside quoted attributes, and
+  server-provided links use `rel="noopener"` (M9, L8).
+- Retrying a failed message keeps its image attachments, and multi-file
+  selection enforces the five-image limit (M10, M11).
+- Aligns the jobs table header with its five-column rows (M5).
+- Small cleanups: debounced log target filter, reconciled mobile tab-bar
+  overflow rules, dead `hljs` loading removed, and background polling pauses
+  in hidden tabs (L2, L3, L5, L7).
 
 ### Dependencies and Package Versions
 
@@ -311,3 +348,6 @@ and the receiving agent disabled itself for 24 hours.
   passed.
 - Coordination repair: 27 focused coordination tests, four bridge-contract
   tests, daemon/channel/bridge checks, rustfmt, Clippy, and diff check passed.
+- Web gateway UI branch: default check, all-target Clippy with warnings
+  denied, rustfmt, and the full test suite passed after merge; gitleaks clean
+  including the vendored JavaScript assets.
