@@ -114,6 +114,21 @@
       <button data-tab="settings" data-i18n="tab.settings">Settings</button>
       <div class="spacer"></div>
 
+      <!-- Mobile "More" overflow (H2): on narrow screens the desktop
+           controls (Logs button, status text, language, theme) are hidden;
+           this exposes them. The dot mirrors the SSE connection state. -->
+      <button class="more-btn" id="more-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="more-menu">
+        <span class="more-btn-label" data-i18n="tab.more">More</span>
+        <span class="mobile-status-dot" id="mobile-status-dot" aria-hidden="true"></span>
+      </button>
+      <div class="more-menu" id="more-menu" style="display:none">
+        <button type="button" class="more-menu-item" id="more-logs-btn" data-i18n="tab.logs">Logs</button>
+        <button type="button" class="more-menu-item" id="more-theme-btn" data-i18n="theme.menuLabel">Theme</button>
+        <div class="more-menu-divider" role="separator"></div>
+        <button type="button" class="more-menu-item" data-action="switch-language" data-lang="en">English</button>
+        <button type="button" class="more-menu-item" data-action="switch-language" data-lang="zh-CN">简体中文</button>
+      </div>
+
       <!-- Language Switcher -->
       <div class="language-switcher">
         <button class="language-btn" id="language-btn" type="button" title="Switch Language"
@@ -238,18 +253,20 @@
     <div class="tab-panel" id="tab-jobs">
       <div class="jobs-container">
         <div class="jobs-summary" id="jobs-summary"></div>
-        <table class="jobs-table" id="jobs-table">
-          <thead>
-            <tr>
-              <th data-i18n="jobs.id">ID</th>
-              <th data-i18n="jobs.title">Title</th>
-              <th data-i18n="jobs.status">Status</th>
-              <th data-i18n="jobs.created">Created</th>
-              <th data-i18n="jobs.actions">Actions</th>
-            </tr>
-          </thead>
-          <tbody id="jobs-tbody"></tbody>
-        </table>
+        <div class="table-scroll">
+          <table class="jobs-table" id="jobs-table">
+            <thead>
+              <tr>
+                <th data-i18n="jobs.id">ID</th>
+                <th data-i18n="jobs.title">Title</th>
+                <th data-i18n="jobs.status">Status</th>
+                <th data-i18n="jobs.created">Created</th>
+                <th data-i18n="jobs.actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="jobs-tbody"></tbody>
+          </table>
+        </div>
         <div class="empty-state" id="jobs-empty" style="display:none" data-i18n="jobs.empty">No jobs found</div>
       </div>
     </div>
@@ -284,21 +301,23 @@
     <div class="tab-panel" id="tab-routines">
       <div class="routines-container">
         <div class="routines-summary" id="routines-summary"></div>
-        <table class="routines-table" id="routines-table">
-          <thead>
-            <tr>
-              <th data-i18n="routines.name">Name</th>
-              <th data-i18n="routines.trigger">Trigger</th>
-              <th data-i18n="routines.action">Action</th>
-              <th data-i18n="routines.lastRun">Last Run</th>
-              <th data-i18n="routines.nextRun">Next Run</th>
-              <th data-i18n="routines.runs">Runs</th>
-              <th data-i18n="routines.status">Status</th>
-              <th data-i18n="routines.actions">Actions</th>
-            </tr>
-          </thead>
-          <tbody id="routines-tbody"></tbody>
-        </table>
+        <div class="table-scroll">
+          <table class="routines-table" id="routines-table">
+            <thead>
+              <tr>
+                <th data-i18n="routines.name">Name</th>
+                <th data-i18n="routines.trigger">Trigger</th>
+                <th data-i18n="routines.action">Action</th>
+                <th data-i18n="routines.lastRun">Last Run</th>
+                <th data-i18n="routines.nextRun">Next Run</th>
+                <th data-i18n="routines.runs">Runs</th>
+                <th data-i18n="routines.status">Status</th>
+                <th data-i18n="routines.actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="routines-tbody"></tbody>
+          </table>
+        </div>
         <div class="empty-state" id="routines-empty" style="display:none">
           <span data-i18n="routines.noConfigured">No routines configured. Ask the assistant to create one.</span>
         </div>

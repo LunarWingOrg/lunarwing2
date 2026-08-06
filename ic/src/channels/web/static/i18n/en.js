@@ -52,6 +52,7 @@ I18n.register('en', {
   'theme.tooltipLight': 'Theme: Light (click for System)',
   'theme.tooltipSystem': 'Theme: System (click for Dark)',
   'theme.announce': 'Theme: {mode}',
+  'theme.menuLabel': 'Theme',
 
   // Tabs
   'tab.chat': 'Chat',
@@ -62,6 +63,7 @@ I18n.register('en', {
   'tab.extensions': 'Extensions',
   'tab.skills': 'Skills',
   'tab.logs': 'Logs',
+  'tab.more': 'More',
   'settings.inference': 'Inference',
   'settings.agent': 'Agent',
   'settings.channels': 'Channels',

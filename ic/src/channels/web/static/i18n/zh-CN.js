@@ -52,6 +52,7 @@ I18n.register('zh-CN', {
   'theme.tooltipLight': '主题：浅色（点击切换跟随系统）',
   'theme.tooltipSystem': '主题：跟随系统（点击切换深色）',
   'theme.announce': '主题：{mode}',
+  'theme.menuLabel': '主题',
 
   // 标签页
   'tab.chat': '聊天',
@@ -62,6 +63,7 @@ I18n.register('zh-CN', {
   'tab.extensions': '扩展',
   'tab.skills': '技能',
   'tab.logs': '日志',
+  'tab.more': '更多',
   'settings.inference': '推理',
   'settings.agent': '代理',
   'settings.channels': '频道',

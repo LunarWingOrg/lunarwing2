@@ -553,6 +553,7 @@ function connectSSE() {
 
   eventSource.onopen = () => {
     document.getElementById('sse-dot').classList.remove('disconnected');
+    document.getElementById('mobile-status-dot').classList.remove('disconnected');
     document.getElementById('sse-status').textContent = I18n.t('status.connected');
     _reconnectAttempts = 0;
 
@@ -586,6 +587,7 @@ function connectSSE() {
   eventSource.onerror = () => {
     _reconnectAttempts++;
     document.getElementById('sse-dot').classList.add('disconnected');
+    document.getElementById('mobile-status-dot').classList.add('disconnected');
     document.getElementById('sse-status').textContent = I18n.t('status.reconnecting');
 
     // M7: EventSource retries forever on any error, including 401s.
@@ -4216,6 +4218,7 @@ function loadJobs() {
   if (!document.getElementById('jobs-summary')) {
     container.innerHTML =
       '<div class="jobs-summary" id="jobs-summary"></div>'
+      + '<div class="table-scroll">'
       + '<table class="jobs-table" id="jobs-table"><thead><tr>'
       + '<th>' + escapeHtml(I18n.t('jobs.id')) + '</th>'
       + '<th>' + escapeHtml(I18n.t('jobs.title')) + '</th>'
@@ -4223,6 +4226,7 @@ function loadJobs() {
       + '<th>' + escapeHtml(I18n.t('jobs.created')) + '</th>'
       + '<th>' + escapeHtml(I18n.t('jobs.actions')) + '</th>'
       + '</tr></thead><tbody id="jobs-tbody"></tbody></table>'
+      + '</div>'
       + '<div class="empty-state" id="jobs-empty" style="display:none">'
       + escapeHtml(I18n.t('jobs.empty')) + '</div>';
   }
@@ -5065,13 +5069,58 @@ function fetchGatewayStatus() {
   }).catch(function() {});
 }
 
-// Show/hide popover on hover
-document.getElementById('gateway-status-trigger').addEventListener('mouseenter', () => {
-  document.getElementById('gateway-popover').classList.add('visible');
-});
-document.getElementById('gateway-status-trigger').addEventListener('mouseleave', () => {
-  document.getElementById('gateway-popover').classList.remove('visible');
-});
+// L6: popovers must be reachable on touch and keyboard, not hover-only.
+// The triggers stay <div>s because the TEE popover nests an interactive
+// copy button (invalid inside <button>), so they get button semantics:
+// role/tabindex/aria-expanded, click toggle, keyboard open, Escape close.
+function setupPopoverTrigger(triggerId, popoverId, onOpen) {
+  const trigger = document.getElementById(triggerId);
+  const popover = document.getElementById(popoverId);
+  if (!trigger || !popover) return;
+  trigger.setAttribute('role', 'button');
+  trigger.setAttribute('tabindex', '0');
+  trigger.setAttribute('aria-expanded', 'false');
+  trigger.setAttribute('aria-controls', popoverId);
+
+  const open = () => {
+    if (onOpen) onOpen();
+    popover.classList.add('visible');
+    trigger.setAttribute('aria-expanded', 'true');
+  };
+  const close = () => {
+    popover.classList.remove('visible');
+    trigger.setAttribute('aria-expanded', 'false');
+  };
+  const toggle = () => {
+    if (popover.classList.contains('visible')) close(); else open();
+  };
+
+  let pointerDown = false;
+  trigger.addEventListener('pointerdown', () => { pointerDown = true; });
+  trigger.addEventListener('mouseenter', open);
+  trigger.addEventListener('mouseleave', close);
+  trigger.addEventListener('click', (e) => {
+    // Don't toggle when interacting with content inside the popover
+    if (popover.contains(e.target)) return;
+    toggle();
+  });
+  trigger.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    if (e.key === 'Escape') close();
+  });
+  trigger.addEventListener('focus', () => {
+    // Only open on keyboard focus; pointer clicks toggle via the click handler
+    if (!pointerDown) open();
+    pointerDown = false;
+  });
+  trigger.addEventListener('blur', (e) => {
+    if (e.relatedTarget && trigger.contains(e.relatedTarget)) return;
+    close();
+  });
+}
+
+// Show/hide popover on hover, focus, or tap (L6)
+setupPopoverTrigger('gateway-status-trigger', 'gateway-popover');
 
 // --- TEE attestation ---
 
@@ -5170,13 +5219,8 @@ function copyTeeReport() {
   });
 }
 
-document.getElementById('tee-shield').addEventListener('mouseenter', function() {
-  fetchTeeReport();
-  document.getElementById('tee-popover').classList.add('visible');
-});
-document.getElementById('tee-shield').addEventListener('mouseleave', function() {
-  document.getElementById('tee-popover').classList.remove('visible');
-});
+// Show/hide TEE popover on hover, focus, or tap; fetches the report on open (L6)
+setupPopoverTrigger('tee-shield', 'tee-popover', fetchTeeReport);
 
 // --- Extension install ---
 
@@ -6824,18 +6868,47 @@ function applyAriaAttributes() {
   if (tabBar) tabBar.setAttribute('role', 'tablist');
 
   document.querySelectorAll('.tab-bar button[data-tab]').forEach(btn => {
+    const tab = btn.getAttribute('data-tab');
+    const isActive = btn.classList.contains('active');
     btn.setAttribute('role', 'tab');
-    btn.setAttribute('aria-selected', btn.classList.contains('active') ? 'true' : 'false');
+    btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+    // L10: connect tabs to their panels and keep only the active tab in
+    // the Tab sequence (roving tabindex)
+    if (!btn.id) btn.id = 'tab-btn-' + tab;
+    btn.setAttribute('aria-controls', 'tab-' + tab);
+    btn.tabIndex = isActive ? 0 : -1;
   });
 
   document.querySelectorAll('.tab-panel').forEach(panel => {
     panel.setAttribute('role', 'tabpanel');
     panel.setAttribute('aria-hidden', panel.classList.contains('active') ? 'false' : 'true');
+    const tab = panel.id.replace(/^tab-/, '');
+    const btn = document.getElementById('tab-btn-' + tab);
+    if (btn) panel.setAttribute('aria-labelledby', btn.id);
   });
 }
 
 // Apply ARIA attributes on initial load
 applyAriaAttributes();
+
+// L10: arrow-key tab navigation with roving tabindex; selection follows
+// focus as keyboard and screen-reader users expect from a tablist.
+document.querySelector('.tab-bar').addEventListener('keydown', (e) => {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+  // Only consider visible tabs (mobile hides the Logs button)
+  const tabs = Array.from(document.querySelectorAll('.tab-bar button[data-tab]'))
+    .filter((b) => b.offsetParent !== null);
+  const currentIndex = tabs.indexOf(document.activeElement);
+  if (currentIndex < 0) return;
+  e.preventDefault();
+  let nextIndex;
+  if (e.key === 'Home') nextIndex = 0;
+  else if (e.key === 'End') nextIndex = tabs.length - 1;
+  else nextIndex = (currentIndex + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+  const next = tabs[nextIndex];
+  next.focus();
+  switchTab(next.getAttribute('data-tab'));
+});
 
 // --- Utilities ---
 
@@ -6968,6 +7041,35 @@ document.addEventListener('click', function(e) {
 document.getElementById('language-btn').addEventListener('click', function() {
   if (typeof toggleLanguageMenu === 'function') toggleLanguageMenu();
 });
+
+// --- H2: mobile "More" overflow menu (Logs, theme, language) ---
+(function setupMoreMenu() {
+  const moreBtn = document.getElementById('more-btn');
+  const moreMenu = document.getElementById('more-menu');
+  if (!moreBtn || !moreMenu) return;
+  const setOpen = (open) => {
+    moreMenu.style.display = open ? 'flex' : 'none';
+    moreBtn.setAttribute('aria-expanded', String(open));
+  };
+  moreBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setOpen(moreMenu.style.display !== 'flex');
+  });
+  document.addEventListener('click', (e) => {
+    if (moreMenu.style.display !== 'flex') return;
+    if (!moreMenu.contains(e.target) && !moreBtn.contains(e.target)) setOpen(false);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') setOpen(false);
+  });
+  document.getElementById('more-logs-btn').addEventListener('click', () => {
+    setOpen(false);
+    switchTab('logs');
+  });
+  document.getElementById('more-theme-btn').addEventListener('click', () => {
+    toggleTheme();
+  });
+})();
 
 // --- Confirmation Modal ---
 
