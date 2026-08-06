@@ -3159,11 +3159,21 @@ function flushLogEntries() {
     output.removeChild(output.lastChild);
   }
 
-  // Auto-scroll to top (newest entries are at the top)
-  if (document.getElementById('logs-autoscroll').checked) {
+  // Auto-scroll to top (newest entries are at the top) — but only when the
+  // user is already near the top, mirroring the chat view's near-bottom
+  // tracking (M4). Scrolling down to read older entries must not be yanked
+  // back on every batch.
+  if (document.getElementById('logs-autoscroll').checked && _logsStickToTop) {
     output.scrollTop = 0;
   }
 }
+
+// M4: track "near top" on the logs view (newest entries prepend at the top).
+let _logsStickToTop = true;
+
+document.getElementById('logs-output').addEventListener('scroll', function () {
+  _logsStickToTop = this.scrollTop < 40;
+});
 
 function queueLogEntry(entry) {
   if (currentTab !== 'logs') {
@@ -3208,6 +3218,7 @@ function clearLogs() {
   logBuffer = [];
   _deferredLogEntries = [];
   _pendingLogEntries = [];
+  _logsStickToTop = true;
   if (_logRenderFrame !== null) cancelAnimationFrame(_logRenderFrame);
   _logRenderFrame = null;
 }
