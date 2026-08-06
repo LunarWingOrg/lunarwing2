@@ -600,6 +600,8 @@ pub async fn start_server(
         .route("/i18n/en.js", get(i18n_en_handler))
         .route("/i18n/zh-CN.js", get(i18n_zh_handler))
         .route("/i18n-app.js", get(i18n_app_handler))
+        .route("/vendor/purify.min.js", get(vendor_purify_handler))
+        .route("/vendor/marked.umd.min.js", get(vendor_marked_handler))
         .layer(CompressionLayer::new().gzip(true));
 
     // Project file serving (behind auth to prevent unauthorized file access).
@@ -654,7 +656,7 @@ pub async fn start_server(
             header::HeaderName::from_static("content-security-policy"),
             header::HeaderValue::from_static(
                 "default-src 'self'; \
-                 script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; \
+                 script-src 'self'; \
                  style-src 'self' 'unsafe-inline'; \
                  font-src 'self'; \
                  connect-src 'self'; \
@@ -847,6 +849,29 @@ async fn i18n_app_handler() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         include_str!("static/i18n-app.js"),
+    )
+}
+
+// Vendored frontend libraries (embedded in the binary). Content is pinned to a
+// specific upstream release (see static/vendor/README.md), so a long cache
+// lifetime is safe.
+async fn vendor_purify_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        include_str!("static/vendor/purify.min.js"),
+    )
+}
+
+async fn vendor_marked_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        include_str!("static/vendor/marked.umd.min.js"),
     )
 }
 
@@ -3507,10 +3532,12 @@ mod tests {
             "CSP must contain default-src"
         );
         assert!(
-            csp_str.contains(
-                "script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com"
-            ),
-            "CSP must allow both marked and DOMPurify script CDNs"
+            csp_str.contains("script-src 'self';"),
+            "CSP script-src must be 'self' only (marked/DOMPurify are vendored)"
+        );
+        assert!(
+            !csp_str.contains("cdn.jsdelivr.net") && !csp_str.contains("cdnjs.cloudflare.com"),
+            "CSP must not reference script CDNs (libraries are vendored)"
         );
         assert!(
             csp_str.contains("object-src 'none'"),

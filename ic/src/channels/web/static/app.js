@@ -1099,7 +1099,7 @@ function sendApprovalAction(requestId, action) {
 }
 
 function renderMarkdown(text) {
-  if (typeof marked !== 'undefined') {
+  if (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined') {
     // Escape raw HTML error pages instead of rendering them as markup.
     // Only triggers when the text *starts with* a doctype or <html> tag
     // (after optional whitespace), so normal messages that mention HTML
@@ -1114,7 +1114,10 @@ function renderMarkdown(text) {
     html = html.replace(/<pre>/g, '<pre class="code-block-wrapper"><button class="copy-btn" data-action="copy-code">Copy</button>');
     return html;
   }
-  return escapeHtml(text);
+  // Degraded mode (marked or DOMPurify failed to load): never inject
+  // unsanitized HTML — show the message content as escaped plain text
+  // with line breaks preserved instead of a blank or unformatted blob.
+  return escapeHtml(text).replace(/\n/g, '<br>');
 }
 
 // Sanitize rendered HTML using DOMPurify to prevent XSS from tool output
@@ -1129,7 +1132,8 @@ function sanitizeRenderedHtml(html) {
       FORBID_ATTR: ['style', 'onerror', 'onload']
     });
   }
-  // DOMPurify not available (CDN unreachable) — return empty string rather than unsanitized HTML
+  // DOMPurify not available — never return unsanitized HTML. Callers
+  // (renderMarkdown) fall back to escaped plain text before reaching this.
   return '';
 }
 

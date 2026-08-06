@@ -14,16 +14,16 @@
   <script src="/i18n/en.js" defer></script>
   <script src="/i18n/zh-CN.js" defer></script>
 
+  <!-- DOMPurify and marked are vendored under /vendor/ (pinned + SRI) so the
+       UI works offline / in private-network installs with no CDN dependency. -->
   <script
-    src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.2.3/purify.min.js"
+    src="/vendor/purify.min.js"
     integrity="sha384-osZDKVu4ipZP703HmPOhWdyBajcFyjX2Psjk//TG1Rc0AdwEtuToaylrmcK3LdAl"
-    crossorigin="anonymous"
     defer
   ></script>
   <script
-    src="https://cdn.jsdelivr.net/npm/marked@17.0.2/lib/marked.umd.min.js"
+    src="/vendor/marked.umd.min.js"
     integrity="sha384-pN9zSKOnTZwXRtYZAu0PBPEgR2B7DOC1aeLxQ33oJ0oy5iN1we6gm57xldM2irDG"
-    crossorigin="anonymous"
     defer
   ></script>
   <script src="/theme-init.js"></script>
