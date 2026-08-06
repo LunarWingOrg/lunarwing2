@@ -2127,8 +2127,8 @@ function loadHistory(before) {
       const fragment = document.createDocumentFragment();
       for (const turn of data.turns) {
         if (turn.user_input) {
-          maybeInsertTimeSeparator(fragment);
-          fragment.appendChild(createMessageElement('user', turn.user_input));
+          maybeInsertTimeSeparator(fragment, turn.started_at);
+          fragment.appendChild(createMessageElement('user', turn.user_input, { timestamp: turn.started_at }));
         }
         if (turn.reasoning) {
           fragment.appendChild(createReasoningSummaryElement(turn.reasoning, false));
@@ -2137,8 +2137,9 @@ function loadHistory(before) {
           fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
         }
         if (turn.response) {
-          maybeInsertTimeSeparator(fragment);
-          fragment.appendChild(createMessageElement('assistant', turn.response));
+          const responseTs = turn.completed_at || turn.started_at;
+          maybeInsertTimeSeparator(fragment, responseTs);
+          fragment.appendChild(createMessageElement('assistant', turn.response, { timestamp: responseTs }));
         }
       }
       resetActivityState();
@@ -2172,7 +2173,7 @@ function loadHistory(before) {
       const fragment = document.createDocumentFragment();
       for (const turn of data.turns) {
         if (turn.user_input) {
-          const userDiv = createMessageElement('user', turn.user_input);
+          const userDiv = createMessageElement('user', turn.user_input, { timestamp: turn.started_at });
           fragment.appendChild(userDiv);
         }
         if (turn.reasoning) {
@@ -2182,7 +2183,7 @@ function loadHistory(before) {
           fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
         }
         if (turn.response) {
-          const assistantDiv = createMessageElement('assistant', turn.response);
+          const assistantDiv = createMessageElement('assistant', turn.response, { timestamp: turn.completed_at || turn.started_at });
           fragment.appendChild(assistantDiv);
         }
       }
@@ -2210,7 +2211,11 @@ function createMessageElement(role, content, options) {
 
   const ts = document.createElement('span');
   ts.className = 'message-timestamp';
-  ts.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  // M6: history loads pass the server timestamp via options.timestamp so
+  // reloaded threads show real send times instead of the page-load time.
+  let tsDate = options && options.timestamp ? new Date(options.timestamp) : new Date();
+  if (isNaN(tsDate.getTime())) tsDate = new Date();
+  ts.textContent = tsDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   div.appendChild(ts);
 
   // Message content
