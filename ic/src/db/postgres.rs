@@ -924,6 +924,43 @@ impl WorkspaceStore for PgBackend {
         self.repo.find_config_documents(user_id, agent_id).await
     }
 
+    // ==================== Study-Notes knowledge store ====================
+
+    async fn knowledge_search(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        query: &str,
+        filter: &crate::workspace::KnowledgeFilter,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeSearchHit>, WorkspaceError> {
+        self.repo
+            .knowledge_search(user_ids, agent_id, query, filter, limit)
+            .await
+    }
+
+    async fn knowledge_topic_versions(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        topic: &str,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        self.repo
+            .knowledge_topic_versions(user_ids, agent_id, topic)
+            .await
+    }
+
+    async fn knowledge_list_notes(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, WorkspaceError> {
+        self.repo
+            .knowledge_list_notes(user_ids, agent_id, limit)
+            .await
+    }
+
     // ==================== Versioning ====================
 
     async fn save_version(

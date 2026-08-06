@@ -1020,7 +1020,46 @@ pub trait WorkspaceStore: Send + Sync {
         agent_id: Option<Uuid>,
     ) -> Result<Vec<crate::workspace::MemoryDocument>, crate::error::WorkspaceError>;
 
-    // ==================== Versioning ====================
+    // ==================== Study-Notes knowledge store ====================
+    //
+    // Study notes are workspace documents under `study-notes/<agent>/<topic>.md`
+    // tagged with `metadata.provenance = "study-note"`. These methods are
+    // multi-scope by design: callers pass the private scope plus the shared
+    // herd scope (`workspace::KNOWLEDGE_SHARED_SCOPE`) as `user_ids`.
+
+    /// PostgreSQL FTS over study-note chunks across scopes.
+    ///
+    /// Returns the best-ranked chunk per matching note, honouring the
+    /// metadata filters in `filter`. Ordered by rank descending, bounded by
+    /// `limit`.
+    async fn knowledge_search(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        query: &str,
+        filter: &crate::workspace::KnowledgeFilter,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeSearchHit>, crate::error::WorkspaceError>;
+
+    /// List every per-agent version of one canonical topic across scopes,
+    /// newest first.
+    async fn knowledge_topic_versions(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        topic: &str,
+    ) -> Result<Vec<crate::workspace::MemoryDocument>, crate::error::WorkspaceError>;
+
+    /// Scan study-note metadata (no content) across scopes, newest first.
+    ///
+    /// Used by stale detection and statistics; bounded by `limit`.
+    async fn knowledge_list_notes(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, crate::error::WorkspaceError>;
+
     //
     // **Trust boundary:** same as metadata — these accept bare `document_id`
     // UUIDs and trust the caller to have verified ownership first.

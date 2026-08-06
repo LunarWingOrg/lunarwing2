@@ -7,7 +7,7 @@ use libsql::params;
 use uuid::Uuid;
 
 use super::{
-    LibSqlBackend, fmt_ts, get_i64, get_opt_text, get_opt_ts, get_text, get_ts,
+    LibSqlBackend, fmt_ts, get_i64, get_json, get_opt_text, get_opt_ts, get_text, get_ts,
     row_to_memory_document,
 };
 use crate::db::WorkspaceStore;
@@ -1299,6 +1299,197 @@ impl WorkspaceStore for LibSqlBackend {
             docs.push(row_to_memory_document(&row));
         }
         Ok(docs)
+    }
+
+    // ==================== Study-Notes knowledge store ====================
+
+    async fn knowledge_search(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        query: &str,
+        filter: &crate::workspace::KnowledgeFilter,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeSearchHit>, WorkspaceError> {
+        let conn = self
+            .connect()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: e.to_string(),
+            })?;
+        let agent_str = agent_id.map(|a| a.to_string());
+        let status = filter.status.map(|s| s.as_str());
+        let mut hits: Vec<crate::workspace::KnowledgeSearchHit> = Vec::new();
+        for scope in user_ids {
+            let mut rows = conn
+                .query(
+                    r#"
+                    SELECT d.user_id, d.path, d.metadata, c.content
+                    FROM memory_chunks_fts fts
+                    JOIN memory_chunks c ON c._rowid = fts.rowid
+                    JOIN memory_documents d ON d.id = c.document_id
+                    WHERE d.user_id = ?1 AND d.agent_id IS ?2
+                      AND memory_chunks_fts MATCH ?3
+                      AND d.path LIKE 'study-notes/%'
+                      AND json_extract(d.metadata, '$.provenance') = 'study-note'
+                      AND (?4 IS NULL OR json_extract(d.metadata, '$.topic') = ?4)
+                      AND (?5 IS NULL OR json_extract(d.metadata, '$.agent') = ?5)
+                      AND (?6 IS NULL OR json_extract(d.metadata, '$.status') = ?6)
+                    ORDER BY rank
+                    LIMIT ?7
+                    "#,
+                    params![
+                        scope.as_str(),
+                        agent_str.as_deref(),
+                        query,
+                        filter.topic.as_deref(),
+                        filter.agent.as_deref(),
+                        status,
+                        limit as i64
+                    ],
+                )
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Knowledge FTS query failed: {e}"),
+                })?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Knowledge FTS row fetch failed: {e}"),
+                })?
+            {
+                let metadata = get_json(&row, 2);
+                let Some(meta) = crate::workspace::KnowledgeNoteMeta::from_metadata_json(&metadata)
+                else {
+                    continue;
+                };
+                if !filter.tags.is_empty() && !filter.tags.iter().any(|t| meta.tags.contains(t)) {
+                    continue;
+                }
+                hits.push(crate::workspace::KnowledgeSearchHit {
+                    scope: get_text(&row, 0),
+                    path: get_text(&row, 1),
+                    snippet: get_text(&row, 3),
+                    rank: 0.0,
+                    meta,
+                });
+            }
+        }
+        // Keep the best (first) chunk per note. FTS5 rank values are not
+        // comparable across scopes, so assign descending ordinal ranks.
+        let mut seen = std::collections::HashSet::new();
+        hits.retain(|h| seen.insert((h.scope.clone(), h.path.clone())));
+        hits.truncate(limit);
+        let total = hits.len() as f32;
+        for (i, hit) in hits.iter_mut().enumerate() {
+            hit.rank = total - i as f32;
+        }
+        Ok(hits)
+    }
+
+    async fn knowledge_topic_versions(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        topic: &str,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        let conn = self
+            .connect()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: e.to_string(),
+            })?;
+        let agent_str = agent_id.map(|a| a.to_string());
+        let mut docs = Vec::new();
+        for scope in user_ids {
+            let mut rows = conn
+                .query(
+                    r#"
+                    SELECT id, user_id, agent_id, path, content,
+                           created_at, updated_at, metadata
+                    FROM memory_documents
+                    WHERE user_id = ?1 AND agent_id IS ?2
+                      AND json_extract(metadata, '$.provenance') = 'study-note'
+                      AND json_extract(metadata, '$.topic') = ?3
+                    ORDER BY updated_at DESC
+                    LIMIT 64
+                    "#,
+                    params![scope.as_str(), agent_str.as_deref(), topic],
+                )
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Knowledge topic query failed: {e}"),
+                })?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Knowledge topic row fetch failed: {e}"),
+                })?
+            {
+                docs.push(row_to_memory_document(&row));
+            }
+        }
+        docs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        docs.truncate(64);
+        Ok(docs)
+    }
+
+    async fn knowledge_list_notes(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, WorkspaceError> {
+        let conn = self
+            .connect()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: e.to_string(),
+            })?;
+        let agent_str = agent_id.map(|a| a.to_string());
+        let mut notes = Vec::new();
+        for scope in user_ids {
+            let mut rows = conn
+                .query(
+                    r#"
+                    SELECT user_id, path, metadata, updated_at
+                    FROM memory_documents
+                    WHERE user_id = ?1 AND agent_id IS ?2
+                      AND json_extract(metadata, '$.provenance') = 'study-note'
+                    ORDER BY updated_at DESC
+                    LIMIT ?3
+                    "#,
+                    params![scope.as_str(), agent_str.as_deref(), limit as i64],
+                )
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Knowledge list query failed: {e}"),
+                })?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Knowledge list row fetch failed: {e}"),
+                })?
+            {
+                let metadata = get_json(&row, 2);
+                let Some(meta) = crate::workspace::KnowledgeNoteMeta::from_metadata_json(&metadata)
+                else {
+                    continue;
+                };
+                notes.push(crate::workspace::KnowledgeNoteRow {
+                    scope: get_text(&row, 0),
+                    path: get_text(&row, 1),
+                    updated_at: get_ts(&row, 3),
+                    meta,
+                });
+            }
+        }
+        notes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        notes.truncate(limit);
+        Ok(notes)
     }
 
     // ==================== Versioning ====================
