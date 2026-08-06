@@ -470,7 +470,7 @@ function dismissRestartLoader() {
 
 function triggerRestart() {
   if (!currentThreadId) {
-    alert(I18n.t('error.startConversation'));
+    showToast(I18n.t('error.startConversation'), 'error');
     return;
   }
 
@@ -481,7 +481,7 @@ function triggerRestart() {
 
 function confirmRestart() {
   if (!currentThreadId) {
-    alert(I18n.t('error.startConversation'));
+    showToast(I18n.t('error.startConversation'), 'error');
     return;
   }
 
@@ -565,7 +565,7 @@ function connectSSE() {
     }
     const lostBanner = document.getElementById('connection-banner');
     if (lostBanner) {
-      lostBanner.textContent = 'Reconnected';
+      lostBanner.textContent = I18n.t('status.reconnected');
       lostBanner.className = 'connection-banner connection-banner-success';
       setTimeout(() => { lostBanner.remove(); }, 2000);
       _connectionLostAt = null;
@@ -600,7 +600,7 @@ function connectSSE() {
     // Update existing banner with attempt count
     const existingBanner = document.getElementById('connection-banner');
     if (existingBanner && existingBanner.classList.contains('connection-banner-warning')) {
-      existingBanner.textContent = 'Connection lost. Reconnecting... (attempt ' + _reconnectAttempts + ')';
+      existingBanner.textContent = I18n.t('status.connectionLost', { attempt: _reconnectAttempts });
     }
 
     // Start connection-lost banner timer (3s delay)
@@ -611,7 +611,7 @@ function connectSSE() {
         // Only show if still disconnected
         const dot = document.getElementById('sse-dot');
         if (dot?.classList.contains('disconnected')) {
-          showConnectionBanner('Connection lost. Reconnecting... (attempt ' + _reconnectAttempts + ')', 'warning');
+          showConnectionBanner(I18n.t('status.connectionLost', { attempt: _reconnectAttempts }), 'warning');
         }
       }, 3000);
     }
@@ -2704,7 +2704,7 @@ document.getElementById('chat-messages').addEventListener('scroll', function () 
     const spinner = document.createElement('div');
     spinner.id = 'scroll-load-spinner';
     spinner.className = 'scroll-load-spinner';
-    spinner.innerHTML = '<div class="spinner"></div> Loading older messages...';
+    spinner.innerHTML = '<div class="spinner"></div> ' + escapeHtml(I18n.t('chat.loadingOlder'));
     this.insertBefore(spinner, this.firstChild);
     loadHistory(oldestTimestamp);
   }
@@ -2829,7 +2829,7 @@ function renderTree() {
   const container = document.getElementById('memory-tree');
   container.innerHTML = '';
   if (!memoryTreeState || memoryTreeState.length === 0) {
-    container.innerHTML = '<div class="tree-item" style="color:var(--text-secondary)">No files in workspace</div>';
+    container.innerHTML = '<div class="tree-item" style="color:var(--text-secondary)">' + escapeHtml(I18n.t('memory.empty')) + '</div>';
     return;
   }
   renderNodes(memoryTreeState, container, 0);
@@ -3038,7 +3038,7 @@ function searchMemory(query) {
     const tree = document.getElementById('memory-tree');
     tree.innerHTML = '';
     if (data.results.length === 0) {
-      tree.innerHTML = '<div class="tree-item" style="color:var(--text-secondary)">No results</div>';
+      tree.innerHTML = '<div class="tree-item" style="color:var(--text-secondary)">' + escapeHtml(I18n.t('memory.noResults')) + '</div>';
       return;
     }
     for (const result of data.results) {
@@ -3238,14 +3238,15 @@ function toggleLogsPause() {
 }
 
 function clearLogs() {
-  if (!confirm('Clear all logs?')) return;
-  document.getElementById('logs-output').innerHTML = '';
-  logBuffer = [];
-  _deferredLogEntries = [];
-  _pendingLogEntries = [];
-  _logsStickToTop = true;
-  if (_logRenderFrame !== null) cancelAnimationFrame(_logRenderFrame);
-  _logRenderFrame = null;
+  showConfirmModal(I18n.t('logs.confirmClear'), '', function() {
+    document.getElementById('logs-output').innerHTML = '';
+    logBuffer = [];
+    _deferredLogEntries = [];
+    _pendingLogEntries = [];
+    _logsStickToTop = true;
+    if (_logRenderFrame !== null) cancelAnimationFrame(_logRenderFrame);
+    _logRenderFrame = null;
+  }, I18n.t('logs.clear'), 'btn-danger');
 }
 
 // Re-apply filters when level or target changes
@@ -4266,16 +4267,17 @@ function renderJobsList(jobs) {
 }
 
 function cancelJob(jobId) {
-  if (!confirm('Cancel this job?')) return;
-  apiFetch('/api/jobs/' + jobId + '/cancel', { method: 'POST' })
-    .then(() => {
-      showToast('Job cancelled', 'success');
-      if (currentJobId) openJobDetail(currentJobId);
-      else loadJobs();
-    })
-    .catch((err) => {
-      showToast('Failed to cancel job: ' + err.message, 'error');
-    });
+  showConfirmModal(I18n.t('jobs.confirmCancel'), '', function() {
+    apiFetch('/api/jobs/' + jobId + '/cancel', { method: 'POST' })
+      .then(() => {
+        showToast(I18n.t('jobs.cancelled'), 'success');
+        if (currentJobId) openJobDetail(currentJobId);
+        else loadJobs();
+      })
+      .catch((err) => {
+        showToast(I18n.t('jobs.cancelFailed', { message: err.message }), 'error');
+      });
+  }, I18n.t('btn.confirm'), 'btn-danger');
 }
 
 function restartJob(jobId) {
@@ -4923,14 +4925,15 @@ function toggleRoutine(id) {
 }
 
 function deleteRoutine(id, name) {
-  if (!confirm('Delete routine "' + name + '"?')) return;
-  apiFetch('/api/routines/' + id, { method: 'DELETE' })
-    .then(() => {
-      showToast('Routine deleted', 'success');
-      if (currentRoutineId === id) closeRoutineDetail();
-      else loadRoutines();
-    })
-    .catch((err) => showToast('Delete failed: ' + err.message, 'error'));
+  showConfirmModal(I18n.t('routines.confirmDelete', { name: name }), '', function() {
+    apiFetch('/api/routines/' + id, { method: 'DELETE' })
+      .then(() => {
+        showToast(I18n.t('routines.deleted'), 'success');
+        if (currentRoutineId === id) closeRoutineDetail();
+        else loadRoutines();
+      })
+      .catch((err) => showToast(I18n.t('routines.deleteFailed', { message: err.message }), 'error'));
+  }, I18n.t('btn.confirm'), 'btn-danger');
 }
 
 function formatRelativeTime(isoString) {
@@ -5380,26 +5383,29 @@ function renderSkillCard(skill) {
 // the bridge enforces eligibility (Trusted + proven confidence/usage) and
 // leak-scans before sending. Requires CLAWHUB_TOKEN to be set server-side.
 function publishSkill(skill) {
-  var slug = window.prompt(I18n.t('skills.publishSlugPrompt'), skill.name);
-  if (!slug) return;
-  var version = window.prompt(I18n.t('skills.publishVersionPrompt'), '1.0.0');
-  if (!version) return;
-  // The publish endpoint takes the engine V2 doc_id, but the skills list (v1)
-  // only carries the name. For now the publish flow is wired through the
-  // engine store; a doc_id lookup by name would require an extra endpoint.
-  // Until then, surface a clear message pointing to the proposals surface.
-  apiFetch('/api/skills/publish/' + encodeURIComponent(skill.doc_id || skill.name), {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({slug: slug, version: version, changelog: '', tags: []}),
-  }).then(function(resp) {
-    if (resp && resp.ok) {
-      showToast(I18n.t('skills.publishOk', {slug: slug, version: version}), 'success');
-    } else {
-      showToast((resp && resp.error) || I18n.t('skills.publishFailed'), 'error');
-    }
-  }).catch(function(err) {
-    showToast(I18n.t('skills.publishFailed') + ': ' + err.message, 'error');
+  showPromptModal(I18n.t('skills.publishTitle'), [
+    { key: 'slug', label: I18n.t('skills.publishSlugPrompt'), value: skill.name },
+    { key: 'version', label: I18n.t('skills.publishVersionPrompt'), value: '1.0.0' },
+  ], function(values) {
+    var slug = values.slug;
+    var version = values.version;
+    // The publish endpoint takes the engine V2 doc_id, but the skills list (v1)
+    // only carries the name. For now the publish flow is wired through the
+    // engine store; a doc_id lookup by name would require an extra endpoint.
+    // Until then, surface a clear message pointing to the proposals surface.
+    apiFetch('/api/skills/publish/' + encodeURIComponent(skill.doc_id || skill.name), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({slug: slug, version: version, changelog: '', tags: []}),
+    }).then(function(resp) {
+      if (resp && resp.ok) {
+        showToast(I18n.t('skills.publishOk', {slug: slug, version: version}), 'success');
+      } else {
+        showToast((resp && resp.error) || I18n.t('skills.publishFailed'), 'error');
+      }
+    }).catch(function(err) {
+      showToast(I18n.t('skills.publishFailed') + ': ' + err.message, 'error');
+    });
   });
 }
 
@@ -5695,10 +5701,11 @@ function renderCatalogSkillCard(entry, installedNames) {
     installBtn.textContent = I18n.t('extensions.install');
     installBtn.addEventListener('click', (function(s, version, owner, btn) {
       return function() {
-        if (!confirm('Install skill "' + s + '" from ClawHub?')) return;
-        btn.disabled = true;
-        btn.textContent = I18n.t('extensions.installing');
-        installSkill(s, null, btn, version, owner);
+        showConfirmModal(I18n.t('skills.confirmInstallHub', { name: s }), '', function() {
+          btn.disabled = true;
+          btn.textContent = I18n.t('extensions.installing');
+          installSkill(s, null, btn, version, owner);
+        }, I18n.t('extensions.install'), 'btn-primary');
       };
     })(slug, entry.version, entry.owner, installBtn));
     actions.appendChild(installBtn);
@@ -5779,10 +5786,11 @@ function installSkillFromForm() {
     showToast('URL must use HTTPS', 'error');
     return;
   }
-  if (!confirm('Install skill "' + name + '"?')) return;
-  installSkill(name, url, null);
-  document.getElementById('skill-install-name').value = '';
-  document.getElementById('skill-install-url').value = '';
+  showConfirmModal(I18n.t('skills.confirmInstall', { name: name }), '', function() {
+    installSkill(name, url, null);
+    document.getElementById('skill-install-name').value = '';
+    document.getElementById('skill-install-url').value = '';
+  }, I18n.t('extensions.install'), 'btn-primary');
 }
 
 // Wire up Enter key on search input
@@ -6600,10 +6608,13 @@ function showToast(message, type) {
   const container = document.getElementById('toasts');
   const toast = document.createElement('div');
   toast.className = 'toast toast-' + (type || 'info');
+  // M13: the host is a polite live region; urgent errors assert themselves.
+  toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
 
   // Icon prefix
   const icon = document.createElement('span');
   icon.className = 'toast-icon';
+  icon.setAttribute('aria-hidden', 'true');
   if (type === 'success') icon.textContent = '\u2713';
   else if (type === 'error') icon.textContent = '\u2717';
   else icon.textContent = '\u2139';
@@ -6962,9 +6973,71 @@ document.getElementById('confirm-modal-cancel-btn').addEventListener('click', cl
 document.getElementById('confirm-modal').addEventListener('click', function(e) {
   if (e.target === this) closeConfirmModal();
 });
+
+// --- Generic Prompt Modal (L9: replaces blocking window.prompt) ---
+
+var _promptModalCallback = null;
+
+// fields: [{ key, label, value? }]. onSubmit receives { key: trimmedValue }.
+// The modal stays open until every field is non-empty.
+function showPromptModal(title, fields, onSubmit) {
+  var modal = document.getElementById('prompt-modal');
+  document.getElementById('prompt-modal-title').textContent = title;
+  var container = document.getElementById('prompt-modal-fields');
+  container.innerHTML = '';
+  fields.forEach(function(f) {
+    var label = document.createElement('label');
+    label.className = 'prompt-modal-field';
+    var caption = document.createElement('span');
+    caption.textContent = f.label;
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.id = 'prompt-modal-field-' + f.key;
+    input.value = f.value || '';
+    label.appendChild(caption);
+    label.appendChild(input);
+    container.appendChild(label);
+  });
+  _promptModalCallback = function() {
+    var values = {};
+    for (var i = 0; i < fields.length; i++) {
+      var v = document.getElementById('prompt-modal-field-' + fields[i].key).value.trim();
+      if (v === '') return false;
+      values[fields[i].key] = v;
+    }
+    onSubmit(values);
+    return true;
+  };
+  modal.style.display = 'flex';
+  var first = container.querySelector('input');
+  if (first) first.focus();
+}
+
+function closePromptModal() {
+  document.getElementById('prompt-modal').style.display = 'none';
+  _promptModalCallback = null;
+}
+
+document.getElementById('prompt-modal-btn').addEventListener('click', function() {
+  if (_promptModalCallback && _promptModalCallback() === false) return;
+  closePromptModal();
+});
+document.getElementById('prompt-modal-cancel-btn').addEventListener('click', closePromptModal);
+document.getElementById('prompt-modal').addEventListener('click', function(e) {
+  if (e.target === this) closePromptModal();
+});
+document.getElementById('prompt-modal-fields').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    document.getElementById('prompt-modal-btn').click();
+  }
+});
 document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape' && document.getElementById('confirm-modal').style.display === 'flex') {
     closeConfirmModal();
+  }
+  if (e.key === 'Escape' && document.getElementById('prompt-modal').style.display === 'flex') {
+    closePromptModal();
   }
 });
 

@@ -259,10 +259,10 @@
       <div class="logs-container">
         <div class="logs-toolbar">
           <select id="logs-server-level" title="Server-side log level (changes what the server emits)">
-            <option value="error">Server: ERROR</option>
-            <option value="warn">Server: WARN</option>
-            <option value="info" selected>Server: INFO</option>
-            <option value="debug">Server: DEBUG</option>
+            <option value="error" data-i18n="logs.serverLevel.error">Server: ERROR</option>
+            <option value="warn" data-i18n="logs.serverLevel.warn">Server: WARN</option>
+            <option value="info" data-i18n="logs.serverLevel.info" selected>Server: INFO</option>
+            <option value="debug" data-i18n="logs.serverLevel.debug">Server: DEBUG</option>
           </select>
           <select id="logs-level-filter">
             <option value="all" data-i18n="logs.allLevels">All Levels</option>
@@ -271,7 +271,7 @@
             <option value="INFO" data-i18n="logs.info">Info</option>
             <option value="DEBUG" data-i18n="logs.debug">Debug</option>
           </select>
-          <input type="text" id="logs-target-filter" placeholder="Filter by target...">
+          <input type="text" id="logs-target-filter" data-i18n-placeholder="logs.targetFilterPlaceholder" placeholder="Filter by target...">
           <label class="logs-checkbox"><input type="checkbox" id="logs-autoscroll" checked> <span data-i18n="logs.autoScroll">Auto-scroll</span></label>
           <button id="logs-pause-btn" data-i18n="logs.pause">Pause</button>
           <button id="logs-clear-btn" data-i18n="logs.clear">Clear</button>
@@ -366,7 +366,7 @@
                 <h3 data-i18n="extensions.installWasm">Install Extension</h3>
                 <div class="ext-install-form">
                   <input type="text" id="wasm-install-name" data-i18n-placeholder="common.name" placeholder="Extension name">
-                  <input type="text" id="wasm-install-url" placeholder="URL to .tar.gz bundle">
+                  <input type="text" id="wasm-install-url" data-i18n-placeholder="ext.bundleUrlPlaceholder" placeholder="URL to .tar.gz bundle">
                   <button id="wasm-install-btn" data-i18n="extensions.install">Install</button>
                 </div>
               </div>
@@ -451,7 +451,21 @@
     </div>
   </div>
 
-  <div id="toasts"></div>
+  <!-- Generic Prompt Modal (collects one or more text fields) -->
+  <div id="prompt-modal" class="modal-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="prompt-modal-title">
+    <div class="modal">
+      <h3 id="prompt-modal-title"></h3>
+      <div id="prompt-modal-fields"></div>
+      <div class="modal-actions">
+        <button id="prompt-modal-cancel-btn" class="btn-secondary" data-i18n="btn.cancel">Cancel</button>
+        <button id="prompt-modal-btn" class="btn-primary" data-i18n="btn.confirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- M13: polite live region so toasts are announced to screen readers;
+       urgent error toasts additionally carry role="alert" (see showToast). -->
+  <div id="toasts" aria-live="polite"></div>
   <script src="/app.js" defer></script>
   <script src="/i18n-app.js" defer></script>
 </body>

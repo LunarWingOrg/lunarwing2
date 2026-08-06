@@ -5439,6 +5439,47 @@ input[type="checkbox"]:focus-visible {
   opacity: 0.9;
 }
 
+.btn-primary {
+  padding: 8px 16px;
+  background: var(--accent-brand);
+  border: 1px solid var(--accent-brand);
+  border-radius: var(--radius);
+  color: white;
+  cursor: pointer;
+  font-size: var(--text-sm);
+}
+
+.btn-primary:hover {
+  background: var(--accent-brand-hover);
+}
+
+/* Generic prompt modal fields */
+#prompt-modal-fields {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3, 12px);
+}
+
+.prompt-modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.prompt-modal-field input {
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: var(--text-sm);
+  width: 100%;
+  box-sizing: border-box;
+}
+
 /* Mobile settings responsiveness */
 @media (max-width: 768px) {
   .settings-row {
