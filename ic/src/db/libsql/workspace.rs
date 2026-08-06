@@ -7,7 +7,7 @@ use libsql::params;
 use uuid::Uuid;
 
 use super::{
-    LibSqlBackend, fmt_ts, get_i64, get_opt_text, get_opt_ts, get_text, get_ts,
+    LibSqlBackend, fmt_ts, get_i64, get_json, get_opt_text, get_opt_ts, get_text, get_ts,
     row_to_memory_document,
 };
 use crate::db::WorkspaceStore;
@@ -1301,6 +1301,197 @@ impl WorkspaceStore for LibSqlBackend {
         Ok(docs)
     }
 
+    // ==================== Study-Notes knowledge store ====================
+
+    async fn knowledge_search(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        query: &str,
+        filter: &crate::workspace::KnowledgeFilter,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeSearchHit>, WorkspaceError> {
+        let conn = self
+            .connect()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: e.to_string(),
+            })?;
+        let agent_str = agent_id.map(|a| a.to_string());
+        let status = filter.status.map(|s| s.as_str());
+        let mut hits: Vec<crate::workspace::KnowledgeSearchHit> = Vec::new();
+        for scope in user_ids {
+            let mut rows = conn
+                .query(
+                    r#"
+                    SELECT d.user_id, d.path, d.metadata, c.content
+                    FROM memory_chunks_fts fts
+                    JOIN memory_chunks c ON c._rowid = fts.rowid
+                    JOIN memory_documents d ON d.id = c.document_id
+                    WHERE d.user_id = ?1 AND d.agent_id IS ?2
+                      AND memory_chunks_fts MATCH ?3
+                      AND d.path LIKE 'study-notes/%'
+                      AND json_extract(d.metadata, '$.provenance') = 'study-note'
+                      AND (?4 IS NULL OR json_extract(d.metadata, '$.topic') = ?4)
+                      AND (?5 IS NULL OR json_extract(d.metadata, '$.agent') = ?5)
+                      AND (?6 IS NULL OR json_extract(d.metadata, '$.status') = ?6)
+                    ORDER BY rank
+                    LIMIT ?7
+                    "#,
+                    params![
+                        scope.as_str(),
+                        agent_str.as_deref(),
+                        query,
+                        filter.topic.as_deref(),
+                        filter.agent.as_deref(),
+                        status,
+                        limit as i64
+                    ],
+                )
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Knowledge FTS query failed: {e}"),
+                })?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Knowledge FTS row fetch failed: {e}"),
+                })?
+            {
+                let metadata = get_json(&row, 2);
+                let Some(meta) = crate::workspace::KnowledgeNoteMeta::from_metadata_json(&metadata)
+                else {
+                    continue;
+                };
+                if !filter.tags.is_empty() && !filter.tags.iter().any(|t| meta.tags.contains(t)) {
+                    continue;
+                }
+                hits.push(crate::workspace::KnowledgeSearchHit {
+                    scope: get_text(&row, 0),
+                    path: get_text(&row, 1),
+                    snippet: get_text(&row, 3),
+                    rank: 0.0,
+                    meta,
+                });
+            }
+        }
+        // Keep the best (first) chunk per note. FTS5 rank values are not
+        // comparable across scopes, so assign descending ordinal ranks.
+        let mut seen = std::collections::HashSet::new();
+        hits.retain(|h| seen.insert((h.scope.clone(), h.path.clone())));
+        hits.truncate(limit);
+        let total = hits.len() as f32;
+        for (i, hit) in hits.iter_mut().enumerate() {
+            hit.rank = total - i as f32;
+        }
+        Ok(hits)
+    }
+
+    async fn knowledge_topic_versions(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        topic: &str,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        let conn = self
+            .connect()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: e.to_string(),
+            })?;
+        let agent_str = agent_id.map(|a| a.to_string());
+        let mut docs = Vec::new();
+        for scope in user_ids {
+            let mut rows = conn
+                .query(
+                    r#"
+                    SELECT id, user_id, agent_id, path, content,
+                           created_at, updated_at, metadata
+                    FROM memory_documents
+                    WHERE user_id = ?1 AND agent_id IS ?2
+                      AND json_extract(metadata, '$.provenance') = 'study-note'
+                      AND json_extract(metadata, '$.topic') = ?3
+                    ORDER BY updated_at DESC
+                    LIMIT 64
+                    "#,
+                    params![scope.as_str(), agent_str.as_deref(), topic],
+                )
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Knowledge topic query failed: {e}"),
+                })?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Knowledge topic row fetch failed: {e}"),
+                })?
+            {
+                docs.push(row_to_memory_document(&row));
+            }
+        }
+        docs.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
+        docs.truncate(64);
+        Ok(docs)
+    }
+
+    async fn knowledge_list_notes(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, WorkspaceError> {
+        let conn = self
+            .connect()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: e.to_string(),
+            })?;
+        let agent_str = agent_id.map(|a| a.to_string());
+        let mut notes = Vec::new();
+        for scope in user_ids {
+            let mut rows = conn
+                .query(
+                    r#"
+                    SELECT user_id, path, metadata, updated_at
+                    FROM memory_documents
+                    WHERE user_id = ?1 AND agent_id IS ?2
+                      AND json_extract(metadata, '$.provenance') = 'study-note'
+                    ORDER BY updated_at DESC
+                    LIMIT ?3
+                    "#,
+                    params![scope.as_str(), agent_str.as_deref(), limit as i64],
+                )
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Knowledge list query failed: {e}"),
+                })?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Knowledge list row fetch failed: {e}"),
+                })?
+            {
+                let metadata = get_json(&row, 2);
+                let Some(meta) = crate::workspace::KnowledgeNoteMeta::from_metadata_json(&metadata)
+                else {
+                    continue;
+                };
+                notes.push(crate::workspace::KnowledgeNoteRow {
+                    scope: get_text(&row, 0),
+                    path: get_text(&row, 1),
+                    updated_at: get_ts(&row, 3),
+                    meta,
+                });
+            }
+        }
+        notes.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
+        notes.truncate(limit);
+        Ok(notes)
+    }
+
     // ==================== Versioning ====================
 
     async fn save_version(
@@ -1884,6 +2075,207 @@ mod tests {
                 std::env::remove_var("EMBEDDING_ENABLED");
                 std::env::remove_var("EMBEDDING_MODEL");
             }
+        }
+    }
+
+    mod knowledge_store {
+        use super::*;
+
+        /// Insert a study-note document with provenance metadata and one chunk.
+        async fn insert_note(
+            backend: &LibSqlBackend,
+            scope: &str,
+            agent: &str,
+            topic: &str,
+            status: crate::workspace::KnowledgeStatus,
+            tags: &[&str],
+            content: &str,
+        ) {
+            let meta = crate::workspace::KnowledgeNoteMeta {
+                topic: topic.to_string(),
+                agent: agent.to_string(),
+                title: format!("{topic} title"),
+                status,
+                confidence: Some(0.8),
+                studied_at: None,
+                source_commit: Some("commit-a".to_string()),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                superseded_by: None,
+            };
+            let conn = backend.connect().await.expect("connect");
+            let doc_id = Uuid::new_v4();
+            let path = crate::workspace::note_path(agent, topic);
+            conn.execute(
+                "INSERT INTO memory_documents (id, user_id, path, content, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    doc_id.to_string(),
+                    scope,
+                    path,
+                    content,
+                    meta.to_metadata_json().to_string()
+                ],
+            )
+            .await
+            .expect("insert note");
+            backend
+                .insert_chunk(doc_id, 0, content, None)
+                .await
+                .expect("insert chunk");
+        }
+
+        async fn seeded_backend() -> (LibSqlBackend, tempfile::TempDir) {
+            let (backend, dir) = setup_backend().await;
+            insert_note(
+                &backend,
+                "alice",
+                "kimi-1",
+                "memory-search",
+                crate::workspace::KnowledgeStatus::Active,
+                &["memory"],
+                "Hybrid search combines FTS and vectors with RRF fusion",
+            )
+            .await;
+            insert_note(
+                &backend,
+                "shared",
+                "kimi-2",
+                "memory-search",
+                crate::workspace::KnowledgeStatus::NeedsVerification,
+                &["memory", "vectors"],
+                "Vector index dimension is set dynamically",
+            )
+            .await;
+            insert_note(
+                &backend,
+                "alice",
+                "kimi-1",
+                "approvals",
+                crate::workspace::KnowledgeStatus::Stale,
+                &[],
+                "Approval flow uses the execution gate",
+            )
+            .await;
+            // Non-note workspace document: must never appear in results.
+            let conn = backend.connect().await.expect("connect");
+            conn.execute(
+                "INSERT INTO memory_documents (id, user_id, path, content, metadata)
+                 VALUES (?1, 'alice', 'MEMORY.md', 'vectors and memory notes', '{}')",
+                params![Uuid::new_v4().to_string()],
+            )
+            .await
+            .expect("insert plain doc");
+            (backend, dir)
+        }
+
+        fn scopes() -> Vec<String> {
+            vec!["alice".to_string(), "shared".to_string()]
+        }
+
+        #[tokio::test]
+        async fn search_matches_only_study_notes_across_scopes() {
+            let (backend, _dir) = seeded_backend().await;
+            let filter = crate::workspace::KnowledgeFilter::default();
+            // FTS5 unicode61 does not stem, so use a prefix query to cover
+            // both "vector" and "vectors" tokens.
+            let hits = backend
+                .knowledge_search(&scopes(), None, "vector*", &filter, 10)
+                .await
+                .expect("knowledge_search");
+            assert_eq!(hits.len(), 2, "only the two notes mention vectors");
+            for hit in &hits {
+                assert!(
+                    hit.path.starts_with("study-notes/"),
+                    "unexpected path: {}",
+                    hit.path
+                );
+            }
+            assert!(hits.iter().any(|h| h.scope == "alice"));
+            assert!(hits.iter().any(|h| h.scope == "shared"));
+        }
+
+        #[tokio::test]
+        async fn search_applies_metadata_filters() {
+            let (backend, _dir) = seeded_backend().await;
+            let filter = crate::workspace::KnowledgeFilter {
+                topic: Some("approvals".to_string()),
+                ..Default::default()
+            };
+            let hits = backend
+                .knowledge_search(&scopes(), None, "approval", &filter, 10)
+                .await
+                .expect("knowledge_search");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].meta.topic, "approvals");
+            assert_eq!(hits[0].meta.status.to_string(), "stale");
+
+            let filter = crate::workspace::KnowledgeFilter {
+                status: Some(crate::workspace::KnowledgeStatus::Active),
+                ..Default::default()
+            };
+            let hits = backend
+                .knowledge_search(&scopes(), None, "search", &filter, 10)
+                .await
+                .expect("knowledge_search");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].meta.agent, "kimi-1");
+
+            let filter = crate::workspace::KnowledgeFilter {
+                tags: vec!["vectors".to_string()],
+                ..Default::default()
+            };
+            let hits = backend
+                .knowledge_search(&scopes(), None, "vector", &filter, 10)
+                .await
+                .expect("knowledge_search");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].meta.agent, "kimi-2");
+        }
+
+        #[tokio::test]
+        async fn topic_versions_span_scopes() {
+            let (backend, _dir) = seeded_backend().await;
+            let docs = backend
+                .knowledge_topic_versions(&scopes(), None, "memory-search")
+                .await
+                .expect("knowledge_topic_versions");
+            assert_eq!(docs.len(), 2);
+            let mut agents: Vec<String> = docs
+                .iter()
+                .filter_map(|d| {
+                    crate::workspace::KnowledgeNoteMeta::from_metadata_json(&d.metadata)
+                })
+                .map(|m| m.agent)
+                .collect();
+            agents.sort_unstable();
+            assert_eq!(agents, vec!["kimi-1", "kimi-2"]);
+
+            let empty = backend
+                .knowledge_topic_versions(&scopes(), None, "no-such-topic")
+                .await
+                .expect("knowledge_topic_versions");
+            assert!(empty.is_empty());
+        }
+
+        #[tokio::test]
+        async fn list_notes_returns_metadata_rows() {
+            let (backend, _dir) = seeded_backend().await;
+            let rows = backend
+                .knowledge_list_notes(&scopes(), None, 100)
+                .await
+                .expect("knowledge_list_notes");
+            assert_eq!(rows.len(), 3);
+            assert!(
+                rows.iter()
+                    .all(|r| r.path.starts_with("study-notes/") && !r.meta.topic.is_empty())
+            );
+
+            let stats = crate::workspace::KnowledgeStats::from_rows(&scopes(), &rows);
+            assert_eq!(stats.total_notes, 3);
+            assert_eq!(stats.topics, 2);
+            assert_eq!(stats.active, 1);
+            assert_eq!(stats.stale, 1);
+            assert_eq!(stats.needs_verification, 1);
         }
     }
 }

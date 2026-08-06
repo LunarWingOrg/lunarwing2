@@ -19,11 +19,12 @@ use crate::tools::builder::{
 };
 use crate::tools::builtin::{
     ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, ExtensionInfoTool, HttpTool,
-    JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool,
-    MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool,
-    ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool,
-    ToolActivateTool, ToolAuthTool, ToolDeactivateTool, ToolInstallTool, ToolListTool,
-    ToolRemoveTool, ToolSearchTool, ToolUpdateTool, ToolUpgradeTool, WriteFileTool,
+    JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, KnowledgeGetTopicTool,
+    KnowledgeListStaleTool, KnowledgeSearchTool, KnowledgeStatsTool, KnowledgeSubmitNoteTool,
+    ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
+    PromptQueue, ReadFileTool, ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool,
+    SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolDeactivateTool, ToolInstallTool,
+    ToolListTool, ToolRemoveTool, ToolSearchTool, ToolUpdateTool, ToolUpgradeTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolDomain};
@@ -52,6 +53,11 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "memory_write",
     "memory_read",
     "memory_tree",
+    "knowledge_search",
+    "knowledge_get_topic",
+    "knowledge_submit_note",
+    "knowledge_list_stale",
+    "knowledge_stats",
     "create_job",
     "list_jobs",
     "job_status",
@@ -521,6 +527,25 @@ impl ToolRegistry {
         self.register_sync(Arc::new(MemoryTreeTool::from_workspace(workspace)));
 
         tracing::debug!("Registered 4 memory tools");
+    }
+
+    /// Register Study-Notes knowledge tools with a workspace resolver.
+    ///
+    /// Knowledge tools resolve workspaces per scope (private caller scope and
+    /// the shared herd scope) through the same resolver as the memory tools.
+    pub fn register_knowledge_tools_with_resolver(
+        &self,
+        resolver: Arc<dyn crate::tools::builtin::memory::WorkspaceResolver>,
+    ) {
+        self.register_sync(Arc::new(KnowledgeSearchTool::new(Arc::clone(&resolver))));
+        self.register_sync(Arc::new(KnowledgeGetTopicTool::new(Arc::clone(&resolver))));
+        self.register_sync(Arc::new(KnowledgeSubmitNoteTool::new(Arc::clone(
+            &resolver,
+        ))));
+        self.register_sync(Arc::new(KnowledgeListStaleTool::new(Arc::clone(&resolver))));
+        self.register_sync(Arc::new(KnowledgeStatsTool::new(resolver)));
+
+        tracing::debug!("Registered 5 knowledge tools");
     }
 
     /// Register job management tools.
