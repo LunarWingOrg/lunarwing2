@@ -1,6 +1,6 @@
 # PRE-RELEASE CHECKLIST for LunarWing v2.0.5.0
 
-## Codename: Undecided
+## Codename: Kagi (鍵)
 
 **Open TODOs (v2.0.5.0) — To be done before release**
 
@@ -23,7 +23,7 @@
 10. [x] (S) review darkirc key exchange implementation (only if completed)
 11. [ ] work on coordination improvements (there is doc in docs/ops with info and list of known issues which has been updated recently)
 12. [x] come up with codename ideas for release. put into new doc — DONE (2026-08-06): added [`CODENAME_IDEAS_v2.0.5.0.md`](CODENAME_IDEAS_v2.0.5.0.md) with ten candidates following the Japanese word/name convention (no repeats of past codenames), themed on this cycle's actual work — DarkIRC staged key exchange Stage A hardening, self-healing watchdog v2.1.0, and dependency/supply-chain maintenance. Top picks: Kagi (鍵), Chiyu (治癒), Hagane (鋼).
-13. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.4.0 explaining all relevant changes since v2.0.3.0 as well as revising and including an ACCURATE VERSION OF`known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is:`UNKNOWN` — The file you write will be`RELEASE-v2.0.4.0.md` and should be written to the ROOT of the repo. When complete with draft, move on to another task, which is: Improve accuracy of the first draft of release notes (from previous task) -`RELEASE-v2.0.4.0.md`
+13. [x] (S) Write up FIRST DRAFT release notes (at root of repo) for v2.0.4.0 explaining all relevant changes since v2.0.3.0 as well as revising and including an ACCURATE VERSION OF`known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is:`UNKNOWN` — The file you write will be`RELEASE-v2.0.4.0.md` and should be written to the ROOT of the repo. When complete with draft, move on to another task, which is: Improve accuracy of the first draft of release notes (from previous task) -`RELEASE-v2.0.4.0.md`
 14. [ ] update README.md in repo root (if necessary)
 
 ---
