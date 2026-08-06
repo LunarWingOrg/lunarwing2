@@ -395,6 +395,63 @@ body {
   background: var(--danger);
 }
 
+/* H2: mobile "More" overflow button + menu (hidden on desktop) */
+.more-btn {
+  display: none;
+  position: relative;
+}
+
+.mobile-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  position: absolute;
+  top: 6px;
+  right: 10px;
+}
+
+.mobile-status-dot.disconnected {
+  background: var(--danger);
+}
+
+.more-menu {
+  position: fixed;
+  right: 8px;
+  bottom: calc(56px + env(safe-area-inset-bottom));
+  flex-direction: column;
+  min-width: 170px;
+  padding: 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 150;
+}
+
+.more-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 10px 12px;
+  background: none;
+  border: none;
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.more-menu-item:hover {
+  background: var(--bg-tertiary);
+}
+
+.more-menu-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
 /* Tab sliding indicator */
 .tab-indicator {
   position: absolute;
@@ -2155,6 +2212,13 @@ body {
   flex: 1;
   overflow-y: auto;
   padding: var(--space-4);
+}
+
+/* M1: keep wide data tables usable on narrow screens — the wrapper
+   scrolls horizontally instead of crushing the columns. */
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .jobs-summary {
@@ -4603,10 +4667,11 @@ mark {
 /* --- Mobile responsive --- */
 
 @media (max-width: 768px) {
-  /* Tab bar: horizontal scroll */
+  /* Tab bar on mobile: the later "Mobile bottom tab bar" block makes it a
+     fixed bottom bar with `overflow-x: visible` — horizontal scrolling is
+     intentionally disabled there (the bar fits by hiding secondary
+     buttons), so no overflow-x rule belongs here. */
   .tab-bar {
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
     padding: 0 8px;
   }
 
@@ -5439,6 +5504,47 @@ input[type="checkbox"]:focus-visible {
   opacity: 0.9;
 }
 
+.btn-primary {
+  padding: 8px 16px;
+  background: var(--accent-brand);
+  border: 1px solid var(--accent-brand);
+  border-radius: var(--radius);
+  color: white;
+  cursor: pointer;
+  font-size: var(--text-sm);
+}
+
+.btn-primary:hover {
+  background: var(--accent-brand-hover);
+}
+
+/* Generic prompt modal fields */
+#prompt-modal-fields {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3, 12px);
+}
+
+.prompt-modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.prompt-modal-field input {
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: var(--text-sm);
+  width: 100%;
+  box-sizing: border-box;
+}
+
 /* Mobile settings responsiveness */
 @media (max-width: 768px) {
   .settings-row {
@@ -5726,6 +5832,13 @@ input[type="checkbox"]:focus-visible {
 
   .tab-bar .status-logs-btn {
     display: none;
+  }
+
+  /* H2: show the More overflow button only on mobile */
+  .tab-bar .more-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
   .tab-bar .theme-toggle-btn {
