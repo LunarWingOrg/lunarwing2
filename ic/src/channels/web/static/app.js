@@ -171,6 +171,7 @@ const LIVE_WORK_MAX_CHARS = 12000;
 
 function authenticate() {
   token = document.getElementById('token-input').value.trim();
+  _authExpired = false; // allow a future expiry to trigger the auth screen again
   if (!token) {
     document.getElementById('auth-error').textContent = I18n.t('auth.errorRequired');
     return;
@@ -268,6 +269,36 @@ document.getElementById('token-input').addEventListener('keydown', (e) => {
 
 // --- API helper ---
 
+// M7: a revoked/rotated token used to leave the UI in an infinite reconnect
+// loop. Route any 401/403 back to the auth screen exactly once.
+let _authExpired = false;
+
+function handleAuthExpiry() {
+  if (_authExpired) return;
+  _authExpired = true;
+  sessionStorage.removeItem('lunarwing_token');
+  token = '';
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  if (logEventSource) { logEventSource.close(); logEventSource = null; }
+  if (gatewayStatusInterval) { clearInterval(gatewayStatusInterval); gatewayStatusInterval = null; }
+  stopPairingPoll();
+  if (_connectionLostTimer) { clearTimeout(_connectionLostTimer); _connectionLostTimer = null; }
+  const banner = document.getElementById('connection-banner');
+  if (banner) banner.remove();
+  const app = document.getElementById('app');
+  if (app) {
+    app.classList.remove('visible');
+    app.style.display = 'none';
+  }
+  const authScreen = document.getElementById('auth-screen');
+  if (authScreen) {
+    authScreen.style.display = '';
+    authScreen.style.opacity = '';
+  }
+  const errEl = document.getElementById('auth-error');
+  if (errEl) errEl.textContent = I18n.t('auth.sessionExpired');
+}
+
 function apiFetch(path, options) {
   const opts = options || {};
   opts.headers = opts.headers || {};
@@ -277,6 +308,9 @@ function apiFetch(path, options) {
     opts.body = JSON.stringify(opts.body);
   }
   return fetch(path, opts).then((res) => {
+    if (res.status === 401 || res.status === 403) {
+      handleAuthExpiry();
+    }
     if (!res.ok) {
       return res.text().then(function(body) {
         const err = new Error(body || (res.status + ' ' + res.statusText));
@@ -535,6 +569,13 @@ function connectSSE() {
     _reconnectAttempts++;
     document.getElementById('sse-dot').classList.add('disconnected');
     document.getElementById('sse-status').textContent = I18n.t('status.reconnecting');
+
+    // M7: EventSource retries forever on any error, including 401s.
+    // Probe once per disconnect streak so an expired token routes back
+    // to the auth screen instead of an endless reconnect loop.
+    if (_reconnectAttempts === 2) {
+      apiFetch('/api/chat/threads').catch(() => {});
+    }
 
     // Update existing banner with attempt count
     const existingBanner = document.getElementById('connection-banner');

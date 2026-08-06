@@ -9,6 +9,7 @@ I18n.register('en', {
   'auth.connect': 'Connect',
   'auth.errorRequired': 'Token required',
   'auth.errorInvalid': 'Invalid token',
+  'auth.sessionExpired': 'Session expired. Please re-enter your token.',
   'auth.hint': 'Enter the GATEWAY_AUTH_TOKEN from your .env file',
   
   // Chat
