@@ -101,6 +101,12 @@ I18n.register('zh-CN', {
   'memory.save': '保存',
   'memory.cancel': '取消',
   'memory.selectFile': '选择文件查看内容',
+  'memory.loading': '加载中…',
+  'memory.saved': '已保存 {path}',
+  'memory.saveFailed': '保存失败：{message}',
+  'memory.saveMismatch': '文件选择已更改；已中止保存以避免覆盖其他文件。',
+  'memory.unsavedTitle': '未保存的更改',
+  'memory.unsavedMessage': '放弃对 {path} 的未保存更改？',
   
   // 任务标签页
   'jobs.summary': '任务摘要',
@@ -262,6 +268,7 @@ I18n.register('zh-CN', {
   'btn.save': '保存',
   'btn.edit': '编辑',
   'btn.confirm': '确认',
+  'btn.discard': '放弃',
   'btn.send': '发送',
   'btn.refresh': '刷新',
   'btn.loadMore': '加载更多',

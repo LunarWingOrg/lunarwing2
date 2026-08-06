@@ -2688,6 +2688,12 @@ window.addEventListener('resize', scheduleTabIndicatorUpdate);
 let memorySearchTimeout = null;
 let currentMemoryPath = null;
 let currentMemoryContent = null;
+// Monotonic guard against out-of-order memory reads (H3)
+let _memoryReadRequestId = 0;
+// Path captured when the editor was opened; save refuses mismatches (H3)
+let memoryEditorPath = null;
+// Baseline for dirty-state tracking of the memory editor (M12)
+let _memoryEditBaseline = null;
 // Tree state: nested nodes persisted across renders
 // { name, path, is_dir, children: [] | null, expanded: bool, loaded: bool }
 let memoryTreeState = null;
@@ -2807,17 +2813,50 @@ function toggleExpand(node) {
   }).catch(() => {});
 }
 
+function isMemoryEditDirty() {
+  const editor = document.getElementById('memory-editor');
+  if (!editor || editor.style.display === 'none') return false;
+  if (_memoryEditBaseline === null) return false;
+  return document.getElementById('memory-edit-textarea').value !== _memoryEditBaseline;
+}
+
 function readMemoryFile(path) {
+  // M12: never silently discard unsaved edits when switching files
+  if (path !== currentMemoryPath && isMemoryEditDirty()) {
+    showConfirmModal(
+      I18n.t('memory.unsavedTitle'),
+      I18n.t('memory.unsavedMessage', { path: currentMemoryPath }),
+      function () {
+        _memoryEditBaseline = null;
+        memoryEditorPath = null;
+        readMemoryFile(path);
+      },
+      I18n.t('btn.discard'),
+      'btn-danger'
+    );
+    return;
+  }
+
   currentMemoryPath = path;
   // Update breadcrumb
   document.getElementById('memory-breadcrumb-path').innerHTML = buildBreadcrumb(path);
-  document.getElementById('memory-edit-btn').style.display = 'inline-block';
 
   // Exit edit mode if active
   cancelMemoryEdit();
 
+  // H3: clear stale content, show a loading state, and hide Edit while the
+  // read is in flight so the editor can never open another file's content.
+  const requestId = ++_memoryReadRequestId;
+  currentMemoryContent = null;
+  document.getElementById('memory-edit-btn').style.display = 'none';
+  const viewer = document.getElementById('memory-viewer');
+  viewer.classList.remove('rendered');
+  viewer.innerHTML = '<div class="empty">' + escapeHtml(I18n.t('memory.loading')) + '</div>';
+
   apiFetch('/api/memory/read?path=' + encodeURIComponent(path)).then((data) => {
+    if (requestId !== _memoryReadRequestId) return;
     currentMemoryContent = data.content;
+    document.getElementById('memory-edit-btn').style.display = 'inline-block';
     const viewer = document.getElementById('memory-viewer');
     // Render markdown if it's a .md file
     if (path.endsWith('.md')) {
@@ -2828,6 +2867,7 @@ function readMemoryFile(path) {
       viewer.classList.remove('rendered');
     }
   }).catch((err) => {
+    if (requestId !== _memoryReadRequestId) return;
     currentMemoryContent = null;
     document.getElementById('memory-viewer').innerHTML = '<div class="empty">Error: ' + escapeHtml(err.message) + '</div>';
   });
@@ -2840,26 +2880,37 @@ function startMemoryEdit() {
   editor.style.display = 'flex';
   const textarea = document.getElementById('memory-edit-textarea');
   textarea.value = currentMemoryContent;
+  memoryEditorPath = currentMemoryPath;
+  _memoryEditBaseline = currentMemoryContent;
   textarea.focus();
 }
 
 function cancelMemoryEdit() {
   document.getElementById('memory-viewer').style.display = '';
   document.getElementById('memory-editor').style.display = 'none';
+  memoryEditorPath = null;
+  _memoryEditBaseline = null;
 }
 
 function saveMemoryEdit() {
-  if (!currentMemoryPath) return;
+  // H3: save to the path the editor was opened for, never to whatever file
+  // happens to be selected now.
+  if (!memoryEditorPath) return;
+  if (memoryEditorPath !== currentMemoryPath) {
+    showToast(I18n.t('memory.saveMismatch'), 'error');
+    return;
+  }
+  const path = memoryEditorPath;
   const content = document.getElementById('memory-edit-textarea').value;
   apiFetch('/api/memory/write', {
     method: 'POST',
-    body: { path: currentMemoryPath, content: content },
+    body: { path: path, content: content },
   }).then(() => {
-    showToast('Saved ' + currentMemoryPath, 'success');
+    showToast(I18n.t('memory.saved', { path: path }), 'success');
     cancelMemoryEdit();
-    readMemoryFile(currentMemoryPath);
+    readMemoryFile(path);
   }).catch((err) => {
-    showToast('Save failed: ' + err.message, 'error');
+    showToast(I18n.t('memory.saveFailed', { message: err.message }), 'error');
   });
 }
 

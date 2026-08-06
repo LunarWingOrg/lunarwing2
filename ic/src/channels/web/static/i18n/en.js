@@ -101,6 +101,12 @@ I18n.register('en', {
   'memory.save': 'Save',
   'memory.cancel': 'Cancel',
   'memory.selectFile': 'Select a file to view content',
+  'memory.loading': 'Loading…',
+  'memory.saved': 'Saved {path}',
+  'memory.saveFailed': 'Save failed: {message}',
+  'memory.saveMismatch': 'File selection changed; save aborted to avoid overwriting another file.',
+  'memory.unsavedTitle': 'Unsaved changes',
+  'memory.unsavedMessage': 'Discard unsaved edits to {path}?',
   
   // Jobs Tab
   'jobs.summary': 'Jobs Summary',
@@ -262,6 +268,7 @@ I18n.register('en', {
   'btn.save': 'Save',
   'btn.edit': 'Edit',
   'btn.confirm': 'Confirm',
+  'btn.discard': 'Discard',
   'btn.send': 'Send',
   'btn.refresh': 'Refresh',
   'btn.loadMore': 'Load More',
