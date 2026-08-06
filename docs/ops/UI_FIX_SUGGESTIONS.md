@@ -4,6 +4,8 @@ Date: 2026-07-29 (first pass); updated 2026-07-29 (second pass, item #25 — add
 Scope: browser UI of the web gateway — `ic/src/channels/web/static/` (`index.html`, `app.js`, `style.css`, `i18n/`).
 Method: static audit of the shipped assets; every finding below cites the exact file:line it was verified against. Third-pass findings were verified against source commit `b400f25`. This document is suggestions only — no code was changed.
 
+**Implementation status (2026-08-06, item #9):** all findings implemented except **L4** (SSE token in URL), which remains deferred until planned gateway auth rework, as this document itself recommends. Notes: H1 vendored DOMPurify 3.2.3 / marked 17.0.2 into `static/vendor/` (SRI retained) and CSP `script-src` is now `'self'` only; L6 kept the popover triggers as `<div>`s with button semantics because the TEE popover nests an interactive copy button (invalid inside `<button>`); L5 removed the dead `scheduleCodeHighlight()` path rather than vendoring highlight.js.
+
 Priorities: **High** = user-visible breakage in supported environments. **Medium** = degraded UX or inconsistency. **Low** = polish / hardening.
 
 ---
