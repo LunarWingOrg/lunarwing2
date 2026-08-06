@@ -4,7 +4,7 @@
 
 > *Kagi* (鍵) means "key." LunarWing v2.0.5.0 hardens key exchange,
 > explicit SSH trust, service recovery, coordination boundaries, and dependency
-> security while keeping unfinished activation paths locked.
+> security while keeping unfinished activation paths locked
 
 ## Overview
 
