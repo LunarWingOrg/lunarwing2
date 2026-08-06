@@ -77,17 +77,27 @@
     <div class="restart-loader-overlay"></div>
     <div class="restart-loader-content">
       <img src="/favicon.svg" alt="LunarWing" class="restart-logo">
-      <div class="restart-spinner"></div>
-      <div class="restart-loader-text">
-        <p class="restart-title" data-i18n="restart.progressTitle">Restarting LunarWing</p>
-        <p class="restart-subtitle" data-i18n="restart.progressSubtitle">Please wait while the process restarts...</p>
+      <div id="restart-loader-progress">
+        <div class="restart-spinner"></div>
+        <div class="restart-loader-text">
+          <p class="restart-title" data-i18n="restart.progressTitle">Restarting LunarWing</p>
+          <p class="restart-subtitle" data-i18n="restart.progressSubtitle">Please wait while the process restarts...</p>
+        </div>
+        <div class="restart-progress-bar">
+          <div class="restart-progress-fill"></div>
+        </div>
+        <p class="restart-modal-info" data-i18n="restart.checkLogs">
+          Check the Logs tab for details after the restart completes.
+        </p>
       </div>
-      <div class="restart-progress-bar">
-        <div class="restart-progress-fill"></div>
+      <div class="restart-loader-error" id="restart-loader-error" style="display:none">
+        <p class="restart-title" data-i18n="restart.tooLong">Restart is taking longer than expected</p>
+        <p class="restart-subtitle" data-i18n="restart.tooLongDetail">The process may not have come back. Check the Logs tab, then reload the page.</p>
+        <div class="restart-modal-footer">
+          <button class="restart-modal-btn cancel" id="restart-dismiss-btn" data-i18n="restart.dismiss">Dismiss</button>
+          <button class="restart-modal-btn confirm" id="restart-reload-btn" data-i18n="restart.reload">Reload page</button>
+        </div>
       </div>
-      <p class="restart-modal-info" data-i18n="restart.checkLogs">
-        Check the Logs tab for details after the restart completes.
-      </p>
     </div>
   </div>
 

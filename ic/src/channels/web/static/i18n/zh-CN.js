@@ -41,6 +41,10 @@ I18n.register('zh-CN', {
   'restart.progressTitle': '正在重启 LunarWing',
   'restart.progressSubtitle': '请等待进程重启...',
   'restart.checkLogs': '重启完成后，请查看日志标签页了解详情。',
+  'restart.tooLong': '重启时间比预期更长',
+  'restart.tooLongDetail': '进程可能未能恢复。请查看日志标签页，然后重新加载页面。',
+  'restart.reload': '重新加载页面',
+  'restart.dismiss': '关闭',
   
   // 主题
   'theme.tooltipDark': '主题：深色（点击切换浅色）',

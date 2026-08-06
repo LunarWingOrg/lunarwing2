@@ -41,6 +41,10 @@ I18n.register('en', {
   'restart.progressTitle': 'Restarting LunarWing',
   'restart.progressSubtitle': 'Please wait for the process to restart...',
   'restart.checkLogs': 'Check the Logs tab for details after restart completes.',
+  'restart.tooLong': 'Restart is taking longer than expected',
+  'restart.tooLongDetail': 'The process may not have come back. Check the Logs tab, then reload the page.',
+  'restart.reload': 'Reload page',
+  'restart.dismiss': 'Dismiss',
   
   // Theme
   'theme.tooltipDark': 'Theme: Dark (click for Light)',

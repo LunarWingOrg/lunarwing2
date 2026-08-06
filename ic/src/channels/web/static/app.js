@@ -432,6 +432,41 @@ function saveCaveponyMode(requestedMode) {
 
 let isRestarting = false; // Track if we're currently restarting
 let restartEnabled = false; // Track if restart is available in this deployment
+// M8: watchdog that swaps the restart loader to an error state (with an
+// escape hatch) when the process does not come back in time.
+const RESTART_WATCHDOG_MS = 90000;
+let _restartWatchdog = null;
+
+function showRestartLoader() {
+  const loaderEl = document.getElementById('restart-loader');
+  document.getElementById('restart-loader-progress').style.display = '';
+  document.getElementById('restart-loader-error').style.display = 'none';
+  loaderEl.style.display = 'flex';
+  if (_restartWatchdog) clearTimeout(_restartWatchdog);
+  _restartWatchdog = setTimeout(() => {
+    _restartWatchdog = null;
+    document.getElementById('restart-loader-progress').style.display = 'none';
+    document.getElementById('restart-loader-error').style.display = '';
+  }, RESTART_WATCHDOG_MS);
+}
+
+function hideRestartLoader(keepWatchdog) {
+  if (!keepWatchdog && _restartWatchdog) {
+    clearTimeout(_restartWatchdog);
+    _restartWatchdog = null;
+  }
+  const loaderEl = document.getElementById('restart-loader');
+  if (loaderEl) loaderEl.style.display = 'none';
+}
+
+function dismissRestartLoader() {
+  hideRestartLoader();
+  isRestarting = false;
+  const restartBtn = document.getElementById('restart-btn');
+  const restartIcon = document.getElementById('restart-icon');
+  if (restartBtn) restartBtn.disabled = false;
+  if (restartIcon) restartIcon.classList.remove('spinning');
+}
 
 function triggerRestart() {
   if (!currentThreadId) {
@@ -462,12 +497,10 @@ function confirmRestart() {
   restartBtn.disabled = true;
   if (restartIcon) restartIcon.classList.add('spinning');
 
-  // Show progress modal
-  const loaderEl = document.getElementById('restart-loader');
-  loaderEl.style.display = 'flex';
+  // Show progress modal (with watchdog escape hatch)
+  showRestartLoader();
 
   // Send restart command via chat
-  console.log('[confirmRestart] Sending /restart command to server');
   apiFetch('/api/chat/send', {
     method: 'POST',
     body: {
@@ -476,16 +509,10 @@ function confirmRestart() {
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     },
   })
-    .then((response) => {
-      console.log('[confirmRestart] API call succeeded, response:', response);
-    })
     .catch((err) => {
       console.error('[confirmRestart] Restart request failed:', err);
       addMessage('system', I18n.t('error.restartFailed', { message: err.message }));
-      isRestarting = false;
-      restartBtn.disabled = false;
-      if (restartIcon) restartIcon.classList.remove('spinning');
-      loaderEl.style.display = 'none';
+      dismissRestartLoader();
     });
 }
 
@@ -503,9 +530,8 @@ function tryShowRestartModal() {
     restartBtn.disabled = true;
     if (restartIcon) restartIcon.classList.add('spinning');
 
-    // Show progress modal
-    const loaderEl = document.getElementById('restart-loader');
-    loaderEl.style.display = 'flex';
+    // Show progress modal (with watchdog escape hatch)
+    showRestartLoader();
   }
 }
 
@@ -547,13 +573,7 @@ function connectSSE() {
 
     // If we were restarting, close the modal and reset button now that server is back
     if (isRestarting) {
-      const loaderEl = document.getElementById('restart-loader');
-      if (loaderEl) loaderEl.style.display = 'none';
-      const restartBtn = document.getElementById('restart-btn');
-      const restartIcon = document.getElementById('restart-icon');
-      if (restartBtn) restartBtn.disabled = false;
-      if (restartIcon) restartIcon.classList.remove('spinning');
-      isRestarting = false;
+      dismissRestartLoader();
     }
 
     if (sseHasConnectedBefore && currentThreadId) {
@@ -6759,6 +6779,11 @@ function closeModals() {
   // Close restart confirmation modal
   const restartModal = document.getElementById('restart-confirm-modal');
   if (restartModal) restartModal.style.display = 'none';
+
+  // M8: Escape also closes the restart progress loader. The watchdog is
+  // kept running so a failed restart still surfaces the error state, and
+  // a successful reconnect resets the restart state.
+  hideRestartLoader(true);
 }
 
 // --- ARIA Accessibility (Phase 5.2) ---
@@ -6803,6 +6828,8 @@ document.getElementById('restart-close-btn').addEventListener('click', () => can
 document.getElementById('restart-cancel-btn').addEventListener('click', () => cancelRestart());
 document.getElementById('restart-confirm-btn').addEventListener('click', () => confirmRestart());
 document.getElementById('restart-btn').addEventListener('click', () => triggerRestart());
+document.getElementById('restart-reload-btn').addEventListener('click', () => window.location.reload());
+document.getElementById('restart-dismiss-btn').addEventListener('click', () => dismissRestartLoader());
 document.getElementById('thread-new-btn').addEventListener('click', () => createNewThread());
 document.getElementById('thread-toggle-btn').addEventListener('click', () => toggleThreadSidebar());
 document.getElementById('assistant-thread').addEventListener('click', () => switchToAssistant());
