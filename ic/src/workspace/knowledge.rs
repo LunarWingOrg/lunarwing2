@@ -215,10 +215,10 @@ impl KnowledgeNoteMeta {
                 return true;
             }
         }
-        if let Some(commit) = repository_commit {
-            if self.source_commit.as_deref() != Some(commit) {
-                return true;
-            }
+        if let Some(commit) = repository_commit
+            && self.source_commit.as_deref() != Some(commit)
+        {
+            return true;
         }
         false
     }

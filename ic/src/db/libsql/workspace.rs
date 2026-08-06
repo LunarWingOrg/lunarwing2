@@ -1431,7 +1431,7 @@ impl WorkspaceStore for LibSqlBackend {
                 docs.push(row_to_memory_document(&row));
             }
         }
-        docs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        docs.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         docs.truncate(64);
         Ok(docs)
     }
@@ -1487,7 +1487,7 @@ impl WorkspaceStore for LibSqlBackend {
                 });
             }
         }
-        notes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        notes.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         notes.truncate(limit);
         Ok(notes)
     }
@@ -2075,6 +2075,207 @@ mod tests {
                 std::env::remove_var("EMBEDDING_ENABLED");
                 std::env::remove_var("EMBEDDING_MODEL");
             }
+        }
+    }
+
+    mod knowledge_store {
+        use super::*;
+
+        /// Insert a study-note document with provenance metadata and one chunk.
+        async fn insert_note(
+            backend: &LibSqlBackend,
+            scope: &str,
+            agent: &str,
+            topic: &str,
+            status: crate::workspace::KnowledgeStatus,
+            tags: &[&str],
+            content: &str,
+        ) {
+            let meta = crate::workspace::KnowledgeNoteMeta {
+                topic: topic.to_string(),
+                agent: agent.to_string(),
+                title: format!("{topic} title"),
+                status,
+                confidence: Some(0.8),
+                studied_at: None,
+                source_commit: Some("commit-a".to_string()),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                superseded_by: None,
+            };
+            let conn = backend.connect().await.expect("connect");
+            let doc_id = Uuid::new_v4();
+            let path = crate::workspace::note_path(agent, topic);
+            conn.execute(
+                "INSERT INTO memory_documents (id, user_id, path, content, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    doc_id.to_string(),
+                    scope,
+                    path,
+                    content,
+                    meta.to_metadata_json().to_string()
+                ],
+            )
+            .await
+            .expect("insert note");
+            backend
+                .insert_chunk(doc_id, 0, content, None)
+                .await
+                .expect("insert chunk");
+        }
+
+        async fn seeded_backend() -> (LibSqlBackend, tempfile::TempDir) {
+            let (backend, dir) = setup_backend().await;
+            insert_note(
+                &backend,
+                "alice",
+                "kimi-1",
+                "memory-search",
+                crate::workspace::KnowledgeStatus::Active,
+                &["memory"],
+                "Hybrid search combines FTS and vectors with RRF fusion",
+            )
+            .await;
+            insert_note(
+                &backend,
+                "shared",
+                "kimi-2",
+                "memory-search",
+                crate::workspace::KnowledgeStatus::NeedsVerification,
+                &["memory", "vectors"],
+                "Vector index dimension is set dynamically",
+            )
+            .await;
+            insert_note(
+                &backend,
+                "alice",
+                "kimi-1",
+                "approvals",
+                crate::workspace::KnowledgeStatus::Stale,
+                &[],
+                "Approval flow uses the execution gate",
+            )
+            .await;
+            // Non-note workspace document: must never appear in results.
+            let conn = backend.connect().await.expect("connect");
+            conn.execute(
+                "INSERT INTO memory_documents (id, user_id, path, content, metadata)
+                 VALUES (?1, 'alice', 'MEMORY.md', 'vectors and memory notes', '{}')",
+                params![Uuid::new_v4().to_string()],
+            )
+            .await
+            .expect("insert plain doc");
+            (backend, dir)
+        }
+
+        fn scopes() -> Vec<String> {
+            vec!["alice".to_string(), "shared".to_string()]
+        }
+
+        #[tokio::test]
+        async fn search_matches_only_study_notes_across_scopes() {
+            let (backend, _dir) = seeded_backend().await;
+            let filter = crate::workspace::KnowledgeFilter::default();
+            // FTS5 unicode61 does not stem, so use a prefix query to cover
+            // both "vector" and "vectors" tokens.
+            let hits = backend
+                .knowledge_search(&scopes(), None, "vector*", &filter, 10)
+                .await
+                .expect("knowledge_search");
+            assert_eq!(hits.len(), 2, "only the two notes mention vectors");
+            for hit in &hits {
+                assert!(
+                    hit.path.starts_with("study-notes/"),
+                    "unexpected path: {}",
+                    hit.path
+                );
+            }
+            assert!(hits.iter().any(|h| h.scope == "alice"));
+            assert!(hits.iter().any(|h| h.scope == "shared"));
+        }
+
+        #[tokio::test]
+        async fn search_applies_metadata_filters() {
+            let (backend, _dir) = seeded_backend().await;
+            let filter = crate::workspace::KnowledgeFilter {
+                topic: Some("approvals".to_string()),
+                ..Default::default()
+            };
+            let hits = backend
+                .knowledge_search(&scopes(), None, "approval", &filter, 10)
+                .await
+                .expect("knowledge_search");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].meta.topic, "approvals");
+            assert_eq!(hits[0].meta.status.to_string(), "stale");
+
+            let filter = crate::workspace::KnowledgeFilter {
+                status: Some(crate::workspace::KnowledgeStatus::Active),
+                ..Default::default()
+            };
+            let hits = backend
+                .knowledge_search(&scopes(), None, "search", &filter, 10)
+                .await
+                .expect("knowledge_search");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].meta.agent, "kimi-1");
+
+            let filter = crate::workspace::KnowledgeFilter {
+                tags: vec!["vectors".to_string()],
+                ..Default::default()
+            };
+            let hits = backend
+                .knowledge_search(&scopes(), None, "vector", &filter, 10)
+                .await
+                .expect("knowledge_search");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].meta.agent, "kimi-2");
+        }
+
+        #[tokio::test]
+        async fn topic_versions_span_scopes() {
+            let (backend, _dir) = seeded_backend().await;
+            let docs = backend
+                .knowledge_topic_versions(&scopes(), None, "memory-search")
+                .await
+                .expect("knowledge_topic_versions");
+            assert_eq!(docs.len(), 2);
+            let mut agents: Vec<String> = docs
+                .iter()
+                .filter_map(|d| {
+                    crate::workspace::KnowledgeNoteMeta::from_metadata_json(&d.metadata)
+                })
+                .map(|m| m.agent)
+                .collect();
+            agents.sort_unstable();
+            assert_eq!(agents, vec!["kimi-1", "kimi-2"]);
+
+            let empty = backend
+                .knowledge_topic_versions(&scopes(), None, "no-such-topic")
+                .await
+                .expect("knowledge_topic_versions");
+            assert!(empty.is_empty());
+        }
+
+        #[tokio::test]
+        async fn list_notes_returns_metadata_rows() {
+            let (backend, _dir) = seeded_backend().await;
+            let rows = backend
+                .knowledge_list_notes(&scopes(), None, 100)
+                .await
+                .expect("knowledge_list_notes");
+            assert_eq!(rows.len(), 3);
+            assert!(
+                rows.iter()
+                    .all(|r| r.path.starts_with("study-notes/") && !r.meta.topic.is_empty())
+            );
+
+            let stats = crate::workspace::KnowledgeStats::from_rows(&scopes(), &rows);
+            assert_eq!(stats.total_notes, 3);
+            assert_eq!(stats.topics, 2);
+            assert_eq!(stats.active, 1);
+            assert_eq!(stats.stale, 1);
+            assert_eq!(stats.needs_verification, 1);
         }
     }
 }

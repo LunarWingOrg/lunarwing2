@@ -471,12 +471,12 @@ fn validate_submission(params: &serde_json::Value) -> Result<SubmittedNote, Tool
         ),
     };
     let source_commit = optional_string(params, "source_commit")?;
-    if let Some(ref commit) = source_commit {
-        if commit.len() > MAX_COMMIT_BYTES {
-            return Err(ToolError::InvalidParameters(format!(
-                "source_commit exceeds {MAX_COMMIT_BYTES} UTF-8 bytes"
-            )));
-        }
+    if let Some(ref commit) = source_commit
+        && commit.len() > MAX_COMMIT_BYTES
+    {
+        return Err(ToolError::InvalidParameters(format!(
+            "source_commit exceeds {MAX_COMMIT_BYTES} UTF-8 bytes"
+        )));
     }
     Ok(SubmittedNote {
         meta: KnowledgeNoteMeta {
