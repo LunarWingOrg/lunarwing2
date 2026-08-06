@@ -4603,10 +4603,11 @@ mark {
 /* --- Mobile responsive --- */
 
 @media (max-width: 768px) {
-  /* Tab bar: horizontal scroll */
+  /* Tab bar on mobile: the later "Mobile bottom tab bar" block makes it a
+     fixed bottom bar with `overflow-x: visible` — horizontal scrolling is
+     intentionally disabled there (the bar fits by hiding secondary
+     buttons), so no overflow-x rule belongs here. */
   .tab-bar {
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
     padding: 0 8px;
   }
 

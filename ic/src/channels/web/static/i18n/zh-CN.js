@@ -117,6 +117,7 @@ I18n.register('zh-CN', {
   'memory.loading': '加载中…',
   'memory.empty': '工作区中没有文件',
   'memory.noResults': '无结果',
+  'memory.loadFailed': '加载工作区失败',
   'memory.saved': '已保存 {path}',
   'memory.saveFailed': '保存失败：{message}',
   'memory.saveMismatch': '文件选择已更改；已中止保存以避免覆盖其他文件。',

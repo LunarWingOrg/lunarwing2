@@ -121,8 +121,6 @@ const _streamSnapshots = new Map();
 let _chatScrollFrame = null;
 let _chatAutoScroll = true;
 let _chatScrollForced = false;
-let _codeHighlightFrame = null;
-const _codeHighlightRoots = new Set();
 
 // --- Connection Status Banner State ---
 let _connectionLostTimer = null;
@@ -1301,21 +1299,6 @@ function scheduleChatScrollToBottom(force) {
   });
 }
 
-function scheduleCodeHighlight(root) {
-  if (typeof hljs === 'undefined') return;
-  _codeHighlightRoots.add(root);
-  if (_codeHighlightFrame !== null) return;
-  _codeHighlightFrame = requestAnimationFrame(() => {
-    _codeHighlightFrame = null;
-    for (const highlightRoot of _codeHighlightRoots) {
-      highlightRoot.querySelectorAll('pre code').forEach((block) => {
-        hljs.highlightElement(block);
-      });
-    }
-    _codeHighlightRoots.clear();
-  });
-}
-
 function addMessage(role, content) {
   const container = document.getElementById('chat-messages');
   maybeInsertTimeSeparator(container);
@@ -2251,7 +2234,6 @@ function createMessageElement(role, content, options) {
       contentEl.textContent = content;
     } else {
       contentEl.innerHTML = renderMarkdown(content);
-      scheduleCodeHighlight(contentEl);
     }
   }
   div.appendChild(contentEl);
@@ -2824,7 +2806,22 @@ function loadMemoryTree() {
       loaded: false,
     }));
     renderTree();
-  }).catch(() => {});
+  }).catch((err) => {
+    // L1: a failed load must not look like an empty workspace
+    memoryTreeState = null;
+    const container = document.getElementById('memory-tree');
+    container.innerHTML = '';
+    const row = document.createElement('div');
+    row.className = 'tree-item';
+    row.style.color = 'var(--text-secondary)';
+    row.textContent = I18n.t('memory.loadFailed') + ': ' + err.message + ' ';
+    const retryBtn = document.createElement('button');
+    retryBtn.className = 'btn-secondary';
+    retryBtn.textContent = I18n.t('chat.retry');
+    retryBtn.addEventListener('click', () => loadMemoryTree());
+    row.appendChild(retryBtn);
+    container.appendChild(row);
+  });
 }
 
 function renderTree() {
@@ -3253,7 +3250,12 @@ function clearLogs() {
 
 // Re-apply filters when level or target changes
 document.getElementById('logs-level-filter').addEventListener('change', scheduleLogFilters);
-document.getElementById('logs-target-filter').addEventListener('input', scheduleLogFilters);
+// L2: debounce the target filter — it rewrites visibility on every log entry
+let _logTargetFilterDebounce = null;
+document.getElementById('logs-target-filter').addEventListener('input', () => {
+  clearTimeout(_logTargetFilterDebounce);
+  _logTargetFilterDebounce = setTimeout(scheduleLogFilters, 150);
+});
 
 function scheduleLogFilters() {
   if (_logFilterFrame !== null) return;
@@ -4106,12 +4108,17 @@ function approvePairing(channel, code, container) {
   }).catch(err => showToast('Error: ' + err.message, 'error'));
 }
 
+function refreshPairingRequests() {
+  document.querySelectorAll('.ext-pairing[data-channel]').forEach(function(el) {
+    loadPairingRequests(el.getAttribute('data-channel'), el);
+  });
+}
+
 function startPairingPoll() {
   stopPairingPoll();
   pairingPollInterval = setInterval(function() {
-    document.querySelectorAll('.ext-pairing[data-channel]').forEach(function(el) {
-      loadPairingRequests(el.getAttribute('data-channel'), el);
-    });
+    if (document.hidden) return; // L7: no background polling in hidden tabs
+    refreshPairingRequests();
   }, 10000);
 }
 
@@ -4121,6 +4128,14 @@ function stopPairingPoll() {
     pairingPollInterval = null;
   }
 }
+
+// L7: skip poll ticks while the tab is hidden and refresh once when the
+// user comes back, instead of polling a backgrounded tab forever.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  if (gatewayStatusInterval) fetchGatewayStatus();
+  if (pairingPollInterval) refreshPairingRequests();
+});
 
 // --- WASM channel stepper ---
 
@@ -4966,7 +4981,10 @@ let gatewayStatusInterval = null;
 
 function startGatewayStatusPolling() {
   fetchGatewayStatus();
-  gatewayStatusInterval = setInterval(fetchGatewayStatus, 30000);
+  gatewayStatusInterval = setInterval(function() {
+    if (document.hidden) return; // L7: no background polling in hidden tabs
+    fetchGatewayStatus();
+  }, 30000);
 }
 
 function formatTokenCount(n) {

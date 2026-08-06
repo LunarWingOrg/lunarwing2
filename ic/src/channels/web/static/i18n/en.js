@@ -117,6 +117,7 @@ I18n.register('en', {
   'memory.loading': 'Loading…',
   'memory.empty': 'No files in workspace',
   'memory.noResults': 'No results',
+  'memory.loadFailed': 'Failed to load workspace',
   'memory.saved': 'Saved {path}',
   'memory.saveFailed': 'Save failed: {message}',
   'memory.saveMismatch': 'File selection changed; save aborted to avoid overwriting another file.',
