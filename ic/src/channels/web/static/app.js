@@ -850,13 +850,17 @@ function sendMessage() {
     renderImagePreviews();
   }
 
+  sendChatPayload(body, userMsg);
+}
+
+function sendChatPayload(body, userMsg) {
   apiFetch('/api/chat/send', {
     method: 'POST',
     body: body,
   }).catch((err) => {
     // Handle rate limiting (429)
     if (err.status === 429) {
-      showToast('Rate limited. Please wait.', 'error');
+      showToast(I18n.t('chat.rateLimited'), 'error');
       _sendCooldown = true;
       const sendBtn = document.getElementById('send-btn');
       if (sendBtn) sendBtn.disabled = true;
@@ -865,19 +869,21 @@ function sendMessage() {
         if (sendBtn) sendBtn.disabled = false;
       }, 2000);
     }
-    // Keep the user message in DOM, add a retry link
+    // Keep the user message in DOM, add a retry link. M10: the retry
+    // resubmits the original payload, including any image attachments.
     if (userMsg) {
       userMsg.classList.add('send-failed');
       userMsg.style.borderStyle = 'dashed';
       const retryLink = document.createElement('a');
       retryLink.className = 'retry-link';
       retryLink.href = '#';
-      retryLink.textContent = 'Retry';
+      retryLink.textContent = I18n.t('chat.retry');
       retryLink.addEventListener('click', (e) => {
         e.preventDefault();
-        if (userMsg.parentNode) userMsg.parentNode.removeChild(userMsg);
-        input.value = content;
-        sendMessage();
+        retryLink.remove();
+        userMsg.classList.remove('send-failed');
+        userMsg.style.borderStyle = '';
+        sendChatPayload(body, userMsg);
       });
       userMsg.appendChild(retryLink);
     }
@@ -924,20 +930,42 @@ function renderImagePreviews() {
 
 const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB per image
 const MAX_STAGED_IMAGES = 5;
+// Readers that have been started but not yet pushed into stagedImages.
+// Counting them reserves slots so concurrent batches cannot exceed the
+// staging limit (M11).
+let _pendingImageReads = 0;
 
 function handleImageFiles(files) {
+  // Validate and slice synchronously: stagedImages only grows inside async
+  // FileReader callbacks, so checking it per file in this loop would let a
+  // multi-file selection overshoot MAX_STAGED_IMAGES.
+  const available = MAX_STAGED_IMAGES - stagedImages.length - _pendingImageReads;
+  const accepted = [];
+  let rejectedSize = 0;
+  let rejectedOverflow = 0;
   Array.from(files).forEach(file => {
     if (!file.type.startsWith('image/')) return;
     if (file.size > MAX_IMAGE_SIZE_BYTES) {
-      alert(`Image "${file.name}" exceeds 5 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB)`);
+      rejectedSize++;
       return;
     }
-    if (stagedImages.length >= MAX_STAGED_IMAGES) {
-      alert(`Maximum ${MAX_STAGED_IMAGES} images allowed per message`);
+    if (accepted.length >= available) {
+      rejectedOverflow++;
       return;
     }
+    accepted.push(file);
+  });
+  if (rejectedSize > 0) {
+    showToast(I18n.t('chat.imageTooLarge', { count: rejectedSize }), 'error');
+  }
+  if (rejectedOverflow > 0) {
+    showToast(I18n.t('chat.imageLimit', { max: MAX_STAGED_IMAGES }), 'error');
+  }
+  accepted.forEach(file => {
+    _pendingImageReads++;
     const reader = new FileReader();
     reader.onload = function(e) {
+      _pendingImageReads--;
       const dataUrl = e.target.result;
       const commaIdx = dataUrl.indexOf(',');
       const meta = dataUrl.substring(0, commaIdx); // e.g. "data:image/png;base64"
@@ -945,6 +973,10 @@ function handleImageFiles(files) {
       const mediaType = meta.replace('data:', '').replace(';base64', '');
       stagedImages.push({ media_type: mediaType, data: base64, dataUrl: dataUrl });
       renderImagePreviews();
+    };
+    reader.onerror = function() {
+      _pendingImageReads--;
+      showToast(I18n.t('chat.imageReadFailed'), 'error');
     };
     reader.readAsDataURL(file);
   });

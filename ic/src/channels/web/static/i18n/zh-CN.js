@@ -13,6 +13,11 @@ I18n.register('zh-CN', {
   
   // 聊天
   'chat.inputPlaceholder': '输入消息或 / 以使用命令...',
+  'chat.retry': '重试',
+  'chat.rateLimited': '请求过于频繁，请稍候。',
+  'chat.imageTooLarge': '{count} 张图片超过 5 MB 限制，未添加',
+  'chat.imageLimit': '每条消息最多 {max} 张图片；多余的图片未添加',
+  'chat.imageReadFailed': '读取图片文件失败',
   'chat.caveponyMode': 'Cavepony 回复模式',
   'chat.caveponyOff': 'Cavepony：关闭',
   'chat.caveponyLite': 'Cavepony：精简',

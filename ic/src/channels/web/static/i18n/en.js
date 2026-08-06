@@ -13,6 +13,11 @@ I18n.register('en', {
   
   // Chat
   'chat.inputPlaceholder': 'Message or / for commands...',
+  'chat.retry': 'Retry',
+  'chat.rateLimited': 'Rate limited. Please wait.',
+  'chat.imageTooLarge': '{count} image(s) over the 5 MB limit were not attached',
+  'chat.imageLimit': 'Maximum {max} images per message; extra images were not attached',
+  'chat.imageReadFailed': 'Failed to read an image file',
   'chat.caveponyMode': 'Cavepony response mode',
   'chat.caveponyOff': 'Cavepony: Off',
   'chat.caveponyLite': 'Cavepony: Lite',
