@@ -112,7 +112,6 @@ I18n.register('en', {
   'jobs.summary': 'Jobs Summary',
   'jobs.id': 'ID',
   'jobs.title': 'Title',
-  'jobs.source': 'Source',
   'jobs.status': 'Status',
   'jobs.created': 'Created',
   'jobs.actions': 'Actions',

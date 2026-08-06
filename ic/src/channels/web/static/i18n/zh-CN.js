@@ -112,7 +112,6 @@ I18n.register('zh-CN', {
   'jobs.summary': '任务摘要',
   'jobs.id': 'ID',
   'jobs.title': '标题',
-  'jobs.source': '来源',
   'jobs.status': '状态',
   'jobs.created': '创建时间',
   'jobs.actions': '操作',

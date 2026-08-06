@@ -4090,9 +4090,14 @@ function loadJobs() {
     container.innerHTML =
       '<div class="jobs-summary" id="jobs-summary"></div>'
       + '<table class="jobs-table" id="jobs-table"><thead><tr>'
-      + '<th>ID</th><th>Title</th><th>Status</th><th>Created</th><th>Actions</th>'
+      + '<th>' + escapeHtml(I18n.t('jobs.id')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('jobs.title')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('jobs.status')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('jobs.created')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('jobs.actions')) + '</th>'
       + '</tr></thead><tbody id="jobs-tbody"></tbody></table>'
-      + '<div class="empty-state" id="jobs-empty" style="display:none">No jobs found</div>';
+      + '<div class="empty-state" id="jobs-empty" style="display:none">'
+      + escapeHtml(I18n.t('jobs.empty')) + '</div>';
   }
 
   Promise.all([
