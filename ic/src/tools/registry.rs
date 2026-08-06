@@ -538,15 +538,11 @@ impl ToolRegistry {
         resolver: Arc<dyn crate::tools::builtin::memory::WorkspaceResolver>,
     ) {
         self.register_sync(Arc::new(KnowledgeSearchTool::new(Arc::clone(&resolver))));
-        self.register_sync(Arc::new(KnowledgeGetTopicTool::new(Arc::clone(
-            &resolver,
-        ))));
+        self.register_sync(Arc::new(KnowledgeGetTopicTool::new(Arc::clone(&resolver))));
         self.register_sync(Arc::new(KnowledgeSubmitNoteTool::new(Arc::clone(
             &resolver,
         ))));
-        self.register_sync(Arc::new(KnowledgeListStaleTool::new(Arc::clone(
-            &resolver,
-        ))));
+        self.register_sync(Arc::new(KnowledgeListStaleTool::new(Arc::clone(&resolver))));
         self.register_sync(Arc::new(KnowledgeStatsTool::new(resolver)));
 
         tracing::debug!("Registered 5 knowledge tools");

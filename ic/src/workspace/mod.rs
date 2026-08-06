@@ -601,10 +601,7 @@ impl WorkspaceStorage {
                 repo.knowledge_topic_versions(user_ids, agent_id, topic)
                     .await
             }
-            Self::Db(db) => {
-                db.knowledge_topic_versions(user_ids, agent_id, topic)
-                    .await
-            }
+            Self::Db(db) => db.knowledge_topic_versions(user_ids, agent_id, topic).await,
         }
     }
 
@@ -1936,7 +1933,9 @@ impl Workspace {
             .storage
             .get_document_by_path(&self.user_id, self.agent_id, &normalize_path(path))
             .await?;
-        self.storage.update_document_metadata(doc.id, metadata).await
+        self.storage
+            .update_document_metadata(doc.id, metadata)
+            .await
     }
 
     // ==================== Indexing ====================

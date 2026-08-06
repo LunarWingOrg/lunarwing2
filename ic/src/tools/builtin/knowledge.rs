@@ -191,10 +191,7 @@ fn note_row_json(row: &KnowledgeNoteRow) -> serde_json::Value {
 
 /// Bound an array-valued output field to the overall output budget by
 /// dropping trailing entries.
-fn bound_results(
-    mut output: serde_json::Value,
-    field: &str,
-) -> (serde_json::Value, bool) {
+fn bound_results(mut output: serde_json::Value, field: &str) -> (serde_json::Value, bool) {
     let mut truncated = false;
     while pretty_json_len(&output) > MAX_KNOWLEDGE_OUTPUT_BYTES {
         let Some(results) = output.get_mut(field).and_then(|v| v.as_array_mut()) else {
@@ -593,10 +590,8 @@ impl Tool for KnowledgeSubmitNoteTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
         let submission = validate_submission(&params)?;
-        let target_scope = write_scope(
-            &ctx.user_id,
-            optional_string(&params, "scope")?.as_deref(),
-        )?;
+        let target_scope =
+            write_scope(&ctx.user_id, optional_string(&params, "scope")?.as_deref())?;
 
         let workspace = self.resolver.resolve(&target_scope).await;
         let path = note_path(&submission.meta.agent, &submission.meta.topic);
