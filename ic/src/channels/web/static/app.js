@@ -1858,6 +1858,7 @@ function showJobCard(data) {
     browseBtn.className = 'job-card-browse';
     browseBtn.href = data.browse_url;
     browseBtn.target = '_blank';
+    browseBtn.rel = 'noopener noreferrer';
     browseBtn.textContent = I18n.t('jobs.browse');
     card.appendChild(browseBtn);
   }
@@ -1971,6 +1972,7 @@ function showAuthCard(data) {
     const setupLink = document.createElement('a');
     setupLink.href = data.setup_url;
     setupLink.target = '_blank';
+    setupLink.rel = 'noopener noreferrer';
     setupLink.textContent = I18n.t('authRequired.getToken');
     links.appendChild(setupLink);
   }
@@ -3022,7 +3024,7 @@ function buildBreadcrumb(path) {
   let current = '';
   for (const part of parts) {
     current += (current ? '/' : '') + part;
-    html += ' / <a data-action="breadcrumb-file" data-path="' + escapeHtml(current) + '" href="#">' + escapeHtml(part) + '</a>';
+    html += ' / <a data-action="breadcrumb-file" data-path="' + escapeAttr(current) + '" href="#">' + escapeHtml(part) + '</a>';
   }
   return html;
 }
@@ -4252,12 +4254,12 @@ function renderJobsList(jobs) {
 
     let actionBtns = '';
     if (job.state === 'pending' || job.state === 'in_progress') {
-      actionBtns = '<button class="btn-cancel" data-action="cancel-job" data-id="' + escapeHtml(job.id) + '">Cancel</button>';
+      actionBtns = '<button class="btn-cancel" data-action="cancel-job" data-id="' + escapeAttr(job.id) + '">Cancel</button>';
     }
     // Retry is only shown in the detail view where can_restart is available.
 
-    return '<tr class="job-row" data-action="open-job" data-id="' + escapeHtml(job.id) + '">'
-      + '<td title="' + escapeHtml(job.id) + '">' + shortId + '</td>'
+    return '<tr class="job-row" data-action="open-job" data-id="' + escapeAttr(job.id) + '">'
+      + '<td title="' + escapeAttr(job.id) + '">' + shortId + '</td>'
       + '<td>' + escapeHtml(job.title) + '</td>'
       + '<td><span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span></td>'
       + '<td>' + formatDate(job.created_at) + '</td>'
@@ -4325,10 +4327,10 @@ function renderJobDetail(job) {
     + '<span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span>';
 
   if ((job.state === 'failed' || job.state === 'interrupted') && job.can_restart === true) {
-    headerHtml += '<button class="btn-restart" data-action="restart-job" data-id="' + escapeHtml(job.id) + '">Retry</button>';
+    headerHtml += '<button class="btn-restart" data-action="restart-job" data-id="' + escapeAttr(job.id) + '">Retry</button>';
   }
   if (job.browse_url) {
-    headerHtml += '<a class="btn-browse" href="' + escapeHtml(job.browse_url) + '" target="_blank">Browse Files</a>';
+    headerHtml += '<a class="btn-browse" href="' + escapeAttr(job.browse_url) + '" target="_blank" rel="noopener noreferrer">Browse Files</a>';
   }
 
   header.innerHTML = headerHtml;
@@ -4782,10 +4784,10 @@ function renderRoutinesList(routines) {
     const toggleLabel = r.enabled ? 'Disable' : 'Enable';
     const toggleClass = r.enabled ? 'btn-cancel' : 'btn-restart';
     const triggerTitle = (r.trigger_type === 'cron' && r.trigger_raw)
-      ? ' title="' + escapeHtml(r.trigger_raw) + '"'
+      ? ' title="' + escapeAttr(r.trigger_raw) + '"'
       : '';
 
-    return '<tr class="routine-row" data-action="open-routine" data-id="' + escapeHtml(r.id) + '">'
+    return '<tr class="routine-row" data-action="open-routine" data-id="' + escapeAttr(r.id) + '">'
       + '<td>' + escapeHtml(r.name) + '</td>'
       + '<td' + triggerTitle + '>' + escapeHtml(r.trigger_summary) + '</td>'
       + '<td>' + escapeHtml(r.action_type) + '</td>'
@@ -4794,9 +4796,9 @@ function renderRoutinesList(routines) {
       + '<td>' + r.run_count + '</td>'
       + '<td><span class="badge ' + statusClass + '">' + escapeHtml(r.status) + '</span></td>'
       + '<td>'
-      + '<button class="' + toggleClass + '" data-action="toggle-routine" data-id="' + escapeHtml(r.id) + '">' + toggleLabel + '</button> '
-      + '<button class="btn-restart" data-action="trigger-routine" data-id="' + escapeHtml(r.id) + '">Run</button> '
-      + '<button class="btn-cancel" data-action="delete-routine" data-id="' + escapeHtml(r.id) + '" data-name="' + escapeHtml(r.name) + '">Delete</button>'
+      + '<button class="' + toggleClass + '" data-action="toggle-routine" data-id="' + escapeAttr(r.id) + '">' + toggleLabel + '</button> '
+      + '<button class="btn-restart" data-action="trigger-routine" data-id="' + escapeAttr(r.id) + '">Run</button> '
+      + '<button class="btn-cancel" data-action="delete-routine" data-id="' + escapeAttr(r.id) + '" data-name="' + escapeAttr(r.name) + '">Delete</button>'
       + '</td>'
       + '</tr>';
   }).join('');
@@ -4893,7 +4895,7 @@ function renderRoutineDetail(routine) {
         + '<td>' + formatDate(run.completed_at) + '</td>'
         + '<td><span class="badge ' + runStatusClass + '">' + escapeHtml(run.status) + '</span></td>'
         + '<td>' + escapeHtml(run.result_summary || '-')
-          + (run.job_id ? ' <a href="#" data-action="view-run-job" data-id="' + escapeHtml(run.job_id) + '">[view job]</a>' : '')
+          + (run.job_id ? ' <a href="#" data-action="view-run-job" data-id="' + escapeAttr(run.job_id) + '">[view job]</a>' : '')
           + '</td>'
         + '<td>' + (run.tokens_used != null ? run.tokens_used : '-') + '</td>'
         + '</tr>';
@@ -6823,6 +6825,12 @@ function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
   return div.innerHTML;
+}
+
+// M9: escapeHtml() escapes & < > but not quotes, so it is not safe for
+// values interpolated into quoted HTML attributes. Use this for those.
+function escapeAttr(value) {
+  return escapeHtml(value).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function formatDate(isoString) {
