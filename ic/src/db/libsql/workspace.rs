@@ -2101,6 +2101,8 @@ mod tests {
                 source_commit: Some("commit-a".to_string()),
                 tags: tags.iter().map(|t| t.to_string()).collect(),
                 superseded_by: None,
+                submitted_by: None,
+                session_id: None,
             };
             let conn = backend.connect().await.expect("connect");
             let doc_id = Uuid::new_v4();

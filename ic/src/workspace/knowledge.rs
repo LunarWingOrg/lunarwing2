@@ -129,6 +129,13 @@ pub struct KnowledgeNoteMeta {
     pub tags: Vec<String>,
     /// Topic/version superseding this note, when status is superseded.
     pub superseded_by: Option<String>,
+    /// User scope that actually submitted the note. Recorded from the
+    /// caller's job context so shared-scope notes keep submitter attribution.
+    #[serde(default)]
+    pub submitted_by: Option<String>,
+    /// Job or conversation session the note was submitted from, when known.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl KnowledgeNoteMeta {
@@ -145,6 +152,8 @@ impl KnowledgeNoteMeta {
             "source_commit": self.source_commit,
             "tags": self.tags,
             "superseded_by": self.superseded_by,
+            "submitted_by": self.submitted_by,
+            "session_id": self.session_id,
         })
     }
 
@@ -189,6 +198,14 @@ impl KnowledgeNoteMeta {
                 .unwrap_or_default(),
             superseded_by: metadata
                 .get("superseded_by")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            submitted_by: metadata
+                .get("submitted_by")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            session_id: metadata
+                .get("session_id")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         })
@@ -351,6 +368,8 @@ mod tests {
             source_commit: Some("abc123".to_string()),
             tags: vec!["memory".to_string(), "search".to_string()],
             superseded_by: None,
+            submitted_by: Some("alice".to_string()),
+            session_id: Some("session-1".to_string()),
         }
     }
 
@@ -395,6 +414,27 @@ mod tests {
         assert_eq!(json["provenance"], KNOWLEDGE_PROVENANCE);
         let parsed = KnowledgeNoteMeta::from_metadata_json(&json);
         assert_eq!(parsed, Some(meta));
+    }
+
+    #[test]
+    fn provenance_fields_default_for_legacy_notes() {
+        // Notes written before Phase 2 have no submitted_by/session_id keys;
+        // they must still parse with None provenance extras.
+        let json = serde_json::json!({
+            "provenance": KNOWLEDGE_PROVENANCE,
+            "topic": "memory-search",
+            "agent": "kimi-1",
+            "title": "Hybrid memory search",
+            "status": "active",
+            "confidence": 0.9,
+            "studied_at": "2026-08-06T10:00:00Z",
+            "source_commit": "abc123",
+            "tags": ["memory"],
+            "superseded_by": null,
+        });
+        let parsed = KnowledgeNoteMeta::from_metadata_json(&json).expect("legacy note parses");
+        assert_eq!(parsed.submitted_by, None);
+        assert_eq!(parsed.session_id, None);
     }
 
     #[test]

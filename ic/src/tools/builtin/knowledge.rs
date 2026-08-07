@@ -178,6 +178,8 @@ fn meta_json(meta: &KnowledgeNoteMeta) -> serde_json::Value {
         "source_commit": meta.source_commit,
         "tags": meta.tags,
         "superseded_by": meta.superseded_by,
+        "submitted_by": meta.submitted_by,
+        "session_id": meta.session_id,
     })
 }
 
@@ -489,6 +491,8 @@ fn validate_submission(params: &serde_json::Value) -> Result<SubmittedNote, Tool
             source_commit,
             tags: optional_tags(params)?,
             superseded_by: None,
+            submitted_by: None,
+            session_id: None,
         },
         content: content.to_string(),
         replace: params
@@ -589,9 +593,17 @@ impl Tool for KnowledgeSubmitNoteTool {
         ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
-        let submission = validate_submission(&params)?;
+        let mut submission = validate_submission(&params)?;
         let target_scope =
             write_scope(&ctx.user_id, optional_string(&params, "scope")?.as_deref())?;
+
+        // Provenance: record the real caller scope and session, not just the
+        // self-declared agent slug, so shared notes keep attribution.
+        submission.meta.submitted_by = Some(ctx.user_id.clone());
+        submission.meta.session_id = ctx
+            .conversation_id
+            .map(|id| id.to_string())
+            .or_else(|| Some(ctx.job_id.to_string()));
 
         let workspace = self.resolver.resolve(&target_scope).await;
         let path = note_path(&submission.meta.agent, &submission.meta.topic);
