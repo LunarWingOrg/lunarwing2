@@ -39,6 +39,7 @@ system need not match the old host's.
 | Item | Where it lives | Carried? |
 |------|----------------|----------|
 | Conversations, memory, routines, reflexes, settings, **encrypted secret rows** | PostgreSQL | **Yes** — `db.dump` (`pg_dump -Fc` → `pg_restore`) |
+| **Study notes** (native knowledge store) | PostgreSQL — ordinary `memory_documents` rows under `study-notes/<agent>/<topic>.md` with `study-note` provenance metadata, plus their `memory_chunks` FTS rows | **Yes** — same `db.dump`; no external database is left behind. The owner-scope rekey covers `memory_documents`, so study notes in the private scope follow the new tenant scope, while shared herd-scope notes stay under the well-known `shared` scope |
 | **`SECRETS_MASTER_KEY`** | env | **Yes (must match)** — the AES-256-GCM key; without it every encrypted secret row is unrecoverable. Injected + verified verbatim before the daemon starts. |
 | **OMEMO store** (encrypted-XMPP device identity/sessions) | `state/xmpp/` on disk | **Yes** — `state.tar.gz`, snapshotted after all writers stop |
 | Workspace identity/memory files, WASM tool storage | `state/` on disk | **Yes** — `state.tar.gz`, except the complete `state/darkirc` subtree |
