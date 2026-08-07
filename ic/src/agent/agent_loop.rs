@@ -18,7 +18,7 @@ use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::dispatch::{
     DEFERRED_QUEUE_FULL_RESPONSE, DeferredMessages, is_priority_interrupt,
 };
-use crate::agent::heartbeat::spawn_heartbeat;
+use crate::agent::heartbeat::spawn_heartbeat_with_sweep;
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
 use crate::agent::session::ThreadState;
@@ -280,6 +280,7 @@ pub struct Agent {
     pub(super) context_monitor: ContextMonitor,
     pub(super) heartbeat_config: Option<HeartbeatConfig>,
     pub(super) hygiene_config: Option<crate::config::HygieneConfig>,
+    pub(super) knowledge_sweep_config: Option<crate::config::KnowledgeSweepConfig>,
     pub(super) routine_config: Option<RoutineConfig>,
     /// Shared routine-engine slot used for internal event matching and for exposing
     /// the engine to gateway/manual trigger entry points.
@@ -378,6 +379,7 @@ impl Agent {
             context_monitor: ContextMonitor::new(),
             heartbeat_config,
             hygiene_config,
+            knowledge_sweep_config: None,
             routine_config,
             routine_engine_slot: Arc::new(tokio::sync::RwLock::new(None)),
             mission_manager_slot: Arc::new(tokio::sync::RwLock::new(None)),
@@ -393,6 +395,12 @@ impl Agent {
         slot: Arc<tokio::sync::RwLock<Option<Arc<crate::agent::routine_engine::RoutineEngine>>>>,
     ) {
         self.routine_engine_slot = slot;
+    }
+
+    /// Set the study-notes stale-sweep configuration (called after construction
+    /// to avoid growing the `Agent::new` parameter list).
+    pub fn set_knowledge_sweep_config(&mut self, config: crate::config::KnowledgeSweepConfig) {
+        self.knowledge_sweep_config = Some(config);
     }
 
     async fn routine_engine(&self) -> Option<Arc<crate::agent::routine_engine::RoutineEngine>> {
@@ -808,9 +816,16 @@ impl Agent {
                         .map(|h| h.to_workspace_config())
                         .unwrap_or_default();
 
-                    Some(spawn_heartbeat(
+                    let knowledge_sweep = self
+                        .knowledge_sweep_config
+                        .as_ref()
+                        .map(|k| k.to_workspace_config())
+                        .unwrap_or_default();
+
+                    Some(spawn_heartbeat_with_sweep(
                         config,
                         hygiene,
+                        knowledge_sweep,
                         workspace.clone(),
                         self.cheap_llm().clone(),
                         Some(notify_tx),

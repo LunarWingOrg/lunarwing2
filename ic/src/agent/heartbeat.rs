@@ -175,6 +175,7 @@ fn duration_until_next_fire(fire_at: chrono::NaiveTime, tz: Tz) -> Duration {
 pub struct HeartbeatRunner {
     config: HeartbeatConfig,
     hygiene_config: HygieneConfig,
+    knowledge_sweep_config: crate::workspace::knowledge_sweep::KnowledgeSweepConfig,
     workspace: Arc<Workspace>,
     llm: Arc<dyn LlmProvider>,
     response_tx: Option<mpsc::Sender<OutgoingResponse>>,
@@ -193,12 +194,22 @@ impl HeartbeatRunner {
         Self {
             config,
             hygiene_config,
+            knowledge_sweep_config: crate::workspace::knowledge_sweep::KnowledgeSweepConfig::default(),
             workspace,
             llm,
             response_tx: None,
             store: None,
             consecutive_failures: 0,
         }
+    }
+
+    /// Set the study-notes stale-sweep configuration.
+    pub fn with_knowledge_sweep_config(
+        mut self,
+        config: crate::workspace::knowledge_sweep::KnowledgeSweepConfig,
+    ) -> Self {
+        self.knowledge_sweep_config = config;
+        self
     }
 
     /// Set the response channel for notifications.
@@ -275,6 +286,31 @@ impl HeartbeatRunner {
                         daily_logs_deleted = report.daily_logs_deleted,
                         conversation_docs_deleted = report.conversation_docs_deleted,
                         "heartbeat: memory hygiene deleted stale documents"
+                    );
+                }
+            });
+
+            // Run the study-notes stale sweep in the background too. Same
+            // cadence-guard pattern as hygiene; failures are logged inside.
+            // The shared herd scope needs its own workspace handle because
+            // metadata writes are primary-scope guarded.
+            let sweep_workspace = Arc::clone(&self.workspace);
+            let sweep_config = self.knowledge_sweep_config.clone();
+            let sweep_store = self.store.clone();
+            tokio::spawn(async move {
+                let shared_workspace = sweep_store.map(|db| {
+                    Workspace::new_with_db(crate::workspace::KNOWLEDGE_SHARED_SCOPE, db)
+                });
+                let report = crate::workspace::knowledge_sweep::run_knowledge_sweep_if_due(
+                    &sweep_workspace,
+                    shared_workspace.as_ref(),
+                    &sweep_config,
+                )
+                .await;
+                if report.had_work() {
+                    tracing::info!(
+                        notes_marked_stale = report.notes_marked_stale,
+                        "heartbeat: knowledge sweep marked aging study notes stale"
                     );
                 }
             });
@@ -495,7 +531,29 @@ pub fn spawn_heartbeat(
     response_tx: Option<mpsc::Sender<OutgoingResponse>>,
     store: Option<Arc<dyn Database>>,
 ) -> tokio::task::JoinHandle<()> {
-    let mut runner = HeartbeatRunner::new(config, hygiene_config, workspace, llm);
+    spawn_heartbeat_with_sweep(
+        config,
+        hygiene_config,
+        crate::workspace::knowledge_sweep::KnowledgeSweepConfig::default(),
+        workspace,
+        llm,
+        response_tx,
+        store,
+    )
+}
+
+/// Spawn the heartbeat runner with an explicit study-notes sweep config.
+pub fn spawn_heartbeat_with_sweep(
+    config: HeartbeatConfig,
+    hygiene_config: HygieneConfig,
+    knowledge_sweep_config: crate::workspace::knowledge_sweep::KnowledgeSweepConfig,
+    workspace: Arc<Workspace>,
+    llm: Arc<dyn LlmProvider>,
+    response_tx: Option<mpsc::Sender<OutgoingResponse>>,
+    store: Option<Arc<dyn Database>>,
+) -> tokio::task::JoinHandle<()> {
+    let mut runner = HeartbeatRunner::new(config, hygiene_config, workspace, llm)
+        .with_knowledge_sweep_config(knowledge_sweep_config);
     if let Some(tx) = response_tx {
         runner = runner.with_response_channel(tx);
     }
