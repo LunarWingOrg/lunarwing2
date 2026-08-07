@@ -531,9 +531,8 @@ mod tests {
         // /cotter-openclaw/api/daemon/register, which a plain "/api/" prefix
         // rejects. The "*/api/" wildcard form allows the API subtree under
         // any deployment prefix.
-        let validator = AllowlistValidator::new(vec![
-            EndpointPattern::host("*").with_path_prefix("*/api/"),
-        ]);
+        let validator =
+            AllowlistValidator::new(vec![EndpointPattern::host("*").with_path_prefix("*/api/")]);
 
         // Root deployment still works.
         assert!(

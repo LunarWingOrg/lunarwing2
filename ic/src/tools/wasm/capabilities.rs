@@ -478,11 +478,7 @@ mod tests {
         // Root deployment: exact /api/ paths still match.
         assert!(pattern.matches("multica.ai", "/api/daemon/register", "POST"));
         // Subpath deployment: base path prefix is tolerated.
-        assert!(pattern.matches(
-            "multica.ai",
-            "/cotter-openclaw/api/daemon/register",
-            "POST"
-        ));
+        assert!(pattern.matches("multica.ai", "/cotter-openclaw/api/daemon/register", "POST"));
         assert!(pattern.matches("multica.ai", "/deep/nest/api/issues", "GET"));
         // Paths outside the API subtree stay denied.
         assert!(!pattern.matches("multica.ai", "/cotter-openclaw/admin", "GET"));
