@@ -66,7 +66,7 @@ mod tests {
     }
 
     #[test]
-    fn study_notes_is_bundled_and_env_gated() {
+    fn study_notes_is_bundled_and_uses_native_tools() {
         let (_, content) = load_bundled_skills()
             .iter()
             .find(|(name, _)| name == "study-notes")
@@ -75,7 +75,7 @@ mod tests {
             .expect("embedded Study Notes skill should parse");
 
         assert_eq!(parsed.manifest.name, "study-notes");
-        assert_eq!(parsed.manifest.version, "2.1.0");
+        assert_eq!(parsed.manifest.version, "3.0.0");
         assert!(
             parsed
                 .manifest
@@ -84,18 +84,21 @@ mod tests {
                 .iter()
                 .any(|keyword| keyword == "lunarwing")
         );
+        // Native knowledge_* tools ship with the daemon, so the skill no
+        // longer needs the external study-MCP env gate.
         assert!(
             parsed
                 .manifest
                 .metadata
                 .and_then(|metadata| metadata.openclaw)
-                .is_some_and(|openclaw| {
-                    openclaw
-                        .requires
-                        .env
-                        .iter()
-                        .any(|name| name == "LW2STUDYMCP_HOME")
-                })
+                .is_none_or(|openclaw| !openclaw
+                    .requires
+                    .env
+                    .iter()
+                    .any(|name| name == "LW2STUDYMCP_HOME"))
         );
+        // The skill body must direct agents at the native tools.
+        assert!(content.contains("knowledge_submit_note"));
+        assert!(content.contains("knowledge_search"));
     }
 }

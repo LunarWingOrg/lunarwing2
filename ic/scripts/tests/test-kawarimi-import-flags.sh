@@ -312,6 +312,18 @@ assert_file_contains "export carries VL_URL" "$EXPORT_SRC" "VL_URL"
 assert_file_contains "export carries VL_MODEL" "$EXPORT_SRC" "VL_MODEL"
 assert_file_not_contains "export does not carry host-local vision auth token" "$EXPORT_SRC" "VISION_KEYS=(VL_URL VL_MODEL LUNARWING_AUTH_TOKEN)"
 
+echo "=== study-notes (knowledge store) travel coverage ==="
+# Study notes are ordinary rows in memory_documents (provenance 'study-note'),
+# so they move with the tenant's full-database dump and the owner-scope rekey.
+# These assertions pin the contract: the dump must stay whole-database (no
+# table exclusion) and the rekey must keep covering memory_documents, or
+# study notes would be left behind on the source host.
+assert_file_contains "export dumps the whole tenant database (memory_documents included)" "$EXPORT_SRC" "pg_dump -U \"\$PG_ROLE\" -Fc \"\$PG_DB\""
+assert_file_not_contains "export does not exclude memory_documents from the dump" "$EXPORT_SRC" "--exclude-table=memory_documents"
+assert_file_not_contains "export does not exclude memory_chunks from the dump" "$EXPORT_SRC" "--exclude-table=memory_chunks"
+assert_file_contains "owner-scope rekey still covers memory_documents (study notes rekeyed)" "$IC_DIR/scripts/lunarwing-mt-admin.sh" "memory_documents)"
+assert_file_contains "migration doc records that study notes travel" "$IC_DIR/../docs/ops/MT-MACHINE-MIGRATION.md" "study notes"
+
 echo "=== encrypted bundle passphrase safety ==="
 passphrase="correct-horse-battery-staple"
 encrypted_bundle="$tmp/kawarimi.7z"
