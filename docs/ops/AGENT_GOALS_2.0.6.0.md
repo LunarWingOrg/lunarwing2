@@ -19,14 +19,14 @@
 6. [ ] work on this issue: [BUG-013] Secret leak warnings in logs (noisy but no functional impact) - last updated 2026-08-01 on build 2.0.3.0 (might already be fixed - in that case, confirm)
 7. [ ] implement mcp part 2 work: general runtime adapters, MCP-over-WASM, and dedicated/shared gateway architecture (see docs for info)
 8. [ ] [BUG-016] WeeChat buffer restore — OpenRC root-vs-tenant context mismatch - work on this issue:[BUG-016] WeeChat buffer restore — OpenRC root-vs-tenant context mismatch  Consolidated from Sunburst's open bug list, last updated 2026-08-01 on build 2.0.3.0 (might already be fixed - in that case, confirm)
-9. [ ] Research the following and make a new doc in ops with findings and next steps for this (referencing docs/ops/35d44998cadf3e6d.md ): LunarHub / IronHub / Extension Marketplace — Future Direction - What they did: IronHub deep link installs, custom MCP server registration from WebUI with OpenAPI-derived tool discovery bounded by manifest tool budget. Extension lifecycle with CAS-protected mutations, hash-pinned manifests, soft-removal tombstones, restart repair. - What LunarWing needs first: 1 Binary distribution (the identified blocker) — proper packaged releases for LunarWing binaries, 2 Manifest registry — could be hosted on git.lunarwing.org, 3 Install flow with provenance verification — MCP provenance pinning already landing in 2.0.6.0 - Status: Pieces are being built. Marketplace is post-2.0.7.0 at earliest
+9. [ ] Research the following and make a new doc in ops with findings and next steps for this ( referencing docs/ops/35d44998cadf3e6d.md ): LunarHub / IronHub / Extension Marketplace — Future Direction - What they did: IronHub deep link installs, custom MCP server registration from WebUI with OpenAPI-derived tool discovery bounded by manifest tool budget. Extension lifecycle with CAS-protected mutations, hash-pinned manifests, soft-removal tombstones, restart repair. - What LunarWing needs first: 1 Binary distribution (the identified blocker) — proper packaged releases for LunarWing binaries, 2 Manifest registry — could be hosted on git.lunarwing.org, 3 Install flow with provenance verification — MCP provenance pinning already landing in 2.0.6.0 - Status: Pieces are being built. Marketplace is post-2.0.7.0 at earliest
 10. [ ]  research wasm functionality expansion n make new doc in doc/proposals
 11. [ ] mcp part 2 work worker-local placement (see docs for info)
 12. [ ] fix cicd issues
 13. [ ] Review and make fixes to MCP part two implementation (see mcp documents first) - address any gaps or problems
 14. [ ] FIX CI/CD ISSUES
 15. [ ] review previous mcp work for part two and fix anything if something is found out to be weird or broken
-16. [ ] come up with codename ideas for release. put into new doc
+16. [ ] come up with codename ideas for release. put into new doc in docs/ops - base the name on all changes made since 2.0.5.0
 17. [ ] go over items in work items ( hint: can use gitlab api to access work items without auth ). make note/document of any that are already confirmed fix and should be closed - put note/doc in docs/ops - check when done
 18. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.6.0 explaining all relevant changes since v2.0.5.0 as well as revising and including an ACCURATE VERSION OF`known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is:`UNKNOWN` — The file you write will be`RELEASE-v2.0.6.0.md` and should be written to the ROOT of the repo
 19. [ ] update any outdated documents in docs/proposals
@@ -34,6 +34,6 @@
 21. [ ] update README.md in repo root (if necessary)
 22. [ ] review first draft of release notes from prev step and update any inconsistencies
 23. [ ] update readme from prev step and update any inconsistencies
-24. [ ] check cicd of master
+24. [ ] check cicd of master for failures
 
 ---
