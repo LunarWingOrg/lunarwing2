@@ -194,7 +194,8 @@ impl HeartbeatRunner {
         Self {
             config,
             hygiene_config,
-            knowledge_sweep_config: crate::workspace::knowledge_sweep::KnowledgeSweepConfig::default(),
+            knowledge_sweep_config:
+                crate::workspace::knowledge_sweep::KnowledgeSweepConfig::default(),
             workspace,
             llm,
             response_tx: None,
@@ -298,9 +299,8 @@ impl HeartbeatRunner {
             let sweep_config = self.knowledge_sweep_config.clone();
             let sweep_store = self.store.clone();
             tokio::spawn(async move {
-                let shared_workspace = sweep_store.map(|db| {
-                    Workspace::new_with_db(crate::workspace::KNOWLEDGE_SHARED_SCOPE, db)
-                });
+                let shared_workspace = sweep_store
+                    .map(|db| Workspace::new_with_db(crate::workspace::KNOWLEDGE_SHARED_SCOPE, db));
                 let report = crate::workspace::knowledge_sweep::run_knowledge_sweep_if_due(
                     &sweep_workspace,
                     shared_workspace.as_ref(),

@@ -16,9 +16,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::bootstrap::lunarwing_base_dir;
-use crate::workspace::{
-    KNOWLEDGE_SCAN_CAP, KNOWLEDGE_SHARED_SCOPE, KnowledgeStatus, Workspace,
-};
+use crate::workspace::{KNOWLEDGE_SCAN_CAP, KNOWLEDGE_SHARED_SCOPE, KnowledgeStatus, Workspace};
 
 /// Global guard preventing concurrent sweeps.
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -221,7 +219,9 @@ fn load_state(path: &std::path::Path) -> Option<KnowledgeSweepState> {
 }
 
 fn save_state(path: &std::path::Path) {
-    let state = KnowledgeSweepState { last_run: Utc::now() };
+    let state = KnowledgeSweepState {
+        last_run: Utc::now(),
+    };
     if let Ok(json) = serde_json::to_string(&state) {
         let _ = std::fs::write(path, json);
     }
@@ -336,8 +336,22 @@ mod tests {
             let shared = Workspace::new_with_db(KNOWLEDGE_SHARED_SCOPE, db);
 
             let old = Utc::now() - chrono::Duration::days(90);
-            submit_note(&alice, "kimi-1", "old-topic", Some(old), KnowledgeStatus::Active).await;
-            submit_note(&alice, "kimi-1", "fresh-topic", None, KnowledgeStatus::Active).await;
+            submit_note(
+                &alice,
+                "kimi-1",
+                "old-topic",
+                Some(old),
+                KnowledgeStatus::Active,
+            )
+            .await;
+            submit_note(
+                &alice,
+                "kimi-1",
+                "fresh-topic",
+                None,
+                KnowledgeStatus::Active,
+            )
+            .await;
             submit_note(
                 &shared,
                 "kimi-2",
@@ -349,7 +363,8 @@ mod tests {
 
             // Call sweep_scope directly: the public entry point's global
             // RUNNING guard would make parallel tests skip nondeterministically.
-            let (scanned_a, marked_a) = sweep_scope(&alice, "alice", 30).await.expect("sweep alice");
+            let (scanned_a, marked_a) =
+                sweep_scope(&alice, "alice", 30).await.expect("sweep alice");
             let (scanned_s, marked_s) = sweep_scope(&shared, KNOWLEDGE_SHARED_SCOPE, 30)
                 .await
                 .expect("sweep shared");
