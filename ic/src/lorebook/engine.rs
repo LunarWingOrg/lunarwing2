@@ -408,7 +408,10 @@ mod tests {
     }
 
     fn config() -> LorebookConfig {
-        LorebookConfig::default()
+        LorebookConfig {
+            enabled: true,
+            ..LorebookConfig::default()
+        }
     }
 
     #[test]

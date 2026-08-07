@@ -189,7 +189,8 @@ When a workspace has additional read scopes (via `with_additional_read_scopes`),
 `lorebooks/*.json` accepts the bounded SillyTavern World Info import subset and
 native list shape documented in `docs/proposals/LOREBOOKS.md`. Create or update
 a lorebook using `memory_write` with `append: false`; append is rejected before
-storage mutation.
+storage mutation. Lorebooks are disabled by default because activation scanning
+is computationally expensive; set `LOREBOOK_ENABLED=true` to opt in.
 
 Lorebooks are prompt-visible configuration. Raw JSON and decoded fields receive
 canonicalized prompt-injection checks on default writes, named-layer writes,
