@@ -27,8 +27,9 @@
 14. [x] disable lorebooks by default - the are computationally expensive and most users will not use them — DONE 100% (2026-08-07, branch `rarity/kimi-7-20260807-0606`): `LorebookConfig::default()` now sets `enabled: false` in `ic/src/config/agent.rs` (opt back in with `LOREBOOK_ENABLED=true`; env override and validation unchanged). Engine test helper and three workspace activation tests now enable lorebooks explicitly; scheduler/dispatcher test configs already pinned `enabled: false`. Docs updated (`docs/proposals/LOREBOOKS.md` env table default `true`→`false` plus opt-in note, root `README.md`, `ic/src/workspace/README.md`). Verified: `cargo check`, 40 lorebook unit tests + 5 `config::agent` tests, clippy `--all --benches --tests --examples -D warnings`, rustfmt.
 15. [x] (S) review darkirc key exchange implementation (only if completed)
 16. [ ] Review and make fixes to MCP part two implementation (see mcp documents first)
-17. [ ] come up with codename ideas for release. put into new doc
-18. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.6.0 explaining all relevant changes since v2.0.5.0 as well as revising and including an ACCURATE VERSION OF`known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is:`UNKNOWN` — The file you write will be`RELEASE-v2.0.6.0.md` and should be written to the ROOT of the repo
-19. [ ] update README.md in repo root (if necessary)
+17. [ ] implement proposal defined here - docs/proposals/lunarvoice-onnx-proposal-2.0.6.0.md
+18. [ ] come up with codename ideas for release. put into new doc
+19. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.6.0 explaining all relevant changes since v2.0.5.0 as well as revising and including an ACCURATE VERSION OF`known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is:`UNKNOWN` — The file you write will be`RELEASE-v2.0.6.0.md` and should be written to the ROOT of the repo
+20. [ ] update README.md in repo root (if necessary)
 
 ---
