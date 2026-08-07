@@ -17,6 +17,7 @@ use crate::tools::mcp::{
     auth::{authorize_mcp_server, is_authenticated},
     config::{self, EffectiveTransport, McpServersFile},
     factory::create_client_from_config,
+    provenance::{McpPackageProvenance, PackageEcosystem, PackageTrust, ProvenanceIdentity},
 };
 
 /// Arguments for the `mcp add` subcommand.
@@ -185,6 +186,60 @@ pub enum McpCommand {
 
     /// Update an MCP server's configuration in-place
     Update(Box<McpUpdateArgs>),
+
+    /// Pin package provenance for a stdio MCP server.
+    ///
+    /// Resolves the configured command, records its SHA-256 digest and any
+    /// supplied package identity, and marks the package pinned. Activation
+    /// then verifies the digest and fails closed on mismatch.
+    Pin {
+        /// Server name to pin
+        name: String,
+
+        /// Canonical package identity (e.g. npm package name)
+        #[arg(long)]
+        package: Option<String>,
+
+        /// Package ecosystem: npm, pypi, binary, or unknown
+        #[arg(long, default_value = "unknown")]
+        ecosystem: String,
+
+        /// Immutable package version
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Source registry or repository URL
+        #[arg(long)]
+        source: Option<String>,
+
+        /// Publisher name or key identifier
+        #[arg(long)]
+        publisher: Option<String>,
+    },
+
+    /// Remove package provenance from an MCP server (resume unverified activation)
+    Unpin {
+        /// Server name to unpin
+        name: String,
+    },
+
+    /// Revoke an MCP server package: blocks activation and disables the server
+    Revoke {
+        /// Server name to revoke
+        name: String,
+
+        /// Gateway URL for disabling a running server immediately
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Gateway auth token (required with --url; otherwise reads configuration or env)
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Only update persisted configuration; do not contact the running gateway
+        #[arg(long)]
+        offline: bool,
+    },
 }
 
 fn parse_header(s: &str) -> Result<(String, String), String> {
@@ -250,6 +305,33 @@ pub async fn run_mcp_command(
             .await
         }
         McpCommand::Update(args) => update_server(*args, config_path, no_db).await,
+        McpCommand::Pin {
+            name,
+            package,
+            ecosystem,
+            version,
+            source,
+            publisher,
+        } => {
+            pin_server(
+                name,
+                package,
+                ecosystem,
+                version,
+                source,
+                publisher,
+                config_path,
+                no_db,
+            )
+            .await
+        }
+        McpCommand::Unpin { name } => unpin_server(name, config_path, no_db).await,
+        McpCommand::Revoke {
+            name,
+            url,
+            token,
+            offline,
+        } => revoke_server(name, url, token, offline, config_path, no_db).await,
     }
 }
 
@@ -522,6 +604,15 @@ async fn list_servers(
             }
             if let Some(ref desc) = server.description {
                 println!("      Description: {}", desc);
+            }
+            if let Some(ref provenance) = server.provenance {
+                println!("      Provenance: {}", provenance.trust);
+                if let Some(ref package_id) = provenance.package_id {
+                    println!("      Package: {} [{}]", package_id, provenance.ecosystem);
+                }
+                if let Some(ref digest) = provenance.command_sha256 {
+                    println!("      Command SHA-256: {}", digest);
+                }
             }
             if let Some(ref oauth) = server.oauth {
                 println!("      OAuth Client ID: {}", oauth.client_id);
@@ -895,7 +986,196 @@ fn build_update_config(
     config.headers = existing.headers.clone();
     config.description = existing.description.clone();
     config.always_require_approval = existing.always_require_approval.clone();
+    // Retain provenance across updates. When the transport leaves stdio the
+    // executable digest is meaningless, so it is dropped and the trust state
+    // demoted to unverified; for stdio the pin is kept, so a command change
+    // fails closed at activation until the operator re-pins.
+    config.provenance = existing.provenance.clone().map(|mut provenance| {
+        if !matches!(
+            config.effective_transport(),
+            EffectiveTransport::Stdio { .. }
+        ) {
+            provenance.command_sha256 = None;
+            provenance.resolved_command = None;
+            if provenance.trust == PackageTrust::Pinned {
+                provenance.trust = PackageTrust::Unverified;
+            }
+        }
+        provenance
+    });
     Ok(config)
+}
+
+/// Persist a mutated server configuration to whichever store is active.
+async fn persist_updated_server(
+    db: Option<&McpDbContext>,
+    server: McpServerConfig,
+) -> anyhow::Result<()> {
+    if let Some(db) = db {
+        config::persist_mcp_server_db(db.store.as_ref(), &db.owner_id, server, true).await?;
+    } else {
+        config::persist_mcp_server(server, true).await?;
+    }
+    Ok(())
+}
+
+/// Pin package provenance for a stdio MCP server.
+#[allow(clippy::too_many_arguments)] // CLI flag plumbing mirrors the clap surface
+async fn pin_server(
+    name: String,
+    package: Option<String>,
+    ecosystem: String,
+    version: Option<String>,
+    source: Option<String>,
+    publisher: Option<String>,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
+    let db = connect_db(config_path, no_db).await?;
+    let servers = load_servers(db.as_ref()).await?;
+    let mut server = servers
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
+
+    let command = match server.effective_transport() {
+        EffectiveTransport::Stdio { command, .. } => command.to_string(),
+        _ => anyhow::bail!(
+            "Server '{name}' is not a stdio server; executable pinning only applies to stdio transports"
+        ),
+    };
+
+    let ecosystem = ecosystem
+        .parse::<PackageEcosystem>()
+        .map_err(|error: String| anyhow::anyhow!(error))?;
+    let identity = ProvenanceIdentity {
+        package_id: package,
+        ecosystem,
+        version,
+        source,
+        publisher,
+    };
+    let provenance = McpPackageProvenance::pin_for_command(&command, identity)
+        .map_err(|error| anyhow::anyhow!("Failed to pin '{name}': {error}"))?;
+
+    print_provenance(&provenance);
+    server.provenance = Some(provenance);
+    persist_updated_server(db.as_ref(), server).await?;
+
+    println!();
+    println!("  ✓ Pinned MCP server '{name}'. Activation now verifies the executable digest");
+    println!("    and fails closed on mismatch. Re-run `mcp pin` after package upgrades.");
+    println!();
+    Ok(())
+}
+
+/// Remove the provenance record from an MCP server.
+async fn unpin_server(name: String, config_path: Option<&Path>, no_db: bool) -> anyhow::Result<()> {
+    let db = connect_db(config_path, no_db).await?;
+    let servers = load_servers(db.as_ref()).await?;
+    let mut server = servers
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
+
+    if server.provenance.is_none() {
+        println!();
+        println!("  Server '{name}' has no provenance record; nothing to unpin.");
+        println!();
+        return Ok(());
+    }
+
+    server.provenance = None;
+    persist_updated_server(db.as_ref(), server).await?;
+
+    println!();
+    println!("  ✓ Removed provenance from '{name}'; activation is unverified again.");
+    println!();
+    Ok(())
+}
+
+/// Revoke an MCP server package and disable the server.
+async fn revoke_server(
+    name: String,
+    gateway_url: Option<String>,
+    gateway_token: Option<String>,
+    offline: bool,
+    config_path: Option<&Path>,
+    no_db: bool,
+) -> anyhow::Result<()> {
+    let db = connect_db(config_path, no_db).await?;
+    let servers = load_servers(db.as_ref()).await?;
+    let mut server = servers
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
+
+    // Persist the revocation first so it is durable even if the live
+    // disable cannot reach the gateway.
+    let mut provenance = server
+        .provenance
+        .clone()
+        .unwrap_or_else(|| McpPackageProvenance::with_trust(PackageTrust::Revoked));
+    provenance.trust = PackageTrust::Revoked;
+    provenance.recorded_at = chrono::Utc::now();
+    server.provenance = Some(provenance);
+    server.enabled = false;
+    persist_updated_server(db.as_ref(), server).await?;
+
+    println!();
+    println!("  ✓ Revoked the package for MCP server '{name}' and disabled it.");
+    println!("    Activation now fails closed until the server is re-pinned or unpinned.");
+
+    if !offline {
+        match apply_live_toggle(
+            &name,
+            Some(false),
+            gateway_url.as_deref(),
+            gateway_token.as_deref(),
+            config_path,
+            db.as_ref(),
+        )
+        .await?
+        {
+            LiveMcpResult::Applied(message) => println!("  ✓ {message}"),
+            LiveMcpResult::Unavailable(reason) => eprintln!(
+                "  Gateway unavailable ({reason}); a running server keeps its current runtime until restart."
+            ),
+        }
+    } else {
+        println!("    Offline: a running server keeps its current runtime until restart.");
+    }
+    println!();
+    Ok(())
+}
+
+/// Print a provenance record for CLI display.
+fn print_provenance(provenance: &McpPackageProvenance) {
+    println!();
+    println!("  Provenance: {}", provenance.trust);
+    if let Some(ref package_id) = provenance.package_id {
+        let ecosystem = match provenance.ecosystem {
+            PackageEcosystem::Unknown => String::new(),
+            other => format!(" [{other}]"),
+        };
+        println!("    Package: {package_id}{ecosystem}");
+    }
+    if let Some(ref version) = provenance.version {
+        println!("    Version: {version}");
+    }
+    if let Some(ref source) = provenance.source {
+        println!("    Source: {source}");
+    }
+    if let Some(ref publisher) = provenance.publisher {
+        println!("    Publisher: {publisher}");
+    }
+    if let Some(ref resolved) = provenance.resolved_command {
+        println!("    Resolved: {resolved}");
+    }
+    if let Some(ref digest) = provenance.command_sha256 {
+        println!("    Command SHA-256: {digest}");
+    }
+    println!("    Recorded: {}", provenance.recorded_at);
 }
 
 /// Toggle server enabled/disabled state.

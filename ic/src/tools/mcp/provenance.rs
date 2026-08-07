@@ -167,6 +167,22 @@ pub struct McpPackageProvenance {
 }
 
 impl McpPackageProvenance {
+    /// Create a minimal record carrying only a trust state (no identity or
+    /// digest). Used when revoking a server that has no provenance yet.
+    pub fn with_trust(trust: PackageTrust) -> Self {
+        Self {
+            package_id: None,
+            ecosystem: PackageEcosystem::Unknown,
+            version: None,
+            source: None,
+            publisher: None,
+            command_sha256: None,
+            resolved_command: None,
+            trust,
+            recorded_at: Utc::now(),
+        }
+    }
+
     /// Record provenance for a stdio command by resolving the executable that
     /// activation would run and hashing it. The record starts out `Pinned`.
     pub fn pin_for_command(
@@ -279,9 +295,7 @@ impl McpPackageProvenance {
 fn validate_metadata_field(field: &'static str, value: &str) -> Result<(), ConfigError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(ConfigError::InvalidConfig {
-            reason: format!(
-                "provenance {field} cannot be empty or contain control characters"
-            ),
+            reason: format!("provenance {field} cannot be empty or contain control characters"),
         });
     }
     Ok(())
@@ -360,10 +374,7 @@ mod tests {
 
     #[test]
     fn ecosystem_parses_known_values() {
-        assert_eq!(
-            "npm".parse::<PackageEcosystem>(),
-            Ok(PackageEcosystem::Npm)
-        );
+        assert_eq!("npm".parse::<PackageEcosystem>(), Ok(PackageEcosystem::Npm));
         assert_eq!(
             "pip".parse::<PackageEcosystem>(),
             Ok(PackageEcosystem::Pypi)
@@ -392,8 +403,7 @@ mod tests {
 
     #[test]
     fn pinned_record_verifies_unchanged_command() {
-        let provenance =
-            McpPackageProvenance::pin_for_command("cat", identity()).expect("pin cat");
+        let provenance = McpPackageProvenance::pin_for_command("cat", identity()).expect("pin cat");
         provenance
             .verify_stdio_command("cat")
             .expect("unchanged executable verifies");
@@ -482,8 +492,8 @@ mod tests {
         let cat = resolve_command_path("cat").expect("cat resolves via PATH");
         assert!(cat.is_file());
 
-        let explicit = resolve_command_path(cat.to_str().expect("utf8 path"))
-            .expect("explicit path resolves");
+        let explicit =
+            resolve_command_path(cat.to_str().expect("utf8 path")).expect("explicit path resolves");
         assert_eq!(explicit, cat);
 
         assert!(resolve_command_path("no-such-command-lw-test").is_err());
@@ -504,8 +514,7 @@ mod tests {
 
     #[test]
     fn provenance_serde_roundtrip() {
-        let provenance =
-            McpPackageProvenance::pin_for_command("cat", identity()).expect("pin cat");
+        let provenance = McpPackageProvenance::pin_for_command("cat", identity()).expect("pin cat");
         let json = serde_json::to_string(&provenance).expect("serialize");
         let parsed: McpPackageProvenance = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.trust, PackageTrust::Pinned);
