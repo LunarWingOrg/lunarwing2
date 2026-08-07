@@ -2372,6 +2372,8 @@ fn build_orchestrator_inputs(
         "enable_tool_intent_nudge": thread.config.enable_tool_intent_nudge,
         "require_action_attempt": thread.config.require_action_attempt,
         "max_action_requirement_nudges": thread.config.max_action_requirement_nudges,
+        "model_recovery_max_attempts": thread.config.model_recovery_max_attempts,
+        "model_recovery_total_attempts": thread.config.model_recovery_total_attempts,
         "max_consecutive_errors": thread.config.max_consecutive_errors,
         "max_tokens_total": thread.config.max_tokens_total,
         "max_budget_usd": thread.config.max_budget_usd,
