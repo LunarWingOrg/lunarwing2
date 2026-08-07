@@ -2818,6 +2818,10 @@ build_darkirc() {
       || die "approved DarkIRC source layout is incomplete"
 
     ensure_darkirc_build_user
+    # The build account must be able to traverse into DARKIRC_BUILD_ROOT and
+    # DARKIRC_BUILD_HOME; a restrictive ambient umask can otherwise leave the
+    # shared parent non-traversable (e.g. 0700) and fail the unprivileged build.
+    install -d -o root -g root -m 0711 "$(dirname "$DARKIRC_BUILD_ROOT")"
     install -d -o root -g root -m 0711 "$DARKIRC_BUILD_ROOT"
     build_tree="$(mktemp -d "$DARKIRC_BUILD_ROOT/build.XXXXXX")"
     cleanup_darkirc_build() {
@@ -2832,9 +2836,13 @@ build_darkirc() {
     install -d -o root -g root -m 0700 "$cargo_home/.cargo"
     chown -R "$DARKIRC_BUILD_USER:$DARKIRC_BUILD_GROUP" "$cargo_home"
     say "building darkirc as $DARKIRC_BUILD_USER from disposable source copy ..."
+    # The build tree is a git-archive extraction (no .git), so darkirc's
+    # build.rs cannot derive COMMITISH. Provide it from the attested checkout
+    # so the embedded version string still carries the approved revision.
     setpriv --reuid="$(id -u "$DARKIRC_BUILD_USER")" \
       --regid="$(id -g "$DARKIRC_BUILD_USER")" --clear-groups --no-new-privs -- \
       env -i HOME="$cargo_home" PATH="/usr/bin:/bin" CARGO_HOME="$cargo_home/.cargo" \
+      COMMITISH="$(git -C "$darkirc_src" rev-parse --short HEAD)" \
       MAKEFLAGS=-j2 taskset -c 0-1 make -C "$build_tree" darkirc \
       || die "darkirc build failed"
     darkirc_validate_clean_root_checkout "$darkirc_src" "$DARKIRC_REV" \
