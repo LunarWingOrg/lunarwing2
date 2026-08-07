@@ -2645,8 +2645,8 @@ install_darkirc_key_helper() {
     --regid="$(id -g "$DARKIRC_BUILD_USER")" --clear-groups --no-new-privs -- \
     env -i HOME="$cargo_home" PATH="/usr/bin:/bin" CARGO_HOME="$cargo_home/.cargo" \
     CARGO_TARGET_DIR="$DARKIRC_KEY_HELPER_BUILD_ROOT" \
-    taskset -c 0-1 cargo build --manifest-path "$archive_root/ic/Cargo.toml" \
-      --release -j2 --bin lunarwing-darkirc-key-helper \
+    taskset -c 0-7 cargo build --manifest-path "$archive_root/ic/Cargo.toml" \
+      --release -j8 --bin lunarwing-darkirc-key-helper \
     || die "DarkIRC key helper build failed"
   darkirc_validate_clean_root_checkout "$LUNARWING_ROOT" \
     || die "DarkIRC helper build changed trusted LunarWing checkout"
@@ -2849,7 +2849,7 @@ build_darkirc() {
       --regid="$(id -g "$DARKIRC_BUILD_USER")" --clear-groups --no-new-privs -- \
       env -i HOME="$cargo_home" PATH="/usr/bin:/bin" CARGO_HOME="$cargo_home/.cargo" \
       COMMITISH="$(git -C "$darkirc_src" rev-parse --short HEAD)" \
-      MAKEFLAGS=-j2 taskset -c 0-1 make -C "$build_tree" darkirc \
+      MAKEFLAGS=-j8 taskset -c 0-7 make -C "$build_tree" darkirc \
       || die "darkirc build failed"
     darkirc_validate_clean_root_checkout "$darkirc_src" "$DARKIRC_REV" \
       || die "DarkIRC build changed trusted source checkout"
