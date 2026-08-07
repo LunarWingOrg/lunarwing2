@@ -20,7 +20,7 @@ lunarwing_common = { path = "../lunarwing_common", version = "2.0.6" }
 lunarwing_skills = { path = "../lunarwing_skills", version = "2.0.6", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
-cron = "0.13"
+cron = "0.17"
 monty = { git = "https://github.com/pydantic/monty.git", rev = "7a0d4b75b72e6ddacafaf36e26486186cdb6eb68" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

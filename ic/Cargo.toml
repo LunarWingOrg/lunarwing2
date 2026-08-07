@@ -46,8 +46,8 @@ serde_json = "1"
 deadpool-postgres = { version = "0.14", optional = true }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"], optional = true }
 postgres-types = { version = "0.2", features = ["with-serde_json-1"], optional = true }
-refinery = { version = "0.8", features = ["tokio-postgres"], optional = true }
-tokio-postgres-rustls = { version = "0.13", optional = true }
+refinery = { version = "0.9", features = ["tokio-postgres"], optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-native-certs = { version = "0.8", optional = true }
 
@@ -64,7 +64,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Configuration
 dotenvy = "0.15"
-toml = "0.8"
+toml = "1"
 
 # Core types
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
@@ -82,20 +82,20 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Terminal
 crossterm = "0.29"
-rustyline = { version = "17", features = ["custom-bindings", "derive", "with-file-history"] }
-termimad = "0.34"
+rustyline = { version = "18", features = ["custom-bindings", "derive", "with-file-history"] }
+termimad = "0.35"
 
 # Channel integrations
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "set-header", "catch-panic", "compression-gzip"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "set-header", "catch-panic", "compression-gzip"] }
 
 # ACP (Agent Client Protocol) bridge
 agent-client-protocol = "0.10"
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # Cron scheduling for routines
-cron = "0.13"
+cron = "0.17"
 
 # Internal crates
 lunarwing_common = { path = "crates/lunarwing_common", version = "2.0.6" }
@@ -178,10 +178,10 @@ http = "1"
 # External worker WebSocket client
 tokio-tungstenite = "0.26"
 bytes = "1"
-base64 = "0.22"
+base64 = "0.23"
 mime_guess = "2.0.5"
 clap_complete = "4.5.0"
-lru = "0.16.3"
+lru = "0.18"
 tempfile = "3"
 
 # XMPP channel
@@ -197,14 +197,14 @@ hex = "0.4.3"
 libsignal-protocol = { path = "vendor/libsignal-protocol" }
 
 # OpenClaw import (feature gated)
-json5 = { version = "0.4", optional = true }
+json5 = { version = "1", optional = true }
 
 # Unix process signalling for graceful tunnel shutdown
 [target.'cfg(unix)'.dependencies]
 bs58 = "0.5.1"
 cap-fs-ext = "3.4.5"
 cap-std = "3.4.5"
-nix = { version = "0.30", features = ["fs", "signal", "process", "user"] }
+nix = { version = "0.31", features = ["fs", "signal", "process", "user"] }
 
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -224,7 +224,7 @@ tracing-test = "0.2"
 tokio-tungstenite = "0.26"
 pretty_assertions = "1"
 insta = "1.46.3"
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "safety_check"
