@@ -31,7 +31,7 @@
 
 | Bug | Name | Audited status |
 |---|---|---|
-| BUG-004 | Multica Registration — `PathNotAllowed` | 🟡 **Open; confirmed in current source.** Both Multica capabilities allow only paths beginning `/api/`, while URL construction preserves any base-path prefix and appends `/api/daemon/register` (`ic/channels-src/multica/multica.capabilities.json:35-41`, `ic/channels-src/multica/src/lib.rs:84-86`, `:362-374`; the tool has the same mismatch). A base URL ending `/cotter-openclaw` therefore produces `/cotter-openclaw/api/...`, which does not match `/api/`. |
+| BUG-004 | Multica Registration — `PathNotAllowed` | ✅ **Fixed.** `EndpointPattern` now supports a wildcard `path_prefix` form: a leading `*` (e.g. `*/api/`) matches the remainder anywhere in the normalized path at a segment boundary, so servers deployed under an arbitrary base path stay within their declared API subtree (`ic/src/tools/wasm/capabilities.rs`, used by both tool and channel HTTP gates via `ic/src/tools/wasm/allowlist.rs`). Both Multica manifests adopt `*/api/` (`ic/channels-src/multica/multica.capabilities.json:39`, `ic/tools-src/multica-bridge/multica-bridge.capabilities.json:128`), so `/cotter-openclaw/api/daemon/register` now passes while non-API paths and traversal collapses stay denied. Registry patch bumps per CI source-version policy: channel 0.1.4→0.1.5, tool 0.1.0→0.1.1. Deployed tenants pick up the fix on channel/tool reinstall or upgrade; live revalidation on Sunburst recommended. |
 | BUG-005 | “Multica Daemon” Connection Refused at `127.0.0.1:6680/poll` | ⚪ **Misclassified duplicate of BUG-006, not Multica.** No Multica source uses port 6680 or `/poll`; those belong to the DarkIRC adapter (`ic/channels-src/darkirc/src/lib.rs:10`, `:307-311`, `ic/channels-src/darkirc/adapter/darkirc_adapter.py:50`). Track the deployment symptom under BUG-006. |
 | BUG-006 | DarkIRC Adapter Not Deployed as Service | ✅ **Fixed in source; affected tenants must re-render units.** `lunarwing-mt-admin.sh` renders, enables, starts, stops, and reports a per-tenant DarkIRC adapter for both systemd-user and OpenRC (`ic/scripts/lunarwing-mt-admin.sh:6409-6428`, `:7192-7253`, `:7325`, `:7348`). Existing tenants missing the unit need `render-units`/normal upgrade deployment; repository inspection cannot prove that Sunburst received it. |
 | BUG-007 | WeeChat Relay 401 Unauthorized | ❓ **Live tenant drift remains unverified; do not mark fixed.** Current source bootstraps one `RELAY_PASSWORD`, writes a dedicated `weechat.env`, injects the same value into the WASM config, and validates new relay configs (`ic/scripts/lunarwing-mt-admin.sh:2779-2957`, `ic/src/channels/wasm/setup.rs:481-530`, `:709-730`). A 401 now indicates deployed password/config drift. Existing non-empty WeeChat configs are deliberately not overwritten, so the Sunburst tenant still needs preflight/live repair confirmation. |
@@ -66,8 +66,8 @@
 
 ## Audit summary
 
-- **Fixed in current source:** 14 bugs — BUG-001, BUG-002, BUG-006, BUG-010, BUG-014, BUG-015, BUG-016, BUG-017, BUG-018, BUG-019, BUG-020, BUG-021, BUG-022, BUG-023.
-- **Open, partial, or requiring live revalidation:** 6 bugs — BUG-003, BUG-004, BUG-007, BUG-011, BUG-012, BUG-013.
+- **Fixed in current source:** 15 bugs — BUG-001, BUG-002, BUG-004, BUG-006, BUG-010, BUG-014, BUG-015, BUG-016, BUG-017, BUG-018, BUG-019, BUG-020, BUG-021, BUG-022, BUG-023.
+- **Open, partial, or requiring live revalidation:** 5 bugs — BUG-003, BUG-007, BUG-011, BUG-012, BUG-013.
 - **Misclassified, expected setup, intentional compatibility, or documented behavior:** 4 bugs — BUG-005, BUG-008, BUG-009, BUG-024.
 - **Feature gaps:** FEAT-001 is implemented; FEAT-002 is partially resolved and still lacks secret-backed HTTP header references.
 - **Watch items:** WATCH-001 remains open for monitoring.
