@@ -237,7 +237,9 @@ impl HttpCapability {
 pub struct EndpointPattern {
     /// Hostname pattern (e.g., "api.example.com", "*.example.com").
     pub host: String,
-    /// Path prefix (e.g., "/v1/", "/api/").
+    /// Path prefix (e.g., "/v1/", "/api/"). A leading `*` (e.g., "*/api/")
+    /// matches the remainder anywhere in the path at a segment boundary,
+    /// for servers deployed under an arbitrary base path.
     pub path_prefix: Option<String>,
     /// Allowed HTTP methods (empty = all methods allowed).
     pub methods: Vec<String>,
@@ -273,9 +275,7 @@ impl EndpointPattern {
         }
 
         // Check path prefix
-        if let Some(ref prefix) = self.path_prefix
-            && !url_path.starts_with(prefix)
-        {
+        if !self.path_matches(url_path) {
             return false;
         }
 
@@ -292,6 +292,25 @@ impl EndpointPattern {
         }
 
         true
+    }
+
+    /// Check if a URL path satisfies this pattern's path constraint.
+    ///
+    /// A plain `path_prefix` requires an exact prefix match. A prefix with a
+    /// leading `*` (e.g. `*/api/`) instead matches when the remainder occurs
+    /// anywhere in the path; since the remainder begins with `/`, any match
+    /// starts on a segment boundary. This supports servers hosted under an
+    /// arbitrary deployment base path (e.g. `/cotter-openclaw/api/...`)
+    /// while still requiring the API subtree. Callers must pass the
+    /// normalized path (traversal segments already collapsed).
+    pub fn path_matches(&self, url_path: &str) -> bool {
+        match &self.path_prefix {
+            None => true,
+            Some(prefix) => match prefix.strip_prefix('*') {
+                Some(needle) => url_path.contains(needle),
+                None => url_path.starts_with(prefix),
+            },
+        }
     }
 
     /// Check if host pattern matches (public for allowlist validation).
@@ -448,6 +467,32 @@ mod tests {
         assert!(pattern.matches("api.example.com", "/v1/", "GET"));
         assert!(!pattern.matches("api.example.com", "/v2/users", "GET"));
         assert!(!pattern.matches("api.example.com", "/", "GET"));
+    }
+
+    #[test]
+    fn test_endpoint_pattern_wildcard_path_prefix() {
+        // Servers deployed under an arbitrary base path (e.g. a reverse-proxy
+        // subpath like /cotter-openclaw) still expose the same /api/ subtree.
+        let pattern = EndpointPattern::host("*").with_path_prefix("*/api/");
+
+        // Root deployment: exact /api/ paths still match.
+        assert!(pattern.matches("multica.ai", "/api/daemon/register", "POST"));
+        // Subpath deployment: base path prefix is tolerated.
+        assert!(pattern.matches(
+            "multica.ai",
+            "/cotter-openclaw/api/daemon/register",
+            "POST"
+        ));
+        assert!(pattern.matches("multica.ai", "/deep/nest/api/issues", "GET"));
+        // Paths outside the API subtree stay denied.
+        assert!(!pattern.matches("multica.ai", "/cotter-openclaw/admin", "GET"));
+        assert!(!pattern.matches("multica.ai", "/other/path", "GET"));
+        // The needle begins with '/', so lookalike segments do not match.
+        assert!(!pattern.matches("multica.ai", "/xapi/foo", "GET"));
+        assert!(!pattern.matches("multica.ai", "/foo/apis/x", "GET"));
+        // Exact-prefix patterns are unaffected by the wildcard form.
+        let exact = EndpointPattern::host("*").with_path_prefix("/api/");
+        assert!(!exact.matches("multica.ai", "/cotter-openclaw/api/daemon/register", "POST"));
     }
 
     #[test]

@@ -351,7 +351,9 @@ pub struct EndpointPatternSchema {
     /// Hostname (e.g., "api.example.com" or "*.example.com").
     pub host: String,
 
-    /// Optional path prefix (e.g., "/api/").
+    /// Optional path prefix (e.g., "/api/"). A leading `*` (e.g., "*/api/")
+    /// matches the remainder anywhere in the path at a segment boundary,
+    /// for servers deployed under an arbitrary base path.
     #[serde(default)]
     pub path_prefix: Option<String>,
 

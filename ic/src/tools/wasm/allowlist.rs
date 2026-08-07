@@ -130,12 +130,7 @@ impl AllowlistValidator {
             // Host matches but path/method doesn't
             let path_matches: Vec<_> = host_matches
                 .iter()
-                .filter(|p| {
-                    p.path_prefix.is_none()
-                        || parsed
-                            .path
-                            .starts_with(p.path_prefix.as_deref().unwrap_or(""))
-                })
+                .filter(|p| p.path_matches(&parsed.path))
                 .collect();
 
             if path_matches.is_empty() {
@@ -527,6 +522,52 @@ mod tests {
 
         let result = validator.validate("http://localhost:8080/api", "GET");
         assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_wildcard_path_prefix_base_path_deployment() {
+        // BUG-004: a Multica server hosted under a base path (e.g.
+        // https://host/cotter-openclaw) builds URLs like
+        // /cotter-openclaw/api/daemon/register, which a plain "/api/" prefix
+        // rejects. The "*/api/" wildcard form allows the API subtree under
+        // any deployment prefix.
+        let validator = AllowlistValidator::new(vec![
+            EndpointPattern::host("*").with_path_prefix("*/api/"),
+        ]);
+
+        // Root deployment still works.
+        assert!(
+            validator
+                .validate("https://multica.example.com/api/daemon/register", "POST")
+                .is_allowed()
+        );
+        // Base-path deployment is now allowed.
+        assert!(
+            validator
+                .validate(
+                    "https://multica.example.com/cotter-openclaw/api/daemon/register",
+                    "POST"
+                )
+                .is_allowed()
+        );
+        // Paths outside the API subtree stay denied, classified as path denies.
+        let result = validator.validate("https://multica.example.com/cotter-openclaw/admin", "GET");
+        assert!(!result.is_allowed());
+        if let super::AllowlistResult::Denied(reason) = result {
+            assert!(matches!(reason, DenyReason::PathNotAllowed { .. }));
+        } else {
+            panic!("Expected denied");
+        }
+        // Traversal cannot escape into a non-API path: normalization collapses
+        // `/api/..` before matching, leaving no `/api/` segment.
+        assert!(
+            !validator
+                .validate(
+                    "https://multica.example.com/cotter-openclaw/api/../admin",
+                    "GET"
+                )
+                .is_allowed()
+        );
     }
 
     #[test]
