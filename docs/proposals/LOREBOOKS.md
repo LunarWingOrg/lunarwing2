@@ -60,11 +60,14 @@ the privacy implications of participant-controlled triggers.
 
 ## Configuration
 
-Configuration is resolved once with normal agent startup validation:
+Configuration is resolved once with normal agent startup validation.
+Lorebooks are disabled by default because activation scanning is
+computationally expensive and most deployments do not use them; set
+`LOREBOOK_ENABLED=true` to opt in.
 
 | Variable | Default | Hard maximum / behavior |
 |---|---:|---|
-| `LOREBOOK_ENABLED` | `true` | Boolean |
+| `LOREBOOK_ENABLED` | `false` | Boolean |
 | `LOREBOOK_ALLOW_GROUP_CHATS` | `false` | Boolean |
 | `LOREBOOK_SCAN_DEPTH` | `10` | `100` messages |
 | `LOREBOOK_MAX_ENTRIES` | `20` | `64`; `0` injects none |

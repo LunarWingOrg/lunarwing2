@@ -59,7 +59,7 @@ DarkIRC is opt-in. It is not rendered or built for a new tenant unless the opera
 
 LunarWing workspace memory provides durable file-like documents and hybrid full-text and vector search on PostgreSQL and libSQL. Vector search activates when an embedding provider is configured; keyword search remains available without one. See [Semantic memory search](docs/architecture/SEMANTIC-MEMORY-SEARCH.md).
 
-Bounded [lorebooks](docs/proposals/LOREBOOKS.md) load a supported subset of SillyTavern World Info JSON and inject only entries activated by the current conversation. Prompt-injection checks run when lorebooks are written and loaded, and activation in group chats is disabled by default.
+Bounded [lorebooks](docs/proposals/LOREBOOKS.md) load a supported subset of SillyTavern World Info JSON and inject only entries activated by the current conversation. Lorebooks are disabled by default (`LOREBOOK_ENABLED=true` opts in) because activation scanning is computationally expensive. Prompt-injection checks run when lorebooks are written and loaded, and activation in group chats is disabled by default.
 
 Skills add reusable prompt-driven capabilities. Optional self-improvement missions can extract reusable skill documents from completed threads, while skill patches and removals remain proposals until a user approves them.
 
