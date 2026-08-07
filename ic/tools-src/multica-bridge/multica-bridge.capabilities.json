@@ -125,7 +125,7 @@
       "allowlist": [
         {
           "host": "*",
-          "path_prefix": "/api/"
+          "path_prefix": "*/api/"
         }
       ],
       "credentials": {

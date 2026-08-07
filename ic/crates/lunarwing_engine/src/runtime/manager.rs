@@ -15,7 +15,10 @@ use crate::executor::ExecutionLoop;
 use crate::executor::loop_engine::{
     INITIAL_PERSISTED_STATE_METADATA_KEY, RUNTIME_CHECKPOINT_METADATA_KEY,
 };
-use crate::runtime::messaging::{self, SignalSender, ThreadOutcome, ThreadSignal};
+use crate::executor::orchestrator::RECOVERY_STATE_KEY;
+use crate::runtime::messaging::{
+    self, SignalSender, ThreadFailureKind, ThreadOutcome, ThreadSignal,
+};
 use crate::runtime::tree::ThreadTree;
 use crate::traits::effect::EffectExecutor;
 use crate::traits::llm::LlmBackend;
@@ -34,6 +37,30 @@ struct RunningThread {
     /// for every `start_thread` call (including resumes) and never reused.
     cancellation: CancellationToken,
     handle: tokio::task::JoinHandle<Result<ThreadOutcome, EngineError>>,
+}
+
+fn clear_waiting_checkpoint_preserving_recovery(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let recovery = metadata
+        .get(RUNTIME_CHECKPOINT_METADATA_KEY)
+        .and_then(|checkpoint| checkpoint.get("persisted_state"))
+        .and_then(|state| state.get(RECOVERY_STATE_KEY))
+        .cloned();
+    metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
+
+    let Some(recovery) = recovery else {
+        return;
+    };
+    let initial_state = metadata
+        .entry(INITIAL_PERSISTED_STATE_METADATA_KEY)
+        .or_insert_with(|| serde_json::json!({}));
+    if !initial_state.is_object() {
+        *initial_state = serde_json::json!({});
+    }
+    if let Some(initial_state) = initial_state.as_object_mut() {
+        initial_state.insert(RECOVERY_STATE_KEY.to_string(), recovery);
+    }
 }
 
 /// Top-level orchestrator for thread lifecycle.
@@ -481,7 +508,7 @@ impl ThreadManager {
         if thread.state == crate::types::thread::ThreadState::Waiting
             && let Some(metadata) = thread.metadata.as_object_mut()
         {
-            metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
+            clear_waiting_checkpoint_preserving_recovery(metadata);
         }
 
         if let Err(error) = self.store.save_thread(&thread).await {
@@ -651,15 +678,25 @@ impl ThreadManager {
 
             let outcome = match result {
                 Ok(outcome) => outcome,
-                Err(error) => ThreadOutcome::Failed {
-                    error: error.to_string(),
-                },
+                Err(error) => {
+                    let (kind, message) = match &error {
+                        EngineError::Llm { kind, .. } => (
+                            ThreadFailureKind::Model(*kind),
+                            kind.terminal_message().to_string(),
+                        ),
+                        _ => (ThreadFailureKind::Unknown, error.to_string()),
+                    };
+                    ThreadOutcome::Failed {
+                        kind,
+                        error: message,
+                    }
+                }
             };
 
             // ExecutionLoop can return an infrastructure error before it makes
             // the thread terminal. Close that lifecycle here so leases and
             // learning events cannot be stranded on a dead background task.
-            if let ThreadOutcome::Failed { error } = &outcome
+            if let ThreadOutcome::Failed { error, .. } = &outcome
                 && !exec.thread.state.is_terminal()
                 && let Err(transition_error) = exec
                     .thread
@@ -1024,6 +1061,7 @@ impl ThreadManager {
                     Err(e) => {
                         error!(thread_id = %thread_id, "thread task panicked: {e}");
                         Ok(ThreadOutcome::Failed {
+                            kind: ThreadFailureKind::Unknown,
                             error: format!("thread task panicked: {e}"),
                         })
                     }
@@ -1184,6 +1222,45 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::sync::Notify;
+
+    #[test]
+    fn waiting_checkpoint_reset_preserves_failure_recovery_state() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            INITIAL_PERSISTED_STATE_METADATA_KEY.into(),
+            serde_json::json!({"trigger_payload": {"issue": 42}}),
+        );
+        metadata.insert(
+            RUNTIME_CHECKPOINT_METADATA_KEY.into(),
+            serde_json::json!({
+                "persisted_state": {
+                    "_failure_recovery": {
+                        "schema_version": 1,
+                        "terminal_attempted": ["no_progress"],
+                        "active_terminal": "no_progress",
+                        "gate_paused": true
+                    }
+                }
+            }),
+        );
+
+        clear_waiting_checkpoint_preserving_recovery(&mut metadata);
+
+        assert!(metadata.get(RUNTIME_CHECKPOINT_METADATA_KEY).is_none());
+        let metadata = serde_json::Value::Object(metadata);
+        assert_eq!(
+            metadata.pointer(&format!(
+                "/{INITIAL_PERSISTED_STATE_METADATA_KEY}/{RECOVERY_STATE_KEY}/active_terminal"
+            )),
+            Some(&serde_json::json!("no_progress"))
+        );
+        assert_eq!(
+            metadata.pointer(&format!(
+                "/{INITIAL_PERSISTED_STATE_METADATA_KEY}/trigger_payload/issue"
+            )),
+            Some(&serde_json::json!(42))
+        );
+    }
 
     // ── Mocks ───────────────────────────────────────────────
 
@@ -2153,6 +2230,7 @@ mod tests {
             _: &LlmCallConfig,
         ) -> Result<LlmOutput, EngineError> {
             Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".into(),
             })
         }
@@ -2208,6 +2286,7 @@ mod tests {
             _: &LlmCallConfig,
         ) -> Result<LlmOutput, EngineError> {
             Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".into(),
             })
         }
@@ -2376,6 +2455,7 @@ mod tests {
             _: &LlmCallConfig,
         ) -> Result<LlmOutput, EngineError> {
             Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".into(),
             })
         }

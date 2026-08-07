@@ -1,5 +1,6 @@
 //! Thread-to-thread messaging via channels.
 
+use crate::types::error::ModelFailureKind;
 use crate::types::message::ThreadMessage;
 use crate::types::thread::ThreadId;
 
@@ -31,7 +32,10 @@ pub enum ThreadOutcome {
     /// Max iterations reached without completing.
     MaxIterations,
     /// Terminal failure.
-    Failed { error: String },
+    Failed {
+        kind: ThreadFailureKind,
+        error: String,
+    },
     /// A unified execution gate paused the thread.
     GatePaused {
         gate_name: String,
@@ -43,6 +47,16 @@ pub enum ThreadOutcome {
         /// of re-running the action.
         resume_output: Option<serde_json::Value>,
     },
+}
+
+/// Stable internal classification for terminal thread failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadFailureKind {
+    Model(ModelFailureKind),
+    NoProgress,
+    ConsecutiveErrors,
+    Orchestrator,
+    Unknown,
 }
 
 /// A mailbox for sending signals to a running thread.

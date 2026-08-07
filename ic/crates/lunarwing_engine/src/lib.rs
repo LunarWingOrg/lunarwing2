@@ -50,7 +50,7 @@ pub use types::capability::{
     ActionDef, Capability, CapabilityLease, EffectType, GrantedActions, LeaseId, PolicyCondition,
     PolicyEffect, PolicyRule,
 };
-pub use types::error::{CapabilityError, EngineError, StepError, ThreadError};
+pub use types::error::{CapabilityError, EngineError, ModelFailureKind, StepError, ThreadError};
 pub use types::event::{EventId, EventKind, ThreadEvent};
 pub use types::memory::{DocId, DocType, MemoryDoc};
 pub use types::message::{MessageRole, ThreadMessage, TransientContentPart};
@@ -91,7 +91,7 @@ pub use gate::{
 pub use executor::prompt::PlatformInfo;
 pub use runtime::conversation::ConversationManager;
 pub use runtime::manager::ThreadManager;
-pub use runtime::messaging::ThreadOutcome;
+pub use runtime::messaging::{ThreadFailureKind, ThreadOutcome};
 pub use runtime::mission::{MissionManager, MissionNotification, MissionUpdate};
 pub use runtime::tree::ThreadTree;
 

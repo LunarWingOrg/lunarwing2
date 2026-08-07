@@ -63,7 +63,7 @@ pub(crate) fn is_retryable(err: &LlmError) -> bool {
 /// Rig and OpenAI-compatible proxies often flatten typed provider errors into
 /// `RequestFailed`. Detect deterministic size failures so retry/failover does
 /// not resend the exact same oversized payload.
-fn is_oversized_request(reason: &str) -> bool {
+pub(crate) fn is_oversized_request(reason: &str) -> bool {
     let reason = reason.to_ascii_lowercase();
     [
         "context length exceeded",
