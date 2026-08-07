@@ -31,17 +31,17 @@ fn truecolor_enabled() -> bool {
 
 // ── Color tokens ────────────────────────────────────────────
 
-/// Emerald green accent — primary brand color.
+/// Brand blue accent — primary brand color.
 ///
-/// Uses true-color `#34d399` when supported, falls back to basic green.
+/// Uses true-color `#1d4ed8` when supported, falls back to basic blue.
 pub fn accent() -> &'static str {
     if !colors_enabled() {
         return "";
     }
     if truecolor_enabled() {
-        "\x1b[38;2;52;211;153m"
+        "\x1b[38;2;29;78;216m"
     } else {
-        "\x1b[32m"
+        "\x1b[34m"
     }
 }
 
@@ -50,9 +50,18 @@ pub fn bold() -> &'static str {
     if colors_enabled() { "\x1b[1m" } else { "" }
 }
 
-/// Green — success indicators.
+/// Light blue — success indicators.
+///
+/// Uses true-color `#60a5fa` when supported, falls back to basic blue.
 pub fn success() -> &'static str {
-    if colors_enabled() { "\x1b[32m" } else { "" }
+    if !colors_enabled() {
+        return "";
+    }
+    if truecolor_enabled() {
+        "\x1b[38;2;96;165;250m"
+    } else {
+        "\x1b[34m"
+    }
 }
 
 /// Yellow — warning indicators.
@@ -77,15 +86,16 @@ pub fn link() -> &'static str {
 
 /// Bold accent — commands and interactive elements.
 ///
-/// Uses bold + true-color emerald when supported, falls back to bold green.
+/// Uses bold + true-color brand blue (`#1d4ed8`) when supported, falls back
+/// to bold basic blue.
 pub fn bold_accent() -> &'static str {
     if !colors_enabled() {
         return "";
     }
     if truecolor_enabled() {
-        "\x1b[1;38;2;52;211;153m"
+        "\x1b[1;38;2;29;78;216m"
     } else {
-        "\x1b[1;32m"
+        "\x1b[1;34m"
     }
 }
 

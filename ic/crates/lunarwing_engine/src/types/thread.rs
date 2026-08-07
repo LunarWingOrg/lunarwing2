@@ -133,6 +133,18 @@ pub struct ThreadConfig {
     /// enabled.
     #[serde(default = "default_max_action_requirement_nudges")]
     pub max_action_requirement_nudges: u32,
+    /// Maximum engine-level recovery attempts per model failure streak.
+    /// Per-kind policy caps (`MODEL_RECOVERY_POLICY` in the orchestrator)
+    /// apply on top. Default: 1 (legacy one-attempt behavior). Clamped to
+    /// 0..=3. Env override: ENGINE_V2_MODEL_RECOVERY_ATTEMPTS.
+    #[serde(default = "default_model_recovery_max_attempts")]
+    pub model_recovery_max_attempts: u32,
+    /// Total engine-level recovery attempts allowed per thread lifetime.
+    /// Bounds cumulative recovery time (the Monty sandbox has no clock for a
+    /// wall-clock budget). Default: 4. Env override:
+    /// ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS.
+    #[serde(default = "default_model_recovery_total_attempts")]
+    pub model_recovery_total_attempts: u32,
 
     // ── Human delay / supervision mode ──
     /// When true, every tool action is gated through human approval,
@@ -191,6 +203,16 @@ impl Default for ThreadConfig {
             max_tool_intent_nudges: 2,
             require_action_attempt: false,
             max_action_requirement_nudges: 2,
+            model_recovery_max_attempts: std::env::var("ENGINE_V2_MODEL_RECOVERY_ATTEMPTS")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .map(|value| value.min(3))
+                .unwrap_or(1),
+            model_recovery_total_attempts: std::env::var("ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .map(|value| value.min(16))
+                .unwrap_or(4),
             supervised_mode: false,
             shared_conversation: false,
             supervised_timeout_secs: 300,
@@ -213,6 +235,14 @@ fn default_max_action_requirement_nudges() -> u32 {
 
 fn default_supervised_timeout_secs() -> u64 {
     300
+}
+
+fn default_model_recovery_max_attempts() -> u32 {
+    1
+}
+
+fn default_model_recovery_total_attempts() -> u32 {
+    4
 }
 
 // ── Thread ──────────────────────────────────────────────────

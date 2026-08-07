@@ -413,6 +413,8 @@ disables every Engine V2 route. With Engine V2 enabled, the gateway is always
 eligible; `ENGINE_V2_CHANNELS` can additionally select the exact names `xmpp`,
 `darkirc`, and `weechat`. Values are comma-separated, trimmed, and matched
 case-insensitively by exact channel name. Empty and unknown values are ignored.
+`ENGINE_V2_MODEL_RECOVERY_ATTEMPTS` is another env var
+example: `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2`
 
 Engine `ResponseDelta` events flow through
 `ChannelManager::send_status(StatusUpdate::StreamChunk)`. The gateway maps each

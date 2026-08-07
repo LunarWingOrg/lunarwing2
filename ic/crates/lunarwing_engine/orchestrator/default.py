@@ -36,6 +36,24 @@ NO_PROGRESS_FAILURE_THRESHOLD = 3
 MAX_RECOVERY_ITERATIONS = 3
 RECOVERY_CONTEXT_MAX_CHARS = 24000
 
+# Per-kind engine recovery policy. max_attempts caps engine-visible recovery
+# retries for that failure kind (further capped by the thread config's
+# model_recovery_max_attempts). shrink (context_overflow only) scales the
+# recovery context budget per attempt. Kinds absent here — and unknown kinds —
+# get no engine recovery attempt: authentication/request_rejected fail fast by
+# design, and rate_limited is owned by the provider layer's Retry-After
+# handling, so the engine must not re-hammer.
+MODEL_RECOVERY_POLICY = {
+    "context_overflow": {"max_attempts": 2, "shrink": [0.60, 0.35]},
+    "transient": {"max_attempts": 2},
+    "invalid_output": {"max_attempts": 1},
+    "rate_limited": {"max_attempts": 0},
+    "unavailable": {"max_attempts": 1},
+    "authentication": {"max_attempts": 0},
+    "request_rejected": {"max_attempts": 0},
+    "internal": {"max_attempts": 1},
+}
+
 
 # ── Helper functions (self-modifiable glue) ──────────────────
 # Defined before run_loop so they are in scope when called.
@@ -568,7 +586,8 @@ def ensure_failure_recovery(state):
             "terminal_attempted": [],
             "pending_terminal": None,
             "active_terminal": None,
-            "model_recovery_attempted": False,
+            "model_recovery_attempts": 0,
+            "model_recovery_total_attempts": 0,
             "pending_model_error": None,
             "consecutive_failed_work": 0,
         }
@@ -577,10 +596,14 @@ def ensure_failure_recovery(state):
 
     if not isinstance(recovery.get("terminal_attempted"), list):
         recovery["terminal_attempted"] = []
-    if not isinstance(recovery.get("model_recovery_attempted"), bool):
-        recovery["model_recovery_attempted"] = False
     if not isinstance(recovery.get("consecutive_failed_work"), int):
         recovery["consecutive_failed_work"] = 0
+    # Migrate the legacy one-shot boolean to the checkpointed counter.
+    legacy_attempted = recovery.pop("model_recovery_attempted", None)
+    if not isinstance(recovery.get("model_recovery_attempts"), int):
+        recovery["model_recovery_attempts"] = 1 if legacy_attempted else 0
+    if not isinstance(recovery.get("model_recovery_total_attempts"), int):
+        recovery["model_recovery_total_attempts"] = 0
     return recovery
 
 
@@ -667,7 +690,7 @@ def activate_delivered_recovery(state):
     changed = False
     if recovery.get("pending_model_error") is not None:
         recovery["pending_model_error"] = None
-        recovery["model_recovery_attempted"] = False
+        recovery["model_recovery_attempts"] = 0
         changed = True
     terminal = recovery.get("pending_terminal")
     if isinstance(terminal, dict):
@@ -677,12 +700,16 @@ def activate_delivered_recovery(state):
     return changed
 
 
-def shrink_context_for_model_recovery(state, goal):
+def shrink_context_for_model_recovery(state, goal, budget_factor=1.0):
     """Replace oversized protocol history with a bounded plain-text view."""
+    if not isinstance(budget_factor, (int, float)) or budget_factor <= 0:
+        budget_factor = 1.0
     messages = state.get("working_messages", [])
     system_message = None
     recent = []
-    remaining = RECOVERY_CONTEXT_MAX_CHARS
+    remaining = int(RECOVERY_CONTEXT_MAX_CHARS * budget_factor)
+    goal_cap = int(8000 * budget_factor)
+    message_cap = int(2000 * budget_factor)
 
     for msg in messages:
         if msg.get("role") in ("System", "system"):
@@ -693,8 +720,8 @@ def shrink_context_for_model_recovery(state, goal):
             break
 
     goal_text = str(goal)
-    if len(goal_text) > 8000:
-        goal_text = goal_text[:8000] + "\n... (goal truncated for recovery)"
+    if len(goal_text) > goal_cap:
+        goal_text = goal_text[:goal_cap] + "\n... (goal truncated for recovery)"
     remaining -= len(goal_text)
 
     for msg in reversed(messages):
@@ -704,8 +731,8 @@ def shrink_context_for_model_recovery(state, goal):
         content = str(msg.get("content", ""))
         if not content:
             continue
-        if len(content) > 2000:
-            content = content[:2000] + "\n... (message truncated for recovery)"
+        if len(content) > message_cap:
+            content = content[:message_cap] + "\n... (message truncated for recovery)"
         line = str(role) + ": " + content
         if len(line) > remaining:
             continue
@@ -957,20 +984,33 @@ def run_loop(context, goal, actions, state, config):
 
         if resp_type == "model_error":
             recovery = ensure_failure_recovery(state)
+            kind = response.get("kind", "internal")
+            if not isinstance(kind, str) or not kind:
+                kind = "internal"
+            policy = MODEL_RECOVERY_POLICY.get(kind, {"max_attempts": 0})
+            max_attempts = min(policy.get("max_attempts", 0),
+                               config.get("model_recovery_max_attempts", 1))
+            total_cap = config.get("model_recovery_total_attempts", 4)
+            attempts = recovery.get("model_recovery_attempts", 0)
+            total_attempts = recovery.get("model_recovery_total_attempts", 0)
             if (not response.get("recoverable", False)
-                    or recovery.get("model_recovery_attempted", False)):
+                    or attempts >= max_attempts
+                    or total_attempts >= total_cap):
                 return model_failure_result(state, response)
 
-            recovery["model_recovery_attempted"] = True
+            recovery["model_recovery_attempts"] = attempts + 1
+            recovery["model_recovery_total_attempts"] = total_attempts + 1
             recovery["pending_model_error"] = {
-                "kind": response.get("kind", "internal"),
+                "kind": kind,
                 "instruction": response.get(
                     "instruction",
                     "Model request failed. Continue concisely from current state.",
                 ),
             }
-            if response.get("kind") == "context_overflow":
-                shrink_context_for_model_recovery(state, goal)
+            if kind == "context_overflow":
+                shrink_factors = policy.get("shrink") or [1.0]
+                factor = shrink_factors[min(attempts, len(shrink_factors) - 1)]
+                shrink_context_for_model_recovery(state, goal, factor)
                 working_messages = ensure_working_messages(state, context)
             __save_checkpoint__(state, {
                 "nudge_count": consecutive_nudges,
