@@ -18,14 +18,16 @@
 5. [ ] MCP part 2 work: host sandboxing (see docs for info)
 6. [ ] go over items in work items. make note of any that are already confirmed fix and should be closed
 7. [ ] implement mcp part 2 work: general runtime adapters, MCP-over-WASM, and dedicated/shared gateway architecture (see docs for info)
-8. [ ] Research the following and make a new doc in ops with findings: LunarHub / IronHub / Extension Marketplace — Future Direction - What they did: IronHub deep link installs, custom MCP server registration from WebUI with OpenAPI-derived tool discovery bounded by manifest tool budget. Extension lifecycle with CAS-protected mutations, hash-pinned manifests, soft-removal tombstones, restart repair. - What LunarWing needs first: 1 Binary distribution (the identified blocker) — proper packaged releases for LunarWing binaries, 2 Manifest registry — could be hosted on git.lunarwing.org, 3 Install flow with provenance verification — MCP provenance pinning already landing in 2.0.6.0 - Status: Pieces are being built. Marketplace is post-2.0.7.0 at earliest
+8. [ ] Research the following and make a new doc in ops with findings and next steps for this (referencing docs/ops/35d44998cadf3e6d.md ): LunarHub / IronHub / Extension Marketplace — Future Direction - What they did: IronHub deep link installs, custom MCP server registration from WebUI with OpenAPI-derived tool discovery bounded by manifest tool budget. Extension lifecycle with CAS-protected mutations, hash-pinned manifests, soft-removal tombstones, restart repair. - What LunarWing needs first: 1 Binary distribution (the identified blocker) — proper packaged releases for LunarWing binaries, 2 Manifest registry — could be hosted on git.lunarwing.org, 3 Install flow with provenance verification — MCP provenance pinning already landing in 2.0.6.0 - Status: Pieces are being built. Marketplace is post-2.0.7.0 at earliest
 9. [ ] mcp part 2 work worker-local placement (see docs for info)
 10. [x] (S) Review implementation of item 5 from docs/ops/35d44998cadf3e6d.md - u may clone ironclaw gh repo for reference - do not cokmit ic repo - needs more testing and refinment for sure especially on low end LLMs
-11. [ ] Review and make fixes to MCP part two implementation (see mcp documents first)
+11. [ ] Review and make fixes to MCP part two implementation (see mcp documents first) - address any gaps or problems
 12. [ ] FIX CI/CD ISSUES
 13. [ ] review previous mcp work for part two and fix anything if something is found out to be weird or broken
 14. [ ] come up with codename ideas for release. put into new doc
 15. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.6.0 explaining all relevant changes since v2.0.5.0 as well as revising and including an ACCURATE VERSION OF`known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is:`UNKNOWN` — The file you write will be`RELEASE-v2.0.6.0.md` and should be written to the ROOT of the repo
+16. [ ] update any outdated documents in docs/proposals
+17. [ ] update any outdated documents in docs/
 16. [ ] update README.md in repo root (if necessary)
 
 ---
