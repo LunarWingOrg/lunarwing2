@@ -53,13 +53,13 @@ for body in "$build_body" "$helper_body"; do
     "build path does not clear groups and set no-new-privs"
   require_body "$body" 'env -i HOME=' \
     "build path does not sanitize its environment"
-  require_body "$body" 'taskset -c 0-1' \
+  require_body "$body" 'taskset -c 0-7' \
     "build path is not CPU bounded"
 done
 
 require_body "$helper_body" 'cargo build --manifest-path' \
   "key helper is not built from the archived trusted manifest"
-require_body "$helper_body" '--release -j2 --bin lunarwing-darkirc-key-helper' \
+require_body "$helper_body" '--release -j8 --bin lunarwing-darkirc-key-helper' \
   "key helper build is not release-only and resource bounded"
 require_body "$helper_body" 'darkirc_validate_build_artifact "$artifact"' \
   "key helper artifact ownership is not validated before publication"
