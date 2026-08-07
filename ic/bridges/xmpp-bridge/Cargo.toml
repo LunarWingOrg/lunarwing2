@@ -9,7 +9,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 futures = "0.3"
 lunarwing = { path = "../.." }
 openclaw-xmpp-bridge-contract = { path = "../../openclaw-ports/xmpp/bridge" }

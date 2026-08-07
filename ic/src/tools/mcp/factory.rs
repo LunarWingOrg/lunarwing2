@@ -25,6 +25,8 @@ pub enum McpFactoryError {
     UnixNotSupported { name: String },
     #[error("Invalid configuration for MCP server '{name}': {reason}")]
     InvalidConfig { name: String, reason: String },
+    #[error("Package provenance check failed for MCP server '{name}': {reason}")]
+    Provenance { name: String, reason: String },
 }
 
 /// Create an `McpClient` from a server configuration, dispatching on the
@@ -50,6 +52,17 @@ pub async fn create_client_from_config(
         }
     })?;
 
+    // Revocation applies to every transport; digest pinning is enforced for
+    // stdio before the child is spawned.
+    if let Some(provenance) = &server.provenance {
+        provenance
+            .verify_not_revoked()
+            .map_err(|error| McpFactoryError::Provenance {
+                name: server_name.clone(),
+                reason: error.to_string(),
+            })?;
+    }
+
     match server.effective_transport() {
         EffectiveTransport::Stdio {
             command,
@@ -57,6 +70,9 @@ pub async fn create_client_from_config(
             env,
             env_secrets,
         } => {
+            if let Some(provenance) = server.provenance.clone() {
+                verify_stdio_provenance(&server_name, provenance, command).await?;
+            }
             let resolved_env =
                 resolve_stdio_env(&server_name, env, env_secrets, secrets.as_deref(), user_id)
                     .await?;
@@ -146,6 +162,38 @@ pub async fn create_client_from_config(
             }
         }
     }
+}
+
+/// Verify a pinned stdio executable digest off the async executor.
+///
+/// Hashing is blocking filesystem work, so it runs on the blocking thread
+/// pool; a failure prevents the child process from being spawned at all.
+async fn verify_stdio_provenance(
+    server_name: &str,
+    provenance: crate::tools::mcp::provenance::McpPackageProvenance,
+    command: &str,
+) -> Result<(), McpFactoryError> {
+    let command = command.to_string();
+    let name = server_name.to_string();
+    let result = tokio::task::spawn_blocking(move || provenance.verify_stdio_command(&command))
+        .await
+        .map_err(|error| McpFactoryError::Provenance {
+            name: name.clone(),
+            reason: format!("provenance verification task failed: {error}"),
+        })?;
+    if let Err(error) = result {
+        tracing::warn!(
+            server = %name,
+            error = %error,
+            "MCP package provenance verification failed; activation blocked"
+        );
+        return Err(McpFactoryError::Provenance {
+            name,
+            reason: error.to_string(),
+        });
+    }
+    tracing::debug!(server = %name, "MCP package provenance verified");
+    Ok(())
 }
 
 /// Resolve configured values and owner-scoped secret references for one spawn.
@@ -289,6 +337,98 @@ mod tests {
         .await
         .expect_err("missing owner secret must fail");
         assert!(wrong_owner.to_string().contains("api_token"));
+    }
+
+    #[tokio::test]
+    async fn stdio_activation_enforces_package_provenance() {
+        use crate::tools::mcp::provenance::{
+            McpPackageProvenance, PackageTrust, ProvenanceIdentity,
+        };
+
+        let session_manager = Arc::new(McpSessionManager::new());
+        let process_manager = Arc::new(McpProcessManager::new());
+
+        // Revoked packages fail closed before any child is spawned.
+        let mut revoked =
+            McpPackageProvenance::pin_for_command("cat", ProvenanceIdentity::default())
+                .expect("pin cat");
+        revoked.trust = PackageTrust::Revoked;
+        let config = McpServerConfig::new_stdio(
+            "revoked-server",
+            "cat",
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )
+        .with_provenance(revoked);
+        let error = match create_client_from_config(
+            config,
+            &session_manager,
+            &process_manager,
+            None,
+            "test-user",
+        )
+        .await
+        {
+            Ok(_) => panic!("revoked package must not activate"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, McpFactoryError::Provenance { .. }));
+        assert!(
+            process_manager.managed_servers().await.is_empty(),
+            "revoked activation must not spawn a child"
+        );
+
+        // A doctored digest fails closed as well.
+        let mut mismatched =
+            McpPackageProvenance::pin_for_command("cat", ProvenanceIdentity::default())
+                .expect("pin cat");
+        mismatched.command_sha256 = Some("0".repeat(64));
+        let config = McpServerConfig::new_stdio(
+            "mismatched-server",
+            "cat",
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )
+        .with_provenance(mismatched);
+        let error = match create_client_from_config(
+            config,
+            &session_manager,
+            &process_manager,
+            None,
+            "test-user",
+        )
+        .await
+        {
+            Ok(_) => panic!("digest mismatch must not activate"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, McpFactoryError::Provenance { .. }));
+        assert!(process_manager.managed_servers().await.is_empty());
+
+        // A correct pin activates and spawns normally.
+        let pinned = McpPackageProvenance::pin_for_command("cat", ProvenanceIdentity::default())
+            .expect("pin cat");
+        let config = McpServerConfig::new_stdio(
+            "pinned-server",
+            "cat",
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )
+        .with_provenance(pinned);
+        let client = create_client_from_config(
+            config,
+            &session_manager,
+            &process_manager,
+            None,
+            "test-user",
+        )
+        .await
+        .expect("pinned package with matching digest activates");
+        client.shutdown().await.expect("shutdown pinned client");
+        process_manager
+            .shutdown("pinned-server")
+            .await
+            .expect("clean up pinned process");
     }
 
     #[tokio::test]

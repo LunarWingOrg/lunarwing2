@@ -54,7 +54,10 @@ These are validation and coverage tasks, not known production-code defects.
 
 - Worker-local MCP placement.
 - Automatic npm/pip package installation.
-- Package provenance, signatures, trust, and revocation.
+- Publisher signatures, trusted signing keys, dependency locking, upgrade
+  diffs, and marketplace revocation distribution. (Operator-pinned executable
+  digests, package identity, trust state, and revocation for host-local stdio
+  servers are implemented as of 2026-08-07.)
 - Host-process filesystem, network, process, device, and resource sandboxing.
 - A generic runtime-adapter boundary.
 - MCP-over-WASM session/runtime support.

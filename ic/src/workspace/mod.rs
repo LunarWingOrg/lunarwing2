@@ -2553,7 +2553,10 @@ mod runtime_index_tests {
             .expect("write clean lorebook");
 
         let messages = [crate::llm::ChatMessage::user("Tell me about the dragon")];
-        let config = crate::config::LorebookConfig::default();
+        let config = crate::config::LorebookConfig {
+            enabled: true,
+            ..crate::config::LorebookConfig::default()
+        };
         let block =
             crate::lorebook::build_active_block(&workspace, &messages, "thread-1", false, &config)
                 .await
@@ -2703,7 +2706,10 @@ mod runtime_index_tests {
                 &[],
                 "cross-file-thread",
                 false,
-                &crate::config::LorebookConfig::default(),
+                &crate::config::LorebookConfig {
+                    enabled: true,
+                    ..crate::config::LorebookConfig::default()
+                },
             )
             .await
             .is_none(),
@@ -2751,7 +2757,10 @@ mod runtime_index_tests {
             .await
             .expect("write target lorebook");
         let messages: Vec<_> = texts.iter().map(crate::llm::ChatMessage::user).collect();
-        let config = crate::config::LorebookConfig::default();
+        let config = crate::config::LorebookConfig {
+            enabled: true,
+            ..crate::config::LorebookConfig::default()
+        };
         let alone =
             crate::lorebook::build_active_block(&workspace, &messages, scope, false, &config)
                 .await

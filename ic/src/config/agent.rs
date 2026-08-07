@@ -46,7 +46,9 @@ pub struct AgentConfig {
 /// Lorebook activation configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LorebookConfig {
-    /// Master feature switch.
+    /// Master feature switch. Disabled by default: activation scanning is
+    /// computationally expensive and most deployments do not use lorebooks.
+    /// Set `LOREBOOK_ENABLED=true` to opt in.
     pub enabled: bool,
     /// Permit primary-scope lorebooks in group chats. Disabled by default to
     /// avoid exposing private lore through participant-controlled triggers.
@@ -101,7 +103,7 @@ impl LorebookConfig {
 impl Default for LorebookConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             allow_group_chats: false,
             scan_depth: 10,
             max_entries: 20,
@@ -310,11 +312,11 @@ mod tests {
     }
 
     #[test]
-    fn lorebook_defaults_are_bounded_and_group_private() {
+    fn lorebook_defaults_are_disabled_bounded_and_group_private() {
         let config = LorebookConfig::default()
             .validated()
             .expect("valid defaults");
-        assert!(config.enabled);
+        assert!(!config.enabled);
         assert!(!config.allow_group_chats);
         assert_eq!(config.scan_depth, 10);
         assert_eq!(config.max_entries, 20);

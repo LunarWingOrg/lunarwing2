@@ -241,9 +241,39 @@ explicit persisted-only removal. As with toggle, custom `--url` requires explici
 
 Automatic npm/pip MCP installation is **not implemented**. LunarWing runs the
 configured stdio command directly and assumes an operator already installed it.
-The current MCP registry records command, arguments, and environment configuration;
-it does not pin, download, sign, verify, upgrade, revoke, or roll back Node/Python
-packages. WASM artifact checksums do not establish provenance for stdio commands.
+The MCP registry records command, arguments, and environment configuration; it
+does not download, sign, upgrade, or roll back Node/Python packages.
+
+Package provenance **is implemented** for host-local stdio servers as an
+operator-driven pinning flow:
+
+```bash
+lunarwing mcp pin local-files \
+  --package @example/local-files-mcp --ecosystem npm \
+  --version 1.4.0 --publisher example
+lunarwing mcp list --verbose     # shows trust state and digest
+lunarwing mcp revoke local-files # block activation + disable
+lunarwing mcp unpin local-files  # back to unverified legacy behavior
+```
+
+`mcp pin` resolves the configured command exactly as activation would (explicit
+path or `PATH` search), records its SHA-256 digest plus the optional package
+identity (canonical id, ecosystem, immutable version, source, publisher), and
+marks the server `pinned`. Every later activation — startup, manual activation,
+and crash recovery alike — re-hashes the resolved executable and **fails
+closed** on mismatch, so a silently replaced or upgraded binary cannot start
+until the operator re-pins. `mcp revoke` records `revoked` trust (blocking
+activation for any transport) and disables the server; a revoked server stays
+blocked until it is re-pinned or unpinned. Servers without a provenance record
+keep the legacy unverified behavior. `mcp update` retains the record for stdio
+servers; switching transports drops the digest. Web and conversational update
+requests do not carry provenance and reset the record — re-pin after using
+them.
+
+What this does not yet cover: publisher signatures and trusted signing keys,
+locked dependency graphs, upgrade diffs, marketplace trust roots, and
+compromised-publisher revocation distribution. WASM artifact checksums remain
+separate from stdio executable digests.
 
 Safe automatic installation would improve usability: one-command installs, exact
 version selection, reproducible tenants, and managed upgrades/rollback. It also
