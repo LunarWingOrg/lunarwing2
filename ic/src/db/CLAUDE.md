@@ -42,3 +42,13 @@ are optional overrides.
 - If libSQL work would be disproportionate, PostgreSQL-only is acceptable with
   a note here.
 - Do not regress existing libSQL coverage.
+
+## Study-Notes knowledge store (v2.0.6)
+
+The `WorkspaceStore` sub-trait carries three multi-scope knowledge methods
+(`knowledge_search`, `knowledge_topic_versions`, `knowledge_list_notes`) for
+the study-notes knowledge layer. Study notes are ordinary `memory_documents`
+rows tagged `metadata->>'provenance' = 'study-note'`; FTS runs on the existing
+`memory_chunks` tsvector (PostgreSQL) / `memory_chunks_fts` FTS5 (libSQL).
+Both backends are implemented; migration V26 adds the partial metadata index
+on each side.

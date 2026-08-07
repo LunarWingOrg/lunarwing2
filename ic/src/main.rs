@@ -1098,6 +1098,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(components.context_manager),
         Some(session_manager),
     );
+    agent.set_knowledge_sweep_config(config.knowledge_sweep.clone());
 
     // Fill the scheduler slot now that Agent (and its Scheduler) exist.
     *scheduler_slot.write().await = Some(agent.scheduler());

@@ -93,6 +93,59 @@ each response is at most 8,000 serialized bytes. `memory_tree` returns at most
 256 entries and 8,000 serialized bytes with machine-readable `truncated`,
 `entry_count`, `next_offset`, and root-list `revision` fields.
 
+## Study-Notes Knowledge Store
+
+Study notes are durable, source-verified codebase-study findings shared between
+agents. They are stored as ordinary workspace documents under
+`study-notes/<agent>/<topic>.md` (per-agent versions of a canonical topic) with
+a `study-note` provenance tag plus structured metadata (agent attribution,
+topic slug, confidence 0.0-1.0, status `active`/`stale`/`superseded`/
+`needs-verification`, studied timestamp, source commit, tags array) in the
+document `metadata` JSONB. Because they are workspace documents, they flow
+through the normal chunking and PostgreSQL FTS pipeline (`memory_chunks`
+`content_tsv` GIN index, `ts_rank_cd` ranking).
+
+Five native tools (see `src/tools/builtin/knowledge.rs`):
+
+- **`knowledge_search`** — PostgreSQL FTS over study-note chunks with optional
+  topic/agent/status/tags filters; best-ranked snippet per note.
+- **`knowledge_get_topic`** — all per-agent versions of one topic with content.
+- **`knowledge_submit_note`** — validated write (slug/topic/title/content
+  limits, confidence 0-1, RFC 3339 `studied_at`); `replace=true` updates the
+  caller's own agent version only (other agents' versions live at different
+  paths).
+- **`knowledge_list_stale`** — notes needing verification by status, age
+  (`max_age_days`), or `repository_commit` mismatch.
+- **`knowledge_stats`** — totals, distinct topics, per-status and per-scope counts.
+
+Scopes: reads span the caller's private scope plus the shared herd scope
+(`workspace::KNOWLEDGE_SHARED_SCOPE`, `"shared"`) unless narrowed with
+`scope=all|private|shared`. Writes default to the private scope;
+`scope=shared` publishes herd knowledge.
+
+### Lifecycle (Phase 2)
+
+- **Provenance** — every submitted note records `submitted_by` (the real
+  caller scope) and `session_id` (conversation/job) from the job context, in
+  addition to the self-declared `agent` slug, so shared notes keep
+  attribution. Legacy notes without these fields still parse.
+- **Stale sweep** (`knowledge_sweep`) — a cadence-guarded background pass
+  (heartbeat-driven, same pattern as memory hygiene) marks `active` notes
+  `stale` once `studied_at` (falling back to the document update time) is
+  older than `KNOWLEDGE_STALE_AFTER_DAYS` (default 30). Cadence:
+  `KNOWLEDGE_SWEEP_CADENCE_HOURS` (default 24); the shared herd scope is
+  swept too unless `KNOWLEDGE_SWEEP_INCLUDE_SHARED=false`; the whole sweep
+  can be disabled with `KNOWLEDGE_SWEEP_ENABLED=false`.
+- **Kawarimi migration** — notes are ordinary `memory_documents` rows, so
+  they travel with the tenant `pg_dump -Fc` → `pg_restore` bundle and the
+  owner-scope rekey (see `docs/ops/MT-MACHINE-MIGRATION.md`).
+- **Skill** — the bundled `study-notes` skill (v3) directs agents through
+  these native tools; the external study-notes MCP is no longer required.
+
+libSQL backend: implemented with FTS5 (`memory_chunks_fts`) and per-scope
+merge; note that FTS5 rank values are not comparable across scopes, so merged
+results carry descending ordinal ranks.
+
 ## Hybrid Search (RRF)
 
 For a deep dive into the full semantic search pipeline (embedding providers, chunking, fusion strategies, database schema, and configuration), see `docs/architecture/SEMANTIC-MEMORY-SEARCH.md`.

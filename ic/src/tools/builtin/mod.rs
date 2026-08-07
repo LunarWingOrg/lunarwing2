@@ -6,6 +6,7 @@ mod file;
 mod http;
 mod job;
 mod json;
+pub mod knowledge;
 pub mod memory;
 mod message;
 pub mod path_utils;
@@ -31,6 +32,10 @@ pub use job::{
     PromptQueue, SchedulerSlot,
 };
 pub use json::JsonTool;
+pub use knowledge::{
+    KnowledgeGetTopicTool, KnowledgeListStaleTool, KnowledgeSearchTool, KnowledgeStatsTool,
+    KnowledgeSubmitNoteTool,
+};
 pub use memory::{MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool};
 pub use message::MessageTool;
 pub use restart::RestartTool;

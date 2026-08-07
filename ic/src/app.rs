@@ -415,12 +415,16 @@ impl AppBuilder {
                     self.config.search.clone(),
                     self.config.workspace.clone(),
                 ));
-                tools.register_memory_tools_with_resolver(pool);
+                tools.register_memory_tools_with_resolver(pool.clone());
+                tools.register_knowledge_tools_with_resolver(pool);
                 tracing::info!(
                     "Memory tools configured with per-user workspace resolver (multi-tenant mode)"
                 );
             } else {
                 tools.register_memory_tools(Arc::clone(&ws));
+                tools.register_knowledge_tools_with_resolver(Arc::new(
+                    crate::tools::builtin::memory::FixedWorkspaceResolver::new(Arc::clone(&ws)),
+                ));
             }
 
             Some(ws)

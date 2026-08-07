@@ -963,6 +963,156 @@ impl Repository {
         Ok(crate::workspace::merge_workspace_entries(all_entries))
     }
 
+    // ==================== Study-Notes Knowledge ====================
+
+    /// PostgreSQL FTS over study-note chunks across scopes.
+    ///
+    /// Returns the best-ranked chunk per matching note. Optional metadata
+    /// filters are applied with the `$n IS NULL OR ...` pattern so one static
+    /// query covers all filter combinations.
+    pub async fn knowledge_search(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        query: &str,
+        filter: &crate::workspace::KnowledgeFilter,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeSearchHit>, WorkspaceError> {
+        let conn = self.conn().await?;
+        let status = filter.status.map(|s| s.as_str());
+        let tags: Option<Vec<String>> = if filter.tags.is_empty() {
+            None
+        } else {
+            Some(filter.tags.clone())
+        };
+        let rows = conn
+            .query(
+                r#"
+                SELECT scope, path, metadata, snippet, rank FROM (
+                    SELECT DISTINCT ON (d.id)
+                           d.user_id AS scope, d.path, d.metadata,
+                           c.content AS snippet,
+                           ts_rank_cd(c.content_tsv, plainto_tsquery('english', $3)) AS rank
+                    FROM memory_chunks c
+                    JOIN memory_documents d ON d.id = c.document_id
+                    WHERE d.user_id = ANY($1)
+                      AND d.agent_id IS NOT DISTINCT FROM $2
+                      AND c.content_tsv @@ plainto_tsquery('english', $3)
+                      AND d.path LIKE 'study-notes/%'
+                      AND d.metadata ->> 'provenance' = 'study-note'
+                      AND ($4::text IS NULL OR d.metadata ->> 'topic' = $4)
+                      AND ($5::text IS NULL OR d.metadata ->> 'agent' = $5)
+                      AND ($6::text IS NULL OR d.metadata ->> 'status' = $6)
+                      AND ($7::text[] IS NULL OR d.metadata -> 'tags' ?| $7)
+                    ORDER BY d.id, rank DESC
+                ) hits
+                ORDER BY rank DESC
+                LIMIT $8
+                "#,
+                &[
+                    &user_ids,
+                    &agent_id,
+                    &query,
+                    &filter.topic,
+                    &filter.agent,
+                    &status,
+                    &tags,
+                    &(limit as i64),
+                ],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Knowledge FTS query failed: {e}"),
+            })?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let metadata: serde_json::Value = row.get("metadata");
+                Some(crate::workspace::KnowledgeSearchHit {
+                    scope: row.get("scope"),
+                    path: row.get("path"),
+                    snippet: row.get("snippet"),
+                    rank: row.get("rank"),
+                    meta: crate::workspace::KnowledgeNoteMeta::from_metadata_json(&metadata)?,
+                })
+            })
+            .collect())
+    }
+
+    /// List every per-agent version of one canonical topic across scopes.
+    ///
+    /// Bounded to 64 versions: topics accrue one version per agent, and this
+    /// keeps pathological scans out of the knowledge tools.
+    pub async fn knowledge_topic_versions(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        topic: &str,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, agent_id, path, content,
+                       created_at, updated_at, metadata
+                FROM memory_documents
+                WHERE user_id = ANY($1)
+                  AND agent_id IS NOT DISTINCT FROM $2
+                  AND metadata ->> 'provenance' = 'study-note'
+                  AND metadata ->> 'topic' = $3
+                ORDER BY updated_at DESC
+                LIMIT 64
+                "#,
+                &[&user_ids, &agent_id, &topic],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Knowledge topic query failed: {e}"),
+            })?;
+        Ok(rows.iter().map(|r| self.row_to_document(r)).collect())
+    }
+
+    /// Scan study-note metadata (no content) across scopes, newest first.
+    ///
+    /// Rows whose metadata no longer parses as a study note are skipped.
+    pub async fn knowledge_list_notes(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, WorkspaceError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT user_id AS scope, path, metadata, updated_at
+                FROM memory_documents
+                WHERE user_id = ANY($1)
+                  AND agent_id IS NOT DISTINCT FROM $2
+                  AND metadata ->> 'provenance' = 'study-note'
+                ORDER BY updated_at DESC
+                LIMIT $3
+                "#,
+                &[&user_ids, &agent_id, &(limit as i64)],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Knowledge list query failed: {e}"),
+            })?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let metadata: serde_json::Value = row.get("metadata");
+                Some(crate::workspace::KnowledgeNoteRow {
+                    scope: row.get("scope"),
+                    path: row.get("path"),
+                    updated_at: row.get("updated_at"),
+                    meta: crate::workspace::KnowledgeNoteMeta::from_metadata_json(&metadata)?,
+                })
+            })
+            .collect())
+    }
+
     // ==================== Metadata ====================
 
     pub async fn update_document_metadata(

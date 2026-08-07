@@ -45,6 +45,8 @@ mod document;
 mod embedding_cache;
 mod embeddings;
 pub mod hygiene;
+pub mod knowledge;
+pub mod knowledge_sweep;
 pub mod layer;
 pub mod privacy;
 #[cfg(feature = "postgres")]
@@ -60,6 +62,13 @@ pub use document::{
 pub use embedding_cache::{CachedEmbeddingProvider, EmbeddingCacheConfig};
 pub use embeddings::{
     EmbeddingProvider, LunarWingCloudEmbeddings, MockEmbeddings, OllamaEmbeddings, OpenAiEmbeddings,
+};
+pub use knowledge::{
+    KNOWLEDGE_DIR, KNOWLEDGE_PROVENANCE, KNOWLEDGE_SCAN_CAP, KNOWLEDGE_SHARED_SCOPE,
+    KnowledgeFilter, KnowledgeNoteMeta, KnowledgeNoteRow, KnowledgeScopeCount, KnowledgeSearchHit,
+    KnowledgeStats, KnowledgeStatus, MAX_COMMIT_BYTES, MAX_CONTENT_BYTES, MAX_SLUG_BYTES,
+    MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES, is_knowledge_path, is_valid_slug, note_path,
+    render_note_markdown,
 };
 #[cfg(feature = "postgres")]
 pub use repository::Repository;
@@ -543,6 +552,70 @@ impl WorkspaceStorage {
                 db.get_document_by_path_multi(user_ids, agent_id, path)
                     .await
             }
+        }
+    }
+
+    // ==================== Study-Notes knowledge store ====================
+
+    async fn update_document_metadata(
+        &self,
+        id: Uuid,
+        metadata: &serde_json::Value,
+    ) -> Result<(), WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.update_document_metadata(id, metadata).await,
+            Self::Db(db) => db.update_document_metadata(id, metadata).await,
+        }
+    }
+
+    async fn knowledge_search(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        query: &str,
+        filter: &crate::workspace::KnowledgeFilter,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeSearchHit>, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => {
+                repo.knowledge_search(user_ids, agent_id, query, filter, limit)
+                    .await
+            }
+            Self::Db(db) => {
+                db.knowledge_search(user_ids, agent_id, query, filter, limit)
+                    .await
+            }
+        }
+    }
+
+    async fn knowledge_topic_versions(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        topic: &str,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => {
+                repo.knowledge_topic_versions(user_ids, agent_id, topic)
+                    .await
+            }
+            Self::Db(db) => db.knowledge_topic_versions(user_ids, agent_id, topic).await,
+        }
+    }
+
+    async fn knowledge_list_notes(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.knowledge_list_notes(user_ids, agent_id, limit).await,
+            Self::Db(db) => db.knowledge_list_notes(user_ids, agent_id, limit).await,
         }
     }
 }
@@ -1802,6 +1875,68 @@ impl Workspace {
                 )
                 .await
         }
+    }
+
+    // ==================== Study-Notes knowledge store ====================
+
+    /// PostgreSQL FTS over study notes across the given scopes.
+    ///
+    /// `scopes` is the caller's private scope plus, for herd knowledge,
+    /// [`crate::workspace::KNOWLEDGE_SHARED_SCOPE`]. Returns the best-ranked
+    /// chunk per matching note, ordered by rank descending.
+    pub async fn knowledge_search(
+        &self,
+        scopes: &[String],
+        query: &str,
+        filter: &KnowledgeFilter,
+        limit: usize,
+    ) -> Result<Vec<KnowledgeSearchHit>, WorkspaceError> {
+        self.storage
+            .knowledge_search(scopes, self.agent_id, query, filter, limit)
+            .await
+    }
+
+    /// List every per-agent version of one canonical topic across scopes,
+    /// newest first.
+    pub async fn knowledge_topic_versions(
+        &self,
+        scopes: &[String],
+        topic: &str,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        self.storage
+            .knowledge_topic_versions(scopes, self.agent_id, topic)
+            .await
+    }
+
+    /// Scan study-note metadata (no content) across scopes, newest first.
+    ///
+    /// Used by stale detection and statistics; bounded by `limit`.
+    pub async fn knowledge_list_notes(
+        &self,
+        scopes: &[String],
+        limit: usize,
+    ) -> Result<Vec<KnowledgeNoteRow>, WorkspaceError> {
+        self.storage
+            .knowledge_list_notes(scopes, self.agent_id, limit)
+            .await
+    }
+
+    /// Replace the metadata JSON of a document in the primary scope.
+    ///
+    /// The path is resolved in the primary scope first, so metadata can never
+    /// be attached to a document the caller does not own.
+    pub async fn set_document_metadata(
+        &self,
+        path: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<(), WorkspaceError> {
+        let doc = self
+            .storage
+            .get_document_by_path(&self.user_id, self.agent_id, &normalize_path(path))
+            .await?;
+        self.storage
+            .update_document_metadata(doc.id, metadata)
+            .await
     }
 
     // ==================== Indexing ====================

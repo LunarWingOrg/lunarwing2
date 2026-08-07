@@ -978,6 +978,17 @@ ALTER TABLE tool_capabilities ADD COLUMN approval_policy TEXT NOT NULL DEFAULT '
     CHECK (approval_policy IN ('never', 'unless_auto_approved', 'always'));
 "#,
     ),
+    (
+        26,
+        "study_notes_knowledge",
+        // Partial index mirroring the PostgreSQL V26 migration: covers the
+        // metadata filters used by study-note topic/status scans.
+        r#"
+CREATE INDEX IF NOT EXISTS idx_memory_documents_study_notes
+    ON memory_documents (user_id, json_extract(metadata, '$.topic'))
+    WHERE json_extract(metadata, '$.provenance') = 'study-note';
+"#,
+    ),
 ];
 
 /// Migrations whose ADD COLUMN should be skipped when the column already
